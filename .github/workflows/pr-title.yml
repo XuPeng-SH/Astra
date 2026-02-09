@@ -1,0 +1,36 @@
+# Validate PR title (Conventional Commits style).
+# Add more workflows under .github/workflows/ for other CI checks.
+name: PR Title
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize]
+
+jobs:
+  title:
+    name: Check PR title
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate title
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+          # Conventional Commits: type(scope?): description
+          # Allowed types: feat, fix, docs, style, refactor, perf, test, chore, build, ci, revert
+          PATTERN: '^(feat|fix|docs|style|refactor|perf|test|chore|build|ci|revert)(\([a-z0-9-]+\))?!?:\s+.+'
+        run: |
+          if echo "$TITLE" | grep -qE "$PATTERN"; then
+            echo "✅ PR title OK: $TITLE"
+          else
+            echo "::error::Invalid PR title! Must follow Conventional Commits format."
+            echo ""
+            echo "✅ Examples:"
+            echo "   feat(auth): add login with Google"
+            echo "   fix(checkout): correct tax calculation"
+            echo "   docs: update installation guide"
+            echo "   ci: enforce PR title format"
+            echo ""
+            echo "❌ Your title: '$TITLE'"
+            echo ""
+            echo "📚 Learn more: https://www.conventionalcommits.org"
+            exit 1
+          fi
