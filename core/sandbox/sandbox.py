@@ -8,7 +8,6 @@ from sdk.database import Database
 from sdk.git_for_data import GitForData
 
 if TYPE_CHECKING:
-    import builtins
     from datetime import datetime
 
 
@@ -28,7 +27,7 @@ class Sandbox:
         name: str,
         description: str = "",
         created_by: str = "system",
-        tags: builtins.list[str] | None = None,
+        tags: list[str] | None = None,
         from_snapshot: str | None = None,
     ) -> None:
         """Create sandbox with metadata."""
@@ -55,44 +54,35 @@ class Sandbox:
         """)
 
     def delete(self, name: str) -> None:
-        """Delete sandbox, its snapshots, and metadata atomically.
+        """Delete sandbox and all its snapshots.
 
-        Deletion order (for safety):
-        1. Delete metadata first (mark as deleted)
-        2. Delete snapshots (best effort, continue on error)
-        3. Drop database (atomic operation)
-
-        If database drop fails, metadata is already deleted, preventing
-        the sandbox from being used even if database still exists.
+        This will:
+        1. Drop the sandbox database
+        2. Delete all snapshots associated with this sandbox
+        3. Remove metadata entry
 
         Args:
             name: Sandbox database name
+
+        Example:
+            >>> sandbox.delete("exp1")
+            >>> # Deletes: exp1 database + all exp1_* snapshots + metadata
         """
-        # Step 1: Delete metadata first (atomic, marks sandbox as deleted)
-        # This prevents the sandbox from being used even if later steps fail
-        self.db.execute(f"DELETE FROM sandbox_metadata WHERE sandbox_name = '{name}'")
+        # Delete all snapshots for this sandbox
+        snapshots = self.list_snapshots(name)
+        for snapshot in snapshots:
+            try:
+                self.git.drop_snapshot(snapshot["full_name"])
+            except Exception:
+                pass  # Continue even if snapshot deletion fails
 
-        # Step 2: Delete all snapshots (best effort)
-        # Continue even if some snapshots fail to delete
-        try:
-            snapshots = self.git.list_snapshots()
-            prefix = f"{name}_"
-            for s in snapshots:
-                if s["snapshot_name"].startswith(prefix):
-                    try:
-                        self.git.drop_snapshot(s["snapshot_name"])
-                    except Exception as e:
-                        # Log but continue - don't fail entire delete for snapshot errors
-                        print(f"Warning: Failed to delete snapshot {s['snapshot_name']}: {e}")
-        except Exception as e:
-            # If listing snapshots fails, continue to database deletion
-            print(f"Warning: Failed to list snapshots for cleanup: {e}")
-
-        # Step 3: Drop database (atomic operation by MatrixOne)
-        # This is the final step - if it fails, sandbox is already marked deleted
+        # Drop database
         self.db.execute(f"DROP DATABASE IF EXISTS {name}")
 
-    def list(
+        # Delete metadata
+        self.db.execute(f"DELETE FROM sandbox_metadata WHERE sandbox_name = '{name}'")
+
+    def list_sandboxes(
         self,
         prefix: str = "sandbox_",
         pattern: str | None = None,
@@ -100,8 +90,8 @@ class Sandbox:
         created_by: str | None = None,
         created_after: datetime | None = None,
         updated_after: datetime | None = None,
-        tags: builtins.list[str] | None = None,
-    ) -> builtins.list[dict]:
+        tags: list[str] | None = None,
+    ) -> list[dict[str, str]]:
         """List sandboxes with filtering.
 
         Args:
@@ -149,7 +139,7 @@ class Sandbox:
         self,
         name: str,
         description: str | None = None,
-        tags: builtins.list[str] | None = None,
+        tags: list[str] | None = None,
         status: str | None = None,
     ) -> None:
         """Update sandbox metadata.
@@ -204,7 +194,7 @@ class Sandbox:
         self.db.execute(f"DROP TABLE IF EXISTS {sandbox}.{table}")
         self._touch_metadata(sandbox)
 
-    def list_tables(self, sandbox: str) -> builtins.list[str]:
+    def list_tables(self, sandbox: str) -> list[str]:
         """List tables in sandbox."""
         rows = self.db.fetchall(f"SHOW TABLES FROM {sandbox}")
         return [row[f"Tables_in_{sandbox}"] for row in rows]
@@ -223,8 +213,8 @@ class Sandbox:
             if table.startswith("_") or table == "sandbox_metadata":
                 continue
             count_row = self.db.fetchone(f"SELECT COUNT(*) as count FROM {sandbox}.{table}")
-            if count_row:
-                table_info.append({"table": table, "rows": count_row["count"]})
+            count = count_row.get("count", 0) if count_row else 0
+            table_info.append({"table": table, "rows": count})
 
         result = {
             "sandbox_name": sandbox,
@@ -238,28 +228,52 @@ class Sandbox:
         return result
 
     def snapshot(self, sandbox: str, name: str, description: str = "") -> None:
-        """Create checkpoint for sandbox.
+        """Create snapshot for sandbox.
 
-        Checkpoint timestamp must not exceed sandbox creation time.
+        Creates a named snapshot of the current sandbox state for later restore.
+        Snapshot name format: {sandbox_name}_{snapshot_name}
+
+        Args:
+            sandbox: Sandbox database name
+            name: Snapshot name (will be prefixed with sandbox name)
+            description: Optional description
+
+        Example:
+            >>> sandbox.snapshot("exp1", "before_test")
+            >>> # Creates snapshot: exp1_before_test
         """
-        # Get sandbox creation time
+        # Verify sandbox exists
         metadata = self.db.fetchone(
             f"SELECT created_at FROM sandbox_metadata WHERE sandbox_name = '{sandbox}'"
         )
         if not metadata:
             raise ValueError(f"Sandbox {sandbox} not found")
 
+        # Create snapshot with prefixed name
         snapshot_name = f"{sandbox}_{name}"
         self.git.create_snapshot(snapshot_name)
         self._touch_metadata(sandbox)
 
-    def list_snapshots(self, sandbox: str) -> builtins.list[dict]:
-        """List checkpoints for sandbox with timestamps."""
-        snapshots = self.git.list_snapshots()
+    def list_snapshots(self, sandbox: str) -> list[dict]:
+        """List all snapshots for a sandbox.
+
+        Args:
+            sandbox: Sandbox database name
+
+        Returns:
+            list[dict]: Snapshot info with name and timestamp
+
+        Example:
+            >>> snapshots = sandbox.list_snapshots("exp1")
+            >>> # [{"name": "before_test", "full_name": "exp1_before_test", "created_at": "..."}]
+        """
+        all_snapshots = self.git.list_snapshots()
+        if not all_snapshots:
+            return []
         prefix = f"{sandbox}_"
 
         result = []
-        for s in snapshots:
+        for s in all_snapshots:
             if s["snapshot_name"].startswith(prefix):
                 result.append(
                     {
@@ -270,10 +284,28 @@ class Sandbox:
                 )
         return result
 
-    def restore(self, sandbox: str, checkpoint: str) -> None:
-        """Restore sandbox to checkpoint using native RESTORE.
+    def restore(self, sandbox: str, snapshot_name: str) -> None:
+        """Restore sandbox to a previous snapshot.
 
-        Validates that checkpoint timestamp <= sandbox creation time.
+        Uses MatrixOne's native RESTORE DATABASE command to atomically restore
+        the sandbox database to a previous snapshot state. This operation:
+        - Only affects the specified sandbox database
+        - Does not affect main database or other sandboxes
+        - Is atomic and instant (no data copy)
+        - Validates snapshot timestamp <= sandbox creation time
+
+        Args:
+            sandbox: Sandbox database name to restore
+            snapshot_name: Snapshot name (without sandbox prefix)
+
+        Raises:
+            ValueError: If sandbox or snapshot not found
+            ValueError: If snapshot timestamp > sandbox creation time
+
+        Example:
+            >>> sandbox.snapshot("exp1", "before_test")
+            >>> # ... make changes ...
+            >>> sandbox.restore("exp1", "before_test")  # Restore to snapshot
         """
         # Get sandbox metadata
         metadata = self.db.fetchone(
@@ -283,30 +315,32 @@ class Sandbox:
             raise ValueError(f"Sandbox {sandbox} not found")
 
         sandbox_created_at = metadata["created_at"]
-        snapshot_name = f"{sandbox}_{checkpoint}"
+        full_snapshot_name = f"{sandbox}_{snapshot_name}"
 
         # Get snapshot info
         snapshots = self.git.list_snapshots()
         snapshot_info = None
         for s in snapshots:
-            if s["snapshot_name"] == snapshot_name:
+            if s["snapshot_name"] == full_snapshot_name:
                 snapshot_info = s
                 break
 
         if not snapshot_info:
-            raise ValueError(f"Checkpoint {checkpoint} not found")
+            raise ValueError(f"Snapshot {snapshot_name} not found for sandbox {sandbox}")
 
-        # Validate checkpoint time <= sandbox creation time
+        # Validate snapshot time <= sandbox creation time
+        # This prevents restoring to a snapshot created after the sandbox
         snapshot_ts = snapshot_info.get("ts", "")
         if snapshot_ts and snapshot_ts > str(sandbox_created_at):
             raise ValueError(
-                f"Cannot restore: checkpoint time ({snapshot_ts}) is after sandbox creation time ({sandbox_created_at})"
+                f"Cannot restore: snapshot time ({snapshot_ts}) is after sandbox creation time ({sandbox_created_at})"
             )
 
-        # Use native RESTORE DATABASE
-        # Syntax: RESTORE ACCOUNT {account} DATABASE {sandbox} FROM SNAPSHOT {snapshot}
+        # Use native RESTORE DATABASE command
+        # Syntax: RESTORE ACCOUNT {account} DATABASE {database_name} FROM SNAPSHOT {snapshot_name}
+        # This only restores the specified database, not the entire account
         self.db.execute(
-            f"RESTORE ACCOUNT {self.account} DATABASE {sandbox} FROM SNAPSHOT {snapshot_name}"
+            f"RESTORE ACCOUNT {self.account} DATABASE {sandbox} FROM SNAPSHOT {full_snapshot_name}"
         )
         self._touch_metadata(sandbox)
 

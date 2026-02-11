@@ -9,6 +9,7 @@ help:
 	@echo "Environment Setup:"
 	@echo "  make setup              - Initial project setup (copy .env, install deps)"
 	@echo "  make install            - Install Python dependencies"
+	@echo "  make lock               - Update dependency lock file (poetry.lock)"
 	@echo ""
 	@echo "Development Environment:"
 	@echo "  make dev-up             - Start MatrixOne + Redis"
@@ -21,6 +22,7 @@ help:
 	@echo ""
 	@echo "Database:"
 	@echo "  make db-init            - Initialize database schema"
+	@echo "  make db-init-agent      - Initialize agent configuration system (RBAC + tables)"
 	@echo "  make db-connect         - Connect to MatrixOne CLI"
 	@echo "  make db-reset           - Reset database (drop + recreate)"
 	@echo ""
@@ -71,6 +73,16 @@ install:
 		poetry install; \
 	else \
 		pip install -e .; \
+	fi
+
+.PHONY: lock
+lock:
+	@echo "Updating dependency lock file..."
+	@if command -v poetry >/dev/null 2>&1; then \
+		poetry lock; \
+		echo "✅ poetry.lock updated"; \
+	else \
+		echo "⚠️  Poetry not found, skipping lock (pip doesn't use lock files)"; \
 	fi
 
 # ============================================================================
@@ -134,6 +146,11 @@ dev-init: dev-up db-init
 db-init:
 	@echo "Initializing database schema..."
 	@bash infra/scripts/init-db.sh
+
+.PHONY: db-init-agent
+db-init-agent:
+	@echo "Initializing agent configuration system..."
+	@python3 infra/scripts/init_agent_system.py
 
 .PHONY: db-connect
 db-connect:

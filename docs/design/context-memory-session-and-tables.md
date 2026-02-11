@@ -28,6 +28,10 @@ We adopt an **event-centric** model so that:
 | **溯源** | **context_snapshot** (JSON) on each LLM-related event captures template id, skills used, history event ids, retrieved chunks; any event can be fully reproduced. |
 | **评分训练** | **event_evaluations** (user/auto scores) and **training_annotations** (labels, dataset_split); **training_eligible** + **quality_score** on events; export pipeline for SFT/RLHF. |
 | **MatrixOne 全栈** | All metadata, events, and configs in MatrixOne; vectors only as **embedding_ref** (external store); no dependency on other stores for core analytics. |
+| **确定性边界控制** | Agent Decision = LLM(versioned_prompt, versioned_skill, versioned_context, versioned_memory, fixed_params); Git for Data controls 4 of 5 inputs, constraining LLM non-determinism to auditable range. |
+| **幻觉防火墙** | hallucination_checks table records every verification; claims verified against same snapshot used for context assembly. |
+| **回归门禁** | gate_results table records every quality gate; snapshot-isolated regression testing before any change reaches production. |
+| **训练数据版本化** | training_datasets table with snapshot_name as version; full lineage from events to datasets. |
 
 **Core shift**: Conversation is no longer “ephemeral context” but **traceable, analyzable, trainable event data**. Business value (e.g. code-review summary) is produced by upper layers via metadata or views; the core event store stays generic and evolution-resistant.
 
@@ -979,6 +983,71 @@ CREATE TABLE memory_index_queue (
   retry_count INT DEFAULT 0,
   created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Regression gate results
+CREATE TABLE gate_results (
+  gate_id         VARCHAR(64) PRIMARY KEY,
+  change_type     VARCHAR(50) NOT NULL,   -- 'skill_change' | 'prompt_change' | 'config_change'
+  change_id       VARCHAR(255) NOT NULL,  -- e.g. 'summarize_pr@2.0.0'
+  snapshot_used   VARCHAR(255) NOT NULL,  -- Git for Data snapshot name
+  sessions_tested INT NOT NULL,
+  error_rate      DECIMAL(5,4),
+  passed          BOOLEAN NOT NULL,
+  metrics         JSON,                   -- detailed metrics breakdown
+  created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_change (change_type, change_id),
+  INDEX idx_created (created_at)
+);
+
+-- Training datasets (versioned via snapshots)
+CREATE TABLE training_datasets (
+  dataset_id      VARCHAR(64) PRIMARY KEY,
+  name            VARCHAR(255) NOT NULL,
+  snapshot_name   VARCHAR(255) NOT NULL,  -- Git for Data snapshot = dataset version
+  event_count     INT NOT NULL,
+  pair_count      INT NOT NULL,           -- SFT instruction-response pairs
+  criteria        JSON NOT NULL,          -- selection criteria used
+  quality_stats   JSON,                   -- avg_score, score_distribution, etc.
+  created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  created_by      VARCHAR(255),
+  INDEX idx_name (name),
+  INDEX idx_snapshot (snapshot_name)
+);
+
+-- Hallucination verification log
+CREATE TABLE hallucination_checks (
+  check_id        VARCHAR(64) PRIMARY KEY,
+  event_id        VARCHAR(64) NOT NULL,   -- LLM response event
+  session_id      VARCHAR(64) NOT NULL,
+  snapshot_used   VARCHAR(255),           -- snapshot used for verification
+  claims_total    INT NOT NULL,
+  claims_verified INT NOT NULL,
+  claims_contradicted INT NOT NULL,
+  claims_unverifiable INT NOT NULL,
+  safe_to_deliver BOOLEAN NOT NULL,
+  contradictions  JSON,                   -- details of contradicted claims
+  created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_event (event_id),
+  INDEX idx_session (session_id),
+  INDEX idx_safe (safe_to_deliver)
+);
+
+-- Prompt experiment branches
+CREATE TABLE prompt_experiments (
+  experiment_id   VARCHAR(64) PRIMARY KEY,
+  template_id     VARCHAR(64) NOT NULL,
+  branch_name     VARCHAR(255) NOT NULL,  -- Git for Data branch/snapshot
+  hypothesis      TEXT,
+  candidate_content TEXT NOT NULL,
+  baseline_metrics JSON,
+  experiment_metrics JSON,
+  quality_delta   DECIMAL(5,4),
+  status          VARCHAR(50) DEFAULT 'running', -- 'running' | 'passed' | 'failed' | 'merged'
+  created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  completed_at    TIMESTAMP,
+  INDEX idx_template (template_id),
+  INDEX idx_status (status)
+);
 ```
 
 (Tokens, token_usage_log, token_rotation_jobs, configs, repos, data_export_jobs, skills_registry, agent_configs: same pattern as in 4.2; adjust to MatrixOne SQL dialect.)
@@ -1124,3 +1193,115 @@ Implementation can proceed Phase 0 → 1 → … → 5; each phase builds on the
 - **Conversation replay (“对话时光机”)**: Causal chain (parent_event_id, causal_chain_id) and LLM params (llm_model_used, llm_params) enable exact **replay** of any past chain; optional **replay with a different model** for regression testing and training data. Shifts debugging from “infer from logs” to “re-run and compare”.
 - **Time-point sandbox (“平行宇宙实验台”)**: MatrixOne Git for Data (or clone) provides **branch-at-T1** and **isolated sandbox**; new prompt/skills/memory can be tested on historical traffic with **zero production impact**; merge or discard after evaluation.
 - **Memory–Prompt–Context clarity**: Explicit three-layer model (Memory = persistent knowledge, Prompt = versioned behavior, Context = one-shot assembled input + snapshot) keeps storage, versioning, and replay semantics consistent and programmable.
+
+
+---
+
+## 11. From Design to Engineering: Operational Completeness
+
+**Context**: This section addresses the review feedback that "操作性完备" (operational completeness) is currently at the design vision layer, lacking concrete validation and acceptance paths. The goal is to bridge the gap between design and provable operational capability.
+
+### 11.1 Engineering Validation Roadmap
+
+The following capabilities move from "design points" to **engineering-validated features** with measurable acceptance criteria:
+
+| Capability | Design Status | Engineering Target | Validation Method |
+|------------|---------------|-------------------|-------------------|
+| **Replay with quality gate** | Designed (§10, Phase 5) | Automated replay gate with 6 metrics | CI/CD integration, 95% pass rate |
+| **Sandbox-based validation** | Designed (§10, Phase 5) | Sandbox lifecycle + isolation guarantees | End-to-end test, zero cross-contamination |
+| **Prompt/Skill evolution** | Designed (§10, Phase 5) | Closed-loop automation (trigger → optimize → validate → deploy) | Weekly optimization runs, < 2 week cycle time |
+| **Training data pipeline** | Designed (§10, Phase 3) | Automated export + quality filtering | Monthly training dataset generation |
+| **A/B testing framework** | Not yet designed | Controlled rollout with statistical analysis | 2 A/B tests per quarter |
+
+**Key insight**: The design provides the **data model and abstractions** (conversation_events, context_snapshot, versioned configs, sandbox); the engineering work is to build the **automation and quality gates** on top of these primitives.
+
+### 11.2 Concrete Deliverables (Next 8 Weeks)
+
+**Week 1-2: Replay Gate MVP**
+- Deliverable: `mo-agent replay-gate run` command
+- Acceptance: Runs 50 golden sessions in < 15 minutes, produces pass/fail decision
+- Metrics: 6 automated metrics (success rate, output stability, latency, token efficiency, skill accuracy, error rate)
+- Validation: Manual spot-check 5 sessions, false positive rate < 5%
+
+**Week 3-4: Sandbox Validation**
+- Deliverable: `mo-agent sandbox create/load/validate/delete` commands
+- Acceptance: Sandbox creation < 30 seconds, zero production data affected
+- Isolation: Separate DB, config, metrics namespace
+- Validation: Audit query confirms no cross-contamination
+
+**Week 5-6: Evolution Automation**
+- Deliverable: `mo-agent evolution optimize-prompt` and `discover-skills` commands
+- Acceptance: Generates valid candidate, runs replay gate automatically
+- Trigger: Automated (satisfaction < 3.5, error rate > 5%) or manual
+- Validation: Finds at least 1 skill gap in test data
+
+**Week 7-8: CI/CD Integration**
+- Deliverable: GitHub Actions workflow for replay gate on PR
+- Acceptance: Gate runs in < 20 minutes, PR comment shows metrics
+- Merge protection: Blocks merge if gate fails
+- Validation: End-to-end test with real PR
+
+### 11.3 Quality Metrics & Acceptance Criteria
+
+**Operational metrics** (3 months post-deployment):
+- Replay gate adoption: 100% of prompt/skill changes
+- Gate pass rate: > 90%
+- False positive rate: < 5%
+- Sandbox usage: > 50 experiments/month
+- Evolution cycle time: < 2 weeks (trigger → production)
+
+**Quality metrics** (6 months post-deployment):
+- User satisfaction: > 4.0/5 (sustained)
+- Production error rate: < 2%
+- Prompt optimization frequency: 1-2 per month
+- New skills added: 3-5 per quarter
+
+**Business metrics**:
+- Reduced manual testing time: 80% (from 4 hours → 48 minutes per change)
+- Faster iteration: 50% reduction in time-to-production for new features
+- Increased confidence: 95% of changes deployed without rollback
+
+### 11.4 Reference Implementation
+
+See **[Replay, Sandbox, Evaluation & Evolution: Engineering Validation](replay-sandbox-evaluation-automation.md)** for complete specification including:
+- Automated replay gating with golden session selection
+- Sandbox lifecycle and isolation guarantees
+- Skill/Prompt evolution closed-loop workflow
+- A/B testing framework
+- CI/CD integration patterns
+- Risk mitigation strategies
+
+**Key difference from this document**: This document defines the **data model and design principles**; the engineering validation document defines the **automation, workflows, and acceptance tests** that prove operational completeness.
+
+### 11.5 Success Criteria for "Provably Leading"
+
+To claim **"可证明的领先"** (provable leadership), the system must demonstrate:
+
+1. **Reproducibility**: Any historical conversation can be replayed with bit-for-bit accuracy (or documented variance)
+2. **Automation**: Prompt/skill changes go through automated quality gates without manual testing
+3. **Isolation**: Experiments run in sandboxes with zero production impact
+4. **Traceability**: Every production decision can be traced to specific prompt version, skills, and context
+5. **Evolution**: Closed-loop improvement (feedback → optimization → validation → deployment) runs continuously
+
+**Validation method**: Public demo showing:
+- Replay of 6-month-old conversation with exact reproduction
+- Automated replay gate blocking a regression
+- Sandbox experiment with prompt optimization
+- A/B test results driving production deployment
+- Training dataset export from production events
+
+**Timeline**: All 5 capabilities demonstrated by **Week 12** (3 months from start).
+
+---
+
+## 12. Conclusion
+
+This design provides a **complete foundation** for event-centric, reproducible, evolvable conversation management:
+
+- **Data model**: conversation_events, sessions, versioned configs, evaluation/training tables
+- **Abstractions**: Token Budget Manager, Memory–Prompt–Context layers, causal chains
+- **Capabilities**: Replay, sandbox, evolution, training pipeline
+
+**Next step**: Implement the **engineering validation roadmap** (§11) to move from design to **provably operational** system. The combination of this design document and the [engineering validation specification](replay-sandbox-evaluation-automation.md) provides a complete path from vision to production-ready implementation.
+
+**Key insight**: The design is **intentionally minimal** to support maximum evolution; the engineering work is to build **automation and quality gates** that make the design operationally complete without requiring schema changes.
