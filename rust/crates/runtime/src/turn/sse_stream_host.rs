@@ -19,6 +19,7 @@ use crate::turn::chat_turn_sse_dispatch::{
     ChatTurnEdgePending, ChatTurnSseAccum, ChatTurnSseFramer, SseRenderEffect,
     dispatch_chat_turn_sse_event_block,
 };
+use astra_thin_client::ApprovalKind;
 use async_trait::async_trait;
 use serde_json::Value;
 
@@ -218,6 +219,8 @@ pub trait SseStreamHost: Send {
         &mut self,
         request_id: &str,
         tool: &str,
+        approval_kind: ApprovalKind,
+        session_id: Option<&str>,
         detail: Option<&str>,
     ) -> EdgeApprovalResult;
 
@@ -349,8 +352,14 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
             // Skill-exclusivity: reorder so skill calls execute before
             // non-skill calls within the same batch.
             prioritize_skill_tools(&mut pending);
-            flush_pending_via_host(&mut pending, host, &mut tool_results, &mut approval_results)
-                .await;
+            flush_pending_via_host(
+                &mut pending,
+                host,
+                accum.session_id.as_deref(),
+                &mut tool_results,
+                &mut approval_results,
+            )
+            .await;
         }
     }
 
@@ -383,7 +392,14 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
         let effects = dispatch_chat_turn_sse_event_block(&tail, &mut accum, &mut pending);
         host.on_render_effects(effects);
         prioritize_skill_tools(&mut pending);
-        flush_pending_via_host(&mut pending, host, &mut tool_results, &mut approval_results).await;
+        flush_pending_via_host(
+            &mut pending,
+            host,
+            accum.session_id.as_deref(),
+            &mut tool_results,
+            &mut approval_results,
+        )
+        .await;
     }
 
     host.on_stream_complete();
@@ -425,6 +441,7 @@ fn prioritize_skill_tools(items: &mut Vec<ChatTurnEdgePending>) {
 async fn flush_pending_via_host<H: SseStreamHost>(
     pending: &mut Vec<ChatTurnEdgePending>,
     host: &mut H,
+    session_id: Option<&str>,
     tool_results: &mut Vec<EdgeToolExecResult>,
     approval_results: &mut Vec<EdgeApprovalResult>,
 ) {
@@ -463,6 +480,7 @@ async fn flush_pending_via_host<H: SseStreamHost>(
         if let ChatTurnEdgePending::ApprovalRequired {
             request_id,
             tool,
+            approval_kind,
             detail,
         } = item
         {
@@ -470,7 +488,13 @@ async fn flush_pending_via_host<H: SseStreamHost>(
                 continue;
             }
             let result = host
-                .resolve_approval(&request_id, &tool, detail.as_deref())
+                .resolve_approval(
+                    &request_id,
+                    &tool,
+                    approval_kind,
+                    session_id,
+                    detail.as_deref(),
+                )
                 .await;
             approval_results.push(result);
         }
@@ -513,6 +537,8 @@ impl SseStreamHost for NoopSseStreamHost {
         &mut self,
         request_id: &str,
         _tool: &str,
+        _approval_kind: ApprovalKind,
+        _session_id: Option<&str>,
         _detail: Option<&str>,
     ) -> EdgeApprovalResult {
         EdgeApprovalResult {
@@ -530,6 +556,7 @@ impl SseStreamHost for NoopSseStreamHost {
 struct RecordingSseStreamHost {
     render_effects: Vec<SseRenderEffect>,
     tool_outputs: std::collections::HashMap<String, String>,
+    approval_kinds: Vec<ApprovalKind>,
     stream_completed: bool,
 }
 
@@ -539,6 +566,7 @@ impl RecordingSseStreamHost {
         Self {
             render_effects: Vec::new(),
             tool_outputs: std::collections::HashMap::new(),
+            approval_kinds: Vec::new(),
             stream_completed: false,
         }
     }
@@ -587,8 +615,11 @@ impl SseStreamHost for RecordingSseStreamHost {
         &mut self,
         request_id: &str,
         _tool: &str,
+        approval_kind: ApprovalKind,
+        _session_id: Option<&str>,
         _detail: Option<&str>,
     ) -> EdgeApprovalResult {
+        self.approval_kinds.push(approval_kind);
         EdgeApprovalResult {
             request_id: request_id.to_string(),
             decision: "allow".to_string(),
@@ -717,7 +748,7 @@ mod tests {
     async fn recording_host_approval_resolved() {
         let events = sse_event(
             "approval_required",
-            ",\"request_id\":\"ap-1\",\"tool\":\"write_file\",\"path\":\"src/x.rs\",\"detail\":\"src/x.rs\"",
+            ",\"request_id\":\"ap-1\",\"tool\":\"write_file\",\"approval_kind\":\"standard\",\"path\":\"src/x.rs\",\"detail\":\"src/x.rs\"",
         );
         let chunks = chunks_from_sse(&events);
         let mut stream = stream::iter(chunks);
@@ -733,6 +764,7 @@ mod tests {
         assert_eq!(result.approval_results.len(), 1);
         assert_eq!(result.approval_results[0].request_id, "ap-1");
         assert_eq!(result.approval_results[0].decision, "allow");
+        assert_eq!(host.approval_kinds, vec![ApprovalKind::Standard]);
     }
 
     #[tokio::test]
@@ -1269,6 +1301,8 @@ mod tests {
                 &mut self,
                 rid: &str,
                 _: &str,
+                _: ApprovalKind,
+                _: Option<&str>,
                 _: Option<&str>,
             ) -> EdgeApprovalResult {
                 EdgeApprovalResult {

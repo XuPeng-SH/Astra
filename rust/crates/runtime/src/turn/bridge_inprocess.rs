@@ -68,9 +68,11 @@ use crate::{
         CliAgenticStallPreflightRequest, apply_cli_agentic_stall_preflight,
     },
     turn::cloud_tool_delivery::{
-        cloud_tool_requires_approval_for_delivery, sse_maps_through_tool_request,
-        tool_approval_detail_for_delivery, tool_path_hint_for_delivery,
-        wait_approval_ledger_for_tool, wait_tool_result_ledger_for_tool,
+        ApprovalAuditContext, cloud_tool_requires_approval_for_delivery,
+        record_approval_required_audit, sse_maps_through_tool_request,
+        tool_approval_detail_for_delivery, tool_approval_kind_for_delivery,
+        tool_path_hint_for_delivery, wait_approval_ledger_for_tool,
+        wait_tool_result_ledger_for_tool,
     },
     turn::edge_ledger::{
         assistant_message_with_tool_calls_and_reasoning, ensure_tool_call_ids,
@@ -497,7 +499,7 @@ fn section_cache_key(tool_names: &[&str], task_type: Option<&str>, confidence: f
 ///   `dynamic` holds a second system message with the per-turn profile/hints, or `None`
 ///   if there is nothing dynamic. This split enables OpenAI's automatic prefix caching:
 ///   the stable message stays identical across turns so the provider can reuse the KV cache.
-fn build_system_message(
+pub(crate) fn build_system_message(
     tool_names: &[&str],
     profile_desc: &str,
     confidence: f64,
@@ -646,7 +648,10 @@ fn build_system_message(
 ///
 /// This matches Claude Code's strategy of prioritizing message history caching
 /// for multi-turn conversations while still caching the stable tool prefix.
-fn annotate_tool_schemas_for_caching(tools: &mut [Value], cache_cfg: &PromptCacheConfig) {
+pub(crate) fn annotate_tool_schemas_for_caching(
+    tools: &mut [Value],
+    cache_cfg: &PromptCacheConfig,
+) {
     if !cache_cfg.should_annotate() || tools.is_empty() {
         return;
     }
@@ -658,7 +663,7 @@ fn annotate_tool_schemas_for_caching(tools: &mut [Value], cache_cfg: &PromptCach
 
 /// Add a cache breakpoint on the last conversation message for Anthropic.
 /// This enables turn-to-turn KV cache reuse for the conversation prefix.
-fn add_message_cache_breakpoint(messages: &mut [Value], cache_cfg: &PromptCacheConfig) {
+pub(crate) fn add_message_cache_breakpoint(messages: &mut [Value], cache_cfg: &PromptCacheConfig) {
     if !cache_cfg.should_annotate() || messages.is_empty() {
         return;
     }
@@ -2125,9 +2130,36 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                         .unwrap_or("");
                     let path = tool_path_hint_for_delivery(tc);
                     let detail = tool_approval_detail_for_delivery(tc);
+                    let approval_kind = tool_approval_kind_for_delivery(tc);
+                    let approval_audit_context = ApprovalAuditContext {
+                        user_id: user_id.clone(),
+                        session_id: session_id.clone(),
+                        agent_id: agent_id.clone(),
+                        parent_event_id: Some(user_query_event_id.clone()),
+                        parent_event_ids: vec![user_query_event_id.clone()],
+                        causal_chain_id: turn_chain_id.clone(),
+                        auxiliary_event_writer: turn_auxiliary_event_writer.clone(),
+                    };
+                    if let Err(error) = record_approval_required_audit(
+                        &approval_audit_context,
+                        id,
+                        tool_name,
+                        approval_kind,
+                        detail.as_deref(),
+                    )
+                    .await
+                    {
+                        astra_core::agent_error!(
+                            "approval",
+                            "approval required audit persist failed for {}: {}",
+                            id,
+                            error
+                        );
+                    }
                     yield render_sse_map(&build_approval_required_event(
                         id,
                         tool_name,
+                        approval_kind,
                         path.as_deref(),
                         detail.as_deref(),
                     ));
@@ -2138,6 +2170,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                                 &user_id,
                                 tc,
                                 ledger_wait,
+                                Some(&approval_audit_context),
                             ),
                         )
                         .await

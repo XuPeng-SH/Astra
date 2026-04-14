@@ -97,6 +97,12 @@ pub struct ApprovalRespondRequest {
     pub decision: ApprovalDecision,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_kind: Option<ApprovalKind>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -105,6 +111,13 @@ pub enum ApprovalDecision {
     Allow,
     Deny,
     AllowSession,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalKind {
+    Standard,
+    Explicit,
 }
 
 /// `POST /agents/edge` — matches server `EdgeRegisterRequest` (Phase 3 registry).
@@ -273,6 +286,7 @@ pub enum StreamEvent {
     ApprovalRequired {
         request_id: String,
         tool: String,
+        approval_kind: ApprovalKind,
         path: Option<String>,
         detail: Option<String>,
         raw: Value,
@@ -445,6 +459,11 @@ pub fn classify_stream_event(value: Value) -> Result<StreamEvent, crate::error::
         "approval_required" => StreamEvent::ApprovalRequired {
             request_id: get_str(&obj, "request_id"),
             tool: get_str(&obj, "tool"),
+            approval_kind: obj
+                .get("approval_kind")
+                .cloned()
+                .and_then(|value| serde_json::from_value::<ApprovalKind>(value).ok())
+                .unwrap_or(ApprovalKind::Explicit),
             path: obj
                 .get("path")
                 .and_then(|v| v.as_str())
@@ -532,6 +551,34 @@ mod tests {
     }
 
     #[test]
+    fn approval_respond_request_roundtrip_preserves_optional_context() {
+        let req = ApprovalRespondRequest {
+            request_id: "ap-1".into(),
+            decision: ApprovalDecision::Allow,
+            reason: Some("looks good".into()),
+            session_id: Some("sess-1".into()),
+            tool_name: Some("write_file".into()),
+            approval_kind: Some(ApprovalKind::Standard),
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        let back: ApprovalRespondRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn approval_respond_request_backwards_compatible_without_optional_context() {
+        let json = serde_json::json!({
+            "request_id": "ap-legacy",
+            "decision": "deny",
+            "reason": "no"
+        });
+        let back: ApprovalRespondRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(back.session_id, None);
+        assert_eq!(back.tool_name, None);
+        assert_eq!(back.approval_kind, None);
+    }
+
+    #[test]
     fn classify_session_info() {
         let v = serde_json::json!({"type":"session_info","session_id":"a","run_id":"b"});
         match classify_stream_event(v).unwrap() {
@@ -574,6 +621,53 @@ mod tests {
                 assert_eq!(args["command"], "ls");
             }
             e => panic!("unexpected {e:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_approval_required_preserves_approval_kind() {
+        let v = serde_json::json!({
+            "type": "approval_required",
+            "request_id": "ap-1",
+            "tool": "bash",
+            "approval_kind": "explicit",
+            "detail": "rm -rf tmp"
+        });
+        match classify_stream_event(v).unwrap() {
+            StreamEvent::ApprovalRequired {
+                request_id,
+                tool,
+                approval_kind,
+                detail,
+                ..
+            } => {
+                assert_eq!(request_id, "ap-1");
+                assert_eq!(tool, "bash");
+                assert_eq!(approval_kind, ApprovalKind::Explicit);
+                assert_eq!(detail.as_deref(), Some("rm -rf tmp"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_approval_required_without_kind_defaults_to_explicit() {
+        let v = serde_json::json!({
+            "type": "approval_required",
+            "request_id": "ap-legacy",
+            "tool": "write_file",
+            "path": "src/lib.rs"
+        });
+        match classify_stream_event(v).unwrap() {
+            StreamEvent::ApprovalRequired {
+                approval_kind,
+                detail,
+                ..
+            } => {
+                assert_eq!(approval_kind, ApprovalKind::Explicit);
+                assert_eq!(detail.as_deref(), Some("src/lib.rs"));
+            }
+            other => panic!("unexpected {other:?}"),
         }
     }
 

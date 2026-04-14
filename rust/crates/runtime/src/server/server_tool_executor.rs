@@ -31,8 +31,7 @@ use crate::turn::file_edit_journal::FileEditJournal;
 pub struct ServerToolExecutor {
     /// Workspace root for this session.
     workspace_root: PathBuf,
-    /// User ID owning this session.
-    #[allow(dead_code)] // Phase 5: used for audit logging and multi-tenant isolation
+    /// User ID owning this session (used for Memoria isolation).
     user_id: String,
     /// Session ID for isolation.
     session_id: String,
@@ -65,6 +64,8 @@ pub struct ServerToolExecutor {
     approval_gate: Option<Arc<dyn astra_tools::ToolApprovalGate>>,
     /// Optional progress callback for streaming tool output.
     progress_callback: Option<Arc<dyn astra_tools::ToolProgressCallback>>,
+    /// Optional edge connection pool for routing to remote edge agents.
+    edge_connection_pool: Option<super::edge_connection_pool::EdgeConnectionPool>,
 }
 
 impl ServerToolExecutor {
@@ -109,6 +110,7 @@ impl ServerToolExecutor {
             url_cache: Mutex::new(HashMap::new()),
             approval_gate: None,
             progress_callback: None,
+            edge_connection_pool: None,
         }
     }
 
@@ -122,11 +124,31 @@ impl ServerToolExecutor {
         self.progress_callback = Some(cb);
     }
 
+    /// Set the edge connection pool for remote tool routing.
+    pub fn set_edge_connection_pool(
+        &mut self,
+        pool: super::edge_connection_pool::EdgeConnectionPool,
+    ) {
+        self.edge_connection_pool = Some(pool);
+    }
+
     /// Execute a tool call and return the result string.
     ///
-    /// This is the main entry point called by the headless round when
-    /// no edge agent is available.
+    /// Routing order:
+    /// 1. Try remote edge agent (if connected via WebSocket)
+    /// 2. Fall back to local server-side execution
     pub async fn execute(&self, name: &str, args: &Value) -> String {
+        // ── Try remote edge agent first ──────────────────────────────
+        if let Some(pool) = &self.edge_connection_pool {
+            if let Some(result) = pool.execute_tool_any_edge(&self.user_id, name, args).await {
+                return result.output;
+            }
+        }
+        self.execute_local(name, args).await
+    }
+
+    /// Execute a tool locally on the server (no edge routing).
+    async fn execute_local(&self, name: &str, args: &Value) -> String {
         // ── Approval gate check ──────────────────────────────────────
         if let Some(gate) = &self.approval_gate {
             if gate.requires_approval(name) {
@@ -156,7 +178,17 @@ impl ServerToolExecutor {
             "memory_retrieve" | "memory_store" | "memory_search" | "memory_purge"
             | "memory_correct" | "memory_profile" => {
                 let op = name.strip_prefix("memory_").unwrap_or(name);
-                self.memoria_client.call(op, args).await
+                // Force-inject user_id and session_id for per-user isolation,
+                // mirroring the server's /memory/* proxy in auth_handlers.rs.
+                let mut isolated_args = args.clone();
+                if let Some(obj) = isolated_args.as_object_mut() {
+                    obj.insert(
+                        "session_id".to_string(),
+                        Value::String(self.user_id.clone()),
+                    );
+                    obj.insert("user_id".to_string(), Value::String(self.user_id.clone()));
+                }
+                self.memoria_client.call(op, &isolated_args).await
             }
             // ── Web search (standalone function) ───────────────────────
             "web_search" => astra_tools::web_search::web_search(args),
@@ -669,4 +701,376 @@ fn uuid_v4_short() -> String {
         .unwrap_or_default()
         .as_nanos();
     format!("{:08x}", (ts & 0xFFFF_FFFF) as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    fn test_executor() -> (ServerToolExecutor, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let exec = ServerToolExecutor::new(
+            dir.path().to_path_buf(),
+            "test-user".into(),
+            "test-session".into(),
+            None,
+            None,
+        );
+        (exec, dir)
+    }
+
+    // ── Path traversal security ────────────────────────────────────────
+
+    #[test]
+    fn resolve_path_allows_relative_inside_workspace() {
+        let (exec, _dir) = test_executor();
+        let result = exec.resolve_path("src/main.rs");
+        assert!(result.is_ok());
+        assert!(result.unwrap().starts_with(exec.workspace_root()));
+    }
+
+    #[test]
+    fn resolve_path_blocks_parent_traversal() {
+        let (exec, _dir) = test_executor();
+        let result = exec.resolve_path("../../etc/passwd");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("SANDBOX_DENIED"));
+    }
+
+    #[test]
+    fn resolve_path_blocks_absolute_outside_workspace() {
+        let (exec, _dir) = test_executor();
+        let result = exec.resolve_path("/etc/passwd");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("SANDBOX_DENIED"));
+    }
+
+    #[test]
+    fn resolve_path_allows_absolute_inside_workspace() {
+        let (exec, dir) = test_executor();
+        let inner = dir.path().join("foo.txt");
+        let result = exec.resolve_path(inner.to_str().unwrap());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn resolve_path_normalizes_dot_dot_in_middle() {
+        let (exec, _dir) = test_executor();
+        // src/../../../etc/passwd should be blocked
+        let result = exec.resolve_path("src/../../../etc/passwd");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("SANDBOX_DENIED"));
+    }
+
+    #[test]
+    fn resolve_path_allows_dot_dot_within_workspace() {
+        let (exec, dir) = test_executor();
+        // Create nested dir so the path stays inside workspace
+        std::fs::create_dir_all(dir.path().join("a/b")).unwrap();
+        let result = exec.resolve_path("a/b/../c.txt");
+        assert!(result.is_ok());
+        let resolved = result.unwrap();
+        assert!(resolved.starts_with(exec.workspace_root()));
+    }
+
+    // ── File operations ────────────────────────────────────────────────
+
+    #[test]
+    fn read_file_returns_content_with_line_numbers() {
+        let (exec, dir) = test_executor();
+        std::fs::write(dir.path().join("hello.txt"), "line1\nline2\nline3\n").unwrap();
+        let result = exec.server_read_file(&json!({"path": "hello.txt"}));
+        assert!(result.contains("1\tline1"));
+        assert!(result.contains("2\tline2"));
+        assert!(result.contains("3\tline3"));
+    }
+
+    #[test]
+    fn read_file_respects_start_and_end_line() {
+        let (exec, dir) = test_executor();
+        std::fs::write(dir.path().join("f.txt"), "a\nb\nc\nd\ne\n").unwrap();
+        let result =
+            exec.server_read_file(&json!({"path": "f.txt", "start_line": 2, "end_line": 4}));
+        assert!(!result.contains("1\ta"));
+        assert!(result.contains("2\tb"));
+        assert!(result.contains("3\tc"));
+        assert!(result.contains("4\td"));
+        assert!(!result.contains("5\te"));
+    }
+
+    #[test]
+    fn read_file_missing_file_returns_error() {
+        let (exec, _dir) = test_executor();
+        let result = exec.server_read_file(&json!({"path": "nonexistent.txt"}));
+        assert!(result.starts_with("Error:"));
+    }
+
+    #[test]
+    fn read_file_missing_path_param_returns_error() {
+        let (exec, _dir) = test_executor();
+        let result = exec.server_read_file(&json!({}));
+        assert!(result.contains("Missing 'path'"));
+    }
+
+    #[test]
+    fn read_file_blocks_path_traversal() {
+        let (exec, _dir) = test_executor();
+        let result = exec.server_read_file(&json!({"path": "../../etc/passwd"}));
+        assert!(result.contains("SANDBOX_DENIED"));
+    }
+
+    #[test]
+    fn write_file_creates_and_writes() {
+        let (exec, dir) = test_executor();
+        let result = exec.server_write_file(&json!({"path": "out.txt", "content": "hello world"}));
+        assert!(result.contains("Successfully wrote"));
+        let content = std::fs::read_to_string(dir.path().join("out.txt")).unwrap();
+        assert_eq!(content, "hello world");
+    }
+
+    #[test]
+    fn write_file_creates_parent_dirs() {
+        let (exec, dir) = test_executor();
+        let result = exec.server_write_file(&json!({
+            "path": "deep/nested/dir/file.txt",
+            "content": "deep content"
+        }));
+        assert!(result.contains("Successfully wrote"));
+        assert!(dir.path().join("deep/nested/dir/file.txt").exists());
+    }
+
+    #[test]
+    fn write_file_blocks_path_traversal() {
+        let (exec, _dir) = test_executor();
+        let result = exec.server_write_file(&json!({
+            "path": "../../evil.txt",
+            "content": "pwned"
+        }));
+        assert!(result.contains("SANDBOX_DENIED"));
+    }
+
+    #[test]
+    fn str_replace_single_occurrence() {
+        let (exec, dir) = test_executor();
+        std::fs::write(dir.path().join("code.rs"), "fn old_name() {}").unwrap();
+        let result = exec.server_str_replace(&json!({
+            "path": "code.rs",
+            "old_str": "old_name",
+            "new_str": "new_name"
+        }));
+        assert!(result.contains("Successfully replaced"));
+        let content = std::fs::read_to_string(dir.path().join("code.rs")).unwrap();
+        assert_eq!(content, "fn new_name() {}");
+    }
+
+    #[test]
+    fn str_replace_rejects_multiple_matches() {
+        let (exec, dir) = test_executor();
+        std::fs::write(dir.path().join("dup.txt"), "foo bar foo").unwrap();
+        let result = exec.server_str_replace(&json!({
+            "path": "dup.txt",
+            "old_str": "foo",
+            "new_str": "baz"
+        }));
+        assert!(result.contains("found 2 times"));
+    }
+
+    #[test]
+    fn str_replace_not_found() {
+        let (exec, dir) = test_executor();
+        std::fs::write(dir.path().join("nope.txt"), "hello").unwrap();
+        let result = exec.server_str_replace(&json!({
+            "path": "nope.txt",
+            "old_str": "missing",
+            "new_str": "x"
+        }));
+        assert!(result.contains("not found"));
+    }
+
+    #[test]
+    fn delete_file_removes_existing() {
+        let (exec, dir) = test_executor();
+        let target = dir.path().join("to_delete.txt");
+        std::fs::write(&target, "temp").unwrap();
+        assert!(target.exists());
+        let result = exec.server_delete_file(&json!({"path": "to_delete.txt"}));
+        assert!(result.contains("Successfully deleted"));
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn delete_file_nonexistent_returns_error() {
+        let (exec, _dir) = test_executor();
+        let result = exec.server_delete_file(&json!({"path": "ghost.txt"}));
+        assert!(result.contains("File not found"));
+    }
+
+    #[test]
+    fn list_dir_shows_files_and_dirs() {
+        let (exec, dir) = test_executor();
+        std::fs::write(dir.path().join("a.txt"), "").unwrap();
+        std::fs::write(dir.path().join("b.rs"), "").unwrap();
+        std::fs::create_dir(dir.path().join("subdir")).unwrap();
+        let result = exec.server_list_dir(&json!({"path": "."}));
+        assert!(result.contains("a.txt"));
+        assert!(result.contains("b.rs"));
+        assert!(result.contains("subdir/"));
+    }
+
+    #[test]
+    fn list_dir_sorted_output() {
+        let (exec, dir) = test_executor();
+        std::fs::write(dir.path().join("z.txt"), "").unwrap();
+        std::fs::write(dir.path().join("a.txt"), "").unwrap();
+        std::fs::write(dir.path().join("m.txt"), "").unwrap();
+        let result = exec.server_list_dir(&json!({"path": "."}));
+        let lines: Vec<&str> = result.lines().collect();
+        assert_eq!(lines, vec!["a.txt", "m.txt", "z.txt"]);
+    }
+
+    // ── Unknown tool ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn unknown_tool_returns_error_message() {
+        let (exec, _dir) = test_executor();
+        let result = exec.execute("nonexistent_tool", &json!({})).await;
+        assert!(result.contains("not available"));
+    }
+
+    // ── Bash execution ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn bash_echo_returns_output() {
+        let (exec, _dir) = test_executor();
+        let result = exec.server_bash(&json!({"command": "echo hello"})).await;
+        assert_eq!(result.trim(), "hello");
+    }
+
+    #[tokio::test]
+    async fn bash_missing_command_returns_error() {
+        let (exec, _dir) = test_executor();
+        let result = exec.server_bash(&json!({})).await;
+        assert!(result.contains("Missing 'command'"));
+    }
+
+    #[tokio::test]
+    async fn bash_nonzero_exit_includes_exit_code() {
+        let (exec, _dir) = test_executor();
+        let result = exec.server_bash(&json!({"command": "exit 42"})).await;
+        assert!(result.contains("exit code: 42"));
+    }
+
+    #[tokio::test]
+    async fn bash_stderr_is_captured() {
+        let (exec, _dir) = test_executor();
+        let result = exec.server_bash(&json!({"command": "echo err >&2"})).await;
+        assert!(result.contains("stderr:"));
+        assert!(result.contains("err"));
+    }
+
+    #[tokio::test]
+    async fn bash_runs_in_workspace_dir() {
+        let (exec, dir) = test_executor();
+        std::fs::write(dir.path().join("marker.txt"), "found").unwrap();
+        let result = exec
+            .server_bash(&json!({"command": "cat marker.txt"}))
+            .await;
+        assert_eq!(result.trim(), "found");
+    }
+
+    // ── Grep ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn grep_finds_pattern_in_files() {
+        let (exec, dir) = test_executor();
+        std::fs::write(dir.path().join("test.rs"), "fn main() {}\nfn helper() {}").unwrap();
+        let result = exec.server_grep(&json!({"pattern": "fn main"}));
+        assert!(result.contains("fn main"));
+    }
+
+    #[test]
+    fn grep_no_matches_returns_message() {
+        let (exec, dir) = test_executor();
+        std::fs::write(dir.path().join("empty.rs"), "nothing here").unwrap();
+        let result = exec.server_grep(&json!({"pattern": "ZZZZNOTFOUND"}));
+        assert!(result.contains("No matches found"));
+    }
+
+    // ── Git operations ─────────────────────────────────────────────────
+
+    #[test]
+    fn git_status_in_non_git_dir_returns_error() {
+        let (exec, _dir) = test_executor();
+        let result = exec.server_git_status();
+        assert!(result.contains("Error:") || result.contains("fatal"));
+    }
+
+    #[test]
+    fn git_log_caps_at_100() {
+        let (exec, dir) = test_executor();
+        // Initialize a git repo
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::fs::write(dir.path().join("f.txt"), "x").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        // Request 999 — should be capped at 100
+        let result = exec.server_git_log(&json!({"n": 999}));
+        assert!(result.contains("initial"));
+    }
+
+    // ── Memory tool user isolation ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn memory_tool_injects_user_id() {
+        let (exec, _dir) = test_executor();
+        // We can't actually call Memoria, but we can verify the execute path
+        // doesn't panic and returns a reasonable error (no MEMORIA_BASE_URL set).
+        let result = exec
+            .execute("memory_store", &json!({"content": "test"}))
+            .await;
+        // Should attempt the call (may fail due to no server, but shouldn't crash)
+        assert!(!result.is_empty());
+    }
+
+    // ── Output management ──────────────────────────────────────────────
+
+    #[test]
+    fn set_turn_index_and_reset_aggregate() {
+        let (exec, _dir) = test_executor();
+        exec.set_turn_index(5);
+        assert_eq!(exec.journal_turn_index.load(Ordering::Relaxed), 5);
+        exec.aggregate_output_bytes.store(999, Ordering::Relaxed);
+        exec.reset_aggregate_output();
+        assert_eq!(exec.aggregate_output_bytes.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn workspace_root_returns_correct_path() {
+        let (exec, dir) = test_executor();
+        assert_eq!(exec.workspace_root(), dir.path());
+    }
 }

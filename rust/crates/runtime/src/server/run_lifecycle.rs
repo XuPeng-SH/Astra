@@ -56,8 +56,7 @@ use super::server_loop_host::ServerAgenticLoopHostBuilder;
 /// Build skill registry + resolver for server-side agentic loops.
 ///
 /// Returns `(registry_for_activation, resolver)` using the global default
-/// registry (Local + Bundled providers). Fork-context skills require a
-/// `skill_executor` which is CLI-only; the server gets inline resolution only.
+/// registry (Local + Bundled providers).
 fn build_server_skill_resolver() -> (
     Option<Arc<crate::skills::UnifiedSkillRegistry>>,
     Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
@@ -79,6 +78,37 @@ fn build_server_skill_resolver() -> (
         Some(Arc::new(adapter))
     };
     (Some(registry), resolver)
+}
+
+/// Build a server-side skill executor that supports both Inline and Fork
+/// execution contexts via [`SkillExecutionRouter`].
+fn build_server_skill_executor(
+    matrixone: &MatrixOneSettings,
+    encryptor: &Arc<FernetTokenEncryptor>,
+    shared_pool: Option<&SharedPool>,
+    model_override: Option<&str>,
+    edge_tools: &[Value],
+    edge_profile: &Map<String, Value>,
+    skill_resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
+    session_id: &str,
+) -> Option<Arc<dyn crate::skills::traits::SkillExecutor>> {
+    use super::server_skill_subrun::ServerSkillSubRunExecutor;
+    use crate::skills::executor::isolated::{IsolatedSkillExecutor, SkillExecutionRouter};
+
+    let subrun_executor = ServerSkillSubRunExecutor::new(
+        matrixone.clone(),
+        Arc::clone(encryptor),
+        session_id.to_string(),
+    )
+    .with_pool(shared_pool.cloned())
+    .with_default_model(model_override.map(String::from))
+    .with_edge_tools(edge_tools.to_vec())
+    .with_edge_profile(edge_profile.clone())
+    .with_skill_resolver(skill_resolver);
+
+    let isolated = Arc::new(IsolatedSkillExecutor::new(Arc::new(subrun_executor)));
+    let router = SkillExecutionRouter::new(Some(isolated));
+    Some(Arc::new(router))
 }
 
 fn skill_search_from_context(
@@ -396,6 +426,8 @@ pub struct AgenticRunLifecycleService {
     run_engine: Option<RunEngine>,
     /// Optional delegation engine for multi-agent coordination.
     delegation_engine: Option<Arc<crate::server::delegation_engine::DelegationEngine>>,
+    /// Live edge WebSocket connection pool (Phase 6).
+    edge_connection_pool: Option<super::edge_connection_pool::EdgeConnectionPool>,
 }
 
 impl AgenticRunLifecycleService {
@@ -412,6 +444,7 @@ impl AgenticRunLifecycleService {
             edge_callback_ledger,
             run_engine: None,
             delegation_engine: None,
+            edge_connection_pool: None,
         }
     }
 
@@ -430,6 +463,14 @@ impl AgenticRunLifecycleService {
         engine: Arc<crate::server::delegation_engine::DelegationEngine>,
     ) -> Self {
         self.delegation_engine = Some(engine);
+        self
+    }
+
+    pub fn with_edge_connection_pool(
+        mut self,
+        pool: super::edge_connection_pool::EdgeConnectionPool,
+    ) -> Self {
+        self.edge_connection_pool = Some(pool);
         self
     }
 
@@ -624,11 +665,16 @@ impl AgenticRunLifecycleService {
     }
 
     /// Build the initial [`AgenticLoopState`] from a chat request.
+    ///
+    /// `workspace_override` — when the server provisions a workspace (web-agent
+    /// mode, no CLI edge), pass it here so stop hooks and skill hooks are loaded
+    /// from the provisioned directory instead of requiring `edge_profile.cwd`.
     fn build_initial_state(
         &self,
         request: &ChatRequestData,
         session_id: &str,
         run_id: &str,
+        workspace_override: Option<&std::path::Path>,
     ) -> AgenticLoopState {
         use crate::pipeline::step_protocol::InMemoryIdempotencyCache;
         use crate::semantic_dedup::SemanticDedup;
@@ -648,7 +694,10 @@ impl AgenticRunLifecycleService {
         let max_turns = request.max_candidates.max(1) as usize;
         let task_profile = infer_task_execution_profile(&request.message);
         let edge_ctx = Self::extract_edge_context(request);
-        let project_root_buf = project_root_for_stop_hooks(&edge_ctx);
+        // Use edge profile's git_root/cwd if available; fall back to provisioned
+        // server workspace so web-agent sessions still load stop-hooks.yaml.
+        let project_root_buf = project_root_for_stop_hooks(&edge_ctx)
+            .or_else(|| workspace_override.map(|p| p.to_path_buf()));
         let hook_sets = project_root_buf
             .as_ref()
             .map(|root| {
@@ -665,6 +714,21 @@ impl AgenticRunLifecycleService {
             .as_ref()
             .map(|root| crate::skills::hooks::load_all_hooks(std::path::Path::new(root)))
             .unwrap_or_default();
+
+        // Build the server-side skill fork executor so skills with
+        // execution_context: Fork can run in isolated sub-agent loops.
+        let edge_tools = Self::extract_edge_tools(request);
+        let edge_profile = Self::extract_edge_profile(request);
+        let skill_executor = build_server_skill_executor(
+            &self.matrixone,
+            &self.encryptor,
+            self.shared_pool.as_ref(),
+            request.model.as_deref(),
+            &edge_tools,
+            &edge_profile,
+            skill_resolver.clone(),
+            session_id,
+        );
 
         AgenticLoopState {
             messages: vec![user_message],
@@ -699,6 +763,7 @@ impl AgenticRunLifecycleService {
             skills: SkillState {
                 registry_for_activation: skill_registry,
                 resolver: skill_resolver,
+                executor: skill_executor,
                 quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
                 improvement_tracker: crate::skills::improvement::ImprovementTracker::new(),
                 search: skill_search,
@@ -913,8 +978,18 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // Spawn background agentic loop.
         let edge_tools = Self::extract_edge_tools(&request);
         let edge_profile = Self::extract_edge_profile(&request);
+
+        // Provision workspace early so build_initial_state can load stop hooks
+        // from the provisioned directory when no edge profile supplies cwd.
+        let server_workspace = if edge_tools.is_empty() {
+            Some(self.provision_server_workspace(&session_id))
+        } else {
+            None
+        };
+
         let mut host = self.build_host(&user_id, &session_id, &request, edge_tools, edge_profile);
-        let mut loop_state = self.build_initial_state(&request, &session_id, &run_id);
+        let mut loop_state =
+            self.build_initial_state(&request, &session_id, &run_id, server_workspace.as_deref());
         self.configure_loop_state_runtime_controls(
             &mut loop_state,
             &cancel_flag,
@@ -931,18 +1006,20 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         .await;
 
         // ── Server-side tool execution (web-only mode) ─────────────────
-        // When no edge tools are provided (no CLI connected), provision a
-        // ServerToolExecutor so tools execute directly on the server.
-        if host.edge_tools_empty() {
-            let workspace = self.provision_server_workspace(&session_id);
+        // When no edge tools are provided (no CLI connected), use the
+        // already-provisioned workspace for the ServerToolExecutor.
+        if let Some(workspace) = server_workspace {
             let memoria_base = std::env::var("MEMORIA_BASE_URL").ok();
-            let executor = super::server_tool_executor::ServerToolExecutor::new(
+            let mut executor = super::server_tool_executor::ServerToolExecutor::new(
                 workspace,
                 user_id.clone(),
                 session_id.clone(),
                 memoria_base,
                 None,
             );
+            if let Some(pool) = &self.edge_connection_pool {
+                executor.set_edge_connection_pool(pool.clone());
+            }
             loop_state.server_tool_executor = Some(std::sync::Arc::new(executor));
         }
 
@@ -1065,10 +1142,19 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let edge_tools = Self::extract_edge_tools(&request);
         let edge_profile = Self::extract_edge_profile(&request);
 
+        // Provision workspace early for web-agent mode (no edge tools) so
+        // build_initial_state loads stop hooks from the provisioned directory.
+        let server_workspace = if edge_tools.is_empty() {
+            Some(self.provision_server_workspace(&session_id))
+        } else {
+            None
+        };
+
         // If no edge tools are provided, return a minimal "no tools" response.
         // The client (CLI thin-client) is expected to provide edge_tools in context.
         let mut host = self.build_host(&user_id, &session_id, &request, edge_tools, edge_profile);
-        let mut state = self.build_initial_state(&request, &session_id, &run_id);
+        let mut state =
+            self.build_initial_state(&request, &session_id, &run_id, server_workspace.as_deref());
         let (run_state, cancel_flag, pause_flag, llm_cancel_token) =
             Self::build_tracked_run_state(run_id.clone(), session_id.clone(), user_id.clone());
         self.runs.write().await.insert(run_id.clone(), run_state);
@@ -1818,7 +1904,7 @@ mod tests {
     fn seed_restricted_tools_from_blocked_patterns_adds_blocked_tools() {
         let svc = test_service();
         let request = test_request("inspect blocked tools");
-        let mut state = svc.build_initial_state(&request, "session-1", "run-1");
+        let mut state = svc.build_initial_state(&request, "session-1", "run-1", None);
         let mut pattern_library = crate::pipeline::pattern::PatternLibrary::new();
 
         for _ in 0..3 {
@@ -1843,7 +1929,7 @@ mod tests {
     fn finalize_run_events_appends_run_finished_for_failures() {
         let svc = test_service();
         let request = test_request("boom");
-        let state = svc.build_initial_state(&request, "session-1", "run-1");
+        let state = svc.build_initial_state(&request, "session-1", "run-1", None);
 
         let (events, status, error) = AgenticRunLifecycleService::finalize_run_events(
             Ok(AgenticLoopOutcome::Error("boom".into())),
@@ -1862,7 +1948,7 @@ mod tests {
     fn finalize_run_events_cancellation_beats_completed_outcome() {
         let svc = test_service();
         let request = test_request("done");
-        let mut state = svc.build_initial_state(&request, "session-1", "run-1");
+        let mut state = svc.build_initial_state(&request, "session-1", "run-1", None);
         let cancel_flag = Arc::new(AtomicBool::new(true));
         let cancel_token = Arc::new(CancellationToken::new());
         cancel_token.cancel();
@@ -2224,7 +2310,7 @@ mod tests {
     fn build_initial_state_sets_user_message() {
         let svc = test_service();
         let req = test_request("write a test");
-        let state = svc.build_initial_state(&req, "sess-1", "run-1");
+        let state = svc.build_initial_state(&req, "sess-1", "run-1", None);
         assert_eq!(state.messages.len(), 1);
         assert_eq!(state.messages[0]["role"], "user");
         assert_eq!(state.messages[0]["content"], "write a test");
@@ -2241,7 +2327,7 @@ mod tests {
         let svc = test_service();
         let mut req = test_request("go");
         req.max_candidates = 0;
-        let state = svc.build_initial_state(&req, "s", "r");
+        let state = svc.build_initial_state(&req, "s", "r", None);
         assert_eq!(state.max_turns, 1);
     }
 
@@ -2267,12 +2353,77 @@ mod tests {
             .clone(),
         );
 
-        let state = svc.build_initial_state(&req, "s", "r");
+        let state = svc.build_initial_state(&req, "s", "r", None);
         assert_eq!(state.hooks.stop_hooks.len(), 1);
         assert_eq!(state.hooks.stop_hooks[0].label, "cloud_hook");
         assert_eq!(
             state.hooks.workspace_root_hint.as_deref(),
             Some(dir.path().to_str().unwrap())
+        );
+    }
+
+    #[test]
+    fn build_initial_state_uses_workspace_override_when_no_edge_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let mo = dir.path().join(".astra");
+        std::fs::create_dir_all(&mo).unwrap();
+        std::fs::write(
+            mo.join("stop-hooks.yaml"),
+            "version: 1\nauto_detect: false\nhooks:\n  - label: server_hook\n    command: echo ok\n",
+        )
+        .unwrap();
+
+        let svc = test_service();
+        // Request with NO edge_profile.cwd — simulates web-agent mode.
+        let req = test_request("fix a bug");
+        let state = svc.build_initial_state(&req, "s", "r", Some(dir.path()));
+        assert_eq!(state.hooks.stop_hooks.len(), 1);
+        assert_eq!(state.hooks.stop_hooks[0].label, "server_hook");
+        assert_eq!(
+            state.hooks.workspace_root_hint.as_deref(),
+            Some(dir.path().to_str().unwrap())
+        );
+    }
+
+    #[test]
+    fn build_initial_state_edge_cwd_takes_priority_over_workspace_override() {
+        // Edge profile with cwd set — workspace_override should be ignored.
+        let edge_dir = tempfile::tempdir().unwrap();
+        let mo = edge_dir.path().join(".astra");
+        std::fs::create_dir_all(&mo).unwrap();
+        std::fs::write(
+            mo.join("stop-hooks.yaml"),
+            "version: 1\nauto_detect: false\nhooks:\n  - label: edge_hook\n    command: true\n",
+        )
+        .unwrap();
+
+        let override_dir = tempfile::tempdir().unwrap();
+        let mo2 = override_dir.path().join(".astra");
+        std::fs::create_dir_all(&mo2).unwrap();
+        std::fs::write(
+            mo2.join("stop-hooks.yaml"),
+            "version: 1\nauto_detect: false\nhooks:\n  - label: override_hook\n    command: true\n",
+        )
+        .unwrap();
+
+        let svc = test_service();
+        let mut req = test_request("deploy");
+        req.context = Some(
+            serde_json::json!({
+                "edge_profile": { "cwd": edge_dir.path().to_str().unwrap() }
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        );
+
+        let state = svc.build_initial_state(&req, "s", "r", Some(override_dir.path()));
+        // Edge profile's cwd wins over the workspace override.
+        assert_eq!(state.hooks.stop_hooks.len(), 1);
+        assert_eq!(state.hooks.stop_hooks[0].label, "edge_hook");
+        assert_eq!(
+            state.hooks.workspace_root_hint.as_deref(),
+            Some(edge_dir.path().to_str().unwrap())
         );
     }
 
