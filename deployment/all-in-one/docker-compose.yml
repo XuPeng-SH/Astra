@@ -1,0 +1,91 @@
+# astra-engine -- All-in-One Docker Compose
+#
+# Default profile: infrastructure only (MatrixOne)
+# App profile: adds init + api
+
+services:
+  matrixone:
+    image: ${MATRIXONE_IMAGE:-matrixorigin/matrixone:latest}
+    hostname: matrixone
+    entrypoint: /entrypoint.sh
+    command: []
+    ports:
+      - "${MATRIXONE_PORT:-6001}:6001"
+      - "${MATRIXONE_DEBUG_HTTP_PORT:-6060}:6060"
+    volumes:
+      - ${MATRIXONE_DATA_DIR:-./data/matrixone}:/mo-data
+      - ${MATRIXONE_LOG_DIR:-./data/matrixone/logs}:/mo-logs
+      - ./matrixone-entrypoint.sh:/entrypoint.sh:ro
+    environment:
+      - TZ=Asia/Shanghai
+    user: "${UID:-1000}:${GID:-1000}"
+    networks:
+      - mo-net
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:6060/debug/vars"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  init:
+    build:
+      context: ../..
+    profiles:
+      - app
+    command: ["astra-admin", "init"]
+    environment:
+      - MATRIXONE_HOST=matrixone
+      - MATRIXONE_PORT=6001
+    env_file:
+      - path: ../../.env
+        required: true
+    depends_on:
+      matrixone:
+        condition: service_healthy
+    networks:
+      - mo-net
+    restart: "no"
+
+  api:
+    build:
+      context: ../..
+    hostname: api
+    profiles:
+      - app
+    command: ["astra-server"]
+    ports:
+      - "${API_PORT:-8000}:8000"
+    environment:
+      - RUST_API_ADDR=0.0.0.0:8000
+      - ENVIRONMENT=${ENVIRONMENT:-production}
+      - MATRIXONE_HOST=matrixone
+      - MATRIXONE_PORT=6001
+      - MATRIXONE_DATABASE=${MATRIXONE_DATABASE:-astra_runtime}
+      - MATRIXONE_DATABASE_PREFIX=${MATRIXONE_DATABASE_PREFIX:-}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:-}
+      - TOKEN_ENCRYPTION_KEY=${TOKEN_ENCRYPTION_KEY:-}
+    env_file:
+      - path: ../../.env
+        required: true
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    networks:
+      - mo-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+
+networks:
+  mo-net:
+    driver: bridge

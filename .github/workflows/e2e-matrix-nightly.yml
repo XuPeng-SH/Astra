@@ -1,0 +1,76 @@
+# Optional: full ignored Matrix system E2E (`system_matrix_http_e2e`).
+# See `docs/testing/system-e2e-matrix.md` for env ↔ test mapping.
+name: E2E Matrix (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_name_filter:
+        description: "Optional `cargo test` name filter (substring). Empty = run all ignored tests."
+        required: false
+        default: ""
+
+jobs:
+  system-matrix-e2e:
+    runs-on: ubuntu-latest
+
+    env:
+      MATRIXONE_HOST: localhost
+      MATRIXONE_PORT: "6001"
+      MATRIXONE_USER: root
+      MATRIXONE_PASSWORD: "111"
+      MATRIXONE_DATABASE: astra_runtime
+      MATRIXONE_AUTO_CREATE_DATABASE: "1"
+      JWT_SECRET_KEY: ci-jwt-secret-key-at-least-32-chars-long
+      SECRET_KEY: ci-app-secret-key-at-least-32-chars-long
+      TOKEN_ENCRYPTION_KEY: ci-token-encryption-key-at-least-32-chars
+      ASTRA_BRIDGE_TEST_SECRET: system-matrix-e2e-secret
+      CHAT_TURN_BRIDGE_SECRET: dev-bridge-secret-change-me
+      MEMORIA_BASE_URL: http://localhost:8100
+      MEMORIA_MASTER_KEY: ci-test-master-key
+      MEMORIA_EMBEDDING_PROVIDER: mock
+      MEMORIA_EMBEDDING_DIM: "384"
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare dependency env
+        run: |
+          cp .env.example .env
+          {
+            echo "MEMORIA_MASTER_KEY=${MEMORIA_MASTER_KEY}"
+            echo "MEMORIA_EMBEDDING_PROVIDER=${MEMORIA_EMBEDDING_PROVIDER}"
+            echo "MEMORIA_EMBEDDING_DIM=${MEMORIA_EMBEDDING_DIM}"
+          } >> .env
+      - name: Start dependencies
+        run: make dev-deps-up
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          shared-key: ci-online
+          save-if: false
+      - name: Wait for dependencies
+        run: make dev-deps-wait
+
+      - name: Run system Matrix HTTP E2E (ignored tests)
+        env:
+          ASTRA_SYSTEM_MATRIX_E2E: "1"
+          TEST_NAME_FILTER: ${{ github.event.inputs.test_name_filter || '' }}
+        run: |
+          set -euo pipefail
+          FILTER="${TEST_NAME_FILTER:-}"
+          if [ -n "$FILTER" ]; then
+            cargo test --manifest-path rust/Cargo.toml -p astra-runtime --test system_matrix_http_e2e \
+              --features bridge-e2e-hooks -- "$FILTER" --ignored --nocapture
+          else
+            cargo test --manifest-path rust/Cargo.toml -p astra-runtime --test system_matrix_http_e2e \
+              --features bridge-e2e-hooks -- --ignored --nocapture
+          fi
+
+      - name: Dump dependency logs
+        if: failure()
+        run: make dev-deps-logs-once
+
+      - name: Stop dependencies
+        if: always()
+        run: make dev-deps-down

@@ -1,168 +1,562 @@
-# mo-dev-agent Makefile
-# Inspired by MatrixOne's development workflow
+# astra-engine Makefile
 
 .PHONY: help
 help:
-	@echo "mo-dev-agent Development Commands"
+	@echo "astra-engine Development Commands"
 	@echo "=================================="
 	@echo ""
-	@echo "Environment Setup:"
-	@echo "  make setup              - Initial project setup (copy .env, install deps)"
-	@echo "  make install            - Install Python dependencies"
-	@echo "  make lock               - Update dependency lock file (poetry.lock)"
+	@echo "Quick Start:"
+	@echo "  make dev-start          - Start all (deps + API server)"
+	@echo "  make dev-stop           - Stop all services"
+	@echo "  make dev-status         - Show all service status"
+	@echo "  make dev-init           - Initialize development environment"
 	@echo ""
-	@echo "Development Environment:"
-	@echo "  make dev-up             - Start MatrixOne + Redis"
-	@echo "  make dev-down           - Stop all services"
-	@echo "  make dev-restart        - Restart all services"
-	@echo "  make dev-logs           - Show all logs (tail -f)"
-	@echo "  make dev-logs-db        - Show MatrixOne logs"
-	@echo "  make dev-ps             - Show service status"
-	@echo "  make dev-clean          - Stop and remove all data (WARNING: destructive!)"
+	@echo "Dependencies (MatrixOne + Memoria):"
+	@echo "  make dev-deps-up        - Start MatrixOne + Memoria"
+	@echo "  make dev-deps-down      - Stop dependency services"
+	@echo "  make dev-deps-clean     - Stop and remove all data (destructive!)"
+	@echo "  make dev-deps-status    - Show dependency status"
+	@echo "  make dev-deps-logs      - Show dependency logs"
+	@echo "  make dev-db-connect     - Connect to MatrixOne CLI"
 	@echo ""
-	@echo "Database:"
-	@echo "  make db-init            - Initialize database schema"
-	@echo "  make db-init-agent      - Initialize agent configuration system (RBAC + tables)"
-	@echo "  make db-connect         - Connect to MatrixOne CLI"
-	@echo "  make db-reset           - Reset database (drop + recreate)"
+	@echo "API Server:"
+	@echo "  make dev-api-start      - Start API server"
+	@echo "  make dev-api-stop       - Stop API server"
+	@echo "  make dev-api-restart    - Restart API server"
+	@echo "  make dev-api-logs       - Show API server logs"
+	@echo "  make dev-api-status     - Show API server status"
 	@echo ""
 	@echo "Testing:"
-	@echo "  make test               - Run all tests"
-	@echo "  make test-unit          - Run unit tests"
-	@echo "  make test-integration   - Run integration tests"
-	@echo "  make test-e2e           - Run end-to-end tests"
+	@echo "  make test               - test-offline + test-online (MatrixOne + Redis required for online portion)"
+	@echo "  make test-offline       - Workspace tests + astra-runtime bridge-e2e-hooks only (no #[ignore] online/Matrix suites)"
+	@echo "  make test-online        - Ignored Matrix HTTP E2E + astra-services multi_agent_integration (exports opt-in env vars)"
+	@echo "  make test-contract      - Run contract tests (http/admin/config)"
 	@echo ""
 	@echo "Code Quality:"
-	@echo "  make check              - Run all static checks (lint + format + type-check)"
-	@echo "  make ci                 - Run all CI checks (check + test)"
-	@echo "  make lint               - Run linters (ruff)"
-	@echo "  make lint-fix           - Run linters with auto-fix"
-	@echo "  make type-check         - Run type checker (mypy)"
+	@echo "  make check              - Run all static checks (lint + format + type)"
+	@echo "  make ci                 - Run CI checks (check + test)"
+	@echo "  make lint               - Run clippy (warnings are errors)"
 	@echo "  make format             - Format code"
-	@echo "  make format-check       - Check code formatting"
+	@echo "  make format-check       - Check formatting"
 	@echo ""
-	@echo "Examples:"
-	@echo "  make setup && make dev-up && make db-init  # First time setup"
-	@echo "  make dev-up && make test                   # Daily development"
+	@echo "Build:"
+	@echo "  make build              - Build entire Rust workspace (release)"
+	@echo "  make build-release      - Build entire Rust workspace (release)"
+	@echo "  make build-server       - Build astra-server (release)"
+	@echo "  make build-server-release - Build astra-server (release)"
+	@echo "  make build-cli          - Build astra + astra-admin (release)"
+	@echo "  make build-cli-release  - Build astra + astra-admin (release)"
+	@echo ""
+	@echo "Cleanup:"
+	@echo "  make clean              - Remove Rust build artifacts (target/)"
+	@echo ""
+	@echo "Memoria (Memory Service):"
+	@echo "  make memoria-start      - Start Memoria service"
+	@echo "  make memoria-stop       - Stop Memoria service"
+	@echo "  make memoria-logs       - Show Memoria logs"
+	@echo "  make memoria-status     - Show Memoria status"
+	@echo "  make memoria-clean      - Stop and remove Memoria data"
+	@echo ""
+	@echo "Docker API (alternative to source mode):"
+	@echo "  make dev-start-docker   - Start deps + API in Docker"
+	@echo "  make dev-api-docker-up  - Start API server in Docker"
+	@echo "  make dev-api-docker-down - Stop API server Docker container"
+
+# ============================================================================
+# Variables
+# ============================================================================
+
+CARGO_MANIFEST := rust/Cargo.toml
+CARGO := cargo
+CARGO_MANIFEST_FLAG := --manifest-path $(CARGO_MANIFEST)
+API_SHELL_PKG := -p astra-runtime
+RUST_TARGET_DIR := rust/target
+RUST_DEBUG_BIN_DIR := $(RUST_TARGET_DIR)/debug
+RUST_RELEASE_BIN_DIR := $(RUST_TARGET_DIR)/release
+API_SERVER_BIN := astra-server
+CLI_BINS := astra astra-admin
 
 # ============================================================================
 # Environment Setup
 # ============================================================================
 
+.PHONY: dev-init
+dev-init: setup install-dev-deps
+	@echo "Initializing development environment..."
+	@bash scripts/dev/init.sh
+	@echo ""
+	@echo "✅ Development environment initialized!"
+	@echo "Next: make dev-start"
+
 .PHONY: setup
 setup:
-	@echo "Setting up mo-dev-agent development environment..."
+	@echo "Setting up astra-engine development environment..."
 	@if [ ! -f .env ]; then \
 		cp .env.example .env; \
 		echo "✅ Created .env file (please review and customize)"; \
 	else \
 		echo "⚠️  .env already exists, skipping"; \
 	fi
-	@echo ""
-	@$(MAKE) install
-	@echo ""
-	@echo "✅ Setup complete! Next steps:"
-	@echo "   1. Review and customize .env file"
-	@echo "   2. Run: make dev-up"
-	@echo "   3. Run: make db-init"
 
-.PHONY: install
-install:
-	@echo "Installing Python dependencies..."
-	@if command -v poetry >/dev/null 2>&1; then \
-		poetry install; \
-	else \
-		pip install -e .; \
-	fi
+.PHONY: install-dev-deps
+install-dev-deps:
+	@echo "Installing Rust workspace dependencies..."
+	@cargo fetch --manifest-path rust/Cargo.toml
+	@echo "✅ Rust dependencies ready"
 
-.PHONY: lock
-lock:
-	@echo "Updating dependency lock file..."
-	@if command -v poetry >/dev/null 2>&1; then \
-		poetry lock; \
-		echo "✅ poetry.lock updated"; \
+.PHONY: check-runtime
+check-runtime:
+	@echo "Checking runtime environment..."
+	@echo ""
+	@echo "1. Docker:"
+	@if command -v docker >/dev/null 2>&1; then \
+		echo "   ✅ $$(docker --version)"; \
+		if docker ps >/dev/null 2>&1; then \
+			echo "   ✅ Docker daemon running"; \
+		else \
+			echo "   ❌ Docker daemon not running"; \
+		fi; \
 	else \
-		echo "⚠️  Poetry not found, skipping lock (pip doesn't use lock files)"; \
+		echo "   ❌ Not installed"; \
 	fi
+	@echo ""
+	@echo "2. Rust API binary:"
+	@cargo build -q --manifest-path rust/Cargo.toml -p astra-runtime --release --bin astra-server && echo "   ✅ Rust binary build OK"
 
 # ============================================================================
-# Development Environment
+# Dependencies (MatrixOne + Memoria)
 # ============================================================================
 
-.PHONY: dev-up
-dev-up:
-	@echo "Starting mo-dev-agent development environment..."
-	@cd infra && docker compose --profile dev up -d
-	@echo ""
-	@echo "✅ Services started!"
-	@echo "   MatrixOne: mysql -h127.0.0.1 -P6001 -uroot -p111"
-	@echo "   Redis:     redis-cli -h 127.0.0.1 -p 6379"
-	@echo ""
-	@echo "Next: make db-init (to initialize database schema)"
+DEPS_COMPOSE := cd deployment/all-in-one && UID=$$(id -u) GID=$$(id -g) docker compose -f docker-compose.deps.yml --env-file ../../.env
 
-.PHONY: dev-down
-dev-down:
-	@echo "Stopping mo-dev-agent services..."
-	@cd infra && docker compose --profile dev down
+.PHONY: dev-deps-up
+dev-deps-up:
+	@echo "Starting dependency services (MatrixOne + Memoria)..."
+	@if [ -d deployment/all-in-one/data ] && [ "$$(stat -c '%u' deployment/all-in-one/data 2>/dev/null || stat -f '%u' deployment/all-in-one/data 2>/dev/null)" != "$$(id -u)" ]; then \
+		echo "❌ Error: Data directory owned by root"; \
+		echo "   Run: make dev-deps-clean"; \
+		echo "   Or:  sudo chown -R $$(id -u):$$(id -g) deployment/all-in-one/data"; \
+		exit 1; \
+	fi
+	@mkdir -p deployment/all-in-one/data/matrixone deployment/all-in-one/data/matrixone/logs deployment/all-in-one/data/logs/memoria
+	@$(DEPS_COMPOSE) up -d
+	@echo "✅ Dependency services started (MatrixOne :6001, Memoria :8100)"
 
-.PHONY: dev-restart
-dev-restart:
-	@echo "Restarting mo-dev-agent services..."
-	@cd infra && docker compose --profile dev restart
+.PHONY: dev-deps-down
+dev-deps-down:
+	@echo "Stopping dependency services..."
+	@$(DEPS_COMPOSE) down
+	@echo "✅ Dependency services stopped"
 
-.PHONY: dev-logs
-dev-logs:
-	@cd infra && docker compose --profile dev logs -f
-
-.PHONY: dev-logs-db
-dev-logs-db:
-	@cd infra && docker compose logs -f matrixone
-
-.PHONY: dev-ps
-dev-ps:
-	@cd infra && docker compose --profile dev ps
-
-.PHONY: dev-clean
-dev-clean:
-	@echo "⚠️  WARNING: This will delete all data!"
-	@printf "Are you sure? [y/N] "; \
-	read REPLY; \
+.PHONY: dev-deps-clean
+dev-deps-clean:
+	@echo "⚠️  WARNING: This will delete all dependency data!"
+	@printf "Are you sure? [y/N] " && read REPLY && \
 	if [ "$$REPLY" = "y" ] || [ "$$REPLY" = "Y" ]; then \
-		cd infra && docker compose --profile dev down -v; \
-		echo "✅ All data removed"; \
+		($(DEPS_COMPOSE) down -v); \
+		if [ -d deployment/all-in-one/data ]; then \
+			if [ "$$(stat -c '%u' deployment/all-in-one/data 2>/dev/null || stat -f '%u' deployment/all-in-one/data 2>/dev/null)" != "$$(id -u)" ]; then \
+				sudo rm -rf deployment/all-in-one/data; \
+			else \
+				rm -rf deployment/all-in-one/data; \
+			fi; \
+		fi; \
+		rm -f api_server.pid api_server.log; \
+		echo "✅ All dependency data removed"; \
 	else \
 		echo "Cancelled"; \
 	fi
 
-.PHONY: dev-init
-dev-init: dev-up db-init
-	@echo "✅ Development environment ready!"
+.PHONY: dev-deps-status
+dev-deps-status:
+	@echo "Dependency Services Status:"
+	@echo "==========================="
+	@$(DEPS_COMPOSE) ps
+
+.PHONY: dev-deps-logs
+dev-deps-logs:
+	@$(DEPS_COMPOSE) logs -f
+
+.PHONY: dev-deps-logs-once
+dev-deps-logs-once:
+	@$(DEPS_COMPOSE) logs --no-color
+
+.PHONY: dev-deps-wait
+dev-deps-wait:
+	@echo "Waiting for MatrixOne..."
+	@for i in $$(seq 1 90); do \
+		if curl -sf "http://127.0.0.1:$${MATRIXONE_DEBUG_HTTP_PORT:-6060}/debug/vars" >/dev/null 2>&1; then \
+			echo "✅ MatrixOne is healthy"; \
+			break; \
+		fi; \
+		if [ "$$i" -eq 90 ]; then \
+			echo "❌ MatrixOne not ready after 180s"; \
+			echo "   Tip: Check with 'make dev-deps-status' or 'make dev-deps-logs-once'"; \
+			exit 1; \
+		fi; \
+		echo "  Waiting for MatrixOne... ($$i/90)"; \
+		sleep 2; \
+	done
+	@echo "Waiting for Memoria..."
+	@for i in $$(seq 1 60); do \
+		if curl -sf "http://127.0.0.1:$${MEMORIA_PORT:-8100}/health" >/dev/null 2>&1; then \
+			echo "✅ Memoria is healthy"; \
+			echo "✅ Dependency services ready"; \
+			exit 0; \
+		fi; \
+		if [ "$$i" -eq 60 ]; then \
+			echo "❌ Memoria not ready after 120s"; \
+			echo "   Tip: Check with 'make dev-deps-status' or 'make dev-deps-logs-once'"; \
+			exit 1; \
+		fi; \
+		echo "  Waiting for Memoria... ($$i/60)"; \
+		sleep 2; \
+	done
+
+.PHONY: dev-db-connect
+dev-db-connect:
+	@mysql -h127.0.0.1 -P6001 -uroot -p111
+
+# ============================================================================
+# API Server (Source Code Mode)
+# ============================================================================
+
+.PHONY: dev-api-start
+dev-api-start:
+	@./scripts/dev/start-api.sh
+
+.PHONY: dev-api-stop
+dev-api-stop:
+	@echo "Stopping API server..."
+	@./scripts/dev/stop-api.sh
+
+.PHONY: dev-api-restart
+dev-api-restart: dev-api-stop
+	@sleep 1
+	@$(MAKE) dev-api-start
+
+.PHONY: dev-api-logs
+dev-api-logs:
+	@if [ -f api_server.log ]; then \
+		tail -f api_server.log; \
+	else \
+		echo "❌ api_server.log not found. Is API server running?"; \
+	fi
+
+.PHONY: dev-api-status
+dev-api-status:
+	@echo "API Server Status:"
+	@echo "=================="
+	@if [ -f api_server.pid ] && kill -0 $$(cat api_server.pid) 2>/dev/null; then \
+		echo "  ✅ Running (PID: $$(cat api_server.pid))"; \
+		if command -v jq >/dev/null 2>&1; then \
+			NO_PROXY=localhost curl -s http://localhost:8000/health 2>/dev/null | jq . || echo "  ⚠️  Health check failed"; \
+		else \
+			NO_PROXY=localhost curl -s http://localhost:8000/health 2>/dev/null || echo "  ⚠️  Health check failed"; \
+		fi; \
+	else \
+		echo "  ❌ Not running"; \
+	fi
+
+# ============================================================================
+# API Server (Docker Mode)
+# ============================================================================
+
+.PHONY: dev-api-docker-build
+dev-api-docker-build:
+	@echo "Building API server image..."
+	@docker build -t astra-engine:latest .
+	@echo "✅ Image built"
+
+.PHONY: dev-api-docker-up
+dev-api-docker-up:
+	@echo "Starting API server (Docker mode)..."
+	@cd deployment/all-in-one && docker compose --profile app up -d --build api
+	@echo "✅ API server container started"
+
+.PHONY: dev-api-docker-down
+dev-api-docker-down:
+	@echo "Stopping API server containers..."
+	@cd deployment/all-in-one && docker compose --profile app down
+	@echo "✅ API server containers stopped"
+
+.PHONY: dev-api-docker-logs
+dev-api-docker-logs:
+	@cd deployment/all-in-one && docker compose logs -f api
+
+.PHONY: dev-api-docker-scale
+dev-api-docker-scale:
+	@if [ -z "$(REPLICAS)" ]; then \
+		echo "❌ Usage: make dev-api-docker-scale REPLICAS=N"; \
+		exit 1; \
+	fi
+	@echo "Scaling API server to $(REPLICAS) replicas..."
+	@cd deployment/all-in-one && docker compose --profile app up -d --scale api=$(REPLICAS)
+	@echo "✅ Scaled to $(REPLICAS) replicas"
+
+# ============================================================================
+# Composite Commands
+# ============================================================================
+
+.PHONY: dev-start
+dev-start: dev-deps-up dev-deps-wait dev-api-start
+	@echo ""
+	@echo "✅ Development environment started!"
+	@echo "   API: http://localhost:8000"
+	@echo ""
+	@echo "Next steps:"
+	@echo "  astra register"
+	@echo "  astra login"
+	@echo "  astra chat"
+
+.PHONY: dev-start-docker
+dev-start-docker: dev-deps-up dev-deps-wait dev-api-docker-up
+	@sleep 3
+	@echo ""
+	@echo "✅ Development environment ready (Docker mode)!"
+	@echo "   API: http://localhost:8000"
+
+.PHONY: dev-stop
+dev-stop: dev-api-stop dev-deps-down
+	@echo "✅ All services stopped"
+
+.PHONY: dev-restart
+dev-restart: dev-stop
+	@sleep 1
+	@$(MAKE) dev-start
+
+.PHONY: dev-status
+dev-status:
+	@echo ""
+	@$(MAKE) dev-deps-status
+	@echo ""
+	@$(MAKE) dev-api-status
+
+.PHONY: dev-clean
+dev-clean: dev-api-stop dev-deps-clean
+	@echo "✅ Development environment cleaned"
+
+.PHONY: dev-reset
+dev-reset: dev-clean
+	@$(MAKE) dev-init
+	@echo "✅ Development environment reset"
+
+.PHONY: dev-setup-demo
+dev-setup-demo:
+	@bash scripts/setup/demo-init.sh
+
+.PHONY: dev-seed
+dev-seed:
+	@echo "⚠️  This will reset the database and reseed admin + models."
+	@printf "Are you sure? [y/N] "; read REPLY; \
+	[ "$$REPLY" = "y" ] || [ "$$REPLY" = "Y" ] || { echo "Cancelled"; exit 1; }
+	@mysql -h127.0.0.1 -P6001 -uroot -p111 \
+		-e "DROP DATABASE IF EXISTS astra_runtime; CREATE DATABASE astra_runtime;" 2>/dev/null || \
+	mysql -h127.0.0.1 -P6001 -uroot -p111 --skip-ssl \
+		-e "DROP DATABASE IF EXISTS astra_runtime; CREATE DATABASE astra_runtime;" 2>/dev/null || \
+	mysql -h127.0.0.1 -P6001 -uroot -p111 --skip_ssl \
+		-e "DROP DATABASE IF EXISTS astra_runtime; CREATE DATABASE astra_runtime;"
+	@$(MAKE) dev-api-restart build-cli-release
+	@sleep 2
+	@echo "Registering admin (admin@mo.com)..."
+	@NO_PROXY=localhost ./rust/target/release/astra-admin register \
+		--username admin --password 11111111 --email admin@mo.com
+	@echo "Logging in as admin..."
+	@NO_PROXY=localhost ./rust/target/release/astra-admin login \
+		--username admin --password 11111111
+	@echo "Loading models from .models.yaml..."
+	@NO_PROXY=localhost ./rust/target/release/astra-admin model load .models.yaml
+	@echo ""
+	@echo "✅ Seed complete — admin@mo.com / 11111111"
+
+# ============================================================================
+# Build
+# ============================================================================
+
+.PHONY: build
+build: build-release
+
+.PHONY: build-release
+build-release:
+	@echo "Building Rust workspace (release)..."
+	@$(CARGO) build $(CARGO_MANIFEST_FLAG) --release
+	@echo "✅ Release artifacts: $(RUST_RELEASE_BIN_DIR)/"
+
+.PHONY: build-cli
+build-cli: build-cli-release
+
+.PHONY: build-cli-release
+build-cli-release:
+	@echo "Building astra + astra-admin (release)..."
+	@$(CARGO) build $(CARGO_MANIFEST_FLAG) -p astra-cli -p astra-admin-cli --release
+	@echo "Binaries:"
+	@for bin in $(CLI_BINS); do echo "  $(RUST_RELEASE_BIN_DIR)/$$bin"; done
+
+.PHONY: build-server
+build-server: build-server-release
+
+.PHONY: build-server-release
+build-server-release:
+	@echo "Building astra-server (release)..."
+	@$(CARGO) build $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --release --bin $(API_SERVER_BIN)
+	@echo "Binary: $(RUST_RELEASE_BIN_DIR)/$(API_SERVER_BIN)"
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+.PHONY: clean
+clean:
+	@echo "Removing Rust build artifacts..."
+	@$(CARGO) clean $(CARGO_MANIFEST_FLAG)
+	@echo "✅ Build artifacts removed"
+
+.PHONY: clean-incremental
+clean-incremental:
+	@echo "Cleaning incremental compilation cache..."
+	@rm -rf $(RUST_TARGET_DIR)/debug/incremental
+	@echo "✅ Incremental cache removed"
+
+# ============================================================================
+# Testing
+# ============================================================================
+
+.PHONY: test test-offline test-online
+test: test-offline test-online
+
+.PHONY: test-offline
+test-offline: test-workspace test-runtime-bridge-hooks
+
+.PHONY: test-workspace
+test-workspace:
+	@echo "Running Rust workspace tests (all members, default features)..."
+	@$(CARGO) test $(CARGO_MANIFEST_FLAG)
+
+# Compiles chat/turn bridge hook paths and runs integration binaries that require
+# `required-features = ["bridge-e2e-hooks"]` (e.g. chat_turn_bridge_ledger_inject_e2e).
+.PHONY: test-runtime-bridge-hooks
+test-runtime-bridge-hooks:
+	@echo "Running astra-runtime tests with feature bridge-e2e-hooks..."
+	@$(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --features bridge-e2e-hooks
+
+# Ignored tests: opt-in via env vars (see `make test-online`). Enable with:
+#   ASTRA_SYSTEM_MATRIX_E2E=1   -> system_matrix_http_e2e (--ignored)
+#   ASTRA_MULTI_AGENT_IT=1      -> astra-services multi_agent_integration + team_persistence (--ignored)
+#   ASTRA_SERVICES_DB_IT=1      -> astra-services services_db_integration (--ignored): list clamps,
+#                                 skills index, cross-session audit stats/lists, durable_task resume history
+# Optional serial Matrix E2E: ASTRA_SYSTEM_MATRIX_E2E_TEST_THREADS=1 -> --test-threads=1
+.PHONY: test-ignored-integration
+test-ignored-integration:
+	@if [ "$${ASTRA_SYSTEM_MATRIX_E2E:-}" != "1" ] && [ "$${ASTRA_MULTI_AGENT_IT:-}" != "1" ] && [ "$${ASTRA_SERVICES_DB_IT:-}" != "1" ]; then \
+		echo "Note: no online/Matrix ignored suites selected. Use \`make test-online\` or set ASTRA_SYSTEM_MATRIX_E2E=1 / ASTRA_MULTI_AGENT_IT=1 / ASTRA_SERVICES_DB_IT=1."; \
+	fi
+	@if [ "$${ASTRA_SYSTEM_MATRIX_E2E:-}" = "1" ]; then \
+		EXTRA_THREADS=""; \
+		if [ "$${ASTRA_SYSTEM_MATRIX_E2E_TEST_THREADS:-}" = "1" ]; then \
+			EXTRA_THREADS="--test-threads=1"; \
+			echo "system_matrix_http_e2e: serial mode (ASTRA_SYSTEM_MATRIX_E2E_TEST_THREADS=1)"; \
+		else \
+			echo "Running system_matrix_http_e2e (ignored; parallel default; live DB + AppSettings::from_env)..."; \
+		fi; \
+		$(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --features bridge-e2e-hooks \
+			--test system_matrix_http_e2e -- --ignored $$EXTRA_THREADS --nocapture; \
+	fi
+	@if [ "$${ASTRA_MULTI_AGENT_IT:-}" = "1" ]; then \
+		echo "Running multi_agent_integration (ignored; live MatrixOne)..."; \
+		$(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-services --test multi_agent_integration -- --ignored; \
+		echo "Running team_persistence_integration (ignored; live MatrixOne)..."; \
+		$(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-services --test team_persistence_integration -- --ignored; \
+	fi
+	@if [ "$${ASTRA_SERVICES_DB_IT:-}" = "1" ]; then \
+		echo "Running services_db_integration (ignored; live MatrixOne)..."; \
+		$(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-services --test services_db_integration -- --ignored; \
+	fi
+
+# Online (MatrixOne): opt-in #[ignore] integration binaries (see test-ignored-integration).
+.PHONY: test-online
+test-online:
+	@if [ ! -f .env ]; then \
+		echo "No .env found — creating from .env.example..."; \
+		cp .env.example .env; \
+	fi
+	@echo "Running astra-runtime ignored unit tests (live DB)..."
+	@$(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) -- --ignored
+	@ASTRA_SYSTEM_MATRIX_E2E=1 ASTRA_MULTI_AGENT_IT=1 ASTRA_SERVICES_DB_IT=1 $(MAKE) test-ignored-integration
+
+.PHONY: test-contract
+test-contract:
+	@echo "Running core HTTP contract binaries (http/admin) + astra-core settings JSON contract..."
+	@$(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) \
+		--test http_contract --test admin_contract
+	@$(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-core --lib settings_contract_tests
+
+# ============================================================================
+# Code Quality
+# ============================================================================
+
+.PHONY: check
+check: lint format-check type-check
+	@echo "✅ All static checks passed!"
+
+.PHONY: ci
+ci: check test
+	@echo "✅ All CI checks passed!"
+
+.PHONY: lint
+lint:
+	@echo "Running clippy..."
+	@$(CARGO) clippy $(CARGO_MANIFEST_FLAG) --all-targets -- -D warnings
+
+.PHONY: lint-fix
+lint-fix:
+	@$(CARGO) fmt $(CARGO_MANIFEST_FLAG) --all
+
+.PHONY: format
+format:
+	@$(CARGO) fmt $(CARGO_MANIFEST_FLAG) --all
+
+.PHONY: format-check
+format-check:
+	@echo "Checking formatting..."
+	@$(CARGO) fmt $(CARGO_MANIFEST_FLAG) --all -- --check
+
+.PHONY: type-check
+type-check:
+	@echo "Running compile checks..."
+	@$(CARGO) check $(CARGO_MANIFEST_FLAG) --all-targets
+
+# ============================================================================
+# Memoria (Memory Service)
+# ============================================================================
+
+.PHONY: memoria-start
+memoria-start:
+	@echo "Starting Memoria..."
+	@docker compose -f memoria/docker-compose.yml up -d
+	@echo "API: http://localhost:8100  Swagger: http://localhost:8100/docs"
+
+.PHONY: memoria-stop
+memoria-stop:
+	@docker compose -f memoria/docker-compose.yml down
+
+.PHONY: memoria-logs
+memoria-logs:
+	@docker compose -f memoria/docker-compose.yml logs -f api
+
+.PHONY: memoria-status
+memoria-status:
+	@docker compose -f memoria/docker-compose.yml ps
+
+.PHONY: memoria-clean
+memoria-clean:
+	@echo "Stopping and removing Memoria (including data)..."
+	@docker compose -f memoria/docker-compose.yml down
+	@rm -rf memoria/data/
+	@echo "Done."
 
 # ============================================================================
 # Database
 # ============================================================================
-
-.PHONY: db-init
-db-init:
-	@echo "Initializing database schema..."
-	@bash infra/scripts/init-db.sh
-
-.PHONY: db-init-agent
-db-init-agent:
-	@echo "Initializing agent configuration system..."
-	@python3 infra/scripts/init_agent_system.py
-
-.PHONY: db-connect
-db-connect:
-	@echo "Connecting to MatrixOne..."
-	@echo ""
-	@mysql -h127.0.0.1 -P6001 -uroot -p111 2>/dev/null || \
-	mysql -h127.0.0.1 -P6001 -uroot -p111 --skip-ssl 2>/dev/null || \
-	mysql -h127.0.0.1 -P6001 -uroot -p111 --skip_ssl 2>/dev/null || \
-	(echo "❌ Connection failed. Please try manually:" && \
-	 echo "   mysql -h127.0.0.1 -P6001 -uroot -p111 --skip-ssl   # or" && \
-	 echo "   mysql -h127.0.0.1 -P6001 -uroot -p111 --skip_ssl   # (underscore)" && \
-	 exit 1)
 
 .PHONY: db-reset
 db-reset:
@@ -172,83 +566,14 @@ db-reset:
 	if [ "$$REPLY" = "y" ] || [ "$$REPLY" = "Y" ]; then \
 		if [ -f .env ]; then \
 			export $$(cat .env | grep -v '^#' | xargs); \
-			DB_NAME=$${MATRIXONE_DATABASE:-dev_agent}; \
+			DB_NAME=$${MATRIXONE_DATABASE_PREFIX:-}$${MATRIXONE_DATABASE:-dev_agent}; \
 		else \
 			DB_NAME=dev_agent; \
 		fi; \
 		mysql -h127.0.0.1 -P6001 -uroot -p111 -e "DROP DATABASE IF EXISTS $$DB_NAME; CREATE DATABASE $$DB_NAME;" 2>/dev/null || \
 		mysql -h127.0.0.1 -P6001 -uroot -p111 --skip-ssl -e "DROP DATABASE IF EXISTS $$DB_NAME; CREATE DATABASE $$DB_NAME;" 2>/dev/null || \
 		mysql -h127.0.0.1 -P6001 -uroot -p111 --skip_ssl -e "DROP DATABASE IF EXISTS $$DB_NAME; CREATE DATABASE $$DB_NAME;"; \
-		$(MAKE) db-init; \
 		echo "✅ Database reset complete"; \
 	else \
 		echo "Cancelled"; \
 	fi
-
-# ============================================================================
-# Testing
-# ============================================================================
-
-.PHONY: test
-test:
-	@echo "Running all tests..."
-	@pytest tests/ -v
-
-.PHONY: test-unit
-test-unit:
-	@echo "Running unit tests..."
-	@pytest tests/unit/ -v
-
-.PHONY: test-integration
-test-integration:
-	@echo "Running integration tests..."
-	@pytest tests/integration/ -v
-
-.PHONY: test-e2e
-test-e2e:
-	@echo "Running end-to-end tests..."
-	@pytest tests/e2e/ -v
-
-# ============================================================================
-# Code Quality
-# ============================================================================
-
-# Check if poetry environment is set up
-.PHONY: check-env
-check-env:
-	@poetry --version >/dev/null 2>&1 || (echo "❌ Error: poetry not found. Install it first: https://python-poetry.org/docs/#installation" && exit 1)
-	@poetry run python --version >/dev/null 2>&1 || (echo "❌ Error: Poetry environment not set up. Run 'make install' first." && exit 1)
-
-.PHONY: check
-check: check-env lint format-check type-check
-	@echo "✅ All static checks passed!"
-
-.PHONY: lint
-lint:
-	@echo "Running linters..."
-	@poetry run ruff check .
-
-.PHONY: lint-fix
-lint-fix:
-	@echo "Running linters with auto-fix..."
-	@poetry run ruff check --fix .
-
-.PHONY: type-check
-type-check:
-	@echo "Running type checker..."
-	@poetry run mypy sdk/ core/ api/
-
-.PHONY: format
-format:
-	@echo "Formatting code..."
-	@poetry run ruff format .
-
-.PHONY: format-check
-format-check:
-	@echo "Checking code formatting..."
-	@poetry run ruff format --check .
-
-.PHONY: pre-commit
-.PHONY: ci
-ci: check test
-	@echo "✅ All CI checks passed!"

@@ -1,0 +1,135 @@
+name: Test Suite
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Offline: split by crate for parallel execution and easier fault isolation ──
+
+  test-offline-cli:
+    name: "Offline: astra-cli"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref || github.ref_name }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@nextest
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          shared-key: ci-offline
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo nextest run --manifest-path rust/Cargo.toml -p astra-cli
+
+  test-offline-runtime:
+    name: "Offline: astra-runtime"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref || github.ref_name }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          shared-key: ci-offline
+          save-if: false
+      - run: cargo test --manifest-path rust/Cargo.toml -p astra-runtime
+      - name: Run bridge-e2e-hooks tests
+        run: cargo test --manifest-path rust/Cargo.toml -p astra-runtime --features bridge-e2e-hooks
+
+  test-offline-services:
+    name: "Offline: astra-services"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref || github.ref_name }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          shared-key: ci-offline
+          save-if: false
+      - run: cargo test --manifest-path rust/Cargo.toml -p astra-services
+
+  test-offline-core:
+    name: "Offline: core crates"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref || github.ref_name }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          shared-key: ci-offline
+          save-if: false
+      - run: cargo test --manifest-path rust/Cargo.toml -p astra-core -p astra-thin-client -p astra-admin-cli
+
+  # ── Online: needs MatrixOne + Memoria ─────────────────────────────────
+  test-online:
+    name: Online Tests
+    runs-on: ubuntu-latest
+    env:
+      MATRIXONE_HOST: localhost
+      MATRIXONE_PORT: "6001"
+      MATRIXONE_USER: root
+      MATRIXONE_PASSWORD: "111"
+      MATRIXONE_DATABASE: astra_runtime
+      MATRIXONE_DATABASE_PREFIX: "test_"
+      MATRIXONE_AUTO_CREATE_DATABASE: "1"
+      JWT_SECRET_KEY: ci-jwt-secret-key-at-least-32-chars-long
+      SECRET_KEY: ci-app-secret-key-at-least-32-chars-long
+      TOKEN_ENCRYPTION_KEY: ci-token-encryption-key-at-least-32-chars
+      ASTRA_BRIDGE_TEST_SECRET: system-matrix-e2e-secret
+      CHAT_TURN_BRIDGE_SECRET: dev-bridge-secret-change-me
+      MEMORIA_BASE_URL: http://localhost:8100
+      MEMORIA_MASTER_KEY: ci-test-master-key
+      MEMORIA_EMBEDDING_PROVIDER: mock
+      MEMORIA_EMBEDDING_DIM: "384"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare dependency env
+        run: |
+          cp .env.example .env
+          {
+            echo "MEMORIA_MASTER_KEY=${MEMORIA_MASTER_KEY}"
+            echo "MEMORIA_EMBEDDING_PROVIDER=${MEMORIA_EMBEDDING_PROVIDER}"
+            echo "MEMORIA_EMBEDDING_DIM=${MEMORIA_EMBEDDING_DIM}"
+          } >> .env
+      - name: Start dependencies
+        run: make dev-deps-up
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          shared-key: ci-online
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Wait for dependencies
+        run: make dev-deps-wait
+      - name: Run online tests
+        env:
+          ASTRA_SYSTEM_MATRIX_E2E: "1"
+          ASTRA_SYSTEM_MATRIX_E2E_TEST_THREADS: "1"
+          ASTRA_MULTI_AGENT_IT: "1"
+          ASTRA_SERVICES_DB_IT: "1"
+        run: make test-online
+      - name: Dump dependency logs
+        if: failure()
+        run: make dev-deps-logs-once
+      - name: Stop dependencies
+        if: always()
+        run: make dev-deps-down

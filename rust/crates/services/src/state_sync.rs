@@ -1,0 +1,1825 @@
+//! State convergence: sync learning state between edge (local files) and cloud (MatrixOne).
+//!
+//! # Architecture
+//!
+//! ```text
+//!   Edge (CLI)                          Cloud (MatrixOne)
+//!   ─────────                          ──────────────────
+//!   ~/.astra/learning/            learning_snapshots table
+//!     {profile}.json         ──push──▶  (user_id, profile, gzip+base64 json)
+//!                            ◀──pull──
+//!
+//!   ~/.astra/sessions/            agent_sessions + agent_events
+//!     workspace.yaml         ──push──▶  (metadata sync)
+//!     journal.jsonl          ──push──▶  (event ingestion)
+//!
+//!   User preferences         ◀──pull──  user_preferences table
+//! ```
+//!
+//! # Sync Protocol
+//!
+//! - **Local-first**: Edge always writes locally first, then async pushes to cloud
+//! - **Last-writer-wins**: For preferences, most recent update wins
+//! - **Merge-on-pull**: For learning data, entity/pattern observations are merged
+//! - **Conflict resolution**: Higher observation count wins for entities; union for patterns
+//! - **Idempotent**: Repeated pushes produce same result (UPSERT semantics)
+
+use astra_core::is_duplicate_key_error;
+use async_trait::async_trait;
+use base64::Engine;
+use flate2::{Compression, read::GzDecoder, write::GzEncoder};
+use serde::{Deserialize, Serialize};
+use std::io::{Read, Write};
+use std::path::Path;
+use std::time::Duration;
+
+// ─── Retry Configuration ────────────────────────────────────────────────────
+
+/// Maximum number of retry attempts for transient network errors.
+const MAX_RETRIES: u32 = 3;
+/// Initial backoff delay between retries.
+const INITIAL_BACKOFF_MS: u64 = 100;
+/// Maximum backoff delay (exponential backoff caps at this value).
+const MAX_BACKOFF_MS: u64 = 2000;
+/// Retain only a bounded tail of successful sync audit rows per user.
+const SYNC_LOG_SUCCESS_RETAIN: usize = 200;
+/// Retain a smaller bounded tail of error rows per user.
+const SYNC_LOG_ERROR_RETAIN: usize = 50;
+
+/// Check if an error is likely transient and worth retrying.
+fn is_retryable_error(err: &sqlx::Error) -> bool {
+    match err {
+        // Connection errors are usually transient
+        sqlx::Error::Io(_) => true,
+        // Pool timeout - might resolve after brief wait
+        sqlx::Error::PoolTimedOut => true,
+        // Protocol errors might be transient network issues
+        sqlx::Error::Protocol(_) => true,
+        // Database errors - check for specific transient codes
+        sqlx::Error::Database(db_err) => {
+            // MySQL error codes for transient issues:
+            // 1040 = Too many connections
+            // 1205 = Lock wait timeout exceeded
+            // 1213 = Deadlock found
+            // 2006 = MySQL server has gone away
+            // 2013 = Lost connection to MySQL server
+            if let Some(code) = db_err.code() {
+                let code_str = code.to_string();
+                matches!(
+                    code_str.as_str(),
+                    "1040" | "1205" | "1213" | "2006" | "2013"
+                )
+            } else {
+                // Unknown database error - don't retry
+                false
+            }
+        }
+        // Other errors are not retryable
+        _ => false,
+    }
+}
+
+/// Compress a JSON payload with gzip and encode it as base64 for storage.
+fn compress_json_payload(json: &str) -> Result<String, String> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder
+        .write_all(json.as_bytes())
+        .map_err(|e| format!("gzip write: {e}"))?;
+    let compressed = encoder.finish().map_err(|e| format!("gzip finish: {e}"))?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(compressed))
+}
+
+/// Decode a base64 payload and decompress it from gzip back into JSON text.
+fn decompress_json_payload(encoded: &str) -> Result<String, String> {
+    let compressed = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|e| format!("base64 decode: {e}"))?;
+    let mut decoder = GzDecoder::new(compressed.as_slice());
+    let mut json = String::new();
+    decoder
+        .read_to_string(&mut json)
+        .map_err(|e| format!("gzip decode: {e}"))?;
+    Ok(json)
+}
+
+fn sync_log_retain_limit(status: &str) -> Option<usize> {
+    match status {
+        "success" => Some(SYNC_LOG_SUCCESS_RETAIN),
+        "error" => Some(SYNC_LOG_ERROR_RETAIN),
+        _ => None,
+    }
+}
+
+fn build_sync_log_prune_query() -> &'static str {
+    "DELETE FROM session_sync_log \
+     WHERE user_id = ? AND status = ? \
+       AND sync_id NOT IN ( \
+           SELECT sync_id FROM ( \
+               SELECT sync_id FROM session_sync_log \
+               WHERE user_id = ? AND status = ? \
+               ORDER BY created_at DESC \
+               LIMIT ? \
+           ) AS keepers \
+       )"
+}
+
+// ─── Sync Types ─────────────────────────────────────────────────────────────
+
+/// Direction of a sync operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SyncDirection {
+    /// Edge → Cloud
+    Push,
+    /// Cloud → Edge
+    Pull,
+}
+
+/// Result of a sync operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncResult {
+    pub direction: SyncDirection,
+    pub sync_type: String,
+    pub success: bool,
+    pub items_synced: u32,
+    pub message: String,
+    /// New cloud version after successful push (for optimistic locking).
+    #[serde(default)]
+    pub new_version: Option<i64>,
+    /// Whether this was a conflict (version mismatch).
+    #[serde(default)]
+    pub is_conflict: bool,
+}
+
+impl SyncResult {
+    pub fn ok(direction: SyncDirection, sync_type: &str, items: u32) -> Self {
+        Self {
+            direction,
+            sync_type: sync_type.to_string(),
+            success: true,
+            items_synced: items,
+            message: "ok".to_string(),
+            new_version: None,
+            is_conflict: false,
+        }
+    }
+
+    pub fn ok_with_version(
+        direction: SyncDirection,
+        sync_type: &str,
+        items: u32,
+        version: i64,
+    ) -> Self {
+        Self {
+            direction,
+            sync_type: sync_type.to_string(),
+            success: true,
+            items_synced: items,
+            message: "ok".to_string(),
+            new_version: Some(version),
+            is_conflict: false,
+        }
+    }
+
+    pub fn err(direction: SyncDirection, sync_type: &str, msg: impl Into<String>) -> Self {
+        Self {
+            direction,
+            sync_type: sync_type.to_string(),
+            success: false,
+            items_synced: 0,
+            message: msg.into(),
+            new_version: None,
+            is_conflict: false,
+        }
+    }
+
+    pub fn conflict(direction: SyncDirection, sync_type: &str, msg: impl Into<String>) -> Self {
+        Self {
+            direction,
+            sync_type: sync_type.to_string(),
+            success: false,
+            items_synced: 0,
+            message: msg.into(),
+            new_version: None,
+            is_conflict: true,
+        }
+    }
+}
+
+/// Learning snapshot with version for optimistic locking.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VersionedSnapshot {
+    /// The JSON-serialized learning snapshot.
+    pub json: String,
+    /// Cloud version number (for optimistic locking).
+    pub version: i64,
+}
+
+/// One row from `plan_templates`, serialized for edge pull sync.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlanTemplateSyncRow {
+    pub template_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    pub goal_pattern: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_type: Option<String>,
+    pub template_json: String,
+    pub success_rate: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avg_completion_time: Option<i32>,
+    pub use_count: i32,
+}
+
+const MAX_PREFERENCE_SYNC_ROWS: i64 = 128;
+const MAX_PLAN_TEMPLATE_SYNC_ROWS: i64 = 500;
+
+/// Delta snapshot containing only changed data since last sync.
+///
+/// Used for incremental sync to reduce network bandwidth.
+/// Full snapshot is ~40KB; delta is typically 2-5KB (85-90% reduction).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeltaSnapshot {
+    /// Unix timestamp of baseline (last successful sync).
+    pub baseline_epoch: u64,
+    /// Changed entities since baseline.
+    pub entity_deltas: Vec<serde_json::Value>,
+    /// Changed patterns since baseline.
+    pub pattern_deltas: Vec<serde_json::Value>,
+    /// Calibration data (always sent in full, as it's small).
+    pub calibration: Option<serde_json::Value>,
+    /// Changed tool health entries since baseline.
+    pub tool_health_deltas: Vec<serde_json::Value>,
+    /// Total count of delta items for statistics.
+    pub delta_count: u32,
+}
+
+impl DeltaSnapshot {
+    /// Create an empty delta snapshot.
+    pub fn empty(baseline_epoch: u64) -> Self {
+        Self {
+            baseline_epoch,
+            entity_deltas: Vec::new(),
+            pattern_deltas: Vec::new(),
+            calibration: None,
+            tool_health_deltas: Vec::new(),
+            delta_count: 0,
+        }
+    }
+
+    /// Check if this delta has any changes.
+    pub fn is_empty(&self) -> bool {
+        self.delta_count == 0
+    }
+
+    /// Approximate size in bytes (for telemetry).
+    pub fn approx_size(&self) -> usize {
+        self.entity_deltas
+            .iter()
+            .map(|v| v.to_string().len())
+            .sum::<usize>()
+            + self
+                .pattern_deltas
+                .iter()
+                .map(|v| v.to_string().len())
+                .sum::<usize>()
+            + self
+                .calibration
+                .as_ref()
+                .map(|v| v.to_string().len())
+                .unwrap_or(0)
+            + self
+                .tool_health_deltas
+                .iter()
+                .map(|v| v.to_string().len())
+                .sum::<usize>()
+    }
+}
+
+/// Metadata about the current sync state.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SyncStatus {
+    pub learning_last_push: Option<String>,
+    pub learning_last_pull: Option<String>,
+    pub preferences_last_sync: Option<String>,
+    pub pending_pushes: u32,
+    pub last_error: Option<String>,
+    /// Last known cloud version (for optimistic locking).
+    #[serde(default)]
+    pub cloud_version: Option<i64>,
+}
+
+// ─── State Sync Service Trait ───────────────────────────────────────────────
+
+/// Abstract sync service for learning state convergence.
+///
+/// Implementations:
+/// - `LocalOnlySyncService` — no-op for offline/edge-only mode
+/// - `MatrixOneSyncService` — full cloud sync via database
+/// - Mock implementations for testing
+///
+/// # Optimistic Locking
+///
+/// The `push_learning_versioned` method uses optimistic locking to prevent
+/// concurrent sessions from overwriting each other's changes:
+///
+/// 1. Call `pull_learning_versioned` to get `(json, version)`
+/// 2. Merge cloud data with local changes
+/// 3. Call `push_learning_versioned(expected_version=version)` to push
+/// 4. If another session pushed in between, returns `is_conflict=true`
+/// 5. On conflict, re-pull, re-merge, and retry
+#[async_trait]
+pub trait StateSyncService: Send + Sync {
+    /// Push local learning snapshot with optimistic locking.
+    ///
+    /// - `expected_version`: The version returned by the last `pull_learning_versioned`.
+    ///   Pass `None` to create a new snapshot (fails if one already exists).
+    ///
+    /// Returns:
+    /// - `success=true, new_version=Some(v)` on success
+    /// - `success=false, is_conflict=true` if version mismatch (another session pushed)
+    /// - `success=false, is_conflict=false` on other errors
+    #[allow(clippy::too_many_arguments)]
+    async fn push_learning_versioned(
+        &self,
+        user_id: &str,
+        profile: &str,
+        snapshot_json: &str,
+        entity_count: u32,
+        pattern_count: u32,
+        has_calibration: bool,
+        expected_version: Option<i64>,
+    ) -> SyncResult;
+
+    /// Pull learning snapshot with version for optimistic locking.
+    ///
+    /// Returns `None` if no snapshot exists, or `Some((json, version))`.
+    async fn pull_learning_versioned(
+        &self,
+        user_id: &str,
+        profile: &str,
+    ) -> Result<Option<VersionedSnapshot>, String>;
+
+    /// Push a user preference to cloud.
+    async fn push_preference(&self, user_id: &str, key: &str, value: &str) -> SyncResult;
+
+    /// Pull a user preference from cloud.
+    async fn pull_preference(&self, user_id: &str, key: &str) -> Result<Option<String>, String>;
+
+    /// Pull all preferences for a user.
+    async fn pull_all_preferences(&self, user_id: &str) -> Result<Vec<(String, String)>, String>;
+
+    /// JSON array of [`PlanTemplateSyncRow`] for the user plus global rows (`user_id IS NULL`).
+    async fn pull_plan_templates_pack(&self, user_id: &str) -> Result<String, String>;
+
+    /// JSON array of [`crate::task_orchestrator::TaskRecord`] for the user (`agent_tasks`).
+    async fn pull_tasks_pack(&self, user_id: &str) -> Result<String, String>;
+
+    /// Apply a task pack from an edge that holds valid leases (`holder_agent_id`).
+    async fn push_tasks_pack_held(
+        &self,
+        user_id: &str,
+        holder_agent_id: &str,
+        pack_json: &str,
+    ) -> Result<crate::multi_agent::TasksPackPushResult, String>;
+
+    /// Push a delta snapshot containing only changed data.
+    ///
+    /// Delta sync reduces bandwidth by ~90%: full snapshot is ~40KB, delta is 2-5KB.
+    ///
+    /// The delta is applied incrementally on the server:
+    /// 1. Fetch current snapshot from cloud
+    /// 2. Merge delta entries (replace by key for entities/patterns, full for calibration)
+    /// 3. Store merged result with incremented version
+    ///
+    /// Uses optimistic locking internally; returns conflict if version mismatch.
+    ///
+    /// # Arguments
+    /// - `delta_json`: JSON-serialized DeltaSnapshot
+    /// - `expected_version`: The version returned by the last `pull_learning_versioned`
+    async fn push_delta(
+        &self,
+        user_id: &str,
+        profile: &str,
+        delta_json: &str,
+        expected_version: Option<i64>,
+    ) -> SyncResult;
+
+    /// Get current sync status.
+    async fn status(&self) -> SyncStatus;
+}
+
+// ─── Local-Only Implementation (No Cloud) ───────────────────────────────────
+
+/// No-op implementation for edge-only mode.
+/// All operations succeed instantly without network calls.
+pub struct LocalOnlySyncService;
+
+#[async_trait]
+impl StateSyncService for LocalOnlySyncService {
+    async fn push_learning_versioned(
+        &self,
+        _user_id: &str,
+        _profile: &str,
+        _snapshot_json: &str,
+        _entity_count: u32,
+        _pattern_count: u32,
+        _has_calibration: bool,
+        _expected_version: Option<i64>,
+    ) -> SyncResult {
+        // Local-only: always succeeds with version 0
+        SyncResult::ok_with_version(SyncDirection::Push, "learning", 0, 0)
+    }
+
+    async fn pull_learning_versioned(
+        &self,
+        _user_id: &str,
+        _profile: &str,
+    ) -> Result<Option<VersionedSnapshot>, String> {
+        Ok(None)
+    }
+
+    async fn push_preference(&self, _user_id: &str, _key: &str, _value: &str) -> SyncResult {
+        SyncResult::ok(SyncDirection::Push, "preference", 0)
+    }
+
+    async fn pull_preference(&self, _user_id: &str, _key: &str) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+
+    async fn pull_all_preferences(&self, _user_id: &str) -> Result<Vec<(String, String)>, String> {
+        Ok(Vec::new())
+    }
+
+    async fn pull_plan_templates_pack(&self, _user_id: &str) -> Result<String, String> {
+        Ok("[]".to_string())
+    }
+
+    async fn pull_tasks_pack(&self, _user_id: &str) -> Result<String, String> {
+        Ok("[]".to_string())
+    }
+
+    async fn push_tasks_pack_held(
+        &self,
+        _user_id: &str,
+        _holder_agent_id: &str,
+        _pack_json: &str,
+    ) -> Result<crate::multi_agent::TasksPackPushResult, String> {
+        Ok(crate::multi_agent::TasksPackPushResult::default())
+    }
+
+    async fn push_delta(
+        &self,
+        _user_id: &str,
+        _profile: &str,
+        _delta_json: &str,
+        _expected_version: Option<i64>,
+    ) -> SyncResult {
+        // Local-only: always succeeds with version 0
+        SyncResult::ok_with_version(SyncDirection::Push, "delta", 0, 0)
+    }
+
+    async fn status(&self) -> SyncStatus {
+        SyncStatus::default()
+    }
+}
+
+// ─── MatrixOne Cloud Implementation ─────────────────────────────────────────
+
+/// Full cloud sync via MatrixOne database.
+///
+/// Uses sqlx connection pool for async operations. Strongly-consistent state uses
+/// explicit update/insert flows, while audit-style records remain append-only.
+///
+/// Tables used:
+/// - `learning_snapshots` — cross-session learning state
+/// - `user_preferences` — user settings
+/// - `session_sync_log` — audit trail
+pub struct MatrixOneSyncService {
+    pool: sqlx::Pool<sqlx::MySql>,
+}
+
+impl MatrixOneSyncService {
+    /// Create from an existing connection pool.
+    pub fn new(pool: sqlx::Pool<sqlx::MySql>) -> Self {
+        Self { pool }
+    }
+
+    /// Log a sync operation to the audit table.
+    #[allow(clippy::too_many_arguments)]
+    async fn log_sync(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        sync_type: &str,
+        direction: SyncDirection,
+        payload_size: usize,
+        status: &str,
+        error_msg: Option<&str>,
+    ) {
+        let dir_str = match direction {
+            SyncDirection::Push => "push",
+            SyncDirection::Pull => "pull",
+        };
+        let inserted = sqlx::query(
+            "INSERT INTO session_sync_log \
+             (sync_id, user_id, session_id, sync_type, sync_direction, payload_size, status, error_message, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(user_id)
+        .bind(session_id)
+        .bind(sync_type)
+        .bind(dir_str)
+        .bind(payload_size as i64)
+        .bind(status)
+        .bind(error_msg)
+        .execute(&self.pool)
+        .await;
+
+        if inserted.is_ok()
+            && let Some(retain) = sync_log_retain_limit(status)
+        {
+            self.prune_sync_logs(user_id, status, retain).await;
+        }
+    }
+
+    async fn prune_sync_logs(&self, user_id: &str, status: &str, retain: usize) {
+        let _ = sqlx::query(build_sync_log_prune_query())
+            .bind(user_id)
+            .bind(status)
+            .bind(user_id)
+            .bind(status)
+            .bind(retain as i64)
+            .execute(&self.pool)
+            .await;
+    }
+}
+
+#[async_trait]
+impl StateSyncService for MatrixOneSyncService {
+    async fn push_learning_versioned(
+        &self,
+        user_id: &str,
+        profile: &str,
+        snapshot_json: &str,
+        entity_count: u32,
+        pattern_count: u32,
+        has_calibration: bool,
+        expected_version: Option<i64>,
+    ) -> SyncResult {
+        let snapshot_id = uuid::Uuid::new_v4().to_string();
+        let has_cal = if has_calibration { 1i32 } else { 0 };
+        let compressed_snapshot = match compress_json_payload(snapshot_json) {
+            Ok(value) => value,
+            Err(e) => return SyncResult::err(SyncDirection::Push, "learning", e),
+        };
+
+        // Retry loop with exponential backoff for transient network errors
+        let mut backoff_ms = INITIAL_BACKOFF_MS;
+
+        match expected_version {
+            Some(ver) => {
+                for attempt in 0..=MAX_RETRIES {
+                    // Optimistic lock: UPDATE only if version matches
+                    let updated = sqlx::query(
+                        "UPDATE learning_snapshots SET \
+                            snapshot_json = ?, \
+                            entity_count = ?, \
+                            pattern_count = ?, \
+                            has_calibration = ?, \
+                            version = version + 1, \
+                            updated_at = NOW() \
+                         WHERE user_id = ? AND profile_name = ? AND version = ?",
+                    )
+                    .bind(&compressed_snapshot)
+                    .bind(entity_count as i64)
+                    .bind(pattern_count as i64)
+                    .bind(has_cal)
+                    .bind(user_id)
+                    .bind(profile)
+                    .bind(ver)
+                    .execute(&self.pool)
+                    .await;
+
+                    match updated {
+                        Ok(r) if r.rows_affected() > 0 => {
+                            let new_ver = ver + 1;
+                            self.log_sync(
+                                user_id,
+                                "",
+                                "learning_versioned",
+                                SyncDirection::Push,
+                                compressed_snapshot.len(),
+                                "success",
+                                None,
+                            )
+                            .await;
+                            return SyncResult::ok_with_version(
+                                SyncDirection::Push,
+                                "learning",
+                                1,
+                                new_ver,
+                            );
+                        }
+                        Ok(_) => {
+                            // No rows affected — version mismatch (conflict)
+                            // Don't retry conflicts — they need caller to pull fresh data
+                            self.log_sync(
+                                user_id,
+                                "",
+                                "learning_versioned",
+                                SyncDirection::Push,
+                                0,
+                                "conflict",
+                                Some(&format!("expected version {ver}")),
+                            )
+                            .await;
+                            return SyncResult::conflict(
+                                SyncDirection::Push,
+                                "learning",
+                                format!(
+                                    "version conflict: expected {ver}, snapshot was modified by another session"
+                                ),
+                            );
+                        }
+                        Err(e) => {
+                            if attempt < MAX_RETRIES && is_retryable_error(&e) {
+                                eprintln!(
+                                    "  ↻ push_learning_versioned retry {} of {}: {}",
+                                    attempt + 1,
+                                    MAX_RETRIES,
+                                    &e
+                                );
+                                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                                backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
+                                continue;
+                            }
+                            let msg = format!("push_learning_versioned: {e}");
+                            self.log_sync(
+                                user_id,
+                                "",
+                                "learning_versioned",
+                                SyncDirection::Push,
+                                0,
+                                "error",
+                                Some(&msg),
+                            )
+                            .await;
+                            return SyncResult::err(SyncDirection::Push, "learning", msg);
+                        }
+                    }
+                }
+                // Max retries exceeded (shouldn't reach here normally)
+                SyncResult::err(
+                    SyncDirection::Push,
+                    "learning",
+                    "push_learning_versioned: max retries exceeded",
+                )
+            }
+            None => {
+                // No expected version — create new (fail if exists)
+                for attempt in 0..=MAX_RETRIES {
+                    let inserted = sqlx::query(
+                        "INSERT INTO learning_snapshots \
+                         (snapshot_id, user_id, profile_name, snapshot_json, entity_count, \
+                          pattern_count, has_calibration, version, created_at, updated_at) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, 1, NOW(), NOW())",
+                    )
+                    .bind(&snapshot_id)
+                    .bind(user_id)
+                    .bind(profile)
+                    .bind(&compressed_snapshot)
+                    .bind(entity_count as i64)
+                    .bind(pattern_count as i64)
+                    .bind(has_cal)
+                    .execute(&self.pool)
+                    .await;
+
+                    match inserted {
+                        Ok(_) => {
+                            self.log_sync(
+                                user_id,
+                                "",
+                                "learning_versioned",
+                                SyncDirection::Push,
+                                compressed_snapshot.len(),
+                                "success",
+                                None,
+                            )
+                            .await;
+                            return SyncResult::ok_with_version(
+                                SyncDirection::Push,
+                                "learning",
+                                1,
+                                1,
+                            );
+                        }
+                        Err(e) => {
+                            let msg = format!("push_learning_versioned (new): {e}");
+                            if is_duplicate_key_error(&e) {
+                                self.log_sync(
+                                    user_id,
+                                    "",
+                                    "learning_versioned",
+                                    SyncDirection::Push,
+                                    0,
+                                    "conflict",
+                                    Some(&msg),
+                                )
+                                .await;
+                                return SyncResult::conflict(
+                                    SyncDirection::Push,
+                                    "learning",
+                                    "snapshot already exists; use expected_version to update",
+                                );
+                            }
+                            // Check for retryable network error
+                            if attempt < MAX_RETRIES && is_retryable_error(&e) {
+                                eprintln!(
+                                    "  ↻ push_learning_versioned (new) retry {} of {}: {}",
+                                    attempt + 1,
+                                    MAX_RETRIES,
+                                    &e
+                                );
+                                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                                backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
+                                continue;
+                            }
+                            self.log_sync(
+                                user_id,
+                                "",
+                                "learning_versioned",
+                                SyncDirection::Push,
+                                0,
+                                "error",
+                                Some(&msg),
+                            )
+                            .await;
+                            return SyncResult::err(SyncDirection::Push, "learning", msg);
+                        }
+                    }
+                }
+                // Max retries exceeded
+                SyncResult::err(
+                    SyncDirection::Push,
+                    "learning",
+                    "push_learning_versioned (new): max retries exceeded",
+                )
+            }
+        }
+    }
+
+    async fn pull_learning_versioned(
+        &self,
+        user_id: &str,
+        profile: &str,
+    ) -> Result<Option<VersionedSnapshot>, String> {
+        // Retry loop with exponential backoff for transient network errors
+        let mut last_error = None;
+        let mut backoff_ms = INITIAL_BACKOFF_MS;
+
+        for attempt in 0..=MAX_RETRIES {
+            let row = sqlx::query(
+                "SELECT snapshot_json, version FROM learning_snapshots \
+                 WHERE user_id = ? AND profile_name = ? \
+                 ORDER BY updated_at DESC LIMIT 1",
+            )
+            .bind(user_id)
+            .bind(profile)
+            .fetch_optional(&self.pool)
+            .await;
+
+            match row {
+                Ok(Some(row)) => {
+                    use sqlx::Row;
+                    let json: String = row
+                        .try_get("snapshot_json")
+                        .map_err(|e| format!("pull_learning_versioned decode json: {e}"))?;
+                    let decompressed = decompress_json_payload(&json)
+                        .map_err(|e| format!("pull_learning_versioned unzip json: {e}"))?;
+                    let version: i64 = row
+                        .try_get("version")
+                        .map_err(|e| format!("pull_learning_versioned decode version: {e}"))?;
+                    self.log_sync(
+                        user_id,
+                        "",
+                        "learning_versioned",
+                        SyncDirection::Pull,
+                        json.len(),
+                        "success",
+                        None,
+                    )
+                    .await;
+                    return Ok(Some(VersionedSnapshot {
+                        json: decompressed,
+                        version,
+                    }));
+                }
+                Ok(None) => return Ok(None),
+                Err(e) => {
+                    if attempt < MAX_RETRIES && is_retryable_error(&e) {
+                        eprintln!(
+                            "  ↻ pull_learning_versioned retry {} of {}: {}",
+                            attempt + 1,
+                            MAX_RETRIES,
+                            &e
+                        );
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                        backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
+                        last_error = Some(e);
+                        continue;
+                    }
+                    return Err(format!("pull_learning_versioned: {e}"));
+                }
+            }
+        }
+
+        // Max retries exceeded
+        Err(format!(
+            "pull_learning_versioned: max retries exceeded: {}",
+            last_error.map(|e| e.to_string()).unwrap_or_default()
+        ))
+    }
+
+    async fn push_preference(&self, user_id: &str, key: &str, value: &str) -> SyncResult {
+        let pref_id = uuid::Uuid::new_v4().to_string();
+
+        // Read current value + version for audit trail
+        let old_row = sqlx::query(
+            "SELECT pref_value, version FROM user_preferences WHERE user_id = ? AND pref_key = ?",
+        )
+        .bind(user_id)
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten();
+
+        let (old_value, old_version): (Option<String>, Option<i32>) = {
+            use sqlx::Row;
+            match &old_row {
+                Some(row) => (row.try_get("pref_value").ok(), row.try_get("version").ok()),
+                None => (None, None),
+            }
+        };
+
+        // Skip write if value unchanged
+        if old_value.as_deref() == Some(value) {
+            return SyncResult::ok(SyncDirection::Push, "preference", 0);
+        }
+
+        let new_version = old_version.unwrap_or(0) + 1;
+
+        // Upsert with version increment
+        let update_result = sqlx::query(
+            "UPDATE user_preferences SET pref_value = ?, version = ?, updated_at = NOW() \
+             WHERE user_id = ? AND pref_key = ?",
+        )
+        .bind(value)
+        .bind(new_version)
+        .bind(user_id)
+        .bind(key)
+        .execute(&self.pool)
+        .await;
+
+        let result = match update_result {
+            Ok(r) if r.rows_affected() > 0 => Ok(r),
+            Ok(_) => {
+                let inserted = sqlx::query(
+                    "INSERT INTO user_preferences (pref_id, user_id, pref_key, pref_value, version, updated_at) \
+                     VALUES (?, ?, ?, ?, ?, NOW())",
+                )
+                .bind(&pref_id)
+                .bind(user_id)
+                .bind(key)
+                .bind(value)
+                .bind(new_version)
+                .execute(&self.pool)
+                .await;
+
+                match inserted {
+                    Ok(r) => Ok(r),
+                    Err(e) if is_duplicate_key_error(&e) => {
+                        sqlx::query(
+                            "UPDATE user_preferences SET pref_value = ?, version = ?, updated_at = NOW() \
+                             WHERE user_id = ? AND pref_key = ?",
+                        )
+                        .bind(value)
+                        .bind(new_version)
+                        .bind(user_id)
+                        .bind(key)
+                        .execute(&self.pool)
+                        .await
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            Err(e) => Err(e),
+        };
+
+        // Write audit trail (best-effort, don't fail the push)
+        if result.is_ok() {
+            let history_id = uuid::Uuid::new_v4().to_string();
+            let _ = sqlx::query(
+                "INSERT INTO user_preference_history \
+                 (history_id, user_id, pref_key, old_value, new_value, old_version, new_version, source) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, 'edge')",
+            )
+            .bind(&history_id)
+            .bind(user_id)
+            .bind(key)
+            .bind(&old_value)
+            .bind(value)
+            .bind(old_version)
+            .bind(new_version)
+            .execute(&self.pool)
+            .await;
+        }
+
+        match result {
+            Ok(_) => SyncResult::ok(SyncDirection::Push, "preference", 1),
+            Err(e) => SyncResult::err(SyncDirection::Push, "preference", format!("push_pref: {e}")),
+        }
+    }
+
+    async fn pull_preference(&self, user_id: &str, key: &str) -> Result<Option<String>, String> {
+        let row = sqlx::query(
+            "SELECT pref_value FROM user_preferences WHERE user_id = ? AND pref_key = ?",
+        )
+        .bind(user_id)
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| format!("pull_pref: {e}"))?;
+
+        match row {
+            Some(row) => {
+                use sqlx::Row;
+                let val: String = row
+                    .try_get("pref_value")
+                    .map_err(|e| format!("pull_pref decode: {e}"))?;
+                Ok(Some(val))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn pull_all_preferences(&self, user_id: &str) -> Result<Vec<(String, String)>, String> {
+        let rows = sqlx::query(
+            "SELECT pref_key, pref_value \
+             FROM user_preferences \
+             WHERE user_id = ? \
+             ORDER BY pref_key \
+             LIMIT ?",
+        )
+        .bind(user_id)
+        .bind(MAX_PREFERENCE_SYNC_ROWS)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("pull_all_prefs: {e}"))?;
+
+        use sqlx::Row;
+        let prefs = rows
+            .iter()
+            .filter_map(|row| {
+                let key: String = row.try_get("pref_key").ok()?;
+                let val: String = row.try_get("pref_value").ok()?;
+                Some((key, val))
+            })
+            .collect();
+        Ok(prefs)
+    }
+
+    async fn pull_plan_templates_pack(&self, user_id: &str) -> Result<String, String> {
+        let rows = sqlx::query(
+            "SELECT template_id, user_id, goal_pattern, project_type, template_json, \
+              success_rate, avg_completion_time, use_count \
+              FROM plan_templates \
+              WHERE user_id = ? OR user_id IS NULL \
+              ORDER BY updated_at DESC \
+              LIMIT ?",
+        )
+        .bind(user_id)
+        .bind(MAX_PLAN_TEMPLATE_SYNC_ROWS)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("pull_plan_templates_pack: {e}"))?;
+
+        use sqlx::Row;
+        let mut items: Vec<PlanTemplateSyncRow> = Vec::with_capacity(rows.len());
+        for row in rows {
+            let template_id: String = row
+                .try_get("template_id")
+                .map_err(|e| format!("pull_plan_templates_pack template_id: {e}"))?;
+            let user_id_col: Option<String> = row
+                .try_get("user_id")
+                .map_err(|e| format!("pull_plan_templates_pack user_id: {e}"))?;
+            let goal_pattern: String = row
+                .try_get("goal_pattern")
+                .map_err(|e| format!("pull_plan_templates_pack goal_pattern: {e}"))?;
+            let project_type: Option<String> = row
+                .try_get("project_type")
+                .map_err(|e| format!("pull_plan_templates_pack project_type: {e}"))?;
+            let template_json: String = row
+                .try_get("template_json")
+                .map_err(|e| format!("pull_plan_templates_pack template_json: {e}"))?;
+            let success_rate: f32 = row
+                .try_get::<f64, _>("success_rate")
+                .map_err(|e| format!("pull_plan_templates_pack success_rate: {e}"))?
+                as f32;
+            let avg_completion_time: Option<i32> = row
+                .try_get("avg_completion_time")
+                .map_err(|e| format!("pull_plan_templates_pack avg_completion_time: {e}"))?;
+            let use_count: i32 = row
+                .try_get::<i64, _>("use_count")
+                .map_err(|e| format!("pull_plan_templates_pack use_count: {e}"))?
+                as i32;
+            items.push(PlanTemplateSyncRow {
+                template_id,
+                user_id: user_id_col,
+                goal_pattern,
+                project_type,
+                template_json,
+                success_rate,
+                avg_completion_time,
+                use_count,
+            });
+        }
+        serde_json::to_string(&items).map_err(|e| format!("pull_plan_templates_pack json: {e}"))
+    }
+
+    async fn pull_tasks_pack(&self, user_id: &str) -> Result<String, String> {
+        crate::multi_agent::pull_tasks_pack_mysql(&self.pool, user_id).await
+    }
+
+    async fn push_tasks_pack_held(
+        &self,
+        user_id: &str,
+        holder_agent_id: &str,
+        pack_json: &str,
+    ) -> Result<crate::multi_agent::TasksPackPushResult, String> {
+        crate::multi_agent::push_tasks_pack_held_mysql(
+            &self.pool,
+            user_id,
+            holder_agent_id,
+            pack_json,
+        )
+        .await
+    }
+
+    async fn status(&self) -> SyncStatus {
+        // Query latest sync timestamps from audit log
+        let learning_push = sqlx::query(
+            "SELECT CAST(created_at AS CHAR) AS created_at FROM session_sync_log \
+             WHERE sync_type = 'learning' AND sync_direction = 'push' AND status = 'success' \
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|row| {
+            use sqlx::Row;
+            row.try_get::<String, _>("created_at").ok()
+        });
+
+        let learning_pull = sqlx::query(
+            "SELECT CAST(created_at AS CHAR) AS created_at FROM session_sync_log \
+             WHERE sync_type = 'learning' AND sync_direction = 'pull' AND status = 'success' \
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|row| {
+            use sqlx::Row;
+            row.try_get::<String, _>("created_at").ok()
+        });
+
+        let pending: u32 =
+            sqlx::query("SELECT COUNT(*) as cnt FROM session_sync_log WHERE status = 'pending'")
+                .fetch_optional(&self.pool)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|row| {
+                    use sqlx::Row;
+                    row.try_get::<i64, _>("cnt").ok().map(|c| c as u32)
+                })
+                .unwrap_or(0);
+
+        let last_err = sqlx::query(
+            "SELECT error_message FROM session_sync_log \
+             WHERE status = 'error' ORDER BY created_at DESC LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|row| {
+            use sqlx::Row;
+            row.try_get::<Option<String>, _>("error_message")
+                .ok()
+                .flatten()
+        });
+
+        SyncStatus {
+            learning_last_push: learning_push,
+            learning_last_pull: learning_pull,
+            preferences_last_sync: None,
+            pending_pushes: pending,
+            last_error: last_err,
+            cloud_version: None, // Could be fetched from DB if needed
+        }
+    }
+
+    async fn push_delta(
+        &self,
+        user_id: &str,
+        profile: &str,
+        delta_json: &str,
+        expected_version: Option<i64>,
+    ) -> SyncResult {
+        // Parse the delta JSON
+        let delta: DeltaSnapshot = match serde_json::from_str(delta_json) {
+            Ok(d) => d,
+            Err(e) => {
+                return SyncResult::err(SyncDirection::Push, "delta", format!("parse delta: {e}"));
+            }
+        };
+        // If delta is empty, skip the push entirely
+        if delta.is_empty() {
+            return SyncResult::ok_with_version(
+                SyncDirection::Push,
+                "delta",
+                0,
+                expected_version.unwrap_or(0),
+            );
+        }
+
+        // Delta sync algorithm:
+        // 1. Fetch current snapshot + version
+        // 2. Deserialize and merge delta entries
+        // 3. Push merged result with version check
+
+        // Step 1: Pull current snapshot
+        let (current_json, current_version) = match self
+            .pull_learning_versioned(user_id, profile)
+            .await
+        {
+            Ok(Some(snap)) => (snap.json, snap.version),
+            Ok(None) => {
+                // No existing snapshot - create from delta only
+                let snapshot = create_snapshot_from_delta(&delta);
+                let json = serde_json::to_string(&snapshot).unwrap_or_default();
+                return self
+                    .push_learning_versioned(
+                        user_id,
+                        profile,
+                        &json,
+                        delta.entity_deltas.len() as u32,
+                        delta.pattern_deltas.len() as u32,
+                        delta.calibration.is_some(),
+                        None,
+                    )
+                    .await;
+            }
+            Err(e) => {
+                return SyncResult::err(SyncDirection::Push, "delta", format!("pull failed: {e}"));
+            }
+        };
+
+        // Check version for conflict
+        if let Some(expected) = expected_version
+            && current_version != expected
+        {
+            return SyncResult::conflict(
+                SyncDirection::Push,
+                "delta",
+                format!(
+                    "version mismatch: expected {}, found {}",
+                    expected, current_version
+                ),
+            );
+        }
+
+        // Step 2: Parse and merge
+        let merged_json = match merge_delta_into_snapshot(&current_json, &delta) {
+            Ok(j) => j,
+            Err(e) => {
+                return SyncResult::err(SyncDirection::Push, "delta", format!("merge failed: {e}"));
+            }
+        };
+
+        // Step 3: Push merged result with optimistic locking
+        // Note: Delta sync stats could be logged at the caller level
+        // delta_items = delta.delta_count
+        // delta_size = delta.approx_size()
+        // full_size = merged_json.len()
+        // reduction_pct = 100 - (delta_size * 100 / full_size.max(1))
+        self.push_learning_versioned(
+            user_id,
+            profile,
+            &merged_json,
+            delta.entity_deltas.len() as u32,
+            delta.pattern_deltas.len() as u32,
+            delta.calibration.is_some(),
+            Some(current_version),
+        )
+        .await
+    }
+}
+
+// ─── Delta Sync Helpers ─────────────────────────────────────────────────────
+
+/// Create a new snapshot from delta entries only (when no existing snapshot exists).
+fn create_snapshot_from_delta(delta: &DeltaSnapshot) -> serde_json::Value {
+    serde_json::json!({
+        "entities": delta.entity_deltas,
+        "patterns": delta.pattern_deltas,
+        "calibration": delta.calibration,
+        "tool_health": delta.tool_health_deltas,
+    })
+}
+
+/// Merge delta entries into an existing snapshot JSON.
+///
+/// Merge strategy:
+/// - entities: Replace by "name" key
+/// - patterns: Replace by "signature" key
+/// - calibration: Full replacement
+/// - tool_health: Replace by "name" key
+fn merge_delta_into_snapshot(snapshot_json: &str, delta: &DeltaSnapshot) -> Result<String, String> {
+    let mut snapshot: serde_json::Value =
+        serde_json::from_str(snapshot_json).map_err(|e| format!("parse snapshot: {e}"))?;
+
+    // Merge entities by name
+    if !delta.entity_deltas.is_empty() {
+        let entities = snapshot.get_mut("entities").and_then(|v| v.as_array_mut());
+        if let Some(arr) = entities {
+            for entity_delta in &delta.entity_deltas {
+                if let Some(name) = entity_delta.get("name").and_then(|v| v.as_str()) {
+                    // Find and replace existing, or append
+                    let pos = arr
+                        .iter()
+                        .position(|e| e.get("name").and_then(|v| v.as_str()) == Some(name));
+                    if let Some(idx) = pos {
+                        arr[idx] = entity_delta.clone();
+                    } else {
+                        arr.push(entity_delta.clone());
+                    }
+                }
+            }
+        } else {
+            // No entities array - create one
+            snapshot["entities"] = serde_json::Value::Array(delta.entity_deltas.clone());
+        }
+    }
+
+    // Merge patterns by signature
+    if !delta.pattern_deltas.is_empty() {
+        let patterns = snapshot.get_mut("patterns").and_then(|v| v.as_array_mut());
+        if let Some(arr) = patterns {
+            for pattern_delta in &delta.pattern_deltas {
+                if let Some(sig) = pattern_delta.get("signature").and_then(|v| v.as_str()) {
+                    let pos = arr
+                        .iter()
+                        .position(|p| p.get("signature").and_then(|v| v.as_str()) == Some(sig));
+                    if let Some(idx) = pos {
+                        arr[idx] = pattern_delta.clone();
+                    } else {
+                        arr.push(pattern_delta.clone());
+                    }
+                }
+            }
+        } else {
+            snapshot["patterns"] = serde_json::Value::Array(delta.pattern_deltas.clone());
+        }
+    }
+
+    // Calibration: full replacement
+    if let Some(cal) = &delta.calibration {
+        snapshot["calibration"] = cal.clone();
+    }
+
+    // Merge tool_health by name
+    if !delta.tool_health_deltas.is_empty() {
+        let tool_health = snapshot
+            .get_mut("tool_health")
+            .and_then(|v| v.as_array_mut());
+        if let Some(arr) = tool_health {
+            for th_delta in &delta.tool_health_deltas {
+                if let Some(name) = th_delta.get("name").and_then(|v| v.as_str()) {
+                    let pos = arr
+                        .iter()
+                        .position(|t| t.get("name").and_then(|v| v.as_str()) == Some(name));
+                    if let Some(idx) = pos {
+                        arr[idx] = th_delta.clone();
+                    } else {
+                        arr.push(th_delta.clone());
+                    }
+                }
+            }
+        } else {
+            snapshot["tool_health"] = serde_json::Value::Array(delta.tool_health_deltas.clone());
+        }
+    }
+
+    serde_json::to_string(&snapshot).map_err(|e| format!("serialize merged: {e}"))
+}
+
+// ─── Preference Constants ───────────────────────────────────────────────────
+
+/// Well-known preference keys.
+pub mod pref_keys {
+    pub const EXPLAIN_MODE: &str = "explain_mode";
+    pub const DEFAULT_MODEL: &str = "default_model";
+    pub const TOOL_BUDGET: &str = "tool_budget_tokens";
+    pub const CHECKPOINT_INTERVAL: &str = "checkpoint_interval";
+    pub const FOCUS_ENTITIES: &str = "focus_entities";
+    pub const LANGUAGE: &str = "language";
+    /// JSON array of persistently blocked tool names (survives across sessions).
+    pub const BLOCKED_TOOLS: &str = "blocked_tools";
+}
+
+// ─── File-based Preference Store ────────────────────────────────────────────
+
+/// Load preferences from a local JSON file.
+pub fn load_local_preferences(path: &Path) -> Result<Vec<(String, String)>, String> {
+    let data = match std::fs::read_to_string(path) {
+        Ok(d) => d,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let map: std::collections::HashMap<String, String> =
+        serde_json::from_str(&data).map_err(|e| format!("parse prefs: {e}"))?;
+    Ok(map.into_iter().collect())
+}
+
+/// Save preferences to a local JSON file (atomic write).
+pub fn save_local_preferences(path: &Path, prefs: &[(String, String)]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
+    }
+    let map: std::collections::HashMap<&str, &str> = prefs
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let json = serde_json::to_string_pretty(&map).map_err(|e| format!("serialize: {e}"))?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &json).map_err(|e| format!("write: {e}"))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("rename: {e}"))?;
+    Ok(())
+}
+
+// ─── Tests ──────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    // ── SyncResult ──
+
+    #[test]
+    fn sync_result_ok_and_err() {
+        let ok = SyncResult::ok(SyncDirection::Push, "learning", 5);
+        assert!(ok.success);
+        assert_eq!(ok.items_synced, 5);
+        assert_eq!(ok.direction, SyncDirection::Push);
+
+        let err = SyncResult::err(SyncDirection::Pull, "learning", "network timeout");
+        assert!(!err.success);
+        assert_eq!(err.message, "network timeout");
+    }
+
+    // ── LocalOnlySyncService ──
+
+    #[tokio::test]
+    async fn local_only_push_versioned_succeeds() {
+        let svc = LocalOnlySyncService;
+        let result = svc
+            .push_learning_versioned("user1", "default", "{}", 0, 0, false, None)
+            .await;
+        assert!(result.success);
+    }
+
+    #[tokio::test]
+    async fn local_only_pull_returns_none() {
+        let svc = LocalOnlySyncService;
+        let result = svc.pull_learning_versioned("user1", "default").await;
+        assert!(result.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn local_only_preferences() {
+        let svc = LocalOnlySyncService;
+        let push = svc.push_preference("user1", "key", "value").await;
+        assert!(push.success);
+        let pull = svc.pull_preference("user1", "key").await;
+        assert!(pull.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn local_only_plan_templates_pack_is_empty_array() {
+        let svc = LocalOnlySyncService;
+        let j = svc.pull_plan_templates_pack("u1").await.unwrap();
+        assert_eq!(j, "[]");
+    }
+
+    #[test]
+    fn plan_template_sync_row_limit_is_bounded() {
+        assert_eq!(MAX_PLAN_TEMPLATE_SYNC_ROWS, 500);
+    }
+
+    // ── File-based preferences ──
+
+    #[test]
+    fn preferences_roundtrip_file() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("prefs.json");
+
+        let prefs = vec![
+            ("model".to_string(), "gpt-4".to_string()),
+            ("language".to_string(), "zh-CN".to_string()),
+        ];
+        save_local_preferences(&path, &prefs).unwrap();
+
+        let loaded = load_local_preferences(&path).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded.iter().any(|(k, v)| k == "model" && v == "gpt-4"));
+    }
+
+    #[test]
+    fn load_nonexistent_preferences_returns_empty() {
+        let prefs = load_local_preferences(Path::new("/nonexistent/prefs.json")).unwrap();
+        assert!(prefs.is_empty());
+    }
+
+    #[test]
+    fn preferences_atomic_write() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("atomic-prefs.json");
+
+        save_local_preferences(&path, &[("k".into(), "v".into())]).unwrap();
+        assert!(path.exists());
+        assert!(!path.with_extension("json.tmp").exists());
+    }
+
+    // ── Preference key constants ──
+
+    #[test]
+    fn pref_keys_are_defined() {
+        assert_eq!(pref_keys::EXPLAIN_MODE, "explain_mode");
+        assert_eq!(pref_keys::DEFAULT_MODEL, "default_model");
+        assert_eq!(pref_keys::TOOL_BUDGET, "tool_budget_tokens");
+    }
+
+    // ── SyncStatus ──
+
+    #[test]
+    fn sync_status_default_is_clean() {
+        let status = SyncStatus::default();
+        assert!(status.learning_last_push.is_none());
+        assert_eq!(status.pending_pushes, 0);
+        assert!(status.last_error.is_none());
+    }
+
+    // ── Serialization ──
+
+    #[test]
+    fn sync_result_json_roundtrip() {
+        let result = SyncResult::ok(SyncDirection::Push, "learning", 3);
+        let json = serde_json::to_string(&result).unwrap();
+        let loaded: SyncResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.items_synced, 3);
+        assert!(loaded.success);
+    }
+
+    #[test]
+    fn compressed_payload_roundtrips_json() {
+        let original =
+            r#"{"entities":[{"name":"tool","count":3}],"patterns":[{"signature":"abc"}]}"#;
+
+        let encoded = compress_json_payload(original).unwrap();
+        let restored = decompress_json_payload(&encoded).unwrap();
+
+        assert_ne!(encoded, original);
+        assert_eq!(restored, original);
+    }
+
+    #[test]
+    fn decompress_rejects_plain_json_storage() {
+        let err = decompress_json_payload(r#"{"entities":[]}"#).unwrap_err();
+        assert!(err.contains("base64 decode"));
+    }
+
+    #[test]
+    fn sync_log_retention_limits_are_bounded() {
+        assert_eq!(
+            sync_log_retain_limit("success"),
+            Some(SYNC_LOG_SUCCESS_RETAIN)
+        );
+        assert_eq!(sync_log_retain_limit("error"), Some(SYNC_LOG_ERROR_RETAIN));
+        assert_eq!(sync_log_retain_limit("pending"), None);
+    }
+
+    #[test]
+    fn prune_query_keeps_latest_rows_for_user_and_status() {
+        let query = build_sync_log_prune_query();
+
+        assert!(query.contains("DELETE FROM session_sync_log"));
+        assert!(query.contains("WHERE user_id = ? AND status = ?"));
+        assert!(query.contains("SELECT sync_id FROM session_sync_log"));
+        assert!(query.contains("ORDER BY created_at DESC"));
+        assert!(query.contains("LIMIT ?"));
+    }
+
+    #[tokio::test]
+    async fn local_only_status_is_default() {
+        let svc = LocalOnlySyncService;
+        let status = svc.status().await;
+        assert!(status.last_error.is_none());
+        assert_eq!(status.pending_pushes, 0);
+    }
+
+    // ── MatrixOneSyncService tests (mock-based) ──
+
+    #[test]
+    fn sync_direction_serializes_correctly() {
+        // Verify JSON serialization of direction (used in sync logs)
+        let push_json = serde_json::to_string(&SyncDirection::Push).unwrap();
+        let pull_json = serde_json::to_string(&SyncDirection::Pull).unwrap();
+
+        assert_ne!(
+            push_json, pull_json,
+            "Push and Pull must serialize differently"
+        );
+
+        let push_back: SyncDirection = serde_json::from_str(&push_json).unwrap();
+        let pull_back: SyncDirection = serde_json::from_str(&pull_json).unwrap();
+
+        assert_eq!(push_back, SyncDirection::Push);
+        assert_eq!(pull_back, SyncDirection::Pull);
+    }
+
+    #[test]
+    fn sync_result_ok_contains_expected_fields() {
+        let result = SyncResult::ok(SyncDirection::Push, "learning", 5);
+
+        assert!(result.success);
+        assert_eq!(result.direction, SyncDirection::Push);
+        assert_eq!(result.sync_type, "learning");
+        assert_eq!(result.items_synced, 5);
+        assert_eq!(result.message, "ok");
+    }
+
+    #[test]
+    fn sync_result_err_contains_error_message() {
+        let result = SyncResult::err(SyncDirection::Pull, "preferences", "connection refused");
+
+        assert!(!result.success);
+        assert_eq!(result.direction, SyncDirection::Pull);
+        assert_eq!(result.sync_type, "preferences");
+        assert_eq!(result.items_synced, 0);
+        assert_eq!(result.message, "connection refused");
+    }
+
+    #[test]
+    fn sync_result_json_roundtrip_preserves_all_fields() {
+        let original = SyncResult {
+            direction: SyncDirection::Push,
+            sync_type: "learning".to_string(),
+            success: true,
+            items_synced: 10,
+            message: "synced 10 entities".to_string(),
+            new_version: Some(5),
+            is_conflict: false,
+        };
+
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: SyncResult = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.direction, original.direction);
+        assert_eq!(restored.sync_type, original.sync_type);
+        assert_eq!(restored.success, original.success);
+        assert_eq!(restored.items_synced, original.items_synced);
+        assert_eq!(restored.message, original.message);
+        assert_eq!(restored.new_version, original.new_version);
+        assert_eq!(restored.is_conflict, original.is_conflict);
+    }
+
+    #[test]
+    fn sync_status_default_has_clean_state() {
+        let status = SyncStatus::default();
+
+        assert!(status.learning_last_push.is_none());
+        assert!(status.learning_last_pull.is_none());
+        assert!(status.preferences_last_sync.is_none());
+        assert_eq!(status.pending_pushes, 0);
+        assert!(status.last_error.is_none());
+        assert!(status.cloud_version.is_none());
+    }
+
+    #[test]
+    fn sync_status_with_values_roundtrips_through_json() {
+        let original = SyncStatus {
+            learning_last_push: Some("2024-01-01T00:00:00Z".to_string()),
+            learning_last_pull: Some("2024-01-02T00:00:00Z".to_string()),
+            preferences_last_sync: Some("2024-01-03T00:00:00Z".to_string()),
+            pending_pushes: 3,
+            last_error: Some("connection refused".to_string()),
+            cloud_version: Some(42),
+        };
+
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: SyncStatus = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.learning_last_push, original.learning_last_push);
+        assert_eq!(restored.pending_pushes, original.pending_pushes);
+        assert_eq!(restored.last_error, original.last_error);
+        assert_eq!(restored.cloud_version, original.cloud_version);
+    }
+
+    #[tokio::test]
+    async fn local_only_push_learning_is_noop_but_succeeds() {
+        let svc = LocalOnlySyncService;
+
+        let result = svc
+            .push_learning_versioned(
+                "user1",
+                "default",
+                r#"{"entities":[{"name":"test","count":5}]}"#,
+                1,
+                0,
+                true,
+                None,
+            )
+            .await;
+
+        assert!(result.success, "LocalOnly should always succeed");
+        assert_eq!(result.items_synced, 0, "LocalOnly doesn't actually sync");
+    }
+
+    #[tokio::test]
+    async fn local_only_pull_learning_returns_none_for_any_user() {
+        let svc = LocalOnlySyncService;
+
+        let result1 = svc.pull_learning_versioned("user1", "default").await;
+        let result2 = svc.pull_learning_versioned("user2", "work").await;
+
+        assert!(result1.unwrap().is_none());
+        assert!(result2.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn local_only_push_and_pull_preference_roundtrip() {
+        let svc = LocalOnlySyncService;
+
+        // Push preference
+        let push_result = svc.push_preference("user1", "model", "gpt-4").await;
+        assert!(push_result.success);
+
+        // Pull returns none (LocalOnly has no storage)
+        let pull_result = svc.pull_preference("user1", "model").await;
+        assert!(pull_result.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn local_only_pull_all_preferences_returns_empty() {
+        let svc = LocalOnlySyncService;
+
+        let result = svc.pull_all_preferences("user1").await;
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn preference_sync_row_limit_is_bounded() {
+        assert_eq!(MAX_PREFERENCE_SYNC_ROWS, 128);
+    }
+
+    #[tokio::test]
+    async fn local_only_status_reflects_no_activity() {
+        let svc = LocalOnlySyncService;
+
+        let status = svc.status().await;
+
+        assert!(status.last_error.is_none());
+        assert_eq!(status.pending_pushes, 0);
+        assert!(status.learning_last_push.is_none());
+    }
+
+    // ── Optimistic Locking Tests ──
+
+    #[tokio::test]
+    async fn local_only_versioned_push_succeeds_with_version_zero() {
+        let svc = LocalOnlySyncService;
+
+        let result = svc
+            .push_learning_versioned("user1", "default", "{}", 0, 0, false, None)
+            .await;
+
+        assert!(result.success);
+        assert_eq!(result.new_version, Some(0)); // LocalOnly always returns 0
+        assert!(!result.is_conflict);
+    }
+
+    #[tokio::test]
+    async fn local_only_versioned_pull_returns_none() {
+        let svc = LocalOnlySyncService;
+
+        let result = svc.pull_learning_versioned("user1", "default").await;
+
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn sync_result_conflict_has_is_conflict_flag() {
+        let result = SyncResult::conflict(SyncDirection::Push, "learning", "version mismatch");
+
+        assert!(!result.success);
+        assert!(result.is_conflict);
+        assert!(result.message.contains("version"));
+    }
+
+    #[test]
+    fn versioned_snapshot_roundtrips_through_json() {
+        let original = VersionedSnapshot {
+            json: r#"{"entities": []}"#.to_string(),
+            version: 42,
+        };
+
+        let serialized = serde_json::to_string(&original).unwrap();
+        let restored: VersionedSnapshot = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(restored.json, original.json);
+        assert_eq!(restored.version, original.version);
+    }
+
+    #[test]
+    fn sync_result_ok_with_version_includes_version() {
+        let result = SyncResult::ok_with_version(SyncDirection::Push, "learning", 1, 5);
+
+        assert!(result.success);
+        assert_eq!(result.new_version, Some(5));
+        assert!(!result.is_conflict);
+    }
+
+    // ── Retry logic tests ──
+
+    #[test]
+    fn is_retryable_error_io_errors() {
+        // IO errors should be retryable
+        let io_err = sqlx::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "connection reset",
+        ));
+        assert!(is_retryable_error(&io_err));
+    }
+
+    #[test]
+    fn is_retryable_error_pool_timeout() {
+        // Pool timeout should be retryable
+        let timeout_err = sqlx::Error::PoolTimedOut;
+        assert!(is_retryable_error(&timeout_err));
+    }
+
+    #[test]
+    fn is_retryable_error_protocol() {
+        // Protocol errors should be retryable
+        let proto_err = sqlx::Error::Protocol("unexpected packet".to_string());
+        assert!(is_retryable_error(&proto_err));
+    }
+
+    #[test]
+    fn is_retryable_error_non_retryable() {
+        // Column decode errors are not retryable
+        let decode_err = sqlx::Error::ColumnDecode {
+            index: "0".to_string(),
+            source: Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "bad data",
+            )),
+        };
+        assert!(!is_retryable_error(&decode_err));
+
+        // Type mismatch errors are not retryable
+        let type_err = sqlx::Error::TypeNotFound {
+            type_name: "unknown".to_string(),
+        };
+        assert!(!is_retryable_error(&type_err));
+    }
+
+    #[test]
+    fn retry_constants_are_reasonable() {
+        let max_retries = std::hint::black_box(MAX_RETRIES);
+        let initial_backoff_ms = std::hint::black_box(INITIAL_BACKOFF_MS);
+        let max_backoff_ms = std::hint::black_box(MAX_BACKOFF_MS);
+        // Verify retry constants are within expected ranges
+        assert!((2..=5).contains(&max_retries));
+        assert!((50..=500).contains(&initial_backoff_ms));
+        assert!((1000..=5000).contains(&max_backoff_ms));
+        // Ensure max backoff is greater than initial
+        assert!(max_backoff_ms > initial_backoff_ms);
+    }
+}

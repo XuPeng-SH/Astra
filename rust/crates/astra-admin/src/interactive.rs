@@ -1,0 +1,437 @@
+use std::{borrow::Cow, fs, path::PathBuf};
+
+use astra_thin_client::ThinClient;
+use astra_thin_client::paths;
+use crossterm::style::Stylize;
+use rustyline::{
+    CompletionType, Config, Context, Editor, Helper,
+    completion::{Completer, Pair},
+    error::ReadlineError,
+    highlight::Highlighter,
+    hint::Hinter,
+    history::FileHistory,
+    validate::{ValidationContext, ValidationResult, Validator},
+};
+
+use super::credentials::{load_credentials, profile_name, save_credentials};
+use super::http_helpers::{get_profile_and_token, map_thin_err, print_json_or_raw};
+
+const ADMIN_COMMANDS: &[(&str, &str)] = &[
+    ("whoami", "Show current user info"),
+    ("health", "Check API server health"),
+    ("init", "Initialize admin system"),
+    ("refresh", "Refresh access token"),
+    ("logout", "Logout and clear tokens"),
+    ("audit", "List audit log  (e.g. audit 50)"),
+    ("token list", "List API tokens"),
+    ("skill list", "List registered skills"),
+    (
+        "prompt optimize",
+        "Optimize agent prompt  (e.g. prompt optimize <agent_id>)",
+    ),
+    ("feedback stats", "Show feedback statistics"),
+    ("model list", "List available models"),
+    (
+        "model check",
+        "Check model health  (e.g. model check <name>)",
+    ),
+    (
+        "model update",
+        "Update model fields  (e.g. model update <name> --quirks '{\"fallback_model\":\"gpt-4o-mini\"}')",
+    ),
+    (
+        "model set-fallback",
+        "Set fallback model  (e.g. model set-fallback <model> <fallback>)",
+    ),
+    (
+        "user grant-role",
+        "Grant role to user  (e.g. user grant-role <user> <role>)",
+    ),
+    (
+        "user revoke-role",
+        "Revoke role from user  (e.g. user revoke-role <user> <role>)",
+    ),
+    ("help", "Show this help"),
+    ("exit", "Exit admin REPL"),
+];
+
+struct AdminHelper;
+
+impl Completer for AdminHelper {
+    type Candidate = Pair;
+    fn complete(
+        &self,
+        line: &str,
+        _pos: usize,
+        _ctx: &Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+        let matches = ADMIN_COMMANDS
+            .iter()
+            .filter(|(cmd, _)| cmd.starts_with(line) && !line.is_empty())
+            .map(|(cmd, desc)| Pair {
+                display: format!("{cmd}  {}", (*desc).dim()),
+                replacement: cmd.to_string(),
+            })
+            .collect();
+        Ok((0, matches))
+    }
+}
+impl Hinter for AdminHelper {
+    type Hint = String;
+    fn hint(&self, _line: &str, _pos: usize, _ctx: &Context<'_>) -> Option<String> {
+        None
+    }
+}
+impl Highlighter for AdminHelper {
+    fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
+        Cow::Borrowed(line)
+    }
+    fn highlight_char(&self, _line: &str, _pos: usize, _forced: bool) -> bool {
+        false
+    }
+    fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
+        Cow::Owned(format!("{}", hint.dim()))
+    }
+}
+impl Validator for AdminHelper {
+    fn validate(&self, _ctx: &mut ValidationContext) -> rustyline::Result<ValidationResult> {
+        Ok(ValidationResult::Valid(None))
+    }
+}
+impl Helper for AdminHelper {}
+
+pub(crate) async fn run_interactive(api: &ThinClient, profile: Option<&str>) -> Result<(), String> {
+    let history_path = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".astra")
+        .join("admin_history");
+    if let Some(parent) = history_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    let rl_config = Config::builder()
+        .completion_type(CompletionType::List)
+        .max_history_size(500)
+        .expect("valid config")
+        .build();
+
+    let mut editor: Editor<AdminHelper, FileHistory> =
+        Editor::with_config(rl_config).map_err(|e| e.to_string())?;
+    editor.set_helper(Some(AdminHelper));
+    let _ = editor.load_history(&history_path);
+
+    eprintln!();
+    eprintln!(
+        "{}",
+        "astra-admin interactive mode  (type help for commands, Ctrl+D to exit)".dim()
+    );
+    eprintln!();
+
+    loop {
+        let readline_result = tokio::task::block_in_place(|| {
+            editor.readline(&format!("{} ", "astra-admin❯".yellow().bold()))
+        });
+
+        let line = match readline_result {
+            Err(ReadlineError::Interrupted) => {
+                eprintln!("^C");
+                continue;
+            }
+            Err(ReadlineError::Eof) => {
+                eprintln!("{}", "Bye!".dim());
+                break;
+            }
+            Err(e) => {
+                eprintln!("{}", format!("Readline error: {}", e).red());
+                break;
+            }
+            Ok(l) => l,
+        };
+
+        let line = line.trim().to_string();
+        if line.is_empty() {
+            continue;
+        }
+        let _ = editor.add_history_entry(&line);
+
+        if line.eq_ignore_ascii_case("exit") || line.eq_ignore_ascii_case("quit") {
+            eprintln!("{}", "Bye!".dim());
+            break;
+        }
+
+        let result: Result<(), String> = if line.eq("help") {
+            eprintln!();
+            eprintln!("{}", "Admin Commands".bold().yellow());
+            eprintln!("{}", "─".repeat(60).dim());
+            for (cmd, desc) in ADMIN_COMMANDS {
+                eprintln!("  {:35}  {}", cmd.yellow(), desc.dim());
+            }
+            eprintln!();
+            Ok(())
+        } else if line.eq("whoami") {
+            let (_, _, _, token) = get_profile_and_token(profile)?;
+            let body = api.get_auth_me_text(&token).await.map_err(map_thin_err)?;
+            print_json_or_raw(&body);
+            Ok(())
+        } else if line.eq("health") {
+            let body = api.get_health_text().await.map_err(map_thin_err)?;
+            eprintln!("{}", "✓ API server is healthy".green());
+            print_json_or_raw(&body);
+            Ok(())
+        } else if line.eq("init") {
+            let (_, _, _, token) = get_profile_and_token(profile)?;
+            let body = api
+                .post_bearer_path_empty_text(&token, paths::ADMIN_INIT)
+                .await
+                .map_err(map_thin_err)?;
+            eprintln!("{}", "✓ Admin initialized".green());
+            print_json_or_raw(&body);
+            Ok(())
+        } else if line.eq("refresh") {
+            let mut creds = load_credentials();
+            let name = profile_name(profile, &creds);
+            let saved = creds
+                .profiles
+                .get(&name)
+                .cloned()
+                .ok_or_else(|| format!("no profile '{name}'"))?;
+            let refresh_token = saved
+                .refresh_token
+                .ok_or_else(|| "no refresh token".to_string())?;
+            let body = api
+                .post_auth_refresh_json(&serde_json::json!({ "refresh_token": refresh_token }))
+                .await
+                .map_err(map_thin_err)?;
+            let value: serde_json::Value =
+                serde_json::from_str(&body).map_err(|e| e.to_string())?;
+            let new_access = value
+                .get("access_token")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("missing access_token")?;
+            let new_refresh = value
+                .get("refresh_token")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("missing refresh_token")?;
+            let entry = creds.profiles.entry(name).or_default();
+            entry.access_token = Some(new_access.to_string());
+            entry.refresh_token = Some(new_refresh.to_string());
+            save_credentials(&creds)?;
+            eprintln!("{}", "✓ Token refreshed".green());
+            Ok(())
+        } else if line.eq("logout") {
+            let mut creds = load_credentials();
+            let name = profile_name(profile, &creds);
+            let saved = creds
+                .profiles
+                .get(&name)
+                .cloned()
+                .ok_or_else(|| "not logged in".to_string())?;
+            let refresh_token = saved
+                .refresh_token
+                .ok_or_else(|| "no refresh token".to_string())?;
+            let _ = api
+                .post_auth_logout_json(&serde_json::json!({ "refresh_token": refresh_token }))
+                .await;
+            if let Some(entry) = creds.profiles.get_mut(&name) {
+                entry.access_token = None;
+                entry.refresh_token = None;
+            }
+            save_credentials(&creds)?;
+            eprintln!("{}", "✓ Logged out".green());
+            Ok(())
+        } else if line.starts_with("audit") {
+            let (_, _, _, token) = get_profile_and_token(profile)?;
+            let limit = line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(100);
+            let q = vec![("limit", limit.to_string())];
+            let body = api
+                .get_bearer_path_query_text(&token, paths::ADMIN_AUDIT, &q)
+                .await
+                .map_err(map_thin_err)?;
+            print_json_or_raw(&body);
+            Ok(())
+        } else if line.eq("token list") {
+            let (_, _, _, token) = get_profile_and_token(profile)?;
+            let body = api
+                .get_bearer_path_query_text(&token, paths::ADMIN_TOKENS, &[])
+                .await
+                .map_err(map_thin_err)?;
+            print_json_or_raw(&body);
+            Ok(())
+        } else if line.eq("skill list") {
+            let (_, _, _, token) = get_profile_and_token(profile)?;
+            let q = vec![("limit", "50".to_string()), ("offset", "0".to_string())];
+            let body = api
+                .get_skills_query_text(&token, &q)
+                .await
+                .map_err(map_thin_err)?;
+            print_json_or_raw(&body);
+            Ok(())
+        } else if line.eq("feedback stats") {
+            let (_, _, _, token) = get_profile_and_token(profile)?;
+            let body = api
+                .get_bearer_path_query_text(&token, paths::ADMIN_FEEDBACK_STATS, &[])
+                .await
+                .map_err(map_thin_err)?;
+            print_json_or_raw(&body);
+            Ok(())
+        } else if line.eq("model list") {
+            let (_, _, _, token) = get_profile_and_token(profile)?;
+            let body = api.get_models_text(&token).await.map_err(map_thin_err)?;
+            print_json_or_raw(&body);
+            Ok(())
+        } else if let Some(model_name) = line.strip_prefix("model check ") {
+            let (_, _, _, token) = get_profile_and_token(profile)?;
+            let body = api
+                .post_bearer_path_empty_text(&token, &paths::model_check(model_name.trim()))
+                .await
+                .map_err(map_thin_err)?;
+            print_json_or_raw(&body);
+            Ok(())
+        } else if let Some(rest) = line.strip_prefix("model set-fallback ") {
+            let mut parts = rest.split_whitespace();
+            let model_name = parts.next().ok_or_else(|| {
+                "usage: model set-fallback <model_name> <fallback_model|none>".to_string()
+            })?;
+            let fallback = parts.next().ok_or_else(|| {
+                "usage: model set-fallback <model_name> <fallback_model|none>".to_string()
+            })?;
+            let (_, _, _, token) = get_profile_and_token(profile)?;
+            let fallback_val = if fallback.eq_ignore_ascii_case("none") {
+                serde_json::json!(null)
+            } else {
+                serde_json::json!(fallback)
+            };
+            let payload = serde_json::json!({ "quirks": { "fallback_model": fallback_val } });
+            let body = api
+                .put_bearer_path_json_text(&token, &paths::model(model_name), &payload)
+                .await
+                .map_err(map_thin_err)?;
+            print_json_or_raw(&body);
+            Ok(())
+        } else if let Some(rest) = line.strip_prefix("model update ") {
+            // Parse inline flags: model update <name> [--api-key K] [--base-url U] [--active B] [--quirks JSON]
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            let model_name = parts.first().ok_or_else(|| "usage: model update <name> [--api-key K] [--base-url U] [--active B] [--quirks JSON]".to_string())?;
+            let mut payload = serde_json::Map::new();
+            let mut i = 1;
+            while i < parts.len() {
+                match parts[i] {
+                    "--api-key" if i + 1 < parts.len() => {
+                        payload.insert("api_key".into(), serde_json::json!(parts[i + 1]));
+                        i += 2;
+                    }
+                    "--base-url" if i + 1 < parts.len() => {
+                        payload.insert("base_url".into(), serde_json::json!(parts[i + 1]));
+                        i += 2;
+                    }
+                    "--active" if i + 1 < parts.len() => {
+                        let active = parts[i + 1]
+                            .parse::<bool>()
+                            .map_err(|_| "--active must be true/false".to_string())?;
+                        payload.insert("is_active".into(), serde_json::json!(active));
+                        i += 2;
+                    }
+                    "--quirks" if i + 1 < parts.len() => {
+                        // Collect remaining parts as the JSON string
+                        let json_str = parts[i + 1..].join(" ");
+                        let quirks: serde_json::Value = serde_json::from_str(&json_str)
+                            .map_err(|e| format!("invalid quirks JSON: {e}"))?;
+                        payload.insert("quirks".into(), quirks);
+                        break;
+                    }
+                    _ => {
+                        return Err(format!("unknown flag: {}", parts[i]));
+                    }
+                }
+            }
+            if payload.is_empty() {
+                return Err("no fields to update".into());
+            }
+            let (_, _, _, token) = get_profile_and_token(profile)?;
+            let body = api
+                .put_bearer_path_json_text(
+                    &token,
+                    &paths::model(model_name),
+                    &serde_json::Value::Object(payload),
+                )
+                .await
+                .map_err(map_thin_err)?;
+            print_json_or_raw(&body);
+            Ok(())
+        } else if let Some(rest) = line.strip_prefix("prompt optimize ") {
+            let mut parts = rest.split_whitespace();
+            let agent_id = parts.next().ok_or_else(|| {
+                "usage: prompt optimize <agent_id> [optimization_type]".to_string()
+            })?;
+            let optimization_type = parts.next().unwrap_or("quality");
+            let (_, _, _, token) = get_profile_and_token(profile)?;
+            let body = api
+                .post_bearer_path_json_text(
+                    &token,
+                    paths::ADMIN_PROMPTS_OPTIMIZE,
+                    &serde_json::json!({"agent_id": agent_id, "optimization_type": optimization_type}),
+                )
+                .await
+                .map_err(map_thin_err)?;
+            print_json_or_raw(&body);
+            Ok(())
+        } else if let Some(rest) = line.strip_prefix("user grant-role ") {
+            let mut parts = rest.split_whitespace();
+            let username = parts
+                .next()
+                .ok_or_else(|| "usage: user grant-role <username> <role_name>".to_string())?;
+            let role_name = parts
+                .next()
+                .ok_or_else(|| "usage: user grant-role <username> <role_name>".to_string())?;
+            let (_, _, _, token) = get_profile_and_token(profile)?;
+            api.post_bearer_path_json_text(
+                &token,
+                paths::ADMIN_USERS_GRANT_ROLE,
+                &serde_json::json!({"username": username, "role_name": role_name}),
+            )
+            .await
+            .map_err(map_thin_err)?;
+            eprintln!(
+                "{}",
+                format!("✓ Role '{role_name}' granted to '{username}'").green()
+            );
+            Ok(())
+        } else if let Some(rest) = line.strip_prefix("user revoke-role ") {
+            let mut parts = rest.split_whitespace();
+            let username = parts
+                .next()
+                .ok_or_else(|| "usage: user revoke-role <username> <role_name>".to_string())?;
+            let role_name = parts
+                .next()
+                .ok_or_else(|| "usage: user revoke-role <username> <role_name>".to_string())?;
+            let (_, _, _, token) = get_profile_and_token(profile)?;
+            api.post_bearer_path_json_text(
+                &token,
+                paths::ADMIN_USERS_REVOKE_ROLE,
+                &serde_json::json!({"username": username, "role_name": role_name}),
+            )
+            .await
+            .map_err(map_thin_err)?;
+            eprintln!(
+                "{}",
+                format!("✓ Role '{role_name}' revoked from '{username}'").green()
+            );
+            Ok(())
+        } else {
+            Err(format!(
+                "unknown command '{line}' — type 'help' to list commands"
+            ))
+        };
+
+        if let Err(err) = result {
+            eprintln!("{}", format!("❌ {err}").red());
+        }
+    }
+
+    let _ = editor.save_history(&history_path);
+    Ok(())
+}

@@ -1,0 +1,50 @@
+name: memory_basic
+description: "记忆注入和召回：observer 自动存储偏好，然后能召回"
+requires: [llm]
+check_graph_activation: true
+
+turns:
+  - user: "记住我喜欢用 Python 做数据分析"
+    checks:
+      rules:
+        - db:
+            table: mem_memories
+            where: "user_id = :uid"
+            assert:
+              count: ">=1"
+        - db:
+            table: mem_memories
+            # workaround: https://github.com/matrixorigin/matrixone/issues/23817
+            # TODO: revert to is_active = 1 after MatrixOne fixes the issue
+            where: "user_id = :uid AND content LIKE '%Python%' AND is_active != 0"
+            assert:
+              count: ">=1"
+        - db:
+            table: mem_edit_log
+            where: "user_id = :uid"
+            assert:
+              count: ">=1"
+      llm_judge:
+        criteria: "回复应确认已记住用户偏好，语气自然，不应反问用户"
+        pass_threshold: 0.7
+
+  - user: "我刚才说我喜欢用什么语言做数据分析？"
+    checks:
+      rules:
+        - no_tool_called: true
+        - response_contains: "Python"
+      llm_judge:
+        criteria: "回复应准确引用之前存储的偏好（Python），不编造其他语言"
+        pass_threshold: 0.8
+
+final_checks:
+  rules:
+    - session_integrity: true
+    - turn_count_increases: true
+    - db:
+        table: agent_events
+        where: "session_id = :sid"
+        assert:
+          count: ">=4"
+          fields:
+            session_id: {not_null: true}

@@ -1,0 +1,81 @@
+[package]
+name = "astra-runtime"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+# Full `/chat/turn` ledger inject tests (see `tests/chat_turn_bridge_ledger_inject_e2e.rs`).
+bridge-e2e-hooks = []
+
+[[test]]
+name = "chat_turn_bridge_ledger_inject_e2e"
+path = "tests/chat_turn_bridge_ledger_inject_e2e.rs"
+required-features = ["bridge-e2e-hooks"]
+
+[[test]]
+name = "edge_cloud_round_trip_e2e"
+path = "tests/edge_cloud_round_trip_e2e.rs"
+required-features = ["bridge-e2e-hooks"]
+
+[[test]]
+name = "system_matrix_http_e2e"
+path = "tests/system_matrix_http_e2e/main.rs"
+required-features = ["bridge-e2e-hooks"]
+
+[[bin]]
+name = "astra-server"
+path = "src/main.rs"
+
+[dependencies]
+dirs = "6.0.0"
+fastrand = "2"
+astra-core.workspace = true
+astra-services.workspace = true
+astra-thin-client.workspace = true
+async-stream.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+base64.workspace = true
+chrono.workspace = true
+dotenvy.workspace = true
+flate2.workspace = true
+futures-util.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml = "0.9.34"
+sha2.workspace = true
+tar.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+http-body-util.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+tree-sitter = "0.24"
+tree-sitter-bash = "0.23"
+notify = { version = "7", default-features = false, features = ["macos_kqueue"] }
+dashmap = "6.1.0"
+toml = { version = "1.1.2", features = ["preserve_order"] }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
+futures-util.workspace = true
+sqlx.workspace = true
+tempfile = "3"
+tokio-util.workspace = true
+tower.workspace = true
+proptest = "1"
+
+[[bench]]
+name = "hot_paths"
+harness = false
+
+[[bench]]
+name = "messaging"
+harness = false

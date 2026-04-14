@@ -6,80 +6,27 @@ on:
   pull_request:
     branches: [main, develop]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  lint:
+  check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
         with:
-          python-version: "3.11"
-      - name: Install dependencies
-        run: |
-          pip install poetry
-          poetry install
-      - name: Run ruff
-        run: poetry run ruff check .
+          workspaces: rust
+          shared-key: ci-offline
+          save-if: false
+      - name: Run clippy
+        run: make lint
       - name: Check formatting
-        run: poetry run ruff format --check .
-
-  type-check:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - name: Install dependencies
-        run: |
-          pip install poetry
-          poetry install
-      - name: Run mypy
-        run: poetry run mypy sdk/ core/ api/
-
-  test:
-    runs-on: ubuntu-latest
-    services:
-      matrixone:
-        image: matrixorigin/matrixone:latest
-        ports:
-          - 6001:6001
-        env:
-          MO_HOST: "0.0.0.0"
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y mysql-client
-      - name: Install dependencies
-        run: |
-          pip install poetry
-          poetry install
-      - name: Wait for MatrixOne
-        run: |
-          echo "Waiting for MatrixOne to start..."
-          sleep 15
-          for i in {1..10}; do
-            if mysql -h127.0.0.1 -P6001 -uroot -p111 -e 'SELECT 1' 2>/dev/null; then
-              echo "✓ MatrixOne is ready"
-              exit 0
-            fi
-            echo "Attempt $i/10..."
-            sleep 2
-          done
-          echo "✗ MatrixOne failed to start"
-          exit 1
-      - name: Initialize database
-        run: bash infra/scripts/init-db.sh
-        env:
-          MATRIXONE_HOST: 127.0.0.1
-          MATRIXONE_PORT: 6001
-          MATRIXONE_USER: root
-          MATRIXONE_PASSWORD: "111"
-          MATRIXONE_DATABASE: dev_agent
-      - name: Run tests
-        run: poetry run pytest tests/ -v
+        run: make format-check
+      - name: Run cargo check
+        run: make type-check
