@@ -12,7 +12,7 @@ use super::agentic_turn_ingest::{
     agentic_turn_stream_snapshot_from_sse_accum, ingest_agentic_turn_stream,
     map_ingest_outcome_to_iteration_control,
 };
-use super::interruption::{InterruptionKind, InterruptionRecord, ResumeAction};
+use super::interruption::{InterruptionKind, InterruptionRecord, ResumeAction, classify_error};
 
 pub(crate) struct TurnExecutionPhase {
     pub(crate) llm_wall_start: Instant,
@@ -150,16 +150,25 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 && state.consecutive_context_window_errors
                     <= super::compaction_replay::MAX_COMPACT_RETRIES
             {
-                if let Some(result) = super::compaction_replay::try_compact_for_retry(
+                if let Some(result) = super::compaction_replay::try_compact_for_retry_tiered(
                     &mut state.messages,
                     state.last_measured_prompt_tokens,
                     state.max_turn_input_tokens,
+                    state.consecutive_context_window_errors,
                 ) {
+                    let tier_label = if state.consecutive_context_window_errors <= 1 {
+                        "default"
+                    } else {
+                        "aggressive"
+                    };
                     let summary = super::compaction_replay::compaction_summary(&result);
                     if !prep.quiet {
                         host.emit_headless_line(
                             HeadlessStderrStyle::Yellow,
-                            format!("♻ Context overflow — {}; retrying turn…", summary),
+                            format!(
+                                "♻ Context overflow — {} pipeline: {}; retrying turn…",
+                                tier_label, summary,
+                            ),
                         );
                     }
                     try_write_heavy_checkpoint(state);
@@ -178,6 +187,20 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                         Some(format!("Context overflow after compaction: {}", e)),
                     ),
                 ));
+            }
+
+            // Catch-all: classify any remaining unstructured error into a
+            // structured InterruptionRecord so the checkpoint always carries
+            // resume guidance. Existing specific records (rate limit, context
+            // overflow) take priority — only fill when still empty.
+            if state.interruption.is_none() {
+                if let Some((kind, action)) = classify_error(&e) {
+                    state.interruption = Some(InterruptionRecord::new(
+                        kind,
+                        action,
+                        interruption_state_summary(state, Some(e.clone())),
+                    ));
+                }
             }
 
             finalize_turn_trace(state).await;
@@ -250,7 +273,7 @@ fn update_turn_trace_collector(state: &mut AgenticLoopState, turn_result: &HostT
     }
 }
 
-fn observe_turn_end_without_tools(
+pub(crate) fn observe_turn_end_without_tools(
     state: &mut AgenticLoopState,
     turn_index: usize,
     turn_start_time: Instant,
@@ -368,6 +391,18 @@ fn should_wrap_up_for_cumulative_budget<H: AgenticLoopHost>(
     }
 
     state.budget_wrapup_injected = true;
+    // Record structured interruption for cumulative budget exhaustion.
+    state.interruption = Some(InterruptionRecord::new(
+        InterruptionKind::CumulativeBudgetExceeded,
+        ResumeAction::ContinueImmediately,
+        interruption_state_summary(
+            state,
+            Some(format!(
+                "Cumulative token budget: {cumulative}/{} tokens",
+                state.max_cumulative_tokens,
+            )),
+        ),
+    ));
     if !quiet {
         host.emit_headless_line(
             HeadlessStderrStyle::Yellow,
