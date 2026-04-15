@@ -101,15 +101,33 @@ impl ServerToolExecutor {
         let memoria_client =
             astra_tools::memoria::MemoriaClient::new(cloud_base.clone(), cloud_token.clone());
 
+        let http_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .user_agent("astra-server/0.1.0")
+            .build()
+            .expect("Failed to build HTTP client");
+
         let default_executor = DefaultToolExecutor::new(ToolContext {
             project_root: workspace_root.clone(),
             workspace_root: workspace_root.clone(),
             user_id: user_id.clone(),
             session_id: session_id.clone(),
             sandbox: astra_tools::SandboxConfig::standard(workspace_root.clone()),
-            http_client: None,
+            http_client: Some(http_client.clone()),
             logger: std::sync::Arc::new(astra_tools::TracingLogger),
         });
+        // Wire GitHubClient into DefaultToolExecutor if token available
+        let github_token = std::env::var("GITHUB_TOKEN").ok();
+        let default_executor = if let Some(ref token) = github_token {
+            let github = astra_tools::github::GitHubClient::new(
+                http_client.clone(),
+                Some(token.clone()),
+                Vec::new(),
+            );
+            default_executor.with_github_client(github)
+        } else {
+            default_executor
+        };
 
         Self {
             workspace_root,
@@ -123,12 +141,8 @@ impl ServerToolExecutor {
             memoria_client,
             cloud_base,
             cloud_token,
-            github_token: std::env::var("GITHUB_TOKEN").ok(),
-            http_client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(15))
-                .user_agent("astra-server/0.1.0")
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+            github_token,
+            http_client,
             url_cache: Mutex::new(HashMap::new()),
             approval_gate: None,
             progress_callback: None,
@@ -278,15 +292,11 @@ impl ServerToolExecutor {
             "delegate" => "Delegation request acknowledged. The delegation engine will execute \
                 this request and provide results in the next round."
                 .to_string(),
-            // ── Unknown tool fallback ──────────────────────────────────
-            _ => {
-                format!(
-                    "Error: Tool '{name}' is not available in server-side execution mode. \
-                     Available: bash, read_file, write_file, str_replace, delete_file, \
-                     list_dir, grep, glob, git_status, git_diff, git_log, git_show, \
-                     git_blame, git_commit, memory_*, web_search"
-                )
-            }
+            // ── Delegate to DefaultToolExecutor for all other tools ────
+            // Covers: git_file_history, git_log_search, git_contributors,
+            // git_revert_commit, git_stash, github_*, symbols, task_*,
+            // tool_search, env, config, multi_edit, sleep, web_fetch, etc.
+            _ => self.default_executor.execute(name, args).await.output,
         };
 
         let output = astra_tools::normalize_empty_output(output, name);
