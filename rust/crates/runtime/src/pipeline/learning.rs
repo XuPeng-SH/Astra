@@ -179,6 +179,12 @@ fn parse_domain_hint(label: Option<&str>) -> Option<DomainHint> {
 #[async_trait]
 impl TurnLearningWriter for PipelineLearningWriter {
     async fn record_outcome(&self, outcome: TurnLearningOutcome) -> Result<(), String> {
+        // Quality gate: filter out trivial, derivable, or ambiguous outcomes
+        if let Err(rejection) = crate::pipeline::learning_quality_gate::evaluate(&outcome) {
+            tracing::debug!(reason = ?rejection, query = %outcome.query, "quality gate rejected learning outcome");
+            return Ok(());
+        }
+
         let task_type = parse_task_type(outcome.task_type_label.as_deref());
         let domain = parse_domain_hint(outcome.domain_hint_label.as_deref());
         let feedback = outcome.user_feedback_score;
@@ -1107,6 +1113,72 @@ mod tests {
         assert!(
             stats.unwrap().correction_rate() == 0.0,
             "positive signal should record success (no correction)"
+        );
+    }
+
+    // ── Quality gate integration ──
+
+    #[tokio::test]
+    async fn quality_gate_blocks_trivial_outcome_from_calibrator() {
+        let cal = Arc::new(Mutex::new(
+            crate::pipeline::calibration::ProgressiveCalibrator::new(0.15),
+        ));
+        let writer = PipelineLearningWriter::new().with_progressive_calibrator(cal.clone());
+
+        // Trivial query (<=5 chars) should be rejected by the gate
+        let outcome = crate::turn::contracts::TurnLearningOutcome {
+            query: "hi".into(),
+            tools_selected: vec!["bash".into()],
+            tools_used: vec!["bash".into()],
+            success: true,
+            quality: 0.9,
+            was_corrected: true,
+            task_type_label: Some("code".into()),
+            domain_hint_label: None,
+            user_feedback_score: None,
+            reward_hacking_risk: 0.0,
+            reward_hacking_flags: Vec::new(),
+            causal_support_score: 1.0,
+            causal_support_flags: Vec::new(),
+        };
+        let _ = writer.record_outcome(outcome).await;
+
+        // Calibrator should NOT have recorded anything
+        let c = cal.lock().unwrap();
+        assert!(
+            c.intent_stats("code").is_none(),
+            "trivial query should be blocked by quality gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn quality_gate_allows_normal_outcome_to_calibrator() {
+        let cal = Arc::new(Mutex::new(
+            crate::pipeline::calibration::ProgressiveCalibrator::new(0.15),
+        ));
+        let writer = PipelineLearningWriter::new().with_progressive_calibrator(cal.clone());
+
+        let outcome = crate::turn::contracts::TurnLearningOutcome {
+            query: "refactor the auth module".into(),
+            tools_selected: vec!["read_file".into(), "write_file".into()],
+            tools_used: vec!["read_file".into(), "write_file".into()],
+            success: true,
+            quality: 0.85,
+            was_corrected: false,
+            task_type_label: Some("code".into()),
+            domain_hint_label: None,
+            user_feedback_score: None,
+            reward_hacking_risk: 0.0,
+            reward_hacking_flags: Vec::new(),
+            causal_support_score: 1.0,
+            causal_support_flags: Vec::new(),
+        };
+        let _ = writer.record_outcome(outcome).await;
+
+        let c = cal.lock().unwrap();
+        assert!(
+            c.intent_stats("code").is_some(),
+            "normal outcome should pass quality gate and reach calibrator"
         );
     }
 }
