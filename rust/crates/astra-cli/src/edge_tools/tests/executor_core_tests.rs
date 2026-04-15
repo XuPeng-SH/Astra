@@ -23,6 +23,7 @@ fn executor_tool_names_match_schemas() {
 async fn execute_unknown_tool_returns_error() {
     let executor = test_executor();
     let result = executor.execute("nonexistent_tool", &json!({})).await;
+    assert!(result.contains("nonexistent_tool"), "got: {result}");
     assert!(result.contains("not available"), "got: {result}");
 }
 
