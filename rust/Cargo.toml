@@ -9,9 +9,16 @@ members = [
     "crates/astra-thin-client",
     "crates/astra-edge",
     "crates/astra-pipeline",
+    "crates/astra-plan",
     "crates/astra-turn-types",
     "crates/astra-skills",
     "crates/astra-sandbox",
+    "crates/astra-server-types",
+    "crates/astra-turn-core",
+    "crates/astra-messaging",
+    "crates/astra-text-utils",
+    "crates/astra-config",
+    "crates/astra-learning",
 ]
 resolver = "2"
 
@@ -21,8 +28,15 @@ edition = "2024"
 
 [workspace.dependencies]
 astra-core = { path = "crates/core" }
+astra-config = { path = "crates/astra-config" }
+astra-learning = { path = "crates/astra-learning" }
+astra-messaging = { path = "crates/astra-messaging" }
+astra-text-utils = { path = "crates/astra-text-utils" }
 astra-pipeline = { path = "crates/astra-pipeline" }
+astra-plan = { path = "crates/astra-plan" }
 astra-sandbox = { path = "crates/astra-sandbox" }
+astra-server-types = { path = "crates/astra-server-types" }
+astra-turn-core = { path = "crates/astra-turn-core" }
 astra-turn-types = { path = "crates/astra-turn-types" }
 astra-skills = { path = "crates/astra-skills" }
 astra-tools = { path = "crates/astra-tools" }
