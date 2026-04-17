@@ -1,5 +1,13 @@
 use super::*;
 
+fn default_skill_category(category: Option<&str>) -> String {
+    category
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("general")
+        .to_string()
+}
+
 // ── Catalog surfacing (SkillSearchSettings → agent context; was /skill-search) ──
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -663,6 +671,14 @@ Follow these steps:
                 "\u{2713}".green(),
                 skill_dir.display().to_string().cyan()
             );
+            match state.unified_skill_registry.discover_all().await {
+                Ok(_) => eprintln!("  {}", "Skill registry refreshed.".dim()),
+                Err(err) => eprintln!(
+                    "  {} {}",
+                    "Warning:".yellow(),
+                    format!("Skill registry refresh failed: {err}").dim()
+                ),
+            }
             eprintln!("  {} SKILL.md", "Files created:".dim());
             eprintln!("  {}", format!("Dev mode: /skill dev {name}").dim());
         }
@@ -2334,6 +2350,14 @@ Skill auto-generated from session {session_short}.
         "\n  {}",
         format!("  Edit: {}/SKILL.md", skill_dir.display()).dim()
     );
+    match state.unified_skill_registry.discover_all().await {
+        Ok(_) => eprintln!("  {}", "  Skill registry refreshed.".dim()),
+        Err(err) => eprintln!(
+            "  {} {}",
+            "Warning:".yellow(),
+            format!("Skill registry refresh failed: {err}").dim()
+        ),
+    }
     eprintln!("  {}", format!("  Dev mode: /skill dev {name}").dim());
     eprintln!("  {}", format!("  Test: /skill test {name}").dim());
     eprintln!();
@@ -3013,7 +3037,7 @@ mod tests {
             let resp = serde_json::json!({
                 "results": [{
                     "skill_name": "my-skill",
-                    "version": "2.0.0",
+                    "version": "1.0.0",
                     "description": null,
                     "publisher_id": null,
                     "trust_tier": null,
@@ -3022,16 +3046,38 @@ mod tests {
                     "avg_quality": 0.0,
                     "total_installs": 0,
                     "active_users_7d": 0,
+                }, {
+                    "skill_name": "my-skill",
+                    "version": "2.0.0",
+                    "description": null,
+                    "publisher_id": null,
+                    "trust_tier": null,
+                    "category": null,
+                    "ranking_score": 0.4,
+                    "avg_quality": 0.0,
+                    "total_installs": 0,
+                    "active_users_7d": 0,
+                }, {
+                    "skill_name": "my-skill",
+                    "version": "1.5.0",
+                    "description": null,
+                    "publisher_id": null,
+                    "trust_tier": null,
+                    "category": null,
+                    "ranking_score": 0.6,
+                    "avg_quality": 0.0,
+                    "total_installs": 0,
+                    "active_users_7d": 0,
                 }],
-                "total": 1,
-                "limit": 1,
+                "total": 3,
+                "limit": 50,
                 "offset": 0,
             });
 
             Mock::given(method("GET"))
                 .and(path("/marketplace/search"))
                 .and(query_param("name", "my-skill"))
-                .and(query_param("limit", "1"))
+                .and(query_param("limit", "50"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(&resp))
                 .expect(1)
                 .mount(&srv)
@@ -3098,6 +3144,17 @@ mod tests {
             let release: Version = "2.0.0".parse().unwrap();
             let pre: Version = "2.0.0-beta".parse().unwrap();
             assert!(release > pre, "release should be greater than pre-release");
+        }
+
+        #[test]
+        fn default_skill_category_falls_back_to_general() {
+            assert_eq!(super::default_skill_category(None), "general");
+            assert_eq!(super::default_skill_category(Some("")), "general");
+            assert_eq!(super::default_skill_category(Some("   ")), "general");
+            assert_eq!(
+                super::default_skill_category(Some("automation")),
+                "automation"
+            );
         }
     }
 }
@@ -3549,6 +3606,7 @@ async fn publish_skill_to_marketplace(
         name.cyan().bold(),
         manifest.version.to_string().dim()
     );
+    let category = default_skill_category(manifest.category.as_deref());
 
     // Try bundle publish if we have a local directory
     if let Some(ref dir) = skill_dir {
@@ -3562,7 +3620,7 @@ async fn publish_skill_to_marketplace(
                     "name": bundle_manifest.name,
                     "version": bundle_manifest.version,
                     "description": bundle_manifest.description,
-                    "category": manifest.category,
+                    "category": category,
                     "tags": manifest.tags,
                     "bundle": encoded,
                     "bundle_sha256": bundle_manifest.skill_md_sha256,
@@ -3618,7 +3676,7 @@ async fn publish_skill_to_marketplace(
         "triggers": manifest.triggers,
         "dependencies": manifest.dependencies,
         "manifest": loaded.instructions,
-        "category": manifest.category,
+        "category": category,
     });
 
     match api
@@ -3905,7 +3963,10 @@ async fn fetch_marketplace_version(
     api: &astra_thin_client::ThinClient,
     tok: &str,
 ) -> Option<String> {
-    let query_pairs = vec![("name", skill_name.to_string()), ("limit", "1".to_string())];
+    let query_pairs = vec![
+        ("name", skill_name.to_string()),
+        ("limit", "50".to_string()),
+    ];
     match api
         .get_bearer_path_query_text(tok, "/marketplace/search", &query_pairs)
         .await
@@ -3915,7 +3976,17 @@ async fn fetch_marketplace_version(
                 astra_services::marketplace_stats::SkillSearchResponse,
             >(&text)
             {
-                resp.results.first().map(|r| r.version.clone())
+                resp.results
+                    .iter()
+                    .filter_map(|result| {
+                        result
+                            .version
+                            .parse::<astra_runtime::skills::version::Version>()
+                            .ok()
+                            .map(|version| (version, result.version.clone()))
+                    })
+                    .max_by(|(left, _), (right, _)| left.cmp(right))
+                    .map(|(_, version)| version)
             } else {
                 None
             }
