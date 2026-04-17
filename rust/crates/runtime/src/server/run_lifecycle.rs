@@ -86,8 +86,21 @@ fn build_server_skill_resolver(
         let registry = Arc::new(registry);
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let r = Arc::clone(&registry);
-            let _ =
-                std::thread::scope(|s| s.spawn(|| handle.block_on(r.discover_all())).join().ok());
+            // Production runs on a multi-thread runtime where block_in_place
+            // is available.  For single-thread runtimes (unit tests) we
+            // detect the runtime flavor first and use thread::scope as a
+            // fallback — safe only because unit tests never wire a
+            // DatabaseSkillProvider, so discover_all does no async I/O.
+            match handle.runtime_flavor() {
+                tokio::runtime::RuntimeFlavor::MultiThread => {
+                    let _ = tokio::task::block_in_place(|| handle.block_on(r.discover_all()));
+                }
+                _ => {
+                    let _ = std::thread::scope(|s| {
+                        s.spawn(|| handle.block_on(r.discover_all())).join().ok()
+                    });
+                }
+            }
         }
         if registry.is_empty() {
             return (None, None);
@@ -685,7 +698,7 @@ impl AgenticRunLifecycleService {
     }
 
     fn finalize_run_events(
-        loop_outcome: Result<AgenticLoopOutcome, String>,
+        loop_outcome: Result<AgenticLoopOutcome, astra_core::ClassifiedError>,
         mut events: Vec<Value>,
         loop_state: &AgenticLoopState,
     ) -> (Vec<Value>, RunStatus, Option<String>) {
@@ -755,15 +768,16 @@ impl AgenticRunLifecycleService {
                     (RunStatus::Failed, Some(msg))
                 }
                 Err(err) => {
+                    let msg = err.to_string();
                     events.push(json!({
                         "event_type": "run_error",
-                        "data": {"error": err.clone()}
+                        "data": {"error": &msg, "error_kind": err.kind.as_str()}
                     }));
                     events.push(json!({
                         "event_type": "run_finished",
                         "data": usage,
                     }));
-                    (RunStatus::Failed, Some(err))
+                    (RunStatus::Failed, Some(msg))
                 }
             }
         };
@@ -1152,7 +1166,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         } else {
             None
         };
-
         let mut host = self.build_host(&user_id, &session_id, &request, edge_tools, edge_profile);
         let mut loop_state =
             self.build_initial_state(&request, &session_id, &run_id, server_workspace.as_deref());
@@ -1170,8 +1183,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             &session_id,
         )
         .await;
-
-        // ── Server-side tool execution (web-only mode) ─────────────────
         // When no edge tools are provided (no CLI connected), use the
         // already-provisioned workspace for the ServerToolExecutor.
         if let Some(workspace) = server_workspace {
@@ -2178,18 +2189,26 @@ impl SubRunExecutor for ServerSubRunExecutor {
                     tool_calls: loop_state.total_tool_calls,
                 })
             }
-            Ok(AgenticLoopOutcome::Error(err)) | Err(err) => {
-                Ok(astra_services::coordination::AgentResult {
-                    agent_id: config.agent_profile.agent_id,
-                    run_id: config.run_id,
-                    status: STATUS_FAILED.to_string(),
-                    output: None,
-                    error: Some(err),
-                    prompt_tokens: loop_state.total_prompt,
-                    completion_tokens: loop_state.total_completion,
-                    tool_calls: loop_state.total_tool_calls,
-                })
-            }
+            Ok(AgenticLoopOutcome::Error(err)) => Ok(astra_services::coordination::AgentResult {
+                agent_id: config.agent_profile.agent_id,
+                run_id: config.run_id,
+                status: STATUS_FAILED.to_string(),
+                output: None,
+                error: Some(err),
+                prompt_tokens: loop_state.total_prompt,
+                completion_tokens: loop_state.total_completion,
+                tool_calls: loop_state.total_tool_calls,
+            }),
+            Err(err) => Ok(astra_services::coordination::AgentResult {
+                agent_id: config.agent_profile.agent_id,
+                run_id: config.run_id,
+                status: STATUS_FAILED.to_string(),
+                output: None,
+                error: Some(err.to_string()),
+                prompt_tokens: loop_state.total_prompt,
+                completion_tokens: loop_state.total_completion,
+                tool_calls: loop_state.total_tool_calls,
+            }),
         }
     }
 }
