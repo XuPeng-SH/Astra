@@ -765,6 +765,7 @@ impl SessionRestoreService for HybridRestoreService {
 }
 
 /// Push a checkpoint to MatrixOne for cross-device availability.
+/// Also logs to session_sync_log for audit trail.
 pub async fn push_checkpoint_to_cloud(
     pool: &sqlx::Pool<sqlx::MySql>,
     session_id: &str,
@@ -775,7 +776,35 @@ pub async fn push_checkpoint_to_cloud(
     let tools_json =
         serde_json::to_string(&checkpoint.tools_used).unwrap_or_else(|_| "[]".to_string());
 
-    let updated = sqlx::query(
+    // Calculate payload_size for sync log (estimate based on serialized fields)
+    let payload_size = checkpoint.title.len()
+        + checkpoint.summary.len()
+        + tools_json.len()
+        + checkpoint
+            .contract_state_json
+            .as_ref()
+            .map_or(0, |s| s.len());
+
+    // Helper: log sync result (success or failure) and propagate result
+    let log_and_return = |result: Result<(), String>, size: usize| async move {
+        let (status, error_msg) = match &result {
+            Ok(()) => ("success", None),
+            Err(e) => ("error", Some(e.as_str())),
+        };
+        let _ = log_checkpoint_sync(
+            pool,
+            user_id,
+            session_id,
+            checkpoint.number,
+            size,
+            status,
+            error_msg,
+        )
+        .await;
+        result
+    };
+
+    let updated = match sqlx::query(
         "UPDATE session_checkpoints SET \
             turn = ?, title = ?, summary = ?, tools_json = ?, total_tokens = ?, \
             had_stalls = ?, error_count = ?, contract_state_json = ? \
@@ -793,7 +822,13 @@ pub async fn push_checkpoint_to_cloud(
     .bind(checkpoint.number as i32)
     .execute(pool)
     .await
-    .map_err(|e| format!("push_checkpoint update: {e}"))?;
+    {
+        Ok(u) => u,
+        Err(e) => {
+            let err = format!("push_checkpoint update: {e}");
+            return log_and_return(Err(err), payload_size).await;
+        }
+    };
 
     if updated.rows_affected() == 0 {
         let inserted = sqlx::query(
@@ -819,7 +854,7 @@ pub async fn push_checkpoint_to_cloud(
 
         if let Err(e) = inserted {
             if is_duplicate_key_error(&e) {
-                sqlx::query(
+                if let Err(e) = sqlx::query(
                     "UPDATE session_checkpoints SET \
                         turn = ?, title = ?, summary = ?, tools_json = ?, total_tokens = ?, \
                         had_stalls = ?, error_count = ?, contract_state_json = ? \
@@ -837,11 +872,65 @@ pub async fn push_checkpoint_to_cloud(
                 .bind(checkpoint.number as i32)
                 .execute(pool)
                 .await
-                .map_err(|err| format!("push_checkpoint retry update: {err}"))?;
+                {
+                    let err = format!("push_checkpoint retry update: {e}");
+                    return log_and_return(Err(err), payload_size).await;
+                }
             } else {
-                return Err(format!("push_checkpoint insert: {e}"));
+                let err = format!("push_checkpoint insert: {e}");
+                return log_and_return(Err(err), payload_size).await;
             }
         }
+    }
+
+    log_and_return(Ok(()), payload_size).await
+}
+
+/// Log checkpoint sync to session_sync_log for audit trail.
+/// This helps diagnose sync issues like Session 7875e355 where cloud had 0 checkpoints.
+/// Now includes payload_size tracking and retention pruning (reuses state_sync infra).
+async fn log_checkpoint_sync(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    user_id: &str,
+    session_id: &str,
+    checkpoint_number: u32,
+    payload_size: usize,
+    status: &str,
+    error_msg: Option<&str>,
+) -> Result<(), String> {
+    // Use fixed sync_type "checkpoint" for easy aggregation.
+    // Include checkpoint number in error_message for debugging if needed.
+    let error_with_number = error_msg.map(|e| format!("[checkpoint #{}] {}", checkpoint_number, e));
+    let inserted = sqlx::query(
+        "INSERT INTO session_sync_log \
+         (sync_id, user_id, session_id, sync_type, sync_direction, payload_size, status, error_message, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(user_id)
+    .bind(session_id)
+    .bind("checkpoint") // Fixed sync_type for easy aggregation
+    .bind("push")
+    .bind(payload_size as i64)
+    .bind(status)
+    .bind(error_with_number.as_deref().or(error_msg))
+    .execute(pool)
+    .await
+    .map_err(|e| format!("log_checkpoint_sync: {e}"))?;
+
+    // Apply retention pruning using the same policy as state_sync.
+    // This prevents unbounded sync_log growth for long-running sessions.
+    if inserted.rows_affected() > 0
+        && let Some(retain) = crate::state_sync::sync_log_retain_limit(status)
+    {
+        let _ = sqlx::query(crate::state_sync::build_sync_log_prune_query())
+            .bind(user_id)
+            .bind(status)
+            .bind(user_id)
+            .bind(status)
+            .bind(retain as i64)
+            .execute(pool)
+            .await;
     }
 
     Ok(())

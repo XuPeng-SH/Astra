@@ -3042,12 +3042,12 @@ mod error_recovery_proofs {
         let l0 = escalation_level(0, 0, 0);
         assert_eq!(l0, EscalationLevel::Normal);
 
-        // After 2 nudges: warning
-        let l1 = escalation_level(2, 0, 0);
+        // After 3 nudges: warning (threshold raised from 2 to 3)
+        let l1 = escalation_level(3, 0, 0);
         assert_eq!(l1, EscalationLevel::Warning);
 
-        // After 3 nudges + 2 errors: critical (nudges alone stay Warning)
-        let l2 = escalation_level(3, 2, 0);
+        // After 4 nudges + 3 errors: critical (threshold raised from 3+2 to 4+3)
+        let l2 = escalation_level(4, 3, 0);
         assert_eq!(l2, EscalationLevel::Critical);
 
         // Severity only increases
@@ -3079,17 +3079,17 @@ mod error_recovery_proofs {
     #[test]
     fn session_error_summary_informs_escalation() {
         let mut summary = SessionErrorSummary::new();
-        // Simulate a problematic session
-        for _ in 0..8 {
+        // Simulate a problematic session — need 15 errors for standalone Critical
+        for _ in 0..15 {
             summary.record_error(ErrorCategory::Network);
         }
         summary.record_retry(false);
         summary.record_retry(false);
 
-        assert_eq!(summary.total_errors, 8);
+        assert_eq!(summary.total_errors, 15);
         assert_eq!(summary.retry_success_rate(), 0.0);
 
-        // This level of errors should trigger escalation
+        // 15 errors should trigger Critical (standalone threshold)
         let level = escalation_level(1, summary.total_errors, 2);
         assert_eq!(level, EscalationLevel::Critical);
     }
@@ -8021,6 +8021,7 @@ mod turnguard_e2e_proofs {
         // Progressive degradation: first Critical → restricted, second → force_stop
         guard.record_tool_result("bash", "error: command not found");
         guard.record_tool_result("bash", "error: no such file or directory");
+        guard.record_tool_result("bash", "Error: unexpected EOF while parsing");
         let v_first_critical = guard.evaluate();
         assert_eq!(v_first_critical.severity, VerdictSeverity::Critical);
         assert!(
@@ -8473,20 +8474,23 @@ mod turnguard_e2e_proofs {
         use astra_runtime::turn::error_recovery::ErrorCategory;
         let mut guard = TurnGuard::new();
 
-        // Record enough non-auth errors to trigger Warning (need 5+ actionable)
+        // Record enough non-auth errors to trigger Warning (need 8+ actionable)
         guard.errors.record_error(ErrorCategory::Auth);
         guard.errors.record_error(ErrorCategory::ToolNotFound);
         guard.errors.record_error(ErrorCategory::Unknown);
         guard.errors.record_error(ErrorCategory::Network);
         guard.errors.record_error(ErrorCategory::ToolNotFound);
         guard.errors.record_error(ErrorCategory::Unknown);
-        assert_eq!(guard.errors.total_errors, 6);
+        guard.errors.record_error(ErrorCategory::Network);
+        guard.errors.record_error(ErrorCategory::ToolNotFound);
+        guard.errors.record_error(ErrorCategory::Unknown);
+        assert_eq!(guard.errors.total_errors, 9);
 
         let verdict = guard.evaluate();
-        // 6 total - 1 auth = 5 actionable errors → Warning level
+        // 9 total - 1 auth = 8 actionable errors → Warning level
         assert!(
             verdict.severity >= VerdictSeverity::Warning,
-            "5 actionable errors should trigger at least Warning"
+            "8 actionable errors should trigger at least Warning"
         );
     }
 
@@ -8529,15 +8533,18 @@ mod turnguard_e2e_proofs {
         assert!(guard.health.get("write_file").is_some());
     }
 
-    // ── Scenario O: Force-stop requires BOTH Critical + nudge_count >= 3 ───────
+    // ── Scenario O: Force-stop requires BOTH Critical + nudge_count >= 4 ───────
     // Proves that nudges alone are not enough for force_stop.
-    // Critical requires nudge_count >= 3 AND total_errors >= 2.
+    // Critical requires nudge_count >= 4 AND total_errors >= 3.
     #[test]
     fn critical_without_enough_nudges_does_not_force_stop() {
         let mut guard = TurnGuard::new();
 
-        // 3 nudges + 1 error → still Warning (need 2+ errors for Critical)
-        guard.nudge_count = 3;
+        // 4 nudges + 2 errors → still Warning (need 3+ errors for Critical)
+        guard.nudge_count = 4;
+        guard
+            .errors
+            .record_error(astra_runtime::turn::error_recovery::ErrorCategory::Unknown);
         guard
             .errors
             .record_error(astra_runtime::turn::error_recovery::ErrorCategory::Unknown);
@@ -8545,10 +8552,10 @@ mod turnguard_e2e_proofs {
         let verdict = guard.evaluate();
         assert!(
             !verdict.force_stop,
-            "3 nudges + 1 error should NOT force_stop (need 2+ errors)"
+            "4 nudges + 2 errors should NOT force_stop (need 3+ errors)"
         );
 
-        // Now at 3 nudges + 2 errors → first Critical → restricted (progressive degradation)
+        // Now at 4 nudges + 3 errors → first Critical → restricted (progressive degradation)
         guard
             .errors
             .record_error(astra_runtime::turn::error_recovery::ErrorCategory::Unknown);
