@@ -167,3 +167,4 @@ pub mod result_quality {
 }
 pub mod routing_engine;
 pub mod turn_guard;
+pub mod ws_approval_gate;
