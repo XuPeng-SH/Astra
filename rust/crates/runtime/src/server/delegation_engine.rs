@@ -15,7 +15,9 @@
 //!   └── aggregate(results) ──▶ merged output
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+use crate::turn::agentic_loop_host::RequestConstraints;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -37,6 +39,37 @@ use super::run_engine::RunEngine;
 use crate::messaging::router::AgentMailboxRouter;
 use crate::prompts::team_prompts;
 
+fn normalize_context_allowlist_entry(entry: &str, key: &str) -> Result<String, String> {
+    let normalized = entry.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        Err(format!(
+            "context[{key}] must not contain empty or whitespace-only strings"
+        ))
+    } else {
+        Ok(normalized)
+    }
+}
+
+fn parse_request_allowlist_from_context(
+    context: &mut HashMap<String, serde_json::Value>,
+    key: &str,
+) -> Result<Option<HashSet<String>>, String> {
+    let Some(value) = context.remove(key) else {
+        return Ok(None);
+    };
+    let values = value
+        .as_array()
+        .ok_or_else(|| format!("context[{key}] must be an array of strings"))?;
+    let mut normalized = HashSet::with_capacity(values.len());
+    for entry in values {
+        let raw = entry
+            .as_str()
+            .ok_or_else(|| format!("context[{key}] must contain only strings"))?;
+        normalized.insert(normalize_context_allowlist_entry(raw, key)?);
+    }
+    Ok(Some(normalized))
+}
+
 // ─── Sub-run Executor Trait ─────────────────────────────────────────────────
 
 /// Configuration for a sub-run spawned by delegation.
@@ -57,6 +90,8 @@ pub struct SubRunConfig {
     pub context: HashMap<String, serde_json::Value>,
     /// Trusted forwarded headers propagated out-of-band for child remote skills.
     pub forward_headers: HashMap<String, String>,
+    /// Request-scoped capability constraints inherited from the parent runtime request.
+    pub request_constraints: RequestConstraints,
     /// Current nested agent/sub-run depth for the child loop.
     pub recursion_depth: u8,
     /// Cooperative pause flag — checked between turns by the sub-run loop.
@@ -80,6 +115,7 @@ impl std::fmt::Debug for SubRunConfig {
             .field("user_id", &self.user_id)
             .field("previous_output", &self.previous_output)
             .field("forward_headers", &!self.forward_headers.is_empty())
+            .field("request_constraints", &self.request_constraints)
             .field("recursion_depth", &self.recursion_depth)
             .field("pause_flag", &self.pause_flag.is_some())
             .field("checkpoint_gate", &self.checkpoint_gate.is_some())
@@ -1442,6 +1478,16 @@ impl DelegationEngine {
         request
             .context
             .remove(crate::turn::agentic_delegate_interception::FORWARD_HEADERS_CONTEXT_KEY);
+        let request_constraints = RequestConstraints::new(
+            parse_request_allowlist_from_context(
+                &mut request.context,
+                crate::turn::agentic_delegate_interception::REQUEST_ALLOWED_TOOLS_CONTEXT_KEY,
+            )?,
+            parse_request_allowlist_from_context(
+                &mut request.context,
+                crate::turn::agentic_delegate_interception::REQUEST_ALLOWED_SKILLS_CONTEXT_KEY,
+            )?,
+        );
 
         // Validate first
         self.validate(&request, source_agent_id).await?;
@@ -1536,6 +1582,7 @@ impl DelegationEngine {
                     agent_ids,
                     aggregation,
                     &forward_headers,
+                    &request_constraints,
                     child_recursion_depth,
                     *timeout_sec,
                     cancel_token.as_ref(),
@@ -1552,6 +1599,7 @@ impl DelegationEngine {
                     &agent_ids,
                     false,
                     &forward_headers,
+                    &request_constraints,
                     child_recursion_depth,
                     *timeout_sec,
                     cancel_token.as_ref(),
@@ -1568,6 +1616,7 @@ impl DelegationEngine {
                     agent_ids,
                     *stop_on_success,
                     &forward_headers,
+                    &request_constraints,
                     child_recursion_depth,
                     *timeout_sec,
                     cancel_token.as_ref(),
@@ -1587,6 +1636,7 @@ impl DelegationEngine {
                     reviewer_id,
                     *max_rounds,
                     &forward_headers,
+                    &request_constraints,
                     child_recursion_depth,
                     *timeout_sec,
                     cancel_token.as_ref(),
@@ -1607,6 +1657,7 @@ impl DelegationEngine {
                     *max_turns,
                     aggregation,
                     &forward_headers,
+                    &request_constraints,
                     child_recursion_depth,
                     *timeout_sec,
                     cancel_token.as_ref(),
@@ -1675,6 +1726,7 @@ impl DelegationEngine {
         agent_ids: &[String],
         aggregation: &AggregationStrategy,
         forward_headers: &HashMap<String, String>,
+        request_constraints: &RequestConstraints,
         child_recursion_depth: u8,
         timeout_sec: u64,
         cancel_token: Option<&Arc<tokio_util::sync::CancellationToken>>,
@@ -1802,6 +1854,7 @@ impl DelegationEngine {
                 previous_output: None,
                 context: request.context.clone(),
                 forward_headers: forward_headers.clone(),
+                request_constraints: request_constraints.clone(),
                 recursion_depth: child_recursion_depth,
                 pause_flag: Some(pause_flag),
                 checkpoint_gate: None,
@@ -2066,6 +2119,7 @@ impl DelegationEngine {
                                 previous_output: None,
                                 context: ctx,
                                 forward_headers: forward_headers.clone(),
+                                request_constraints: request_constraints.clone(),
                                 recursion_depth: child_recursion_depth,
                                 pause_flag: None,
                                 checkpoint_gate: None,
@@ -2096,6 +2150,7 @@ impl DelegationEngine {
         agent_ids: &[String],
         stop_on_success: bool,
         forward_headers: &HashMap<String, String>,
+        request_constraints: &RequestConstraints,
         child_recursion_depth: u8,
         timeout_sec: u64,
         cancel_token: Option<&Arc<tokio_util::sync::CancellationToken>>,
@@ -2230,6 +2285,7 @@ impl DelegationEngine {
                 previous_output: previous_output.clone(),
                 context: request.context.clone(),
                 forward_headers: forward_headers.clone(),
+                request_constraints: request_constraints.clone(),
                 recursion_depth: child_recursion_depth,
                 pause_flag: Some(pause_flag),
                 checkpoint_gate: None,
@@ -2335,6 +2391,7 @@ impl DelegationEngine {
                         previous_output: prev.clone(),
                         context: ctx.clone(),
                         forward_headers: forward_headers.clone(),
+                        request_constraints: request_constraints.clone(),
                         recursion_depth: child_recursion_depth,
                         pause_flag: None,
                         checkpoint_gate: None,
@@ -2372,6 +2429,7 @@ impl DelegationEngine {
         reviewer_id: &str,
         max_rounds: u32,
         forward_headers: &HashMap<String, String>,
+        request_constraints: &RequestConstraints,
         child_recursion_depth: u8,
         timeout_sec: u64,
         cancel_token: Option<&Arc<tokio_util::sync::CancellationToken>>,
@@ -2513,6 +2571,7 @@ impl DelegationEngine {
                 previous_output: last_producer_output.clone(),
                 context: request.context.clone(),
                 forward_headers: forward_headers.clone(),
+                request_constraints: request_constraints.clone(),
                 recursion_depth: child_recursion_depth,
                 pause_flag: Some(prod_pause.clone()),
                 checkpoint_gate: None,
@@ -2612,6 +2671,7 @@ impl DelegationEngine {
                         previous_output: prev.clone(),
                         context: ctx.clone(),
                         forward_headers: forward_headers.clone(),
+                        request_constraints: request_constraints.clone(),
                         recursion_depth: child_recursion_depth,
                         pause_flag: None,
                         checkpoint_gate: None,
@@ -2713,6 +2773,7 @@ impl DelegationEngine {
                 previous_output: last_producer_output.clone(),
                 context: request.context.clone(),
                 forward_headers: forward_headers.clone(),
+                request_constraints: request_constraints.clone(),
                 recursion_depth: child_recursion_depth,
                 pause_flag: Some(rev_pause),
                 checkpoint_gate: None,
@@ -2806,6 +2867,7 @@ impl DelegationEngine {
         _max_turns: u32,
         _aggregation: &AggregationStrategy,
         forward_headers: &HashMap<String, String>,
+        request_constraints: &RequestConstraints,
         child_recursion_depth: u8,
         timeout_sec: u64,
         cancel_token: Option<&Arc<tokio_util::sync::CancellationToken>>,
@@ -2942,6 +3004,7 @@ impl DelegationEngine {
                 previous_output: None,
                 context: fork_context,
                 forward_headers: forward_headers.clone(),
+                request_constraints: request_constraints.clone(),
                 recursion_depth: child_recursion_depth,
                 pause_flag: Some(pause_flag),
                 checkpoint_gate: None,
@@ -4078,6 +4141,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parse_request_allowlist_from_context_normalizes_and_dedupes() {
+        let key = crate::turn::agentic_delegate_interception::REQUEST_ALLOWED_TOOLS_CONTEXT_KEY;
+        let mut context = HashMap::from([(
+            key.to_string(),
+            serde_json::json!([" Bash ", "bash", "READ_FILE"]),
+        )]);
+
+        let parsed = parse_request_allowlist_from_context(&mut context, key)
+            .expect("allowlist should parse")
+            .expect("allowlist should be present");
+
+        let expected = HashSet::from(["bash".to_string(), "read_file".to_string()]);
+        assert_eq!(parsed, expected);
+        assert!(
+            !context.contains_key(key),
+            "key should be removed from context"
+        );
+    }
+
+    #[test]
+    fn parse_request_allowlist_from_context_rejects_non_array_value() {
+        let key = crate::turn::agentic_delegate_interception::REQUEST_ALLOWED_TOOLS_CONTEXT_KEY;
+        let mut context = HashMap::from([(key.to_string(), serde_json::json!("bash"))]);
+
+        let err = parse_request_allowlist_from_context(&mut context, key)
+            .expect_err("non-array allowlist should fail");
+        assert!(err.contains("must be an array of strings"));
+    }
+
+    #[test]
+    fn parse_request_allowlist_from_context_rejects_non_string_or_empty_entries() {
+        let key = crate::turn::agentic_delegate_interception::REQUEST_ALLOWED_TOOLS_CONTEXT_KEY;
+        let mut non_string_context =
+            HashMap::from([(key.to_string(), serde_json::json!(["bash", 42]))]);
+        let err = parse_request_allowlist_from_context(&mut non_string_context, key)
+            .expect_err("non-string entry should fail");
+        assert!(err.contains("must contain only strings"));
+
+        let mut empty_context =
+            HashMap::from([(key.to_string(), serde_json::json!(["bash", "   "]))]);
+        let err = parse_request_allowlist_from_context(&mut empty_context, key)
+            .expect_err("empty entry should fail");
+        assert!(err.contains("must not contain empty or whitespace-only strings"));
+    }
+
     #[tokio::test]
     async fn worktree_path_per_agent_flows_through_context() {
         /// Executor that captures the agent-specific worktree_path from context.
@@ -4167,6 +4276,7 @@ mod tests {
             previous_output: None,
             context: HashMap::new(),
             forward_headers: HashMap::new(),
+            request_constraints: Default::default(),
             recursion_depth: 1,
             pause_flag: None,
             checkpoint_gate: None,

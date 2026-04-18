@@ -193,6 +193,36 @@ pub trait AgenticLoopHost: Send {
 
 // ─── Loop state sub-structs ──────────────────────────────────────────────────
 
+/// Request-scoped capability constraints supplied by the external caller.
+///
+/// Tool and skill access are controlled separately:
+/// - `allowed_tools` applies to non-skill tools.
+/// - `allowed_skills` applies to skill visibility/execution via the
+///   `skill` / `discover_skills` tool schemas.
+#[derive(Clone, Debug, Default)]
+pub struct RequestConstraints {
+    /// When set, only this subset of non-skill tools may execute for the request.
+    ///
+    /// This does not restrict the `skill` or `discover_skills` tool schemas;
+    /// skill access is controlled by `allowed_skills`.
+    pub allowed_tools: Option<HashSet<String>>,
+    /// When set, only this subset of skills may be visible/executable via
+    /// the `skill` / `discover_skills` tool schemas.
+    pub allowed_skills: Option<HashSet<String>>,
+}
+
+impl RequestConstraints {
+    pub fn new(
+        allowed_tools: Option<HashSet<String>>,
+        allowed_skills: Option<HashSet<String>>,
+    ) -> Self {
+        Self {
+            allowed_tools,
+            allowed_skills,
+        }
+    }
+}
+
 /// Skill-related state for the agentic loop.
 pub struct SkillState {
     /// Unified skill registry for conditional activation via file paths.
@@ -216,6 +246,9 @@ pub struct SkillState {
     /// When non-empty, only these tools (plus `skill` itself) should be available.
     /// The host converts this allow-list to additions in `restricted_tools`.
     pub allowed_tools: Option<HashSet<String>>,
+    /// Request-scoped tool/skill constraints supplied by the external caller.
+    /// Nested runs inherit these constraints unchanged.
+    pub request_constraints: RequestConstraints,
     /// Sandbox policy derived from the most recently activated skill's trust tier.
     /// When set, tool execution should apply these restrictions (path boundaries,
     /// env filtering, network control, timeouts).
@@ -257,6 +290,7 @@ impl Default for SkillState {
             effort: None,
             agent_type: None,
             allowed_tools: None,
+            request_constraints: Default::default(),
             sandbox_policy: None,
             quality_tracker: Default::default(),
             improvement_tracker: Default::default(),
