@@ -331,6 +331,40 @@ pub trait ToolApprovalGate: Send + Sync {
     fn requires_approval(&self, tool_name: &str) -> bool;
 }
 
+// ─── ask_user gate ────────────────────────────────────────────────────────────
+
+/// Final answer returned from an interactive ask_user prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AskUserResponse {
+    pub answer: String,
+    pub was_custom: bool,
+}
+
+/// Result from an ask_user gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AskUserDecision {
+    /// User provided an answer.
+    Answer(AskUserResponse),
+    /// The prompt timed out before the user responded.
+    Timeout,
+    /// The prompt could not be delivered or decoded.
+    Error(String),
+}
+
+/// Trait for routing ask_user prompts through an interactive frontend.
+#[async_trait]
+pub trait AskUserGate: Send + Sync {
+    /// Ask the user a question and wait for their response.
+    async fn request_user_input(
+        &self,
+        request_id: &str,
+        question: &str,
+        choices: &[String],
+        default: Option<&str>,
+        context: Option<&str>,
+    ) -> AskUserDecision;
+}
+
 // ─── Tool progress callback ─────────────────────────────────────────────────
 
 /// Callback for streaming tool execution progress to the frontend.
@@ -354,8 +388,11 @@ pub const APPROVAL_REQUIRED_TOOLS: &[&str] = &[
     "bash",
     "write_file",
     "str_replace",
+    "multi_edit",
     "delete_file",
     "git_commit",
+    "git_stash",
+    "github_create_issue",
 ];
 
 // ─── Output management utilities ────────────────────────────────────────────
@@ -774,8 +811,11 @@ mod tests {
     fn approval_required_tools_includes_dangerous_ops() {
         assert!(APPROVAL_REQUIRED_TOOLS.contains(&"bash"));
         assert!(APPROVAL_REQUIRED_TOOLS.contains(&"write_file"));
+        assert!(APPROVAL_REQUIRED_TOOLS.contains(&"multi_edit"));
         assert!(APPROVAL_REQUIRED_TOOLS.contains(&"delete_file"));
         assert!(APPROVAL_REQUIRED_TOOLS.contains(&"git_commit"));
+        assert!(APPROVAL_REQUIRED_TOOLS.contains(&"git_stash"));
+        assert!(APPROVAL_REQUIRED_TOOLS.contains(&"github_create_issue"));
         assert!(!APPROVAL_REQUIRED_TOOLS.contains(&"read_file"));
         assert!(!APPROVAL_REQUIRED_TOOLS.contains(&"grep"));
     }

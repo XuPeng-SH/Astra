@@ -640,6 +640,18 @@ if let Err(e) = writeln!(file, "{line}") {
             classify_tool_error("write_file", output),
             ToolErrorSeverity::HardError
         );
+
+        // git_stash timeout
+        assert_eq!(
+            classify_tool_error("git_stash", output),
+            ToolErrorSeverity::HardError
+        );
+
+        // github_create_issue timeout
+        assert_eq!(
+            classify_tool_error("github_create_issue", output),
+            ToolErrorSeverity::HardError
+        );
     }
 
     #[test]
