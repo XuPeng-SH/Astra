@@ -10,7 +10,8 @@ use axum::extract::Extension;
 use super::*;
 
 use astra_services::session_journal::{
-    JournalEvent, JournalWriter, find_latest_approval_required, validate_session_id,
+    JournalEvent, JournalWriter, find_latest_approval_decision, find_latest_approval_required,
+    validate_session_id,
 };
 use astra_thin_client::ASTRA_EDGE_ID_HEADER;
 use serde::Deserialize;
@@ -104,6 +105,8 @@ pub(super) async fn post_approval_respond_handler(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     let edge_id = edge_id_from_headers(&headers);
+    let key = approval_callback_key(&user.user_id, &body.request_id);
+    let mut lock = state.edge_callback_ledger.lock().await;
     if let Some(session_id) = body.session_id.as_deref() {
         validate_session_id(session_id)
             .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
@@ -120,31 +123,44 @@ pub(super) async fn post_approval_respond_handler(
             .ok()
             .flatten()
             .and_then(|request| request.turn);
-        let writer = JournalWriter::new(session_id).map_err(|error| {
-            error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("approval journal unavailable: {error}"),
-            )
-        })?;
-        writer
-            .append(&JournalEvent::approval_decision(
-                Some(session_id),
-                approval_turn,
-                &body.request_id,
-                body.tool_name.as_deref(),
-                approval_kind,
-                decision,
-                body.reason.as_deref(),
-            ))
+        let already_recorded = find_latest_approval_decision(session_id, &body.request_id)
             .map_err(|error| {
                 error_response(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    format!("approval journal append failed: {error}"),
+                    format!("approval journal lookup failed: {error}"),
+                )
+            })?
+            .is_some_and(|existing| {
+                existing.decision == decision
+                    && existing.reason.as_deref() == body.reason.as_deref()
+                    && existing.tool_name.as_deref() == body.tool_name.as_deref()
+                    && existing.approval_kind.as_deref() == approval_kind
+            });
+        if !already_recorded {
+            let writer = JournalWriter::new(session_id).map_err(|error| {
+                error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("approval journal unavailable: {error}"),
                 )
             })?;
+            writer
+                .append(&JournalEvent::approval_decision(
+                    Some(session_id),
+                    approval_turn,
+                    &body.request_id,
+                    body.tool_name.as_deref(),
+                    approval_kind,
+                    decision,
+                    body.reason.as_deref(),
+                ))
+                .map_err(|error| {
+                    error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("approval journal append failed: {error}"),
+                    )
+                })?;
+        }
     }
-    let key = approval_callback_key(&user.user_id, &body.request_id);
-    let mut lock = state.edge_callback_ledger.lock().await;
     let ledger_enqueued = insert_approval_ledger_entry(
         &mut lock,
         key,
