@@ -296,6 +296,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             has_any_usage: false,
             max_turns: SUBRUN_MAX_TURNS,
             remaining_turns: SUBRUN_MAX_TURNS,
+            current_round_index: 0,
             turn_guard: TurnGuard::with_profile(task_profile),
             restricted_tools,
             step_recorder,
@@ -373,6 +374,9 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             approval_overrides: None,
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
+            session_turn: 0,
+            prefetch_injected: false,
+            turn_event_buffer: None,
         };
 
         // ── Wire ServerToolExecutor for skill sub-run tool execution ────

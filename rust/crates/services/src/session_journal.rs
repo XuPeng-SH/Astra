@@ -461,7 +461,7 @@ pub struct SelectionTrace {
 }
 
 /// Per-tool-call audit record, embedded in turn events for granular tracking.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ToolCallRecord {
     /// Tool name.
     pub name: String,
@@ -498,6 +498,28 @@ pub struct ToolCallRecord {
     /// Only set when `surgically_removed == Some(true)`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original_tool_name: Option<String>,
+    // ── Observability fields (Phase 1) ───────────────────────────────────
+    /// Offset from turn start when this tool began executing (milliseconds).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_offset_ms: Option<u64>,
+    /// Batch ID shared by tools executed in parallel within the same round.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_id: Option<String>,
+    /// Whether this tool was executed in parallel with others.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel: Option<bool>,
+    /// LLM round index within the turn (0-based). Identifies which LLM→tool
+    /// cycle this call belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub round: Option<u32>,
+    /// Full tool arguments as JSON string (untruncated).
+    /// Enables exact tool call reproduction from journal data alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args_full: Option<String>,
+    /// Full tool result text (untruncated, after per-tool output limit).
+    /// Enables debugging tool failures without re-execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_full: Option<String>,
 }
 
 /// Tool call name sentinel used for assistant messages that had parallel tool
@@ -697,6 +719,25 @@ pub struct JournalEvent {
     /// True when the turn succeeded with tool calls but routing had no domain — entity graph learn was skipped.
     #[serde(default, skip_serializing_if = "is_false")]
     pub entity_learn_skipped_no_domain: bool,
+    // ── Observability fields (Phase 1) ───────────────────────────────────
+    /// LLM round index within a turn (0-based, for llm_round events).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub round: Option<u32>,
+    /// Number of tool_calls returned by LLM in this round.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls_returned: Option<u32>,
+    /// Offset from turn start in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset_ms: Option<u64>,
+    /// Total LLM rounds in this turn (set on turn_completed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_rounds: Option<u32>,
+    /// Total LLM time in this turn excluding tool execution (set on turn_completed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_llm_ms: Option<u64>,
+    /// Total tool execution time in this turn (set on turn_completed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_tool_ms: Option<u64>,
 }
 
 /// Event type discriminator.
@@ -786,6 +827,8 @@ pub enum JournalEventType {
     ConfidenceDiagnosisRecorded,
     /// Compaction retry completed — records tier, tokens freed, and per-layer breakdown.
     CompactionRetry,
+    /// One LLM→tools round within a turn (observability Phase 1).
+    LlmRound,
 }
 
 /// Writer that appends events to a session journal file.
@@ -836,6 +879,179 @@ impl JournalWriter {
     /// Get the path to this journal file.
     pub fn path(&self) -> &PathBuf {
         &self.path
+    }
+
+    /// Batch-append multiple events in a single write + fsync.
+    pub fn append_bulk(&self, events: &[JournalEvent]) -> std::io::Result<()> {
+        self.append_bulk_inner(events, true)
+    }
+
+    /// Batch-append multiple events without fsync (best-effort, for interrupted turns).
+    pub fn append_bulk_no_sync(&self, events: &[JournalEvent]) -> std::io::Result<()> {
+        self.append_bulk_inner(events, false)
+    }
+
+    fn append_bulk_inner(&self, events: &[JournalEvent], sync: bool) -> std::io::Result<()> {
+        use std::io::Write;
+        if events.is_empty() {
+            return Ok(());
+        }
+        let mut buf = String::new();
+        for event in events {
+            let line = serde_json::to_string(event)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            buf.push_str(&line);
+            buf.push('\n');
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
+        file.write_all(buf.as_bytes())?;
+        if sync {
+            file.sync_data()?;
+        }
+        Ok(())
+    }
+}
+
+// ─── Turn Event Buffer ───────────────────────────────────────────────────────
+
+/// Data for one LLM→tools round within a turn.
+pub struct LlmRoundRecord {
+    pub ttft_ms: Option<u64>,
+    pub duration_ms: u64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub tool_calls_returned: u32,
+    pub tool_call_names: Vec<String>,
+    pub finish_reason: Option<String>,
+}
+
+/// In-memory collector for fine-grained turn events.
+///
+/// Events are accumulated during a turn and flushed to the journal in a single
+/// IO operation when the turn completes. On interruption, `flush_interrupted`
+/// writes partial data without fsync.
+pub struct TurnEventBuffer {
+    events: Vec<JournalEvent>,
+    turn_start: std::time::Instant,
+    session_id: Option<String>,
+    turn: u32,
+    round: u32,
+    batch_counter: u32,
+}
+
+impl TurnEventBuffer {
+    /// Start collecting events for a new turn.
+    pub fn begin_turn(session_id: Option<&str>, turn: u32) -> Self {
+        Self {
+            events: Vec::new(),
+            turn_start: std::time::Instant::now(),
+            session_id: session_id.map(ToString::to_string),
+            turn,
+            round: 0,
+            batch_counter: 0,
+        }
+    }
+
+    /// Elapsed milliseconds since turn start.
+    pub fn offset_ms(&self) -> u64 {
+        self.turn_start.elapsed().as_millis() as u64
+    }
+
+    /// The instant when this turn started (for passing to sub-contexts).
+    pub fn turn_start_instant(&self) -> std::time::Instant {
+        self.turn_start
+    }
+
+    /// Current LLM round index (0-based).
+    pub fn current_round(&self) -> u32 {
+        self.round
+    }
+
+    /// Generate a batch ID for a group of parallel tool executions.
+    pub fn next_batch_id(&mut self) -> String {
+        let id = format!("b-{}-{}", self.round, self.batch_counter);
+        self.batch_counter += 1;
+        id
+    }
+
+    /// Record an LLM round completion (one LLM→tools cycle).
+    pub fn record_llm_round(&mut self, r: LlmRoundRecord) {
+        let mut evt = JournalEvent::base(JournalEventType::LlmRound, self.session_id.as_deref());
+        evt.turn = Some(self.turn);
+        evt.round = Some(self.round);
+        evt.offset_ms = Some(self.offset_ms().saturating_sub(r.duration_ms));
+        evt.ttft_ms = r.ttft_ms;
+        evt.duration_ms = Some(r.duration_ms);
+        evt.tokens_in = Some(r.prompt_tokens);
+        evt.tokens_out = Some(r.completion_tokens);
+        if r.cache_read_tokens > 0 {
+            evt.cache_read_tokens = Some(r.cache_read_tokens);
+        }
+        evt.tool_calls_returned = Some(r.tool_calls_returned);
+        if !r.tool_call_names.is_empty() || r.finish_reason.is_some() {
+            evt.metadata = Some(serde_json::json!({
+                "tool_call_names": r.tool_call_names,
+                "finish_reason": r.finish_reason,
+            }));
+        }
+        self.events.push(evt);
+        self.round += 1;
+        self.batch_counter = 0;
+    }
+
+    /// Record a single event (generic).
+    pub fn record(&mut self, event: JournalEvent) {
+        self.events.push(event);
+    }
+
+    /// Number of events collected so far.
+    pub fn len(&self) -> usize {
+        self.events.len()
+    }
+
+    /// Whether no events have been collected.
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
+    /// Flush all collected events to the journal (one IO, with fsync).
+    pub fn flush(&mut self, writer: &JournalWriter) -> std::io::Result<()> {
+        if self.events.is_empty() {
+            return Ok(());
+        }
+        writer.append_bulk(&self.events)?;
+        self.events.clear();
+        Ok(())
+    }
+
+    /// Best-effort flush on interruption: no fsync, marks events as partial.
+    pub fn flush_interrupted(&mut self, writer: &JournalWriter) -> std::io::Result<()> {
+        if self.events.is_empty() {
+            return Ok(());
+        }
+        for event in &mut self.events {
+            let meta = event.metadata.get_or_insert_with(|| serde_json::json!({}));
+            if let Some(obj) = meta.as_object_mut() {
+                obj.insert("partial".into(), serde_json::json!(true));
+            }
+        }
+        writer.append_bulk_no_sync(&self.events)?;
+        self.events.clear();
+        Ok(())
+    }
+
+    /// Drain collected events (for callers that persist elsewhere, e.g. DB).
+    pub fn drain(&mut self) -> Vec<JournalEvent> {
+        std::mem::take(&mut self.events)
     }
 }
 
@@ -1715,6 +1931,12 @@ impl JournalEvent {
             selector_confidence: None,
             routing_domain_hint: None,
             entity_learn_skipped_no_domain: false,
+            round: None,
+            tool_calls_returned: None,
+            offset_ms: None,
+            llm_rounds: None,
+            total_llm_ms: None,
+            total_tool_ms: None,
         }
     }
 
@@ -3265,6 +3487,11 @@ mod tests {
     use astra_core::{DriftCause, DriftEvidence, EvidenceType};
     use tempfile::tempdir;
 
+    const REAL_SESSION_0AC769_FIXTURE: &str =
+        include_str!("../fixtures/real_session_0ac769_min.jsonl");
+    const REAL_SESSION_1D21375_FIXTURE: &str =
+        include_str!("../fixtures/real_session_1d21375_min.jsonl");
+
     fn base_tool_record(name: &str, ok: bool, preview: Option<&str>) -> ToolCallRecord {
         ToolCallRecord {
             name: name.to_string(),
@@ -3278,7 +3505,156 @@ mod tests {
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+            ..Default::default()
         }
+    }
+
+    #[test]
+    fn real_session_fixture_parses_with_expected_rounds_and_repeat_signals() {
+        let tmp = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = "0ac7696c-8a67-4e9f-b7bb-88b3bf7b59a0";
+        std::fs::write(
+            tmp.path().join(format!("{sid}.jsonl")),
+            REAL_SESSION_0AC769_FIXTURE,
+        )
+        .unwrap();
+
+        let (events, non_empty_lines, malformed_lines) = read_journal_for_digest(sid).unwrap();
+        assert_eq!(non_empty_lines, 14);
+        assert_eq!(malformed_lines, 0);
+        assert_eq!(events.len(), 14);
+
+        let llm_rounds: Vec<_> = events
+            .iter()
+            .filter(|event| event.event_type == JournalEventType::LlmRound)
+            .collect();
+        assert_eq!(
+            llm_rounds.len(),
+            7,
+            "fixture should preserve the 7-round loop"
+        );
+
+        let turn = events
+            .iter()
+            .find(|event| event.event_type == JournalEventType::Turn)
+            .expect("turn event");
+        assert_eq!(
+            turn.user_input.as_deref(),
+            Some("review b273c589a73799070a71f4cfc6d55349b534d8d1")
+        );
+        assert!(
+            turn.assistant_output
+                .as_deref()
+                .unwrap_or("")
+                .contains("not b273c589"),
+            "fixture should preserve the wrong-prefetch symptom"
+        );
+
+        let eval = events
+            .iter()
+            .find(|event| event.event_type == JournalEventType::TurnEvaluation)
+            .expect("turn_evaluation event");
+        let metadata = eval.metadata.as_ref().expect("turn evaluation metadata");
+        assert_eq!(metadata["tool_call_count"], 12);
+        assert_eq!(metadata["signal_count"], 4);
+        assert_eq!(metadata["quality"], 0.5);
+        assert_eq!(metadata["confidence"], 0.7);
+
+        let signals = metadata["signals"].as_array().expect("signals array");
+        let repeat_tools: std::collections::BTreeSet<_> = signals
+            .iter()
+            .filter(|signal| signal["kind"].as_str() == Some("repeat_tool_call"))
+            .filter_map(|signal| signal["tool"].as_str())
+            .collect();
+        assert_eq!(
+            repeat_tools,
+            std::collections::BTreeSet::from(["git_show", "read_file"])
+        );
+    }
+
+    #[test]
+    fn real_session_followup_fixture_preserves_low_information_repair_pathology() {
+        let tmp = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = "1d21375d-18f5-4e53-9145-1fa197b564dd";
+        std::fs::write(
+            tmp.path().join(format!("{sid}.jsonl")),
+            REAL_SESSION_1D21375_FIXTURE,
+        )
+        .unwrap();
+
+        let (events, non_empty_lines, malformed_lines) = read_journal_for_digest(sid).unwrap();
+        assert_eq!(non_empty_lines, 31);
+        assert_eq!(malformed_lines, 0);
+        assert_eq!(events.len(), 31);
+
+        let llm_rounds = events
+            .iter()
+            .filter(|event| event.event_type == JournalEventType::LlmRound)
+            .count();
+        assert_eq!(
+            llm_rounds, 19,
+            "fixture should preserve the 19-round session"
+        );
+
+        let turn = events
+            .iter()
+            .rev()
+            .find(|event| event.event_type == JournalEventType::Turn)
+            .expect("turn event");
+        assert_eq!(turn.turn, Some(3));
+        assert_eq!(turn.user_input.as_deref(), Some("修复?"));
+        assert_eq!(turn.tool_count, Some(16));
+        assert_eq!(turn.llm_rounds, Some(17));
+        assert_eq!(turn.tokens_in, Some(285_235));
+        assert_eq!(turn.tokens_out, Some(4_624));
+        assert_eq!(
+            turn.tool_calls.as_ref().map(Vec::len),
+            Some(16),
+            "fixture should preserve the serial repair spiral"
+        );
+
+        let context = events
+            .iter()
+            .find(|event| {
+                event.event_type == JournalEventType::ContextAssemblyRecorded
+                    && event.turn == Some(3)
+            })
+            .expect("turn 3 context record");
+        let token_budget = &context
+            .context_assembly_trace
+            .as_ref()
+            .expect("context trace")["token_budget"];
+        assert_eq!(token_budget["user_message_tokens"], 3);
+        assert_eq!(token_budget["tool_schema_tokens"], 4_663);
+        assert_eq!(token_budget["system_prompt_tokens"], 3_829);
+        assert_eq!(token_budget["compression_triggered"], false);
+
+        let stall_count = events
+            .iter()
+            .filter(|event| event.event_type == JournalEventType::StallDetected)
+            .count();
+        let verdict_count = events
+            .iter()
+            .filter(|event| event.event_type == JournalEventType::TurnGuardVerdict)
+            .count();
+        assert_eq!(stall_count, 1);
+        assert_eq!(verdict_count, 1);
+
+        let eval = events
+            .iter()
+            .find(|event| {
+                event.event_type == JournalEventType::TurnEvaluation && event.turn == Some(3)
+            })
+            .expect("turn 3 evaluation");
+        let metadata = eval.metadata.as_ref().expect("turn evaluation metadata");
+        assert_eq!(metadata["quality"], 0.2);
+        assert_eq!(metadata["confidence"], 0.7);
+        assert_eq!(metadata["stall_count"], 1);
+        assert_eq!(metadata["success"], false);
+        assert_eq!(metadata["tool_call_count"], 16);
+        assert_eq!(metadata["verdict_warning"], true);
     }
 
     #[test]
@@ -3867,6 +4243,7 @@ mod tests {
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+            ..Default::default()
         };
         let json = serde_json::to_string(&record).unwrap();
         assert!(json.contains("\"ok\":true"));
@@ -3892,6 +4269,7 @@ mod tests {
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+            ..Default::default()
         };
         let json = serde_json::to_string(&record).unwrap();
         assert!(json.contains("\"ok\":false"));
@@ -3918,6 +4296,7 @@ mod tests {
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+            ..Default::default()
         };
         let deferred = ToolCallRecord {
             name: "bash".into(),
@@ -3934,6 +4313,7 @@ mod tests {
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+            ..Default::default()
         };
         let dedup = ToolCallRecord {
             name: "skill".into(),
@@ -3950,6 +4330,7 @@ mod tests {
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+            ..Default::default()
         };
         let actual_failure = ToolCallRecord {
             name: "skill".into(),
@@ -3963,6 +4344,7 @@ mod tests {
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+            ..Default::default()
         };
 
         assert!(skipped.is_synthetic_placeholder());
@@ -4002,6 +4384,7 @@ mod tests {
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+            ..Default::default()
         }]);
         let json = serde_json::to_string(&evt).unwrap();
         let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
@@ -4053,6 +4436,7 @@ mod tests {
                 file_path: None,
                 surgically_removed: None,
                 original_tool_name: None,
+                ..Default::default()
             })
             .collect();
         let json = serde_json::to_string(&records).unwrap();
@@ -4076,6 +4460,7 @@ mod tests {
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+            ..Default::default()
         };
         let json = serde_json::to_string(&record).unwrap();
         let parsed: ToolCallRecord = serde_json::from_str(&json).unwrap();
@@ -4096,6 +4481,7 @@ mod tests {
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+            ..Default::default()
         };
         let json = serde_json::to_string(&record).unwrap();
         let parsed: ToolCallRecord = serde_json::from_str(&json).unwrap();
@@ -5067,6 +5453,7 @@ mod tests {
             file_path: None,
             surgically_removed: Some(true),
             original_tool_name: Some("read_file".to_string()),
+            ..Default::default()
         };
         let json = serde_json::to_string(&rec).unwrap();
         assert!(json.contains("\"surgically_removed\":true"));
@@ -5117,10 +5504,689 @@ mod tests {
             file_path: None,
             surgically_removed: Some(true),
             original_tool_name: Some("read_file".to_string()),
+            ..Default::default()
         };
         assert!(
             rec.is_synthetic_placeholder(),
             "surgically_removed=true must classify as synthetic regardless of name"
         );
+    }
+}
+
+#[cfg(test)]
+mod turn_event_buffer_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn begin_turn_initializes_round_zero() {
+        let buf = TurnEventBuffer::begin_turn(Some("sess-1"), 3);
+        assert_eq!(buf.current_round(), 0);
+        assert!(buf.is_empty());
+        assert_eq!(buf.len(), 0);
+    }
+
+    #[test]
+    fn record_llm_round_advances_round_counter() {
+        let mut buf = TurnEventBuffer::begin_turn(Some("sess-1"), 1);
+        buf.record_llm_round(LlmRoundRecord {
+            ttft_ms: Some(100),
+            duration_ms: 500,
+            prompt_tokens: 1000,
+            completion_tokens: 200,
+            cache_read_tokens: 0,
+            tool_calls_returned: 2,
+            tool_call_names: vec!["read_file".into(), "grep".into()],
+            finish_reason: Some("tool_calls".into()),
+        });
+        assert_eq!(buf.current_round(), 1);
+        assert_eq!(buf.len(), 1);
+
+        buf.record_llm_round(LlmRoundRecord {
+            ttft_ms: None,
+            duration_ms: 300,
+            prompt_tokens: 2000,
+            completion_tokens: 100,
+            cache_read_tokens: 500,
+            tool_calls_returned: 1,
+            tool_call_names: vec!["write_file".into()],
+            finish_reason: None,
+        });
+        assert_eq!(buf.current_round(), 2);
+        assert_eq!(buf.len(), 2);
+    }
+
+    #[test]
+    fn recorded_llm_round_event_has_correct_fields() {
+        let mut buf = TurnEventBuffer::begin_turn(Some("sess-1"), 5);
+        buf.record_llm_round(LlmRoundRecord {
+            ttft_ms: Some(42),
+            duration_ms: 800,
+            prompt_tokens: 3000,
+            completion_tokens: 400,
+            cache_read_tokens: 1000,
+            tool_calls_returned: 3,
+            tool_call_names: vec!["a".into(), "b".into(), "c".into()],
+            finish_reason: Some("tool_calls".into()),
+        });
+        let events = buf.drain();
+        assert_eq!(events.len(), 1);
+        let ev = &events[0];
+        assert_eq!(ev.event_type, JournalEventType::LlmRound);
+        assert_eq!(ev.turn, Some(5));
+        assert_eq!(ev.round, Some(0));
+        assert_eq!(ev.ttft_ms, Some(42));
+        assert_eq!(ev.tokens_in, Some(3000));
+        assert_eq!(ev.tokens_out, Some(400));
+        assert_eq!(ev.cache_read_tokens, Some(1000));
+        assert_eq!(ev.tool_calls_returned, Some(3));
+        let meta = ev.metadata.as_ref().unwrap();
+        assert_eq!(meta["tool_call_names"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn next_batch_id_includes_round() {
+        let mut buf = TurnEventBuffer::begin_turn(Some("s"), 0);
+        assert_eq!(buf.next_batch_id(), "b-0-0");
+        assert_eq!(buf.next_batch_id(), "b-0-1");
+        // Advance round
+        buf.record_llm_round(LlmRoundRecord {
+            ttft_ms: None,
+            duration_ms: 0,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cache_read_tokens: 0,
+            tool_calls_returned: 0,
+            tool_call_names: vec![],
+            finish_reason: None,
+        });
+        assert_eq!(buf.next_batch_id(), "b-1-0");
+    }
+
+    /// Regression: llm_round events must carry the session-level turn number,
+    /// not the internal agentic loop iteration count.
+    #[test]
+    fn llm_round_turn_uses_session_turn_number() {
+        // Simulate session turn 7 (the 7th user message in the session)
+        let mut buf = TurnEventBuffer::begin_turn(Some("sess-turn"), 7);
+        buf.record_llm_round(LlmRoundRecord {
+            ttft_ms: Some(100),
+            duration_ms: 500,
+            prompt_tokens: 5000,
+            completion_tokens: 200,
+            cache_read_tokens: 0,
+            tool_calls_returned: 0,
+            tool_call_names: vec![],
+            finish_reason: None,
+        });
+        let events = buf.drain();
+        assert_eq!(
+            events[0].turn,
+            Some(7),
+            "llm_round must use session turn number"
+        );
+    }
+
+    /// Regression: text-only LLM responses (no tool calls) must still record
+    /// an llm_round event so llm_rounds count is correct.
+    #[test]
+    fn text_only_response_records_llm_round() {
+        let mut buf = TurnEventBuffer::begin_turn(Some("sess-text"), 3);
+        // Simulate a text-only response (0 tool calls)
+        buf.record_llm_round(LlmRoundRecord {
+            ttft_ms: Some(48521),
+            duration_ms: 120000,
+            prompt_tokens: 24829,
+            completion_tokens: 1281,
+            cache_read_tokens: 0,
+            tool_calls_returned: 0,
+            tool_call_names: vec![],
+            finish_reason: None,
+        });
+        assert_eq!(
+            buf.current_round(),
+            1,
+            "round must advance even for text-only"
+        );
+        let events = buf.drain();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].tokens_in, Some(24829));
+        assert_eq!(events[0].tool_calls_returned, Some(0));
+    }
+
+    /// Regression: auto-reflection LLM calls must record llm_round events
+    /// so turn.tokens_in breakdown is complete.
+    #[test]
+    fn auto_reflection_round_has_finish_reason() {
+        let mut buf = TurnEventBuffer::begin_turn(Some("sess-refl"), 2);
+        // Normal round
+        buf.record_llm_round(LlmRoundRecord {
+            ttft_ms: Some(100),
+            duration_ms: 500,
+            prompt_tokens: 10000,
+            completion_tokens: 200,
+            cache_read_tokens: 0,
+            tool_calls_returned: 1,
+            tool_call_names: vec!["read_file".into()],
+            finish_reason: None,
+        });
+        // Auto-reflection round
+        buf.record_llm_round(LlmRoundRecord {
+            ttft_ms: None,
+            duration_ms: 0,
+            prompt_tokens: 54000,
+            completion_tokens: 500,
+            cache_read_tokens: 0,
+            tool_calls_returned: 0,
+            tool_call_names: vec![],
+            finish_reason: Some("auto_reflection".into()),
+        });
+        assert_eq!(buf.current_round(), 2);
+        let events = buf.drain();
+        assert_eq!(events.len(), 2);
+        // Verify auto-reflection round has the finish_reason in metadata
+        let refl = &events[1];
+        assert_eq!(refl.round, Some(1));
+        assert_eq!(refl.tokens_in, Some(54000));
+    }
+
+    /// Regression: rate-limited early exit must record an llm_round with
+    /// finish_reason so the journal reflects the LLM call happened.
+    #[test]
+    fn rate_limited_round_records_finish_reason() {
+        let mut buf = TurnEventBuffer::begin_turn(Some("sess-rl"), 2);
+        buf.record_llm_round(LlmRoundRecord {
+            ttft_ms: Some(50),
+            duration_ms: 200,
+            prompt_tokens: 8000,
+            completion_tokens: 0,
+            cache_read_tokens: 0,
+            tool_calls_returned: 0,
+            tool_call_names: vec![],
+            finish_reason: Some("rate_limited".into()),
+        });
+        let events = buf.drain();
+        assert_eq!(events.len(), 1);
+        let meta = events[0].metadata.as_ref().unwrap();
+        assert_eq!(meta["finish_reason"], "rate_limited");
+        assert_eq!(events[0].tool_calls_returned, Some(0));
+    }
+
+    /// Regression: token-budget-exceeded early exit must record an llm_round.
+    #[test]
+    fn token_budget_exceeded_round_records_finish_reason() {
+        let mut buf = TurnEventBuffer::begin_turn(Some("sess-tb"), 5);
+        buf.record_llm_round(LlmRoundRecord {
+            ttft_ms: None,
+            duration_ms: 100,
+            prompt_tokens: 128000,
+            completion_tokens: 50,
+            cache_read_tokens: 64000,
+            tool_calls_returned: 0,
+            tool_call_names: vec![],
+            finish_reason: Some("token_budget_exceeded".into()),
+        });
+        let events = buf.drain();
+        assert_eq!(events.len(), 1);
+        let meta = events[0].metadata.as_ref().unwrap();
+        assert_eq!(meta["finish_reason"], "token_budget_exceeded");
+        assert_eq!(events[0].tokens_in, Some(128000));
+        assert_eq!(events[0].cache_read_tokens, Some(64000));
+    }
+
+    #[test]
+    fn flush_writes_events_to_journal() {
+        let tmp = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let writer = JournalWriter::new("sess-flush").unwrap();
+
+        let mut buf = TurnEventBuffer::begin_turn(Some("sess-flush"), 1);
+        buf.record_llm_round(LlmRoundRecord {
+            ttft_ms: None,
+            duration_ms: 100,
+            prompt_tokens: 500,
+            completion_tokens: 50,
+            cache_read_tokens: 0,
+            tool_calls_returned: 1,
+            tool_call_names: vec!["bash".into()],
+            finish_reason: None,
+        });
+        buf.record(JournalEvent::base_public(
+            JournalEventType::Turn,
+            Some("sess-flush"),
+        ));
+        assert_eq!(buf.len(), 2);
+
+        buf.flush(&writer).unwrap();
+        assert!(buf.is_empty());
+
+        // Verify written to disk
+        let content = std::fs::read_to_string(writer.path()).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2);
+        let ev0: JournalEvent = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(ev0.event_type, JournalEventType::LlmRound);
+        let ev1: JournalEvent = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(ev1.event_type, JournalEventType::Turn);
+    }
+
+    #[test]
+    fn flush_interrupted_marks_events_partial() {
+        let tmp = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let writer = JournalWriter::new("sess-interrupted").unwrap();
+
+        let mut buf = TurnEventBuffer::begin_turn(Some("sess-interrupted"), 1);
+        buf.record_llm_round(LlmRoundRecord {
+            ttft_ms: Some(50),
+            duration_ms: 200,
+            prompt_tokens: 1000,
+            completion_tokens: 100,
+            cache_read_tokens: 0,
+            tool_calls_returned: 2,
+            tool_call_names: vec!["read_file".into(), "grep".into()],
+            finish_reason: None,
+        });
+
+        buf.flush_interrupted(&writer).unwrap();
+        assert!(buf.is_empty());
+
+        let content = std::fs::read_to_string(writer.path()).unwrap();
+        let ev: JournalEvent = serde_json::from_str(content.trim()).unwrap();
+        assert_eq!(ev.event_type, JournalEventType::LlmRound);
+        let partial = ev
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("partial"))
+            .and_then(|v| v.as_bool());
+        assert_eq!(partial, Some(true));
+    }
+
+    #[test]
+    fn flush_empty_buffer_is_noop() {
+        let tmp = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let writer = JournalWriter::new("sess-empty").unwrap();
+
+        let mut buf = TurnEventBuffer::begin_turn(Some("sess-empty"), 1);
+        buf.flush(&writer).unwrap();
+        // File should not exist (no events written)
+        assert!(!writer.path().exists());
+    }
+
+    #[test]
+    fn drain_returns_events_and_clears_buffer() {
+        let mut buf = TurnEventBuffer::begin_turn(Some("s"), 0);
+        buf.record(JournalEvent::base_public(JournalEventType::Turn, Some("s")));
+        buf.record(JournalEvent::base_public(JournalEventType::Turn, Some("s")));
+        assert_eq!(buf.len(), 2);
+        let drained = buf.drain();
+        assert_eq!(drained.len(), 2);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn append_bulk_writes_multiple_events_atomically() {
+        let tmp = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let writer = JournalWriter::new("sess-bulk").unwrap();
+
+        let events = vec![
+            JournalEvent::session_start(Some("sess-bulk"), Some("gpt-4")),
+            JournalEvent::base_public(JournalEventType::Turn, Some("sess-bulk")),
+            JournalEvent::session_end(Some("sess-bulk"), 1),
+        ];
+        writer.append_bulk(&events).unwrap();
+
+        let content = std::fs::read_to_string(writer.path()).unwrap();
+        let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 3);
+    }
+
+    /// E2E regression test using real session data (a33177cc).
+    ///
+    /// Before the fix, llm_round events used 0-based turn numbers while
+    /// turn events used 1-based numbers (state.turn += 1 happens before
+    /// the turn event is written, but after stream_chat_sse returns).
+    ///
+    /// Real data (buggy):
+    ///   llm_round turn=0  ← should be 1
+    ///   turn      turn=1
+    ///   llm_round turn=1  ← should be 2
+    ///   llm_round turn=1  ← should be 2
+    ///   turn      turn=2
+    ///   llm_round turn=2  ← should be 3
+    ///   turn      turn=3
+    #[test]
+    fn e2e_llm_round_turn_matches_turn_event() {
+        let tmp = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let writer = JournalWriter::new("sess-e2e-turn").unwrap();
+
+        // Simulate 3 turns with the FIXED numbering (1-based).
+        // Turn 1: "hi" — 1 round, text-only
+        let mut buf1 = TurnEventBuffer::begin_turn(Some("sess-e2e-turn"), 1);
+        buf1.record_llm_round(LlmRoundRecord {
+            ttft_ms: Some(988),
+            duration_ms: 1831,
+            prompt_tokens: 9375,
+            completion_tokens: 11,
+            cache_read_tokens: 0,
+            tool_calls_returned: 0,
+            tool_call_names: vec![],
+            finish_reason: Some("stop".into()),
+        });
+        let obs1 = buf1.drain();
+        writer.append_bulk(&obs1).unwrap();
+        let turn1 = JournalEvent::turn(
+            Some("sess-e2e-turn"),
+            1,
+            Some("qwen-turbo"),
+            "hi",
+            "你好！",
+            0,
+            9375,
+            11,
+            1831,
+        );
+        writer.append(&turn1).unwrap();
+
+        // Turn 2: "描述一下这个项目" — 2 rounds, 1 tool call
+        let mut buf2 = TurnEventBuffer::begin_turn(Some("sess-e2e-turn"), 2);
+        buf2.record_llm_round(LlmRoundRecord {
+            ttft_ms: Some(2388),
+            duration_ms: 3500,
+            prompt_tokens: 10070,
+            completion_tokens: 30,
+            cache_read_tokens: 0,
+            tool_calls_returned: 1,
+            tool_call_names: vec!["read_file".into()],
+            finish_reason: None,
+        });
+        buf2.record_llm_round(LlmRoundRecord {
+            ttft_ms: Some(1200),
+            duration_ms: 7121,
+            prompt_tokens: 19744,
+            completion_tokens: 539,
+            cache_read_tokens: 0,
+            tool_calls_returned: 0,
+            tool_call_names: vec![],
+            finish_reason: Some("stop".into()),
+        });
+        let obs2 = buf2.drain();
+        writer.append_bulk(&obs2).unwrap();
+        let turn2 = JournalEvent::turn(
+            Some("sess-e2e-turn"),
+            2,
+            Some("qwen-turbo"),
+            "描述一下这个项目",
+            "这个项目是...",
+            1,
+            29814,
+            569,
+            10621,
+        );
+        writer.append(&turn2).unwrap();
+
+        // Turn 3: "review local changes" — 1 round, text-only (prefetch)
+        let mut buf3 = TurnEventBuffer::begin_turn(Some("sess-e2e-turn"), 3);
+        buf3.record_llm_round(LlmRoundRecord {
+            ttft_ms: Some(21633),
+            duration_ms: 85243,
+            prompt_tokens: 21454,
+            completion_tokens: 1347,
+            cache_read_tokens: 0,
+            tool_calls_returned: 0,
+            tool_call_names: vec![],
+            finish_reason: Some("stop".into()),
+        });
+        let obs3 = buf3.drain();
+        writer.append_bulk(&obs3).unwrap();
+        let turn3 = JournalEvent::turn(
+            Some("sess-e2e-turn"),
+            3,
+            Some("qwen3.6-plus"),
+            "review local changes",
+            "Code review...",
+            0,
+            43815,
+            3308,
+            85243,
+        );
+        writer.append(&turn3).unwrap();
+
+        // Parse back and verify consistency
+        let content = std::fs::read_to_string(writer.path()).unwrap();
+        let events: Vec<JournalEvent> = content
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+
+        let llm_rounds: Vec<_> = events
+            .iter()
+            .filter(|e| e.event_type == JournalEventType::LlmRound)
+            .collect();
+        let turns: Vec<_> = events
+            .iter()
+            .filter(|e| e.event_type == JournalEventType::Turn)
+            .collect();
+
+        assert_eq!(turns.len(), 3);
+        assert_eq!(llm_rounds.len(), 4); // 1 + 2 + 1
+
+        // Core invariant: every llm_round's turn must match its parent turn event
+        // Turn 1 has 1 llm_round
+        assert_eq!(llm_rounds[0].turn, Some(1), "llm_round[0] must be turn 1");
+        assert_eq!(turns[0].turn, Some(1));
+
+        // Turn 2 has 2 llm_rounds
+        assert_eq!(llm_rounds[1].turn, Some(2), "llm_round[1] must be turn 2");
+        assert_eq!(llm_rounds[2].turn, Some(2), "llm_round[2] must be turn 2");
+        assert_eq!(turns[1].turn, Some(2));
+
+        // Turn 3 has 1 llm_round
+        assert_eq!(llm_rounds[3].turn, Some(3), "llm_round[3] must be turn 3");
+        assert_eq!(turns[2].turn, Some(3));
+
+        // Verify round numbers within each turn
+        assert_eq!(llm_rounds[0].round, Some(0));
+        assert_eq!(llm_rounds[1].round, Some(0));
+        assert_eq!(llm_rounds[2].round, Some(1));
+        assert_eq!(llm_rounds[3].round, Some(0));
+    }
+
+    /// Verify the needs_start_event logic for resumed sessions.
+    /// This mirrors the rposition-based check in repl_turn::initialize_journal.
+    #[test]
+    fn needs_start_event_scenarios() {
+        let tmp = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+
+        // Helper: same logic as repl_turn::initialize_journal
+        fn needs_start(events: &[JournalEvent]) -> bool {
+            let last_type = events.last().map(|e| &e.event_type);
+            match last_type {
+                None | Some(JournalEventType::SessionEnd) => true,
+                _ => {
+                    let last_start = events
+                        .iter()
+                        .rposition(|e| e.event_type == JournalEventType::SessionStart);
+                    let last_end = events
+                        .iter()
+                        .rposition(|e| e.event_type == JournalEventType::SessionEnd);
+                    let has_unmatched_start = match (last_start, last_end) {
+                        (Some(s), Some(e)) => s > e,
+                        (Some(_), None) => true,
+                        _ => false,
+                    };
+                    !has_unmatched_start
+                }
+            }
+        }
+
+        // Empty journal → needs start
+        assert!(needs_start(&[]));
+
+        // Clean end → needs start
+        let events = vec![
+            JournalEvent::session_start(Some("s"), Some("m")),
+            JournalEvent::base_public(JournalEventType::Turn, Some("s")),
+            JournalEvent::session_end(Some("s"), 1),
+        ];
+        assert!(needs_start(&events));
+
+        // Interrupted (start, turn, no end) → already has open start, skip
+        let events = vec![
+            JournalEvent::session_start(Some("s"), Some("m")),
+            JournalEvent::base_public(JournalEventType::Turn, Some("s")),
+        ];
+        assert!(!needs_start(&events));
+
+        // start → end → start → turn (interrupted) → already has open start, skip
+        let events = vec![
+            JournalEvent::session_start(Some("s"), Some("m")),
+            JournalEvent::session_end(Some("s"), 1),
+            JournalEvent::session_start(Some("s"), Some("m")),
+            JournalEvent::base_public(JournalEventType::Turn, Some("s")),
+        ];
+        assert!(!needs_start(&events));
+
+        // start → end → turn (orphan turn after clean end) → needs start
+        let events = vec![
+            JournalEvent::session_start(Some("s"), Some("m")),
+            JournalEvent::session_end(Some("s"), 1),
+            JournalEvent::base_public(JournalEventType::Turn, Some("s")),
+        ];
+        assert!(needs_start(&events));
+    }
+}
+
+#[cfg(test)]
+mod observability_serde_tests {
+    use super::*;
+
+    #[test]
+    fn tool_call_record_new_fields_serialize_only_when_set() {
+        let rec = ToolCallRecord {
+            name: "bash".into(),
+            ok: true,
+            ms: 50,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&rec).unwrap();
+        // New fields should be omitted when None.
+        assert!(!json.contains("start_offset_ms"));
+        assert!(!json.contains("batch_id"));
+        assert!(!json.contains("parallel"));
+        assert!(!json.contains("\"round\""));
+    }
+
+    #[test]
+    fn tool_call_record_new_fields_round_trip() {
+        let rec = ToolCallRecord {
+            name: "read_file".into(),
+            ok: true,
+            ms: 10,
+            start_offset_ms: Some(5000),
+            batch_id: Some("b-0-0".into()),
+            parallel: Some(true),
+            round: Some(2),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(json.contains("\"start_offset_ms\":5000"));
+        assert!(json.contains("\"batch_id\":\"b-0-0\""));
+        assert!(json.contains("\"parallel\":true"));
+        assert!(json.contains("\"round\":2"));
+
+        let deser: ToolCallRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.start_offset_ms, Some(5000));
+        assert_eq!(deser.batch_id.as_deref(), Some("b-0-0"));
+        assert_eq!(deser.parallel, Some(true));
+        assert_eq!(deser.round, Some(2));
+    }
+
+    #[test]
+    fn tool_call_record_backward_compat_old_json_missing_new_fields() {
+        // Old journal entries won't have the new fields — they must deserialize to None.
+        let old_json = r#"{"name":"bash","ok":true,"ms":100}"#;
+        let rec: ToolCallRecord = serde_json::from_str(old_json).unwrap();
+        assert_eq!(rec.name, "bash");
+        assert!(rec.ok);
+        assert_eq!(rec.ms, 100);
+        assert_eq!(rec.start_offset_ms, None);
+        assert_eq!(rec.batch_id, None);
+        assert_eq!(rec.parallel, None);
+        assert_eq!(rec.round, None);
+    }
+
+    #[test]
+    fn journal_event_new_fields_serialize_only_when_set() {
+        let ev = JournalEvent::base_public(JournalEventType::Turn, Some("s1"));
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(!json.contains("\"round\""));
+        assert!(!json.contains("tool_calls_returned"));
+        assert!(!json.contains("offset_ms"));
+        assert!(!json.contains("llm_rounds"));
+        assert!(!json.contains("total_llm_ms"));
+        assert!(!json.contains("total_tool_ms"));
+    }
+
+    #[test]
+    fn journal_event_llm_round_type_round_trip() {
+        let mut ev = JournalEvent::base_public(JournalEventType::LlmRound, Some("s1"));
+        ev.round = Some(3);
+        ev.tool_calls_returned = Some(5);
+        ev.offset_ms = Some(12000);
+        ev.tokens_in = Some(8000);
+        ev.tokens_out = Some(400);
+
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains("\"llm_round\""));
+        assert!(json.contains("\"round\":3"));
+        assert!(json.contains("\"tool_calls_returned\":5"));
+
+        let deser: JournalEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.event_type, JournalEventType::LlmRound);
+        assert_eq!(deser.round, Some(3));
+        assert_eq!(deser.tool_calls_returned, Some(5));
+        assert_eq!(deser.offset_ms, Some(12000));
+    }
+
+    #[test]
+    fn journal_event_backward_compat_old_turn_missing_new_fields() {
+        let old_json = r#"{"type":"turn","ts":"2026-01-01T00:00:00Z","session_id":"s1","turn":1,"tokens_in":100,"tokens_out":20,"duration_ms":500}"#;
+        let ev: JournalEvent = serde_json::from_str(old_json).unwrap();
+        assert_eq!(ev.event_type, JournalEventType::Turn);
+        assert_eq!(ev.round, None);
+        assert_eq!(ev.tool_calls_returned, None);
+        assert_eq!(ev.llm_rounds, None);
+        assert_eq!(ev.total_llm_ms, None);
+        assert_eq!(ev.total_tool_ms, None);
+    }
+
+    #[test]
+    fn journal_event_turn_with_observability_summary() {
+        let mut ev = JournalEvent::turn(
+            Some("s1"),
+            1,
+            Some("gpt-4"),
+            "hi",
+            "hello",
+            3,
+            1000,
+            200,
+            5000,
+        );
+        ev.llm_rounds = Some(2);
+        ev.total_llm_ms = Some(4500);
+        ev.total_tool_ms = Some(500);
+
+        let json = serde_json::to_string(&ev).unwrap();
+        let deser: JournalEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.llm_rounds, Some(2));
+        assert_eq!(deser.total_llm_ms, Some(4500));
+        assert_eq!(deser.total_tool_ms, Some(500));
     }
 }

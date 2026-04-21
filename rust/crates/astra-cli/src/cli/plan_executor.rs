@@ -463,6 +463,17 @@ pub struct PlanExecutorHandle {
 /// Create a linked pair of channels for plan executor ↔ REPL communication.
 ///
 /// Returns `(handle, update_tx, cmd_rx)`:
+/// Errors that indicate authentication/credential failure — retrying is pointless.
+fn is_credential_error(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    lower.contains("could not validate credentials")
+        || lower.contains("invalid credentials")
+        || lower.contains("unauthorized")
+        || lower.contains("authentication failed")
+        || lower.contains("token expired")
+        || lower.contains("401")
+}
+
 /// - `handle` goes to the REPL loop
 /// - `update_tx` is wrapped in a `ChannelSink` for the executor
 /// - `cmd_rx` goes to the executor to receive commands
@@ -1076,6 +1087,37 @@ async fn plan_executor_task(
                 Ok(result) => {
                     ctx.turn += 1;
 
+                    // Flush turn observability events (llm_round, tool timing)
+                    // so plan executor turns are visible in the journal.
+                    for evt in &result.turn_observability_events {
+                        let mut e = evt.clone();
+                        // Inject subtask_id into llm_round events so they can be
+                        // correlated with the subtask that produced them.
+                        if e.event_type == session_journal::JournalEventType::LlmRound {
+                            e.plan_subtask_id = Some(next_id.to_string());
+                        }
+                        emit_event(&update_tx, &ctx, e);
+                    }
+
+                    // Write a turn event so plan executor turns appear in digest.
+                    {
+                        let mut turn_event = session_journal::JournalEvent::turn(
+                            ctx.session_id.as_deref(),
+                            ctx.turn,
+                            ctx.model.as_deref(),
+                            &prompt,
+                            &result.full_text,
+                            result.tool_calls_count,
+                            result.prompt_tokens,
+                            result.completion_tokens,
+                            subtask_start.elapsed().as_millis() as u64,
+                        )
+                        .with_tool_calls(result.tool_call_records.clone())
+                        .with_ttft(result.ttft_ms);
+                        turn_event.llm_rounds = result.llm_rounds;
+                        emit_event(&update_tx, &ctx, turn_event);
+                    }
+
                     // Send turn result back to REPL for token accounting
                     let _ = update_tx.send(PlanUpdate::SubtaskTurnResult {
                         subtask_id: next_id.clone(),
@@ -1260,6 +1302,20 @@ async fn plan_executor_task(
                         &failure.partial,
                     );
                     emit_event(&update_tx, &ctx, event);
+
+                    // Bail immediately on authentication/credential errors — retrying is pointless.
+                    if is_credential_error(&failure.error) {
+                        if let Some(st) = ctx.plan.subtasks.iter_mut().find(|s| s.id == *next_id) {
+                            st.status = TaskStatus::Failed;
+                        }
+                        let _ = update_tx.send(PlanUpdate::PlanError {
+                            error: format!(
+                                "Authentication failed — please re-login: {}",
+                                failure.error
+                            ),
+                        });
+                        return;
+                    }
 
                     // Retry: mark subtask back to Pending so the next loop iteration
                     // picks it up again. Use local turn_retry_counts for LLM turn failures
@@ -1760,5 +1816,199 @@ mod tests {
 
         drop(tx1);
         drop(tx2);
+    }
+
+    // ─── Observability event emission ────────────────────────────────────
+
+    /// Verify that JournalEvent items sent via PlanUpdate::JournalEvent are
+    /// received and carry the correct event type. This covers the emit_event
+    /// closure used to flush turn_observability_events (llm_round, etc.).
+    #[test]
+    fn journal_event_roundtrip_via_plan_update() {
+        use astra_services::session_journal::{LlmRoundRecord, TurnEventBuffer};
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PlanUpdate>();
+
+        // Build an llm_round event via TurnEventBuffer (the same path as runtime).
+        let mut buf = TurnEventBuffer::begin_turn(Some("sess-1"), 2);
+        buf.record_llm_round(LlmRoundRecord {
+            prompt_tokens: 1000,
+            completion_tokens: 50,
+            cache_read_tokens: 0,
+            duration_ms: 3500,
+            ttft_ms: Some(2100),
+            finish_reason: None,
+            tool_calls_returned: 0,
+            tool_call_names: vec![],
+        });
+        let events = buf.drain();
+        assert_eq!(events.len(), 1);
+
+        // Simulate emit_event sending it.
+        tx.send(PlanUpdate::JournalEvent(Box::new(
+            events.into_iter().next().unwrap(),
+        )))
+        .unwrap();
+
+        let update = rx.try_recv().unwrap();
+        let PlanUpdate::JournalEvent(received) = update else {
+            panic!("expected JournalEvent");
+        };
+        assert_eq!(
+            received.event_type,
+            astra_services::session_journal::JournalEventType::LlmRound
+        );
+        assert_eq!(received.turn, Some(2));
+        assert_eq!(received.tokens_in, Some(1000));
+        assert_eq!(received.ttft_ms, Some(2100));
+    }
+
+    /// Verify that observability events are emitted BEFORE the turn summary event,
+    /// matching the order in the Ok(result) branch of plan_executor_task.
+    #[test]
+    fn observability_events_emitted_before_turn_event() {
+        use astra_services::session_journal::{LlmRoundRecord, TurnEventBuffer};
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PlanUpdate>();
+
+        // Simulate: 2 llm_round events from TurnEventBuffer, then 1 turn event.
+        let mut buf = TurnEventBuffer::begin_turn(Some("sess-1"), 3);
+        for _ in 0..2 {
+            buf.record_llm_round(LlmRoundRecord {
+                prompt_tokens: 500,
+                completion_tokens: 20,
+                cache_read_tokens: 0,
+                duration_ms: 1000,
+                ttft_ms: Some(800),
+                finish_reason: None,
+                tool_calls_returned: 1,
+                tool_call_names: vec!["bash".into()],
+            });
+        }
+        // Emit observability events first (mirrors Ok(result) branch).
+        for evt in buf.drain() {
+            tx.send(PlanUpdate::JournalEvent(Box::new(evt))).unwrap();
+        }
+        // Then emit the turn summary.
+        let turn_evt = session_journal::JournalEvent::turn(
+            Some("sess-1"),
+            3,
+            Some("qwen-turbo"),
+            "prompt",
+            "response",
+            2,
+            1000,
+            40,
+            2000,
+        );
+        tx.send(PlanUpdate::JournalEvent(Box::new(turn_evt)))
+            .unwrap();
+
+        // Drain and verify order: llm_round, llm_round, turn.
+        let mut received_types = Vec::new();
+        while let Ok(update) = rx.try_recv() {
+            if let PlanUpdate::JournalEvent(evt) = update {
+                received_types.push(evt.event_type.clone());
+            }
+        }
+        assert_eq!(received_types.len(), 3);
+        assert_eq!(
+            received_types[0],
+            astra_services::session_journal::JournalEventType::LlmRound
+        );
+        assert_eq!(
+            received_types[1],
+            astra_services::session_journal::JournalEventType::LlmRound
+        );
+        assert_eq!(
+            received_types[2],
+            astra_services::session_journal::JournalEventType::Turn
+        );
+    }
+
+    /// Verify that llm_round events emitted by plan executor carry plan_subtask_id.
+    #[test]
+    fn llm_round_events_carry_subtask_id() {
+        use astra_services::session_journal::{JournalEventType, LlmRoundRecord, TurnEventBuffer};
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PlanUpdate>();
+        let subtask_id = "create-index-html";
+
+        let mut buf = TurnEventBuffer::begin_turn(Some("sess-1"), 2);
+        buf.record_llm_round(LlmRoundRecord {
+            prompt_tokens: 1000,
+            completion_tokens: 50,
+            cache_read_tokens: 0,
+            duration_ms: 3000,
+            ttft_ms: Some(1500),
+            finish_reason: None,
+            tool_calls_returned: 1,
+            tool_call_names: vec!["bash".into()],
+        });
+
+        // Simulate the plan_executor emit loop: inject subtask_id on LlmRound events.
+        for evt in buf.drain() {
+            let mut e = evt;
+            if e.event_type == JournalEventType::LlmRound {
+                e.plan_subtask_id = Some(subtask_id.to_string());
+            }
+            tx.send(PlanUpdate::JournalEvent(Box::new(e))).unwrap();
+        }
+
+        let update = rx.try_recv().unwrap();
+        let PlanUpdate::JournalEvent(received) = update else {
+            panic!("expected JournalEvent");
+        };
+        assert_eq!(received.event_type, JournalEventType::LlmRound);
+        assert_eq!(
+            received.plan_subtask_id.as_deref(),
+            Some(subtask_id),
+            "llm_round must carry plan_subtask_id"
+        );
+    }
+
+    /// Verify that the turn event emitted by plan executor carries ttft_ms from the first llm round.
+    #[test]
+    fn turn_event_carries_ttft_ms() {
+        use astra_services::session_journal::JournalEventType;
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PlanUpdate>();
+
+        // Build a turn event with ttft_ms set (mirrors the Ok(result) branch).
+        let turn_evt = session_journal::JournalEvent::turn(
+            Some("sess-1"),
+            3,
+            Some("qwen-turbo"),
+            "prompt",
+            "response",
+            2,
+            1000,
+            40,
+            2000,
+        )
+        .with_ttft(Some(1750));
+        tx.send(PlanUpdate::JournalEvent(Box::new(turn_evt)))
+            .unwrap();
+
+        let update = rx.try_recv().unwrap();
+        let PlanUpdate::JournalEvent(received) = update else {
+            panic!("expected JournalEvent");
+        };
+        assert_eq!(received.event_type, JournalEventType::Turn);
+        assert_eq!(
+            received.ttft_ms,
+            Some(1750),
+            "turn event must carry ttft_ms"
+        );
+    }
+
+    /// Verify that is_credential_error correctly identifies auth failures.
+    #[test]
+    fn credential_error_detection() {
+        assert!(is_credential_error("could not validate credentials"));
+        assert!(is_credential_error("401 Unauthorized"));
+        assert!(is_credential_error("Authentication failed: token expired"));
+        assert!(!is_credential_error("network timeout"));
+        assert!(!is_credential_error("tool execution failed"));
     }
 }

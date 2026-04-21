@@ -91,8 +91,43 @@ pub struct SystemPromptBreakdown {
     pub repository_memories: Vec<MemoryInjection>,
     /// User preferences/settings tokens.
     pub user_preferences_tokens: u32,
+    /// Structured dynamic context signals present in the prompt.
+    #[serde(default)]
+    pub context_signals: PromptContextSignals,
+    /// Structured late-round guidance signals present in the dynamic prompt.
+    #[serde(default)]
+    pub guidance_signals: PromptGuidanceSignals,
     /// Total system prompt tokens.
     pub total_tokens: u32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptGuidanceSignals {
+    pub round_budget_warning: bool,
+    pub synthesize_or_batch: bool,
+    pub parallel_feedback: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptContextSignals {
+    pub active_output_skills: bool,
+    pub learned_runtime_context: bool,
+    pub memory_signal_detected: bool,
+    pub system_prompt_override: bool,
+    pub effort_hint: bool,
+    pub agent_type_hint: bool,
+    pub self_awareness: bool,
+    pub implicit_feedback: bool,
+    pub learned_feedback_rules: bool,
+    pub session_anchor: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptTraceSignals {
+    #[serde(default)]
+    pub context_signals: PromptContextSignals,
+    #[serde(default)]
+    pub guidance_signals: PromptGuidanceSignals,
 }
 
 /// A skill that was injected into the system prompt.

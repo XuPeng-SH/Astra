@@ -279,6 +279,7 @@ mod tests {
             has_any_usage: false,
             max_turns: 3,
             remaining_turns: 3,
+            current_round_index: 0,
             turn_guard: TurnGuard::new(),
             restricted_tools: HashSet::new(),
             step_recorder: StepRecorder::new("test", "run"),
@@ -331,6 +332,9 @@ mod tests {
             approval_overrides: None,
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
+            session_turn: 0,
+            prefetch_injected: false,
+            turn_event_buffer: None,
         }
     }
 

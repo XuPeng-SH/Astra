@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use super::super::agentic_headless_round::HeadlessStderrStyle;
 use super::super::headless_tool_assembly::{
-    CACHEABLE_TOOLS, openai_tool_roundtrip_values_with_result_fields,
+    READ_ONLY_TOOLS, openai_tool_roundtrip_values_with_result_fields,
 };
 use super::super::headless_tool_body_preview::emit_headless_tool_body_preview;
 use super::super::headless_tool_journal::journal_record_executed_tool_call;
@@ -110,10 +110,10 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             }
         }
 
-        let args_size = serde_json::to_string(&execution.args)
-            .map(|s| s.len() as u32)
-            .unwrap_or(0);
+        let args_json = serde_json::to_string(&execution.args).ok();
+        let args_size = args_json.as_ref().map(|s| s.len() as u32).unwrap_or(0);
         let args_preview = make_args_preview(&execution.name, &execution.args);
+        let args_full = args_json;
         let file_path = execution
             .args
             .get("path")
@@ -129,7 +129,16 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 execution.result_str.as_str(),
                 args_preview,
                 file_path,
+                args_full,
             ));
+        // Fill observability fields on the just-pushed record.
+        if let Some(rec) = self.ctx.tool_call_records.last_mut() {
+            if let Some(start) = self.ctx.turn_start {
+                rec.start_offset_ms =
+                    Some((start.elapsed().as_millis() as u64).saturating_sub(executed_ms));
+            }
+            rec.round = Some(self.ctx.llm_round);
+        }
         self.ctx.step_recorder.complete_tool_with_result(
             &execution.name,
             is_err,
@@ -143,7 +152,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             try_write_light_headless_step_checkpoint(sid, self.ctx.step_recorder);
         }
 
-        if !is_err && CACHEABLE_TOOLS.contains(&execution.name.as_str()) {
+        if !is_err && READ_ONLY_TOOLS.contains(&execution.name.as_str()) {
             record_headless_cacheable_success_and_semantic_hint(
                 &execution.name,
                 &execution.args,
@@ -178,12 +187,26 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             model_result_str,
         );
 
-        let (tool_msg, tr) = openai_tool_roundtrip_values_with_result_fields(
+        let (mut tool_msg, tr) = openai_tool_roundtrip_values_with_result_fields(
             &execution.id,
             &execution.name,
             &model_result_str,
             execution.tool_result_fields.as_ref(),
         );
+        // Add metadata for compression (P6) and folding (P0):
+        // - _round_index: Current-round tool results should never be truncated
+        //   because the LLM hasn't seen them yet.
+        // - _tool_name: Enables proactive folding of old read-only tool results.
+        if let Some(obj) = tool_msg.as_object_mut() {
+            obj.insert(
+                "_round_index".to_string(),
+                serde_json::Value::Number(self.ctx.llm_round.into()),
+            );
+            obj.insert(
+                "_tool_name".to_string(),
+                serde_json::Value::String(execution.name.clone()),
+            );
+        }
         self.ctx.messages.push(tool_msg);
         self.ctx.tool_results.push(tr);
     }

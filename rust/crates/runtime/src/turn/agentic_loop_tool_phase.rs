@@ -70,6 +70,7 @@ async fn refresh_runtime_promotion_signals_from_db(state: &mut AgenticLoopState)
         state.stall.events.len(),
         verdict_warning,
         state.telemetry.first_budget_pressure,
+        state.prefetch_injected,
     );
     let assessment = build_runtime_session_quality_assessment(
         &session_id,
@@ -148,6 +149,7 @@ fn refresh_runtime_promotion_signals_from_turn(
     stall_events: &[(String, u32)],
     verdict_events: &[super::agentic_verdict_audit::AgenticVerdictAuditEvent],
     budget_pressure: f64,
+    prefetch_injected: bool,
 ) -> Option<RuntimePromotionSignals> {
     let stall_count = stall_events
         .iter()
@@ -161,6 +163,7 @@ fn refresh_runtime_promotion_signals_from_turn(
         stall_count,
         verdict_warning,
         budget_pressure,
+        prefetch_injected,
     );
     let recent_turn = (!tool_call_records.is_empty()
         || stall_count > 0
@@ -834,6 +837,15 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     {
         let mut term_adapter = HostTerminalAdapter(host);
         let headless_quiet = prep.quiet || state.skill_produced_output;
+        let obs_turn_start = state
+            .turn_event_buffer
+            .as_ref()
+            .map(|b| b.turn_start_instant());
+        let obs_llm_round = state
+            .turn_event_buffer
+            .as_ref()
+            .map(|b| b.current_round())
+            .unwrap_or(0);
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {
             turn_index,
             quiet: headless_quiet,
@@ -863,9 +875,71 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             progress_emitter: state.messaging.progress_emitter.as_ref(),
             pre_resolved_results: &pre_resolved_results,
             server_tool_executor: state.server_tool_executor.as_deref(),
+            turn_start: obs_turn_start,
+            llm_round: obs_llm_round,
         })
         .await;
     }
+
+    // Record LLM round in the turn event buffer and advance the round counter.
+    // Also post-process new ToolCallRecords to set batch_id and parallel flags.
+    let new_records_start = evo_records_before;
+    let new_records = &mut state.stall.tool_call_records[new_records_start..];
+    if !new_records.is_empty() && turn_result.accum.tool_calls.len() > 1 {
+        let batch_id = state.turn_event_buffer.as_mut().map(|b| b.next_batch_id());
+        let has_parallel = new_records
+            .iter()
+            .filter(|r| !r.is_synthetic_placeholder())
+            .count()
+            > 1;
+        for rec in new_records.iter_mut() {
+            if rec.is_synthetic_placeholder() {
+                continue;
+            }
+            rec.batch_id = batch_id.clone();
+            if has_parallel {
+                rec.parallel = Some(true);
+            }
+        }
+        // B4: Inject positive reinforcement when LLM successfully batched tools.
+        if has_parallel {
+            let parallel_count = new_records
+                .iter()
+                .filter(|r| !r.is_synthetic_placeholder())
+                .count();
+            state.messages.push(serde_json::json!({
+                "role": "system",
+                "content": format!(
+                    "✓ {parallel_count} tools executed in parallel — excellent. Keep batching independent operations."
+                )
+            }));
+        }
+    }
+
+    if let Some(ref mut buf) = state.turn_event_buffer {
+        let tool_names: Vec<String> = turn_result
+            .accum
+            .tool_calls
+            .iter()
+            .filter_map(|tc| {
+                tc.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                    .map(String::from)
+            })
+            .collect();
+        buf.record_llm_round(astra_services::session_journal::LlmRoundRecord {
+            ttft_ms: turn_result.ttft_ms,
+            duration_ms: prep.turn_start_time.elapsed().as_millis() as u64,
+            prompt_tokens: turn_result.accum.prompt_tokens,
+            completion_tokens: turn_result.accum.completion_tokens,
+            cache_read_tokens: turn_result.accum.cache_read_tokens,
+            tool_calls_returned: turn_result.accum.tool_calls.len() as u32,
+            tool_call_names: tool_names,
+            finish_reason: None,
+        });
+    }
+
     if let (Some(active), Some(executor)) = (
         active_server_rollback_boundary.as_ref(),
         state.server_tool_executor.as_deref(),
@@ -1142,6 +1216,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                         &state.stall.events,
                         &state.stall.verdict_events,
                         state.telemetry.first_budget_pressure,
+                        state.prefetch_injected,
                     );
                     state.telemetry.runtime_promotion_signals = updated_promotion_signals;
                     observe_gate_cancelled(state, turn_index, prep.turn_start_time, &turn_result);
@@ -1201,6 +1276,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                 &state.stall.events,
                 &state.stall.verdict_events,
                 state.telemetry.first_budget_pressure,
+                state.prefetch_injected,
             );
             state.telemetry.runtime_promotion_signals = updated_promotion_signals;
             state.step_recorder.end_turn(true);
@@ -1284,6 +1360,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                 &state.stall.events,
                 &state.stall.verdict_events,
                 state.telemetry.first_budget_pressure,
+                state.prefetch_injected,
             );
             state.telemetry.runtime_promotion_signals = updated_promotion_signals;
             state.step_recorder.end_turn(false);
@@ -1294,6 +1371,21 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             maybe_trigger_auto_reflection(host, state).await;
             let turn_tokens = state.last_measured_prompt_tokens.unwrap_or(0);
             apply_per_turn_adaptation(state, turn_tokens);
+
+            // P0: Proactive context folding at turn end.
+            // Fold old read-only tool results to maintain predictable context size.
+            let fold_result = super::context_compression::fold_old_read_only_results(
+                &mut state.messages,
+                state.current_round_index,
+            );
+            if fold_result.folded_count > 0 {
+                astra_core::agent_debug!(
+                    "context_folding",
+                    "Folded {} tool results, freed ~{} tokens",
+                    fold_result.folded_count,
+                    fold_result.tokens_freed_estimate
+                );
+            }
         }
     }
 
@@ -1350,6 +1442,7 @@ mod tests {
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+            ..Default::default()
         }
     }
 
@@ -1407,6 +1500,7 @@ mod tests {
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+            ..Default::default()
         }
     }
 
@@ -1441,6 +1535,7 @@ mod tests {
             &[],
             &[],
             0.2,
+            false,
         )
         .expect("recent turn signal should be captured");
 
@@ -1481,6 +1576,7 @@ mod tests {
             &[],
             &[],
             0.0,
+            false,
         );
 
         assert!(updated.is_none());

@@ -67,12 +67,15 @@ pub struct ToolCallInfo {
 /// - `verdict_warning` — whether TurnGuard issued a Warning or higher
 /// - `budget_pressure` — 0.0–0.9 budget pressure from compaction tier
 /// - `is_factual_query` — whether the query likely needed tool calls
+/// - `prefetch_injected` — whether prefetched context (e.g. git diff) was
+///   injected into the prompt, making zero tool calls acceptable
 pub fn evaluate_turn(
     tool_calls: &[ToolCallInfo],
     stall_count: usize,
     verdict_warning: bool,
     budget_pressure: f64,
     is_factual_query: bool,
+    prefetch_injected: bool,
 ) -> TurnEvaluation {
     let mut signals = Vec::new();
     let mut quality = 0.5_f64; // base quality
@@ -82,7 +85,7 @@ pub fn evaluate_turn(
 
     // ─── No tool calls ──────────────────────────────────────────────────
     if total_calls == 0 {
-        if is_factual_query {
+        if is_factual_query && !prefetch_injected {
             // Needed tools but didn't use any — bad
             signals.push(EvalSignal::NoToolsNeeded);
             return TurnEvaluation {
@@ -184,6 +187,7 @@ pub fn evaluate_tool_call_records(
     stall_count: usize,
     verdict_warning: bool,
     budget_pressure: f64,
+    prefetch_injected: bool,
 ) -> TurnEvaluation {
     // Synthetic placeholders (skill skipped/deferred, surgically removed
     // parallel tool calls) are audit-only records that do NOT represent real
@@ -215,6 +219,7 @@ pub fn evaluate_tool_call_records(
         verdict_warning,
         budget_pressure,
         is_live_query,
+        prefetch_injected,
     )
 }
 
@@ -347,13 +352,14 @@ mod tests {
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+            ..Default::default()
         }
     }
 
     #[test]
     fn all_tools_succeed_high_quality() {
         let calls = vec![ok_call("bash"), ok_call("grep"), ok_call("read_file")];
-        let eval = evaluate_turn(&calls, 0, false, 0.3, false);
+        let eval = evaluate_turn(&calls, 0, false, 0.3, false, false);
         assert!(eval.success);
         assert!(eval.quality > 0.7, "quality={}", eval.quality);
         assert!(eval.signals.contains(&EvalSignal::AllToolsHealthy));
@@ -362,7 +368,7 @@ mod tests {
     #[test]
     fn all_tools_fail_low_quality() {
         let calls = vec![err_call("bash"), err_call("grep")];
-        let eval = evaluate_turn(&calls, 0, false, 0.3, false);
+        let eval = evaluate_turn(&calls, 0, false, 0.3, false, false);
         assert!(!eval.success);
         assert!(eval.quality < 0.4, "quality={}", eval.quality);
         assert!(
@@ -375,7 +381,7 @@ mod tests {
     #[test]
     fn mixed_success_moderate_quality() {
         let calls = vec![ok_call("bash"), err_call("grep"), ok_call("read_file")];
-        let eval = evaluate_turn(&calls, 0, false, 0.3, false);
+        let eval = evaluate_turn(&calls, 0, false, 0.3, false, false);
         assert!(eval.success); // error rate < 0.5
         let rate_signal = eval
             .signals
@@ -386,7 +392,7 @@ mod tests {
 
     #[test]
     fn no_tools_conversational_ok() {
-        let eval = evaluate_turn(&[], 0, false, 0.3, false);
+        let eval = evaluate_turn(&[], 0, false, 0.3, false, false);
         assert!(eval.success);
         assert_eq!(eval.quality, 0.5);
         assert!(eval.confidence < 0.5); // low confidence for text-only
@@ -394,7 +400,7 @@ mod tests {
 
     #[test]
     fn no_tools_factual_query_bad() {
-        let eval = evaluate_turn(&[], 0, false, 0.3, true);
+        let eval = evaluate_turn(&[], 0, false, 0.3, true, false);
         assert!(!eval.success);
         assert!(eval.quality < 0.3);
         assert!(eval.signals.contains(&EvalSignal::NoToolsNeeded));
@@ -403,8 +409,8 @@ mod tests {
     #[test]
     fn stalls_reduce_quality() {
         let calls = vec![ok_call("bash")];
-        let no_stall = evaluate_turn(&calls, 0, false, 0.3, false);
-        let with_stall = evaluate_turn(&calls, 2, false, 0.3, false);
+        let no_stall = evaluate_turn(&calls, 0, false, 0.3, false, false);
+        let with_stall = evaluate_turn(&calls, 2, false, 0.3, false, false);
         assert!(with_stall.quality < no_stall.quality);
         assert!(with_stall.signals.contains(&EvalSignal::StallDetected));
     }
@@ -412,8 +418,8 @@ mod tests {
     #[test]
     fn verdict_warning_reduces_quality() {
         let calls = vec![ok_call("bash")];
-        let no_verdict = evaluate_turn(&calls, 0, false, 0.3, false);
-        let with_verdict = evaluate_turn(&calls, 0, true, 0.3, false);
+        let no_verdict = evaluate_turn(&calls, 0, false, 0.3, false, false);
+        let with_verdict = evaluate_turn(&calls, 0, true, 0.3, false, false);
         assert!(with_verdict.quality < no_verdict.quality);
         assert!(with_verdict.signals.contains(&EvalSignal::VerdictWarning));
     }
@@ -421,8 +427,8 @@ mod tests {
     #[test]
     fn high_budget_pressure_penalizes() {
         let calls = vec![ok_call("bash")];
-        let low_pressure = evaluate_turn(&calls, 0, false, 0.3, false);
-        let high_pressure = evaluate_turn(&calls, 0, false, 0.85, false);
+        let low_pressure = evaluate_turn(&calls, 0, false, 0.3, false, false);
+        let high_pressure = evaluate_turn(&calls, 0, false, 0.85, false, false);
         assert!(high_pressure.quality < low_pressure.quality);
         assert!(
             high_pressure
@@ -439,7 +445,7 @@ mod tests {
             ok_call("bash"),
             ok_call("grep"),
         ];
-        let eval = evaluate_turn(&calls, 0, false, 0.3, false);
+        let eval = evaluate_turn(&calls, 0, false, 0.3, false, false);
         assert!(
             eval.signals
                 .iter()
@@ -450,13 +456,14 @@ mod tests {
     #[test]
     fn empty_output_penalizes() {
         let calls = vec![empty_call("read_file"), ok_call("bash")];
-        let eval = evaluate_turn(&calls, 0, false, 0.3, false);
+        let eval = evaluate_turn(&calls, 0, false, 0.3, false, false);
         assert!(eval.signals.contains(&EvalSignal::EmptyToolOutput));
         let all_ok = evaluate_turn(
             &[ok_call("read_file"), ok_call("bash")],
             0,
             false,
             0.3,
+            false,
             false,
         );
         assert!(eval.quality < all_ok.quality);
@@ -466,7 +473,7 @@ mod tests {
     fn quality_clamped_to_bounds() {
         // Worst case: all errors + stalls + verdict + pressure
         let calls = vec![err_call("a"), err_call("b"), err_call("c")];
-        let eval = evaluate_turn(&calls, 5, true, 0.9, true);
+        let eval = evaluate_turn(&calls, 5, true, 0.9, true, false);
         assert!(eval.quality >= 0.0);
         assert!(eval.quality <= 1.0);
         assert!(eval.confidence >= 0.0);
@@ -475,8 +482,15 @@ mod tests {
 
     #[test]
     fn confidence_increases_with_more_signals() {
-        let simple = evaluate_turn(&[ok_call("bash")], 0, false, 0.3, false);
-        let complex = evaluate_turn(&[err_call("bash"), err_call("grep")], 2, true, 0.9, false);
+        let simple = evaluate_turn(&[ok_call("bash")], 0, false, 0.3, false, false);
+        let complex = evaluate_turn(
+            &[err_call("bash"), err_call("grep")],
+            2,
+            true,
+            0.9,
+            false,
+            false,
+        );
         assert!(complex.confidence > simple.confidence);
     }
 
@@ -489,9 +503,17 @@ mod tests {
             0,
             false,
             0.2,
+            false,
         );
         assert!(!eval.success);
         assert!(eval.signals.contains(&EvalSignal::NoToolsNeeded));
+    }
+
+    #[test]
+    fn prefetch_injected_suppresses_no_tools_needed() {
+        let eval = evaluate_turn(&[], 0, false, 0.3, true, true);
+        assert!(eval.success);
+        assert!(!eval.signals.contains(&EvalSignal::NoToolsNeeded));
     }
 
     #[test]
@@ -504,6 +526,7 @@ mod tests {
             0,
             false,
             0.2,
+            false,
         );
 
         let event = build_turn_evaluation_journal_event(
@@ -545,6 +568,7 @@ mod tests {
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+            ..Default::default()
         };
 
         // 1 real successful tool + 3 synthetic placeholders (skipped,
@@ -569,6 +593,7 @@ mod tests {
             0,
             false,
             0.1,
+            false,
         );
 
         // Must contain exactly one error_rate=0.0 signal AND AllToolsHealthy
@@ -619,6 +644,7 @@ mod tests {
                 file_path: None,
                 surgically_removed: Some(true),
                 original_tool_name: Some("read_file".to_string()),
+                ..Default::default()
             })
             .chain(std::iter::once(ToolCallRecord {
                 name: "git_show".to_string(),
@@ -632,10 +658,11 @@ mod tests {
                 file_path: None,
                 surgically_removed: None,
                 original_tool_name: None,
+                ..Default::default()
             }))
             .collect();
 
-        let eval = evaluate_tool_call_records("noop", &[], &records, 0, false, 0.1);
+        let eval = evaluate_tool_call_records("noop", &[], &records, 0, false, 0.1, false);
         assert!(
             !eval
                 .signals
@@ -662,6 +689,7 @@ mod tests {
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+            ..Default::default()
         };
 
         let distinct_greps = vec![
@@ -680,6 +708,7 @@ mod tests {
             0,
             false,
             0.1,
+            false,
         );
         assert!(
             !eval
@@ -702,6 +731,7 @@ mod tests {
             0,
             false,
             0.1,
+            false,
         );
         assert!(
             eval.signals
@@ -710,6 +740,134 @@ mod tests {
             "identical git_show targets should still surface as repeat loops: {:?}",
             eval.signals
         );
+    }
+
+    #[test]
+    fn real_session_0ac769_pattern_surfaces_git_show_and_read_file_repeats() {
+        use astra_services::session_journal::ToolCallRecord;
+
+        let record = |name: &str, args_preview: &str| ToolCallRecord {
+            name: name.to_string(),
+            ok: true,
+            ms: 20,
+            error: None,
+            input_bytes: None,
+            output_bytes: Some(120),
+            args_preview: Some(args_preview.to_string()),
+            result_preview: Some("ok".into()),
+            file_path: None,
+            surgically_removed: None,
+            original_tool_name: None,
+            ..Default::default()
+        };
+
+        // Real session 0ac7696c had 7 LLM rounds with this 12-tool pattern:
+        // git_show, git_show, read_file x3 + grep, grep x3 + read_file, git_show, git_show.
+        // The persisted turn_evaluation surfaced repeat loops for read_file and
+        // git_show, while distinct grep queries stayed healthy.
+        let records = vec![
+            record(
+                "git_show",
+                r#"{"rev":"b273c589a73799070a71f4cfc6d55349b534d8d1"}"#,
+            ),
+            record(
+                "git_show",
+                r#"{"rev":"b273c589a73799070a71f4cfc6d55349b534d8d1"}"#,
+            ),
+            record(
+                "read_file",
+                r#"{"path":"rust/crates/runtime/src/server/run_lifecycle.rs"}"#,
+            ),
+            record(
+                "read_file",
+                r#"{"path":"rust/crates/runtime/src/server/run_lifecycle.rs"}"#,
+            ),
+            record(
+                "read_file",
+                r#"{"path":"rust/crates/runtime/src/server/run_lifecycle.rs"}"#,
+            ),
+            record("grep", r#"/factual retry/ in rust/crates/runtime/src"#),
+            record("grep", r#"/ContinueLoop/ in rust/crates/runtime/src"#),
+            record("grep", r#"/TPM/ in rust/crates/runtime/src"#),
+            record(
+                "read_file",
+                r#"{"path":"rust/crates/runtime/src/server/run_lifecycle.rs"}"#,
+            ),
+            record(
+                "git_show",
+                r#"{"rev":"b273c589a73799070a71f4cfc6d55349b534d8d1"}"#,
+            ),
+            record(
+                "git_show",
+                r#"{"rev":"b273c589a73799070a71f4cfc6d55349b534d8d1"}"#,
+            ),
+            record("grep", r#"/turn_evaluation/ in rust/crates/runtime/src"#),
+        ];
+
+        let eval = evaluate_tool_call_records(
+            "review b273c589a73799070a71f4cfc6d55349b534d8d1",
+            &[
+                "git_show".to_string(),
+                "read_file".to_string(),
+                "grep".to_string(),
+            ],
+            &records,
+            0,
+            false,
+            0.446_225,
+            true,
+        );
+
+        assert!(
+            eval.success,
+            "real-session loop still completed successfully"
+        );
+        assert_eq!(eval.quality, 0.5);
+        assert_eq!(eval.confidence, 0.7);
+        assert!(
+            eval.signals
+                .iter()
+                .any(|s| matches!(s, EvalSignal::RepeatToolCall(name) if name == "read_file")),
+            "expected read_file repeat signal, got {:?}",
+            eval.signals
+        );
+        assert!(
+            eval.signals
+                .iter()
+                .any(|s| matches!(s, EvalSignal::RepeatToolCall(name) if name == "git_show")),
+            "expected git_show repeat signal, got {:?}",
+            eval.signals
+        );
+        assert!(
+            !eval
+                .signals
+                .iter()
+                .any(|s| matches!(s, EvalSignal::RepeatToolCall(name) if name == "grep")),
+            "distinct grep queries should not collapse into a repeat loop: {:?}",
+            eval.signals
+        );
+
+        let event = build_turn_evaluation_journal_event(
+            Some("0ac7696c-8a67-4e9f-b7bb-88b3bf7b59a0"),
+            Some(1),
+            "cli_repl",
+            "review b273c589a73799070a71f4cfc6d55349b534d8d1",
+            &[
+                "git_show".to_string(),
+                "read_file".to_string(),
+                "grep".to_string(),
+            ],
+            &records,
+            0,
+            false,
+            0.446_225,
+            &eval,
+        );
+        let metadata = event.metadata.expect("turn evaluation metadata");
+        assert_eq!(metadata["tool_call_count"], 12);
+        assert_eq!(metadata["signal_count"], 4);
+        assert_eq!(metadata["quality"], 0.5);
+        assert_eq!(metadata["confidence"], 0.7);
     }
 
     #[test]
@@ -730,6 +888,7 @@ mod tests {
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+            ..Default::default()
         };
         let surgical = || ToolCallRecord {
             name: SURGICAL_REMOVAL_TOOL_NAME.to_string(),
@@ -743,6 +902,7 @@ mod tests {
             file_path: None,
             surgically_removed: Some(true),
             original_tool_name: Some("glob".to_string()),
+            ..Default::default()
         };
         let records = vec![real(), surgical(), real(), surgical(), real()];
 
@@ -791,6 +951,7 @@ mod tests {
             file_path: None,
             surgically_removed: Some(true),
             original_tool_name: Some("bash".to_string()),
+            ..Default::default()
         };
         assert!(flagged.is_synthetic_placeholder());
 
@@ -807,6 +968,7 @@ mod tests {
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+            ..Default::default()
         };
         assert!(legacy.is_synthetic_placeholder());
 
@@ -823,6 +985,7 @@ mod tests {
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+            ..Default::default()
         };
         assert!(!normal.is_synthetic_placeholder());
     }

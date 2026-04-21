@@ -76,6 +76,7 @@ pub(super) fn is_session_service_unconfigured_error(
     error.0 == StatusCode::NOT_IMPLEMENTED && error.1.0.detail == "Session service not configured"
 }
 
+#[cfg(any(test, feature = "bridge-e2e-hooks"))]
 fn chat_stream_bridge_fallback_payload(
     chat_data: &astra_services::runs::ChatRequestData,
 ) -> serde_json::Value {
@@ -104,6 +105,7 @@ fn chat_stream_bridge_fallback_payload(
     })
 }
 
+#[cfg(any(test, feature = "bridge-e2e-hooks"))]
 fn normalize_bridge_allowlist(entries: Option<&[String]>) -> Option<Vec<String>> {
     entries.map(|entries| {
         let mut normalized = std::collections::BTreeSet::new();
@@ -162,42 +164,16 @@ pub(super) async fn chat_stream_handler(
         Err((status, error)) => return sse_error_response(status, error.0.detail),
     };
 
-    // Bridge E2E hooks: when test secret is present, route through bridge so
-    // `test_llm_rounds` mock works without a real LLM.
+    // Bridge E2E hooks: when test secret is present and NO test_llm_rounds in
+    // context, route through bridge. When test_llm_rounds IS present, fall
+    // through to stream_chat() which wires mock rounds into the host.
     #[cfg(feature = "bridge-e2e-hooks")]
-    if crate::turn::bridge_e2e_hooks::authorized(&headers) {
-        let payload = chat_stream_bridge_fallback_payload(&chat_data);
-        let body = match serde_json::to_vec(&payload).map(Bytes::from) {
-            Ok(body) => body,
-            Err(e) => {
-                return sse_error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
-            }
-        };
-        return dispatch_chat_turn_bridge(&state, &user, &headers, body).await;
-    }
-
-    match state
-        .run_lifecycle_service
-        .stream_chat(user.user_id.clone(), chat_data.clone())
-        .await
     {
-        Ok(stream) => {
-            let mut events = vec![serde_json::json!({
-                "type": "session_info",
-                "session_id": stream.session_id,
-                "run_id": stream.run_id,
-            })];
-            events.extend(transform_stream_run_events_for_client(
-                &stream.run_id,
-                stream.events,
-            ));
-            sse_json_response(events)
-        }
-        Err((status, error))
-            if astra_services::runs::is_run_lifecycle_unconfigured_error(status, &error.0) =>
-        {
-            // Fallback path: route /chat/stream through chat-turn bridge when lifecycle
-            // service isn't wired yet. This preserves CLI usability during cutover.
+        let has_test_rounds = chat_data
+            .context
+            .as_ref()
+            .map_or(false, |c| c.contains_key("test_llm_rounds"));
+        if crate::turn::bridge_e2e_hooks::authorized(&headers) && !has_test_rounds {
             let payload = chat_stream_bridge_fallback_payload(&chat_data);
             let body = match serde_json::to_vec(&payload).map(Bytes::from) {
                 Ok(body) => body,
@@ -205,7 +181,34 @@ pub(super) async fn chat_stream_handler(
                     return sse_error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
                 }
             };
-            dispatch_chat_turn_bridge(&state, &user, &headers, body).await
+            return dispatch_chat_turn_bridge(&state, &user, &headers, body).await;
+        }
+    }
+
+    match state
+        .run_lifecycle_service
+        .stream_chat(user.user_id.clone(), chat_data.clone())
+        .await
+    {
+        Ok(mut stream) => {
+            if let Some(event_rx) = stream.event_rx.take() {
+                // Incremental SSE streaming: convert channel into SSE body.
+                let session_id = stream.session_id.clone();
+                let run_id = stream.run_id.clone();
+                sse_streaming_response(session_id, run_id, event_rx)
+            } else {
+                // Batch fallback (test stubs, etc.)
+                let mut events = vec![serde_json::json!({
+                    "type": "session_info",
+                    "session_id": stream.session_id,
+                    "run_id": stream.run_id,
+                })];
+                events.extend(transform_stream_run_events_for_client(
+                    &stream.run_id,
+                    stream.events,
+                ));
+                sse_json_response(events)
+            }
         }
         Err((status, error)) => sse_error_response(status, error.0.detail),
     }
@@ -350,8 +353,16 @@ pub(super) async fn dispatch_chat_turn_bridge(
 
     let client_disconnect = std::sync::Arc::new(tokio_util::sync::CancellationToken::new());
 
-    match state
-        .chat_turn_bridge
+    let bridge = match state.chat_turn_bridge.as_ref() {
+        Some(b) => b,
+        None => {
+            return sse_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "chat turn bridge disabled. Configure the runtime with an in-process bridge.",
+            );
+        }
+    };
+    match bridge
         .forward(
             &bridge_headers,
             prepared.body,
@@ -803,22 +814,16 @@ mod chat_stream_bridge_fallback_tests {
     use async_trait::async_trait;
     use axum::{
         Json,
-        body::{self, Body, Bytes},
+        body::{self, Body},
         http::{HeaderMap, Request, StatusCode},
-        response::Response,
     };
-    use serde_json::Value;
-    use tokio::sync::Mutex;
     use tower::util::ServiceExt;
 
     use crate::{
         AppState, AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData,
-        AuthService, AuthTokenRecord, AuthUserRecord, ChatTurnBridge, ErrorResponse, HealthChecker,
-        ServiceInfo, SessionActivityRecord, SessionCreateRequestData, SessionListFilter,
-        SessionListRecord, SessionRecord, SessionService, SessionUpdateRequestData,
-        TurnAuxiliaryEventWriter, TurnCoreEventWriter, TurnHookDbWriter, TurnObserverWorker,
-        TurnReflectionLessonWriter, TurnReflectionStateStore, TurnSessionActivityWriter,
-        TurnToolEventWriter, build_app,
+        AuthService, AuthTokenRecord, AuthUserRecord, ErrorResponse, HealthChecker, ServiceInfo,
+        SessionActivityRecord, SessionCreateRequestData, SessionListFilter, SessionListRecord,
+        SessionRecord, SessionService, SessionUpdateRequestData, build_app,
     };
 
     #[derive(Clone)]
@@ -975,16 +980,6 @@ mod chat_stream_bridge_fallback_tests {
         }
     }
 
-    #[derive(Clone, Default)]
-    struct Capture {
-        body: Arc<Mutex<Option<Value>>>,
-    }
-
-    #[derive(Clone)]
-    struct StubChatTurnBridge {
-        capture: Capture,
-    }
-
     #[derive(Clone)]
     struct StubOtherNotImplementedLifecycle;
 
@@ -1080,6 +1075,7 @@ mod chat_stream_bridge_fallback_tests {
                         "data": {"prompt_tokens": 7, "completion_tokens": 3, "tool_call_count": 2}
                     }),
                 ],
+                event_rx: None,
             })
         }
 
@@ -1116,91 +1112,6 @@ mod chat_stream_bridge_fallback_tests {
         ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
             unreachable!()
         }
-    }
-
-    #[async_trait]
-    impl ChatTurnBridge for StubChatTurnBridge {
-        async fn forward(
-            &self,
-            _headers: &HeaderMap,
-            body: Bytes,
-            _turn_core_event_writer: Arc<dyn TurnCoreEventWriter>,
-            _turn_tool_event_writer: Arc<dyn TurnToolEventWriter>,
-            _turn_hook_db_writer: Arc<dyn TurnHookDbWriter>,
-            _turn_reflection_state_store: Arc<dyn TurnReflectionStateStore>,
-            _turn_reflection_lesson_writer: Arc<dyn TurnReflectionLessonWriter>,
-            _turn_observer_worker: Arc<dyn TurnObserverWorker>,
-            _turn_auxiliary_event_writer: Arc<dyn TurnAuxiliaryEventWriter>,
-            _turn_session_activity_writer: Arc<dyn TurnSessionActivityWriter>,
-            _client_cancel: Option<Arc<tokio_util::sync::CancellationToken>>,
-        ) -> Result<Response, (StatusCode, String)> {
-            *self.capture.body.lock().await =
-                Some(serde_json::from_slice(&body).expect("request body should be valid json"));
-            Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header("content-type", "text/event-stream")
-                .body(Body::from(
-                    "data: {\"type\":\"session_info\",\"session_id\":\"s1\",\"run_id\":\"r1\"}\n\n\
-                     data: {\"type\":\"text_delta\",\"content\":\"hello\"}\n\n\
-                     data: {\"type\":\"text_done\",\"full_text\":\"hello\"}\n\n\
-                     data: [DONE]\n\n",
-                ))
-                .expect("response should build"))
-        }
-    }
-
-    #[tokio::test]
-    async fn chat_stream_falls_back_to_chat_turn_bridge_when_lifecycle_unconfigured() {
-        let capture = Capture::default();
-        let app = build_app(
-            AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
-                .with_auth_service(Arc::new(StubAuthService))
-                .with_session_service(Arc::new(StubSessionService))
-                .with_chat_turn_bridge_secret("test-secret")
-                .with_chat_turn_bridge(Arc::new(StubChatTurnBridge {
-                    capture: capture.clone(),
-                })),
-        );
-
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/chat/stream")
-                    .header("authorization", "Bearer good-token")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"message":"hi","session_id":"s1","model":"demo-model","context":{"topic":"runtime"},"skill_search":{"dynamic_surface":false,"min_catalog_size":12,"surface_cap":20},"max_candidates":3,"explain":true}"#,
-                    ))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("response should be returned");
-
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = body::to_bytes(resp.into_body(), 1024 * 1024)
-            .await
-            .expect("body should be readable");
-        let text = String::from_utf8(body.to_vec()).expect("sse should be utf8");
-        assert!(text.contains("\"type\":\"text_delta\""));
-        assert!(text.contains("\"content\":\"hello\""));
-
-        let forwarded = capture
-            .body
-            .lock()
-            .await
-            .clone()
-            .expect("bridge should receive payload");
-        assert_eq!(forwarded["session_id"], "s1");
-        assert_eq!(forwarded["model"], "demo-model");
-        assert_eq!(forwarded["context"]["topic"], "runtime");
-        assert_eq!(forwarded["skill_search"]["dynamic_surface"], false);
-        assert_eq!(forwarded["skill_search"]["min_catalog_size"], 12);
-        assert_eq!(forwarded["skill_search"]["surface_cap"], 20);
-        assert_eq!(forwarded["max_candidates"], 3);
-        assert_eq!(forwarded["explain"], true);
-        assert_eq!(forwarded["messages"][0]["role"], "user");
-        assert_eq!(forwarded["messages"][0]["content"], "hi");
     }
 
     #[tokio::test]
@@ -1242,16 +1153,11 @@ mod chat_stream_bridge_fallback_tests {
 
     #[tokio::test]
     async fn chat_stream_does_not_fall_back_for_other_not_implemented_errors() {
-        let capture = Capture::default();
         let app = build_app(
             AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
                 .with_auth_service(Arc::new(StubAuthService))
                 .with_session_service(Arc::new(StubSessionService))
-                .with_run_lifecycle_service(Arc::new(StubOtherNotImplementedLifecycle))
-                .with_chat_turn_bridge_secret("test-secret")
-                .with_chat_turn_bridge(Arc::new(StubChatTurnBridge {
-                    capture: capture.clone(),
-                })),
+                .with_run_lifecycle_service(Arc::new(StubOtherNotImplementedLifecycle)),
         );
 
         let resp = app
@@ -1276,38 +1182,5 @@ mod chat_stream_bridge_fallback_tests {
         let text = String::from_utf8(body.to_vec()).expect("sse should be utf8");
         assert!(text.contains("\"type\":\"error\""));
         assert!(!text.contains("\"type\":\"text_delta\""));
-        assert!(capture.body.lock().await.is_none());
-    }
-
-    #[tokio::test]
-    async fn chat_stream_fallback_returns_bridge_disabled_error_when_bridge_unconfigured() {
-        let app = build_app(
-            AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
-                .with_auth_service(Arc::new(StubAuthService))
-                .with_session_service(Arc::new(StubSessionService)),
-        );
-
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/chat/stream")
-                    .header("authorization", "Bearer good-token")
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"message":"hi"}"#))
-                    .expect("request should build"),
-            )
-            .await
-            .expect("response should be returned");
-
-        assert_eq!(resp.status(), StatusCode::OK);
-        let bytes = body::to_bytes(resp.into_body(), 1024 * 1024)
-            .await
-            .expect("body should be readable");
-        let text = String::from_utf8(bytes.to_vec()).expect("sse should be utf8");
-        assert!(text.contains("\"type\":\"session_info\""));
-        assert!(text.contains("\"session_id\":\"s-created\""));
-        assert!(text.contains("\"type\":\"error\""));
-        assert!(text.contains("chat turn bridge disabled"));
     }
 }

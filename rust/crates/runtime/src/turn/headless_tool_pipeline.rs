@@ -99,6 +99,11 @@ pub(crate) struct HeadlessToolExecutionCtx<'a, E: EdgeToolRoundRow> {
     /// Optional server-side tool executor for web agent sessions (no CLI edge agent).
     /// When present, tools that have no edge match are executed directly by the server.
     pub server_tool_executor: Option<&'a crate::server::server_tool_executor::ServerToolExecutor>,
+    // ── Observability (Phase 1) ──
+    /// Turn start instant for computing start_offset_ms on tool records.
+    pub turn_start: Option<std::time::Instant>,
+    /// Current LLM round index (0-based) within this turn.
+    pub llm_round: u32,
 }
 
 pub(crate) struct HeadlessToolExecutionPipeline<'a, E: EdgeToolRoundRow> {
@@ -219,6 +224,69 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
 
         let executed = self.execute_execution(permitted).await;
         self.record_execution(executed).await;
+        true
+    }
+
+    /// Execute a batch of read-only tools concurrently.
+    /// Returns false if the round should be aborted.
+    pub(crate) async fn run_batch_concurrent(&mut self, items: &[HeadlessRoundToolIdx]) -> bool {
+        use super::headless_tool_pipeline::execute::execute_tool_pure;
+
+        // Phase 1: validate + permit serially (fast, needs &mut self).
+        let mut permitted_batch: Vec<PermittedExecution> = Vec::with_capacity(items.len());
+        for &item in items {
+            let validated = match self.validate_slot(item) {
+                HeadlessPipelineStage::Continue(v) => v,
+                HeadlessPipelineStage::ShortCircuit => continue,
+                HeadlessPipelineStage::AbortRound => return false,
+            };
+            match self.permit_execution(validated).await {
+                HeadlessPipelineStage::Continue(p) => permitted_batch.push(p),
+                HeadlessPipelineStage::ShortCircuit => continue,
+                HeadlessPipelineStage::AbortRound => return false,
+            };
+        }
+
+        if permitted_batch.is_empty() {
+            return true;
+        }
+
+        // Phase 2: execute all concurrently (no &mut self needed).
+        let mut executions: Vec<(HeadlessResolvedExecution, IdempotencyKey)> = permitted_batch
+            .into_iter()
+            .map(|p| (p.execution, p.idem_key))
+            .collect();
+
+        let server_executor = self.ctx.server_tool_executor;
+        let api = self.ctx.api;
+        let token = self.ctx.token;
+        let session_id = self.ctx.current_session_id;
+        let turn_index = self.ctx.turn_index;
+
+        let futs: Vec<_> = executions
+            .iter_mut()
+            .map(|(exec, _)| {
+                execute_tool_pure(exec, server_executor, api, token, session_id, turn_index)
+            })
+            .collect();
+        futures_util::future::join_all(futs).await;
+
+        // Phase 3: post-process + record serially (fast, needs &mut self).
+        for (execution, idem_key) in executions {
+            let is_err = crate::turn::tool_result_semantics::is_tool_error(&execution.result_str);
+            let executed_ms = if execution.is_edge_tool && execution.edge_duration_ms > 0 {
+                execution.edge_duration_ms
+            } else {
+                0
+            };
+            let executed = ExecutedExecution {
+                execution,
+                idem_key,
+                is_err,
+                executed_ms,
+            };
+            self.record_execution(executed).await;
+        }
         true
     }
 }
@@ -344,6 +412,8 @@ mod tests {
                     progress_emitter: None,
                     effective_permission_timeout: Duration::from_secs(30),
                     server_tool_executor,
+                    turn_start: None,
+                    llm_round: 0,
                 },
                 vec![false; self.edge_tool_round.len()],
             )

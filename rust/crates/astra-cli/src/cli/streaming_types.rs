@@ -117,6 +117,16 @@ pub(crate) struct StreamResult {
     pub(crate) entity_learn_skipped_no_domain: bool,
     /// Deferred context assembly trace: journal event is only written on turn commit.
     pub(crate) pending_context_assembly_trace: Option<(u32, serde_json::Value)>,
+    /// Collected turn observability events (llm_round, tool timing) for batch flush.
+    pub(crate) turn_observability_events: Vec<astra_services::session_journal::JournalEvent>,
+    /// Aggregated LLM round count for this turn.
+    pub(crate) llm_rounds: Option<u32>,
+    /// True when context_prefetch injected data before the agentic loop.
+    pub(crate) prefetch_injected: bool,
+    /// Task type detected by context_prefetch (e.g. "code_review", "exploration").
+    pub(crate) prefetch_task_type: Option<String>,
+    /// Size of the prefetched context body in bytes.
+    pub(crate) prefetch_body_bytes: Option<usize>,
 }
 
 impl StreamResult {
@@ -149,6 +159,7 @@ mod tests {
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+            ..Default::default()
         }
     }
 

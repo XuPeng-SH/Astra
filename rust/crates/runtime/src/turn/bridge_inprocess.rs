@@ -1,4 +1,4 @@
-/// In-process ChatTurnBridge — calls LLM directly without an external bridge service.
+/// In-process chat turn bridge — calls LLM directly without an external bridge service.
 ///
 /// # Key behaviors
 ///
@@ -27,88 +27,45 @@
 ///
 /// # Architecture (legacy)
 ///
-///   Rust API (dispatch_chat_turn_bridge) injects context into headers:
+///   Rust API (`forward()` on [`InProcessChatTurnBridge`]) injects context into headers:
 ///     x-mo-user-id, x-mo-session-id, x-mo-turn-chain-id, x-mo-user-query-event-id, ...
 ///   This bridge reads those headers, calls the LLM, streams SSE back, persists events, and
 ///   for each tool round blocks on [`super::edge_ledger`] until `POST /tools/result` (or timeout).
 use std::{
     collections::{HashMap, HashSet},
-    future::Future,
     sync::Arc,
     time::Instant,
 };
 
 use astra_core::SharedPool;
-use astra_services::evaluation::SessionQualityAssessmentRequest;
-use astra_services::session_journal::ToolCallRecord;
-use astra_services::session_workspace::{
-    ContextTraceBudgetSignal, ContextTraceSignal, ContextTraceTimingSignal,
-    ContextTraceToolSelection,
+use astra_services::session_journal::{
+    JournalWriter, LlmRoundRecord, ToolCallRecord, TurnEventBuffer,
 };
 use async_stream::stream;
 use axum::body::Body;
 use axum::body::Bytes;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
-use futures_util::{StreamExt, stream};
+use futures_util::StreamExt;
 
-/// Maximum number of read-only tools to execute concurrently.
-/// Prevents resource exhaustion from parallel tool execution.
-const MAX_CONCURRENT_READ_ONLY_TOOLS: usize = 10;
-use astra_tools::executor::DefaultToolExecutor;
-use astra_tools::{SandboxConfig, SandboxMode, ToolContext, ToolExecutor, TracingLogger};
 use serde_json::{Map, Value, json};
-use std::path::PathBuf;
-use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
-    ChatTurnBridge, DatabaseEvaluationService, DatabaseEventService, EvaluationService,
-    EventCreateRequestData, EventService, FernetTokenEncryptor, MatrixOneSettings,
-    SessionActivityUpdatePlan, TurnAuxiliaryEventWriter, TurnCoreEventRecord, TurnCoreEventWriter,
-    TurnCorePersistPlan, TurnHookDbWriter, TurnObserverWorker, TurnReflectionLessonWriter,
-    TurnReflectionStateStore, TurnSessionActivityWriter, TurnToolEventPersistPlan,
-    TurnToolEventRecord, TurnToolEventWriter, build_explain_event, build_stream_error_event,
-    pipeline::{step_protocol::StepCheckpoint, step_recorder::StepRecorder},
-    prompts,
-    turn::agentic_post_tool_policy::{
-        AgenticPostToolPolicyOutcome, AgenticPostToolPolicyRequest, apply_agentic_post_tool_policy,
-    },
-    turn::agentic_stall_preflight::{
-        CliAgenticStallPreflightRequest, apply_cli_agentic_stall_preflight,
-    },
-    turn::cloud_tool_delivery::{
-        ApprovalAuditContext, cloud_tool_requires_approval_for_delivery,
-        local_tool_execution_delivery, record_approval_required_audit,
-        sse_maps_through_tool_request, tool_approval_detail_for_delivery,
-        tool_approval_kind_for_delivery, tool_path_hint_for_delivery,
-        wait_approval_ledger_for_tool, wait_tool_result_ledger_for_tool,
-    },
-    turn::edge_ledger::{
-        assistant_message_with_tool_calls_and_reasoning, ensure_tool_call_ids,
-        history_has_reasoning,
-    },
-    turn::llm_client::{LlmCancel, sleep_ms_or_llm_cancel},
+    FernetTokenEncryptor, MatrixOneSettings, SessionActivityUpdatePlan, TurnAuxiliaryEventWriter,
+    TurnCoreEventRecord, TurnCoreEventWriter, TurnCorePersistPlan, TurnHookDbWriter,
+    TurnObserverWorker, TurnReflectionLessonWriter, TurnReflectionStateStore,
+    TurnSessionActivityWriter, TurnToolEventPersistPlan, TurnToolEventRecord, TurnToolEventWriter,
+    build_explain_event, build_stream_error_event, prompts,
+    turn::edge_ledger::ensure_tool_call_ids,
     turn::persist::{build_tool_call_event_payload, build_tool_result_event_payload},
     turn::sse_blocks::SseBlankLineUtf8Buf,
-    turn::sse_data_lines::{
-        drain_sse_data_lines, finish_sse_data_buffer, validate_sse_event_block_json,
-        validated_json_events_from_sse_block,
-    },
-    turn::stall::cli_agentic_tool_round_budget_abort_msg,
-    turn::stream_events::build_approval_required_event,
-    turn::tool_argument_hints::normalize_llm_function_arguments,
-    turn::tool_call_shape::{tool_call_arguments_value, tool_call_name},
+    turn::tool_call_shape::tool_call_name,
     turn::tool_schema_prune::prune_tool_schemas,
-    turn::turn_guard::TurnGuard,
 };
 
 const TOOL_RESULT_AUDIT_CHARS: usize = 4000;
-
-fn turn_timeout_s() -> f64 {
-    astra_core::RuntimeLimits::global().turn_timeout_s
-}
 
 fn count_inprocess_persisted_events(
     core_event_count: usize,
@@ -123,19 +80,11 @@ fn count_inprocess_persisted_events(
         }
 }
 
-fn render_sse(event: &Value) -> Bytes {
-    match serde_json::to_string(event) {
-        Ok(s) => Bytes::from(format!("data: {s}\n\n")),
-        Err(e) => {
-            astra_core::agent_error!("sse", "serialization failed: {e}");
-            Bytes::from("event: error\ndata: {\"error\":\"internal serialization failure\"}\n\n")
-        }
-    }
-}
-
-fn render_sse_map(event: &Map<String, Value>) -> Bytes {
-    render_sse(&Value::Object(event.clone()))
-}
+// ── SSE helpers — delegated to turn::bridge_sse_helpers ───────────────────────
+use super::bridge_sse_helpers::{
+    extend_forward_from_validated_sse_block, flush_tail_buf_into_llm_forward,
+    reasoning_done_sse_bytes_if_needed, render_sse, render_sse_map,
+};
 
 fn preview_chars(value: &str, limit: usize) -> String {
     value.chars().take(limit).collect()
@@ -144,6 +93,7 @@ fn preview_chars(value: &str, limit: usize) -> String {
 fn build_bridge_tool_call_records(
     tool_calls: &[Value],
     tool_results: &[Value],
+    round_info: &HashMap<String, (u32, usize)>, // request_id → (round, tools_in_round)
 ) -> Vec<ToolCallRecord> {
     let mut call_metadata: HashMap<String, (String, Option<String>, Option<u32>)> = HashMap::new();
     for tool_call in tool_calls {
@@ -219,6 +169,12 @@ fn build_bridge_tool_call_records(
                 .ok()
                 .and_then(|v| v.get("path").and_then(|p| p.as_str()).map(String::from))
         });
+        // Observability: assign round/batch_id/parallel from round_info.
+        let (round, batch_id, parallel) = match round_info.get(&request_id) {
+            Some(&(r, count)) if count > 1 => (Some(r), Some(format!("bridge-r{r}")), Some(true)),
+            Some(&(r, _)) => (Some(r), None, None),
+            None => (None, None, None),
+        };
         records.push(ToolCallRecord {
             name: tool_name,
             ok,
@@ -236,6 +192,12 @@ fn build_bridge_tool_call_records(
             file_path,
             surgically_removed: None,
             original_tool_name: None,
+            args_full: arguments.clone(),
+            result_full: output.clone(),
+            round,
+            batch_id,
+            parallel,
+            ..Default::default()
         });
     }
 
@@ -243,6 +205,11 @@ fn build_bridge_tool_call_records(
         if seen_request_ids.contains(&request_id) {
             continue;
         }
+        let (round, batch_id, parallel) = match round_info.get(&request_id) {
+            Some(&(r, count)) if count > 1 => (Some(r), Some(format!("bridge-r{r}")), Some(true)),
+            Some(&(r, _)) => (Some(r), None, None),
+            None => (None, None, None),
+        };
         records.push(ToolCallRecord {
             name: tool_name,
             ok: false,
@@ -257,237 +224,35 @@ fn build_bridge_tool_call_records(
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+            args_full: arguments,
+            result_full: None,
+            round,
+            batch_id,
+            parallel,
+            ..Default::default()
         });
     }
 
     records
 }
 
-fn build_legacy_context_trace_signal(
-    turn: u32,
-    turn_id: String,
-    tools_available: usize,
-    selected_tools: Vec<String>,
-    selection_confidence: f64,
-    measured_prompt_tokens: Option<u64>,
-    model_limit: usize,
-    tool_execution_ms: u64,
-    total_ms: u64,
-) -> ContextTraceSignal {
-    let unique_selected = selected_tools.iter().cloned().collect::<HashSet<_>>().len();
-    let budget = measured_prompt_tokens.map(|total_used| ContextTraceBudgetSignal {
-        max_tokens: model_limit.min(u32::MAX as usize) as u32,
-        total_used: total_used.min(u32::MAX as u64) as u32,
-        budget_pressure: if model_limit > 0 {
-            total_used as f64 / model_limit as f64
-        } else {
-            0.0
-        },
-        compression_triggered: false,
-    });
-    let llm_total_ms = total_ms.saturating_sub(tool_execution_ms);
+// ── Bridge observability — delegated to turn::bridge_observability ────────────
+use super::bridge_observability::{
+    build_legacy_context_trace_signal, persist_legacy_bridge_trace_and_quality,
+};
 
-    ContextTraceSignal {
-        turn_id,
-        captured_at: Some(chrono::Utc::now().to_rfc3339()),
-        tool_selection: Some(ContextTraceToolSelection {
-            tools_available: tools_available.min(u32::MAX as usize) as u32,
-            selected_tools,
-            rejected_tools: tools_available.saturating_sub(unique_selected),
-            strategy: "inprocess_bridge".to_string(),
-            confidence: selection_confidence,
-            latency_ms: 0,
-        }),
-        memory: None,
-        history: None,
-        budget,
-        timing: Some(ContextTraceTimingSignal {
-            turn,
-            context_assembly_ms: 0,
-            ttft_ms: 0,
-            llm_total_ms,
-            tool_execution_ms,
-            total_ms,
-        }),
-        explanations: Vec::new(),
-    }
-}
+// ── LLM streaming — delegated to turn::bridge_llm_stream ─────────────────────
+use super::bridge_llm_stream::call_llm_stream;
+use super::bridge_llm_stream::rate_limit_cooldown;
+use crate::bridge::rate_limit_cooldown::RateLimitAction;
 
-async fn persist_legacy_bridge_trace_and_quality(
-    matrixone: &MatrixOneSettings,
-    shared_pool: Option<SharedPool>,
-    user_id: String,
-    session_id: String,
-    agent_id: Option<String>,
-    turn_chain_id: String,
-    signal: ContextTraceSignal,
-    evaluation: Option<crate::pipeline::evaluation::TurnEvaluation>,
-    step_count: usize,
-) {
-    let Some(shared_pool) = shared_pool else {
-        return;
-    };
-
-    if let Some(evaluation) = evaluation {
-        let evaluation_service =
-            DatabaseEvaluationService::new(matrixone.clone()).with_pool(shared_pool.clone());
-        let assessment = SessionQualityAssessmentRequest {
-            session_id: session_id.clone(),
-            score: evaluation.quality,
-            step_count: i32::try_from(step_count).unwrap_or(i32::MAX),
-        };
-        if let Err((status, response)) = evaluation_service
-            .record_session_quality_assessment(&user_id, assessment)
-            .await
-        {
-            astra_core::agent_warn!(
-                "legacy-bridge",
-                "Failed to persist session quality assessment for {}: {} {}",
-                session_id,
-                status,
-                response.0.detail
-            );
-        }
-    }
-
-    let event_service = DatabaseEventService::new(matrixone.clone()).with_pool(shared_pool);
-    let mut metadata = match serde_json::to_value(&signal) {
-        Ok(metadata) => metadata,
-        Err(err) => {
-            astra_core::agent_warn!(
-                "legacy-bridge",
-                "Failed to serialize context trace signal for {}: {}",
-                session_id,
-                err
-            );
-            return;
-        }
-    };
-    if let Some(metadata_obj) = metadata.as_object_mut() {
-        if let Some(duration_ms) = signal.timing.as_ref().map(|timing| timing.total_ms) {
-            metadata_obj.insert(
-                "duration_ms".to_string(),
-                json!(duration_ms.min(i32::MAX as u64)),
-            );
-        }
-        if let Some(tool_name) = signal
-            .tool_selection
-            .as_ref()
-            .and_then(|selection| selection.selected_tools.first())
-        {
-            metadata_obj.insert("tool_name".to_string(), json!(tool_name));
-        }
-    }
-
-    let content = {
-        let preview = signal.preview();
-        if preview.is_empty() {
-            "context trace signal".to_string()
-        } else {
-            preview
-        }
-    };
-    let turn_id = if signal.turn_id.is_empty() {
-        "latest".to_string()
-    } else {
-        signal.turn_id.clone()
-    };
-    if let Err((status, response)) = event_service
-        .create_event(
-            user_id,
-            EventCreateRequestData {
-                session_id,
-                event_type: "context_trace_signal".to_string(),
-                content,
-                agent_id,
-                agent_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-                parent_event_id: None,
-                parent_event_ids: Some(Vec::new()),
-                causal_chain_id: Some(format!("{turn_chain_id}:context-trace:{turn_id}")),
-                metadata: Some(metadata),
-            },
-        )
-        .await
-    {
-        astra_core::agent_warn!(
-            "legacy-bridge",
-            "Failed to persist context trace signal: {} {}",
-            status,
-            response.0.detail
-        );
-    }
-}
-
-/// Returns `true` if `name` looks like a valid tool function name.
-///
-/// LLM providers sometimes return malformed tool calls when the model leaks XML-style
-/// thinking tags (e.g., `<reflect>`) into tool call blocks. We reject names that:
-/// - are empty
-/// - contain `<` or `>` (XML artifact)
-/// - contain whitespace
-fn is_valid_tool_name(name: &str) -> bool {
-    !name.is_empty()
-        && !name.contains('<')
-        && !name.contains('>')
-        && !name.chars().any(char::is_whitespace)
-}
-
-/// Maps one parsed JSON event from the in-process LLM SSE stream to bytes forwarded to the HTTP client.
-fn apply_forward_llm_sse_event(
-    event: &Value,
-    saw_inprocess_summary: &mut bool,
-    loop_text: &mut String,
-    loop_reasoning: &mut String,
-    loop_tool_calls: &mut Vec<Value>,
-    usage: &mut Map<String, Value>,
-    resolved_model: &mut String,
-) -> Result<Vec<Bytes>, String> {
-    let Some(t) = event.get("type").and_then(Value::as_str) else {
-        return Err("SSE event missing type field".into());
-    };
-    match t {
-        "_inprocess_summary" => {
-            *saw_inprocess_summary = true;
-            *loop_text = event
-                .get("full_text")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            *loop_reasoning = event
-                .get("reasoning")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            *loop_tool_calls = event
-                .get("tool_calls")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            if let Some(u) = event.get("usage").and_then(Value::as_object) {
-                *usage = u.clone();
-            }
-            if let Some(m) = event.get("model_used").and_then(Value::as_str) {
-                *resolved_model = m.to_string();
-            }
-            Ok(vec![])
-        }
-        "text_delta" | "reasoning_delta" | "reasoning_done" | "tool_call_start" | "usage"
-        | "error" | "error_message" => Ok(vec![render_sse(event)]),
-        "warning" => Ok(vec![render_sse(event)]),
-        _ => Ok(vec![]),
-    }
-}
-
-fn reasoning_done_sse_bytes_if_needed(reasoning: &str) -> Option<Bytes> {
-    (!reasoning.is_empty()).then(|| render_sse(&json!({"type": "reasoning_done"})))
-}
-
+#[cfg(test)]
 async fn await_with_client_disconnect<T, F>(
     cancel: Option<&CancellationToken>,
     future: F,
 ) -> Result<T, Map<String, Value>>
 where
-    F: Future<Output = T>,
+    F: std::future::Future<Output = T>,
 {
     tokio::select! {
         biased;
@@ -551,7 +316,11 @@ fn filter_round_edge_tools(edge_tools: &[Value], restricted_tools: &HashSet<Stri
         .collect()
 }
 
-fn record_turn_guard_tool_results(turn_guard: &mut TurnGuard, persist_tool_results: &[Value]) {
+#[cfg(test)]
+fn record_turn_guard_tool_results(
+    turn_guard: &mut crate::turn::turn_guard::TurnGuard,
+    persist_tool_results: &[Value],
+) {
     for tool_result in persist_tool_results {
         let Some(tool_result) = tool_result.as_object() else {
             continue;
@@ -565,42 +334,6 @@ fn record_turn_guard_tool_results(turn_guard: &mut TurnGuard, persist_tool_resul
             .unwrap_or("");
         turn_guard.record_tool_result(tool_name, result);
     }
-}
-
-fn tool_call_start_event(tool_call: &mut Map<String, Value>) -> Option<Value> {
-    let function = tool_call.get("function").and_then(Value::as_object)?;
-    let tool = function
-        .get("name")
-        .and_then(Value::as_str)
-        .filter(|name| is_valid_tool_name(name))?
-        .to_string();
-    let arguments = function
-        .get("arguments")
-        .and_then(Value::as_str)
-        .filter(|args| !args.is_empty())
-        .map(std::string::ToString::to_string);
-    let call_id = tool_call
-        .get("id")
-        .and_then(Value::as_str)
-        .filter(|id| !id.is_empty())
-        .map(std::string::ToString::to_string)
-        .unwrap_or_else(|| {
-            let id = Uuid::now_v7().to_string();
-            tool_call.insert("id".to_string(), Value::String(id.clone()));
-            id
-        });
-
-    let mut event = json!({
-        "type": "tool_call_start",
-        "tool": tool,
-        "call_id": call_id,
-    });
-    if let Some(arguments) = arguments
-        && let Some(obj) = event.as_object_mut()
-    {
-        obj.insert("arguments".to_string(), Value::String(arguments));
-    }
-    Some(event)
 }
 
 fn turn_complete_event(messages: &[Value], assistant_text: &str, tool_calls: &[Value]) -> Value {
@@ -625,821 +358,14 @@ fn turn_complete_event(messages: &[Value], assistant_text: &str, tool_calls: &[V
     Value::Object(event)
 }
 
-fn extend_forward_from_validated_sse_block(
-    block: &str,
-    saw_inprocess_summary: &mut bool,
-    loop_text: &mut String,
-    loop_reasoning: &mut String,
-    loop_tool_calls: &mut Vec<Value>,
-    usage: &mut Map<String, Value>,
-    resolved_model: &mut String,
-) -> Result<Vec<Bytes>, String> {
-    let events = validated_json_events_from_sse_block(block)?;
-    let mut out = Vec::new();
-    for ev in events {
-        out.extend(apply_forward_llm_sse_event(
-            &ev,
-            saw_inprocess_summary,
-            loop_text,
-            loop_reasoning,
-            loop_tool_calls,
-            usage,
-            resolved_model,
-        )?);
-    }
-    Ok(out)
-}
-
-fn flush_tail_buf_into_llm_forward(
-    buf: &mut String,
-    saw_inprocess_summary: &mut bool,
-    loop_text: &mut String,
-    loop_reasoning: &mut String,
-    loop_tool_calls: &mut Vec<Value>,
-    usage: &mut Map<String, Value>,
-    resolved_model: &mut String,
-) -> Result<Vec<Bytes>, String> {
-    if !buf.trim().is_empty() {
-        validate_sse_event_block_json(buf)?;
-    }
-    let mut out = Vec::new();
-    let d = drain_sse_data_lines(buf, "");
-    for ev in d.events {
-        out.extend(apply_forward_llm_sse_event(
-            &ev,
-            saw_inprocess_summary,
-            loop_text,
-            loop_reasoning,
-            loop_tool_calls,
-            usage,
-            resolved_model,
-        )?);
-    }
-    if d.stream_finished {
-        return Ok(out);
-    }
-    let fin = finish_sse_data_buffer(buf);
-    for ev in fin.events {
-        out.extend(apply_forward_llm_sse_event(
-            &ev,
-            saw_inprocess_summary,
-            loop_text,
-            loop_reasoning,
-            loop_tool_calls,
-            usage,
-            resolved_model,
-        )?);
-    }
-    Ok(out)
-}
-
-/// Maximum retries for transient LLM errors (429, 5xx, network).
-const LLM_MAX_RETRIES: u32 = 3;
-/// Base delay between retries (doubles each attempt: 1s, 2s, 4s).
-const LLM_RETRY_BASE_MS: u64 = 1000;
-
-// ── Rate-Limit Cooldown ──────────────────────────────────────────────────────
-use crate::bridge::rate_limit_cooldown::{
-    PerModelCooldown, RateLimitAction, is_overload_status, is_rate_limit_status,
-    parse_retry_after_ms,
+// ── Prompt caching — delegated to turn::prompt_cache ─────────────────────────
+pub use super::prompt_cache::PromptCacheConfig;
+#[cfg(test)]
+pub(crate) use super::prompt_cache::build_system_message;
+pub(crate) use super::prompt_cache::{
+    add_message_cache_breakpoint, annotate_tool_schemas_for_caching,
+    build_system_message_with_dynamic_sections,
 };
-use std::sync::OnceLock;
-
-/// Per-model rate-limit cooldown tracker.
-fn rate_limit_cooldown() -> &'static PerModelCooldown {
-    static COOLDOWN: OnceLock<PerModelCooldown> = OnceLock::new();
-    COOLDOWN.get_or_init(PerModelCooldown::new)
-}
-
-// ── Cache Configuration (session-latched) ────────────────────────────────────
-// Latched at session start to prevent mid-session flips from busting the cache.
-
-/// Prompt cache configuration, latched once per session.
-///
-/// Instead of reading `MO_PROMPT_CACHE_DISABLED` on every LLM call (which risks
-/// mid-session env var changes busting the KV cache), this struct captures the
-/// config at session init and is passed to all cache-related functions.
-#[derive(Debug, Clone)]
-pub struct PromptCacheConfig {
-    /// Whether cache_control annotations are enabled for Anthropic.
-    pub cache_enabled: bool,
-    /// Whether the provider supports cache_control (Anthropic/Claude).
-    pub is_anthropic: bool,
-}
-
-impl PromptCacheConfig {
-    /// Latch config from environment and provider info. Call once at session start.
-    pub fn latch(provider: &str, model_name: &str) -> Self {
-        let cache_enabled = !std::env::var("MO_PROMPT_CACHE_DISABLED")
-            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
-        let is_anthropic = provider == "anthropic" || model_name.contains("claude");
-        Self {
-            cache_enabled,
-            is_anthropic,
-        }
-    }
-
-    /// Convenience: should we emit cache_control annotations?
-    pub fn should_annotate(&self) -> bool {
-        self.cache_enabled && self.is_anthropic
-    }
-}
-
-impl Default for PromptCacheConfig {
-    fn default() -> Self {
-        Self {
-            cache_enabled: true,
-            is_anthropic: false,
-        }
-    }
-}
-
-// ── System Prompt Cache ──────────────────────────────────────────────────────
-// Two-level cache for static/dynamic prompt boundary:
-// - Global+Session sections are cached by (tool_names, task_type, confidence) — stable within a session
-// - Per-turn profile_desc is NOT cached (changes every turn with skills/memory/environment)
-use std::sync::Mutex;
-
-/// Cached prompt sections (Global + Session scoped).
-struct CachedSections {
-    /// Concatenated text of Global+Session sections (for non-Anthropic providers).
-    text: String,
-    /// Individual sections with scope metadata (for Anthropic cache_control).
-    sections: Vec<prompts::PromptSection>,
-}
-
-fn section_cache() -> &'static Mutex<HashMap<u64, CachedSections>> {
-    static CACHE: OnceLock<Mutex<HashMap<u64, CachedSections>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn section_cache_key(tool_names: &[&str], task_type: Option<&str>, confidence: f64) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    for name in tool_names {
-        name.hash(&mut hasher);
-    }
-    task_type.unwrap_or("none").hash(&mut hasher);
-    let bucket = if confidence < 0.3 { "low" } else { "normal" };
-    bucket.hash(&mut hasher);
-    hasher.finish()
-}
-
-/// Build the system message Value for the LLM API.
-///
-/// For Anthropic providers: uses content array with `cache_control` on stable sections,
-/// enabling server-side KV cache reuse across turns.
-///
-/// For other providers (OpenAI, DeepSeek, etc.): uses a single content string.
-/// Build the system message(s) for the LLM API.
-///
-/// Returns `(primary, dynamic)`:
-/// - **Anthropic**: `primary` is a multi-block content array with `cache_control` on stable
-///   sections and dynamic profile appended without cache markers. `dynamic` is `None`.
-/// - **OpenAI / other**: `primary` contains only the **stable** text (cacheable prefix).
-///   `dynamic` holds a second system message with the per-turn profile/hints, or `None`
-///   if there is nothing dynamic. This split enables OpenAI's automatic prefix caching:
-///   the stable message stays identical across turns so the provider can reuse the KV cache.
-pub(crate) fn build_system_message(
-    tool_names: &[&str],
-    profile_desc: &str,
-    confidence: f64,
-    task_type: Option<&str>,
-    cache_cfg: &PromptCacheConfig,
-) -> (Value, Option<Value>, Vec<prompts::PromptSection>) {
-    let key = section_cache_key(tool_names, task_type, confidence);
-
-    // Try cache for the stable (Global + Session) sections
-    let cached = if let Ok(cache) = section_cache().lock() {
-        cache
-            .get(&key)
-            .map(|c| (c.text.clone(), c.sections.clone()))
-    } else {
-        None
-    };
-
-    let (stable_text, sections) = cached.unwrap_or_else(|| {
-        // Build all sections (profile_desc is "" for cache — we'll append it separately)
-        let all = prompts::build_system_prompt_sections(tool_names, "", confidence, task_type);
-        // Only cache Global + Session sections (not None-scoped profile)
-        let stable: Vec<prompts::PromptSection> = all
-            .into_iter()
-            .filter(|s| s.scope != prompts::CacheScope::None)
-            .collect();
-        let text = stable
-            .iter()
-            .map(|s| s.text.as_str())
-            .collect::<Vec<_>>()
-            .join("");
-
-        if let Ok(mut cache) = section_cache().lock() {
-            if cache.len() > 32 {
-                cache.clear();
-            }
-            cache.insert(
-                key,
-                CachedSections {
-                    text: text.clone(),
-                    sections: stable.clone(),
-                },
-            );
-        }
-        (text, stable)
-    });
-
-    let is_anthropic = cache_cfg.is_anthropic;
-
-    // Build complete sections list (stable + dynamic) for trace.
-    let append_dynamic = |mut secs: Vec<prompts::PromptSection>| -> Vec<prompts::PromptSection> {
-        if !profile_desc.is_empty() {
-            secs.push(prompts::PromptSection {
-                text: profile_desc.to_string(),
-                scope: prompts::CacheScope::None,
-            });
-        }
-        secs
-    };
-
-    if is_anthropic {
-        // Anthropic: multi-block content with cache_control on stable sections.
-        // Even via OpenAI-compatible proxies, many forward cache_control to the
-        // native Messages API. Proxies that don't will simply ignore the field.
-        //
-        // Cache strategy:
-        //   Place cache_control on the LAST block of each scope group.
-        //   Anthropic allows up to 4 breakpoints per request — we use at most 2
-        //   (last Global, last Session). The provider caches the prefix up to
-        //   each breakpoint.
-        //
-        //   Global  → scope:"global" + ttl:"1h"  (shared across all sessions/orgs)
-        //   Session → ttl:"1h"                    (stable within a session)
-        //   None    → no cache_control             (changes every turn)
-        let cache_disabled = !cache_cfg.cache_enabled;
-
-        // Find the last index of each scope group for breakpoint placement
-        let last_global = sections
-            .iter()
-            .rposition(|s| s.scope == prompts::CacheScope::Global);
-        let last_session = sections
-            .iter()
-            .rposition(|s| s.scope == prompts::CacheScope::Session);
-
-        let mut blocks: Vec<Value> = Vec::with_capacity(sections.len() + 1);
-        for (i, section) in sections.iter().enumerate() {
-            let cc = if cache_disabled {
-                None
-            } else if Some(i) == last_global {
-                Some(json!({"type": "ephemeral", "scope": "global", "ttl": "1h"}))
-            } else if Some(i) == last_session {
-                Some(json!({"type": "ephemeral", "ttl": "1h"}))
-            } else {
-                None
-            };
-            let mut block = json!({
-                "type": "text",
-                "text": section.text,
-            });
-            if let Some(cc) = cc {
-                block["cache_control"] = cc;
-            }
-            blocks.push(block);
-        }
-        // Dynamic section (profile + per-turn hints) — no cache_control
-        if !profile_desc.is_empty() {
-            blocks.push(json!({
-                "type": "text",
-                "text": profile_desc,
-            }));
-        }
-        // Anthropic: everything in one message (cache_control breakpoints handle caching)
-        (
-            json!({
-                "role": "system",
-                "content": blocks,
-            }),
-            None,
-            append_dynamic(sections),
-        )
-    } else {
-        // OpenAI-compatible: split stable / dynamic into separate system messages
-        // so the stable prefix is identical across turns and the provider can reuse
-        // its automatic KV cache.
-        let primary = json!({
-            "role": "system",
-            "content": stable_text,
-        });
-        let dynamic = if profile_desc.is_empty() {
-            None
-        } else {
-            Some(json!({
-                "role": "system",
-                "content": profile_desc,
-            }))
-        };
-        (primary, dynamic, append_dynamic(sections))
-    }
-}
-
-/// Add `cache_control` to the last tool schema for Anthropic caching.
-///
-/// Anthropic allows only 4 cache_control breakpoints per request. Our allocation:
-/// - System prompt: 2 breakpoints (global scope + session scope)
-/// - Tools: 1 breakpoint (last tool only)
-/// - Messages: 1 breakpoint (last message)
-///
-/// Prioritizes message history caching for multi-turn conversations
-/// while still caching the stable tool prefix.
-pub(crate) fn annotate_tool_schemas_for_caching(
-    tools: &mut [Value],
-    cache_cfg: &PromptCacheConfig,
-) {
-    if !cache_cfg.should_annotate() || tools.is_empty() {
-        return;
-    }
-    // Mark only the last tool — this creates a single cache covering all tools.
-    // Since tools rarely change mid-conversation, this is usually a cache hit.
-    let last_idx = tools.len() - 1;
-    tools[last_idx]["cache_control"] = json!({"type": "ephemeral", "ttl": "1h"});
-}
-
-/// Add a cache breakpoint on the last conversation message for Anthropic.
-/// This enables turn-to-turn KV cache reuse for the conversation prefix.
-pub(crate) fn add_message_cache_breakpoint(messages: &mut [Value], cache_cfg: &PromptCacheConfig) {
-    if !cache_cfg.should_annotate() || messages.is_empty() {
-        return;
-    }
-    // Find the last non-system message and add cache_control to it
-    if let Some(last) = messages.iter_mut().rev().find(|m| {
-        m.get("role")
-            .and_then(Value::as_str)
-            .is_some_and(|r| r != "system")
-    }) {
-        // If content is a string, convert to array format for cache_control
-        if last.get("content").is_some_and(Value::is_string) {
-            let text = last["content"].as_str().unwrap_or_default().to_string();
-            last["content"] = json!([{
-                "type": "text",
-                "text": text,
-                "cache_control": {"type": "ephemeral"},
-            }]);
-        } else if let Some(arr) = last.get_mut("content").and_then(Value::as_array_mut) {
-            // Content is already an array — add cache_control to last element
-            if let Some(last_block) = arr.last_mut() {
-                last_block["cache_control"] = json!({"type": "ephemeral"});
-            }
-        }
-    }
-}
-
-fn bridge_llm_cancel(cc: &Option<Arc<CancellationToken>>) -> LlmCancel<'_> {
-    match cc.as_ref() {
-        Some(t) => LlmCancel::Token(t.as_ref()),
-        None => LlmCancel::None,
-    }
-}
-
-/// Call LLM streaming API, yield SSE bytes.
-/// Emits: text_delta, reasoning_delta, reasoning_done, tool_call_start, usage SSE events,
-/// then a final `_inprocess_summary` event with full_text/tool_calls/usage/model_used.
-///
-/// **Stream resilience (same as [`super::llm_client::call_llm_and_collect`])**:
-/// per-chunk idle watchdog on parsed SSE; if the provider stops sending, partial state is
-/// discarded and a **single non-stream** `/chat/completions` request attempts recovery.
-///
-/// Retries up to LLM_MAX_RETRIES times on transient errors (429/5xx/network)
-/// with exponential backoff.
-///
-/// **Note**: Caller must check rate-limit cooldown state and handle fallback model
-/// resolution BEFORE calling this function. This function only handles retries for
-/// transient errors within a single model.
-#[allow(clippy::too_many_arguments)]
-async fn call_llm_stream(
-    messages: &[Value],
-    tools: &[Value],
-    model_name: &str,
-    api_key: &str,
-    base_url: &str,
-    provider: &str,
-    max_output_tokens: Option<usize>,
-    has_fallback: bool,
-    client_cancel: Option<Arc<CancellationToken>>,
-) -> Result<impl futures_util::Stream<Item = Bytes> + Send + 'static, String> {
-    let cooldown = rate_limit_cooldown();
-    let model_key = model_name;
-
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .connect_timeout(crate::turn::llm_client::llm_connect_timeout())
-        .timeout(std::time::Duration::from_secs(turn_timeout_s() as u64 + 10))
-        .build()
-        .map_err(|e| e.to_string())?;
-
-    let messages = crate::turn::llm_client::consolidate_system_messages(messages);
-
-    let mut body = json!({
-        "model": model_name,
-        "messages": messages,
-        "stream": true,
-        "stream_options": {"include_usage": true},
-    });
-
-    // Set max output tokens to prevent generation cutoff.
-    // Use provider-appropriate field name.
-    if let Some(max_out) = max_output_tokens {
-        if provider == "anthropic" || model_name.contains("claude") {
-            body["max_tokens"] = json!(max_out);
-        } else {
-            // OpenAI, DeepSeek, Qwen, etc. use max_completion_tokens (newer)
-            // or max_tokens (legacy). Prefer max_completion_tokens.
-            body["max_completion_tokens"] = json!(max_out);
-        }
-    }
-
-    if !tools.is_empty() {
-        body["tools"] = Value::Array(tools.to_vec());
-        body["tool_choice"] = Value::String("auto".to_string());
-    }
-
-    let url = crate::turn::llm_client::llm_completions_url_for_provider(base_url, provider);
-
-    // Retry loop for transient errors (429 rate limit, 5xx server errors, network)
-    let mut last_err = String::new();
-    for attempt in 0..=LLM_MAX_RETRIES {
-        if attempt > 0 {
-            let delay = LLM_RETRY_BASE_MS * (1 << (attempt - 1));
-            sleep_ms_or_llm_cancel(delay, bridge_llm_cancel(&client_cancel))
-                .await
-                .map_err(|e| e.to_string())?;
-        }
-
-        let mut req = client.post(&url).header("content-type", "application/json");
-
-        if provider == "anthropic" {
-            req = req
-                .header("x-api-key", api_key)
-                .header("anthropic-version", "2023-06-01");
-        } else {
-            req = req.header("authorization", format!("Bearer {api_key}"));
-        }
-
-        let response = match req.json(&body).send().await {
-            Ok(r) => r,
-            Err(e) => {
-                last_err = format!("LLM request failed: {e}");
-                // Network errors are always retryable
-                continue;
-            }
-        };
-
-        let status = response.status().as_u16();
-        if response.status().is_success() {
-            // Success — record to cooldown tracker and return the stream
-            cooldown.with(model_key, |c| c.record_success());
-            let byte_stream = response.bytes_stream();
-            let model_name = model_name.to_string();
-
-            let client_for_fallback = client.clone();
-            let messages_for_fallback: Vec<Value> = messages.to_vec();
-            let tools_for_fallback: Vec<Value> = tools.to_vec();
-            let api_key_for_fallback = api_key.to_string();
-            let base_url_for_fallback = base_url.to_string();
-            let provider_for_fallback = provider.to_string();
-            let max_out_for_fallback = max_output_tokens;
-            let idle_pre = crate::turn::llm_client::stream_idle_timeout();
-            let idle_post = crate::turn::llm_client::stream_idle_timeout_after_progress();
-
-            let out = stream! {
-                let cc = client_cancel.clone();
-                let mut full_text = String::new();
-                let mut reasoning = String::new();
-                let mut in_think_block = false;
-                let mut tool_calls_map: std::collections::HashMap<usize, Map<String, Value>> =
-                    std::collections::HashMap::new();
-                let mut usage = Map::new();
-                let mut made_progress = false;
-
-                let sse = crate::turn::llm_client::parse_openai_sse_json_stream(byte_stream);
-                tokio::pin!(sse);
-
-                loop {
-                    let idle = if made_progress { idle_post } else { idle_pre };
-                    tokio::select! {
-                        biased;
-                        _ = crate::turn::llm_client::wait_until_cancelled_or_pending(cc.as_deref()) => {
-                            astra_core::agent_warn!(
-                                "llm",
-                                "in-process LLM SSE cancelled (client disconnect)"
-                            );
-                            tool_calls_map.clear();
-                            full_text.clear();
-                            reasoning.clear();
-                            break;
-                        }
-                        tick = tokio::time::timeout(idle, sse.next()) => {
-                            let next = tick;
-                            let chunk = match next {
-                                Ok(c) => c,
-                                Err(_) => {
-                                    astra_core::agent_warn!(
-                                        "llm",
-                                        "in-process stream idle after {}ms (made_progress={}) — attempting non-stream fallback",
-                                        idle.as_millis(),
-                                        made_progress
-                                    );
-                                    tool_calls_map.clear();
-                                    full_text.clear();
-                                    reasoning.clear();
-                                    let fb_timeout = crate::turn::llm_client::llm_fallback_timeout();
-                                    match crate::turn::llm_client::call_llm_nonstream_fallback(
-                                        &client_for_fallback,
-                                        &messages_for_fallback,
-                                        &tools_for_fallback,
-                                        &model_name,
-                                        &api_key_for_fallback,
-                                        &base_url_for_fallback,
-                                        &provider_for_fallback,
-                                        max_out_for_fallback,
-                                        fb_timeout,
-                                    )
-                                    .await
-                                    {
-                                        Ok(mut result) => {
-                                            ensure_tool_call_ids(&mut result.tool_calls);
-                                            full_text = result.full_text.clone();
-                                            reasoning = result.reasoning.clone();
-                                            usage = result.usage.clone();
-                                            tool_calls_map.clear();
-                                            for (i, tc) in result.tool_calls.iter().enumerate() {
-                                                if let Value::Object(m) = tc {
-                                                    tool_calls_map.insert(i, m.clone());
-                                                }
-                                            }
-                                            if !result.full_text.is_empty()
-                                                && result.tool_calls.is_empty()
-                                            {
-                                                yield render_sse(&json!({"type":"text_delta","content": result.full_text}));
-                                            }
-                                            if !result.reasoning.is_empty() {
-                                                yield render_sse(&json!({"type":"reasoning_delta","content": result.reasoning}));
-                                            }
-                                            for tc in &result.tool_calls {
-                                                if let Some(obj) = tc.as_object() {
-                                                    let mut tc = obj.clone();
-                                                    if let Some(event) = tool_call_start_event(&mut tc) {
-                                                        yield render_sse(&event);
-                                                    }
-                                                }
-                                            }
-                                            let prompt = result.usage.get("prompt").and_then(Value::as_i64);
-                                            let completion = result.usage.get("completion").and_then(Value::as_i64);
-                                            if prompt.is_some() || completion.is_some() {
-                                                let cache_read = result.usage.get("cache_read").and_then(Value::as_i64);
-                                                let cache_creation = result.usage.get("cache_creation").and_then(Value::as_i64);
-                                                yield render_sse(&json!({
-                                                    "type": "usage",
-                                                    "prompt_tokens": prompt,
-                                                    "completion_tokens": completion,
-                                                    "cache_read_tokens": cache_read,
-                                                    "cache_creation_tokens": cache_creation,
-                                                }));
-                                            }
-                                        }
-                                        Err(e) => {
-                                            yield render_sse(&json!({"type":"error","message": format!("stream stalled; non-stream recovery failed: {e}")}));
-                                            tool_calls_map.clear();
-                                            full_text.clear();
-                                            reasoning.clear();
-                                        }
-                                    }
-                                    break;
-                                }
-                            };
-                            let Some(item) = chunk else { break };
-                            let chunk = match item {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    astra_core::agent_warn!(
-                                        "llm",
-                                        "in-process stream transport error: {e}"
-                                    );
-                                    yield render_sse(&json!({"type":"error","message": format!("LLM stream transport error: {e}")}));
-                                    tool_calls_map.clear();
-                                    full_text.clear();
-                                    reasoning.clear();
-                                    break;
-                                }
-                            };
-                            // Some providers attach usage to a chunk that also contains choices,
-                            // so parse usage first on every chunk.
-                            made_progress = true;
-                            if let Some(u) = chunk.get("usage").and_then(Value::as_object) {
-                                let prompt = u.get("prompt_tokens").and_then(Value::as_i64);
-                                let completion = u.get("completion_tokens").and_then(Value::as_i64);
-                                if prompt.is_some() || completion.is_some() {
-                                    let mut usage_map = Map::new();
-                                    if let Some(value) = prompt {
-                                        usage_map.insert("prompt".to_string(), Value::from(value));
-                                    }
-                                    if let Some(value) = completion {
-                                        usage_map.insert("completion".to_string(), Value::from(value));
-                                    }
-                                    if let (Some(p), Some(c)) = (prompt, completion) {
-                                        usage_map.insert("total".to_string(), Value::from(p + c));
-                                    }
-                                    usage = usage_map;
-                                    // OpenAI: prompt_tokens_details.cached_tokens
-                                    // Anthropic (via proxy): cache_read_input_tokens / cache_creation_input_tokens
-                                    let cache_read = u.get("prompt_tokens_details")
-                                        .and_then(|d| d.get("cached_tokens"))
-                                        .and_then(Value::as_i64)
-                                        .or_else(|| u.get("cache_read_input_tokens").and_then(Value::as_i64));
-                                    let cache_creation = u.get("prompt_tokens_details")
-                                        .and_then(|d| d.get("cache_creation_input_tokens"))
-                                        .and_then(Value::as_i64)
-                                        .or_else(|| u.get("cache_creation_input_tokens").and_then(Value::as_i64));
-                                    yield render_sse(&json!({
-                                        "type": "usage",
-                                        "prompt_tokens": prompt,
-                                        "completion_tokens": completion,
-                                        "cache_read_tokens": cache_read,
-                                        "cache_creation_tokens": cache_creation,
-                                    }));
-                                }
-                            }
-
-                            let Some(choices) = chunk.get("choices").and_then(Value::as_array) else {
-                                continue;
-                            };
-
-                            let Some(delta) = choices.first()
-                                .and_then(|c| c.get("delta"))
-                                .and_then(Value::as_object)
-                            else { continue };
-
-                            // Text content — split out <think>...</think> blocks into reasoning_delta.
-                            // Models like MiniMax embed thinking in content with <think> tags.
-                            if let Some(content) = delta.get("content").and_then(Value::as_str)
-                                && !content.is_empty() {
-                                    for (chunk, is_think) in crate::turn::llm_client::split_think_chunks(content, &mut in_think_block) {
-                                        if is_think {
-                                            reasoning.push_str(&chunk);
-                                            yield render_sse(&json!({"type": "reasoning_delta", "content": chunk}));
-                                        } else {
-                                            full_text.push_str(&chunk);
-                                            yield render_sse(&json!({"type": "text_delta", "content": chunk}));
-                                        }
-                                    }
-                                }
-
-                            // Reasoning (DeepSeek / o1 style)
-                            if let Some(r) = delta.get("reasoning_content").and_then(Value::as_str)
-                                && !r.is_empty() {
-                                    reasoning.push_str(r);
-                                    yield render_sse(&json!({"type": "reasoning_delta", "content": r}));
-                                }
-
-                            // Tool calls (streaming accumulation)
-                            if let Some(tcs) = delta.get("tool_calls").and_then(Value::as_array) {
-                                for tc in tcs {
-                                    let idx = tc.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-                                    let entry = tool_calls_map.entry(idx).or_insert_with(|| {
-                                        Map::from_iter([
-                                            ("id".to_string(), Value::String(String::new())),
-                                            ("type".to_string(), Value::String("function".to_string())),
-                                            ("function".to_string(), json!({"name": "", "arguments": ""})),
-                                        ])
-                                    });
-                                    if let Some(id) = tc.get("id").and_then(Value::as_str)
-                                        && !id.is_empty() {
-                                            entry.insert("id".to_string(), Value::String(id.to_string()));
-                                        }
-                                        if let Some(func) = tc.get("function").and_then(Value::as_object) {
-                                            let f = entry
-                                                .entry("function".to_string())
-                                                .or_insert_with(|| json!({}));
-                                            let Some(f) = f.as_object_mut() else { continue; };
-                                            if let Some(args) = func.get("arguments").and_then(Value::as_str) {
-                                                let existing = f
-                                                    .entry("arguments".to_string())
-                                                    .or_insert_with(|| Value::String(String::new()));
-                                                if let Value::String(s) = existing {
-                                                    s.push_str(args);
-                                                }
-                                            }
-                                            if let Some(name) = func.get("name").and_then(Value::as_str)
-                                            && is_valid_tool_name(name) {
-                                                let is_new = f.get("name").and_then(Value::as_str).unwrap_or("").is_empty();
-                                                f.insert("name".to_string(), Value::String(name.to_string()));
-                                                if is_new {
-                                                    if let Some(event) = tool_call_start_event(entry) {
-                                                        yield render_sse(&event);
-                                                    }
-                                                }
-                                            } else if let Some(bad_name) = func.get("name").and_then(Value::as_str) {
-                                                astra_core::agent_warn!(
-                                                    "llm",
-                                                    "dropped malformed tool_call with invalid name: {bad_name:?}"
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                        }
-                    }
-                }
-
-                // Emit final summary as a special internal event (not forwarded to client)
-                let mut sorted_tcs: Vec<_> = tool_calls_map.into_iter().collect();
-                sorted_tcs.sort_by_key(|(idx, _)| *idx);
-                let mut tool_calls: Vec<Value> = sorted_tcs.into_iter().map(|(_, v)| Value::Object(v)).collect();
-
-                // Degraded tool-call fallback: recover <invoke> or <tool_call> blocks.
-                if tool_calls.is_empty() {
-                    if let Some(parsed) = crate::turn::xml_tool_call_fallback::parse_degraded_tool_calls(&full_text) {
-                        astra_core::agent_warn!(
-                            "llm",
-                            "recovered {} tool call(s) from degraded text in content (inprocess)",
-                            parsed.len()
-                        );
-                        full_text = crate::turn::xml_tool_call_fallback::strip_degraded_tool_calls(&full_text);
-                        tool_calls = parsed;
-                    }
-                }
-
-                yield render_sse(&json!({
-                    "type": "_inprocess_summary",
-                    "full_text": full_text,
-                    "reasoning": reasoning,
-                    "tool_calls": tool_calls,
-                    "usage": usage,
-                    "model_used": model_name,
-                }));
-            };
-
-            return Ok(out);
-        }
-
-        // Non-success: check if retryable (429 rate limit, 5xx server error)
-        let headers = response.headers();
-        let retry_after_ms = headers
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok())
-            .and_then(parse_retry_after_ms);
-
-        let text = response.text().await.unwrap_or_default();
-        last_err = format!("LLM error {status}: {text}");
-
-        // Record rate-limit errors to cooldown tracker
-        if is_rate_limit_status(status) {
-            let action = cooldown.with(model_key, |c| c.record_429(retry_after_ms, has_fallback));
-            astra_core::agent_warn!(
-                "llm",
-                "rate limit (429) on {}: action={:?}",
-                model_key,
-                action,
-            );
-
-            // If cooldown says to wait, honor it
-            if let RateLimitAction::WaitAndRetry { delay_ms } = action {
-                sleep_ms_or_llm_cancel(delay_ms, bridge_llm_cancel(&client_cancel))
-                    .await
-                    .map_err(|e| e.to_string())?;
-            }
-            continue; // Retryable
-        }
-
-        if is_overload_status(status) {
-            let action = cooldown.with(model_key, |c| c.record_529(retry_after_ms, has_fallback));
-            astra_core::agent_warn!(
-                "llm",
-                "server overload ({status}) on {}: action={:?}",
-                model_key,
-                action,
-            );
-
-            // If cooldown says to wait, honor it
-            if let RateLimitAction::WaitAndRetry { delay_ms } = action {
-                sleep_ms_or_llm_cancel(delay_ms, bridge_llm_cancel(&client_cancel))
-                    .await
-                    .map_err(|e| e.to_string())?;
-            }
-            continue; // Retryable
-        }
-
-        // Other 5xx errors are retryable but don't affect cooldown state
-        if status >= 500 {
-            continue;
-        }
-
-        // 4xx (except 429) is not retryable — fail immediately.
-        // Context-window errors are detected by content at the call site
-        // (bridge_inprocess line ~2271), not here.
-        return Err(last_err);
-    }
-
-    // All retries exhausted
-    Err(format!("{last_err} (after {} retries)", LLM_MAX_RETRIES))
-}
 
 #[derive(Clone)]
 pub struct InProcessChatTurnBridge {
@@ -1503,9 +429,9 @@ fn inprocess_session_info_event(session_id: &str, run_id: &str) -> Value {
     })
 }
 
-#[async_trait::async_trait]
-impl ChatTurnBridge for InProcessChatTurnBridge {
-    async fn forward(
+impl InProcessChatTurnBridge {
+    #[allow(clippy::too_many_arguments)]
+    pub async fn forward(
         &self,
         headers: &HeaderMap,
         body: Bytes,
@@ -1565,6 +491,10 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
             .get("model")
             .and_then(Value::as_str)
             .map(ToString::to_string);
+        let round_index = payload
+            .get("round_index")
+            .and_then(Value::as_i64)
+            .unwrap_or(0) as u32;
         let _agent_id = payload
             .get("agent_id")
             .and_then(Value::as_str)
@@ -1574,7 +504,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
         let encryptor = self.encryptor.clone();
         let shared_pool = self.shared_pool.clone();
         let turn_learning_writer = self.turn_learning_writer.clone();
-        let edge_callback_ledger = self.edge_callback_ledger.clone();
+        let _edge_callback_ledger = self.edge_callback_ledger.clone();
 
         #[cfg(feature = "bridge-e2e-hooks")]
         let bridge_e2e_for_stream: Option<Vec<Value>> =
@@ -1602,6 +532,11 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 .map(|t| crate::turn::llm_client::CancelOnClientDisconnect::new(t.clone()));
             let turn_started = Instant::now();
             let run_id = uuid::Uuid::new_v4().to_string();
+            let trace_turn = turn_count_from_messages(&messages).max(1) as u32;
+            let mut turn_event_buffer = TurnEventBuffer::begin_turn(
+                (!session_id.is_empty()).then_some(session_id.as_str()),
+                trace_turn,
+            );
             // Emit session_info first
             yield render_sse(&inprocess_session_info_event(&session_id, &run_id));
 
@@ -1803,23 +738,21 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 }
             };
             // Read active skill hints from edge_profile (injected by CLI)
-            let skill_hint = edge_profile
+            let active_skill_names: Vec<&str> = edge_profile
                 .get("active_skills")
                 .and_then(Value::as_array)
-                .map(|arr| {
-                    let names: Vec<&str> = arr.iter().filter_map(Value::as_str).collect();
-                    if names.is_empty() {
-                        String::new()
-                    } else {
-                        format!(
-                            "\n\n## Active Output Skills\n\
-                             The user has enabled these output constraints: {}. \
-                             Follow their formatting rules strictly.",
-                            names.join(", ")
-                        )
-                    }
-                })
+                .map(|arr| arr.iter().filter_map(Value::as_str).collect())
                 .unwrap_or_default();
+            let skill_hint = if active_skill_names.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "\n\n## Active Output Skills\n\
+                     The user has enabled these output constraints: {}. \
+                     Follow their formatting rules strictly.",
+                    active_skill_names.join(", ")
+                )
+            };
             // ── Extract user query for signal detection ──
             let user_content_for_signal = messages
                 .iter()
@@ -1828,18 +761,20 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 .and_then(|m| m.get("content").and_then(Value::as_str))
                 .unwrap_or("");
 
-            let learned_context_hint = edge_profile
+            let learned_context_text = edge_profile
                 .get("learned_context_hint")
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
-                .map(|hint| format!("\n\n## Learned Runtime Context\n{hint}"))
                 .unwrap_or_default();
+            let learned_context_hint = if learned_context_text.is_empty() {
+                String::new()
+            } else {
+                format!("\n\n## Learned Runtime Context\n{learned_context_text}")
+            };
             let task_type = edge_profile
                 .get("selection_task_type")
                 .and_then(Value::as_str)
                 .or_else(|| prompts::detect_task_type(user_content_for_signal));
-            let profile_with_hints = format!("{profile_desc}{skill_hint}{learned_context_hint}");
-
             // ── Self-awareness section (injected by CLI via edge_profile) ──
             let self_awareness_hint = edge_profile
                 .get("self_awareness_text")
@@ -1963,15 +898,145 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 }
             };
 
-            // Build per-turn dynamic content (profile + skills + memory signal + feedback + self-awareness + learned rules + anchor)
-            let dynamic_desc = format!("{profile_with_hints}{memory_signal_hint}{implicit_feedback_hint}{feedback_rules_hint}{self_awareness_hint}{session_anchor}");
+            // ── Round budget directive: encourage synthesis after several rounds ──
+            let tool_cfg = crate::runtime_config::RuntimeConfig::load().tool_selection;
+            let (tool_round_guidance, guidance_signals) = prompts::tool_round_guidance_trace_with(
+                &messages,
+                round_index,
+                tool_cfg.effective_round_budget_warning(),
+                tool_cfg.effective_round_budget_limit(),
+            );
 
+            let mut dynamic_sections = Vec::new();
+            if !profile_desc.is_empty() {
+                dynamic_sections.push(prompts::PromptSection::dynamic(
+                    profile_desc.clone(),
+                    prompts::PromptTokenBucket::Environment,
+                ));
+            }
+            if !skill_hint.is_empty() {
+                dynamic_sections.push(
+                    prompts::PromptSection::dynamic(
+                        skill_hint.clone(),
+                        prompts::PromptTokenBucket::UserPreferences,
+                    )
+                    .with_trace_signals(crate::turn::context_assembly_trace::PromptTraceSignals {
+                        context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
+                            active_output_skills: true,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }),
+                );
+            }
+            if !learned_context_hint.is_empty() {
+                dynamic_sections.push(
+                    prompts::PromptSection::dynamic(
+                        learned_context_hint.clone(),
+                        prompts::PromptTokenBucket::UserPreferences,
+                    )
+                    .with_trace_signals(crate::turn::context_assembly_trace::PromptTraceSignals {
+                        context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
+                            learned_runtime_context: true,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }),
+                );
+            }
+            if !memory_signal_hint.is_empty() {
+                dynamic_sections.push(
+                    prompts::PromptSection::dynamic(
+                        memory_signal_hint.clone(),
+                        prompts::PromptTokenBucket::Environment,
+                    )
+                    .with_trace_signals(crate::turn::context_assembly_trace::PromptTraceSignals {
+                        context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
+                            memory_signal_detected: true,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }),
+                );
+            }
+            if !implicit_feedback_hint.is_empty() {
+                dynamic_sections.push(
+                    prompts::PromptSection::dynamic(
+                        implicit_feedback_hint.clone(),
+                        prompts::PromptTokenBucket::Environment,
+                    )
+                    .with_trace_signals(crate::turn::context_assembly_trace::PromptTraceSignals {
+                        context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
+                            implicit_feedback: true,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }),
+                );
+            }
+            if !feedback_rules_hint.is_empty() {
+                dynamic_sections.push(
+                    prompts::PromptSection::dynamic(
+                        feedback_rules_hint.clone(),
+                        prompts::PromptTokenBucket::Environment,
+                    )
+                    .with_trace_signals(crate::turn::context_assembly_trace::PromptTraceSignals {
+                        context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
+                            learned_feedback_rules: true,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }),
+                );
+            }
+            if !self_awareness_hint.is_empty() {
+                dynamic_sections.push(
+                    prompts::PromptSection::dynamic(
+                        self_awareness_hint.clone(),
+                        prompts::PromptTokenBucket::Environment,
+                    )
+                    .with_trace_signals(crate::turn::context_assembly_trace::PromptTraceSignals {
+                        context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
+                            self_awareness: true,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }),
+                );
+            }
+            if !session_anchor.is_empty() {
+                dynamic_sections.push(
+                    prompts::PromptSection::dynamic(
+                        session_anchor.clone(),
+                        prompts::PromptTokenBucket::Environment,
+                    )
+                    .with_trace_signals(crate::turn::context_assembly_trace::PromptTraceSignals {
+                        context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
+                            session_anchor: true,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }),
+                );
+            }
+            if !tool_round_guidance.is_empty() {
+                dynamic_sections.push(
+                    prompts::PromptSection::dynamic(
+                        tool_round_guidance.clone(),
+                        prompts::PromptTokenBucket::Environment,
+                    )
+                    .with_trace_signals(crate::turn::context_assembly_trace::PromptTraceSignals {
+                        guidance_signals,
+                        ..Default::default()
+                    }),
+                );
+            }
             // Build provider-aware system message with static/dynamic boundary.
             // Anthropic gets multi-block content with cache_control on stable sections;
             // OpenAI/others get two messages: stable prefix (cacheable) + dynamic per-turn.
-            let (system_msg, dynamic_msg, prompt_sections) = build_system_message(
+            let (system_msg, dynamic_msg, prompt_sections) = build_system_message_with_dynamic_sections(
                 &tool_names,
-                &dynamic_desc,
+                &dynamic_sections,
                 selection_confidence,
                 task_type,
                 &cache_cfg,
@@ -2115,10 +1180,12 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
             super::edge_ledger::strip_stale_reasoning(&mut llm_messages, &provider, &model_name);
 
             // Cloud loop: every tool round waits on §5.5 ledger (`POST /tools/result`) then continues LLM.
-            let mut merged_tool_results: Vec<Value> = tool_results.clone();
+            let merged_tool_results: Vec<Value> = tool_results.clone();
 
             let mut full_text = String::new();
             let mut all_round_tool_calls: Vec<Value> = Vec::new();
+            // Track (start_index, count) per round for post-hoc round assignment.
+            let mut round_boundaries: Vec<(usize, usize)> = Vec::new();
             let mut reasoning = String::new();
             let mut usage = Map::new();
             let mut resolved_model = model_name.clone();
@@ -2128,9 +1195,8 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
             let llm_started = Instant::now();
             let budget = crate::prompts::budget_for_model(Some(&model_name));
             let max_output_tokens = crate::prompts::capped_output_tokens(&budget);
-            let ledger_wait = std::time::Duration::from_secs_f64(turn_timeout_s().max(1.0));
             let max_rounds = crate::turn::routing::max_tool_rounds();
-            let round_limit: i64 = if use_e2e_llm {
+            let _round_limit: i64 = if use_e2e_llm {
                 bridge_e2e
                     .as_ref()
                     .map(|r| (r.len() as i64).clamp(1, max_rounds))
@@ -2140,41 +1206,18 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
             };
 
             let mut last_measured_prompt: Option<u64> = None;
-            let mut bridge_ptl_streak: u32 = 0;
             let mut cache_detector = crate::turn::cloud::cache_diagnostics::CacheBreakDetector::new();
-            let mut bridge_turn_sigs = Vec::new();
-            let mut bridge_turn_tool_names = Vec::new();
-            let mut bridge_stall_events = Vec::new();
-            let mut bridge_intent_tool_turns = Vec::new();
-            let mut bridge_verdict_events = Vec::new();
-            let mut bridge_turn_guard = TurnGuard::new();
-            let mut bridge_restricted_tools = HashSet::new();
-            let mut bridge_remaining_turns = round_limit as usize;
-            let mut bridge_step_recorder = StepRecorder::new(&session_id, "legacy-bridge-loop");
-            let mut bridge_last_heavy_checkpoint: Option<StepCheckpoint> = None;
-            let user_message_for_guard = latest_user_message_text(&messages)
-                .unwrap_or("")
-                .to_string();
 
-            for round_ix in 0i64..round_limit {
+
+            // Single LLM call per HTTP request (no multi-round tool loop).
+            let round_ix = 0i64;
+            {
                 cloud_loop_turns += 1;
 
-                if bridge_remaining_turns == 0 {
-                    yield render_sse_map(&build_stream_error_event(
-                        &format!(
-                            "{} (round limit: {})",
-                            cli_agentic_tool_round_budget_abort_msg(round_limit as usize),
-                            round_limit
-                        ),
-                        "TURN_BUDGET_EXHAUSTED",
-                        false,
-                    ));
-                    return;
-                }
-                bridge_remaining_turns = bridge_remaining_turns.saturating_sub(1);
+                // Budget check removed: single LLM call per HTTP request.
 
                 let round_edge_tools =
-                    filter_round_edge_tools(&edge_tools, &bridge_restricted_tools);
+                    filter_round_edge_tools(&edge_tools, &HashSet::new());
                 let round_tools_fingerprint_str =
                     serde_json::to_string(&round_edge_tools).unwrap_or_default();
 
@@ -2194,7 +1237,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                     &budget,
                     cache_est_round.total_tokens,
                     last_measured_prompt,
-                    bridge_ptl_streak,
+                    0, // single-call proxy: no consecutive context-window errors to track
                 );
                 let mut pruned_tools = prune_tool_schemas(&round_edge_tools, round_tier);
                 annotate_tool_schemas_for_caching(&mut pruned_tools, &cache_cfg);
@@ -2265,7 +1308,9 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                             }
                         }).collect();
                     let breakdown = prompts::build_system_prompt_trace(
-                        &prompt_sections, skill_injections, memory_injections,
+                        &prompt_sections,
+                        skill_injections,
+                        memory_injections,
                     );
                     yield render_sse(&json!({
                         "type": "context_meta",
@@ -2274,6 +1319,8 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                             "base_persona_tokens": breakdown.base_persona_tokens,
                             "environment_tokens": breakdown.environment_tokens,
                             "user_preferences_tokens": breakdown.user_preferences_tokens,
+                            "context_signals": breakdown.context_signals,
+                            "guidance_signals": breakdown.guidance_signals,
                             "skills_injected": breakdown.skills_injected,
                             "repository_memories": breakdown.repository_memories,
                             "total_tokens": breakdown.total_tokens,
@@ -2296,7 +1343,6 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                         Ok(s) => s,
                         Err(e) if crate::turn::llm_client::is_context_window_error(&e.to_lowercase()) => {
                             // Context-window error: force aggressive compaction and retry once
-                            bridge_ptl_streak = bridge_ptl_streak.saturating_add(1);
                             astra_core::agent_warn!(
                                 "bridge",
                                 "context window exceeded — forcing aggressive compaction and retrying"
@@ -2533,9 +1579,23 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                         yield done;
                     }
                 }
+                let round_ms = loop_started.elapsed().as_millis();
+                let tok_in = usage.get("prompt").and_then(Value::as_i64).unwrap_or(0);
+                let tok_out = usage.get("completion").and_then(Value::as_i64).unwrap_or(0);
+                astra_core::agent_info!(
+                    "llm",
+                    "⏱ LLM round done: total={}ms tok_in={} tok_out={} tools={} model={} sid={} r={}",
+                    round_ms,
+                    tok_in,
+                    tok_out,
+                    loop_tool_calls.len(),
+                    if resolved_model.is_empty() { &model_name } else { &resolved_model },
+                    session_id,
+                    round_ix,
+                );
                 llm_steps.push(json!({
                     "step": "llm",
-                    "duration_ms": loop_started.elapsed().as_millis() as i64,
+                    "duration_ms": round_ms as i64,
                     "in": usage.get("prompt").and_then(Value::as_i64),
                     "out": usage.get("completion").and_then(Value::as_i64),
                     "tool_calls": loop_tool_calls.len(),
@@ -2546,8 +1606,34 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                     .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|i| i.max(0) as u64)));
                 if let Some(p) = prompt_from_usage.filter(|&p| p > 0) {
                     last_measured_prompt = Some(p);
-                    bridge_ptl_streak = 0;
                 }
+                turn_event_buffer.record_llm_round(LlmRoundRecord {
+                    ttft_ms: None,
+                    duration_ms: round_ms as u64,
+                    prompt_tokens: usage
+                        .get("prompt")
+                        .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|i| i.max(0) as u64)))
+                        .unwrap_or(0),
+                    completion_tokens: usage
+                        .get("completion")
+                        .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|i| i.max(0) as u64)))
+                        .unwrap_or(0),
+                    cache_read_tokens: usage
+                        .get("cache_read")
+                        .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|i| i.max(0) as u64)))
+                        .unwrap_or(0),
+                    tool_calls_returned: loop_tool_calls.len().min(u32::MAX as usize) as u32,
+                    tool_call_names: loop_tool_calls
+                        .iter()
+                        .filter_map(tool_call_name)
+                        .map(ToString::to_string)
+                        .collect(),
+                    finish_reason: Some(if loop_tool_calls.is_empty() {
+                        "stop".to_string()
+                    } else {
+                        "tool_calls".to_string()
+                    }),
+                });
 
                 // ── Cache break detection ──
                 {
@@ -2574,343 +1660,35 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                     }
                 }
 
-                if loop_tool_calls.is_empty() {
-                    break;
-                }
+                if !loop_tool_calls.is_empty() {
+                    // Accumulate tool calls for turn_complete event.
+                    // Tool execution and continuation happen on the CLI side.
+                    ensure_tool_call_ids(&mut loop_tool_calls);
 
-                ensure_tool_call_ids(&mut loop_tool_calls);
-                apply_cli_agentic_stall_preflight(CliAgenticStallPreflightRequest {
-                    turn_index: round_ix as u32,
-                    tool_calls_for_guard: &loop_tool_calls,
-                    turn_sigs: &mut bridge_turn_sigs,
-                    turn_tool_names: &mut bridge_turn_tool_names,
-                    stall_events: &mut bridge_stall_events,
-                    turn_guard: &mut bridge_turn_guard,
-                });
+                    for tc in &loop_tool_calls {
+                        if let Some(tc_map) = tc.as_object() {
+                            // Emit tool_call with FULL accumulated arguments so the
+                            // CLI's accum.tool_calls gets updated (replacing the
+                            // empty-args entry from tool_call_start). Without this,
+                            // signature matching in headless_tool_assembly fails
+                            // because accum has empty args while edge_tool_round
+                            // has the real parsed args.
+                            let tc_event = astra_turn_core::stream_events::build_edge_tool_call_event(tc_map);
+                            yield render_sse_map(&tc_event);
 
-                all_round_tool_calls.extend(loop_tool_calls.iter().cloned());
+                            // Emit tool_request so the CLI executes the tool
+                            // locally and populates edge_tool_round.
+                            let req_event = astra_turn_core::stream_events::build_tool_request_event(tc_map);
+                            yield render_sse_map(&req_event);
+                        }
+                    }
 
-                llm_messages.push(assistant_message_with_tool_calls_and_reasoning(
-                    &loop_tool_calls,
-                    &loop_reasoning,
-                    !reasoning.is_empty() || history_has_reasoning(&llm_messages),
-                ));
-                // Tool delivery matrix for this generator (legacy `/chat/turn`):
-                // - Approval-gated + empty `edge_tools`: fast-fail via `local_tool_execution_delivery`
-                //   (no edge client for §5.5 POST /approval/respond or /tools/result).
-                // - Approval-gated + non-empty `edge_tools`: sequential §5.5 ledger
-                //   (audit + approval_required → wait approval → tool_request → wait result).
-                // - Read-only batch: empty `edge_tools` → `DefaultToolExecutor` + cwd; else concurrent
-                //   `wait_tool_result_ledger_for_tool` after broadcasting all `tool_request` maps.
-                // (`cloud_tool_requires_approval_for_delivery` / bash read-only rules live in astra-turn-core.)
-                // ── Tool delivery: approval tools sequential, read-only concurrent ──
-                let mut read_only_tcs: Vec<Value> = Vec::new();
-                for tc in loop_tool_calls.iter() {
-                    let Some(tc_map) = tc.as_object() else { continue };
-                    if !cloud_tool_requires_approval_for_delivery(tc) {
-                        read_only_tcs.push(tc.clone());
-                        continue;
-                    }
-                    if edge_tools.is_empty() {
-                        // No edge tool schemas: §5.5 approval/result round-trip has no edge client
-                        // to POST /approval/respond or /tools/result — fail fast instead of ledger timeout.
-                        let tool_name = tc_map
-                            .get("function")
-                            .and_then(|f| f.get("name"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("");
-                        let tail = local_tool_execution_delivery(
-                            tc,
-                            &format!(
-                                "approval-required tool `{tool_name}` cannot execute: no edge agent connected"
-                            ),
-                            true,
-                        );
-                        for m in tail.sse_maps {
-                            yield render_sse_map(&m);
-                        }
-                        record_turn_guard_tool_results(
-                            &mut bridge_turn_guard,
-                            &tail.persist_tool_results,
-                        );
-                        merged_tool_results.extend(tail.persist_tool_results);
-                        llm_messages.extend(tail.tool_messages);
-                        continue;
-                    }
-                    // Sequential: approval → wait → request → wait (§5.5 ledger + edge agent).
-                    let id = tc_map.get("id").and_then(Value::as_str).unwrap_or("");
-                    let tool_name = tc_map
-                        .get("function")
-                        .and_then(|f| f.get("name"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
-                    let path = tool_path_hint_for_delivery(tc);
-                    let detail = tool_approval_detail_for_delivery(tc);
-                    let approval_kind = tool_approval_kind_for_delivery(tc);
-                    let approval_audit_context = ApprovalAuditContext {
-                        user_id: user_id.clone(),
-                        session_id: session_id.clone(),
-                        turn: turn_count_from_messages(&messages).max(1) as u32,
-                        agent_id: agent_id.clone(),
-                        parent_event_id: Some(user_query_event_id.clone()),
-                        parent_event_ids: vec![user_query_event_id.clone()],
-                        causal_chain_id: turn_chain_id.clone(),
-                        auxiliary_event_writer: turn_auxiliary_event_writer.clone(),
-                    };
-                    if let Err(error) = record_approval_required_audit(
-                        &approval_audit_context,
-                        id,
-                        tool_name,
-                        approval_kind,
-                        detail.as_deref(),
-                    )
-                    .await
-                    {
-                        astra_core::agent_error!(
-                            "approval",
-                            "approval required audit persist failed for {}: {}",
-                            id,
-                            error
-                        );
-                    }
-                    yield render_sse_map(&build_approval_required_event(
-                        id,
-                        tool_name,
-                        approval_kind,
-                        path.as_deref(),
-                        detail.as_deref(),
-                    ));
-                    let approval = match await_with_client_disconnect(
-                        cc.as_deref(),
-                        wait_approval_ledger_for_tool(
-                            &edge_callback_ledger,
-                            &user_id,
-                            tc,
-                            ledger_wait,
-                            Some(&approval_audit_context),
-                        ),
-                    )
-                    .await
-                    {
-                        Ok(approval) => approval,
-                        Err(event) => {
-                            yield render_sse_map(&event);
-                            return;
-                        }
-                    };
-                    match approval {
-                        Ok(()) => {}
-                        Err(part) => {
-                            record_turn_guard_tool_results(
-                                &mut bridge_turn_guard,
-                                &part.persist_tool_results,
-                            );
-                            for m in part.sse_maps {
-                                yield render_sse_map(&m);
-                            }
-                            merged_tool_results.extend(part.persist_tool_results);
-                            llm_messages.extend(part.tool_messages);
-                            continue;
-                        }
-                    }
-                    for m in sse_maps_through_tool_request(tc) {
-                        yield render_sse_map(&m);
-                    }
-                    let tail = match await_with_client_disconnect(
-                        cc.as_deref(),
-                        wait_tool_result_ledger_for_tool(
-                            &edge_callback_ledger,
-                            &user_id,
-                            tc,
-                            ledger_wait,
-                        ),
-                    )
-                    .await
-                    {
-                        Ok(tail) => tail,
-                        Err(event) => {
-                            yield render_sse_map(&event);
-                            return;
-                        }
-                    };
-                    for m in tail.sse_maps {
-                        yield render_sse_map(&m);
-                    }
-                    record_turn_guard_tool_results(
-                        &mut bridge_turn_guard,
-                        &tail.persist_tool_results,
-                    );
-                    merged_tool_results.extend(tail.persist_tool_results);
-                    llm_messages.extend(tail.tool_messages);
-                }
-                // Read-only: yield all tool_request SSEs first so edge can
-                // start executing in parallel, then join_all on ledger waits.
-                if !read_only_tcs.is_empty() {
-                    for tc in &read_only_tcs {
-                        for m in sse_maps_through_tool_request(tc) {
-                            yield render_sse_map(&m);
-                        }
-                    }
-                    if edge_tools.is_empty() {
-                        // No edge agent: execute read-only tools locally (requires cwd workspace).
-                        let cwd_str = edge_profile
-                            .get("cwd")
-                            .and_then(Value::as_str)
-                            .filter(|s| !s.is_empty());
-                        let Some(cwd_str) = cwd_str else {
-                            yield render_sse_map(&build_stream_error_event(
-                                "edge_tools is empty but edge_profile.cwd is missing; cannot execute read-only tools on the server",
-                                "LOCAL_TOOL_NO_WORKSPACE",
-                                false,
-                            ));
-                            return;
-                        };
-                        let root = PathBuf::from(cwd_str);
-                        if !root.is_dir() {
-                            yield render_sse_map(&build_stream_error_event(
-                                &format!(
-                                    "edge_profile.cwd is not a directory: {}",
-                                    root.display()
-                                ),
-                                "LOCAL_TOOL_NO_WORKSPACE",
-                                false,
-                            ));
-                            return;
-                        }
-                        // SandboxConfig for server-side read-only tool execution:
-                        // The primary protection is the SERVER_EXECUTOR_TOOL_NAMES allowlist,
-                        // which only includes read-only tools. SandboxMode::ReadOnly and
-                        // network_allowed=false serve as a future enforcement layer; currently
-                        // individual tools do not check sandbox mode at dispatch time.
-                        // 30s command timeout (vs 120s strict default) — server should be more
-                        // conservative, failing fast on stalled commands.
-                        let sandbox = SandboxConfig {
-                            project_root: root.clone(),
-                            allowed_paths: vec![PathBuf::from("/tmp")],
-                            mode: SandboxMode::ReadOnly,
-                            max_output_bytes: 200_000,
-                            command_timeout: Duration::from_secs(30),
-                            network_allowed: false,
-                        };
-                        let ctx = ToolContext {
-                            project_root: root.clone(),
-                            workspace_root: root,
-                            user_id: user_id.clone(),
-                            session_id: session_id.clone(),
-                            sandbox,
-                            http_client: None,
-                            logger: Arc::new(TracingLogger),
-                            cancel_token: None,
-                        };
-                        let executor = Arc::new(DefaultToolExecutor::new(ctx));
-                        let local_ro = read_only_tcs;
-                        let local_futs = stream::iter(local_ro.into_iter().map(|tc| {
-                            let exec = executor.clone();
-                            async move {
-                                let Some(name) = tool_call_name(&tc) else {
-                                    tracing::warn!(
-                                        tool_call = %tc,
-                                        "skipping local tool call with missing name"
-                                    );
-                                    return None;
-                                };
-                                let args =
-                                    normalize_llm_function_arguments(&tool_call_arguments_value(&tc));
-                                let result = exec.execute(name, &args).await;
-                                Some(local_tool_execution_delivery(
-                                    &tc,
-                                    &result.output,
-                                    result.is_error,
-                                ))
-                            }
-                        }))
-                        .buffer_unordered(MAX_CONCURRENT_READ_ONLY_TOOLS);
-                        tokio::pin!(local_futs);
-                        while let Some(tail) = local_futs.next().await.flatten() {
-                            for m in tail.sse_maps {
-                                yield render_sse_map(&m);
-                            }
-                            record_turn_guard_tool_results(
-                                &mut bridge_turn_guard,
-                                &tail.persist_tool_results,
-                            );
-                            merged_tool_results.extend(tail.persist_tool_results);
-                            llm_messages.extend(tail.tool_messages);
-                        }
-                    } else {
-                        // Use buffer_unordered to limit concurrent tool executions.
-                        // This prevents resource exhaustion when many tools are called.
-                        let ro = read_only_tcs.clone();
-                        let tool_stream = stream::iter(ro.into_iter().map(|tc| {
-                            let ledger = edge_callback_ledger.clone();
-                            let uid = user_id.clone();
-                            async move {
-                                wait_tool_result_ledger_for_tool(
-                                    &ledger, &uid, &tc, ledger_wait,
-                                )
-                                .await
-                            }
-                        }))
-                        .buffer_unordered(MAX_CONCURRENT_READ_ONLY_TOOLS);
-                        tokio::pin!(tool_stream);
-                        loop {
-                            let next_tail = match await_with_client_disconnect(
-                                cc.as_deref(),
-                                tool_stream.next(),
-                            )
-                            .await
-                            {
-                                Ok(next_tail) => next_tail,
-                                Err(event) => {
-                                    yield render_sse_map(&event);
-                                    return;
-                                }
-                            };
-                            let Some(tail) = next_tail else { break };
-                            for m in tail.sse_maps {
-                                yield render_sse_map(&m);
-                            }
-                            record_turn_guard_tool_results(
-                                &mut bridge_turn_guard,
-                                &tail.persist_tool_results,
-                            );
-                            merged_tool_results.extend(tail.persist_tool_results);
-                            llm_messages.extend(tail.tool_messages);
-                        }
-                    }
-                }
-
-                let recent_tools_for_policy = tool_names_from_tool_calls(&all_round_tool_calls);
-                match apply_agentic_post_tool_policy(AgenticPostToolPolicyRequest {
-                    turn_index: round_ix as u32,
-                    message: &user_message_for_guard,
-                    tool_calls_for_guard: &loop_tool_calls,
-                    intent_tool_turns: &mut bridge_intent_tool_turns,
-                    messages: &mut llm_messages,
-                    stall_events: &mut bridge_stall_events,
-                    turn_guard: &mut bridge_turn_guard,
-                    verdict_events: &mut bridge_verdict_events,
-                    restricted_tools: &mut bridge_restricted_tools,
-                    remaining_turns: &mut bridge_remaining_turns,
-                    step_recorder: &mut bridge_step_recorder,
-                    current_session_id: None,
-                    max_turns: round_limit as usize,
-                    loop_turn: round_ix as usize,
-                    recent_tools: &recent_tools_for_policy,
-                    last_heavy_checkpoint: &mut bridge_last_heavy_checkpoint,
-                }) {
-                    AgenticPostToolPolicyOutcome::ProceedEndTurn
-                    | AgenticPostToolPolicyOutcome::RetryLlmClearToolResults => {}
-                    AgenticPostToolPolicyOutcome::Abort(message) => {
-                        yield render_sse_map(&build_stream_error_event(
-                            &message,
-                            "TURN_GUARD_ABORT",
-                            false,
-                        ));
-                        return;
-                    }
+                    let round_start = all_round_tool_calls.len();
+                    all_round_tool_calls.extend(loop_tool_calls.iter().cloned());
+                    round_boundaries.push((round_start, loop_tool_calls.len()));
                 }
             }
+
 
             let llm_duration_ms = llm_started.elapsed().as_millis() as i64;
 
@@ -2921,21 +1699,28 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
             let llm_content = full_text.trim().to_string();
             let should_persist_llm = !llm_content.is_empty() || has_tool_calls;
 
-            let user_query_event = user_content.as_ref().map(|content| TurnCoreEventRecord {
-                event_id: user_query_event_id.clone(),
-                user_id: user_id.clone(),
-                session_id: session_id.clone(),
-                agent_id: agent_id.clone(),
-                event_type: "user_query".to_string(),
-                content: content.clone(),
-                parent_event_id: None,
-                parent_event_ids: Vec::new(),
-                causal_chain_id: turn_chain_id.clone(),
-                llm_model_used: None,
-                token_usage: None,
-                llm_params: None,
-                reasoning_content: None,
-            });
+            // P2 fix: on continuation calls (CLI sent tool_results), the user query
+            // was already persisted on the first bridge call. Skip to avoid duplicate event_id.
+            let is_continuation = !tool_results.is_empty();
+            let user_query_event = if is_continuation {
+                None
+            } else {
+                user_content.as_ref().map(|content| TurnCoreEventRecord {
+                    event_id: user_query_event_id.clone(),
+                    user_id: user_id.clone(),
+                    session_id: session_id.clone(),
+                    agent_id: agent_id.clone(),
+                    event_type: "user_query".to_string(),
+                    content: content.clone(),
+                    parent_event_id: None,
+                    parent_event_ids: Vec::new(),
+                    causal_chain_id: turn_chain_id.clone(),
+                    llm_model_used: None,
+                    token_usage: None,
+                    llm_params: None,
+                    reasoning_content: None,
+                })
+            };
 
             let llm_response_event = should_persist_llm.then(|| TurnCoreEventRecord {
                 event_id: Uuid::now_v7().to_string(),
@@ -3088,6 +1873,32 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 }
             });
 
+            if !turn_event_buffer.is_empty() && !session_id.is_empty() {
+                let journal_sid = session_id.clone();
+                tokio::task::spawn_blocking(move || {
+                    let writer = match JournalWriter::new(&journal_sid) {
+                        Ok(writer) => writer,
+                        Err(error) => {
+                            astra_core::agent_warn!(
+                                "bridge",
+                                "failed to create journal writer for llm_round flush: session={} error={}",
+                                journal_sid,
+                                error
+                            );
+                            return;
+                        }
+                    };
+                    if let Err(error) = turn_event_buffer.flush(&writer) {
+                        astra_core::agent_warn!(
+                            "bridge",
+                            "failed to flush llm_round events: session={} error={}",
+                            journal_sid,
+                            error
+                        );
+                    }
+                });
+            }
+
             // Hook side effects: decision audit, skill selection, implicit feedback, reflection
             {
                 let mut hook_payload = crate::turn::tail_persist::build_turn_hook_args(
@@ -3135,12 +1946,21 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 );
             }
 
+            // Build request_id → (round, tools_in_round) for observability.
+            let round_info: HashMap<String, (u32, usize)> = {
+                let mut m = HashMap::new();
+                for (round_idx, (start, count)) in round_boundaries.iter().enumerate() {
+                    for tc in &all_round_tool_calls[*start..*start + *count] {
+                        if let Some(id) = tc.get("id").and_then(Value::as_str) {
+                            m.insert(id.to_string(), (round_idx as u32, *count));
+                        }
+                    }
+                }
+                m
+            };
             let tool_call_records =
-                build_bridge_tool_call_records(&all_round_tool_calls, &merged_tool_results);
-            let verdict_warning = bridge_verdict_events.iter().any(|event| {
-                event.severity.eq_ignore_ascii_case("warning")
-                    || event.severity.eq_ignore_ascii_case("critical")
-            });
+                build_bridge_tool_call_records(&all_round_tool_calls, &merged_tool_results, &round_info);
+            let verdict_warning = false; // No multi-round verdicts in single-call mode.
             let recent_tools_for_quality = tool_names_from_tool_calls(&all_round_tool_calls);
             let budget_pressure = last_measured_prompt.map_or(0.0, |measured| {
                 if budget.model_limit > 0 {
@@ -3149,14 +1969,18 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                     0.0
                 }
             });
+            let user_message_for_eval = latest_user_message_text(&messages)
+                .unwrap_or("")
+                .to_string();
             let evaluation = (!tool_call_records.is_empty()).then(|| {
                 crate::pipeline::evaluation::evaluate_tool_call_records(
-                    &user_message_for_guard,
+                    &user_message_for_eval,
                     &recent_tools_for_quality,
                     &tool_call_records,
-                    bridge_stall_events.len(),
+                    0, // No stall events in single-call mode.
                     verdict_warning,
                     budget_pressure,
+                    false, // No prefetch in bridge single-call mode.
                 )
             });
             let tool_execution_ms: u64 = merged_tool_results
@@ -3167,7 +1991,6 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                         .and_then(Value::as_u64)
                 })
                 .sum();
-            let trace_turn = turn_count_from_messages(&messages).max(1) as u32;
             let trace_signal = build_legacy_context_trace_signal(
                 trace_turn,
                 format!("turn-{trace_turn}"),
@@ -3371,150 +2194,8 @@ fn classify_llm_error(msg: &str) -> astra_core::ErrorKind {
     crate::turn::llm_client::classify_llm_error(msg)
 }
 
-/// Result of a memory prefetch operation.
-#[derive(Debug, Default)]
-pub struct MemoryPrefetchResult {
-    pub section: Option<String>,
-    pub items: usize,
-    pub preview: Vec<String>,
-    pub fetch_ms: i64,
-}
-
-/// Prefetch memories relevant to the user message via hybrid retrieval.
-/// Sends two queries (full message + entity tokens), merges and deduplicates.
-pub async fn prefetch_memories(
-    mem_url: &str,
-    mem_key: &str,
-    user_msg: &str,
-    user_id: &str,
-    top_k: u32,
-) -> MemoryPrefetchResult {
-    if mem_key.is_empty() || user_msg.trim().is_empty() {
-        return MemoryPrefetchResult::default();
-    }
-    let started = Instant::now();
-    let entity_query = extract_entity_tokens(user_msg);
-    let trimmed_msg = user_msg.trim();
-
-    // Parallel fetch: full message retrieval + entity-keyword retrieval via tokio::join!
-    // Saves one round-trip latency (~50-200ms) compared to sequential.
-    let do_entity = !entity_query.is_empty() && entity_query != trimmed_msg;
-    let (full_result, entity_result) = tokio::join!(
-        fetch_memories(mem_url, mem_key, trimmed_msg, user_id, top_k),
-        async {
-            if do_entity {
-                fetch_memories(mem_url, mem_key, &entity_query, user_id, top_k).await
-            } else {
-                String::new()
-            }
-        }
-    );
-    let merged = merge_memory_results(&[&full_result, &entity_result]);
-    let fetch_ms = started.elapsed().as_millis() as i64;
-    let preview = merged.iter().take(3).map(|l| l.to_string()).collect();
-    let items = merged.len();
-    let section = build_memory_section(&merged);
-    MemoryPrefetchResult {
-        section,
-        items,
-        preview,
-        fetch_ms,
-    }
-}
-
-/// Merge and deduplicate memory results from multiple retrieval queries.
-fn merge_memory_results(results: &[&str]) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
-    let mut merged = Vec::new();
-    for result in results {
-        for line in result.lines() {
-            let trimmed = line.trim();
-            if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
-                merged.push(trimmed.to_string());
-            }
-        }
-    }
-    merged
-}
-
-/// Build the memory section for the profile block.
-/// Returns None if no memories matched.
-fn build_memory_section(merged_lines: &[String]) -> Option<String> {
-    if merged_lines.is_empty() {
-        return None;
-    }
-    let refs: Vec<&str> = merged_lines.iter().map(|s| s.as_str()).collect();
-    let formatted = crate::prompts::memory_proto::format_for_llm(&refs);
-    if !formatted.is_empty() {
-        Some(format!("## User Memories\n{formatted}"))
-    } else {
-        Some(format!("## User Memories\n{}", merged_lines.join("\n")))
-    }
-}
-
-/// Extract non-CJK, non-punctuation tokens from a message for keyword-based retrieval.
-/// General purpose: works for any mixed-language input, not specific to any domain.
-fn extract_entity_tokens(msg: &str) -> String {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    for ch in msg.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-            current.push(ch);
-        } else {
-            if current.len() >= 3 {
-                tokens.push(current.clone());
-            }
-            current.clear();
-        }
-    }
-    if current.len() >= 3 {
-        tokens.push(current);
-    }
-    tokens.join(" ")
-}
-
-/// Fetch memories from Memoria HTTP API. Returns joined content string.
-async fn fetch_memories(
-    base_url: &str,
-    api_key: &str,
-    query: &str,
-    user_id: &str,
-    top_k: u32,
-) -> String {
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
-    let mut payload = serde_json::json!({"query": query, "top_k": top_k});
-    if !user_id.is_empty() {
-        payload["session_id"] = serde_json::Value::String(user_id.to_string());
-        payload["user_id"] = serde_json::Value::String(user_id.to_string());
-    }
-    let resp = match client
-        .post(format!("{base_url}/v1/memories/retrieve"))
-        .header("Authorization", format!("Bearer {api_key}"))
-        .json(&payload)
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            astra_core::agent_error!("memory", "fetch error: {e:#}");
-            return String::new();
-        }
-    };
-    if !resp.status().is_success() {
-        return String::new();
-    }
-    let arr = match resp.json::<Vec<serde_json::Value>>().await {
-        Ok(a) => a,
-        Err(_) => return String::new(),
-    };
-    arr.iter()
-        .filter_map(|m| m.get("content").and_then(|c| c.as_str()))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
+// ── Memory prefetch — delegated to turn::memory_prefetch ─────────────────────
+pub use super::memory_prefetch::{MemoryPrefetchResult, prefetch_memories};
 
 /// Test-accessible wrapper around private schema pruning — used by integration
 /// tests that need to verify progressive schema detail levels.
@@ -3530,117 +2211,8 @@ pub mod bridge_inprocess_test_helpers {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn extract_entity_tokens_from_mixed_language() {
-        assert_eq!(extract_entity_tokens("memoria 最新的ci?"), "memoria");
-        assert_eq!(
-            extract_entity_tokens("matrixone latest pr"),
-            "matrixone latest"
-        );
-        assert_eq!(extract_entity_tokens("你好"), "");
-        assert_eq!(
-            extract_entity_tokens("check astra status"),
-            "check astra status"
-        );
-    }
-
-    // ── merge_memory_results ──────────────────────────────────────────────────
-
-    #[test]
-    fn merge_deduplicates_across_queries() {
-        let r1 = "[@fact/semantic] memoria is matrixorigin/memoria\nsome other fact";
-        let r2 = "[@fact/semantic] memoria is matrixorigin/memoria\nnew fact";
-        let merged = merge_memory_results(&[r1, r2]);
-        assert_eq!(
-            merged.len(),
-            3,
-            "duplicate should be removed, got: {merged:?}"
-        );
-        assert!(merged.contains(&"[@fact/semantic] memoria is matrixorigin/memoria".to_string()));
-        assert!(merged.contains(&"some other fact".to_string()));
-        assert!(merged.contains(&"new fact".to_string()));
-    }
-
-    #[test]
-    fn merge_skips_empty_lines() {
-        let r1 = "line1\n\n\nline2";
-        let r2 = "";
-        let merged = merge_memory_results(&[r1, r2]);
-        assert_eq!(merged, vec!["line1", "line2"]);
-    }
-
-    #[test]
-    fn merge_empty_inputs() {
-        assert!(merge_memory_results(&["", ""]).is_empty());
-        assert!(merge_memory_results(&[]).is_empty());
-    }
-
-    // ── build_memory_section ──────────────────────────────────────────────────
-
-    #[test]
-    fn build_memory_section_returns_none_for_empty() {
-        assert!(build_memory_section(&[]).is_none());
-    }
-
-    #[test]
-    fn build_memory_section_includes_header() {
-        let lines = vec!["[@pref/active] memoria = matrixorigin/Memoria".to_string()];
-        let section = build_memory_section(&lines).unwrap();
-        assert!(section.starts_with("## User Memories"), "got: {section}");
-    }
-
-    #[test]
-    fn section_cache_key_varies_by_tools_and_task() {
-        let key1 = section_cache_key(&["bash"], Some("implementation"), 0.8);
-        let key2 = section_cache_key(&["bash", "read_file"], Some("implementation"), 0.8);
-        let key3 = section_cache_key(&["bash"], Some("debugging"), 0.8);
-        let key4 = section_cache_key(&["bash"], Some("implementation"), 0.2);
-        assert_ne!(key1, key2, "different tools should differ");
-        assert_ne!(key1, key3, "different task types should differ");
-        assert_ne!(key1, key4, "different confidence buckets should differ");
-    }
-
-    #[test]
-    fn build_memory_section_formats_structured_entries() {
-        let lines = vec!["[@pref/active] dark mode preferred".to_string()];
-        let section = build_memory_section(&lines).unwrap();
-        assert!(
-            section.contains("Preferences"),
-            "structured entries should be grouped, got: {section}"
-        );
-    }
-
-    #[test]
-    fn build_memory_section_handles_unstructured() {
-        let lines = vec!["just a plain memory without tags".to_string()];
-        let section = build_memory_section(&lines).unwrap();
-        assert!(section.contains("just a plain memory"), "got: {section}");
-    }
-
-    // ── entity + merge integration ────────────────────────────────────────────
-
-    #[test]
-    fn entity_query_differs_from_mixed_language_input() {
-        let msg = "memoria 最新的ci?";
-        let entity = extract_entity_tokens(msg);
-        assert_ne!(
-            entity,
-            msg.trim(),
-            "entity query should differ for mixed-language"
-        );
-        assert_eq!(entity, "memoria");
-    }
-
-    #[test]
-    fn entity_query_same_for_pure_ascii() {
-        let msg = "memoria latest ci";
-        let entity = extract_entity_tokens(msg);
-        assert_eq!(
-            entity, "memoria latest",
-            "pure ASCII: entity ≈ original (minus short words)"
-        );
-    }
+    use crate::turn::bridge_sse_helpers::apply_forward_llm_sse_event;
+    use crate::turn::turn_guard::TurnGuard;
 
     #[test]
     fn count_inprocess_persisted_events_skips_failed_tool_events() {
@@ -3902,6 +2474,47 @@ mod tests {
     }
 
     #[test]
+    fn build_system_message_openai_keeps_late_round_guidance_in_dynamic_message() {
+        let messages = vec![
+            json!({"role": "user", "content": "inspect the project"}),
+            json!({"role": "tool", "content": "Cargo.toml"}),
+            json!({"role": "tool", "content": "README.md"}),
+        ];
+        let guidance = prompts::tool_round_guidance(&messages, prompts::ROUND_BUDGET_THRESHOLD);
+
+        let (primary, dynamic, _) = build_system_message(
+            &["read_file", "list_dir"],
+            &guidance,
+            0.8,
+            Some("implementation"),
+            &PromptCacheConfig::latch("openai", "gpt-4"),
+        );
+
+        let primary_text = primary
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let dynamic_text = dynamic
+            .as_ref()
+            .and_then(|msg| msg.get("content"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+
+        assert!(
+            !primary_text.contains("Synthesize Or Batch Now"),
+            "stable primary message must not contain late-round dynamic guidance"
+        );
+        assert!(
+            dynamic_text.contains("Synthesize Or Batch Now"),
+            "dynamic message should include the late-round synthesis nudge"
+        );
+        assert!(
+            dynamic_text.contains("2 tools executed in parallel"),
+            "dynamic message should keep batching feedback"
+        );
+    }
+
+    #[test]
     fn build_system_message_claude_model_triggers_anthropic_format() {
         // Even if provider is not "anthropic", claude model name should trigger it
         let (msg, _, _) = build_system_message(
@@ -3940,6 +2553,166 @@ mod tests {
         assert!(has_session, "should have Session sections");
     }
 
+    #[test]
+    fn build_system_message_records_bridge_context_signals() {
+        let active_skill_names = vec!["concise"];
+        let learned_context_text = "matrixorigin => github";
+        let memory_signal_hint =
+            "\n\n⚡ MEMORY SIGNAL DETECTED: category=\"preference\", namespace=\"prefs\".";
+        let implicit_feedback_hint =
+            "\n\n## Implicit Feedback\nThe user is correcting the previous attempt.";
+        let feedback_rules_hint = "\n\n[Learned Feedback Rules]\n- Rule: do not use mocks";
+        let self_awareness_hint =
+            "\n\n## Self-Awareness\nCurrent task: review runtime prompt assembly.";
+        let session_anchor = "\n\n## Session Anchor\nOriginal task: optimize prompt tracing.";
+        let dynamic_sections = vec![
+            prompts::PromptSection::dynamic(
+                "\n\n# Project Profile\ncwd: /test".to_string(),
+                prompts::PromptTokenBucket::Environment,
+            ),
+            prompts::PromptSection::dynamic(
+                "skill payload".to_string(),
+                prompts::PromptTokenBucket::UserPreferences,
+            )
+            .with_trace_signals(
+                crate::turn::context_assembly_trace::PromptTraceSignals {
+                    context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
+                        active_output_skills: !active_skill_names.is_empty(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
+            prompts::PromptSection::dynamic(
+                "learned context payload".to_string(),
+                prompts::PromptTokenBucket::UserPreferences,
+            )
+            .with_trace_signals(
+                crate::turn::context_assembly_trace::PromptTraceSignals {
+                    context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
+                        learned_runtime_context: !learned_context_text.is_empty(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
+            prompts::PromptSection::dynamic(
+                "memory signal payload".to_string(),
+                prompts::PromptTokenBucket::Environment,
+            )
+            .with_trace_signals(
+                crate::turn::context_assembly_trace::PromptTraceSignals {
+                    context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
+                        memory_signal_detected: !memory_signal_hint.is_empty(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
+            prompts::PromptSection::dynamic(
+                "implicit feedback payload".to_string(),
+                prompts::PromptTokenBucket::Environment,
+            )
+            .with_trace_signals(
+                crate::turn::context_assembly_trace::PromptTraceSignals {
+                    context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
+                        implicit_feedback: !implicit_feedback_hint.is_empty(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
+            prompts::PromptSection::dynamic(
+                "feedback rules payload".to_string(),
+                prompts::PromptTokenBucket::Environment,
+            )
+            .with_trace_signals(
+                crate::turn::context_assembly_trace::PromptTraceSignals {
+                    context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
+                        learned_feedback_rules: !feedback_rules_hint.is_empty(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
+            prompts::PromptSection::dynamic(
+                "self awareness payload".to_string(),
+                prompts::PromptTokenBucket::Environment,
+            )
+            .with_trace_signals(
+                crate::turn::context_assembly_trace::PromptTraceSignals {
+                    context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
+                        self_awareness: !self_awareness_hint.is_empty(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
+            prompts::PromptSection::dynamic(
+                "session anchor payload".to_string(),
+                prompts::PromptTokenBucket::Environment,
+            )
+            .with_trace_signals(
+                crate::turn::context_assembly_trace::PromptTraceSignals {
+                    context_signals: crate::turn::context_assembly_trace::PromptContextSignals {
+                        session_anchor: !session_anchor.is_empty(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ),
+        ];
+        let (_, _, prompt_sections) = build_system_message_with_dynamic_sections(
+            &["bash", "read_file"],
+            &dynamic_sections,
+            0.8,
+            Some("implementation"),
+            &PromptCacheConfig::latch("openai", "gpt-4"),
+        );
+        let breakdown = prompts::build_system_prompt_trace(&prompt_sections, vec![], vec![]);
+
+        assert!(breakdown.context_signals.active_output_skills);
+        assert!(breakdown.context_signals.learned_runtime_context);
+        assert!(breakdown.context_signals.memory_signal_detected);
+        assert!(breakdown.context_signals.self_awareness);
+        assert!(breakdown.context_signals.implicit_feedback);
+        assert!(breakdown.context_signals.learned_feedback_rules);
+        assert!(breakdown.context_signals.session_anchor);
+        assert!(!breakdown.context_signals.system_prompt_override);
+        assert!(!breakdown.context_signals.effort_hint);
+        assert!(!breakdown.context_signals.agent_type_hint);
+        assert!(breakdown.environment_tokens > 0);
+        assert!(breakdown.user_preferences_tokens > 0);
+        // guidance_signals default to false — guard against accidental default changes
+        assert!(!breakdown.guidance_signals.round_budget_warning);
+        assert!(!breakdown.guidance_signals.synthesize_or_batch);
+        assert!(!breakdown.guidance_signals.parallel_feedback);
+    }
+
+    #[test]
+    fn build_system_prompt_trace_guidance_signals_only() {
+        use crate::prompts::{CacheScope, PromptSection, PromptTokenBucket};
+        use crate::turn::context_assembly_trace::{PromptGuidanceSignals, PromptTraceSignals};
+
+        let section = PromptSection {
+            text: "round budget warning".to_string(),
+            scope: CacheScope::None,
+            token_bucket: PromptTokenBucket::Environment,
+            trace_signals: PromptTraceSignals {
+                guidance_signals: PromptGuidanceSignals {
+                    round_budget_warning: true,
+                    synthesize_or_batch: true,
+                    parallel_feedback: false,
+                },
+                ..Default::default()
+            },
+        };
+        let breakdown = prompts::build_system_prompt_trace(&[section], vec![], vec![]);
+        assert!(!breakdown.context_signals.active_output_skills);
+        assert!(breakdown.guidance_signals.round_budget_warning);
+        assert!(breakdown.guidance_signals.synthesize_or_batch);
+        assert!(!breakdown.guidance_signals.parallel_feedback);
+    }
     #[test]
     fn annotate_tool_schemas_for_caching_adds_cache_control() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
@@ -4191,36 +2964,6 @@ mod tests {
         );
     }
 
-    // ── is_valid_tool_name ───────────────────────────────────────────────────
-
-    #[test]
-    fn is_valid_tool_name_rejects_xml_artifacts() {
-        // Malformed names from LLM leaking XML thinking tags
-        assert!(!is_valid_tool_name("reflect>"));
-        assert!(!is_valid_tool_name("<reflect"));
-        assert!(!is_valid_tool_name("<think>"));
-        assert!(!is_valid_tool_name("</think>"));
-        assert!(!is_valid_tool_name("foo<bar"));
-        assert!(!is_valid_tool_name("foo>bar"));
-    }
-
-    #[test]
-    fn is_valid_tool_name_rejects_empty_and_whitespace() {
-        assert!(!is_valid_tool_name(""));
-        assert!(!is_valid_tool_name("tool name"));
-        assert!(!is_valid_tool_name("tool\tname"));
-        assert!(!is_valid_tool_name("tool\nname"));
-    }
-
-    #[test]
-    fn is_valid_tool_name_accepts_valid_names() {
-        assert!(is_valid_tool_name("bash"));
-        assert!(is_valid_tool_name("str_replace"));
-        assert!(is_valid_tool_name("read_file"));
-        assert!(is_valid_tool_name("list_dir"));
-        assert!(is_valid_tool_name("github-mcp-server-search_code"));
-    }
-
     #[test]
     fn intermediate_text_is_suppressed_when_tool_calls_exist() {
         let loop_text = "draft review text";
@@ -4462,68 +3205,6 @@ mod tests {
         unsafe {
             std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
         }
-    }
-
-    // ── Section cache eviction test ────────────────────────────────────
-
-    #[test]
-    fn section_cache_evicts_after_capacity() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
-
-        // Clear any pre-existing cache entries
-        if let Ok(mut cache) = section_cache().lock() {
-            cache.clear();
-        }
-
-        // Fill cache to 33 entries (> 32 threshold), then one more triggers clear
-        for i in 0..34 {
-            let tool_name = format!("tool_{i}");
-            let tools: Vec<&str> = vec![tool_name.as_str()];
-            let (_msg, _, _) = build_system_message(
-                &tools,
-                "",
-                0.8,
-                None,
-                &PromptCacheConfig::latch("openai", "gpt-4"),
-            );
-        }
-
-        let cache_size = section_cache().lock().unwrap().len();
-        // After 34th insert: cache had 33 entries (> 32), cleared, then 34th re-added → 1
-        assert!(
-            cache_size <= 2,
-            "cache should have been evicted: size={cache_size}, expected ≤2"
-        );
-
-        // Clean up
-        section_cache().lock().unwrap().clear();
-    }
-
-    #[test]
-    fn section_cache_key_deterministic_for_same_inputs() {
-        let k1 = section_cache_key(&["bash", "read_file"], Some("debug"), 0.5);
-        let k2 = section_cache_key(&["bash", "read_file"], Some("debug"), 0.5);
-        assert_eq!(k1, k2, "same inputs should produce same key");
-    }
-
-    #[test]
-    fn section_cache_key_differs_for_different_tools() {
-        let k1 = section_cache_key(&["bash"], None, 0.8);
-        let k2 = section_cache_key(&["read_file"], None, 0.8);
-        assert_ne!(k1, k2, "different tools should produce different keys");
-    }
-
-    #[test]
-    fn section_cache_key_low_confidence_bucketed() {
-        // confidence < 0.3 → "low" bucket, >= 0.3 → "normal" bucket
-        let low = section_cache_key(&["bash"], None, 0.1);
-        let normal = section_cache_key(&["bash"], None, 0.5);
-        assert_ne!(low, normal, "low vs normal confidence should differ");
-
-        // Both in normal bucket → same key
-        let n1 = section_cache_key(&["bash"], None, 0.5);
-        let n2 = section_cache_key(&["bash"], None, 0.9);
-        assert_eq!(n1, n2, "both normal confidence should be same bucket");
     }
 
     // ── Message breakpoint edge cases ──────────────────────────────────
@@ -5233,90 +3914,6 @@ mod tests {
         assert_eq!(event["run_id"], "run-1");
     }
 
-    #[test]
-    fn extract_entity_tokens_empty_string() {
-        assert_eq!(extract_entity_tokens(""), "");
-    }
-
-    #[test]
-    fn extract_entity_tokens_short_words_filtered() {
-        // Words < 3 chars are dropped
-        assert_eq!(extract_entity_tokens("a b cd ef"), "");
-    }
-
-    #[test]
-    fn extract_entity_tokens_preserves_long_tokens() {
-        assert_eq!(extract_entity_tokens("hello world"), "hello world");
-    }
-
-    #[test]
-    fn extract_entity_tokens_special_chars_split() {
-        assert_eq!(
-            extract_entity_tokens("user.name@domain.com"),
-            "user name domain com"
-        );
-    }
-
-    #[test]
-    fn extract_entity_tokens_hyphens_and_underscores_kept() {
-        assert_eq!(extract_entity_tokens("my-app_v2"), "my-app_v2");
-    }
-
-    #[test]
-    fn extract_entity_tokens_unicode_chars_as_delimiters() {
-        // CJK chars and emoji act as delimiters
-        let result = extract_entity_tokens("hello你好world");
-        // 'hello' is 5 chars, '你好' splits, 'world' is 5 chars
-        assert_eq!(result, "hello world");
-    }
-
-    #[test]
-    fn extract_entity_tokens_only_special_chars() {
-        assert_eq!(extract_entity_tokens("!@#$%^&*()"), "");
-    }
-
-    #[test]
-    fn prefetch_memories_empty_key_returns_default() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let result = rt.block_on(prefetch_memories(
-            "http://localhost",
-            "",
-            "query",
-            "user1",
-            5,
-        ));
-        assert_eq!(result.items, 0);
-        assert!(result.section.is_none());
-    }
-
-    #[test]
-    fn prefetch_memories_whitespace_message_returns_default() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let result = rt.block_on(prefetch_memories(
-            "http://localhost",
-            "key",
-            "   ",
-            "user1",
-            5,
-        ));
-        assert_eq!(result.items, 0);
-    }
-
-    #[test]
-    fn memory_prefetch_result_default() {
-        let r = MemoryPrefetchResult::default();
-        assert!(r.section.is_none());
-        assert_eq!(r.items, 0);
-        assert!(r.preview.is_empty());
-        assert_eq!(r.fetch_ms, 0);
-    }
-
     // ── render_sse tests ────────────────────────────────────────────────
 
     #[test]
@@ -5327,17 +3924,6 @@ mod tests {
         assert!(s.starts_with("data: "));
         assert!(s.ends_with("\n\n"));
         assert!(s.contains("\"text_delta\""));
-    }
-
-    #[test]
-    fn render_sse_map_delegates_to_render_sse() {
-        let mut map = Map::new();
-        map.insert("type".into(), json!("usage"));
-        map.insert("prompt_tokens".into(), json!(100));
-        let bytes = render_sse_map(&map);
-        let s = std::str::from_utf8(&bytes).unwrap();
-        assert!(s.starts_with("data: "));
-        assert!(s.contains("\"usage\""));
     }
 
     // ── apply_forward_llm_sse_event tests ───────────────────────────────
@@ -5474,14 +4060,6 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_done_sse_bytes_only_for_non_empty_reasoning() {
-        let bytes = reasoning_done_sse_bytes_if_needed("thinking...").unwrap();
-        let s = std::str::from_utf8(&bytes).unwrap();
-        assert!(s.contains("reasoning_done"));
-        assert!(reasoning_done_sse_bytes_if_needed("").is_none());
-    }
-
-    #[test]
     fn forward_event_error_forwarded() {
         let event = json!({"type": "error", "message": "rate limit"});
         let mut saw = false;
@@ -5574,42 +4152,6 @@ mod tests {
             result.get("message").and_then(Value::as_str),
             Some("Request cancelled (client disconnected)")
         );
-    }
-
-    #[test]
-    fn tool_call_start_event_preserves_protocol_fields() {
-        let mut tool_call = Map::from_iter([
-            ("id".to_string(), Value::String("call-1".to_string())),
-            (
-                "function".to_string(),
-                json!({"name": "bash", "arguments": "{\"command\":\"ls\"}"}),
-            ),
-        ]);
-        let event = tool_call_start_event(&mut tool_call).unwrap();
-        assert_eq!(
-            event,
-            json!({
-                "type": "tool_call_start",
-                "tool": "bash",
-                "call_id": "call-1",
-                "arguments": "{\"command\":\"ls\"}",
-            })
-        );
-    }
-
-    #[test]
-    fn tool_call_start_event_fills_missing_call_id() {
-        let mut tool_call = Map::from_iter([(
-            "function".to_string(),
-            json!({"name": "bash", "arguments": "{}"}),
-        )]);
-        let event = tool_call_start_event(&mut tool_call).unwrap();
-        let call_id = event
-            .get("call_id")
-            .and_then(Value::as_str)
-            .expect("call_id");
-        assert!(!call_id.is_empty());
-        assert_eq!(tool_call.get("id").and_then(Value::as_str), Some(call_id));
     }
 
     #[test]

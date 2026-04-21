@@ -16,11 +16,13 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
 use tokio::sync::Mutex as TokioMutex;
+use tokio_util::sync::CancellationToken;
 
 use crate::bridge::rate_limit_cooldown::{PerModelCooldown, RateLimitAction};
 use crate::turn::agentic_headless_round::HeadlessStderrStyle;
@@ -28,15 +30,15 @@ use crate::turn::agentic_loop_host::{
     AgenticLoopHost, AgenticLoopState, HostReflectionRequest, HostReflectionResult, HostTurnResult,
     TurnInteractionMode, TurnInteractionPolicy, interaction_scoped_tool_restrictions,
 };
-use crate::turn::bridge_inprocess::{
-    PromptCacheConfig, add_message_cache_breakpoint, annotate_tool_schemas_for_caching,
-    build_system_message,
-};
 use crate::turn::chat_turn_sse_dispatch::ChatTurnSseAccum;
 use crate::turn::llm_client::{
     LlmCallResult, LlmCancel, cached_system_prompt, call_llm_and_collect_with_request_overrides,
     call_llm_nonstream_fallback_with_request_overrides, llm_connect_timeout, llm_fallback_timeout,
     sleep_ms_or_llm_cancel,
+};
+use crate::turn::prompt_cache::{
+    PromptCacheConfig, add_message_cache_breakpoint, annotate_tool_schemas_for_caching,
+    build_system_message_with_dynamic_sections,
 };
 use crate::turn::tool_schema_prune::{filter_tool_schemas_by_excluded_names, prune_tool_schemas};
 use crate::turn::turn_guard::merge_deprioritized_tools_into_restricted;
@@ -211,20 +213,36 @@ pub struct ServerAgenticLoopHost {
     /// `true` when the connected client can answer ask_user prompts.
     interactive_client: bool,
 
-    // ── Tool execution (used by RunLifecycleService wiring) ──
-    #[allow(dead_code)] // needed once RunLifecycleService uses ledger-based tool execution
+    // ── Tool execution ──
+    #[allow(dead_code)] // used in Step 3: wire edge tool delivery via ledger
     edge_callback_ledger: Arc<TokioMutex<HashMap<String, Value>>>,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // used in Step 3
     user_id: String,
     session_id: String,
 
     // ── Output collection ──
     /// SSE events emitted during the turn, streamed to the client.
     emitted_events: Vec<Value>,
+    /// When set, SSE events are also pushed through this channel for
+    /// incremental streaming (web agent mode). The HTTP handler reads
+    /// from the corresponding receiver to stream SSE to the client.
+    event_tx: Option<tokio::sync::mpsc::Sender<Value>>,
+    /// When the SSE channel's receiver is dropped (client disconnected),
+    /// this flag is set so the agentic loop cancels at the next turn boundary.
+    client_cancel_flag: Option<Arc<AtomicBool>>,
+    /// Low-latency cancellation token — cancelled alongside `client_cancel_flag`
+    /// for immediate LLM abort on client disconnect.
+    client_cancel_token: Option<Arc<CancellationToken>>,
 
     // ── Agent progress ──
     /// Optional receiver for agent progress events (multi-agent tree updates).
     progress_rx: Option<tokio::sync::broadcast::Receiver<crate::orchestration::AgentProgressEvent>>,
+
+    // ── Test hooks ──
+    #[cfg(feature = "bridge-e2e-hooks")]
+    test_llm_rounds: std::collections::VecDeque<Value>,
+    #[cfg(feature = "bridge-e2e-hooks")]
+    test_llm_rounds_wired: bool,
 }
 
 /// Builder for [`ServerAgenticLoopHost`].
@@ -242,6 +260,11 @@ pub struct ServerAgenticLoopHostBuilder {
     session_id: String,
     progress_broadcaster: Option<Arc<crate::orchestration::ProgressBroadcaster>>,
     interactive_client: bool,
+    event_tx: Option<tokio::sync::mpsc::Sender<Value>>,
+    #[cfg(feature = "bridge-e2e-hooks")]
+    test_llm_rounds: Vec<Value>,
+    #[cfg(feature = "bridge-e2e-hooks")]
+    test_llm_rounds_wired: bool,
 }
 
 impl ServerAgenticLoopHostBuilder {
@@ -265,6 +288,11 @@ impl ServerAgenticLoopHostBuilder {
             session_id,
             progress_broadcaster: None,
             interactive_client: false,
+            event_tx: None,
+            #[cfg(feature = "bridge-e2e-hooks")]
+            test_llm_rounds: Vec::new(),
+            #[cfg(feature = "bridge-e2e-hooks")]
+            test_llm_rounds_wired: false,
         }
     }
 
@@ -322,6 +350,18 @@ impl ServerAgenticLoopHostBuilder {
         self
     }
 
+    pub fn with_event_tx(mut self, tx: tokio::sync::mpsc::Sender<Value>) -> Self {
+        self.event_tx = Some(tx);
+        self
+    }
+
+    #[cfg(feature = "bridge-e2e-hooks")]
+    pub fn with_test_llm_rounds(mut self, rounds: Vec<Value>) -> Self {
+        self.test_llm_rounds_wired = true;
+        self.test_llm_rounds = rounds;
+        self
+    }
+
     pub fn build(self) -> ServerAgenticLoopHost {
         // When no edge tools are provided (web-only mode), populate with
         // server-side tool schemas from astra-tools so the LLM knows what's available.
@@ -360,7 +400,14 @@ impl ServerAgenticLoopHostBuilder {
             user_id: self.user_id,
             session_id: self.session_id,
             emitted_events: Vec::new(),
+            event_tx: self.event_tx,
+            client_cancel_flag: None,
+            client_cancel_token: None,
             progress_rx,
+            #[cfg(feature = "bridge-e2e-hooks")]
+            test_llm_rounds: std::collections::VecDeque::from(self.test_llm_rounds),
+            #[cfg(feature = "bridge-e2e-hooks")]
+            test_llm_rounds_wired: self.test_llm_rounds_wired,
         }
     }
 }
@@ -374,15 +421,48 @@ impl ServerAgenticLoopHost {
         }
     }
 
-    fn push_reasoning_events(emitted_events: &mut Vec<Value>, reasoning: &str) {
+    /// Push an SSE event to both the internal buffer and the streaming channel.
+    /// If the streaming channel is closed (client disconnected), triggers
+    /// cancellation so the agentic loop stops at the next turn boundary.
+    fn emit_event(&mut self, event: Value) {
+        if let Some(ref tx) = self.event_tx {
+            match tx.try_send(event.clone()) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    // Client disconnected — cancel the loop to stop wasting LLM tokens.
+                    if let Some(flag) = &self.client_cancel_flag {
+                        flag.store(true, Ordering::SeqCst);
+                    }
+                    if let Some(token) = &self.client_cancel_token {
+                        token.cancel();
+                    }
+                    self.event_tx = None;
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    // Backpressure: client can't keep up. Cancel to avoid unbounded buffering.
+                    tracing::warn!(target: "sse_channel", "SSE event channel full — cancelling run");
+                    if let Some(flag) = &self.client_cancel_flag {
+                        flag.store(true, Ordering::SeqCst);
+                    }
+                    if let Some(token) = &self.client_cancel_token {
+                        token.cancel();
+                    }
+                    self.event_tx = None;
+                }
+            }
+        }
+        self.emitted_events.push(event);
+    }
+
+    fn push_reasoning_events(&mut self, reasoning: &str) {
         if reasoning.is_empty() {
             return;
         }
-        emitted_events.push(json!({
+        self.emit_event(json!({
             "type": "reasoning_delta",
             "content": reasoning,
         }));
-        emitted_events.push(json!({
+        self.emit_event(json!({
             "type": "reasoning_done",
         }));
     }
@@ -391,12 +471,16 @@ impl ServerAgenticLoopHost {
     /// Also drains any pending agent progress events into the result.
     pub fn take_emitted_events(&mut self) -> Vec<Value> {
         // Drain pending progress events from the broadcast receiver
+        let mut progress_events = Vec::new();
         if let Some(ref mut rx) = self.progress_rx {
             while let Ok(evt) = rx.try_recv() {
                 if let Some(sse_val) = progress_event_to_sse(&evt) {
-                    self.emitted_events.push(sse_val);
+                    progress_events.push(sse_val);
                 }
             }
+        }
+        for evt in progress_events {
+            self.emit_event(evt);
         }
         std::mem::take(&mut self.emitted_events)
     }
@@ -404,6 +488,315 @@ impl ServerAgenticLoopHost {
     /// Returns `true` when no CLI edge agent is connected (tools are server-side).
     pub fn edge_tools_empty(&self) -> bool {
         self.server_side_tools
+    }
+
+    /// Attach an incremental SSE channel. Events will be pushed through
+    /// this sender as they are emitted, enabling streaming to the client.
+    /// When the channel closes (client disconnect), `cancel_flag` and
+    /// `cancel_token` are triggered to stop the agentic loop.
+    pub fn set_event_tx(&mut self, tx: tokio::sync::mpsc::Sender<Value>) {
+        self.event_tx = Some(tx);
+    }
+
+    /// Set the cancellation handles used when client disconnects.
+    pub fn set_client_cancel(&mut self, flag: Arc<AtomicBool>, token: Arc<CancellationToken>) {
+        self.client_cancel_flag = Some(flag);
+        self.client_cancel_token = Some(token);
+    }
+
+    /// Execute a mock LLM turn from `test_llm_rounds` (bridge-e2e-hooks only).
+    ///
+    /// Parses the round JSON (same shape as bridge e2e hooks), emits SSE events,
+    /// and returns a `HostTurnResult` as if a real LLM responded.
+    #[cfg(feature = "bridge-e2e-hooks")]
+    async fn execute_mock_turn(
+        &mut self,
+        state: &mut AgenticLoopState,
+        round: &Value,
+        turn_started: Instant,
+    ) -> Result<HostTurnResult, astra_core::ClassifiedError> {
+        let (_, _, system_prompt_breakdown) = self.build_system_messages_cached(
+            &state.message,
+            &self.edge_tools.clone(),
+            state,
+            &PromptCacheConfig::default(),
+        );
+        self.emit_context_meta(&system_prompt_breakdown);
+
+        let (full_text, reasoning, tool_calls, usage) =
+            crate::turn::bridge_e2e_hooks::parse_llm_round(round);
+
+        // Emit SSE events matching real flow.
+        if !reasoning.is_empty() {
+            self.push_reasoning_events(&reasoning);
+        }
+        if !full_text.is_empty() {
+            self.emit_event(json!({ "type": "text_delta", "content": &full_text }));
+        }
+        for tc in &tool_calls {
+            self.emit_event(json!({ "type": "tool_call", "tool_call": tc }));
+        }
+        let prompt = usage
+            .get("prompt_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(10);
+        let completion = usage
+            .get("completion_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(5);
+        self.emit_event(json!({
+            "type": "usage",
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+        }));
+
+        // Edge tool delivery via ledger (when streaming to web client).
+        let edge_tool_round =
+            if !self.server_side_tools && self.event_tx.is_some() && !tool_calls.is_empty() {
+                self.deliver_edge_tools_via_ledger(&tool_calls).await
+            } else {
+                Vec::new()
+            };
+
+        let accum = ChatTurnSseAccum {
+            full_text: full_text.clone(),
+            reasoning_content: reasoning,
+            tool_calls: tool_calls.clone(),
+            has_tool_calls: !tool_calls.is_empty(),
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            has_usage: true,
+            system_prompt_tokens: Some(system_prompt_breakdown.total_tokens),
+            system_prompt_breakdown: serde_json::to_value(&system_prompt_breakdown).ok(),
+            ..Default::default()
+        };
+
+        state.final_text = full_text;
+        state.total_prompt += prompt;
+        state.total_completion += completion;
+        state.has_any_usage = true;
+
+        Ok(HostTurnResult {
+            accum,
+            ttft_ms: Some(turn_started.elapsed().as_millis() as u64),
+            edge_tool_round,
+            error_kind: None,
+        })
+    }
+
+    /// Deliver edge tool calls via the ledger protocol.
+    ///
+    /// For each tool call:
+    /// 1. If approval required: emit `approval_required` SSE → wait on approval ledger
+    /// 2. Emit `tool_request` SSE (so client can execute the tool)
+    /// 3. Wait on tool result ledger (populated by client's `POST /tools/result`)
+    /// 4. Convert result to `EdgeToolExecResult`
+    ///
+    /// Events are streamed incrementally through `event_tx`.
+    async fn deliver_edge_tools_via_ledger(
+        &mut self,
+        tool_calls: &[Value],
+    ) -> Vec<astra_turn_core::sse_stream_host::EdgeToolExecResult> {
+        use astra_turn_core::cloud_tool_delivery::{
+            cloud_tool_requires_approval_for_delivery, collect_approval_batches,
+            sse_maps_through_tool_request, wait_approval_ledger_for_tool,
+            wait_tool_result_ledger_for_tool,
+        };
+        use astra_turn_core::headless_tool_assembly::ensure_tool_call_ids;
+        use astra_turn_core::sse_stream_host::EdgeToolExecResult;
+        use astra_turn_core::stream_events::{
+            ApprovalBatchRequestEvent, build_approval_batch_required_event,
+            build_approval_required_event,
+        };
+        use std::collections::HashMap;
+
+        let tool_calls = ensure_tool_call_ids(tool_calls);
+        // 5-minute timeout: web clients may execute long-running tools.
+        let ledger_wait = std::time::Duration::from_secs(300);
+        let mut results_by_id: HashMap<String, EdgeToolExecResult> = HashMap::new();
+
+        for batch in collect_approval_batches(&tool_calls) {
+            if batch.items.len() == 1 {
+                let item = &batch.items[0];
+                self.emit_event(Value::Object(build_approval_required_event(
+                    &item.request_id,
+                    &item.tool_name,
+                    item.approval_kind,
+                    item.path.as_deref(),
+                    item.detail.as_deref(),
+                )));
+            } else {
+                let requests = batch
+                    .items
+                    .iter()
+                    .map(|item| ApprovalBatchRequestEvent {
+                        request_id: &item.request_id,
+                        tool_name: &item.tool_name,
+                        approval_kind: item.approval_kind,
+                        path: item.path.as_deref(),
+                        detail: item.detail.as_deref(),
+                    })
+                    .collect::<Vec<_>>();
+                self.emit_event(Value::Object(build_approval_batch_required_event(
+                    &requests,
+                )));
+            }
+        }
+
+        let mut block_start = 0;
+        while block_start < tool_calls.len() {
+            let approval_required =
+                cloud_tool_requires_approval_for_delivery(&tool_calls[block_start]);
+            let mut block_end = block_start + 1;
+            while block_end < tool_calls.len()
+                && cloud_tool_requires_approval_for_delivery(&tool_calls[block_end])
+                    == approval_required
+            {
+                block_end += 1;
+            }
+
+            let block = &tool_calls[block_start..block_end];
+            let mut executable_calls = Vec::new();
+            if approval_required {
+                for tc in block {
+                    let Some(tc_map) = tc.as_object() else {
+                        continue;
+                    };
+                    let request_id = tc_map
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let tool_name = tc_map
+                        .get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let args = tc_map
+                        .get("function")
+                        .and_then(|f| f.get("arguments"))
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    if let Err(denied) = wait_approval_ledger_for_tool(
+                        &self.edge_callback_ledger,
+                        &self.user_id,
+                        tc,
+                        ledger_wait,
+                        None,
+                    )
+                    .await
+                    {
+                        for m in denied.sse_maps {
+                            self.emit_event(Value::Object(m));
+                        }
+                        results_by_id.insert(
+                            request_id.clone(),
+                            EdgeToolExecResult {
+                                request_id,
+                                tool: tool_name,
+                                args,
+                                output: "Tool execution denied or timed out".to_string(),
+                                tool_result_fields: None,
+                                status: "error".to_string(),
+                                duration_ms: 0,
+                            },
+                        );
+                        continue;
+                    }
+                    executable_calls.push(tc);
+                }
+            } else {
+                executable_calls.extend(block.iter());
+            }
+
+            for tc in &executable_calls {
+                for m in sse_maps_through_tool_request(tc) {
+                    self.emit_event(Value::Object(m));
+                }
+            }
+
+            for tc in executable_calls {
+                let tc_map = match tc.as_object() {
+                    Some(m) => m,
+                    None => continue,
+                };
+                let id = tc_map
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let tool_name = tc_map
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let args = tc_map
+                    .get("function")
+                    .and_then(|f| f.get("arguments"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let started = std::time::Instant::now();
+                let delivery = wait_tool_result_ledger_for_tool(
+                    &self.edge_callback_ledger,
+                    &self.user_id,
+                    tc,
+                    ledger_wait,
+                )
+                .await;
+                let duration_ms = started.elapsed().as_millis() as u64;
+
+                for m in delivery.sse_maps {
+                    self.emit_event(Value::Object(m));
+                }
+
+                let output = delivery
+                    .tool_messages
+                    .first()
+                    .and_then(|m| m.get("content"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let status = if output.contains("status=error") {
+                    "error"
+                } else {
+                    "ok"
+                };
+
+                results_by_id.insert(
+                    id.clone(),
+                    EdgeToolExecResult {
+                        request_id: id,
+                        tool: tool_name,
+                        args,
+                        output,
+                        tool_result_fields: None,
+                        status: status.to_string(),
+                        duration_ms,
+                    },
+                );
+            }
+
+            block_start = block_end;
+        }
+
+        let mut results = Vec::with_capacity(tool_calls.len());
+        for tc in tool_calls.iter() {
+            let Some(tc_map) = tc.as_object() else {
+                continue;
+            };
+            let request_id = tc_map
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            if let Some(result) = results_by_id.remove(&request_id) {
+                results.push(result);
+            }
+        }
+
+        results
     }
 
     /// Build the system prompt from edge context and the tool schemas visible
@@ -418,7 +811,11 @@ impl ServerAgenticLoopHost {
         tools: &[Value],
         state: &AgenticLoopState,
         cache_cfg: &PromptCacheConfig,
-    ) -> (Vec<Value>, String) {
+    ) -> (
+        Vec<Value>,
+        String,
+        crate::turn::context_assembly_trace::SystemPromptBreakdown,
+    ) {
         let tool_names: Vec<&str> = tools
             .iter()
             .filter_map(|t| {
@@ -436,31 +833,33 @@ impl ServerAgenticLoopHost {
             profile_parts.push(format!("git_branch: {branch}"));
         }
 
-        let skill_hint = self
+        let active_skill_names: Vec<&str> = self
             .edge_profile
             .get("active_skills")
             .and_then(Value::as_array)
-            .map(|arr| {
-                let names: Vec<&str> = arr.iter().filter_map(Value::as_str).collect();
-                if names.is_empty() {
-                    String::new()
-                } else {
-                    format!(
-                        "\n\n## Active Output Skills\nThe user has enabled these output constraints: {}. \
-                         Follow their formatting rules strictly.",
-                        names.join(", ")
-                    )
-                }
-            })
+            .map(|arr| arr.iter().filter_map(Value::as_str).collect())
             .unwrap_or_default();
+        let skill_hint = if active_skill_names.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n\n## Active Output Skills\nThe user has enabled these output constraints: {}. \
+                 Follow their formatting rules strictly.",
+                active_skill_names.join(", ")
+            )
+        };
 
-        let learned_context_hint = self
+        let learned_context_text = self
             .edge_profile
             .get("learned_context_hint")
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
-            .map(|hint| format!("\n\n## Learned Runtime Context\n{hint}"))
             .unwrap_or_default();
+        let learned_context_hint = if learned_context_text.is_empty() {
+            String::new()
+        } else {
+            format!("\n\n## Learned Runtime Context\n{learned_context_text}")
+        };
 
         let task_type = self
             .edge_profile
@@ -473,7 +872,6 @@ impl ServerAgenticLoopHost {
         } else {
             format!("\n\n# Project Profile\n{}", profile_parts.join("\n"))
         };
-        let profile_with_hints = format!("{profile_desc}{skill_hint}{learned_context_hint}");
 
         // Skill effort/agent_type hints (dynamic per-turn)
         let mut extra_dynamic = String::new();
@@ -511,19 +909,139 @@ impl ServerAgenticLoopHost {
             .map(|s| format!("\n\n{s}"))
             .unwrap_or_default();
 
-        // All dynamic per-turn content (not cached)
-        let full_dynamic =
-            format!("{profile_with_hints}{extra_dynamic}{memory_signal_hint}{system_override}");
+        let tool_cfg = crate::runtime_config::RuntimeConfig::load().tool_selection;
+        let (tool_round_guidance, guidance_signals) =
+            crate::prompts::tool_round_guidance_trace_with(
+                &state.messages,
+                state.current_round_index,
+                tool_cfg.effective_round_budget_warning(),
+                tool_cfg.effective_round_budget_limit(),
+            );
+
+        let mut dynamic_sections = Vec::new();
+        if !profile_desc.is_empty() {
+            dynamic_sections.push(crate::prompts::PromptSection::dynamic(
+                profile_desc.clone(),
+                crate::prompts::PromptTokenBucket::Environment,
+            ));
+        }
+        if !skill_hint.is_empty() {
+            dynamic_sections.push(
+                crate::prompts::PromptSection::dynamic(
+                    skill_hint.clone(),
+                    crate::prompts::PromptTokenBucket::UserPreferences,
+                )
+                .with_trace_signals(
+                    crate::turn::context_assembly_trace::PromptTraceSignals {
+                        context_signals:
+                            crate::turn::context_assembly_trace::PromptContextSignals {
+                                active_output_skills: true,
+                                ..Default::default()
+                            },
+                        ..Default::default()
+                    },
+                ),
+            );
+        }
+        if !learned_context_hint.is_empty() {
+            dynamic_sections.push(
+                crate::prompts::PromptSection::dynamic(
+                    learned_context_hint.clone(),
+                    crate::prompts::PromptTokenBucket::UserPreferences,
+                )
+                .with_trace_signals(
+                    crate::turn::context_assembly_trace::PromptTraceSignals {
+                        context_signals:
+                            crate::turn::context_assembly_trace::PromptContextSignals {
+                                learned_runtime_context: true,
+                                ..Default::default()
+                            },
+                        ..Default::default()
+                    },
+                ),
+            );
+        }
+        if !extra_dynamic.is_empty() {
+            dynamic_sections.push(
+                crate::prompts::PromptSection::dynamic(
+                    extra_dynamic.clone(),
+                    crate::prompts::PromptTokenBucket::Environment,
+                )
+                .with_trace_signals(
+                    crate::turn::context_assembly_trace::PromptTraceSignals {
+                        context_signals:
+                            crate::turn::context_assembly_trace::PromptContextSignals {
+                                effort_hint: state.skills.effort.is_some(),
+                                agent_type_hint: state.skills.agent_type.is_some(),
+                                ..Default::default()
+                            },
+                        ..Default::default()
+                    },
+                ),
+            );
+        }
+        if !memory_signal_hint.is_empty() {
+            dynamic_sections.push(
+                crate::prompts::PromptSection::dynamic(
+                    memory_signal_hint.clone(),
+                    crate::prompts::PromptTokenBucket::Environment,
+                )
+                .with_trace_signals(
+                    crate::turn::context_assembly_trace::PromptTraceSignals {
+                        context_signals:
+                            crate::turn::context_assembly_trace::PromptContextSignals {
+                                memory_signal_detected: true,
+                                ..Default::default()
+                            },
+                        ..Default::default()
+                    },
+                ),
+            );
+        }
+        if !system_override.is_empty() {
+            dynamic_sections.push(
+                crate::prompts::PromptSection::dynamic(
+                    system_override.clone(),
+                    crate::prompts::PromptTokenBucket::Environment,
+                )
+                .with_trace_signals(
+                    crate::turn::context_assembly_trace::PromptTraceSignals {
+                        context_signals:
+                            crate::turn::context_assembly_trace::PromptContextSignals {
+                                system_prompt_override: true,
+                                ..Default::default()
+                            },
+                        ..Default::default()
+                    },
+                ),
+            );
+        }
+        if !tool_round_guidance.is_empty() {
+            dynamic_sections.push(
+                crate::prompts::PromptSection::dynamic(
+                    tool_round_guidance.clone(),
+                    crate::prompts::PromptTokenBucket::Environment,
+                )
+                .with_trace_signals(
+                    crate::turn::context_assembly_trace::PromptTraceSignals {
+                        guidance_signals,
+                        ..Default::default()
+                    },
+                ),
+            );
+        }
+        let full_dynamic = crate::prompts::sections_to_string(&dynamic_sections);
 
         // Build structured system messages with Anthropic cache annotations.
         // Stable sections (Global/Session) get cache_control; dynamic content does not.
-        let (sys_msg, dynamic_msg, _sections) = build_system_message(
+        let (sys_msg, dynamic_msg, sections) = build_system_message_with_dynamic_sections(
             &tool_names,
-            &full_dynamic,
+            &dynamic_sections,
             self.selection_confidence,
             task_type,
             cache_cfg,
         );
+        let breakdown = crate::prompts::build_system_prompt_trace(&sections, vec![], vec![]);
         let mut system_messages = vec![sys_msg];
         if let Some(dm) = dynamic_msg {
             system_messages.push(dm);
@@ -537,7 +1055,18 @@ impl ServerAgenticLoopHost {
             task_type,
         );
 
-        (system_messages, plain)
+        (system_messages, plain, breakdown)
+    }
+
+    fn emit_context_meta(
+        &mut self,
+        breakdown: &crate::turn::context_assembly_trace::SystemPromptBreakdown,
+    ) {
+        self.emit_event(json!({
+            "type": "context_meta",
+            "system_prompt_tokens": breakdown.total_tokens,
+            "system_prompt_breakdown": breakdown,
+        }));
     }
 
     /// Compute the tool schemas visible for the current turn after applying
@@ -669,8 +1198,15 @@ impl ServerAgenticLoopHost {
         } else {
             String::new()
         };
-        let full_dynamic =
-            format!("{profile_desc}{skill_hint}{learned_context_hint}{memory_signal_hint}");
+        let tool_cfg = crate::runtime_config::RuntimeConfig::load().tool_selection;
+        let round_budget_hint = crate::prompts::round_budget_directive_with(
+            0,
+            tool_cfg.effective_round_budget_warning(),
+            tool_cfg.effective_round_budget_limit(),
+        );
+        let full_dynamic = format!(
+            "{profile_desc}{skill_hint}{learned_context_hint}{memory_signal_hint}{round_budget_hint}"
+        );
 
         cached_system_prompt(
             &tool_names,
@@ -863,6 +1399,31 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
     ) -> Result<HostTurnResult, astra_core::ClassifiedError> {
         let turn_started = Instant::now();
 
+        // ── Test hook: mock LLM rounds ──────────────────────────────────
+        #[cfg(feature = "bridge-e2e-hooks")]
+        {
+            if let Some(round) = self.test_llm_rounds.pop_front() {
+                return self.execute_mock_turn(state, &round, turn_started).await;
+            }
+            if self.test_llm_rounds_wired {
+                // All mock rounds consumed — return a no-op text result so the
+                // agentic loop terminates cleanly (no real LLM fallback).
+                self.emit_event(
+                    json!({ "type": "text_delta", "content": "[mock rounds exhausted]" }),
+                );
+                state.final_text = "[mock rounds exhausted]".to_string();
+                return Ok(HostTurnResult {
+                    accum: ChatTurnSseAccum {
+                        full_text: "[mock rounds exhausted]".to_string(),
+                        ..Default::default()
+                    },
+                    ttft_ms: Some(0),
+                    edge_tool_round: Vec::new(),
+                    error_kind: None,
+                });
+            }
+        }
+
         // ── 1. Resolve LLM model ────────────────────────────────────────
         // Skill-level model override takes precedence over the host-level one.
         let effective_model_override = state
@@ -977,8 +1538,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // provider doesn't change within a turn).
         let cache_cfg = PromptCacheConfig::latch(&llm_cfg.provider, &llm_cfg.model_name);
 
-        let (system_messages, system_prompt_plain) =
+        let (system_messages, system_prompt_plain, system_prompt_breakdown) =
             self.build_system_messages_cached(&user_content, &visible_tools, state, &cache_cfg);
+        self.emit_context_meta(&system_prompt_breakdown);
 
         let llm_messages = self
             .build_llm_messages(
@@ -1052,6 +1614,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 Err(ref e) if e.kind == astra_core::ErrorKind::ContextWindow => {
                     let accum = ChatTurnSseAccum {
                         error_message: Some(e.message.clone()),
+                        system_prompt_tokens: Some(system_prompt_breakdown.total_tokens),
+                        system_prompt_breakdown: serde_json::to_value(&system_prompt_breakdown)
+                            .ok(),
                         ..Default::default()
                     };
                     let ttft_ms = Some(turn_started.elapsed().as_millis() as u64);
@@ -1083,30 +1648,47 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
 
         // ── 4. Emit SSE events for client ───────────────────────────────
         if !result.full_text.is_empty() {
-            self.emitted_events.push(json!({
+            self.emit_event(json!({
                 "type": "text_delta",
                 "content": result.full_text,
             }));
         }
-        Self::push_reasoning_events(&mut self.emitted_events, &result.reasoning);
+        self.push_reasoning_events(&result.reasoning);
         if !result.usage.is_empty() {
-            self.emitted_events.push(json!({
+            self.emit_event(json!({
                 "type": "usage",
                 "prompt_tokens": result.usage.get("prompt"),
                 "completion_tokens": result.usage.get("completion"),
             }));
         }
 
-        // ── 5. Build turn result ────────────────────────────────────────
-        let ttft_ms = Some(turn_started.elapsed().as_millis() as u64);
-        let accum = Self::result_to_accum(&result);
+        // ── 5. Edge tool delivery via ledger (streaming mode) ────────────
+        //
+        // When streaming to a web client with edge tools, emit `tool_request`
+        // SSE events so the client can execute tools locally, then wait on
+        // the ledger for the results posted via `POST /tools/result`.
+        //
+        // When server_side_tools is true, the headless pipeline uses
+        // server_tool_executor and no ledger is needed.
+        let edge_tool_round = if !self.server_side_tools
+            && self.event_tx.is_some()
+            && !result.tool_calls.is_empty()
+        {
+            self.deliver_edge_tools_via_ledger(&result.tool_calls).await
+        } else {
+            Vec::new()
+        };
 
-        // Edge tool round is empty — tools are executed by the runtime's
-        // headless round via the edge_callback_ledger, not inline here.
+        // ── 6. Build turn result ────────────────────────────────────────
+        let ttft_ms = Some(turn_started.elapsed().as_millis() as u64);
+        let mut accum = Self::result_to_accum(&result);
+        accum.system_prompt_tokens = Some(system_prompt_breakdown.total_tokens);
+        accum.system_prompt_breakdown = serde_json::to_value(&system_prompt_breakdown).ok();
+
         Ok(HostTurnResult {
             accum,
             ttft_ms,
-            edge_tool_round: Vec::new(),
+            edge_tool_round,
             error_kind: None,
         })
     }
@@ -1215,7 +1797,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
     }
 
     fn emit_headless_line(&mut self, _style: HeadlessStderrStyle, line: String) {
-        self.emitted_events.push(json!({
+        self.emit_event(json!({
             "type": "headless_line",
             "content": line,
         }));
@@ -1364,6 +1946,7 @@ mod tests {
     use crate::turn::agentic_loop_host::ASK_USER_TOOL_NAME;
     use crate::turn::agentic_loop_host::run_agentic_loop_with_host;
     use crate::turn::cloud::summary::SummaryLlmClient;
+    use crate::turn::edge_ledger::{approval_callback_key, tool_callback_key};
     use crate::turn::sse_stream_host::EdgeToolExecResult;
 
     fn mock_matrixone() -> MatrixOneSettings {
@@ -1561,6 +2144,113 @@ mod tests {
     }
 
     #[test]
+    fn build_system_messages_cached_includes_late_round_guidance_in_dynamic_prompt() {
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u1".to_string(),
+            "s1".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .build();
+
+        let mut state = create_test_state();
+        state.current_round_index = crate::prompts::ROUND_BUDGET_THRESHOLD;
+        state.messages = vec![
+            json!({"role": "user", "content": "inspect the project"}),
+            json!({"role": "tool", "content": "Cargo.toml"}),
+            json!({"role": "tool", "content": "README.md"}),
+        ];
+
+        let (system_messages, plain, breakdown) = host.build_system_messages_cached(
+            "inspect the project",
+            &host.edge_tools,
+            &state,
+            &PromptCacheConfig::latch("openai", "gpt-4o"),
+        );
+
+        assert!(
+            plain.contains("Synthesize Or Batch Now"),
+            "plain prompt should include the late-round synthesis nudge"
+        );
+        assert!(
+            plain.contains("2 tools executed in parallel"),
+            "plain prompt should preserve batching feedback"
+        );
+
+        let primary = system_messages.first().expect("primary system message");
+        let dynamic = system_messages.last().expect("dynamic system message");
+        let primary_text = primary
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let dynamic_text = dynamic
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+
+        assert!(
+            !primary_text.contains("Synthesize Or Batch Now"),
+            "late-round guidance must stay out of the stable cached prefix"
+        );
+        assert!(
+            dynamic_text.contains("Synthesize Or Batch Now"),
+            "late-round guidance should live in the dynamic prompt message"
+        );
+        assert!(breakdown.guidance_signals.round_budget_warning);
+        assert!(breakdown.guidance_signals.synthesize_or_batch);
+        assert!(breakdown.guidance_signals.parallel_feedback);
+    }
+
+    #[test]
+    fn build_system_messages_cached_records_dynamic_context_signals() {
+        let mut profile = Map::new();
+        profile.insert("active_skills".to_string(), json!(["concise"]));
+        profile.insert(
+            "learned_context_hint".to_string(),
+            json!("matrixorigin => github"),
+        );
+        profile.insert(
+            "system_prompt_override".to_string(),
+            json!("You are operating under a delegated reviewer contract."),
+        );
+
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u1".to_string(),
+            "s1".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_edge_profile(profile)
+        .build();
+
+        let mut state = create_test_state();
+        state.skills.effort = Some(crate::skills::manifest::EffortLevel::High);
+        state.skills.agent_type = Some("reviewer".to_string());
+
+        let (_, _, breakdown) = host.build_system_messages_cached(
+            "remember that I prefer dark mode",
+            &host.edge_tools,
+            &state,
+            &PromptCacheConfig::latch("openai", "gpt-4o"),
+        );
+
+        assert!(breakdown.context_signals.active_output_skills);
+        assert!(breakdown.context_signals.learned_runtime_context);
+        assert!(breakdown.context_signals.memory_signal_detected);
+        assert!(breakdown.context_signals.system_prompt_override);
+        assert!(breakdown.context_signals.effort_hint);
+        assert!(breakdown.context_signals.agent_type_hint);
+        assert!(!breakdown.context_signals.self_awareness);
+        assert!(!breakdown.context_signals.implicit_feedback);
+        assert!(!breakdown.context_signals.learned_feedback_rules);
+        assert!(!breakdown.context_signals.session_anchor);
+        assert!(breakdown.environment_tokens > 0);
+        assert!(breakdown.user_preferences_tokens > 0);
+    }
+
+    #[test]
     fn result_to_accum_converts_correctly() {
         let result = LlmCallResult {
             full_text: "Hello world".to_string(),
@@ -1631,20 +2321,32 @@ mod tests {
 
     #[test]
     fn push_reasoning_events_emits_done_marker() {
-        let mut emitted = Vec::new();
-        ServerAgenticLoopHost::push_reasoning_events(&mut emitted, "thinking...");
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u".to_string(),
+            "s".to_string(),
+        )
+        .build();
+        host.push_reasoning_events("thinking...");
 
-        assert_eq!(emitted.len(), 2);
-        assert_eq!(emitted[0]["type"], "reasoning_delta");
-        assert_eq!(emitted[0]["content"], "thinking...");
-        assert_eq!(emitted[1]["type"], "reasoning_done");
+        assert_eq!(host.emitted_events.len(), 2);
+        assert_eq!(host.emitted_events[0]["type"], "reasoning_delta");
+        assert_eq!(host.emitted_events[0]["content"], "thinking...");
+        assert_eq!(host.emitted_events[1]["type"], "reasoning_done");
     }
 
     #[test]
     fn push_reasoning_events_skips_empty_reasoning() {
-        let mut emitted = Vec::new();
-        ServerAgenticLoopHost::push_reasoning_events(&mut emitted, "");
-        assert!(emitted.is_empty());
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u".to_string(),
+            "s".to_string(),
+        )
+        .build();
+        host.push_reasoning_events("");
+        assert!(host.emitted_events.is_empty());
     }
 
     #[test]
@@ -1695,6 +2397,203 @@ mod tests {
         assert!(msgs.len() >= 2, "should have system + user messages");
         assert_eq!(msgs[0]["role"], "system");
         assert_eq!(msgs[0]["content"], "system prompt text");
+    }
+
+    #[tokio::test]
+    async fn deliver_edge_tools_batches_multiple_approval_prompts() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-batch".to_string(),
+            "s-batch".to_string(),
+        )
+        .build();
+        let ledger = host.edge_callback_ledger.clone();
+        let tool_calls = vec![
+            json!({
+                "id": "w1",
+                "type": "function",
+                "function": {"name": "write_file", "arguments": r#"{"path":"a.rs","content":"1"}"#}
+            }),
+            json!({
+                "id": "w2",
+                "type": "function",
+                "function": {"name": "write_file", "arguments": r#"{"path":"b.rs","content":"2"}"#}
+            }),
+        ];
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let mut guard = ledger.lock().await;
+            guard.insert(
+                approval_callback_key("u-batch", "w1"),
+                json!({"kind": "approval_respond", "body": {"request_id": "w1", "decision": "allow"}}),
+            );
+            guard.insert(
+                approval_callback_key("u-batch", "w2"),
+                json!({"kind": "approval_respond", "body": {"request_id": "w2", "decision": "allow"}}),
+            );
+            drop(guard);
+
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let mut guard = ledger.lock().await;
+            guard.insert(
+                tool_callback_key("u-batch", "w1"),
+                json!({"body": {"request_id": "w1", "status": "ok", "output": "wrote-a"}}),
+            );
+            guard.insert(
+                tool_callback_key("u-batch", "w2"),
+                json!({"body": {"request_id": "w2", "status": "ok", "output": "wrote-b"}}),
+            );
+        });
+
+        let results = host.deliver_edge_tools_via_ledger(&tool_calls).await;
+
+        assert!(
+            host.emitted_events
+                .iter()
+                .all(|event| event.get("type").and_then(Value::as_str) != Some("approval_required"))
+        );
+        let batch = host
+            .emitted_events
+            .iter()
+            .find(|event| {
+                event.get("type").and_then(Value::as_str) == Some("approval_batch_required")
+            })
+            .expect("approval batch event");
+        assert_eq!(batch["requests"].as_array().unwrap().len(), 2);
+
+        let tool_request_positions: Vec<_> = host
+            .emitted_events
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, event)| {
+                (event.get("type").and_then(Value::as_str) == Some("tool_request")).then_some(idx)
+            })
+            .collect();
+        assert_eq!(tool_request_positions.len(), 2);
+        let first_end = host
+            .emitted_events
+            .iter()
+            .position(|event| event.get("type").and_then(Value::as_str) == Some("tool_call_end"))
+            .expect("tool_call_end");
+        assert!(tool_request_positions.iter().all(|idx| *idx < first_end));
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].request_id, "w1");
+        assert_eq!(results[1].request_id, "w2");
+        assert_eq!(results[0].status, "ok");
+        assert_eq!(results[1].status, "ok");
+    }
+
+    #[tokio::test]
+    async fn deliver_edge_tools_does_not_block_later_read_only_block_on_future_approval_block() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-mixed".to_string(),
+            "s-mixed".to_string(),
+        )
+        .build();
+        let ledger = host.edge_callback_ledger.clone();
+        let tool_calls = vec![
+            json!({
+                "id": "r1",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": r#"{"path":"a.rs"}"#}
+            }),
+            json!({
+                "id": "w1",
+                "type": "function",
+                "function": {"name": "write_file", "arguments": r#"{"path":"b.rs","content":"1"}"#}
+            }),
+            json!({
+                "id": "r2",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": r#"{"path":"c.rs"}"#}
+            }),
+            json!({
+                "id": "w2",
+                "type": "function",
+                "function": {"name": "write_file", "arguments": r#"{"path":"d.rs","content":"2"}"#}
+            }),
+        ];
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            ledger.lock().await.insert(
+                tool_callback_key("u-mixed", "r1"),
+                json!({"body": {"request_id": "r1", "status": "ok", "output": "read-a"}}),
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            ledger.lock().await.insert(
+                approval_callback_key("u-mixed", "w1"),
+                json!({"kind": "approval_respond", "body": {"request_id": "w1", "decision": "allow"}}),
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            ledger.lock().await.insert(
+                tool_callback_key("u-mixed", "w1"),
+                json!({"body": {"request_id": "w1", "status": "ok", "output": "wrote-b"}}),
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            ledger.lock().await.insert(
+                tool_callback_key("u-mixed", "r2"),
+                json!({"body": {"request_id": "r2", "status": "ok", "output": "read-c"}}),
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            ledger.lock().await.insert(
+                approval_callback_key("u-mixed", "w2"),
+                json!({"kind": "approval_respond", "body": {"request_id": "w2", "decision": "allow"}}),
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            ledger.lock().await.insert(
+                tool_callback_key("u-mixed", "w2"),
+                json!({"body": {"request_id": "w2", "status": "ok", "output": "wrote-d"}}),
+            );
+        });
+
+        let results = host.deliver_edge_tools_via_ledger(&tool_calls).await;
+
+        let request_ids: Vec<_> = host
+            .emitted_events
+            .iter()
+            .filter(|event| event.get("type").and_then(Value::as_str) == Some("tool_request"))
+            .filter_map(|event| event.get("request_id").and_then(Value::as_str))
+            .collect();
+        assert_eq!(request_ids, vec!["r1", "w1", "r2", "w2"]);
+
+        let w1_end = host
+            .emitted_events
+            .iter()
+            .position(|event| {
+                event.get("type").and_then(Value::as_str) == Some("tool_call_end")
+                    && event.get("call_id").and_then(Value::as_str) == Some("w1")
+            })
+            .expect("w1 tool_call_end");
+        let r2_request = host
+            .emitted_events
+            .iter()
+            .position(|event| {
+                event.get("type").and_then(Value::as_str) == Some("tool_request")
+                    && event.get("request_id").and_then(Value::as_str) == Some("r2")
+            })
+            .expect("r2 tool_request");
+        let w2_request = host
+            .emitted_events
+            .iter()
+            .position(|event| {
+                event.get("type").and_then(Value::as_str) == Some("tool_request")
+                    && event.get("request_id").and_then(Value::as_str) == Some("w2")
+            })
+            .expect("w2 tool_request");
+        assert!(r2_request > w1_end);
+        assert!(r2_request < w2_request);
+
+        assert_eq!(results.len(), 4);
+        assert_eq!(results[0].request_id, "r1");
+        assert_eq!(results[1].request_id, "w1");
+        assert_eq!(results[2].request_id, "r2");
+        assert_eq!(results[3].request_id, "w2");
     }
 
     // ── Mock host tests for agentic loop integration ───────────────────────
@@ -1802,6 +2701,7 @@ mod tests {
             has_any_usage: false,
             max_turns: 10,
             remaining_turns: 10,
+            current_round_index: 0,
             turn_guard: TurnGuard::new(),
             restricted_tools: HashSet::new(),
             step_recorder: StepRecorder::new("test-session", "test-task"),
@@ -1854,6 +2754,9 @@ mod tests {
             approval_overrides: None,
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
+            session_turn: 0,
+            prefetch_injected: false,
+            turn_event_buffer: None,
         }
     }
 

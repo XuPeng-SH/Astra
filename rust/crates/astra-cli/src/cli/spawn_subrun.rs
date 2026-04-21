@@ -206,6 +206,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             has_any_usage: false,
             max_turns,
             remaining_turns: max_turns,
+            current_round_index: 0,
             turn_guard: TurnGuard::with_profile(task_profile),
             restricted_tools,
             step_recorder,
@@ -286,6 +287,9 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             approval_overrides: None,
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
+            session_turn: 0,
+            prefetch_injected: false,
+            turn_event_buffer: None,
         };
 
         // Inherit skills from parent: pre-populate discovered skills

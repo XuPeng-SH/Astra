@@ -62,6 +62,11 @@ pub struct HeadlessToolRoundCtx<'a, E: EdgeToolRoundRow> {
     pub pre_resolved_results: &'a [(String, String)],
     /// Optional server-side tool executor for web agent sessions.
     pub server_tool_executor: Option<&'a crate::server::server_tool_executor::ServerToolExecutor>,
+    // ── Observability (Phase 1) ──
+    /// Turn start instant for computing start_offset_ms on tool records.
+    pub turn_start: Option<std::time::Instant>,
+    /// Current LLM round index (0-based) within this turn.
+    pub llm_round: u32,
 }
 
 struct HeadlessPreparedRound<'a> {
@@ -169,6 +174,8 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
         progress_emitter,
         pre_resolved_results,
         server_tool_executor,
+        turn_start,
+        llm_round,
     } = ctx;
     let HeadlessPreparedRound {
         effective_permission_timeout,
@@ -219,11 +226,16 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
             progress_emitter,
             effective_permission_timeout,
             server_tool_executor,
+            turn_start,
+            llm_round,
         },
         consumed_edge,
     );
 
-    for item in &indices {
+    // Partition indices into batches: consecutive read-only tools run concurrently,
+    // non-read-only tools run serially (one at a time).
+    let batches = partition_tool_batches(&indices, tool_calls);
+    'outer: for batch in &batches {
         if let Some((aborted_count, aborted_tools)) = step_deadline.step_timeout_abort(
             &indices,
             pipeline.tool_results_len(),
@@ -241,8 +253,62 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
             pipeline.record_step_abort(&aborted_tools);
             break;
         }
-        if !pipeline.run_slot_with_control(*item).await {
-            break;
+
+        match batch {
+            ToolBatch::Concurrent(items) => {
+                if !pipeline.run_batch_concurrent(items).await {
+                    break 'outer;
+                }
+            }
+            ToolBatch::Serial(item) => {
+                if !pipeline.run_slot_with_control(*item).await {
+                    break 'outer;
+                }
+            }
         }
     }
+}
+
+use super::headless_tool_assembly::HeadlessRoundToolIdx;
+
+pub(crate) enum ToolBatch {
+    Concurrent(Vec<HeadlessRoundToolIdx>),
+    Serial(HeadlessRoundToolIdx),
+}
+
+pub(crate) fn partition_tool_batches(
+    indices: &[HeadlessRoundToolIdx],
+    tool_calls: &[Value],
+) -> Vec<ToolBatch> {
+    use super::headless_tool_assembly::READ_ONLY_TOOLS;
+
+    let mut batches = Vec::new();
+    let mut concurrent_buf: Vec<HeadlessRoundToolIdx> = Vec::new();
+
+    for &idx in indices {
+        let tool_name = match &idx {
+            HeadlessRoundToolIdx::ServerToolCall(i) => tool_calls
+                .get(*i)
+                .and_then(|tc| tc.get("function"))
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+                .unwrap_or(""),
+            HeadlessRoundToolIdx::SyntheticEdge(_) => "synthetic_edge",
+        };
+
+        let is_readonly = READ_ONLY_TOOLS.contains(&tool_name) || tool_name == "synthetic_edge";
+
+        if is_readonly {
+            concurrent_buf.push(idx);
+        } else {
+            if !concurrent_buf.is_empty() {
+                batches.push(ToolBatch::Concurrent(std::mem::take(&mut concurrent_buf)));
+            }
+            batches.push(ToolBatch::Serial(idx));
+        }
+    }
+    if !concurrent_buf.is_empty() {
+        batches.push(ToolBatch::Concurrent(concurrent_buf));
+    }
+    batches
 }

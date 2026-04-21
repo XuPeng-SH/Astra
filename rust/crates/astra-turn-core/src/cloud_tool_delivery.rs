@@ -22,8 +22,8 @@ use crate::edge_ledger::{
     tool_content_from_ledger_entry,
 };
 use crate::stream_events::{
-    build_approval_required_event, build_edge_tool_call_event, build_tool_call_end_event,
-    build_tool_request_event,
+    ApprovalBatchRequestEvent, build_approval_batch_required_event, build_approval_required_event,
+    build_edge_tool_call_event, build_tool_call_end_event, build_tool_request_event,
 };
 use crate::tool_argument_hints::{
     normalize_llm_function_arguments, path_hint_from_args, permission_prompt_primary_detail,
@@ -645,6 +645,225 @@ pub fn tool_approval_kind_for_delivery(tool_call: &Value) -> ApprovalKind {
     tool_approval_kind(tool_call)
 }
 
+#[derive(Debug, Clone)]
+pub struct ApprovalBatchItem {
+    pub tool_call: Value,
+    pub request_id: String,
+    pub tool_name: String,
+    pub approval_kind: ApprovalKind,
+    pub path: Option<String>,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ApprovalBatch {
+    pub approval_kind: ApprovalKind,
+    pub items: Vec<ApprovalBatchItem>,
+}
+
+pub fn collect_approval_batches(tool_calls: &[Value]) -> Vec<ApprovalBatch> {
+    let mut batches: Vec<ApprovalBatch> = Vec::new();
+    for tc in tool_calls {
+        if !cloud_tool_requires_approval(tc) {
+            continue;
+        }
+        let Some(tc_map) = tc.as_object() else {
+            continue;
+        };
+        let approval_kind = tool_approval_kind(tc);
+        let item = ApprovalBatchItem {
+            tool_call: tc.clone(),
+            request_id: tc_map
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            tool_name: tc_map
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            approval_kind,
+            path: tool_path_hint(tc),
+            detail: tool_approval_detail(tc),
+        };
+        if let Some(batch) = batches
+            .iter_mut()
+            .find(|batch| batch.approval_kind == approval_kind)
+        {
+            batch.items.push(item);
+        } else {
+            batches.push(ApprovalBatch {
+                approval_kind,
+                items: vec![item],
+            });
+        }
+    }
+    batches
+}
+
+fn extend_delivery(out: &mut EdgeToolRoundDelivery, part: EdgeToolRoundDelivery) {
+    out.sse_maps.extend(part.sse_maps);
+    out.tool_messages.extend(part.tool_messages);
+    out.persist_tool_results.extend(part.persist_tool_results);
+}
+
+fn append_approval_batch_events(out: &mut EdgeToolRoundDelivery, batches: &[ApprovalBatch]) {
+    for batch in batches {
+        if batch.items.len() == 1 {
+            let item = &batch.items[0];
+            out.sse_maps.push(build_approval_required_event(
+                &item.request_id,
+                &item.tool_name,
+                item.approval_kind,
+                item.path.as_deref(),
+                item.detail.as_deref(),
+            ));
+        } else {
+            let requests = batch
+                .items
+                .iter()
+                .map(|item| ApprovalBatchRequestEvent {
+                    request_id: &item.request_id,
+                    tool_name: &item.tool_name,
+                    approval_kind: item.approval_kind,
+                    path: item.path.as_deref(),
+                    detail: item.detail.as_deref(),
+                })
+                .collect::<Vec<_>>();
+            out.sse_maps
+                .push(build_approval_batch_required_event(&requests));
+        }
+    }
+}
+
+async fn deliver_read_only_block(
+    ledger: &Arc<tokio::sync::Mutex<HashMap<String, Value>>>,
+    user_id: &str,
+    tool_calls: &[Value],
+    ledger_wait: Duration,
+) -> EdgeToolRoundDelivery {
+    let mut out = EdgeToolRoundDelivery::default();
+    for tc in tool_calls {
+        out.sse_maps.extend(sse_maps_through_tool_request(tc));
+        extend_delivery(
+            &mut out,
+            wait_tool_result_ledger_for_tool(ledger, user_id, tc, ledger_wait).await,
+        );
+    }
+    out
+}
+
+async fn deliver_approval_block(
+    ledger: &Arc<tokio::sync::Mutex<HashMap<String, Value>>>,
+    user_id: &str,
+    tool_calls: &[Value],
+    ledger_wait: Duration,
+) -> EdgeToolRoundDelivery {
+    let mut out = EdgeToolRoundDelivery::default();
+    let mut approved_calls = Vec::new();
+
+    for tc in tool_calls {
+        match wait_approval_ledger_for_tool(ledger, user_id, tc, ledger_wait, None).await {
+            Ok(()) => approved_calls.push(tc),
+            Err(part) => extend_delivery(&mut out, part),
+        }
+    }
+
+    for tc in &approved_calls {
+        out.sse_maps.extend(sse_maps_through_tool_request(tc));
+    }
+    for tc in approved_calls {
+        extend_delivery(
+            &mut out,
+            wait_tool_result_ledger_for_tool(ledger, user_id, tc, ledger_wait).await,
+        );
+    }
+
+    out
+}
+
+#[cfg(test)]
+async fn deliver_read_only_block_concurrent(
+    ledger: &Arc<tokio::sync::Mutex<HashMap<String, Value>>>,
+    user_id: &str,
+    tool_calls: &[Value],
+    ledger_wait: Duration,
+) -> EdgeToolRoundDelivery {
+    let mut out = EdgeToolRoundDelivery::default();
+    for tc in tool_calls {
+        out.sse_maps.extend(sse_maps_through_tool_request(tc));
+    }
+    if !tool_calls.is_empty() {
+        let futs: Vec<_> =
+            tool_calls
+                .iter()
+                .map(|tc| {
+                    let ledger = ledger.clone();
+                    let uid = user_id.to_owned();
+                    let tc = tc.clone();
+                    async move {
+                        wait_tool_result_ledger_for_tool(&ledger, &uid, &tc, ledger_wait).await
+                    }
+                })
+                .collect();
+        for tail in futures_util::stream::iter(futs)
+            .buffer_unordered(tool_calls.len())
+            .collect::<Vec<_>>()
+            .await
+        {
+            extend_delivery(&mut out, tail);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+async fn deliver_approval_block_concurrent(
+    ledger: &Arc<tokio::sync::Mutex<HashMap<String, Value>>>,
+    user_id: &str,
+    tool_calls: &[Value],
+    ledger_wait: Duration,
+) -> EdgeToolRoundDelivery {
+    let mut out = EdgeToolRoundDelivery::default();
+    let mut approved_calls = Vec::new();
+
+    for tc in tool_calls {
+        match wait_approval_ledger_for_tool(ledger, user_id, tc, ledger_wait, None).await {
+            Ok(()) => approved_calls.push(tc),
+            Err(part) => extend_delivery(&mut out, part),
+        }
+    }
+
+    for tc in &approved_calls {
+        out.sse_maps.extend(sse_maps_through_tool_request(tc));
+    }
+    if !approved_calls.is_empty() {
+        let futs: Vec<_> =
+            approved_calls
+                .iter()
+                .map(|tc| {
+                    let ledger = ledger.clone();
+                    let uid = user_id.to_owned();
+                    let tc = (*tc).clone();
+                    async move {
+                        wait_tool_result_ledger_for_tool(&ledger, &uid, &tc, ledger_wait).await
+                    }
+                })
+                .collect();
+        for tail in futures_util::stream::iter(futs)
+            .buffer_unordered(approved_calls.len())
+            .collect::<Vec<_>>()
+            .await
+        {
+            extend_delivery(&mut out, tail);
+        }
+    }
+
+    out
+}
+
 pub async fn deliver_tool_calls_through_edge_ledger(
     ledger: &Arc<tokio::sync::Mutex<HashMap<String, Value>>>,
     user_id: &str,
@@ -653,45 +872,26 @@ pub async fn deliver_tool_calls_through_edge_ledger(
 ) -> EdgeToolRoundDelivery {
     let tool_calls = crate::headless_tool_assembly::ensure_tool_call_ids(tool_calls);
     let mut out = EdgeToolRoundDelivery::default();
+    append_approval_batch_events(&mut out, &collect_approval_batches(&tool_calls));
 
-    for tc in tool_calls.iter() {
-        let Some(tc_map) = tc.as_object() else {
-            continue;
-        };
-        let id = tc_map.get("id").and_then(Value::as_str).unwrap_or("");
-        let tool_name = tc_map
-            .get("function")
-            .and_then(|f| f.get("name"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
-
-        if cloud_tool_requires_approval(tc) {
-            let path = tool_path_hint(tc);
-            let detail = tool_approval_detail(tc);
-            let approval_kind = tool_approval_kind(tc);
-            out.sse_maps.push(build_approval_required_event(
-                id,
-                tool_name,
-                approval_kind,
-                path.as_deref(),
-                detail.as_deref(),
-            ));
-            match wait_approval_ledger_for_tool(ledger, user_id, tc, ledger_wait, None).await {
-                Ok(()) => {}
-                Err(part) => {
-                    out.sse_maps.extend(part.sse_maps);
-                    out.tool_messages.extend(part.tool_messages);
-                    out.persist_tool_results.extend(part.persist_tool_results);
-                    continue;
-                }
-            }
+    let mut block_start = 0;
+    while block_start < tool_calls.len() {
+        let approval_required = cloud_tool_requires_approval(&tool_calls[block_start]);
+        let mut block_end = block_start + 1;
+        while block_end < tool_calls.len()
+            && cloud_tool_requires_approval(&tool_calls[block_end]) == approval_required
+        {
+            block_end += 1;
         }
 
-        out.sse_maps.extend(sse_maps_through_tool_request(tc));
-        let tail = wait_tool_result_ledger_for_tool(ledger, user_id, tc, ledger_wait).await;
-        out.sse_maps.extend(tail.sse_maps);
-        out.tool_messages.extend(tail.tool_messages);
-        out.persist_tool_results.extend(tail.persist_tool_results);
+        let block = &tool_calls[block_start..block_end];
+        let part = if approval_required {
+            deliver_approval_block(ledger, user_id, block, ledger_wait).await
+        } else {
+            deliver_read_only_block(ledger, user_id, block, ledger_wait).await
+        };
+        extend_delivery(&mut out, part);
+        block_start = block_end;
     }
 
     out
@@ -714,75 +914,26 @@ pub async fn deliver_tool_calls_concurrent(
 ) -> EdgeToolRoundDelivery {
     let tool_calls = crate::headless_tool_assembly::ensure_tool_call_ids(tool_calls);
     let mut out = EdgeToolRoundDelivery::default();
-    let mut read_only: Vec<&Value> = Vec::new();
+    append_approval_batch_events(&mut out, &collect_approval_batches(&tool_calls));
 
-    // Phase 1: approval-required tools sequentially, collect read-only for later.
-    for tc in tool_calls.iter() {
-        let Some(tc_map) = tc.as_object() else {
-            continue;
-        };
-        if !cloud_tool_requires_approval(tc) {
-            read_only.push(tc);
-            continue;
-        }
-        let id = tc_map.get("id").and_then(Value::as_str).unwrap_or("");
-        let tool_name = tc_map
-            .get("function")
-            .and_then(|f| f.get("name"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let path = tool_path_hint(tc);
-        let detail = tool_approval_detail(tc);
-        let approval_kind = tool_approval_kind(tc);
-        out.sse_maps.push(build_approval_required_event(
-            id,
-            tool_name,
-            approval_kind,
-            path.as_deref(),
-            detail.as_deref(),
-        ));
-        match wait_approval_ledger_for_tool(ledger, user_id, tc, ledger_wait, None).await {
-            Ok(()) => {}
-            Err(part) => {
-                out.sse_maps.extend(part.sse_maps);
-                out.tool_messages.extend(part.tool_messages);
-                out.persist_tool_results.extend(part.persist_tool_results);
-                continue;
-            }
-        }
-        out.sse_maps.extend(sse_maps_through_tool_request(tc));
-        let tail = wait_tool_result_ledger_for_tool(ledger, user_id, tc, ledger_wait).await;
-        out.sse_maps.extend(tail.sse_maps);
-        out.tool_messages.extend(tail.tool_messages);
-        out.persist_tool_results.extend(tail.persist_tool_results);
-    }
-
-    // Phase 2: read-only tools — emit all SSE events, then await results concurrently.
-    for tc in &read_only {
-        out.sse_maps.extend(sse_maps_through_tool_request(tc));
-    }
-    if !read_only.is_empty() {
-        let futs: Vec<_> =
-            read_only
-                .iter()
-                .map(|tc| {
-                    let ledger = ledger.clone();
-                    let uid = user_id.to_owned();
-                    let tc = (*tc).clone();
-                    async move {
-                        wait_tool_result_ledger_for_tool(&ledger, &uid, &tc, ledger_wait).await
-                    }
-                })
-                .collect();
-        for tail in futures_util::stream::iter(futs)
-            .buffer_unordered(read_only.len())
-            .collect::<Vec<_>>()
-            .await
+    let mut block_start = 0;
+    while block_start < tool_calls.len() {
+        let approval_required = cloud_tool_requires_approval(&tool_calls[block_start]);
+        let mut block_end = block_start + 1;
+        while block_end < tool_calls.len()
+            && cloud_tool_requires_approval(&tool_calls[block_end]) == approval_required
         {
-            out.sse_maps.extend(tail.sse_maps);
-            out.tool_messages.extend(tail.tool_messages);
-            out.persist_tool_results.extend(tail.persist_tool_results);
+            block_end += 1;
         }
+
+        let block = &tool_calls[block_start..block_end];
+        let part = if approval_required {
+            deliver_approval_block_concurrent(ledger, user_id, block, ledger_wait).await
+        } else {
+            deliver_read_only_block_concurrent(ledger, user_id, block, ledger_wait).await
+        };
+        extend_delivery(&mut out, part);
+        block_start = block_end;
     }
 
     out
@@ -1021,6 +1172,81 @@ mod tests {
         assert!(ledger.lock().await.is_empty());
     }
 
+    #[tokio::test]
+    async fn multiple_write_files_emit_batched_approval_then_batched_requests() {
+        let ledger = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let uid = "u_batch";
+        let tcs = vec![write_tool("w1"), write_tool("w2")];
+        let l2 = ledger.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let mut guard = l2.lock().await;
+            guard.insert(
+                approval_callback_key(uid, "w1"),
+                json!({"kind": "approval_respond", "body": {"request_id": "w1", "decision": "allow"}}),
+            );
+            guard.insert(
+                approval_callback_key(uid, "w2"),
+                json!({"kind": "approval_respond", "body": {"request_id": "w2", "decision": "allow"}}),
+            );
+            drop(guard);
+
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let mut guard = l2.lock().await;
+            guard.insert(
+                tool_callback_key(uid, "w1"),
+                json!({"body": {"request_id": "w1", "status": "ok", "output": "wrote-1"}}),
+            );
+            guard.insert(
+                tool_callback_key(uid, "w2"),
+                json!({"body": {"request_id": "w2", "status": "ok", "output": "wrote-2"}}),
+            );
+        });
+
+        let d = deliver_tool_calls_through_edge_ledger(&ledger, uid, &tcs, Duration::from_secs(2))
+            .await;
+
+        assert!(
+            d.sse_maps
+                .iter()
+                .all(|m| m.get("type").and_then(Value::as_str) != Some("approval_required"))
+        );
+        let batch = d
+            .sse_maps
+            .iter()
+            .find(|m| m.get("type").and_then(Value::as_str) == Some("approval_batch_required"))
+            .expect("approval batch event");
+        let requests = batch["requests"].as_array().expect("requests array");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["request_id"], "w1");
+        assert_eq!(requests[1]["request_id"], "w2");
+
+        let tool_request_positions: Vec<_> = d
+            .sse_maps
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, m)| {
+                (m.get("type").and_then(Value::as_str) == Some("tool_request")).then_some(idx)
+            })
+            .collect();
+        assert_eq!(tool_request_positions.len(), 2);
+        let first_end = d
+            .sse_maps
+            .iter()
+            .position(|m| m.get("type").and_then(Value::as_str) == Some("tool_call_end"))
+            .expect("tool_call_end");
+        assert!(tool_request_positions.iter().all(|idx| *idx < first_end));
+
+        let outputs: Vec<_> = d
+            .tool_messages
+            .iter()
+            .map(|m| m["content"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(outputs.len(), 2);
+        assert!(outputs.iter().any(|output| output.contains("wrote-1")));
+        assert!(outputs.iter().any(|output| output.contains("wrote-2")));
+    }
+
     // ── deliver_tool_calls_concurrent ─────────────────────────────────────
 
     #[tokio::test]
@@ -1148,6 +1374,104 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(1),
             "took too long: {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_approval_segments_do_not_block_later_read_only_block() {
+        let ledger = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let uid = "u_segmented";
+        let tcs = vec![
+            read_tool("r1"),
+            write_tool("w1"),
+            read_tool("r2"),
+            write_tool("w2"),
+        ];
+
+        let l2 = ledger.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            l2.lock().await.insert(
+                tool_callback_key(uid, "r1"),
+                json!({"body": {"request_id": "r1", "status": "ok", "output": "read_1"}}),
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            l2.lock().await.insert(
+                approval_callback_key(uid, "w1"),
+                json!({"kind": "approval_respond", "body": {"request_id": "w1", "decision": "allow"}}),
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            l2.lock().await.insert(
+                tool_callback_key(uid, "w1"),
+                json!({"body": {"request_id": "w1", "status": "ok", "output": "wrote_1"}}),
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            l2.lock().await.insert(
+                tool_callback_key(uid, "r2"),
+                json!({"body": {"request_id": "r2", "status": "ok", "output": "read_2"}}),
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            l2.lock().await.insert(
+                approval_callback_key(uid, "w2"),
+                json!({"kind": "approval_respond", "body": {"request_id": "w2", "decision": "allow"}}),
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            l2.lock().await.insert(
+                tool_callback_key(uid, "w2"),
+                json!({"body": {"request_id": "w2", "status": "ok", "output": "wrote_2"}}),
+            );
+        });
+
+        let d = deliver_tool_calls_through_edge_ledger(&ledger, uid, &tcs, Duration::from_secs(2))
+            .await;
+
+        let batch = d
+            .sse_maps
+            .iter()
+            .find(|m| m.get("type").and_then(Value::as_str) == Some("approval_batch_required"))
+            .expect("approval batch event");
+        let requests = batch["requests"].as_array().expect("requests array");
+        assert_eq!(requests.len(), 2);
+
+        let request_ids: Vec<_> = d
+            .sse_maps
+            .iter()
+            .filter(|m| m.get("type").and_then(Value::as_str) == Some("tool_request"))
+            .filter_map(|m| m.get("request_id").and_then(Value::as_str))
+            .collect();
+        assert_eq!(request_ids, vec!["r1", "w1", "r2", "w2"]);
+
+        let w1_end = d
+            .sse_maps
+            .iter()
+            .position(|m| {
+                m.get("type").and_then(Value::as_str) == Some("tool_call_end")
+                    && m.get("call_id").and_then(Value::as_str) == Some("w1")
+            })
+            .expect("w1 tool_call_end");
+        let r2_request = d
+            .sse_maps
+            .iter()
+            .position(|m| {
+                m.get("type").and_then(Value::as_str) == Some("tool_request")
+                    && m.get("request_id").and_then(Value::as_str) == Some("r2")
+            })
+            .expect("r2 tool_request");
+        let w2_request = d
+            .sse_maps
+            .iter()
+            .position(|m| {
+                m.get("type").and_then(Value::as_str) == Some("tool_request")
+                    && m.get("request_id").and_then(Value::as_str) == Some("w2")
+            })
+            .expect("w2 tool_request");
+        assert!(
+            r2_request > w1_end,
+            "r2 should wait for the earlier write block"
+        );
+        assert!(
+            r2_request < w2_request,
+            "r2 should not wait for the later write approval block"
         );
     }
 

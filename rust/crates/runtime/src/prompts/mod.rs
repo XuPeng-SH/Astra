@@ -24,10 +24,13 @@ pub use skills::{
     builtin_markdown_skill, builtin_system_skills,
 };
 pub use system::{
-    CacheScope, LOW_CONFIDENCE_THRESHOLD, PromptSection, STALL_NUDGE, SYSTEM_PROMPT_BASE,
+    CacheScope, LOW_CONFIDENCE_THRESHOLD, PromptSection, PromptTokenBucket,
+    ROUND_BUDGET_HARD_LIMIT, ROUND_BUDGET_THRESHOLD, STALL_NUDGE, SYSTEM_PROMPT_BASE,
     build_main_system_prompt, build_main_system_prompt_with_style, build_system_prompt_sections,
     build_system_prompt_sections_with_style, build_system_prompt_trace, detect_task_type,
-    sections_to_string, self_awareness_prompt_section,
+    parallel_execution_feedback, round_budget_directive, round_budget_directive_with,
+    sections_to_string, self_awareness_prompt_section, synthesize_or_batch_directive,
+    tool_round_guidance, tool_round_guidance_trace_with, tool_round_guidance_with,
 };
 
 #[cfg(test)]
@@ -135,7 +138,7 @@ mod tests {
 
     #[test]
     fn memory_rules_include_negative_examples() {
-        let p = build_main_system_prompt(&["memory_store"], "", 1.0, None);
+        let p = build_main_system_prompt(&["memory_store", "memory_search"], "", 1.0, None);
         assert!(
             p.contains("SKIP:"),
             "should have negative guidance (SKIP list)"
@@ -202,22 +205,26 @@ mod tests {
         );
     }
 
-    /// Tool selection guidance: prefer specific tools over bash.
+    /// Tool selection guidance: prefer specific tools for single ops, bash for compound.
     #[test]
-    fn git_tools_get_bash_avoidance_rule() {
+    fn git_tools_get_compound_bash_guidance() {
         let p = build_main_system_prompt(&["git_diff", "git_log", "bash"], "", 1.0, None);
         assert!(
-            p.contains("NOT bash"),
-            "should guide away from bash for git queries"
+            p.contains("SINGLE operations"),
+            "should guide git tools for single operations"
+        );
+        assert!(
+            p.contains("COMPOUND git operations"),
+            "should guide bash for compound git operations"
         );
     }
 
     #[test]
-    fn no_git_tools_omits_bash_avoidance() {
+    fn no_git_tools_omits_git_guidance() {
         let p = build_main_system_prompt(&["bash", "read_file"], "", 1.0, None);
         assert!(
-            !p.contains("NOT bash"),
-            "should NOT include bash avoidance when no git tools selected"
+            !p.contains("COMPOUND git operations"),
+            "should NOT include git guidance when no git tools selected"
         );
     }
 
@@ -242,8 +249,8 @@ mod tests {
         // Token Efficiency, Build/Test Guidance, Plan Execution, Search Strategy (with Simple vs Complex).
         // Headroom: ~200 chars above measured size. Bump when adding new rules.
         assert!(
-            p.len() < 11700,
-            "compressed prompt should be under 11700 chars, got {}",
+            p.len() < 12500,
+            "compressed prompt should be under 12500 chars, got {}",
             p.len()
         );
     }
@@ -943,8 +950,8 @@ mod tests {
         // and Parallel Tool Calls Limit/Anti-pattern, Search Strategy Simple vs Complex).
         // Headroom: ~200 chars above measured size. Bump when adding new rules.
         assert!(
-            p.len() < 17100,
-            "full toolset prompt should be under 17100 chars, got {}",
+            p.len() < 18200,
+            "full toolset prompt should be under 18200 chars, got {}",
             p.len()
         );
     }

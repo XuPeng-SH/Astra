@@ -93,7 +93,7 @@ pub(crate) async fn stream_chat_sse(
     let show_early_hint = !p.render_policy.suppress_text()
         && std::io::IsTerminal::is_terminal(&std::io::stderr())
         && p.plan_assemble_line_release.is_none();
-    let early_spinner: Option<crate::effects::Spinner> = if show_early_hint {
+    let mut early_spinner: Option<crate::effects::Spinner> = if show_early_hint {
         Some(crate::effects::Spinner::start_immediate(
             "Preparing…".to_string(),
         ))
@@ -191,6 +191,60 @@ pub(crate) async fn stream_chat_sse(
         }
     }
     let mut messages = openai_messages_from_repl_history(p.history, p.message);
+
+    // ─── Context pre-fetch ───────────────────────────────────────────────
+    // For well-known task patterns (code review, etc.), pre-fetch relevant
+    // context locally so the LLM can respond in fewer rounds.
+    let mut prefetch_injected = false;
+    let mut prefetch_task_type: Option<String> = None;
+    let mut prefetch_body_bytes: Option<usize> = None;
+    if !p.plan_only_chat && !p.is_plan_subtask {
+        // Detect task type first (cheap, synchronous) before touching the spinner.
+        if let Some(task_type) = astra_runtime::prompts::detect_task_type(p.message) {
+            // Stop the generic "Preparing…" spinner and show a task-specific one.
+            if let Some(s) = early_spinner.take() {
+                s.stop_clear();
+            }
+            let fetch_spinner = if show_early_hint {
+                Some(crate::effects::Spinner::start_immediate(format!(
+                    "Fetching {task_type} context…"
+                )))
+            } else {
+                None
+            };
+            if let Some(ctx) =
+                crate::context_prefetch::prefetch_context_for_message(p.message, &project_root)
+                    .await
+            {
+                prefetch_task_type = Some(ctx.task_type.to_string());
+                prefetch_body_bytes = Some(ctx.body.len());
+                astra_core::agent_info!(
+                    "prefetch",
+                    "injected task_type={} body_bytes={}",
+                    ctx.task_type,
+                    ctx.body.len()
+                );
+                if let Some(s) = fetch_spinner {
+                    s.stop_clear();
+                }
+                if show_early_hint {
+                    let size_str = if ctx.body.len() >= 1024 {
+                        format!("{:.1}KB", ctx.body.len() as f64 / 1024.0)
+                    } else {
+                        format!("{}B", ctx.body.len())
+                    };
+                    eprintln!("  {} context ready ({})", crate::theme::icon_ok(), size_str);
+                }
+                crate::context_prefetch::inject_prefetched_context(&mut messages, &ctx);
+                prefetch_injected = true;
+            } else {
+                if let Some(s) = fetch_spinner {
+                    s.stop_clear();
+                }
+            }
+        }
+    }
+
     let all_schemas = if p.plan_only_chat {
         messages.insert(
             0,
@@ -453,6 +507,7 @@ pub(crate) async fn stream_chat_sse(
         has_any_usage: false,
         max_turns,
         remaining_turns: max_turns,
+        current_round_index: 0,
         turn_guard,
         restricted_tools: initial_restricted,
         step_recorder,
@@ -585,9 +640,20 @@ pub(crate) async fn stream_chat_sse(
         approval_overrides: initial_approval_overrides,
         confidence_trend: Default::default(),
         last_confidence_diagnosis: None,
+        // turn_index is 0-based (pre-increment); turn events are written
+        // after state.turn += 1, so add 1 here to keep llm_round.turn
+        // consistent with the turn event's turn number.
+        session_turn: p.turn_index + 1,
+        prefetch_injected,
+        turn_event_buffer: None,
     };
 
     // ─── Run the runtime loop ────────────────────────────────────────────
+    // When prefetch injected live data, suppress the "no tool call on live query"
+    // corrective retry — the LLM already has the data it needs.
+    if prefetch_injected {
+        state.stall.forced_factual_retry = true;
+    }
     // Stop the early spinner — the per-turn prep spinner inside execute_turn takes over.
     if let Some(s) = early_spinner {
         s.stop_clear();
@@ -642,7 +708,7 @@ pub(crate) async fn stream_chat_sse(
         current_session_id: state.current_session_id.as_deref(),
     });
 
-    Ok(build_stream_result(StreamResultBuild {
+    let result = build_stream_result(StreamResultBuild {
         tool_health_entries: p.tool_health_entries,
         session_id: state.current_session_id,
         run_id: state.current_run_id,
@@ -673,9 +739,18 @@ pub(crate) async fn stream_chat_sse(
         routing_domain_hint: None,
         entity_learn_skipped_no_domain: false,
         pending_context_assembly_trace: state.telemetry.pending_context_assembly_trace,
-    }))
+        turn_observability_events: state
+            .turn_event_buffer
+            .as_mut()
+            .map(|b| b.drain())
+            .unwrap_or_default(),
+        llm_rounds: state.turn_event_buffer.as_ref().map(|b| b.current_round()),
+        prefetch_injected: state.prefetch_injected,
+        prefetch_task_type,
+        prefetch_body_bytes,
+    });
+    Ok(result)
 }
-
 #[cfg(test)]
 mod tests {
     use super::detect_turn_hook_sets;

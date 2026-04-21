@@ -719,6 +719,46 @@ pub fn parse_plan_response(response: &str) -> Result<TaskPlan, String> {
                 "'subtasks' must be an array. Expected format: {\"subtasks\": [...]}".to_string(),
             );
         }
+        // Coerce string-array subtasks → minimal objects so models that return
+        // ["do A", "do B"] instead of [{...}, {...}] still produce a usable plan.
+        if let Some(arr) = obj.get("subtasks").and_then(|v| v.as_array())
+            && arr.iter().any(|v| v.is_string())
+        {
+            let coerced: Vec<serde_json::Value> = arr
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    if let Some(s) = v.as_str() {
+                        let id = format!("subtask-{}", i + 1);
+                        serde_json::json!({
+                            "id": id,
+                            "title": s,
+                            "description": s,
+                            "depends_on": [],
+                            "effort": "small",
+                            "files": [],
+                            "acceptance_checks": []
+                        })
+                    } else {
+                        v.clone()
+                    }
+                })
+                .collect();
+            let coerced_obj = serde_json::json!({ "subtasks": coerced });
+            let coerced_str = coerced_obj.to_string();
+            let parsed: PlanResponse = serde_json::from_str(&coerced_str)
+                .map_err(|e| format!("Invalid plan JSON after coercion: {e}"))?;
+            let subtasks = parsed
+                .subtasks
+                .into_iter()
+                .enumerate()
+                .map(|(i, st)| normalize_subtask(i, st))
+                .collect();
+            return Ok(TaskPlan {
+                subtasks,
+                notes: None,
+            });
+        }
     } else if parsed_value.is_array() {
         // This might be a clarification question array - caller should handle this
         return Err(
@@ -746,16 +786,8 @@ pub fn parse_plan_response(response: &str) -> Result<TaskPlan, String> {
     let subtasks = parsed
         .subtasks
         .into_iter()
-        .map(|st| SubtaskPlan {
-            id: st.id,
-            title: st.title,
-            description: st.description,
-            depends_on: st.depends_on.unwrap_or_default(),
-            status: TaskStatus::Pending,
-            effort: st.effort,
-            files: st.files.unwrap_or_default(),
-            acceptance_checks: parse_acceptance_checks(st.acceptance_checks),
-        })
+        .enumerate()
+        .map(|(i, st)| normalize_subtask(i, st))
         .collect();
 
     Ok(TaskPlan {
@@ -772,8 +804,10 @@ struct PlanResponse {
 
 #[derive(Deserialize)]
 struct SubtaskResponse {
-    id: String,
-    title: String,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
     description: Option<String>,
     depends_on: Option<Vec<String>>,
     effort: Option<String>,
@@ -784,6 +818,21 @@ struct SubtaskResponse {
 
 /// Try-parse each raw JSON value into a `VerifierKind`, skipping entries that
 /// fail (unknown/hallucinated kind) and filtering out shell-execution variants
+/// Convert a raw `SubtaskResponse` (from LLM JSON) into a `SubtaskPlan`, filling in
+/// fallback `id` / `title` when the model omitted or nulled them.
+fn normalize_subtask(i: usize, st: SubtaskResponse) -> SubtaskPlan {
+    SubtaskPlan {
+        id: st.id.unwrap_or_else(|| format!("subtask-{}", i + 1)),
+        title: st.title.unwrap_or_else(|| format!("Subtask {}", i + 1)),
+        description: st.description,
+        depends_on: st.depends_on.unwrap_or_default(),
+        status: TaskStatus::Pending,
+        effort: st.effort,
+        files: st.files.unwrap_or_default(),
+        acceptance_checks: parse_acceptance_checks(st.acceptance_checks),
+    }
+}
+
 /// (`Command`, `CommandOutput`) that could be an RCE vector from LLM output.
 fn parse_acceptance_checks(
     raw: Vec<serde_json::Value>,
@@ -934,8 +983,9 @@ fn strip_thinking_tags(text: &str) -> String {
                     result = format!("{}{}", &result[..start], &result[end_pos..]);
                     continue;
                 }
-                // Unclosed tag — strip from open tag to end
-                result = result[..start].to_string();
+                // Unclosed tag — keep content after the open tag; the JSON
+                // may be embedded inside the thinking block itself.
+                result = result[start + open.len()..].to_string();
             }
             break;
         }
@@ -2057,16 +2107,47 @@ fn truncate_str(s: &str, max_len: usize) -> String {
 
 // ─── Clarification Questions ─────────────────────────────────────────────────
 
+/// Deserialize an optional usize that models sometimes emit as a JSON string (e.g. `"0"`).
+fn deserialize_optional_usize<'de, D>(de: D) -> Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    match serde_json::Value::deserialize(de)? {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::Number(n) => Ok(n.as_u64().map(|v| v as usize)),
+        serde_json::Value::String(s) => Ok(s.trim().parse::<usize>().ok()),
+        _ => Ok(None),
+    }
+}
+
+/// Deserialize a required usize that models sometimes emit as a string or omit entirely.
+/// Defaults to 1 on missing, non-numeric string, or unexpected type.
+pub(crate) fn deserialize_coerced_usize<'de, D>(de: D) -> Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    Ok(match serde_json::Value::deserialize(de)? {
+        serde_json::Value::Number(n) => n.as_u64().unwrap_or(1) as usize,
+        serde_json::Value::String(s) => s.trim().parse::<usize>().unwrap_or(1),
+        _ => 1,
+    })
+}
+
 /// A clarification question with multiple choice options.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClarificationQuestion {
     /// The question text
     pub question: String,
     /// Available options (1-indexed for user)
+    #[serde(default)]
     pub options: Vec<String>,
-    /// Optional default option (0-indexed)
+    /// Optional default option (0-indexed); models sometimes emit a string — coerced on parse.
+    #[serde(default, deserialize_with = "deserialize_optional_usize")]
     pub default: Option<usize>,
     /// Category of clarification (scope, approach, behavior, etc.)
+    #[serde(default)]
     pub category: ClarificationCategory,
 }
 
@@ -2085,6 +2166,9 @@ pub enum ClarificationCategory {
     Technical,
     /// Confirmation: yes/no confirmation
     Confirmation,
+    /// Catch-all for any other category string the LLM may emit.
+    #[serde(other)]
+    Other,
 }
 
 /// Format a clarification question for CLI display.
@@ -2098,6 +2182,7 @@ pub fn format_clarification_question(q: &ClarificationQuestion) -> String {
         ClarificationCategory::Behavior => "⚙️ ",
         ClarificationCategory::Technical => "🔧",
         ClarificationCategory::Confirmation => "❓",
+        ClarificationCategory::Other => "💬",
     };
 
     out.push_str(&format!("  {} {}\n", icon, q.question));
@@ -2664,7 +2749,9 @@ pub fn format_subtask_prompt(subtask: &SubtaskPlan) -> String {
 
     prompt.push_str(
         "\nPlease implement this change. Read the relevant files first, \
-         make the changes, and verify they compile/pass tests.",
+         make the changes, and verify they compile/pass tests.\n\
+         Before referencing any project type, function, struct, or API in new code, \
+         confirm it exists using read_file, grep, or LSP tools. Do not assume symbol names.",
     );
 
     prompt
@@ -4557,8 +4644,43 @@ Done!"#;
         assert!(result.is_err());
         assert!(
             result.unwrap_err().contains("array"),
-            "should mention it's an array"
+            "clarification array should mention 'array' in error"
         );
+    }
+
+    #[test]
+    fn parse_plan_response_string_array_subtasks_coerced() {
+        // Model returns subtasks as string array instead of object array.
+        let result =
+            parse_plan_response(r#"{"subtasks": ["Add CSS styles", "Add JS interactions"]}"#);
+        assert!(
+            result.is_ok(),
+            "string-array subtasks should be coerced, not rejected"
+        );
+        let plan = result.unwrap();
+        assert_eq!(plan.subtasks.len(), 2);
+        assert_eq!(plan.subtasks[0].title, "Add CSS styles");
+        assert_eq!(plan.subtasks[0].id, "subtask-1");
+        assert_eq!(plan.subtasks[1].title, "Add JS interactions");
+        assert_eq!(plan.subtasks[1].id, "subtask-2");
+    }
+
+    #[test]
+    fn parse_plan_response_mixed_array_subtasks_coerced() {
+        // Mixed: some strings, some objects — strings get coerced.
+        let result = parse_plan_response(
+            r#"{
+            "subtasks": [
+                "Add CSS styles",
+                {"id": "js-step", "title": "Add JS", "depends_on": [], "acceptance_checks": []}
+            ]
+        }"#,
+        );
+        assert!(result.is_ok(), "mixed array should be coerced");
+        let plan = result.unwrap();
+        assert_eq!(plan.subtasks.len(), 2);
+        assert_eq!(plan.subtasks[0].id, "subtask-1");
+        assert_eq!(plan.subtasks[1].id, "js-step");
     }
 
     #[test]
@@ -7228,7 +7350,15 @@ Done!"#;
     #[test]
     fn strip_thinking_tags_handles_unclosed() {
         let input = "before<think>reasoning without close";
-        assert_eq!(strip_thinking_tags(input), "before");
+        assert_eq!(strip_thinking_tags(input), "reasoning without close");
+    }
+
+    #[test]
+    fn strip_thinking_tags_unclosed_with_json() {
+        // Model outputs <think>...JSON... without </think> — JSON must survive
+        let input = "<think>some reasoning\n{\"phases\": []}";
+        let result = strip_thinking_tags(input);
+        assert!(result.contains("{\"phases\": []}"), "got: {result}");
     }
 
     #[test]

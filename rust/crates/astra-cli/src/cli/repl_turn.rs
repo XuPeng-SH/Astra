@@ -272,7 +272,7 @@ pub(super) async fn handle_chat_input(
     if state.session_id.is_none()
         && let Some(session_id) = state.pending_recovery.clone()
     {
-        if is_short_continuation_prompt(&line) {
+        if is_low_information_followup(&line) {
             if let Err(e) =
                 slash_session::restore_session_into_state(&session_id, ctx.profile, ctx.api, state)
                     .await
@@ -485,7 +485,7 @@ pub(super) fn build_effective_line(line: &str, state: &ReplState) -> String {
     if let Some(anchor) = state
         .continuation_anchor
         .as_deref()
-        .filter(|_| is_short_continuation_prompt(line))
+        .filter(|_| is_low_information_followup(line))
     {
         let goal_line = state
             .session_goal
@@ -493,7 +493,11 @@ pub(super) fn build_effective_line(line: &str, state: &ReplState) -> String {
             .map(|g| format!("Session goal: {g}\n"))
             .unwrap_or_default();
         effective_line = format!(
-            "[Continuation anchor]\nResume the active task/thread below unless the user explicitly changes topic.\n{goal_line}{anchor}\n\n[User follow-up]\n{effective_line}"
+            "[Active task attachment]\n\
+Resume the active task/thread below unless the user explicitly changes topic.\n\
+Treat brief follow-ups as actions on this active thread, not as brand-new unrelated tasks.\n\
+If the follow-up asks to fix / patch / test / continue, apply that action to this active thread.\n\
+{goal_line}{anchor}\n\n[User follow-up]\n{effective_line}"
         );
     }
 
@@ -533,6 +537,186 @@ pub(super) fn is_short_continuation_prompt(line: &str) -> bool {
     )
 }
 
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (idx, ch) in text.chars().enumerate() {
+        if idx >= max_chars {
+            out.push('…');
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn contains_any_token(haystack: &str, tokens: &[&str]) -> bool {
+    tokens.iter().any(|token| haystack.contains(token))
+}
+
+fn is_low_information_followup(line: &str) -> bool {
+    if is_short_continuation_prompt(line) {
+        return true;
+    }
+
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > 32 {
+        return false;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    let has_action = contains_any_token(
+        &lower,
+        &[
+            "fix",
+            "patch",
+            "repair",
+            "implement",
+            "apply",
+            "edit",
+            "update",
+            "test",
+            "verify",
+            "run",
+            "commit",
+            "push",
+            "continue",
+            "resume",
+            "retry",
+        ],
+    ) || contains_any_token(
+        trimmed,
+        &[
+            "修复",
+            "修一下",
+            "改一下",
+            "改下",
+            "处理一下",
+            "处理下",
+            "优化一下",
+            "优化下",
+            "测一下",
+            "测试一下",
+            "验证一下",
+            "提交一下",
+            "推一下",
+            "继续",
+            "重试",
+        ],
+    );
+    if !has_action {
+        return false;
+    }
+
+    let has_deictic_reference =
+        contains_any_token(&lower, &["this", "it", "that", "them", "here", "there"])
+            || contains_any_token(trimmed, &["这", "这个", "这里", "它", "这些", "那个"]);
+    let has_question_shape =
+        trimmed.ends_with('?') || trimmed.ends_with('？') || trimmed.ends_with('吗');
+    let token_count = trimmed
+        .split(|c: char| c.is_whitespace() || c == ',' || c == '，')
+        .filter(|part| !part.is_empty())
+        .count();
+    let short_ascii_action =
+        (trimmed.is_ascii() || trimmed.contains(char::is_whitespace)) && token_count <= 3;
+
+    has_deictic_reference || has_question_shape || short_ascii_action
+}
+
+fn summarize_assistant_for_anchor(full_text: &str) -> Option<String> {
+    let mut lines = Vec::new();
+    let mut total_chars = 0usize;
+
+    for line in full_text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        if lines.len() >= 3 || total_chars >= 420 {
+            break;
+        }
+        let clipped = truncate_chars(line, 160);
+        total_chars += clipped.chars().count();
+        lines.push(clipped);
+    }
+
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
+}
+
+fn summarize_anchor_artifacts(result: &StreamResult) -> Vec<String> {
+    let mut lines = Vec::new();
+    if !result.tools_used.is_empty() {
+        lines.push(format!(
+            "Recent tools: {}",
+            result
+                .tools_used
+                .iter()
+                .take(5)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
+    for call in result.tool_call_records.iter().take(3) {
+        if let Some(preview) = call
+            .args_preview
+            .as_deref()
+            .filter(|preview| !preview.trim().is_empty())
+        {
+            lines.push(format!(
+                "Artifact: {} → {}",
+                call.name,
+                truncate_chars(preview.trim(), 120)
+            ));
+        }
+    }
+
+    lines
+}
+
+fn summarize_event_anchor_artifacts(event: Option<&session_journal::JournalEvent>) -> Vec<String> {
+    let Some(event) = event else {
+        return Vec::new();
+    };
+
+    let mut lines = Vec::new();
+    if let Some(tools_used) = event.tools_used.as_ref()
+        && !tools_used.is_empty()
+    {
+        lines.push(format!(
+            "Recent tools: {}",
+            tools_used
+                .iter()
+                .take(5)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
+    if let Some(tool_calls) = event.tool_calls.as_ref() {
+        for call in tool_calls.iter().take(3) {
+            if let Some(preview) = call
+                .args_preview
+                .as_deref()
+                .filter(|preview| !preview.trim().is_empty())
+            {
+                lines.push(format!(
+                    "Artifact: {} → {}",
+                    call.name,
+                    truncate_chars(preview.trim(), 120)
+                ));
+            }
+        }
+    }
+
+    lines
+}
+
 fn build_continuation_anchor(
     state: &ReplState,
     line: &str,
@@ -543,23 +727,48 @@ fn build_continuation_anchor(
         return state.continuation_anchor.clone();
     }
 
-    let assistant_summary = result
-        .full_text
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .map(str::trim)
-        .unwrap_or_default();
+    let user_summary = truncate_chars(user_line, 220);
+    let mut sections = vec![format!("Latest user task: {user_summary}")];
 
-    let assistant_summary: String = assistant_summary.chars().take(220).collect();
-    let user_summary: String = user_line.chars().take(220).collect();
-
-    if assistant_summary.is_empty() {
-        return Some(format!("Latest user task: {user_summary}"));
+    if let Some(assistant_summary) = summarize_assistant_for_anchor(&result.full_text) {
+        sections.push(format!("Latest assistant summary:\n{assistant_summary}"));
     }
 
-    Some(format!(
-        "Latest user task: {user_summary}\nLatest assistant direction: {assistant_summary}"
-    ))
+    let artifact_lines = summarize_anchor_artifacts(result);
+    if !artifact_lines.is_empty() {
+        sections.extend(artifact_lines);
+    }
+
+    if sections.is_empty() {
+        None
+    } else {
+        Some(sections.join("\n"))
+    }
+}
+
+pub(super) fn rebuild_continuation_anchor_from_state(state: &mut ReplState) {
+    state.last_response = state.history.last().map(|(_, assistant)| assistant.clone());
+
+    let Some((user_line, assistant_text)) = state.history.last() else {
+        state.continuation_anchor = None;
+        return;
+    };
+    if user_line.trim().is_empty() {
+        state.continuation_anchor = None;
+        return;
+    }
+
+    let user_summary = truncate_chars(user_line, 220);
+    let mut sections = vec![format!("Latest user task: {user_summary}")];
+
+    if let Some(assistant_summary) = summarize_assistant_for_anchor(assistant_text) {
+        sections.push(format!("Latest assistant summary:\n{assistant_summary}"));
+    }
+
+    sections.extend(summarize_event_anchor_artifacts(
+        state.last_turn_event.as_ref(),
+    ));
+    state.continuation_anchor = Some(sections.join("\n"));
 }
 
 async fn maybe_auto_compact(
@@ -926,7 +1135,14 @@ fn commit_turn_journal_workspace_and_sidecars(
     turn_start: Instant,
 ) {
     if let Some(journal) = state.journal.as_ref() {
-        let turn_event = session_journal::JournalEvent::turn(
+        // Flush turn observability events (llm_round, tool timing) before the turn summary.
+        if !result.turn_observability_events.is_empty() {
+            if let Err(e) = journal.append_bulk(&result.turn_observability_events) {
+                astra_core::agent_warn!("journal", "failed to write observability events: {e}");
+            }
+        }
+
+        let mut turn_event = session_journal::JournalEvent::turn(
             state.session_id.as_deref(),
             state.turn,
             state.model.as_deref(),
@@ -959,6 +1175,19 @@ fn commit_turn_journal_workspace_and_sidecars(
         .with_memoria_time(result.memoria_ms)
         .with_cache_tokens(result.cache_read_tokens, result.cache_creation_tokens);
 
+        // Add turn observability summary.
+        turn_event.llm_rounds = result.llm_rounds;
+        let tool_ms: u64 = result
+            .tool_call_records
+            .iter()
+            .filter(|r| !r.is_synthetic_placeholder())
+            .map(|r| r.ms)
+            .sum();
+        turn_event.total_tool_ms = Some(tool_ms);
+        if let Some(dur) = turn_event.duration_ms {
+            turn_event.total_llm_ms = Some(dur.saturating_sub(tool_ms));
+        }
+
         // Store for /turn command
         state.last_turn_event = Some(turn_event.clone());
 
@@ -969,12 +1198,26 @@ fn commit_turn_journal_workspace_and_sidecars(
 
         // Emit deferred context_assembly_recorded — only on successful turn commit.
         if let Some((_internal_turn, trace_json)) = &result.pending_context_assembly_trace {
+            let mut trace = trace_json.clone();
+            // Annotate with prefetch info so token audits can account for it.
+            if result.prefetch_injected {
+                if let Some(obj) = trace.as_object_mut() {
+                    let mut pf = serde_json::json!({ "injected": true });
+                    if let Some(tt) = &result.prefetch_task_type {
+                        pf["task_type"] = serde_json::json!(tt);
+                    }
+                    if let Some(bb) = result.prefetch_body_bytes {
+                        pf["body_bytes"] = serde_json::json!(bb);
+                    }
+                    obj.insert("prefetch".into(), pf);
+                }
+            }
             // Use the REPL's user-visible turn number, not the internal agentic
             // loop counter that was stored in the trace.
             let assembly_event = session_journal::JournalEvent::context_assembly_recorded(
                 state.session_id.as_deref(),
                 state.turn,
-                trace_json.clone(),
+                trace,
             );
             if let Err(e) = journal.append(&assembly_event) {
                 astra_core::agent_warn!(
@@ -1280,6 +1523,7 @@ pub(super) fn analyze_repl_turn_learning(
         result.stall_events.len(),
         has_verdict_warning,
         result.budget_pressure,
+        result.prefetch_injected,
     );
 
     ReplTurnLearningSnapshot { routing, eval }
@@ -1414,7 +1658,9 @@ fn apply_turn_success(
         );
     }
 
-    if result.tool_calls_count == 0 && looks_like_live_query_with_context(line, &state.recent_tools)
+    if result.tool_calls_count == 0
+        && !result.prefetch_injected
+        && looks_like_live_query_with_context(line, &state.recent_tools)
     {
         eprintln!(
             "{}",
@@ -1500,6 +1746,11 @@ fn print_turn_status_line(state: &ReplState, result: &StreamResult, turn_start: 
             / (result.prompt_tokens + result.cache_read_tokens).max(1) as f64
             * 100.0;
         parts.push(format!("cache:{cache_pct:.0}%"));
+    }
+
+    // Prefetch indicator
+    if let Some(ref task_type) = result.prefetch_task_type {
+        parts.push(format!("prefetch:{task_type}"));
     }
 
     let line = format!("  ─ {} ─", parts.join(" │ "));
@@ -1660,10 +1911,29 @@ fn initialize_journal(state: &mut ReplState, session_id: &str) {
     }
 
     let needs_start_event = match session_journal::read_journal(session_id) {
-        Ok(events) => matches!(
-            events.last().map(|event| &event.event_type),
-            None | Some(session_journal::JournalEventType::SessionEnd)
-        ),
+        Ok(events) => {
+            // Write session_start if: journal is empty, last event is session_end
+            // (clean restart), or we're resuming an interrupted session (no open
+            // session_start). Use rposition to find the LAST start/end pair.
+            let last_type = events.last().map(|e| &e.event_type);
+            match last_type {
+                None | Some(session_journal::JournalEventType::SessionEnd) => true,
+                _ => {
+                    let last_start = events.iter().rposition(|e| {
+                        e.event_type == session_journal::JournalEventType::SessionStart
+                    });
+                    let last_end = events.iter().rposition(|e| {
+                        e.event_type == session_journal::JournalEventType::SessionEnd
+                    });
+                    let has_unmatched_start = match (last_start, last_end) {
+                        (Some(s), Some(e)) => s > e,
+                        (Some(_), None) => true,
+                        _ => false,
+                    };
+                    !has_unmatched_start
+                }
+            }
+        }
         Err(_) => true,
     };
 
@@ -2956,9 +3226,37 @@ mod tests {
         };
 
         let effective = build_effective_line("继续", &state);
-        assert!(effective.contains("[Continuation anchor]"));
+        assert!(effective.contains("[Active task attachment]"));
         assert!(effective.contains("debug Chinese input drops"));
         assert!(effective.contains("[User follow-up]\n继续"));
+    }
+
+    #[test]
+    fn low_information_followup_detects_repair_prompts() {
+        assert!(is_low_information_followup("修复?"));
+        assert!(is_low_information_followup("fix this"));
+        assert!(is_low_information_followup("test it"));
+        assert!(!is_low_information_followup("修一下输入法问题"));
+        assert!(!is_low_information_followup(
+            "implement request batching in runtime selector"
+        ));
+    }
+
+    #[test]
+    fn build_effective_line_injects_attachment_for_low_information_repair_followup() {
+        let state = ReplState {
+            continuation_anchor: Some(
+                "Latest user task: review commit aa1f419b\nLatest assistant summary:\n## Review\nP5 still blocks large merges"
+                    .to_string(),
+            ),
+            ..ReplState::default()
+        };
+
+        let effective = build_effective_line("修复?", &state);
+        assert!(effective.contains("[Active task attachment]"));
+        assert!(effective.contains("review commit aa1f419b"));
+        assert!(effective.contains("fix / patch / test / continue"));
+        assert!(effective.contains("[User follow-up]\n修复?"));
     }
 
     #[test]
@@ -2969,7 +3267,7 @@ mod tests {
         };
 
         let effective = build_effective_line("修一下输入法问题", &state);
-        assert!(!effective.contains("[Continuation anchor]"));
+        assert!(!effective.contains("[Active task attachment]"));
         assert_eq!(effective, "修一下输入法问题");
     }
 
@@ -2986,7 +3284,7 @@ mod tests {
 
         let effective = build_effective_line("ok", &state);
         assert!(
-            effective.contains("[Continuation anchor]"),
+            effective.contains("[Active task attachment]"),
             "anchor injected"
         );
         assert!(
@@ -3005,7 +3303,7 @@ mod tests {
             ..ReplState::default()
         };
         let effective_no_goal = build_effective_line("sure", &state_no_goal);
-        assert!(effective_no_goal.contains("[Continuation anchor]"));
+        assert!(effective_no_goal.contains("[Active task attachment]"));
         assert!(!effective_no_goal.contains("Session goal:"));
     }
 
@@ -3151,7 +3449,7 @@ mod tests {
         let effective = build_effective_line("continue", &state);
         assert!(effective.contains("[SKILL DEV: combo]"), "skill dev prefix");
         assert!(effective.contains("Concise"), "system skill");
-        assert!(effective.contains("[Continuation anchor]"), "anchor");
+        assert!(effective.contains("[Active task attachment]"), "anchor");
         assert!(effective.contains("fix auth"), "anchor content");
     }
 
@@ -3296,7 +3594,7 @@ mod tests {
 
         let effective = build_effective_line("继续", &state);
         assert!(
-            effective.contains("[Continuation anchor]"),
+            effective.contains("[Active task attachment]"),
             "anchor injection must work after compaction"
         );
         assert!(
@@ -3311,7 +3609,7 @@ mod tests {
         // Phase 5: Normal prompt should NOT inject anchor
         let normal = build_effective_line("explain Pin in detail", &state);
         assert!(
-            !normal.contains("[Continuation anchor]"),
+            !normal.contains("[Active task attachment]"),
             "normal prompt must not inject anchor"
         );
     }
@@ -3392,6 +3690,11 @@ mod tests {
             routing_domain_hint: None,
             entity_learn_skipped_no_domain: false,
             pending_context_assembly_trace: None,
+            turn_observability_events: Vec::new(),
+            prefetch_injected: false,
+            prefetch_task_type: None,
+            prefetch_body_bytes: None,
+            llm_rounds: None,
         }
     }
 
@@ -3417,6 +3720,7 @@ mod tests {
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+            ..Default::default()
         }
     }
 
@@ -3536,6 +3840,7 @@ mod tests {
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+            ..Default::default()
         }];
 
         let learning =
@@ -3595,20 +3900,36 @@ mod tests {
         super::repl_ui::clear_followup_prompt_hint();
     }
 
-    /// Verifies build_continuation_anchor truncates long content to 220 chars
-    /// and formats correctly for both user and assistant parts.
+    /// Verifies build_continuation_anchor keeps a bounded, multi-line attachment.
     #[test]
     fn continuation_anchor_builder_truncates_long_content() {
         let long_user_input = "a".repeat(300);
-        let long_assistant = format!("{}\nSecond line of detail", "b".repeat(300));
+        let long_assistant = format!(
+            "{}\nSecond line of detail\nThird line of detail\nFourth line should be dropped",
+            "b".repeat(300)
+        );
 
         let state = ReplState::default();
-        let result = stub_stream_result(&long_assistant);
+        let mut result = stub_stream_result(&long_assistant);
+        result.tools_used = vec!["read_file".into(), "str_replace".into()];
+        result.tool_call_records = vec![session_journal::ToolCallRecord {
+            name: "read_file".into(),
+            ok: true,
+            ms: 10,
+            error: None,
+            input_bytes: None,
+            output_bytes: None,
+            args_preview: Some("rust/crates/runtime/src/server/run_lifecycle.rs".into()),
+            result_preview: None,
+            file_path: None,
+            surgically_removed: None,
+            original_tool_name: None,
+            ..Default::default()
+        }];
 
         let anchor = build_continuation_anchor(&state, &long_user_input, &result);
         let anchor = anchor.expect("should produce anchor");
 
-        // User part truncated to 220 chars
         assert!(anchor.contains("Latest user task: "));
         let user_part = anchor
             .split("Latest user task: ")
@@ -3617,12 +3938,17 @@ mod tests {
             .split('\n')
             .next()
             .unwrap();
-        assert_eq!(user_part.chars().count(), 220);
+        assert_eq!(user_part.chars().count(), 221);
 
-        // Assistant part truncated to 220 chars (first non-empty line)
-        assert!(anchor.contains("Latest assistant direction: "));
-        let assistant_part = anchor.split("Latest assistant direction: ").nth(1).unwrap();
-        assert_eq!(assistant_part.chars().count(), 220);
+        assert!(anchor.contains("Latest assistant summary:\n"));
+        assert!(anchor.contains("Second line of detail"));
+        assert!(anchor.contains("Third line of detail"));
+        assert!(!anchor.contains("Fourth line should be dropped"));
+        assert!(anchor.contains("Recent tools: read_file, str_replace"));
+        assert!(
+            anchor
+                .contains("Artifact: read_file → rust/crates/runtime/src/server/run_lifecycle.rs")
+        );
     }
 
     /// Verifies that when user input is empty, the previous anchor is preserved.
@@ -3652,7 +3978,7 @@ mod tests {
         ));
         state.turn = 1;
         state.continuation_anchor = Some(
-            "Latest user task: explain ownership\nLatest assistant direction: Ownership in Rust means each value has exactl"
+            "Latest user task: explain ownership\nLatest assistant summary:\nOwnership in Rust means each value has exactl"
                 .to_string(),
         );
 
@@ -3682,11 +4008,11 @@ mod tests {
 
         // Verify: continuation still works after recovery
         state.continuation_anchor = Some(
-            "Latest user task: now explain borrowing\nLatest assistant direction: Borrowing lets you reference data"
+            "Latest user task: now explain borrowing\nLatest assistant summary:\nBorrowing lets you reference data"
                 .to_string(),
         );
         let effective = build_effective_line("continue", &state);
-        assert!(effective.contains("[Continuation anchor]"));
+        assert!(effective.contains("[Active task attachment]"));
         assert!(effective.contains("explain borrowing"));
 
         // Verify: the failed message is nowhere in the conversation

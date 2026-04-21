@@ -307,6 +307,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             has_any_usage: false,
             max_turns: DELEGATE_MAX_TURNS,
             remaining_turns: DELEGATE_MAX_TURNS,
+            current_round_index: 0,
             turn_guard: TurnGuard::with_profile(task_profile),
             restricted_tools,
             step_recorder,
@@ -390,6 +391,9 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             approval_overrides: None,
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
+            session_turn: 0,
+            prefetch_injected: false,
+            turn_event_buffer: None,
         };
 
         let loop_result = run_agentic_loop_with_host(&mut host, &mut state).await;

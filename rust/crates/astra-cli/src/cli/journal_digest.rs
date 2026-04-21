@@ -1,5 +1,6 @@
 //! Local session journal digest for `astra journal digest` and tooling.
 
+use crate::tool_call_groups;
 use astra_services::session_journal::{self, JournalEventType};
 use serde::Serialize;
 use serde_json::json;
@@ -96,6 +97,12 @@ pub struct Aggregates {
     pub avg_tokens_in: f64,
     pub avg_tokens_out: f64,
     pub avg_duration_ms: f64,
+    /// Average LLM rounds per turn (how many LLM→tool cycles).
+    pub avg_llm_rounds: f64,
+    /// Average tool calls per LLM round.
+    pub avg_tool_calls_per_round: f64,
+    /// Number of turns where context_prefetch injected data.
+    pub prefetch_turn_count: usize,
 }
 
 #[derive(Serialize)]
@@ -138,6 +145,39 @@ pub struct TurnRow {
     pub user_input_preview: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub budget_pressure: Option<f64>,
+    /// LLM rounds in this turn (LLM→tool cycles).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llm_rounds: Option<u32>,
+    /// Total LLM time excluding tool execution (ms).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_llm_ms: Option<u64>,
+    /// Total tool execution time (ms).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_tool_ms: Option<u64>,
+    /// Whether context_prefetch injected data before the agentic loop.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefetch_injected: Option<bool>,
+    /// Task type detected by prefetch (e.g. "code_review", "exploration").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefetch_task_type: Option<String>,
+    /// Size of the prefetched context body in bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefetch_body_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tool_groups: Vec<ToolGroupRow>,
+}
+
+#[derive(Serialize)]
+pub struct ToolGroupRow {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub round: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_id: Option<String>,
+    pub parallel: bool,
+    pub call_count: usize,
+    pub ok_count: usize,
+    pub fail_count: usize,
+    pub tools: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -192,6 +232,30 @@ fn tool_call_counts(calls: Option<&Vec<session_journal::ToolCallRecord>>) -> (u3
     (ok, fail)
 }
 
+fn build_tool_group_rows(calls: &[session_journal::ToolCallRecord]) -> Vec<ToolGroupRow> {
+    tool_call_groups::group_tool_calls(calls)
+        .into_iter()
+        .map(|group| ToolGroupRow {
+            round: group.round,
+            batch_id: group.batch_id.map(|batch_id| batch_id.to_string()),
+            parallel: group.parallel,
+            call_count: group.calls.len(),
+            ok_count: group.ok_count(),
+            fail_count: group.fail_count(),
+            tools: group
+                .calls
+                .iter()
+                .map(|call| {
+                    crate::stream_render::format_tool_display_from_preview(
+                        &call.name,
+                        call.args_preview.as_deref(),
+                    )
+                })
+                .collect(),
+        })
+        .collect()
+}
+
 pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDigest, String> {
     let (events, journal_lines_non_empty, journal_lines_malformed) =
         session_journal::read_journal_for_digest(session_id).map_err(|e| e.to_string())?;
@@ -217,13 +281,23 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
     let mut session_start_count = 0usize;
     let mut session_end_count = 0usize;
 
+    // Prefetch data extracted from ContextAssemblyRecorded events, keyed by turn number.
+    let mut prefetch_by_turn: std::collections::HashMap<u32, (Option<String>, Option<u64>)> =
+        std::collections::HashMap::new();
+
     let mut seq: u32 = 0;
     for ev in &events {
         match ev.event_type {
             JournalEventType::Turn => {
                 seq += 1;
                 let (ok_c, fail_c) = tool_call_counts(ev.tool_calls.as_ref());
-                total_tool_calls += u64::from(ok_c + fail_c);
+                // Fallback: if tool_calls Vec is absent, use tool_count scalar.
+                let effective_total = if ok_c + fail_c > 0 {
+                    u64::from(ok_c + fail_c)
+                } else {
+                    u64::from(ev.tool_count.unwrap_or(0))
+                };
+                total_tool_calls += effective_total;
                 tool_calls_failed += u64::from(fail_c);
                 if let Some(ti) = ev.tokens_in {
                     total_tokens_in += ti;
@@ -288,10 +362,30 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
                     } else {
                         Vec::new()
                     },
-                    tool_calls_ok: ok_c,
+                    // When tool_calls Vec is absent, treat tool_count as all-ok
+                    // (fail_c is necessarily 0 in this branch).
+                    tool_calls_ok: if ok_c + fail_c > 0 {
+                        ok_c
+                    } else {
+                        ev.tool_count.unwrap_or(0)
+                    },
                     tool_calls_fail: fail_c,
                     user_input_preview,
                     budget_pressure: ev.budget_pressure,
+                    llm_rounds: ev.llm_rounds,
+                    total_llm_ms: ev.total_llm_ms,
+                    total_tool_ms: ev.total_tool_ms,
+                    prefetch_injected: None,
+                    prefetch_task_type: None,
+                    prefetch_body_bytes: None,
+                    tool_groups: if matches!(focus, DigestFocus::All) {
+                        ev.tool_calls
+                            .as_ref()
+                            .map(|calls| build_tool_group_rows(calls))
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    },
                 };
                 turns_out.push(row);
             }
@@ -339,9 +433,40 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
             }
             JournalEventType::SessionStart => session_start_count += 1,
             JournalEventType::SessionEnd => session_end_count += 1,
+            JournalEventType::ContextAssemblyRecorded => {
+                if let Some(turn) = ev.turn {
+                    if let Some(trace) = &ev.context_assembly_trace {
+                        if let Some(pf) = trace.get("prefetch") {
+                            if pf.get("injected").and_then(|v| v.as_bool()) == Some(true) {
+                                let task_type = pf
+                                    .get("task_type")
+                                    .and_then(|v| v.as_str())
+                                    .map(String::from);
+                                let body_bytes = pf.get("body_bytes").and_then(|v| v.as_u64());
+                                prefetch_by_turn.insert(turn, (task_type, body_bytes));
+                            }
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
+
+    // Apply prefetch data from ContextAssemblyRecorded events to matching turns.
+    for turn in &mut turns_out {
+        if let Some(turn_id) = turn.turn_id {
+            if let Some((task_type, body_bytes)) = prefetch_by_turn.remove(&turn_id) {
+                turn.prefetch_injected = Some(true);
+                turn.prefetch_task_type = task_type;
+                turn.prefetch_body_bytes = body_bytes;
+            }
+        }
+    }
+    let prefetch_turn_count = turns_out
+        .iter()
+        .filter(|t| t.prefetch_injected == Some(true))
+        .count();
 
     let turn_count = turns_out.len();
     let (avg_tokens_in, avg_tokens_out, avg_duration_ms) = if turn_count == 0 {
@@ -377,6 +502,25 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
             avg_tokens_in,
             avg_tokens_out,
             avg_duration_ms,
+            avg_llm_rounds: if turn_count > 0 {
+                turns_out.iter().filter_map(|t| t.llm_rounds).sum::<u32>() as f64
+                    / turns_out
+                        .iter()
+                        .filter(|t| t.llm_rounds.is_some())
+                        .count()
+                        .max(1) as f64
+            } else {
+                0.0
+            },
+            avg_tool_calls_per_round: {
+                let total_rounds: u32 = turns_out.iter().filter_map(|t| t.llm_rounds).sum();
+                if total_rounds > 0 {
+                    total_tool_calls as f64 / total_rounds as f64
+                } else {
+                    0.0
+                }
+            },
+            prefetch_turn_count,
         },
         turns: turns_out,
         compaction_events,
@@ -404,12 +548,13 @@ pub fn print_text(d: &JournalDigest) {
     let a = &d.aggregates;
     println!("\n  {}", "Aggregates".bold().cyan());
     println!(
-        "  turns={} turn_errors={} compacts={} stalls={} errors={}",
+        "  turns={} turn_errors={} compacts={} stalls={} errors={} prefetch={}",
         a.turn_count.to_string().cyan(),
         a.turn_error_count,
         a.compact_count,
         a.stall_count,
-        a.error_event_count
+        a.error_event_count,
+        a.prefetch_turn_count
     );
     println!(
         "  tokens_in={} tokens_out={} duration_ms={} tool_calls={} tool_failures={}",
@@ -424,6 +569,12 @@ pub fn print_text(d: &JournalDigest) {
         "  tokens_in={:.1} tokens_out={:.1} duration_ms={:.1}",
         a.avg_tokens_in, a.avg_tokens_out, a.avg_duration_ms
     );
+    if a.avg_llm_rounds > 0.0 {
+        println!(
+            "  llm_rounds={:.1} tool_calls_per_round={:.1}",
+            a.avg_llm_rounds, a.avg_tool_calls_per_round
+        );
+    }
     if !d.turns.is_empty() {
         println!("\n  {}", "Turns".bold().cyan());
         println!(
@@ -451,6 +602,39 @@ pub fn print_text(d: &JournalDigest) {
                 ms,
                 t.user_input_preview.as_str().dim()
             );
+            if let Some(ref task_type) = t.prefetch_task_type {
+                let bytes_str = t
+                    .prefetch_body_bytes
+                    .map(|b| format!(" {b}B"))
+                    .unwrap_or_default();
+                println!(
+                    "                          {}",
+                    format!("prefetch:{task_type}{bytes_str}").dim()
+                );
+            }
+            for group in &t.tool_groups {
+                let mut scope = match group.round {
+                    Some(round) => format!("r{round}"),
+                    None => "r?".to_string(),
+                };
+                if let Some(batch_id) = group.batch_id.as_deref() {
+                    scope.push_str(&format!(" · {batch_id}"));
+                }
+                if group.parallel || group.call_count > 1 {
+                    scope.push_str(&format!(" · {} calls", group.call_count));
+                }
+                let status = if group.fail_count > 0 {
+                    format!("{} ok / {} fail", group.ok_count, group.fail_count)
+                } else {
+                    format!("{} ok", group.ok_count)
+                };
+                println!(
+                    "                          {} {} — {}",
+                    scope.as_str().dim(),
+                    status.as_str().dim(),
+                    group.tools.join(", ").dim()
+                );
+            }
         }
     }
     if !d.compaction_events.is_empty() {
@@ -537,6 +721,9 @@ mod tests {
     use astra_services::session_journal::JournalDirGuard;
     use std::fs;
 
+    const REAL_SESSION_0AC769_FIXTURE: &str =
+        include_str!("../../../services/fixtures/real_session_0ac769_min.jsonl");
+
     #[test]
     fn digest_counts_turns_and_aggregates() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -564,6 +751,78 @@ mod tests {
         assert_eq!(d.turns[0].seq, 1);
         assert_eq!(d.turns[0].turn_id, Some(1));
         assert_eq!(d.turns[1].tool_calls_ok, 1);
+    }
+
+    #[test]
+    fn digest_includes_grouped_tool_batches() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = JournalDirGuard::new(tmp.path());
+
+        let sid = "test-digest-groups-00000000-0000-0000-0000-000000000003";
+        fs::write(
+            tmp.path().join(format!("{sid}.jsonl")),
+            r#"{"type":"turn","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":1,"tool_calls":[{"name":"read_file","ok":true,"ms":10,"args_preview":"src/lib.rs","batch_id":"b-0-0","parallel":true,"round":0},{"name":"grep","ok":true,"ms":11,"args_preview":"SessionState","batch_id":"b-0-0","parallel":true,"round":0},{"name":"bash","ok":false,"ms":20,"round":1,"error":"boom"}]}
+"#,
+        )
+        .expect("write journal");
+
+        let d = build_digest(sid, DigestFocus::All).expect("digest");
+        assert_eq!(d.turns.len(), 1);
+        assert_eq!(d.turns[0].tool_groups.len(), 2);
+        assert_eq!(d.turns[0].tool_groups[0].batch_id.as_deref(), Some("b-0-0"));
+        assert!(d.turns[0].tool_groups[0].parallel);
+        assert_eq!(d.turns[0].tool_groups[0].call_count, 2);
+        assert_eq!(d.turns[0].tool_groups[1].round, Some(1));
+        assert_eq!(d.turns[0].tool_groups[1].fail_count, 1);
+    }
+
+    #[test]
+    fn digest_surfaces_real_session_fixture_rounds_and_grouped_tools() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = JournalDirGuard::new(tmp.path());
+
+        let sid = "0ac7696c-8a67-4e9f-b7bb-88b3bf7b59a0";
+        fs::write(
+            tmp.path().join(format!("{sid}.jsonl")),
+            REAL_SESSION_0AC769_FIXTURE,
+        )
+        .expect("write journal");
+
+        let d = build_digest(sid, DigestFocus::All).expect("digest");
+        assert_eq!(d.journal_lines_non_empty, 14);
+        assert_eq!(d.journal_lines_malformed, 0);
+        assert_eq!(d.aggregates.turn_count, 1);
+        assert_eq!(d.aggregates.total_tool_calls, 12);
+        assert_eq!(d.aggregates.avg_llm_rounds, 7.0);
+        assert_eq!(d.turns.len(), 1);
+
+        let turn = &d.turns[0];
+        assert_eq!(
+            turn.user_input_preview,
+            "review b273c589a73799070a71f4cfc6d55349b534d8d1"
+        );
+        assert_eq!(turn.tool_calls_ok, 12);
+        assert_eq!(turn.llm_rounds, Some(7));
+        assert!(
+            turn.tool_groups.iter().any(|group| {
+                group.round == Some(0)
+                    && group.call_count == 1
+                    && group.tools.iter().any(|tool| tool == "Git show b273c589")
+            }),
+            "digest should preserve the first repeated git_show round"
+        );
+        assert!(
+            turn.tool_groups.iter().any(|group| {
+                group.round == Some(2)
+                    && group.parallel
+                    && group.call_count == 4
+                    && group
+                        .tools
+                        .iter()
+                        .any(|tool| tool.contains("run_lifecycle.rs"))
+            }),
+            "digest should preserve the large round-2 batch from the real session"
+        );
     }
 
     #[test]
@@ -596,5 +855,38 @@ mod tests {
             err.contains("not found") || err.contains("journal"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn digest_extracts_prefetch_from_context_assembly() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = JournalDirGuard::new(tmp.path());
+
+        let sid = "test-digest-prefetch-00000000-0000-0000-0000-000000000004";
+        fs::write(
+            tmp.path().join(format!("{sid}.jsonl")),
+            concat!(
+                r#"{"type":"turn","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":1,"tokens_in":100,"tokens_out":20,"duration_ms":500,"user_input":"review latest commit","tool_calls":[]}"#, "\n",
+                r#"{"type":"context_assembly_recorded","ts":"2026-01-01T00:00:01Z","session_id":"S","turn":1,"context_assembly_trace":{"prefetch":{"injected":true,"task_type":"code_review","body_bytes":12345}}}"#, "\n",
+                r#"{"type":"turn","ts":"2026-01-01T00:00:02Z","session_id":"S","turn":2,"tokens_in":200,"tokens_out":40,"duration_ms":600,"user_input":"fix it","tool_calls":[]}"#, "\n",
+                r#"{"type":"context_assembly_recorded","ts":"2026-01-01T00:00:03Z","session_id":"S","turn":2,"context_assembly_trace":{"explanations":[]}}"#, "\n",
+            ),
+        )
+        .expect("write journal");
+
+        let d = build_digest(sid, DigestFocus::All).expect("digest");
+        assert_eq!(d.aggregates.prefetch_turn_count, 1);
+
+        // Turn 1: has prefetch
+        assert_eq!(d.turns[0].prefetch_injected, Some(true));
+        assert_eq!(
+            d.turns[0].prefetch_task_type.as_deref(),
+            Some("code_review")
+        );
+        assert_eq!(d.turns[0].prefetch_body_bytes, Some(12345));
+
+        // Turn 2: no prefetch (assembly event has no prefetch key)
+        assert!(d.turns[1].prefetch_injected.is_none());
+        assert!(d.turns[1].prefetch_task_type.is_none());
     }
 }

@@ -66,7 +66,9 @@ fn context_trace_turn_number(state: &AgenticLoopState) -> u32 {
     // Journal turn numbers should match the user-visible outer turn count.
     // The observability session tracks its own internal counter, which can
     // include sub-rounds and drift away from the REPL/session journal turn IDs.
-    (state.max_turns - state.remaining_turns).max(1) as u32
+    state
+        .session_turn
+        .max((state.max_turns - state.remaining_turns).max(1) as u32)
 }
 
 async fn persist_latest_context_trace_signal(state: &mut AgenticLoopState) {
@@ -366,9 +368,31 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
 ) -> Result<AgenticLoopOutcome, astra_core::ClassifiedError> {
     let result = run_agentic_loop_impl(host, state).await;
 
+    // On error, best-effort flush turn observability events.
+    if result.is_err() {
+        if let Some(sid) = state.current_session_id.as_deref() {
+            if let Some(buf) = state.turn_event_buffer.as_mut() {
+                if !buf.is_empty() {
+                    if let Ok(writer) = astra_services::session_journal::JournalWriter::new(sid) {
+                        let _ = buf.flush_interrupted(&writer);
+                    }
+                }
+            }
+        }
+    }
+
     // Emit structured interruption to journal if one was recorded.
     if let Some(ref interruption) = state.interruption {
         if let Some(ref sid) = state.current_session_id {
+            // Best-effort flush of turn observability events on interruption.
+            if let Some(buf) = state.turn_event_buffer.as_mut() {
+                if !buf.is_empty() {
+                    if let Ok(writer) = astra_services::session_journal::JournalWriter::new(sid) {
+                        let _ = buf.flush_interrupted(&writer);
+                    }
+                }
+            }
+
             let turn_num = (state.max_turns - state.remaining_turns) as u32;
             let evt = astra_services::session_journal::JournalEvent::interruption_recorded(
                 Some(sid.as_str()),
@@ -692,6 +716,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn finalize_turn_trace_prefers_session_turn_across_requests() {
+        let mut state = make_state();
+        state.max_turns = 10;
+        state.remaining_turns = 9; // first internal round of a new request
+        state.session_turn = 2; // second outer turn in the persisted session
+
+        let hub = crate::observability_integration::ObservabilityHub::new();
+        let session = hub.start_session("u1", "s1");
+        session.write().unwrap().turn_number = 99;
+        state.current_session_id = Some("s1".to_string());
+        state.telemetry.observability_session = Some(session);
+        state.telemetry.turn_trace_collector =
+            Some(crate::turn::turn_trace_collector::TurnTraceCollector::new(
+                "turn-0".to_string(),
+                "s1".to_string(),
+            ));
+        state.max_turn_input_tokens = 100_000;
+        state.last_measured_prompt_tokens = Some(42_000);
+
+        finalize_turn_trace(&mut state).await;
+
+        let (turn_num, trace_json) = state
+            .telemetry
+            .pending_context_assembly_trace
+            .as_ref()
+            .expect("pending_context_assembly_trace should be set");
+        assert_eq!(*turn_num, 2);
+        assert_eq!(trace_json["turn_id"], "turn-2");
+    }
+
+    #[tokio::test]
     async fn finalize_turn_trace_preserves_first_pending_trace_within_outer_turn() {
         let mut state = make_state();
         state.max_turns = 40;
@@ -764,6 +819,7 @@ mod tests {
                 file_path: Some("src/main.rs".to_string()),
                 surgically_removed: None,
                 original_tool_name: None,
+                ..Default::default()
             },
             astra_services::session_journal::ToolCallRecord {
                 name: "str_replace".to_string(),
@@ -777,6 +833,7 @@ mod tests {
                 file_path: Some("src/lib.rs".to_string()),
                 surgically_removed: None,
                 original_tool_name: None,
+                ..Default::default()
             },
         ];
         state.total_prompt = 5000;
@@ -823,6 +880,7 @@ mod tests {
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+            ..Default::default()
         }];
         state.total_prompt = 15000;
 

@@ -34,6 +34,10 @@ fn parse_retry_after(headers: &HeaderMap) -> Option<u64> {
 #[derive(Debug, Clone)]
 pub struct ThinClient {
     http: Client,
+    /// Separate client for SSE streams — auto-decompression disabled to prevent
+    /// "error decoding response body" when the server sends Content-Encoding on
+    /// a streaming response.
+    http_stream: Client,
     base: Url,
     /// Default bearer when call sites omit per-request token (optional).
     bearer_token: Option<String>,
@@ -45,14 +49,21 @@ impl ThinClient {
         let base =
             Url::parse(base).map_err(|_| ThinClientError::InvalidBaseUrl(base.to_string()))?;
         let http = Client::builder().no_proxy().build()?;
+        let http_stream = Client::builder()
+            .no_proxy()
+            .no_gzip()
+            .no_brotli()
+            .no_deflate()
+            .build()?;
         Ok(Self {
             http,
+            http_stream,
             base,
             bearer_token,
         })
     }
 
-    /// Shared `reqwest::Client` (TLS / proxy policy aligned with thin API). For `LlmToolSelector` and ad-hoc calls to other origins (e.g. Memoria health).
+    /// Shared `reqwest::Client` (TLS / proxy policy aligned with thin API). For optional in-library LLM tool selection and ad-hoc calls to other origins (e.g. Memoria health).
     pub fn http_client(&self) -> &Client {
         &self.http
     }
@@ -782,7 +793,7 @@ impl ThinClient {
             HeaderValue::from_static("text/event-stream"),
         );
         Ok(self
-            .http
+            .http_stream
             .post(url)
             .headers(headers)
             .json(payload)
@@ -804,7 +815,7 @@ impl ThinClient {
             HeaderValue::from_static("text/event-stream"),
         );
         Ok(self
-            .http
+            .http_stream
             .post(url)
             .timeout(timeout)
             .headers(headers)

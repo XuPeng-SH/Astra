@@ -114,6 +114,11 @@ pub(crate) struct StreamResultBuild<'a> {
     pub(crate) routing_domain_hint: Option<String>,
     pub(crate) entity_learn_skipped_no_domain: bool,
     pub(crate) pending_context_assembly_trace: Option<(u32, serde_json::Value)>,
+    pub(crate) turn_observability_events: Vec<astra_services::session_journal::JournalEvent>,
+    pub(crate) llm_rounds: Option<u32>,
+    pub(crate) prefetch_injected: bool,
+    pub(crate) prefetch_task_type: Option<String>,
+    pub(crate) prefetch_body_bytes: Option<usize>,
 }
 
 pub(crate) fn resolved_tool_metrics<I>(
@@ -176,6 +181,11 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
         routing_domain_hint,
         entity_learn_skipped_no_domain,
         pending_context_assembly_trace,
+        turn_observability_events,
+        llm_rounds,
+        prefetch_injected,
+        prefetch_task_type,
+        prefetch_body_bytes,
     } = ctx;
     let (tool_calls_count, tools_used) =
         resolved_tool_metrics(tool_calls_count, tools_used, &tool_call_records);
@@ -239,9 +249,13 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
         routing_domain_hint,
         entity_learn_skipped_no_domain,
         pending_context_assembly_trace,
+        turn_observability_events,
+        llm_rounds,
+        prefetch_injected,
+        prefetch_task_type,
+        prefetch_body_bytes,
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,6 +303,11 @@ mod tests {
             routing_domain_hint: None,
             entity_learn_skipped_no_domain: false,
             pending_context_assembly_trace: None,
+            turn_observability_events: Vec::new(),
+            llm_rounds: None,
+            prefetch_injected: false,
+            prefetch_task_type: None,
+            prefetch_body_bytes: None,
         }
     }
 
@@ -332,6 +351,7 @@ mod tests {
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+            ..Default::default()
         }
     }
 

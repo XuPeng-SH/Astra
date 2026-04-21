@@ -2511,6 +2511,11 @@ mod exit_code_tests {
             routing_domain_hint: None,
             entity_learn_skipped_no_domain: false,
             pending_context_assembly_trace: None,
+            turn_observability_events: Vec::new(),
+            prefetch_injected: false,
+            prefetch_task_type: None,
+            prefetch_body_bytes: None,
+            llm_rounds: None,
         }
     }
 
@@ -2536,6 +2541,7 @@ mod exit_code_tests {
                 file_path: None,
                 surgically_removed: None,
                 original_tool_name: None,
+                ..Default::default()
             });
         assert_eq!(compute_exit_code(&sr), ExitCode::ToolFailure);
     }
@@ -2556,6 +2562,7 @@ mod exit_code_tests {
                 file_path: None,
                 surgically_removed: None,
                 original_tool_name: None,
+                ..Default::default()
             });
         sr.verdict_events.push(VerdictEvent {
             turn: 1,
@@ -2591,6 +2598,7 @@ mod exit_code_tests {
                 file_path: None,
                 surgically_removed: None,
                 original_tool_name: None,
+                ..Default::default()
             });
         sr.tool_call_records
             .push(astra_services::session_journal::ToolCallRecord {
@@ -2605,6 +2613,7 @@ mod exit_code_tests {
                 file_path: None,
                 surgically_removed: None,
                 original_tool_name: None,
+                ..Default::default()
             });
         assert_eq!(compute_exit_code(&sr), ExitCode::Success);
     }

@@ -75,6 +75,8 @@ mod cloud_sync;
 mod command_registry;
 #[path = "cli/command_router.rs"]
 mod command_router;
+#[path = "cli/context_prefetch.rs"]
+mod context_prefetch;
 #[path = "cli/delegate_subrun.rs"]
 mod delegate_subrun;
 #[path = "cli/diagnostic_log.rs"]
@@ -201,6 +203,8 @@ mod streaming_types;
 mod terminal_region;
 #[path = "cli/theme.rs"]
 mod theme;
+#[path = "cli/tool_call_groups.rs"]
+mod tool_call_groups;
 mod tool_safety_guard;
 
 use agent_runtime::initialize_multi_agent_runtime;
@@ -2307,13 +2311,18 @@ total_tokens_out: 3
         std::fs::create_dir_all(&ws_dir).unwrap();
         std::fs::write(ws_dir.join("workspace.yaml"), "invalid: yaml: content: [").unwrap();
 
-        // Should return None for malformed workspace
+        // Malformed workspace now falls back to journal-only local restore.
         let svc = astra_services::session_restore::HybridRestoreService::local_only();
-        let result = svc.restore_session(&sid).await.unwrap();
-        assert!(
-            result.is_none(),
-            "malformed workspace.yaml should cause restore to return None"
-        );
+        let result = svc
+            .restore_session(&sid)
+            .await
+            .unwrap()
+            .expect("malformed workspace should still restore from journal");
+        assert_eq!(result.session_id, sid);
+        assert_eq!(result.turn_count, 0);
+        assert_eq!(result.model.as_deref(), Some("gpt-4o"));
+        assert_eq!(result.last_status, "local");
+        assert!(!result.restored_from_cloud);
     }
 
     #[tokio::test]
@@ -2321,7 +2330,7 @@ total_tokens_out: 3
         let _creds = isolate_credentials();
         use astra_services::session_restore::SessionRestoreService;
 
-        // Only journal, no workspace → should fall back to cloud (which returns None)
+        // Only journal, no workspace → local journal-only restore should still work.
         let sid = format!("test-no-ws-{}", uuid::Uuid::new_v4());
         let writer = session_journal::JournalWriter::new(&sid).unwrap();
         writer
@@ -2333,11 +2342,16 @@ total_tokens_out: 3
         drop(writer);
 
         let svc = astra_services::session_restore::HybridRestoreService::local_only();
-        let result = svc.restore_session(&sid).await.unwrap();
-        assert!(
-            result.is_none(),
-            "session without workspace.yaml should return None"
-        );
+        let result = svc
+            .restore_session(&sid)
+            .await
+            .unwrap()
+            .expect("journal-only session should restore");
+        assert_eq!(result.session_id, sid);
+        assert_eq!(result.turn_count, 0);
+        assert_eq!(result.model.as_deref(), Some("gpt-4o"));
+        assert_eq!(result.last_status, "local");
+        assert!(!result.restored_from_cloud);
     }
 
     // ── Integration: full resume flow simulation ─────────────────────────────
@@ -2818,6 +2832,7 @@ total_tokens_out: 500
                 file_path: None,
                 surgically_removed: None,
                 original_tool_name: None,
+                ..Default::default()
             },
             session_journal::ToolCallRecord {
                 name: "bash".into(),
@@ -2831,6 +2846,7 @@ total_tokens_out: 500
                 file_path: None,
                 surgically_removed: None,
                 original_tool_name: None,
+                ..Default::default()
             },
             session_journal::ToolCallRecord {
                 name: "grep".into(),
@@ -2844,6 +2860,7 @@ total_tokens_out: 500
                 file_path: None,
                 surgically_removed: None,
                 original_tool_name: None,
+                ..Default::default()
             },
         ]);
         writer.append(&event).unwrap();

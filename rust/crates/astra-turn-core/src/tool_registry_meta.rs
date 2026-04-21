@@ -143,7 +143,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "输出到文件",
             "导出文件",
         ],
-        pinned: true,
+        pinned: false,
         intents: &[IntentType::CodeEdit],
         scope: Scope::Local,
         schema_tokens: 25,
@@ -203,7 +203,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "文件结构",
             "目录结构",
         ],
-        pinned: true,
+        pinned: false,
         intents: &[IntentType::CodeRead],
         scope: Scope::Local,
         schema_tokens: 25,
@@ -221,7 +221,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "代码搜索",
             "全文搜索",
         ],
-        pinned: true,
+        pinned: false,
         intents: &[IntentType::CodeRead],
         scope: Scope::Local,
         schema_tokens: 40,
@@ -249,7 +249,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "文件模式",
             "扩展名",
         ],
-        pinned: true,
+        pinned: false,
         intents: &[IntentType::CodeRead],
         scope: Scope::Local,
         schema_tokens: 25,
@@ -758,10 +758,10 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         scope: Scope::External,
         schema_tokens: 25,
     },
-    // memory_store stays pinned: preference expressions ("苹果比较好吃") have
-    // zero keyword overlap with memory triggers, so tfidf can't select it.
-    // The system prompt tells the LLM to call memory_store for preferences,
-    // so the tool must always be available. Cost: ~35 tokens/turn.
+    // memory_store is now selective, not baseline-pinned. We surface it for
+    // explicit remember/track language plus common preference phrasing, so
+    // implicit user preferences can still route without paying the schema tax
+    // on unrelated turns.
     ToolMeta {
         name: "memory_store",
         description: "Store information to persistent memory",
@@ -786,13 +786,19 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "记下",
             "记录",
             "保存",
+            "偏爱",
+            "喜欢",
+            "更喜欢",
+            "倾向",
+            "好吃",
+            "比较好",
             // Disambiguate from write_file "保存"
             "保存到记忆",
             "存储到记忆",
             "存一下",
             "帮我记住",
         ],
-        pinned: true,
+        pinned: false,
         intents: &[IntentType::Memory],
         scope: Scope::CrossSession,
         schema_tokens: 35,
@@ -1418,11 +1424,11 @@ mod tests {
     }
 
     #[test]
-    fn catalog_memory_store_is_pinned() {
+    fn catalog_memory_store_is_not_pinned() {
         let ms = TOOL_CATALOG
             .iter()
             .find(|t| t.name == "memory_store")
             .unwrap();
-        assert!(ms.pinned, "memory_store should be pinned");
+        assert!(!ms.pinned, "memory_store should be selected dynamically");
     }
 }

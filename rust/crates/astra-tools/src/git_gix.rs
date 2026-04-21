@@ -16,6 +16,69 @@ use serde_json::Value;
 const DIFF_LIMIT: usize = 40_000; // ~10K tokens — diff is the primary input for code review
 const SHOW_LIMIT: usize = 16_000;
 
+/// Maximum time to wait for a git subprocess to complete.
+/// Prevents 67s+ hangs on large merge commits (observed in session 0ac7696c).
+const GIT_SUBPROCESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Run a git command with a timeout, returning None if it times out or fails.
+/// Uses `try_wait` polling with explicit child-kill on timeout to avoid
+/// leaked threads / zombie processes.
+fn run_git_with_timeout(project_root: &Path, args: &[&str]) -> Option<std::process::Output> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new("git")
+        .args(args)
+        .current_dir(project_root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+
+    let start = std::time::Instant::now();
+
+    loop {
+        if let Some(status) = child.try_wait().ok().flatten() {
+            // Process exited — collect remaining stdout/stderr.
+            let stdout = child
+                .stdout
+                .take()
+                .map(|mut s| {
+                    let mut buf = Vec::new();
+                    let _ = s.read_to_end(&mut buf);
+                    buf
+                })
+                .unwrap_or_default();
+            let stderr = child
+                .stderr
+                .take()
+                .map(|mut s| {
+                    let mut buf = Vec::new();
+                    let _ = s.read_to_end(&mut buf);
+                    buf
+                })
+                .unwrap_or_default();
+            return Some(std::process::Output {
+                status,
+                stdout,
+                stderr,
+            });
+        }
+        if start.elapsed() >= GIT_SUBPROCESS_TIMEOUT {
+            // Explicitly kill the child to avoid zombie thread / leaked FDs.
+            let _ = child.kill();
+            let _ = child.wait(); // Reap the zombie.
+            eprintln!(
+                "  ⚠️ git {} timed out after {}s",
+                args.first().unwrap_or(&""),
+                GIT_SUBPROCESS_TIMEOUT.as_secs()
+            );
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 /// Outcome of a tool execution with optional metadata fields.
 #[derive(Debug, Clone, Default)]
 pub struct ToolExecutionOutcome {
@@ -711,11 +774,8 @@ pub fn git_show(
             cli_args.push("--");
             cli_args.push(f);
         }
-        let cli_out = std::process::Command::new("git")
-            .args(&cli_args)
-            .current_dir(project_root)
-            .output()
-            .ok();
+        // Use timeout to prevent 67s+ hangs on large merge commits
+        let cli_out = run_git_with_timeout(project_root, &cli_args);
         if let Some(output) = cli_out {
             if output.status.success() {
                 let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -729,7 +789,7 @@ pub fn git_show(
                 // Fall through to gix to at least show the commit header.
             }
         }
-        // CLI failed or empty — fall through to gix (best effort)
+        // CLI failed, timed out, or empty — fall through to gix (best effort)
     }
 
     // Diff: use tree changes API
@@ -1157,11 +1217,8 @@ pub fn git_diff(
 }
 
 fn diff_via_git_cli(project_root: &Path, args: &[&str], limit: usize) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .args(args)
-        .current_dir(project_root)
-        .output()
-        .ok()?;
+    // Use timeout to prevent hangs on large diffs
+    let out = run_git_with_timeout(project_root, args)?;
     if !out.status.success() {
         return None;
     }

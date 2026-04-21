@@ -72,12 +72,12 @@ mod tests {
 
     #[test]
     fn catalog_has_8_pinned() {
-        assert_eq!(ToolRegistry::pinned_count(), 8);
+        assert_eq!(ToolRegistry::pinned_count(), 3);
     }
 
     #[test]
     fn catalog_has_35_dynamic() {
-        assert_eq!(ToolRegistry::dynamic_count(), 35);
+        assert_eq!(ToolRegistry::dynamic_count(), 40);
     }
 
     #[test]
@@ -89,12 +89,12 @@ mod tests {
             .collect();
         assert!(pinned.contains(&"bash"));
         assert!(pinned.contains(&"read_file"));
-        assert!(pinned.contains(&"write_file"));
         assert!(pinned.contains(&"str_replace"));
-        assert!(pinned.contains(&"list_dir"));
-        assert!(pinned.contains(&"grep"));
-        assert!(pinned.contains(&"glob"));
-        assert!(pinned.contains(&"memory_store"));
+        assert!(!pinned.contains(&"memory_store"));
+        assert!(!pinned.contains(&"write_file"));
+        assert!(!pinned.contains(&"list_dir"));
+        assert!(!pinned.contains(&"grep"));
+        assert!(!pinned.contains(&"glob"));
         // memory_search is dynamic — selected only when query involves recall
         assert!(!pinned.contains(&"memory_search"));
     }
@@ -184,7 +184,7 @@ mod tests {
 
     #[test]
     fn prefilter_ranks_memory_tools_for_recall() {
-        // memory_store is pinned; memory_search and memory_purge are dynamic.
+        // memory_store, memory_search, and memory_purge are dynamic.
         // For memory recall queries, memory_search should appear.
         let state = ConversationState::from_message("之前我记住了什么偏好?", 1);
         let ranked = pre_filter_dynamic(&state, "之前我记住了什么偏好?");
@@ -249,28 +249,21 @@ mod tests {
         );
     }
 
-    /// Regression: "我有哪些记忆？" — memory_store and memory_search are now pinned,
-    /// so they're always available. Verify via registry.select().
+    /// Regression: recall queries should surface recall-oriented memory tools.
     #[test]
-    fn select_memory_query_includes_pinned_memory_tools() {
+    fn select_memory_query_prefers_memory_search() {
         let registry = ToolRegistry::new(mock_schemas());
         let selected = registry.select("我有哪些记忆？", 1);
         let names = ToolRegistry::selected_names(&selected);
         assert!(
-            names.contains(&"memory_store".to_string()),
-            "memory_store (pinned) must be in selection for '我有哪些记忆？', got: {:?}",
-            names
-        );
-        assert!(
             names.contains(&"memory_search".to_string()),
-            "memory_search (pinned) must be in selection for '我有哪些记忆？', got: {:?}",
+            "memory_search must be in selection for '我有哪些记忆？', got: {:?}",
             names
         );
     }
 
-    /// Regression: "苹果比较好吃" is a preference statement with zero keyword overlap
-    /// with memory_store triggers. Before pinning, memory_store was filtered out and
-    /// the LLM couldn't store the preference despite system prompt instructions.
+    /// Regression: implicit Chinese preferences should still surface memory_store
+    /// even after it leaves the pinned baseline.
     #[test]
     fn select_preference_statement_has_memory_store() {
         let registry = ToolRegistry::new(mock_schemas());
@@ -278,7 +271,19 @@ mod tests {
         let names = ToolRegistry::selected_names(&selected);
         assert!(
             names.contains(&"memory_store".to_string()),
-            "memory_store (pinned) must be available for preference statements, got: {:?}",
+            "memory_store must be selected for implicit preference intent, got: {:?}",
+            names
+        );
+    }
+
+    #[test]
+    fn select_tracking_intent_has_memory_store() {
+        let registry = ToolRegistry::new(mock_schemas());
+        let selected = registry.select("我关注 matrixorigin", 1);
+        let names = ToolRegistry::selected_names(&selected);
+        assert!(
+            names.contains(&"memory_store".to_string()),
+            "memory_store must be selected for tracking intent, got: {:?}",
             names
         );
     }

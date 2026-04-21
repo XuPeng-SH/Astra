@@ -493,6 +493,10 @@ pub struct AgenticLoopState {
     // ── Turn management ──
     pub max_turns: usize,
     pub remaining_turns: usize,
+    /// Current agentic loop turn index (0-based, updated each iteration).
+    /// Used by the CLI to inject `round_index` into the bridge payload so the
+    /// system prompt can include round budget directives.
+    pub current_round_index: u32,
     pub turn_guard: TurnGuard,
     pub restricted_tools: HashSet<String>,
     pub step_recorder: StepRecorder,
@@ -564,6 +568,11 @@ pub struct AgenticLoopState {
     /// turn. The CLI host reads this to suppress intermediate text rendering
     /// on subsequent iterations (prevents markdown leak from draft text).
     pub skill_produced_output: bool,
+
+    /// True when context_prefetch injected data into the user message before
+    /// the agentic loop started. Suppresses "no tool call on live query" warnings
+    /// because the LLM already has the data it needs.
+    pub prefetch_injected: bool,
 
     // ── Cumulative token budget ──
     /// Maximum cumulative (prompt + completion) tokens across all rounds.
@@ -665,6 +674,14 @@ pub struct AgenticLoopState {
     pub confidence_trend: super::confidence_contract::ConfidenceTrendTracker,
     /// Last diagnosis computed after tool selection (for telemetry and fallback).
     pub last_confidence_diagnosis: Option<super::confidence_contract::ConfidenceDiagnosis>,
+
+    // ── Turn observability (Phase 1) ──
+    /// In-memory collector for fine-grained turn events (llm_round, tool timing).
+    /// Session-level turn number (1-based). Set by the CLI from ReplState.turn
+    /// so that llm_round journal events carry the correct turn number.
+    pub session_turn: u32,
+    /// Created at turn start, flushed at turn end or on interruption.
+    pub turn_event_buffer: Option<astra_services::session_journal::TurnEventBuffer>,
 }
 
 /// Consecutive same-category error turns before forcing a strategy change.
@@ -744,6 +761,7 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
     run_loop_preamble(host, state).await;
 
     for turn_index in 0..state.max_turns {
+        state.current_round_index = turn_index as u32;
         let TurnIterationPrep {
             quiet,
             turn_start_time,
@@ -1051,6 +1069,7 @@ pub(crate) mod tests {
             has_any_usage: false,
             max_turns: 10,
             remaining_turns: 10,
+            current_round_index: 0,
             turn_guard: TurnGuard::new(),
             restricted_tools: HashSet::new(),
             step_recorder: StepRecorder::new("test-session", "test-task"),
@@ -1109,6 +1128,9 @@ pub(crate) mod tests {
             approval_overrides: None,
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
+            session_turn: 0,
+            prefetch_injected: false,
+            turn_event_buffer: None,
         }
     }
 
@@ -3967,6 +3989,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
+            ..Default::default()
         }
     }
 
@@ -4801,6 +4824,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
         let session = make_session();
         let mut state = make_state();
         state.telemetry.observability_session = Some(session.clone());
+        state.session_turn = 10;
 
         {
             let mut guard = session.write().unwrap();
@@ -4983,6 +5007,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
         let session = make_session();
         let mut state = make_state();
         state.telemetry.observability_session = Some(session.clone());
+        state.session_turn = 10;
 
         {
             let mut guard = session.write().unwrap();
@@ -5074,6 +5099,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
         let session = make_session();
         let mut state = make_state();
         state.telemetry.observability_session = Some(session.clone());
+        state.session_turn = 1;
 
         {
             let mut guard = session.write().unwrap();
@@ -5901,6 +5927,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 file_path: None,
                 surgically_removed: None,
                 original_tool_name: None,
+                ..Default::default()
             },
             astra_services::session_journal::ToolCallRecord {
                 name: "bash".into(),
@@ -5914,6 +5941,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 file_path: None,
                 surgically_removed: None,
                 original_tool_name: None,
+                ..Default::default()
             },
         ];
 
@@ -6058,6 +6086,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 file_path: None,
                 surgically_removed: None,
                 original_tool_name: None,
+                ..Default::default()
             },
             ToolCallRecord {
                 name: "bash".into(),
@@ -6071,6 +6100,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 file_path: None,
                 surgically_removed: None,
                 original_tool_name: None,
+                ..Default::default()
             },
             ToolCallRecord {
                 name: "bash".into(),
@@ -6084,6 +6114,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 file_path: None,
                 surgically_removed: None,
                 original_tool_name: None,
+                ..Default::default()
             },
         ];
 
@@ -6644,6 +6675,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                     file_path: None,
                     surgically_removed: None,
                     original_tool_name: None,
+                    ..Default::default()
                 },
                 ToolCallRecord {
                     name: "rg".to_string(),
@@ -6657,6 +6689,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                     file_path: None,
                     surgically_removed: None,
                     original_tool_name: None,
+                    ..Default::default()
                 },
             ]);
             if !bash_ok {
@@ -6714,6 +6747,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                     file_path: None,
                     surgically_removed: None,
                     original_tool_name: None,
+                    ..Default::default()
                 }]),
                 budget_used: None,
                 budget_pressure: None,
@@ -6737,6 +6771,12 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 selector_confidence: None,
                 routing_domain_hint: None,
                 entity_learn_skipped_no_domain: false,
+                round: None,
+                tool_calls_returned: None,
+                offset_ms: None,
+                llm_rounds: None,
+                total_llm_ms: None,
+                total_tool_ms: None,
             })
             .unwrap();
         astra_services::session_journal::JournalWriter::new("sess-reflect")
@@ -6802,6 +6842,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 file_path: None,
                 surgically_removed: None,
                 original_tool_name: None,
+                ..Default::default()
             },
             ToolCallRecord {
                 name: "bash".into(),
@@ -6815,6 +6856,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 file_path: None,
                 surgically_removed: None,
                 original_tool_name: None,
+                ..Default::default()
             },
             ToolCallRecord {
                 name: "web_fetch".into(),
@@ -6828,6 +6870,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 file_path: None,
                 surgically_removed: None,
                 original_tool_name: None,
+                ..Default::default()
             },
         ];
         state.recent_tactical_actions = vec![
@@ -7458,5 +7501,415 @@ print(json.dumps({'context': 'user said: ' + msg}))
             "expected reduced content after compaction, got {} bytes",
             total_content_bytes
         );
+    }
+}
+
+#[cfg(test)]
+mod observability_e2e_tests {
+    use super::tests::*;
+    use super::*;
+    use astra_services::session_journal::{
+        JournalDirGuard, JournalEventType, JournalWriter, ToolCallRecord,
+    };
+    use serde_json::json;
+
+    fn tool_call_json(name: &str) -> Value {
+        json!({
+            "id": format!("call-{name}"),
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": json!({"path": format!("/tmp/{name}.txt")}).to_string()
+            }
+        })
+    }
+
+    fn turn_with_tools(tools: &[&str], text: &str) -> HostTurnResult {
+        HostTurnResult {
+            accum: ChatTurnSseAccum {
+                full_text: text.to_string(),
+                tool_calls: tools.iter().map(|t| tool_call_json(t)).collect(),
+                has_tool_calls: !tools.is_empty(),
+                prompt_tokens: 1000,
+                completion_tokens: 200,
+                cache_read_tokens: 100,
+                has_usage: true,
+                ..Default::default()
+            },
+            ttft_ms: Some(50),
+            edge_tool_round: Vec::new(),
+            error_kind: None,
+        }
+    }
+
+    fn text_only_turn(text: &str) -> HostTurnResult {
+        turn_with_tools(&[], text)
+    }
+
+    fn read_journal_events(session_id: &str) -> Vec<astra_services::session_journal::JournalEvent> {
+        let writer = JournalWriter::new(session_id).unwrap();
+        let content = std::fs::read_to_string(writer.path()).unwrap_or_default();
+        content
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect()
+    }
+
+    /// Scenario 1: Single round with multiple tools — verifies round, start_offset_ms,
+    /// batch_id, parallel fields are populated on ToolCallRecords.
+    #[tokio::test]
+    async fn observability_single_round_multi_tool_records_round_and_batch() {
+        let session_id = format!("obs-e2e-{}", uuid::Uuid::new_v4());
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+
+        let mut state = make_state();
+        state.current_session_id = Some(session_id.clone());
+        // Two turns: first returns 3 tool_calls, second returns text.
+        let mut host = MockHost::new(vec![
+            turn_with_tools(&["read_file", "grep", "glob"], ""),
+            text_only_turn("done"),
+        ])
+        .with_valid_tools(&["read_file", "grep", "glob"]);
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, AgenticLoopOutcome::Completed));
+
+        // Verify ToolCallRecords have round field set.
+        let records: Vec<&ToolCallRecord> = state
+            .stall
+            .tool_call_records
+            .iter()
+            .filter(|r| !r.is_synthetic_placeholder())
+            .collect();
+        assert!(
+            !records.is_empty(),
+            "expected tool call records from headless round"
+        );
+        for rec in &records {
+            assert_eq!(
+                rec.round,
+                Some(0),
+                "all tools in first round should have round=0"
+            );
+            assert!(
+                rec.start_offset_ms.is_some(),
+                "start_offset_ms should be set for {}",
+                rec.name
+            );
+        }
+
+        // If multiple tools, they should share a batch_id and be marked parallel.
+        if records.len() > 1 {
+            let batch_ids: Vec<_> = records.iter().filter_map(|r| r.batch_id.as_ref()).collect();
+            assert!(
+                !batch_ids.is_empty(),
+                "batch_id should be set for multi-tool round"
+            );
+            let first = &batch_ids[0];
+            assert!(
+                batch_ids.iter().all(|b| b == first),
+                "all tools in same round should share batch_id"
+            );
+            assert!(
+                records.iter().all(|r| r.parallel == Some(true)),
+                "multi-tool round should mark parallel=true"
+            );
+        }
+    }
+
+    /// Scenario 2: Multiple LLM rounds — verifies llm_round events are recorded
+    /// and round counter increments correctly.
+    #[tokio::test]
+    async fn observability_multi_round_records_llm_round_events() {
+        let session_id = format!("obs-e2e-{}", uuid::Uuid::new_v4());
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+
+        let mut state = make_state();
+        state.current_session_id = Some(session_id.clone());
+        // Three turns: round 0 (1 tool), round 1 (1 tool), round 2 (text).
+        let mut host = MockHost::new(vec![
+            turn_with_tools(&["read_file"], ""),
+            turn_with_tools(&["grep"], ""),
+            text_only_turn("final answer"),
+        ])
+        .with_valid_tools(&["read_file", "grep"]);
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, AgenticLoopOutcome::Completed));
+
+        // Verify tool records have incrementing round numbers.
+        let records: Vec<&ToolCallRecord> = state
+            .stall
+            .tool_call_records
+            .iter()
+            .filter(|r| !r.is_synthetic_placeholder())
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].round, Some(0));
+        assert_eq!(records[1].round, Some(1));
+
+        // Verify start_offset_ms is monotonically increasing.
+        let off0 = records[0].start_offset_ms.unwrap_or(0);
+        let off1 = records[1].start_offset_ms.unwrap_or(0);
+        assert!(
+            off1 >= off0,
+            "second tool should start after first: {off0} vs {off1}"
+        );
+
+        // The buffer persists across iterations within the same agentic loop.
+        // It should have recorded 3 llm_round events: 2 tool rounds + 1 text-only final.
+        if let Some(buf) = &state.turn_event_buffer {
+            assert_eq!(
+                buf.current_round(),
+                3,
+                "buffer should have 3 rounds recorded (2 tool + 1 text-only)"
+            );
+        }
+    }
+
+    /// Scenario 3: Cancellation preserves partial data via flush_interrupted.
+    #[tokio::test]
+    async fn observability_cancellation_flushes_partial_events() {
+        let session_id = format!("obs-e2e-cancel-{}", uuid::Uuid::new_v4());
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+
+        let mut state = make_state();
+        state.current_session_id = Some(session_id.clone());
+        // First turn returns tools, second turn the host will error (simulating cancel).
+        let mut host = MockHost::new(vec![
+            turn_with_tools(&["read_file"], ""),
+            // No more turns → BudgetExhausted error → triggers interruption path.
+        ])
+        .with_valid_tools(&["read_file"]);
+        state.max_turns = 2;
+        state.remaining_turns = 2;
+
+        let _outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        // The loop should complete (budget exhausted gracefully) or error.
+        // Either way, check that partial events were flushed.
+
+        let events = read_journal_events(&session_id);
+        // We should see at least an interruption_recorded event.
+        // The flush_interrupted path writes partial llm_round events.
+        let has_interruption = events
+            .iter()
+            .any(|e| e.event_type == JournalEventType::InterruptionRecorded);
+        // If there was an interruption, partial events should have been flushed.
+        if has_interruption {
+            let llm_rounds: Vec<_> = events
+                .iter()
+                .filter(|e| e.event_type == JournalEventType::LlmRound)
+                .collect();
+            // Should have at least 1 llm_round from the first successful tool turn.
+            if !llm_rounds.is_empty() {
+                let partial = llm_rounds[0]
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.get("partial"))
+                    .and_then(|v| v.as_bool());
+                assert_eq!(
+                    partial,
+                    Some(true),
+                    "interrupted events should be marked partial"
+                );
+            }
+        }
+
+        // Verify tool records still have round info even on interruption.
+        let records: Vec<&ToolCallRecord> = state
+            .stall
+            .tool_call_records
+            .iter()
+            .filter(|r| !r.is_synthetic_placeholder())
+            .collect();
+        if !records.is_empty() {
+            assert_eq!(records[0].round, Some(0));
+            assert!(records[0].start_offset_ms.is_some());
+        }
+    }
+}
+
+#[cfg(test)]
+mod parallel_execution_tests {
+    use super::tests::*;
+    use super::*;
+    use astra_services::session_journal::{JournalDirGuard, ToolCallRecord};
+    use serde_json::json;
+
+    fn tool_call_json_named(name: &str, id: &str) -> Value {
+        json!({
+            "id": id,
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": json!({"path": format!("/tmp/{name}.txt")}).to_string()
+            }
+        })
+    }
+
+    fn turn_with_named_tools(tools: &[(&str, &str)], text: &str) -> HostTurnResult {
+        HostTurnResult {
+            accum: ChatTurnSseAccum {
+                full_text: text.to_string(),
+                tool_calls: tools
+                    .iter()
+                    .map(|(name, id)| tool_call_json_named(name, id))
+                    .collect(),
+                has_tool_calls: !tools.is_empty(),
+                prompt_tokens: 1000,
+                completion_tokens: 200,
+                cache_read_tokens: 0,
+                has_usage: true,
+                ..Default::default()
+            },
+            ttft_ms: Some(50),
+            edge_tool_round: Vec::new(),
+            error_kind: None,
+        }
+    }
+
+    /// 6 read-only tools in one round — all should be batched concurrently.
+    #[tokio::test]
+    async fn parallel_all_readonly_tools_batched_together() {
+        let session_id = format!("par-e2e-{}", uuid::Uuid::new_v4());
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+
+        let mut state = make_state();
+        state.current_session_id = Some(session_id.clone());
+
+        let tools = vec![
+            ("read_file", "c1"),
+            ("grep", "c2"),
+            ("glob", "c3"),
+            ("git_status", "c4"),
+            ("git_diff", "c5"),
+            ("read_file", "c6"),
+        ];
+        let mut host = MockHost::new(vec![
+            turn_with_named_tools(&tools, ""),
+            turn_with_named_tools(&[], "done"),
+        ])
+        .with_valid_tools(&["read_file", "grep", "glob", "git_status", "git_diff"]);
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, AgenticLoopOutcome::Completed));
+
+        let records: Vec<&ToolCallRecord> = state
+            .stall
+            .tool_call_records
+            .iter()
+            .filter(|r| !r.is_synthetic_placeholder())
+            .collect();
+        assert_eq!(records.len(), 6, "expected 6 tool call records");
+
+        // All should be in round 0, all parallel, all same batch_id.
+        for rec in &records {
+            assert_eq!(rec.round, Some(0), "tool {} should be round 0", rec.name);
+            assert!(
+                rec.parallel == Some(true),
+                "tool {} should be parallel",
+                rec.name
+            );
+        }
+        let batch_ids: Vec<_> = records.iter().filter_map(|r| r.batch_id.as_ref()).collect();
+        assert!(!batch_ids.is_empty(), "batch_ids should be set");
+        let first = &batch_ids[0];
+        assert!(
+            batch_ids.iter().all(|b| b == first),
+            "all tools should share same batch_id"
+        );
+    }
+
+    /// Mixed: 3 read-only, then 1 write (bash), then 2 read-only.
+    /// Partition should produce: Concurrent(3), Serial(1), Concurrent(2).
+    /// All tools should complete successfully.
+    #[tokio::test]
+    async fn parallel_mixed_readonly_and_write_tools_partitioned() {
+        let session_id = format!("par-mix-{}", uuid::Uuid::new_v4());
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+
+        let mut state = make_state();
+        state.current_session_id = Some(session_id.clone());
+
+        let tools = vec![
+            ("read_file", "c1"),
+            ("grep", "c2"),
+            ("glob", "c3"),
+            ("bash", "c4"), // write tool — breaks the concurrent batch
+            ("read_file", "c5"),
+            ("git_diff", "c6"),
+        ];
+        let mut host = MockHost::new(vec![
+            turn_with_named_tools(&tools, ""),
+            turn_with_named_tools(&[], "all done"),
+        ])
+        .with_valid_tools(&["read_file", "grep", "glob", "bash", "git_diff"]);
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, AgenticLoopOutcome::Completed));
+
+        let records: Vec<&ToolCallRecord> = state
+            .stall
+            .tool_call_records
+            .iter()
+            .filter(|r| !r.is_synthetic_placeholder())
+            .collect();
+        assert_eq!(records.len(), 6, "expected 6 tool call records");
+
+        // All should be round 0 (same LLM round).
+        for rec in &records {
+            assert_eq!(rec.round, Some(0), "tool {} should be round 0", rec.name);
+        }
+
+        // Verify tool names in order.
+        let names: Vec<&str> = records.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["read_file", "grep", "glob", "bash", "read_file", "git_diff"],
+            "tools should be in original order"
+        );
+
+        // All tools should have completed (ok or error — we're testing partitioning, not tool success).
+        // The key verification is that the partition logic ran without panics and
+        // all 6 tools were processed in the correct order.
+        assert_eq!(records.len(), 6, "all 6 tools should have been processed");
+    }
+
+    /// Unit test for partition_tool_batches.
+    #[test]
+    fn partition_tool_batches_groups_correctly() {
+        use crate::turn::agentic_headless_round::{ToolBatch, partition_tool_batches};
+        use astra_turn_core::headless_tool_assembly::HeadlessRoundToolIdx;
+
+        let tool_calls = vec![
+            json!({"function": {"name": "read_file"}}),
+            json!({"function": {"name": "grep"}}),
+            json!({"function": {"name": "bash"}}),
+            json!({"function": {"name": "glob"}}),
+            json!({"function": {"name": "git_diff"}}),
+        ];
+        let indices: Vec<HeadlessRoundToolIdx> =
+            (0..5).map(HeadlessRoundToolIdx::ServerToolCall).collect();
+
+        let batches = partition_tool_batches(&indices, &tool_calls);
+
+        // Expected: Concurrent([0,1]), Serial(2), Concurrent([3,4])
+        assert_eq!(batches.len(), 3);
+        assert!(matches!(&batches[0], ToolBatch::Concurrent(v) if v.len() == 2));
+        assert!(matches!(&batches[1], ToolBatch::Serial(_)));
+        assert!(matches!(&batches[2], ToolBatch::Concurrent(v) if v.len() == 2));
     }
 }

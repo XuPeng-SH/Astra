@@ -26,11 +26,45 @@ pub enum CacheScope {
     None,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptTokenBucket {
+    BasePersona,
+    Environment,
+    UserPreferences,
+}
+
 /// A section of the system prompt with cache scope metadata.
 #[derive(Debug, Clone)]
 pub struct PromptSection {
     pub text: String,
     pub scope: CacheScope,
+    pub token_bucket: PromptTokenBucket,
+    pub trace_signals: PromptTraceSignals,
+}
+
+impl PromptSection {
+    pub fn stable(text: impl Into<String>, scope: CacheScope) -> Self {
+        Self {
+            text: text.into(),
+            scope,
+            token_bucket: PromptTokenBucket::BasePersona,
+            trace_signals: PromptTraceSignals::default(),
+        }
+    }
+
+    pub fn dynamic(text: impl Into<String>, token_bucket: PromptTokenBucket) -> Self {
+        Self {
+            text: text.into(),
+            scope: CacheScope::None,
+            token_bucket,
+            trace_signals: PromptTraceSignals::default(),
+        }
+    }
+
+    pub fn with_trace_signals(mut self, trace_signals: PromptTraceSignals) -> Self {
+        self.trace_signals = trace_signals;
+        self
+    }
 }
 
 // ── Section builder functions ─────────────────────────────────────────────
@@ -95,14 +129,24 @@ fn coding_discipline_section() -> &'static str {
 
 /// Parallel tool calls + token efficiency + build/test warning. Pure static.
 fn parallel_and_efficiency_section() -> &'static str {
-    "\n## Parallel Tool Calls\n\
+    "\n## Think-Before-Act\n\
+     Before your FIRST tool call in any task:\n\
+     1. Identify ALL the information you need.\n\
+     2. Plan which tools to call and in what order.\n\
+     3. Batch all independent calls into ONE turn.\n\
+     4. Only make sequential calls when one result determines the next call's arguments.\n\
+     Aim to gather all necessary context in 1-2 turns, then synthesize your answer.\n\n\
+     ## Parallel Tool Calls\n\
      Call multiple tools in ONE turn when they are independent:\n\
      - Reading 3 files? Call read_file 3× in parallel.\n\
      - Need git_status AND git_diff? Call both.\n\
      - Need glob AND grep with different patterns? Call both.\n\
+     - Reviewing a commit? Call git_log AND git_show (or git_diff) in the SAME turn.\n\
+     - Analyzing a project? Call list_dir + read_file for multiple key files in ONE turn.\n\
      Do NOT parallelize when one result determines the next call's arguments.\n\
       **Limit**: Keep parallel tool calls to ≤5 per turn. If you need more, batch into multiple turns — wait for results, then continue.\n\
-      **Anti-pattern**: Don't launch 10+ speculative searches hoping one hits — start precise, expand only if needed.\n\n\
+      **Anti-pattern**: Don't launch 10+ speculative searches hoping one hits — start precise, expand only if needed.\n\
+      **Anti-pattern**: Don't call one tool, wait for results, then call the next independent tool — batch them.\n\n\
       ## Token Efficiency\n\
      - Prefer targeted reads (line ranges) over full-file reads.\n\
      - Use glob to narrow candidates before grep.\n\
@@ -180,10 +224,40 @@ fn self_model_section(tool_names: &[&str]) -> String {
     format!("\n## Self-Model\nTools: {}\n", tool_names.join(", "))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemoryPromptMode {
+    None,
+    Minimal,
+    Full,
+}
+
+fn memory_prompt_mode(tool_names: &[&str], profile_desc: &str) -> MemoryPromptMode {
+    let has_memory_store = tool_names.contains(&"memory_store");
+    let has_memory_ops = tool_names.iter().any(|name| {
+        matches!(
+            *name,
+            "memory_search" | "memory_correct" | "memory_purge" | "memory_profile"
+        )
+    });
+    let has_user_memories = profile_desc.contains("## User Memories");
+
+    if !has_memory_store && !has_memory_ops {
+        MemoryPromptMode::None
+    } else if has_memory_ops || has_user_memories {
+        MemoryPromptMode::Full
+    } else {
+        MemoryPromptMode::Minimal
+    }
+}
+
 /// Tool-conditional guidance (git, code nav, editing, build/test, memory, etc.).
 /// Session-scoped — depends on which tools are selected.
-fn tool_conditional_section(tool_names: &[&str], selection_confidence: f64) -> String {
-    let has_memory = tool_names.iter().any(|n| n.starts_with("memory"));
+fn tool_conditional_section(
+    tool_names: &[&str],
+    profile_desc: &str,
+    selection_confidence: f64,
+) -> String {
+    let memory_mode = memory_prompt_mode(tool_names, profile_desc);
     let has_github = tool_names.iter().any(|n| n.starts_with("github"));
     let has_git = tool_names.iter().any(|n| n.starts_with("git_"));
     let has_spawn_agent = tool_names.contains(&"spawn_agent");
@@ -204,7 +278,8 @@ fn tool_conditional_section(tool_names: &[&str], selection_confidence: f64) -> S
 
     if has_git || has_github {
         s.push_str(
-            "7. Git/GitHub: use git_status, git_diff (stat_only:true ≈ `git diff --stat`), git_show, git_log, github_* — NOT bash for `git status`/`git diff`/`git log` when those tools apply.\n",
+            "7. Git/GitHub: use git_status, git_diff (stat_only:true ≈ `git diff --stat`), git_show, git_log, github_* for SINGLE operations.\n\
+             For COMPOUND git operations (e.g., log + diff + show in one step), prefer bash with && chaining: `git log -1 --format='%H %s' && git diff HEAD~1`.\n",
         );
     }
     if has_github {
@@ -326,15 +401,18 @@ fn tool_conditional_section(tool_names: &[&str], selection_confidence: f64) -> S
             );
         }
     }
-    if has_memory {
+    if memory_mode != MemoryPromptMode::None {
         s.push_str(
             "\n## Memory Rules (check BEFORE reasoning about tools)\n\
              ### Triggers: 关注|跟踪|留意|记住|感兴趣|follow|watch|track|interested|prefer|remember\n\
              When user expresses tracking, interest, or preference → call memory_store IMMEDIATELY.\n\
-             Format: \"[@ns/status] content\" (ns: pref, fact, knowledge, task, plan, insight)\n\
-             Example: \"我关注matrixorigin\" → store \"[@pref/active] user follows matrixorigin\"\n\
              - Do NOT ask whether to store — just store, then confirm.\n\
-             - Do NOT explore codebase for interest expressions.\n\
+             - Do NOT explore codebase for interest expressions.\n",
+        );
+        if memory_mode == MemoryPromptMode::Full {
+            s.push_str(
+                "             Format: \"[@ns/status] content\" (ns: pref, fact, knowledge, task, plan, insight)\n\
+             Example: \"我关注matrixorigin\" → store \"[@pref/active] user follows matrixorigin\"\n\
              - '## User Memories' (when present) = user context — check it BEFORE calling any tool.\n\
              - If User Memories has a repo mapping, USE that exact repo.\n\
              ### What to STORE: preferences, conventions, decisions, tracking interests.\n\
@@ -342,10 +420,11 @@ fn tool_conditional_section(tool_names: &[&str], selection_confidence: f64) -> S
              ### Deduplication: before storing, consider if similar memory already exists. Use memory_correct to update instead of creating duplicates.\n\
              ### Negative preferences: \"不喜欢\", \"别用\", \"don't want\", \"stop using\" → store as [@pref/negative]. Respect in future tool/approach selection.\n\
              ### Staleness: if a stored memory seems outdated (e.g., old repo URL, changed preference), correct it with memory_correct rather than storing a new one.\n",
-        );
-        s.push_str(
-            "         - **Memory precedence**: check '## User Memories' → search → store/correct\n",
-        );
+            );
+            s.push_str(
+                "         - **Memory precedence**: check '## User Memories' → search → store/correct\n",
+            );
+        }
     }
     if selection_confidence < LOW_CONFIDENCE_THRESHOLD {
         s.push_str(
@@ -368,7 +447,10 @@ fn task_type_section(task_type: Option<&str>) -> &'static str {
               first tool call — wait for tool results.\n\
               \n\
               ### Process\n\
-              1. **Get the diff**: call git_status + git_diff in ONE parallel turn. \
+              1. **Get the diff**: Determine what type of review this is:\n\
+                 - **Working-tree / staged changes**: call git_status + git_diff in ONE parallel turn.\n\
+                 - **Specific commit review**: call git_log + git_show (or git_diff with ref) in ONE parallel turn.\n\
+                 - **Efficient alternative**: use bash with `git log -1 --format='%H %s' && git diff HEAD~1` for a single-tool compound fetch.\n\
               ONLY use git_diff with `path` if the output shows \"[truncated]\". \
               The first git_diff returns the COMPLETE diff — do NOT re-fetch the same content with path filters.\n\
               2. **Identify scope**: from the diff, list changed files and categorize (logic, test, config, formatting).\n\
@@ -398,6 +480,7 @@ fn task_type_section(task_type: Option<&str>) -> &'static str {
               ### Anti-patterns (NEVER do these)\n\
               - Do NOT write a review summary in the same response where you call git_diff.\n\
               - Do NOT say \"tests look good\" without reading at least one test file.\n\
+              - Do NOT call git_log in one turn, wait, then call git_show — call BOTH in the first turn.\n\
               - Do NOT output `<reflect>`, `<think>`, or other XML-like tags in your final response.\n\
               - Do NOT claim full confidence when evidence is incomplete.\n"
         }
@@ -577,100 +660,73 @@ pub fn build_system_prompt_sections_with_style(
 ) -> Vec<PromptSection> {
     if tool_names.is_empty() {
         return vec![
-            PromptSection {
-                text: format!(
+            PromptSection::stable(
+                format!(
                     "{SYSTEM_PROMPT_BASE}\n\n\
                  ## CRITICAL\n\
                  You have NO tools available in this turn. \
                  Do NOT generate fake data (PRs, issues, commits, file contents). \
                  If the user asks for real-time data, say: \"I don't have tools available to look that up.\""
                 ),
-                scope: CacheScope::Global,
-            },
-            PromptSection {
-                text: profile_desc.to_string(),
-                scope: CacheScope::None,
-            },
+                CacheScope::Global,
+            ),
+            PromptSection::dynamic(profile_desc.to_string(), PromptTokenBucket::Environment),
         ];
     }
 
     // ── Global sections (stable across sessions) ──
     let mut sections = vec![
-        PromptSection {
-            text: core_rules_section(),
-            scope: CacheScope::Global,
-        },
-        PromptSection {
-            text: planning_section().to_string(),
-            scope: CacheScope::Global,
-        },
-        PromptSection {
-            text: coding_discipline_section().to_string(),
-            scope: CacheScope::Global,
-        },
-        PromptSection {
-            text: parallel_and_efficiency_section().to_string(),
-            scope: CacheScope::Global,
-        },
-        PromptSection {
-            text: plan_execution_section().to_string(),
-            scope: CacheScope::Global,
-        },
-        PromptSection {
-            text: output_format_section().to_string(),
-            scope: CacheScope::Global,
-        },
-        PromptSection {
-            text: tool_error_recovery_section().to_string(),
-            scope: CacheScope::Global,
-        },
+        PromptSection::stable(core_rules_section(), CacheScope::Global),
+        PromptSection::stable(planning_section().to_string(), CacheScope::Global),
+        PromptSection::stable(coding_discipline_section().to_string(), CacheScope::Global),
+        PromptSection::stable(
+            parallel_and_efficiency_section().to_string(),
+            CacheScope::Global,
+        ),
+        PromptSection::stable(plan_execution_section().to_string(), CacheScope::Global),
+        PromptSection::stable(output_format_section().to_string(), CacheScope::Global),
+        PromptSection::stable(
+            tool_error_recovery_section().to_string(),
+            CacheScope::Global,
+        ),
     ];
 
     // ── Session sections (stable within a session) ──
-    sections.push(PromptSection {
-        text: self_model_section(tool_names),
-        scope: CacheScope::Session,
-    });
+    sections.push(PromptSection::stable(
+        self_model_section(tool_names),
+        CacheScope::Session,
+    ));
 
-    let tool_cond = tool_conditional_section(tool_names, selection_confidence);
+    let tool_cond = tool_conditional_section(tool_names, profile_desc, selection_confidence);
     if !tool_cond.is_empty() {
-        sections.push(PromptSection {
-            text: tool_cond,
-            scope: CacheScope::Session,
-        });
+        sections.push(PromptSection::stable(tool_cond, CacheScope::Session));
     }
 
     let tt = task_type_section(task_type);
     if !tt.is_empty() {
-        sections.push(PromptSection {
-            text: tt.to_string(),
-            scope: CacheScope::Session,
-        });
+        sections.push(PromptSection::stable(tt.to_string(), CacheScope::Session));
     }
 
     let ss = search_strategy_section(tool_names);
     if !ss.is_empty() {
-        sections.push(PromptSection {
-            text: ss.to_string(),
-            scope: CacheScope::Session,
-        });
+        sections.push(PromptSection::stable(ss.to_string(), CacheScope::Session));
     }
 
     // ── Dynamic sections (change every turn) ──
     if let Some(style) = output_style
         && !style.prompt.is_empty()
     {
-        sections.push(PromptSection {
-            text: format!("\n{}\n", style.prompt),
-            scope: CacheScope::None,
-        });
+        sections.push(PromptSection::dynamic(
+            format!("\n{}\n", style.prompt),
+            PromptTokenBucket::UserPreferences,
+        ));
     }
 
     if !profile_desc.is_empty() {
-        sections.push(PromptSection {
-            text: profile_desc.to_string(),
-            scope: CacheScope::None,
-        });
+        sections.push(PromptSection::dynamic(
+            profile_desc.to_string(),
+            PromptTokenBucket::Environment,
+        ));
     }
 
     sections
@@ -688,9 +744,14 @@ pub fn self_awareness_prompt_section(
     if text.trim().len() <= "## Self-Awareness".len() + 5 {
         return None;
     }
-    Some(PromptSection {
-        text,
-        scope: CacheScope::None,
+    Some(PromptSection::dynamic(text, PromptTokenBucket::Environment)).map(|section| {
+        section.with_trace_signals(PromptTraceSignals {
+            context_signals: PromptContextSignals {
+                self_awareness: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
     })
 }
 
@@ -779,7 +840,10 @@ pub fn apply_overrides(sections: &mut [PromptSection], overrides: &PromptOverrid
 
 // ── System Prompt Tracing ─────────────────────────────────────────────────────
 
-use crate::turn::context_assembly_trace::{MemoryInjection, SkillInjection, SystemPromptBreakdown};
+use crate::turn::context_assembly_trace::{
+    MemoryInjection, PromptContextSignals, PromptGuidanceSignals, PromptTraceSignals,
+    SkillInjection, SystemPromptBreakdown,
+};
 
 /// Build a trace breakdown from prompt sections.
 ///
@@ -795,42 +859,42 @@ pub fn build_system_prompt_trace(
     let mut base_persona_tokens = 0u32;
     let mut environment_tokens = 0u32;
     let mut user_preferences_tokens = 0u32;
+    let mut context_signals = PromptContextSignals::default();
+    let mut guidance_signals = PromptGuidanceSignals::default();
     let mut total_tokens = 0u32;
 
     for section in sections {
         let tokens = estimate_section_tokens(&section.text);
         total_tokens += tokens;
+        context_signals.active_output_skills |=
+            section.trace_signals.context_signals.active_output_skills;
+        context_signals.learned_runtime_context |= section
+            .trace_signals
+            .context_signals
+            .learned_runtime_context;
+        context_signals.memory_signal_detected |=
+            section.trace_signals.context_signals.memory_signal_detected;
+        context_signals.system_prompt_override |=
+            section.trace_signals.context_signals.system_prompt_override;
+        context_signals.effort_hint |= section.trace_signals.context_signals.effort_hint;
+        context_signals.agent_type_hint |= section.trace_signals.context_signals.agent_type_hint;
+        context_signals.self_awareness |= section.trace_signals.context_signals.self_awareness;
+        context_signals.implicit_feedback |=
+            section.trace_signals.context_signals.implicit_feedback;
+        context_signals.learned_feedback_rules |=
+            section.trace_signals.context_signals.learned_feedback_rules;
+        context_signals.session_anchor |= section.trace_signals.context_signals.session_anchor;
+        guidance_signals.round_budget_warning |=
+            section.trace_signals.guidance_signals.round_budget_warning;
+        guidance_signals.synthesize_or_batch |=
+            section.trace_signals.guidance_signals.synthesize_or_batch;
+        guidance_signals.parallel_feedback |=
+            section.trace_signals.guidance_signals.parallel_feedback;
 
-        match section.scope {
-            CacheScope::Global => {
-                // Global sections = base persona + core rules
-                base_persona_tokens += tokens;
-            }
-            CacheScope::Session => {
-                // Session sections = tool list, task-type guidance
-                // Count as base persona (structural)
-                base_persona_tokens += tokens;
-            }
-            CacheScope::None => {
-                // Dynamic sections = profile, environment, preferences
-                // Try to categorize based on content markers
-                let text = &section.text;
-                if text.contains("cwd:")
-                    || text.contains("git_branch:")
-                    || text.contains("## Environment")
-                    || text.contains("Working directory")
-                {
-                    environment_tokens += tokens;
-                } else if text.contains("## User Preferences")
-                    || text.contains("## Learned")
-                    || text.contains("Output Style")
-                {
-                    user_preferences_tokens += tokens;
-                } else {
-                    // Generic dynamic content
-                    environment_tokens += tokens;
-                }
-            }
+        match section.token_bucket {
+            PromptTokenBucket::BasePersona => base_persona_tokens += tokens,
+            PromptTokenBucket::Environment => environment_tokens += tokens,
+            PromptTokenBucket::UserPreferences => user_preferences_tokens += tokens,
         }
     }
 
@@ -848,6 +912,8 @@ pub fn build_system_prompt_trace(
         environment_tokens,
         repository_memories,
         user_preferences_tokens,
+        context_signals,
+        guidance_signals,
         total_tokens,
     }
 }
@@ -1047,6 +1113,148 @@ const TASK_TYPE_KEYWORDS: &[(&str, &[&str])] = &[
     ),
 ];
 
+/// Round budget directive injected into the dynamic system prompt.
+///
+/// When `round_index` >= `ROUND_BUDGET_THRESHOLD`, nudges the LLM to synthesize
+/// what it has gathered so far rather than continuing sequential tool exploration.
+/// This is a **generic** mechanism — not task-specific.
+///
+/// These constants are defaults; callers should prefer
+/// `ToolSelectionConfig::effective_round_budget_warning/limit` for runtime overrides.
+pub const ROUND_BUDGET_THRESHOLD: u32 = 3;
+pub const ROUND_BUDGET_HARD_LIMIT: u32 = 6;
+
+pub fn round_budget_directive(round_index: u32) -> String {
+    round_budget_directive_with(round_index, ROUND_BUDGET_THRESHOLD, ROUND_BUDGET_HARD_LIMIT)
+}
+
+pub fn round_budget_directive_with(round_index: u32, warning: u32, limit: u32) -> String {
+    if round_index >= limit {
+        format!(
+            "\n\n## ⚠ Round Budget Exceeded (round {round_index}/{limit})\n\
+             You MUST produce your final answer NOW. Do NOT call any more tools.\n\
+             Synthesize everything you have gathered so far into a complete response.\n\
+             If some information is missing, state what you could not verify.\n"
+        )
+    } else if round_index >= warning {
+        let remaining = limit - round_index;
+        format!(
+            "\n\n## ⚡ Round Budget Warning (round {round_index}/{limit})\n\
+             You have used {round_index} tool rounds. {remaining} remaining before the hard limit.\n\
+             - If you have enough information, produce your final answer NOW.\n\
+             - If you still need data, batch ALL remaining tool calls into ONE parallel turn.\n\
+             - Do NOT make one-tool-at-a-time sequential calls.\n"
+        )
+    } else {
+        String::new()
+    }
+}
+
+/// Inject an additional synthesis nudge once the loop has already spent several
+/// rounds without producing any assistant text after the latest tool batch.
+///
+/// This is generic and history-based: it looks only at the current round index
+/// plus whether the visible conversation ends with tool results.
+pub fn synthesize_or_batch_directive(messages: &[serde_json::Value], round_index: u32) -> String {
+    if round_index < ROUND_BUDGET_THRESHOLD {
+        return String::new();
+    }
+
+    let trailing_tool_count = messages
+        .iter()
+        .rev()
+        .take_while(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
+        .count();
+    if trailing_tool_count == 0 {
+        return String::new();
+    }
+
+    format!(
+        "\n\n## Synthesize Or Batch Now\n\
+         The last round ended with {trailing_tool_count} tool result(s) and no assistant synthesis yet.\n\
+         - If you already have enough information, produce your final answer NOW.\n\
+         - If you still need more data, make at most ONE more tool round and batch all remaining independent calls together.\n\
+         - Do NOT continue one-tool-at-a-time exploration.\n"
+    )
+}
+
+/// Combined late-round guidance block used by bridge/server dynamic prompt
+/// assembly. Keeps the policy centralized so both paths surface the same
+/// round-budget, synthesis, and batching nudges.
+pub fn tool_round_guidance_with(
+    messages: &[serde_json::Value],
+    round_index: u32,
+    warning: u32,
+    limit: u32,
+) -> String {
+    tool_round_guidance_trace_with(messages, round_index, warning, limit).0
+}
+
+pub fn tool_round_guidance(messages: &[serde_json::Value], round_index: u32) -> String {
+    tool_round_guidance_with(
+        messages,
+        round_index,
+        ROUND_BUDGET_THRESHOLD,
+        ROUND_BUDGET_HARD_LIMIT,
+    )
+}
+
+pub fn tool_round_guidance_trace_with(
+    messages: &[serde_json::Value],
+    round_index: u32,
+    warning: u32,
+    limit: u32,
+) -> (String, PromptGuidanceSignals) {
+    let round_budget_warning = round_index >= warning;
+    let trailing_tool_count = messages
+        .iter()
+        .rev()
+        .take_while(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
+        .count();
+    let synthesize_or_batch = round_index >= ROUND_BUDGET_THRESHOLD && trailing_tool_count > 0;
+    let parallel_feedback = trailing_tool_count > 1;
+
+    (
+        format!(
+            "{}{}{}",
+            round_budget_directive_with(round_index, warning, limit),
+            synthesize_or_batch_directive(messages, round_index),
+            parallel_execution_feedback(messages)
+        ),
+        PromptGuidanceSignals {
+            round_budget_warning,
+            synthesize_or_batch,
+            parallel_feedback,
+        },
+    )
+}
+
+/// Parallel execution feedback — injected into dynamic prompt when the previous
+/// round had multiple tool results, indicating the LLM successfully batched.
+///
+/// Generic mechanism: counts tool-role messages in conversation history, returns
+/// positive reinforcement hint when batching detected. Returns empty string for
+/// round 0 or when ≤1 tool result in previous round.
+pub fn parallel_execution_feedback(messages: &[serde_json::Value]) -> String {
+    if messages.is_empty() {
+        return String::new();
+    }
+    // Count trailing consecutive tool-role messages (results from last round).
+    let tool_count = messages
+        .iter()
+        .rev()
+        .take_while(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
+        .count();
+    if tool_count > 1 {
+        format!(
+            "\n\n✓ Previous round: {tool_count} tools executed in parallel — excellent. \
+             Keep batching independent operations."
+        )
+    } else {
+        String::new()
+    }
+}
+
 /// Detect task type from user query text.
 /// Returns one of: `code_review`, `debugging`, `exploration`, `implementation`,
 /// `refactoring`, `testing`, `documentation`, `performance`, `analysis`,
@@ -1107,6 +1315,32 @@ mod tests {
             Some("code_review")
         );
         assert_eq!(detect_task_type("look at the changes"), Some("code_review"));
+        assert_eq!(
+            detect_task_type("review latest commit"),
+            Some("code_review")
+        );
+    }
+
+    #[test]
+    fn code_review_prompt_includes_commit_review_guidance() {
+        let p = build_main_system_prompt(
+            &["git_diff", "git_log", "git_show", "bash"],
+            "",
+            1.0,
+            Some("code_review"),
+        );
+        assert!(
+            p.contains("Specific commit review"),
+            "should include commit review variant"
+        );
+        assert!(
+            p.contains("git_log + git_show"),
+            "should guide git_log + git_show in parallel"
+        );
+        assert!(
+            p.contains("call BOTH in the first turn"),
+            "should warn against sequential git_log then git_show"
+        );
     }
 
     #[test]
@@ -1286,6 +1520,16 @@ mod tests {
     }
 
     #[test]
+    fn prompt_memory_store_only_uses_minimal_rules() {
+        let p = build_main_system_prompt(&["memory_store"], "", 0.5, None);
+        assert!(p.contains("Memory Rules"));
+        assert!(p.contains("memory_store IMMEDIATELY"));
+        assert!(!p.contains("Deduplication"));
+        assert!(!p.contains("Negative preferences"));
+        assert!(!p.contains("Memory precedence"));
+    }
+
+    #[test]
     fn prompt_no_memory_rules_without_memory_tools() {
         let p = build_main_system_prompt(&["bash", "git_diff"], "", 0.5, None);
         assert!(!p.contains("Memory Rules"));
@@ -1453,10 +1697,10 @@ mod tests {
     }
 
     #[test]
-    fn prompt_git_tool_preference_over_bash() {
+    fn prompt_git_tool_guidance_for_compound_ops() {
         let p = build_main_system_prompt(&["git_diff", "git_log", "bash"], "", 0.5, None);
         assert!(p.contains("git_status, git_diff"));
-        assert!(p.contains("NOT bash"));
+        assert!(p.contains("COMPOUND git operations"));
     }
 
     #[test]
@@ -1611,6 +1855,18 @@ mod tests {
         assert!(p.contains("Negative preferences"));
         assert!(p.contains("不喜欢"));
         assert!(p.contains("Staleness"));
+    }
+
+    #[test]
+    fn prompt_user_memories_upgrade_memory_rules_to_full() {
+        let p = build_main_system_prompt(
+            &["memory_store"],
+            "\n## User Memories\nprefers Rust\n",
+            0.5,
+            None,
+        );
+        assert!(p.contains("Deduplication"));
+        assert!(p.contains("Memory precedence"));
     }
 
     // ── Task type count invariant ──
@@ -2361,5 +2617,205 @@ mod tests {
             bd.total_tokens,
             bd.base_persona_tokens + bd.environment_tokens + bd.user_preferences_tokens
         );
+    }
+
+    #[test]
+    fn synthesize_or_batch_directive_requires_late_round_and_trailing_tools() {
+        let early = synthesize_or_batch_directive(
+            &[serde_json::json!({"role": "tool", "content": "a"})],
+            ROUND_BUDGET_THRESHOLD - 1,
+        );
+        assert!(early.is_empty(), "early rounds should not get the nudge");
+
+        let no_trailing_tools = synthesize_or_batch_directive(
+            &[serde_json::json!({"role": "assistant", "content": "done"})],
+            ROUND_BUDGET_THRESHOLD,
+        );
+        assert!(
+            no_trailing_tools.is_empty(),
+            "non-tool endings should not get the nudge"
+        );
+    }
+
+    #[test]
+    fn tool_round_guidance_combines_budget_synthesis_and_parallel_feedback() {
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "inspect the repo"}),
+            serde_json::json!({"role": "tool", "content": "Cargo.toml"}),
+            serde_json::json!({"role": "tool", "content": "README.md"}),
+        ];
+
+        let guidance = tool_round_guidance(&messages, ROUND_BUDGET_THRESHOLD);
+        assert!(
+            guidance.contains("Round Budget Warning"),
+            "guidance should include the round-budget warning"
+        );
+        assert!(
+            guidance.contains("Synthesize Or Batch Now"),
+            "guidance should include the late-round synthesis nudge"
+        );
+        assert!(
+            guidance.contains("2 tool result(s)"),
+            "guidance should mention trailing tool results"
+        );
+        assert!(
+            guidance.contains("2 tools executed in parallel"),
+            "guidance should preserve parallel batching feedback"
+        );
+    }
+
+    #[test]
+    fn build_system_prompt_trace_records_guidance_signals_from_section_metadata() {
+        let (guidance, guidance_signals) = tool_round_guidance_trace_with(
+            &[
+                serde_json::json!({"role": "tool", "content": "Cargo.toml"}),
+                serde_json::json!({"role": "tool", "content": "README.md"}),
+            ],
+            ROUND_BUDGET_THRESHOLD,
+            ROUND_BUDGET_THRESHOLD,
+            ROUND_BUDGET_HARD_LIMIT,
+        );
+        let sections = vec![
+            PromptSection::dynamic(guidance, PromptTokenBucket::Environment).with_trace_signals(
+                PromptTraceSignals {
+                    guidance_signals,
+                    ..Default::default()
+                },
+            ),
+        ];
+
+        let breakdown = build_system_prompt_trace(&sections, vec![], vec![]);
+        assert!(breakdown.guidance_signals.round_budget_warning);
+        assert!(breakdown.guidance_signals.synthesize_or_batch);
+        assert!(breakdown.guidance_signals.parallel_feedback);
+    }
+
+    #[test]
+    fn tool_round_guidance_trace_with_returns_matching_signals() {
+        let messages = vec![
+            serde_json::json!({"role": "tool", "content": "Cargo.toml"}),
+            serde_json::json!({"role": "tool", "content": "README.md"}),
+        ];
+
+        let (guidance, signals) = tool_round_guidance_trace_with(
+            &messages,
+            ROUND_BUDGET_THRESHOLD,
+            ROUND_BUDGET_THRESHOLD,
+            ROUND_BUDGET_HARD_LIMIT,
+        );
+
+        assert!(guidance.contains("Round Budget Warning"));
+        assert!(guidance.contains("Synthesize Or Batch Now"));
+        assert!(guidance.contains("2 tools executed in parallel"));
+        assert!(signals.round_budget_warning);
+        assert!(signals.synthesize_or_batch);
+        assert!(signals.parallel_feedback);
+    }
+
+    #[test]
+    fn build_system_prompt_trace_records_context_signals_from_section_metadata() {
+        let sections = vec![
+            PromptSection::dynamic(
+                "arbitrary dynamic payload without legacy markers".to_string(),
+                PromptTokenBucket::Environment,
+            )
+            .with_trace_signals(PromptTraceSignals {
+                context_signals: PromptContextSignals {
+                    active_output_skills: true,
+                    learned_runtime_context: true,
+                    memory_signal_detected: true,
+                    effort_hint: true,
+                    agent_type_hint: true,
+                    self_awareness: true,
+                    implicit_feedback: true,
+                    learned_feedback_rules: true,
+                    session_anchor: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        ];
+
+        let breakdown = build_system_prompt_trace(&sections, vec![], vec![]);
+        assert!(breakdown.context_signals.active_output_skills);
+        assert!(breakdown.context_signals.learned_runtime_context);
+        assert!(breakdown.context_signals.memory_signal_detected);
+        assert!(!breakdown.context_signals.system_prompt_override);
+        assert!(breakdown.context_signals.effort_hint);
+        assert!(breakdown.context_signals.agent_type_hint);
+        assert!(breakdown.context_signals.self_awareness);
+        assert!(breakdown.context_signals.implicit_feedback);
+        assert!(breakdown.context_signals.learned_feedback_rules);
+        assert!(breakdown.context_signals.session_anchor);
+    }
+
+    #[test]
+    fn build_system_prompt_trace_uses_section_token_buckets() {
+        let sections = vec![
+            PromptSection::stable("base".to_string(), CacheScope::Global),
+            PromptSection::dynamic(
+                "runtime preference without legacy marker".to_string(),
+                PromptTokenBucket::UserPreferences,
+            ),
+            PromptSection::dynamic(
+                "arbitrary environment payload".to_string(),
+                PromptTokenBucket::Environment,
+            ),
+        ];
+
+        let breakdown = build_system_prompt_trace(&sections, vec![], vec![]);
+
+        assert_eq!(
+            breakdown.base_persona_tokens,
+            estimate_section_tokens("base")
+        );
+        assert_eq!(
+            breakdown.user_preferences_tokens,
+            estimate_section_tokens("runtime preference without legacy marker")
+        );
+        assert_eq!(
+            breakdown.environment_tokens,
+            estimate_section_tokens("arbitrary environment payload")
+        );
+    }
+
+    #[test]
+    fn build_system_prompt_trace_ignores_unannotated_legacy_markers() {
+        let breakdown = build_system_prompt_trace(
+            &[PromptSection::dynamic(
+                "\n\n## System Prompt Override\nlegacy override\n\n## ⚡ Round Budget Warning"
+                    .to_string(),
+                PromptTokenBucket::Environment,
+            )],
+            vec![],
+            vec![],
+        );
+
+        assert!(!breakdown.context_signals.system_prompt_override);
+        assert!(!breakdown.guidance_signals.round_budget_warning);
+    }
+
+    #[test]
+    fn build_system_prompt_trace_uses_explicit_section_signals() {
+        let breakdown = build_system_prompt_trace(
+            &[
+                PromptSection::dynamic("cwd: /tmp".to_string(), PromptTokenBucket::Environment)
+                    .with_trace_signals(PromptTraceSignals {
+                        context_signals: PromptContextSignals {
+                            system_prompt_override: true,
+                            ..Default::default()
+                        },
+                        guidance_signals: PromptGuidanceSignals {
+                            round_budget_warning: true,
+                            ..Default::default()
+                        },
+                    }),
+            ],
+            vec![],
+            vec![],
+        );
+
+        assert!(breakdown.context_signals.system_prompt_override);
+        assert!(breakdown.guidance_signals.round_budget_warning);
     }
 }

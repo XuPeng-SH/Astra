@@ -399,6 +399,7 @@ pub(crate) fn consolidate_system_messages(messages: &[Value]) -> Vec<Value> {
 ///
 /// Returns a vec of (chunk_str, is_reasoning) pairs. Callers should route
 /// is_reasoning=true chunks to `reasoning_delta` and false to `text_delta`.
+#[allow(dead_code)] // Reserved for MiniMax M2.7 streaming support
 pub(crate) fn split_think_chunks(content: &str, in_think: &mut bool) -> Vec<(String, bool)> {
     let mut out = Vec::new();
     let mut pos = 0;
@@ -583,15 +584,21 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides(
     // (e.g. MiniMax) reject system messages after the first position.
     let messages = consolidate_system_messages(messages);
 
+    let is_anthropic = provider == "anthropic" || model_name.contains("claude");
+
     let mut body = json!({
         "model": model_name,
         "messages": messages,
         "stream": true,
-        "stream_options": {"include_usage": true},
     });
+    // stream_options is OpenAI-only; Anthropic-compatible endpoints
+    // (including MiniMax /anthropic) reject unknown fields.
+    if !is_anthropic {
+        body["stream_options"] = json!({"include_usage": true});
+    }
 
     if let Some(max_out) = max_output_tokens {
-        if provider == "anthropic" || model_name.contains("claude") {
+        if is_anthropic {
             body["max_tokens"] = json!(max_out);
         } else {
             body["max_completion_tokens"] = json!(max_out);
@@ -600,7 +607,12 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides(
 
     if !tools.is_empty() {
         body["tools"] = Value::Array(tools.to_vec());
-        body["tool_choice"] = Value::String("auto".to_string());
+        // Anthropic tool_choice is an object, not a string.
+        if is_anthropic {
+            body["tool_choice"] = json!({"type": "auto"});
+        } else {
+            body["tool_choice"] = Value::String("auto".to_string());
+        }
     }
 
     let url = llm_completions_url(base_url, completions_url_override, provider);
@@ -1203,13 +1215,15 @@ pub(crate) async fn call_llm_nonstream_fallback_with_request_overrides(
 
     let messages = consolidate_system_messages(messages);
 
+    let is_anthropic = provider == "anthropic" || model_name.contains("claude");
+
     let mut body = json!({
         "model": model_name,
         "messages": messages,
         "stream": false,
     });
     if let Some(max_out) = max_output_tokens {
-        if provider == "anthropic" || model_name.contains("claude") {
+        if is_anthropic {
             body["max_tokens"] = json!(max_out);
         } else {
             body["max_completion_tokens"] = json!(max_out);
@@ -1217,7 +1231,11 @@ pub(crate) async fn call_llm_nonstream_fallback_with_request_overrides(
     }
     if !tools.is_empty() {
         body["tools"] = Value::Array(tools.to_vec());
-        body["tool_choice"] = Value::String("auto".to_string());
+        if is_anthropic {
+            body["tool_choice"] = json!({"type": "auto"});
+        } else {
+            body["tool_choice"] = Value::String("auto".to_string());
+        }
     }
 
     let url = llm_completions_url(base_url, completions_url_override, provider);

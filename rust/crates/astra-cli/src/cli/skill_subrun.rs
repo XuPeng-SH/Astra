@@ -496,6 +496,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             has_any_usage: false,
             max_turns: SUBRUN_MAX_TURNS,
             remaining_turns: SUBRUN_MAX_TURNS,
+            current_round_index: 0,
             turn_guard: TurnGuard::with_profile(task_profile),
             restricted_tools,
             step_recorder,
@@ -571,6 +572,9 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             approval_overrides: None,
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
+            session_turn: 0,
+            prefetch_injected: false,
+            turn_event_buffer: None,
         };
 
         if let Err(err) = run_agentic_loop_with_host(&mut host, &mut state).await {

@@ -2138,6 +2138,7 @@ fn event_type_name(event_type: &JournalEventType) -> String {
         JournalEventType::InterruptionRecorded => "interruption_recorded",
         JournalEventType::ConfidenceDiagnosisRecorded => "confidence_diagnosis_recorded",
         JournalEventType::CompactionRetry => "compaction_retry",
+        JournalEventType::LlmRound => "llm_round",
     }
     .to_string()
 }
@@ -2163,6 +2164,9 @@ fn compact_json_value(value: &serde_json::Value) -> String {
 mod tests {
     use super::*;
     use crate::session_journal::{JournalDirGuard, JournalWriter, ToolCallRecord};
+
+    const REAL_SESSION_0AC769_FIXTURE: &str =
+        include_str!("../fixtures/real_session_0ac769_min.jsonl");
 
     struct StubRuntimeSupport;
 
@@ -2325,6 +2329,7 @@ mod tests {
                     file_path: None,
                     surgically_removed: None,
                     original_tool_name: None,
+                    ..Default::default()
                 }]),
                 budget_used: Some(8300),
                 budget_pressure: Some(0.83),
@@ -2348,6 +2353,12 @@ mod tests {
                 selector_confidence: Some(0.7),
                 routing_domain_hint: Some("code".to_string()),
                 entity_learn_skipped_no_domain: false,
+                round: None,
+                tool_calls_returned: None,
+                offset_ms: None,
+                llm_rounds: None,
+                total_llm_ms: None,
+                total_tool_ms: None,
             })
             .unwrap();
 
@@ -2360,6 +2371,109 @@ mod tests {
         assert_eq!(snapshot.recent_steps.len(), 1);
         assert_eq!(snapshot.recent_decisions.len(), 1);
         assert!(snapshot.acceptance.ok);
+    }
+
+    #[tokio::test]
+    async fn snapshot_surfaces_real_session_fixture_turn_evaluation_and_prefetch_symptom() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(temp.path());
+        let session_id = "0ac7696c-8a67-4e9f-b7bb-88b3bf7b59a0";
+        std::fs::write(
+            temp.path().join(format!("{session_id}.jsonl")),
+            REAL_SESSION_0AC769_FIXTURE,
+        )
+        .unwrap();
+
+        let service =
+            LocalSelfSurfaceService::new().with_runtime_support(Arc::new(StubRuntimeSupport));
+        let snapshot = service.snapshot(session_id, 20).await.unwrap();
+
+        assert_eq!(
+            snapshot.run.latest_user_request.as_deref(),
+            Some("review b273c589a73799070a71f4cfc6d55349b534d8d1")
+        );
+        assert!(
+            snapshot
+                .run
+                .latest_assistant_output
+                .as_deref()
+                .unwrap_or("")
+                .contains("not b273c589"),
+            "snapshot should surface the wrong-prefetch symptom from the real session"
+        );
+        assert_eq!(snapshot.recent_steps.len(), 14);
+        assert_eq!(
+            snapshot
+                .recent_steps
+                .iter()
+                .filter(|step| step.event_type == "llm_round")
+                .count(),
+            7,
+            "snapshot should preserve the 7-round loop"
+        );
+        assert!(
+            snapshot.recent_steps.iter().any(|step| {
+                step.event_type == "turn_evaluation" && step.summary.contains("q=0.50, conf=0.70")
+            }),
+            "turn evaluation summary should be visible in recent steps"
+        );
+    }
+
+    #[tokio::test]
+    async fn journal_surface_exposes_real_session_fixture_previews() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(temp.path());
+        let session_id = "0ac7696c-8a67-4e9f-b7bb-88b3bf7b59a0";
+        std::fs::write(
+            temp.path().join(format!("{session_id}.jsonl")),
+            REAL_SESSION_0AC769_FIXTURE,
+        )
+        .unwrap();
+
+        let service =
+            LocalSelfSurfaceService::new().with_runtime_support(Arc::new(StubRuntimeSupport));
+        let surface = service
+            .surface(session_id, SelfSurfaceDimension::Journal, 20)
+            .await
+            .unwrap();
+
+        let SelfSurfaceResponse::Journal(journal) = surface else {
+            panic!("expected journal surface");
+        };
+        assert_eq!(journal.total_events, 14);
+        assert_eq!(journal.returned, 14);
+        assert_eq!(
+            journal
+                .events
+                .iter()
+                .filter(|event| event.event_type == "llm_round")
+                .count(),
+            7,
+            "journal surface should preserve the 7-round loop"
+        );
+        assert!(
+            journal.events.iter().any(|event| {
+                event.event_type == "turn"
+                    && event
+                        .assistant_output_preview
+                        .as_deref()
+                        .unwrap_or("")
+                        .contains("not b273c589")
+            }),
+            "journal surface should preview the wrong-prefetch symptom"
+        );
+        assert!(
+            journal.events.iter().any(|event| {
+                event.event_type == "turn_evaluation"
+                    && event
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.get("tool_call_count"))
+                        .and_then(|value| value.as_u64())
+                        == Some(12)
+            }),
+            "journal surface should expose the persisted turn_evaluation metadata"
+        );
     }
 
     #[tokio::test]
