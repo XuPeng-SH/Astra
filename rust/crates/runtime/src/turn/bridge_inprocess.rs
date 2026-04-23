@@ -254,8 +254,10 @@ async fn await_with_client_disconnect<T, F>(
 where
     F: std::future::Future<Output = T>,
 {
+    // audit-#11: do not bias toward the cancel arm. If the caller's token is
+    // already set when we reach the select! a biased poll would always pick
+    // it and starve real work that completes synchronously.
     tokio::select! {
-        biased;
         _ = crate::turn::llm_client::wait_until_cancelled_or_pending(cancel) => Err(
             build_stream_error_event(
                 "Request cancelled (client disconnected)",
@@ -1892,6 +1894,15 @@ impl InProcessChatTurnBridge {
                 .map(|plan| plan.events.len())
                 .unwrap_or(0);
 
+            // TODO(audit-#3): The persist tokio::spawn here is fire-and-forget,
+            // so a turn that is cancelled (or whose session is dropped) right
+            // after the SSE "turn complete" event leaves the in-flight persist
+            // racing the runtime tear-down — session state can be left
+            // partially written. Fix shape: capture this JoinHandle on a
+            // tracked persist set on the bridge and either await it before
+            // emitting the terminal SSE frame or drain it during runtime
+            // shutdown. Deferred until the bridge owns a shared task tracker
+            // (paired with audit-#2).
             tokio::spawn(async move {
                 let persist_start = std::time::Instant::now();
                 let core_outcome = match writer.persist(persist_plan).await {
@@ -1916,6 +1927,16 @@ impl InProcessChatTurnBridge {
                                 count = tool_event_count,
                                 elapsed = format!("{:?}", persist_start.elapsed()),
                                 error = e
+                            );
+                            // audit-#6: core events are durable but tool events
+                            // are lost. Emit a structured forensic marker so
+                            // log-based reconciliation can find the orphans.
+                            tracing::error!(
+                                target: "astra_runtime::persist",
+                                session_id = %sid,
+                                tool_event_count = tool_event_count,
+                                marker = "tool_events_orphaned",
+                                "CRITICAL: core events persisted but tool events lost; journal needs forensic recovery"
                             );
                             false
                         } else {
@@ -4838,5 +4859,34 @@ mod tests {
                     > 10
             });
         assert!(!is_cjk, "should not detect CJK in English content");
+    }
+
+    /// audit-#6: when tool events fail to persist after core events succeed,
+    /// the spawned persist task must emit a structured `tool_events_orphaned`
+    /// marker so log-based reconciliation can recover the lost data.
+    #[test]
+    fn persist_task_emits_orphan_marker_on_tool_failure() {
+        let source = include_str!("bridge_inprocess.rs");
+        assert!(
+            source.contains("marker = \"tool_events_orphaned\""),
+            "bridge persist task must emit a `tool_events_orphaned` marker when \
+             tool_writer.persist fails after core events were already committed"
+        );
+    }
+
+    /// audit-#11: `await_with_client_disconnect` must not use `biased;` —
+    /// biasing toward the cancellation arm starves real work whenever the
+    /// caller's cancel token is already set when the future is polled.
+    #[test]
+    fn await_with_client_disconnect_is_not_biased() {
+        let source = include_str!("bridge_inprocess.rs");
+        let fn_start = source
+            .find("async fn await_with_client_disconnect")
+            .expect("await_with_client_disconnect must exist");
+        let body = &source[fn_start..fn_start + 700];
+        assert!(
+            !body.contains("biased;"),
+            "await_with_client_disconnect must not use biased select (starvation risk)"
+        );
     }
 }
