@@ -817,6 +817,34 @@ fn journal_plan_event(
     let _ = writer.append(&event);
 }
 
+/// B6: Drop the in-memory plan_mode state and delete persisted state files
+/// after a generation failure or cancellation.
+///
+/// Without this, a cancelled outline left `state.plan_mode = Some(...)` with
+/// `plan.subtasks` empty. The user would then type "继续" expecting it to
+/// retry generation, but `PlanCommand::parse` routed it to Resume which —
+/// even after B4's EmptyNoSubtasks branch — still left them in plan-mode
+/// purgatory rather than back in normal chat.
+///
+/// We deliberately keep the journal event so the failure is auditable.
+fn abort_plan_mode_after_failure(state: &mut ReplState, stage: &'static str, reason: &str) {
+    journal_plan_event(
+        &mut state.journal,
+        session_journal::JournalEventType::PlanLifecycle,
+        &format!("Plan generation aborted at {stage}: {reason}"),
+        Some(serde_json::json!({
+            "stage": stage,
+            "reason": reason,
+            "outcome": "abort",
+        })),
+    );
+    state.plan_mode = None;
+    state.chat_plan_only = false;
+    state.pending_plan_resume_digest = None;
+    let path = astra_runtime::plan_decompose::PlanModeState::state_path();
+    let _ = astra_runtime::plan_decompose::PlanModeState::clear_saved_state_at(&path);
+}
+
 pub(super) fn journal_goal_steering_event(
     journal: &mut Option<session_journal::JournalWriter>,
     turn: u32,
@@ -1369,7 +1397,12 @@ enum PlanResumeRecovery {
     /// recovered plan ready for a new executor.
     Ready(astra_services::task_orchestrator::TaskPlan),
     /// All subtasks are already Completed — nothing to resume.
-    NothingToDo,
+    AllCompleted,
+    /// Plan has no subtasks at all — generation never produced any work.
+    /// (Previously misreported as `NothingToDo`/AllCompleted, surfacing the
+    /// confusing "All subtasks already completed" message on a fresh empty
+    /// plan after a failed generation.)
+    EmptyNoSubtasks,
 }
 
 /// Recover a plan for resume: reset Failed→Pending and return a clone if work remains.
@@ -1381,12 +1414,16 @@ fn recover_plan_for_resume(
 ) -> PlanResumeRecovery {
     use astra_services::task_orchestrator::TaskStatus;
 
+    if plan.subtasks.is_empty() {
+        return PlanResumeRecovery::EmptyNoSubtasks;
+    }
+
     let has_work = plan
         .subtasks
         .iter()
         .any(|s| s.status == TaskStatus::Pending || s.status == TaskStatus::Failed);
     if !has_work {
-        return PlanResumeRecovery::NothingToDo;
+        return PlanResumeRecovery::AllCompleted;
     }
     for st in &mut plan.subtasks {
         if st.status == TaskStatus::Failed {
@@ -1714,11 +1751,21 @@ async fn handle_plan_command(
                         state.executing_plan = Some(plan);
                         eprintln!("  {} Resuming plan execution...", "▶".cyan());
                     }
-                    PlanResumeRecovery::NothingToDo => {
+                    PlanResumeRecovery::AllCompleted => {
                         eprintln!(
                             "  {} {}",
                             theme::icon_warn(),
                             "All subtasks already completed — nothing to resume".yellow()
+                        );
+                    }
+                    PlanResumeRecovery::EmptyNoSubtasks => {
+                        // Plan generation never produced subtasks (likely
+                        // failed JSON parse or cancelled). Don't lie that
+                        // everything is "completed" — guide the user back.
+                        eprintln!(
+                            "  {} {}",
+                            theme::icon_warn(),
+                            "Plan is empty — type a goal to generate one, or 'cancel' to exit plan mode".yellow()
                         );
                     }
                 }
@@ -1972,9 +2019,29 @@ async fn handle_goal_submission(
         return Ok(PlanInputResult::Handled);
     };
 
-    let Some(plan_state) = state.plan_mode.as_mut() else {
+    if state.plan_mode.is_none() {
         return Ok(PlanInputResult::Handled);
-    };
+    }
+
+    // B10: Initialise the journal writer eagerly so the "Plan mode started"
+    // event and any subsequent abort events are recorded even if the very
+    // first LLM call fails. Previously the journal writer was only attached
+    // when an LLM response carried a session_id, so a failure on the first
+    // outline call would silently drop every plan-mode event.
+    if state.session_id.is_none() {
+        let new_sid = uuid::Uuid::new_v4().to_string();
+        super::repl_turn::initialize_journal_pub(state, &new_sid);
+        state.session_id = Some(new_sid);
+    } else if state.journal.is_none() {
+        if let Some(sid) = state.session_id.clone() {
+            super::repl_turn::initialize_journal_pub(state, &sid);
+        }
+    }
+
+    let plan_state = state
+        .plan_mode
+        .as_mut()
+        .expect("plan_mode is_some checked above");
     plan_state.goal = goal.clone();
 
     journal_plan_event(
@@ -1986,6 +2053,21 @@ async fn handle_goal_submission(
         ),
         Some(serde_json::json!({
             "goal": goal,
+            "stage": "entered",
+            // P5: classify the goal at entry so downstream digesters can
+            // distinguish executable vs analytical without re-running the
+            // heuristic.
+            "kind": match astra_runtime::plan_decompose::classify_plan_suggestion(&goal)
+                .map(|s| s.kind)
+                .unwrap_or(astra_runtime::plan_decompose::PlanKind::Executable)
+            {
+                astra_runtime::plan_decompose::PlanKind::Executable => "executable",
+                astra_runtime::plan_decompose::PlanKind::Analytical => "analytical",
+            },
+            "started_at_ms": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
         })),
     );
 
@@ -2017,10 +2099,12 @@ async fn handle_goal_submission(
         PlanLlmOutcome::Ok { text, .. } => text,
         PlanLlmOutcome::Cancelled => {
             eprintln!("  {} Plan generation cancelled.", theme::icon_warn());
+            abort_plan_mode_after_failure(state, "outline", "cancelled");
             return Ok(PlanInputResult::Handled);
         }
         PlanLlmOutcome::Error(e) => {
-            eprintln!("  {} {}", theme::icon_err(), e.red());
+            eprintln!("  {} {}", theme::icon_err(), e.clone().red());
+            abort_plan_mode_after_failure(state, "outline", &e);
             return Ok(PlanInputResult::Handled);
         }
     };
@@ -2109,10 +2193,12 @@ async fn handle_goal_submission(
         PlanLlmOutcome::Ok { text, .. } => text,
         PlanLlmOutcome::Cancelled => {
             eprintln!("  {} Plan generation cancelled.", theme::icon_warn());
+            abort_plan_mode_after_failure(state, "full_plan", "cancelled");
             return Ok(PlanInputResult::Handled);
         }
         PlanLlmOutcome::Error(e) => {
-            eprintln!("  {} {}", theme::icon_err(), e.red());
+            eprintln!("  {} {}", theme::icon_err(), e.clone().red());
+            abort_plan_mode_after_failure(state, "full_plan", &e);
             return Ok(PlanInputResult::Handled);
         }
     };
@@ -2125,6 +2211,7 @@ async fn handle_goal_submission(
         Ok(plan) => accept_generated_plan(plan, token, state, api).await,
         Err(e) => {
             eprint_plan_json_parse_failed(&full_text, &e.to_string());
+            abort_plan_mode_after_failure(state, "full_plan_parse", &e.to_string());
             Ok(PlanInputResult::Handled)
         }
     }
@@ -2952,7 +3039,7 @@ mod tests {
     }
 
     #[test]
-    fn recover_plan_for_resume_all_completed_returns_nothing() {
+    fn recover_plan_for_resume_all_completed_returns_all_completed() {
         use astra_services::task_orchestrator::TaskPlan;
         let mut plan = TaskPlan {
             subtasks: vec![
@@ -2973,7 +3060,23 @@ mod tests {
         };
         assert!(matches!(
             super::recover_plan_for_resume(&mut plan),
-            super::PlanResumeRecovery::NothingToDo
+            super::PlanResumeRecovery::AllCompleted
+        ));
+    }
+
+    #[test]
+    fn recover_plan_for_resume_empty_subtasks_returns_empty_no_subtasks() {
+        // B4: An empty subtasks list means generation never produced a plan.
+        // Previously this fell into the "AllCompleted" branch and confused the
+        // user with "All subtasks already completed — nothing to resume".
+        use astra_services::task_orchestrator::TaskPlan;
+        let mut plan = TaskPlan {
+            subtasks: vec![],
+            notes: None,
+        };
+        assert!(matches!(
+            super::recover_plan_for_resume(&mut plan),
+            super::PlanResumeRecovery::EmptyNoSubtasks
         ));
     }
 
