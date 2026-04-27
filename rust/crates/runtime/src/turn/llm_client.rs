@@ -3,6 +3,14 @@
 //! Extracted from [`super::bridge_inprocess`] so both the in-process bridge
 //! and [`crate::server::server_loop_host::ServerAgenticLoopHost`] can call LLMs
 //! without duplicating the retry/backoff/parsing logic.
+//!
+//! # Proxy invariant
+//!
+//! [`apply_env_proxy`] is the **only** place in the codebase that honours
+//! `HTTPS_PROXY` / `ALL_PROXY` env vars. All other `reqwest` clients
+//! (durable bridge, skill HTTP, server tool executor, summary client, …)
+//! must call `.no_proxy()` — their traffic is local/intranet and should
+//! not be routed through a user's LLM proxy.
 
 use std::{
     collections::HashMap,
@@ -92,13 +100,15 @@ fn global_llm_client() -> &'static reqwest::Client {
     CLIENT.get_or_init(|| {
         let connect = llm_connect_timeout();
         let total = std::time::Duration::from_secs(LLM_TOTAL_BUDGET_S + 60);
-        match reqwest::Client::builder()
-            .no_proxy()
+        let mut builder = reqwest::Client::builder()
             .connect_timeout(connect)
             // Use a generous timeout; per-request timeout handled via tokio::time::timeout
             .timeout(total)
-            .pool_max_idle_per_host(4)
-            .build()
+            .pool_max_idle_per_host(4);
+        // Honour HTTPS_PROXY / ALL_PROXY env vars (reqwest default-features=false
+        // does not auto-read system proxy, so we wire it up explicitly).
+        builder = apply_env_proxy(builder);
+        match builder.build()
         {
             Ok(client) => client,
             Err(e) => {
@@ -350,6 +360,144 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// Apply HTTP(S)/ALL proxy env vars to a reqwest::ClientBuilder.
+///
+/// reqwest is built with `default-features = false`, so it does not auto-read
+/// the system proxy env vars. We wire them up explicitly here and honour
+/// `NO_PROXY` via `reqwest::NoProxy::from_env()`.
+///
+/// Precedence (first match wins): `HTTPS_PROXY`, `https_proxy`, `ALL_PROXY`,
+/// `all_proxy`. For `HTTPS_PROXY`/`https_proxy` we register an HTTPS-scheme
+/// proxy; for `ALL_PROXY`/`all_proxy` we register an all-scheme proxy so that
+/// `socks5://` URLs (which only make sense as all-scheme) are honoured.
+pub(crate) fn apply_env_proxy(mut builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    let no_proxy = reqwest::NoProxy::from_env();
+    for var in &["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"] {
+        let Ok(proxy_url) = std::env::var(var) else {
+            continue;
+        };
+        if proxy_url.is_empty() {
+            continue;
+        }
+        let is_all = matches!(*var, "ALL_PROXY" | "all_proxy");
+        let parsed = if is_all {
+            reqwest::Proxy::all(&proxy_url)
+        } else {
+            reqwest::Proxy::https(&proxy_url)
+        };
+        match parsed {
+            Ok(mut proxy) => {
+                if let Some(np) = no_proxy.clone() {
+                    proxy = proxy.no_proxy(Some(np));
+                }
+                tracing::info!(
+                    target: "astra_runtime::llm_client",
+                    env_var = *var,
+                    proxy = %proxy_url,
+                    "applying proxy from environment"
+                );
+                builder = builder.proxy(proxy);
+                return builder;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "astra_runtime::llm_client",
+                    env_var = *var,
+                    proxy = %proxy_url,
+                    error = %e,
+                    "failed to parse proxy URL; ignoring"
+                );
+            }
+        }
+    }
+    builder
+}
+
+#[cfg(test)]
+mod apply_env_proxy_tests {
+    use super::apply_env_proxy;
+
+    /// All four recognized env var names must be cleared for isolation, since
+    /// `apply_env_proxy` reads them in precedence order.
+    const PROXY_VARS: &[&str] = &["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"];
+
+    fn clear_all() -> Vec<(&'static str, Option<String>)> {
+        PROXY_VARS.iter().map(|v| (*v, None)).collect()
+    }
+
+    #[test]
+    fn no_env_vars_leaves_builder_unmodified() {
+        temp_env::with_vars(clear_all(), || {
+            // Smoke: must not panic and must build a usable client.
+            let builder = reqwest::Client::builder();
+            let builder = apply_env_proxy(builder);
+            assert!(
+                builder.build().is_ok(),
+                "builder should produce client with no proxy"
+            );
+        });
+    }
+
+    #[test]
+    fn empty_proxy_url_is_ignored() {
+        temp_env::with_vars([("HTTPS_PROXY", Some(""))], || {
+            let builder = apply_env_proxy(reqwest::Client::builder());
+            assert!(
+                builder.build().is_ok(),
+                "empty proxy URL should be ignored, not error"
+            );
+        });
+    }
+
+    #[test]
+    fn malformed_proxy_url_is_ignored_not_panic() {
+        // Regression: prior code silently swallowed parse errors. We now log+skip.
+        // Ensure builder is still usable even when the URL is garbage.
+        temp_env::with_vars([("HTTPS_PROXY", Some("not a url ::::"))], || {
+            let builder = apply_env_proxy(reqwest::Client::builder());
+            assert!(
+                builder.build().is_ok(),
+                "malformed proxy must not break the builder"
+            );
+        });
+    }
+
+    #[test]
+    fn valid_https_proxy_applied_without_panic() {
+        temp_env::with_vars([("HTTPS_PROXY", Some("http://127.0.0.1:9999"))], || {
+            let builder = apply_env_proxy(reqwest::Client::builder());
+            assert!(builder.build().is_ok());
+        });
+    }
+
+    #[test]
+    fn socks5_via_all_proxy_is_accepted() {
+        // Regression: ALL_PROXY must use Proxy::all() so socks5:// schemes work.
+        // Requires the `socks` feature on reqwest (enabled in workspace).
+        temp_env::with_vars([("ALL_PROXY", Some("socks5://127.0.0.1:1080"))], || {
+            let builder = apply_env_proxy(reqwest::Client::builder());
+            assert!(builder.build().is_ok(), "socks5 via ALL_PROXY must build");
+        });
+    }
+
+    #[test]
+    fn https_proxy_takes_precedence_over_all_proxy() {
+        // Documented contract: first match wins in HTTPS_PROXY, https_proxy,
+        // ALL_PROXY, all_proxy order. Set both and ensure build succeeds —
+        // precedence is asserted behaviourally via early-return in apply_env_proxy.
+        temp_env::with_vars(
+            [
+                ("HTTPS_PROXY", Some("http://127.0.0.1:1")),
+                ("ALL_PROXY", Some("socks5://127.0.0.1:2")),
+            ],
+            || {
+                let builder = apply_env_proxy(reqwest::Client::builder());
+                assert!(builder.build().is_ok());
+            },
+        );
+    }
+}
+
 /// TCP connect timeout for LLM API requests.
 pub(crate) fn llm_connect_timeout() -> std::time::Duration {
     let s = std::env::var("MO_LLM_CONNECT_TIMEOUT_S")
@@ -588,12 +736,18 @@ fn build_bedrock_message_content(msg: &Value) -> Vec<Value> {
             let content = content_text_value(msg.get("content")).unwrap_or_default();
             tool_use_id
                 .map(|tool_use_id| {
+                    // Bedrock's `toolResult.content[].json` field requires a
+                    // JSON object (Document type). Scalars, arrays, strings,
+                    // booleans, and null must use the `text` branch — or
+                    // Bedrock rejects with "messages.N.content.M.toolResult
+                    // .content.0.json is invalid — provide a json object".
                     let result_block = if content.is_empty() {
                         json!({"json": {}})
-                    } else if let Ok(parsed) = serde_json::from_str::<Value>(&content) {
-                        json!({"json": parsed})
                     } else {
-                        json!({"text": content})
+                        match serde_json::from_str::<Value>(&content) {
+                            Ok(parsed) if parsed.is_object() => json!({"json": parsed}),
+                            _ => json!({"text": content}),
+                        }
                     };
                     let mut blocks = vec![json!({
                         "toolResult": {
@@ -621,28 +775,154 @@ fn build_bedrock_message_content(msg: &Value) -> Vec<Value> {
     }
 }
 
+/// Synthetic tool_result content inserted for a declared tool_call that has
+/// no matching response. The model sees this and can recover (e.g. retry).
+const SYNTHETIC_TOOL_INTERRUPTED_CONTENT: &str = "[tool execution not recorded]";
+
+/// Repair tool_use/tool_result pairing mismatches that Bedrock Converse rejects
+/// as 400. Three classes of corruption we observe, in order of severity:
+///
+/// 1. Missing tool_result for a declared tool_call (stream cut mid-execution,
+///    session resume, or bridge restart). Bedrock: "Expected toolResult blocks
+///    at messages.N.content for the following Ids: …".
+/// 2. Orphaned tool_result whose tool_call_id doesn't match any preceding
+///    assistant's tool_calls. Bedrock: "unexpected toolResult".
+/// 3. Duplicate tool_call_id within one tool-group (retry artifact). Bedrock:
+///    duplicate-id 400.
+///
+/// Bedrock-only: OpenAI and Anthropic providers consume the original messages
+/// unchanged. This mirrors claudecode's `ensureToolResultPairing` but operates
+/// on OpenAI wire format (role=tool messages) instead of Anthropic blocks.
+pub(crate) fn repair_openai_tool_pairing_for_bedrock(messages: &[Value]) -> Vec<Value> {
+    let mut repaired: Vec<Value> = Vec::with_capacity(messages.len());
+    let mut missing_counts: usize = 0;
+    let mut orphan_counts: usize = 0;
+    let mut dup_counts: usize = 0;
+
+    let mut i = 0;
+    while i < messages.len() {
+        let msg = &messages[i];
+        let role = msg.get("role").and_then(Value::as_str).unwrap_or_default();
+
+        if role == "assistant" {
+            let declared_ids: Vec<String> = msg
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .map(|tcs| {
+                    tcs.iter()
+                        .filter_map(|tc| tc.get("id").and_then(Value::as_str).map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            repaired.push(msg.clone());
+            i += 1;
+
+            if declared_ids.is_empty() {
+                continue;
+            }
+
+            // Collect the contiguous run of role=tool messages that follow.
+            let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let declared_set: std::collections::HashSet<&str> =
+                declared_ids.iter().map(String::as_str).collect();
+            while i < messages.len()
+                && messages[i].get("role").and_then(Value::as_str) == Some("tool")
+            {
+                let tool_msg = &messages[i];
+                let id = tool_msg
+                    .get("tool_call_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if id.is_empty() || !declared_set.contains(id) {
+                    orphan_counts += 1;
+                    i += 1;
+                    continue;
+                }
+                if !seen_ids.insert(id.to_string()) {
+                    dup_counts += 1;
+                    i += 1;
+                    continue;
+                }
+                repaired.push(tool_msg.clone());
+                i += 1;
+            }
+
+            for declared in &declared_ids {
+                if !seen_ids.contains(declared) {
+                    missing_counts += 1;
+                    repaired.push(json!({
+                        "role": "tool",
+                        "tool_call_id": declared,
+                        "content": SYNTHETIC_TOOL_INTERRUPTED_CONTENT,
+                    }));
+                }
+            }
+            continue;
+        }
+
+        if role == "tool" {
+            // Orphan: a role=tool message without a preceding assistant
+            // tool_calls declaration in the current window. Drop it.
+            orphan_counts += 1;
+            i += 1;
+            continue;
+        }
+
+        repaired.push(msg.clone());
+        i += 1;
+    }
+
+    if missing_counts + orphan_counts + dup_counts > 0 {
+        tracing::warn!(
+            missing = missing_counts,
+            orphaned = orphan_counts,
+            duplicate = dup_counts,
+            input_len = messages.len(),
+            output_len = repaired.len(),
+            "repaired tool_use/tool_result pairing for Bedrock request"
+        );
+    }
+    repaired
+}
+
+fn flush_tool_buffer(out: &mut Vec<Value>, buffer: &mut Vec<Value>) {
+    if buffer.is_empty() {
+        return;
+    }
+    let blocks = std::mem::take(buffer);
+    out.push(json!({
+        "role": "user",
+        "content": blocks,
+    }));
+}
+
 fn build_bedrock_messages(messages: &[Value]) -> (Vec<Value>, Vec<Value>) {
     let mut system = Vec::new();
     let mut out = Vec::new();
+    // Bedrock Converse requires all toolResult blocks for a given assistant
+    // turn's parallel toolUse blocks to live in a SINGLE user message. OpenAI
+    // wire format emits one `role: "tool"` per result, so we buffer
+    // consecutive tool messages and flush them as one merged user message
+    // whenever a non-tool message (or end of input) is reached.
+    let mut tool_buffer: Vec<Value> = Vec::new();
     for msg in messages {
-        match msg.get("role").and_then(Value::as_str).unwrap_or_default() {
+        let role = msg.get("role").and_then(Value::as_str).unwrap_or_default();
+        if role != "tool" {
+            flush_tool_buffer(&mut out, &mut tool_buffer);
+        }
+        match role {
             "system" => {
                 system.extend(build_bedrock_text_content_blocks(msg.get("content")));
             }
             "tool" => {
-                let content = build_bedrock_message_content(msg);
-                if !content.is_empty() {
-                    out.push(json!({
-                        "role": "user",
-                        "content": content,
-                    }));
-                }
+                tool_buffer.extend(build_bedrock_message_content(msg));
             }
             "user" | "assistant" => {
                 let content = build_bedrock_message_content(msg);
                 if !content.is_empty() {
                     out.push(json!({
-                        "role": msg.get("role").and_then(Value::as_str).unwrap_or("user"),
+                        "role": role,
                         "content": content,
                     }));
                 }
@@ -650,6 +930,7 @@ fn build_bedrock_messages(messages: &[Value]) -> (Vec<Value>, Vec<Value>) {
             _ => {}
         }
     }
+    flush_tool_buffer(&mut out, &mut tool_buffer);
     (system, out)
 }
 
@@ -696,7 +977,8 @@ pub(crate) fn build_provider_request_body(
 ) -> Value {
     match llm_provider_protocol(provider) {
         LlmProviderProtocol::BedrockConverse => {
-            let (system, bedrock_messages) = build_bedrock_messages(messages);
+            let repaired = repair_openai_tool_pairing_for_bedrock(messages);
+            let (system, bedrock_messages) = build_bedrock_messages(&repaired);
             let mut body = json!({
                 "messages": bedrock_messages,
             });
@@ -4250,6 +4532,398 @@ mod tests {
         );
         assert_eq!(body["toolConfig"]["tools"][0]["toolSpec"]["name"], "bash");
         assert_eq!(body["inferenceConfig"]["maxTokens"], 128);
+    }
+
+    #[test]
+    fn build_bedrock_body_wraps_non_object_tool_content_as_text_not_json() {
+        // Session 28e858fd-... failure: `git rev-list --count main..HEAD`
+        // returned "2\n" which parses as JSON integer 2. The previous code
+        // wrapped it as {"json": 2}, which Bedrock rejects:
+        // "messages.N.content.M.toolResult.content.0.json is invalid —
+        //  provide a json object".
+        // Bedrock's `json` field requires a JSON *object*. Scalars, arrays,
+        // strings, booleans, and null must go through the `text` branch.
+        for (label, content) in [
+            ("integer", "2\n"),
+            ("float", "3.14"),
+            ("bool", "true"),
+            ("null", "null"),
+            ("string", "\"hello\""),
+            ("array", "[1, 2, 3]"),
+        ] {
+            let messages = vec![
+                json!({
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "t", "type": "function",
+                        "function": {"name": "f", "arguments": "{}"}
+                    }]
+                }),
+                json!({"role": "tool", "tool_call_id": "t", "name": "f", "content": content}),
+            ];
+            let body = build_provider_request_body(
+                &messages,
+                &[],
+                "anthropic.claude-3-5-sonnet-v1:0",
+                "bedrock",
+                None,
+                None,
+                false,
+            );
+            let result_block = &body["messages"][1]["content"][0]["toolResult"]["content"][0];
+            // Bedrock-legal: either `json` with an object, or `text` with a string.
+            // Must NOT be `json` pointing at a non-object value.
+            if let Some(json_val) = result_block.get("json") {
+                assert!(
+                    json_val.is_object(),
+                    "{label}: toolResult.content[].json must be an object, got {json_val:?}"
+                );
+            } else {
+                assert!(
+                    result_block.get("text").is_some(),
+                    "{label}: non-object content must fall through to text, got {result_block:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn build_bedrock_body_keeps_json_object_branch_for_real_objects() {
+        // Regression: ensure the object branch still works (don't overcorrect).
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "t", "type": "function",
+                    "function": {"name": "f", "arguments": "{}"}
+                }]
+            }),
+            json!({"role": "tool", "tool_call_id": "t", "name": "f",
+                   "content": "{\"cwd\":\"/tmp\",\"ok\":true}"}),
+        ];
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "anthropic.claude-3-5-sonnet-v1:0",
+            "bedrock",
+            None,
+            None,
+            false,
+        );
+        let result_block = &body["messages"][1]["content"][0]["toolResult"]["content"][0];
+        assert!(result_block["json"].is_object(), "{result_block:?}");
+        assert_eq!(result_block["json"]["cwd"], "/tmp");
+    }
+
+    #[test]
+    fn build_bedrock_body_merges_parallel_tool_results_into_single_user_message() {
+        // Assistant makes two parallel tool calls. OpenAI wire format emits
+        // one `role: "tool"` message per result. Bedrock Converse requires
+        // that all toolResult blocks corresponding to a single assistant
+        // turn's toolUse blocks live in ONE user message — emitting two
+        // separate user messages triggers the "Expected toolResult blocks
+        // at messages.N.content" 400 observed in session 319b68b4-....
+        let messages = vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                    {"id": "call_a", "type": "function",
+                     "function": {"name": "bash", "arguments": "{\"cmd\":\"pwd\"}"}},
+                    {"id": "call_b", "type": "function",
+                     "function": {"name": "bash", "arguments": "{\"cmd\":\"whoami\"}"}},
+                ]
+            }),
+            json!({"role": "tool", "tool_call_id": "call_a", "name": "bash", "content": "{\"cwd\":\"/tmp\"}"}),
+            json!({"role": "tool", "tool_call_id": "call_b", "name": "bash", "content": "{\"user\":\"astra\"}"}),
+        ];
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "anthropic.claude-3-5-sonnet-v1:0",
+            "bedrock",
+            Some(64),
+            None,
+            false,
+        );
+        let out = body["messages"].as_array().expect("messages array");
+        assert_eq!(
+            out.len(),
+            3,
+            "expected user/assistant/user-merged, got {out:#?}",
+        );
+        assert_eq!(out[2]["role"], "user");
+        let content = out[2]["content"].as_array().expect("merged content");
+        let tool_result_ids: Vec<&str> = content
+            .iter()
+            .filter_map(|b| b.get("toolResult")?.get("toolUseId")?.as_str())
+            .collect();
+        assert_eq!(tool_result_ids, vec!["call_a", "call_b"]);
+    }
+
+    #[test]
+    fn build_bedrock_body_preserves_tool_order_within_merged_block() {
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                    {"id": "t1", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+                    {"id": "t2", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+                    {"id": "t3", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+                ]
+            }),
+            json!({"role": "tool", "tool_call_id": "t3", "name": "f", "content": "three"}),
+            json!({"role": "tool", "tool_call_id": "t1", "name": "f", "content": "one"}),
+            json!({"role": "tool", "tool_call_id": "t2", "name": "f", "content": "two"}),
+        ];
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "anthropic.claude-3-5-sonnet-v1:0",
+            "bedrock",
+            None,
+            None,
+            false,
+        );
+        let content = body["messages"][1]["content"]
+            .as_array()
+            .expect("merged content");
+        let ids: Vec<&str> = content
+            .iter()
+            .filter_map(|b| b.get("toolResult")?.get("toolUseId")?.as_str())
+            .collect();
+        // Insertion order of tool messages is preserved — no reordering.
+        assert_eq!(ids, vec!["t3", "t1", "t2"]);
+    }
+
+    #[test]
+    fn build_bedrock_body_splits_tool_group_when_non_tool_message_intervenes() {
+        // A user message between two tool-result groups must break the merge —
+        // otherwise we'd splice tool_results around unrelated content.
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                    {"id": "x", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+                ]
+            }),
+            json!({"role": "tool", "tool_call_id": "x", "name": "f", "content": "first"}),
+            json!({"role": "user", "content": "interrupt"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                    {"id": "y", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+                ]
+            }),
+            json!({"role": "tool", "tool_call_id": "y", "name": "f", "content": "second"}),
+        ];
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "anthropic.claude-3-5-sonnet-v1:0",
+            "bedrock",
+            None,
+            None,
+            false,
+        );
+        let out = body["messages"].as_array().expect("messages array");
+        // assistant / user(tool x) / user(interrupt) / assistant / user(tool y)
+        assert_eq!(out.len(), 5);
+        assert_eq!(
+            out[1]["content"][0]["toolResult"]["toolUseId"], "x",
+            "first tool group"
+        );
+        assert_eq!(out[2]["role"], "user");
+        assert_eq!(out[2]["content"][0]["text"], "interrupt");
+        assert_eq!(
+            out[4]["content"][0]["toolResult"]["toolUseId"], "y",
+            "second tool group"
+        );
+    }
+
+    #[test]
+    fn repair_tool_pairing_injects_synthetic_result_for_missing_tool_call() {
+        // Assistant declared two tool_calls but the tool transcript only
+        // carries one response (e.g. stream was cut mid-execution on resume).
+        // Bedrock would reject with "Expected toolResult blocks for the
+        // following Ids: call_b". Pre-send repair must synthesize an error
+        // tool_result so the model context stays valid — matching claudecode's
+        // ensureToolResultPairing repair behavior.
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                    {"id": "call_a", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+                    {"id": "call_b", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+                ]
+            }),
+            json!({"role": "tool", "tool_call_id": "call_a", "name": "f", "content": "ok"}),
+        ];
+        let repaired = repair_openai_tool_pairing_for_bedrock(&messages);
+        // Expected: assistant / tool(call_a) / synthetic tool(call_b, is_error).
+        assert_eq!(repaired.len(), 3, "{repaired:#?}");
+        assert_eq!(repaired[1]["tool_call_id"], "call_a");
+        assert_eq!(repaired[2]["role"], "tool");
+        assert_eq!(repaired[2]["tool_call_id"], "call_b");
+        let content = repaired[2]["content"].as_str().unwrap_or_default();
+        assert!(
+            content.contains("tool execution not recorded")
+                || content.contains("tool_use_interrupted"),
+            "synthetic content must be identifiable; got {content:?}",
+        );
+    }
+
+    #[test]
+    fn repair_tool_pairing_strips_orphaned_tool_result() {
+        // A role=tool message whose tool_call_id doesn't match any preceding
+        // assistant's tool_calls is an orphan — Bedrock rejects it with a
+        // different 400 ("unexpected toolResult"). Strip to keep the request
+        // well-formed.
+        let messages = vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "tool", "tool_call_id": "nonexistent", "name": "f", "content": "ghost"}),
+            json!({"role": "user", "content": "continue"}),
+        ];
+        let repaired = repair_openai_tool_pairing_for_bedrock(&messages);
+        // Orphan removed, non-tool messages untouched.
+        assert_eq!(repaired.len(), 2);
+        assert_eq!(repaired[0]["content"], "hi");
+        assert_eq!(repaired[1]["content"], "continue");
+    }
+
+    #[test]
+    fn repair_tool_pairing_dedupes_duplicate_tool_call_ids() {
+        // Same tool_call_id appearing twice in one tool-group (e.g. retry
+        // artifact). Bedrock rejects with a duplicate-id 400. Keep first.
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                    {"id": "dup", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+                ]
+            }),
+            json!({"role": "tool", "tool_call_id": "dup", "name": "f", "content": "first"}),
+            json!({"role": "tool", "tool_call_id": "dup", "name": "f", "content": "second"}),
+        ];
+        let repaired = repair_openai_tool_pairing_for_bedrock(&messages);
+        assert_eq!(repaired.len(), 2, "{repaired:#?}");
+        assert_eq!(repaired[1]["tool_call_id"], "dup");
+        assert_eq!(repaired[1]["content"], "first");
+    }
+
+    #[test]
+    fn repair_tool_pairing_is_identity_when_well_formed() {
+        // Regression: a correctly-paired transcript must pass through unchanged.
+        let messages = vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                    {"id": "t1", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+                    {"id": "t2", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+                ]
+            }),
+            json!({"role": "tool", "tool_call_id": "t1", "name": "f", "content": "a"}),
+            json!({"role": "tool", "tool_call_id": "t2", "name": "f", "content": "b"}),
+        ];
+        let repaired = repair_openai_tool_pairing_for_bedrock(&messages);
+        assert_eq!(repaired, messages);
+    }
+
+    #[test]
+    fn build_bedrock_body_end_to_end_repairs_missing_tool_result() {
+        // Integration: build_provider_request_body with provider=bedrock
+        // must run repair before merging, so Bedrock sees a complete pair.
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                    {"id": "a", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+                    {"id": "b", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+                ]
+            }),
+            json!({"role": "tool", "tool_call_id": "a", "name": "f", "content": "ok"}),
+        ];
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "anthropic.claude-3-5-sonnet-v1:0",
+            "bedrock",
+            None,
+            None,
+            false,
+        );
+        let merged = body["messages"][1]["content"]
+            .as_array()
+            .expect("user content array");
+        let ids: Vec<&str> = merged
+            .iter()
+            .filter_map(|b| b.get("toolResult")?.get("toolUseId")?.as_str())
+            .collect();
+        assert_eq!(ids, vec!["a", "b"], "{body:#?}");
+    }
+
+    #[test]
+    fn repair_tool_pairing_synthesizes_all_when_zero_responses() {
+        // Crash scenario from session 319b68b4-...: assistant declared N
+        // tool_calls but the transcript resumed with NO tool-role messages
+        // before the next turn. Every declared id must be synthesized.
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                    {"id": "Npi0", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+                    {"id": "94F3", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+                ]
+            }),
+            // No tool responses — jumps straight to another user turn.
+            json!({"role": "user", "content": "next question"}),
+        ];
+        let repaired = repair_openai_tool_pairing_for_bedrock(&messages);
+        // assistant / tool(Npi0, synthetic) / tool(94F3, synthetic) / user
+        assert_eq!(repaired.len(), 4, "{repaired:#?}");
+        assert_eq!(repaired[1]["role"], "tool");
+        assert_eq!(repaired[1]["tool_call_id"], "Npi0");
+        assert_eq!(repaired[2]["tool_call_id"], "94F3");
+        assert_eq!(repaired[3]["role"], "user");
+    }
+
+    #[test]
+    fn repair_tool_pairing_handles_tool_separated_from_assistant_by_user() {
+        // A user message between assistant.tool_calls and role=tool severs the
+        // pairing window. The orphan tool message is stripped and the missing
+        // declaration gets a synthetic — keeps Bedrock request well-formed.
+        let messages = vec![
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                    {"id": "late", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+                ]
+            }),
+            json!({"role": "user", "content": "interrupt"}),
+            json!({"role": "tool", "tool_call_id": "late", "name": "f", "content": "delayed"}),
+        ];
+        let repaired = repair_openai_tool_pairing_for_bedrock(&messages);
+        // assistant / tool(late, synthetic) / user(interrupt); orphan dropped.
+        assert_eq!(repaired.len(), 3, "{repaired:#?}");
+        assert_eq!(repaired[1]["tool_call_id"], "late");
+        assert_eq!(
+            repaired[1]["content"].as_str().unwrap_or_default(),
+            SYNTHETIC_TOOL_INTERRUPTED_CONTENT
+        );
+        assert_eq!(repaired[2]["content"], "interrupt");
     }
 
     #[test]

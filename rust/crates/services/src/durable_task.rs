@@ -22,17 +22,20 @@ use serde::{Deserialize, Serialize};
 use crate::event_ingestion::{IngestionEvent, IngestionSender};
 use crate::task_orchestrator::{TaskCheckpoint, TaskPlan};
 
-/// Build a reqwest client that skips the system proxy for localhost/loopback URLs.
-fn build_client_for_url(url: &str) -> reqwest::Client {
-    let is_local = url.contains("127.0.0.1")
-        || url.contains("localhost")
-        || url.contains("[::1]")
-        || url.contains("0.0.0.0");
-    let mut builder = reqwest::Client::builder();
-    if is_local {
-        builder = builder.no_proxy();
-    }
-    builder.build().unwrap_or_else(|_| reqwest::Client::new())
+/// Build a reqwest client for durable-task HTTP callbacks.
+///
+/// All durable-bridge traffic is local/intranet; only `turn/llm_client.rs`
+/// honours env proxy vars. Every other reqwest client in the runtime calls
+/// `.no_proxy()`.
+fn build_client_for_url(_url: &str) -> reqwest::Client {
+    // Local/intranet traffic only — never inherit env proxy.
+    // 30s request timeout prevents leaked requests from a hung callback server.
+    reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
 }
 
 /// Maximum `task_verification_results` rows loaded per task (unbounded `fetch_all` guard).
@@ -7832,5 +7835,11 @@ Time:        3.456 s
             fn_body.contains("Executing") && fn_body.contains("Pending"),
             "resume_task must reset stuck Executing subtasks to Pending"
         );
+    }
+
+    #[test]
+    fn build_client_for_url_succeeds() {
+        // Smoke: builder with no_proxy + timeouts must not panic.
+        let _ = build_client_for_url("http://127.0.0.1:1");
     }
 }
