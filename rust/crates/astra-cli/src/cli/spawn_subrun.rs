@@ -106,7 +106,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
         // Use the working directory from config (may be a worktree)
         let effective_root = config.working_dir.clone();
         let compact_strategy =
-            astra_runtime::turn::microcompact::CompactStrategy::from_provider_hint(&config.model);
+            astra_turn_core::microcompact::CompactStrategy::from_provider_hint(&config.model);
 
         let executor = edge_tools::ToolExecutor::new(&effective_root)
             .with_cloud(self.api.api_origin(), &self.token);
@@ -116,7 +116,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
 
         // Resolve per-model workflow-guard policy once; used for both the
         // `SubRunHost::tool_cache` and the `AgenticLoopState` below.
-        let resolved_tool_policy = astra_runtime::runtime_config::RuntimeConfig::load()
+        let resolved_tool_policy = astra_config::runtime_config::RuntimeConfig::load()
             .tool_selection
             .resolve_for_model(Some(&config.model));
 
@@ -234,15 +234,11 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             telemetry: Default::default(),
             skills: SkillState {
                 resolver: self.skill_resolver.clone(),
-                quality_tracker: astra_runtime::skills::quality::SkillQualityTracker::new(),
-                improvement_tracker: astra_runtime::skills::improvement::ImprovementTracker::new(),
+                quality_tracker: astra_skills::quality::SkillQualityTracker::new(),
+                improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
                 search: self.skill_search.clone(),
-                tool_event_hooks: astra_runtime::skills::hooks::load_tool_event_hooks(
-                    &effective_root,
-                ),
-                session_event_hooks: astra_runtime::skills::hooks::load_session_event_hooks(
-                    &effective_root,
-                ),
+                tool_event_hooks: astra_skills::hooks::load_tool_event_hooks(&effective_root),
+                session_event_hooks: astra_skills::hooks::load_session_event_hooks(&effective_root),
                 ..Default::default()
             },
             hooks: StopHookState {

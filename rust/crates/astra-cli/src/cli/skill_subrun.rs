@@ -11,7 +11,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use astra_core::SkillSearchSettings;
-use astra_runtime::skills::executor::isolated::{SkillSubRunExecutor, SubRunResult};
 use astra_runtime::{
     pipeline::step_protocol::InMemoryIdempotencyCache,
     pipeline::step_recorder::StepRecorder,
@@ -30,6 +29,7 @@ use astra_runtime::{
     turn::tool_schema_prune::openai_tool_names_from_schemas,
     turn::turn_guard::TurnGuard,
 };
+use astra_skills::executor::isolated::{SkillSubRunExecutor, SubRunResult};
 use serde_json::{Value, json};
 
 use super::edge_tools;
@@ -121,9 +121,8 @@ pub(crate) fn persist_failed_subrun(state: &mut AgenticLoopState, error: &str) -
         &blocked_tools,
         &state.recent_tools,
     ) {
-        let checkpoint =
-            astra_runtime::pipeline::step_protocol::StepCheckpoint::Heavy(Box::new(heavy));
-        let _ = astra_runtime::pipeline::step_checkpoint::write_step_checkpoint(
+        let checkpoint = astra_pipeline::step_protocol::StepCheckpoint::Heavy(Box::new(heavy));
+        let _ = astra_pipeline::step_checkpoint::write_step_checkpoint(
             &summary.session_id,
             summary.checkpoints,
             &checkpoint,
@@ -393,19 +392,18 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
         agent_type: Option<&str>,
     ) -> Result<SubRunResult, String> {
         let child_recursion_depth =
-            astra_runtime::turn::agentic_recursion_guard::checked_child_recursion_depth(
+            astra_turn_core::agentic_recursion_guard::checked_child_recursion_depth(
                 parent_recursion_depth,
             )?;
         let effective_model = model
             .map(String::from)
             .or_else(|| self.default_model.clone());
-        let compact_strategy =
-            astra_runtime::turn::microcompact::CompactStrategy::from_provider_hint(
-                effective_model.as_deref().unwrap_or(""),
-            );
+        let compact_strategy = astra_turn_core::microcompact::CompactStrategy::from_provider_hint(
+            effective_model.as_deref().unwrap_or(""),
+        );
         // Resolve per-model workflow-guard policy up front; `effective_model`
         // is moved into the SubRunHost below.
-        let resolved_tool_policy = astra_runtime::runtime_config::RuntimeConfig::load()
+        let resolved_tool_policy = astra_config::runtime_config::RuntimeConfig::load()
             .tool_selection
             .resolve_for_model(effective_model.as_deref());
 
@@ -474,7 +472,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
         };
 
         let task_profile = infer_task_execution_profile(task_context);
-        let safe_name = astra_runtime::skills::loader::sanitize_for_path(skill_name);
+        let safe_name = astra_skills::loader::sanitize_for_path(skill_name);
         let subrun_session_id = format!(
             "subrun-{}-{}",
             safe_name,
@@ -526,13 +524,11 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             telemetry: Default::default(),
             skills: SkillState {
                 resolver: self.skill_resolver.clone(),
-                quality_tracker: astra_runtime::skills::quality::SkillQualityTracker::new(),
-                improvement_tracker: astra_runtime::skills::improvement::ImprovementTracker::new(),
+                quality_tracker: astra_skills::quality::SkillQualityTracker::new(),
+                improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
                 search: self.skill_search.clone(),
-                tool_event_hooks: astra_runtime::skills::hooks::load_tool_event_hooks(
-                    &self.project_root,
-                ),
-                session_event_hooks: astra_runtime::skills::hooks::load_session_event_hooks(
+                tool_event_hooks: astra_skills::hooks::load_tool_event_hooks(&self.project_root),
+                session_event_hooks: astra_skills::hooks::load_session_event_hooks(
                     &self.project_root,
                 ),
                 ..Default::default()
@@ -749,7 +745,7 @@ mod tests {
                 None,
                 None,
                 &allowed_tools,
-                astra_runtime::turn::agentic_recursion_guard::MAX_AGENT_RECURSION_DEPTH,
+                astra_turn_core::agentic_recursion_guard::MAX_AGENT_RECURSION_DEPTH,
                 None,
                 None,
             )

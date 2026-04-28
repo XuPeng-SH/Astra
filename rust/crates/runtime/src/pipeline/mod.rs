@@ -11,35 +11,15 @@
 //! 4. **Goal-gradient budget** — budget expands/contracts based on progress rate.
 //! 5. **Structured reflection** — not just "nudge", but causal analysis + strategy change.
 
-pub mod calibration;
-pub mod defaults;
-pub mod engine;
-pub mod entity;
 pub mod evaluation;
-pub mod event;
-pub mod feedback_extraction;
-pub mod feedback_store;
-pub mod learning;
-pub mod learning_quality_gate;
-pub mod mo_persistence;
-pub mod pattern;
-pub mod persistence;
-pub mod routing;
-pub mod scheduling;
-pub mod stages;
-pub mod state;
-pub mod step_checkpoint;
-pub mod step_protocol;
-pub mod step_recorder;
-pub mod step_restore;
-pub mod task_learning;
 
-pub use engine::*;
-pub use event::*;
-pub use mo_persistence::*;
-pub use scheduling::*;
-pub use state::*;
-pub use step_checkpoint::*;
-pub use step_protocol::*;
-pub use step_recorder::*;
-pub use step_restore::*;
+// Re-export from astra-pipeline for public API compatibility
+pub use astra_evolution::persistence;
+pub use astra_pipeline::{
+    calibration, engine, entity, event, feedback_extraction, feedback_store, pattern, state,
+    step_checkpoint, step_restore,
+};
+pub use astra_pipeline::{step_protocol, step_recorder};
+pub use astra_turn_core::learning_quality_gate;
+pub use astra_turn_core::pipeline_learning as learning;
+pub use astra_turn_core::routing_engine as routing;

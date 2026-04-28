@@ -46,7 +46,6 @@ pub struct AppState {
     pub(crate) marketplace_stats_service: Arc<dyn MarketplaceStatsService>,
     pub(crate) replay_service: Arc<dyn ReplayService>,
     pub(crate) session_audit_service: Arc<dyn SessionAuditService>,
-    pub(crate) streaming_service: Arc<dyn StreamingService>,
     pub(crate) skill_service: Arc<dyn SkillService>,
     pub(crate) skill_config_service: Arc<dyn SkillConfigService>,
     pub(crate) llm_trusted_domain_service:
@@ -88,7 +87,7 @@ pub struct AppState {
     pub shared_pool: Option<SharedPool>,
     /// Matrix pool + journal ingestion + [`astra_services::SyncOrchestrator`] (learning/events).
     pub(crate) matrix_cloud_runtime: Option<Arc<crate::matrix_cloud_runtime::MatrixCloudRuntime>>,
-    /// Edge §5.5 callbacks (`/tools/result`, `/approval/respond`); keys via [`crate::turn::edge_ledger`].
+    /// Edge §5.5 callbacks (`/tools/result`, `/approval/respond`); keys via [`astra_turn_core::edge_ledger`].
     pub(crate) edge_callback_ledger:
         Arc<tokio::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>>,
     /// Multi-agent profile registry — defines agent tiers, delegation rules.
@@ -101,7 +100,7 @@ pub struct AppState {
     /// Per-user resource governor for limit checking and usage tracking (Phase 5).
     pub resource_governor: std::sync::Arc<dyn astra_services::resource_governor::ResourceGovernor>,
     /// Live edge agent WebSocket connections for remote tool execution (Phase 6).
-    pub edge_connection_pool: crate::server::edge_connection_pool::EdgeConnectionPool,
+    pub edge_connection_pool: astra_server_types::edge_connection_pool::EdgeConnectionPool,
     /// Shared HTTP client for upstream LLM proxy requests (completions handler).
     /// Reuses connection pool and TLS state across requests.
     pub(crate) http_client: reqwest::Client,
@@ -143,7 +142,6 @@ impl AppState {
             marketplace_stats_service: Arc::new(NoopMarketplaceStatsService),
             replay_service: Arc::new(UnconfiguredReplayService),
             session_audit_service: Arc::new(UnconfiguredSessionAuditService),
-            streaming_service: Arc::new(UnconfiguredStreamingService),
             skill_service: Arc::new(UnconfiguredSkillService),
             skill_config_service: Arc::new(UnconfiguredSkillConfigService),
             llm_trusted_domain_service: Arc::new(
@@ -202,7 +200,8 @@ impl AppState {
             resource_governor: std::sync::Arc::new(
                 astra_services::resource_governor::InMemoryResourceGovernor::new(),
             ),
-            edge_connection_pool: crate::server::edge_connection_pool::EdgeConnectionPool::new(),
+            edge_connection_pool: astra_server_types::edge_connection_pool::EdgeConnectionPool::new(
+            ),
             http_client: reqwest::Client::builder()
                 .no_proxy()
                 .connect_timeout(std::time::Duration::from_secs(30))
@@ -343,11 +342,6 @@ impl AppState {
         session_audit_service: Arc<dyn SessionAuditService>,
     ) -> Self {
         self.session_audit_service = session_audit_service;
-        self
-    }
-
-    pub fn with_streaming_service(mut self, streaming_service: Arc<dyn StreamingService>) -> Self {
-        self.streaming_service = streaming_service;
         self
     }
 
@@ -755,10 +749,10 @@ impl HealthChecker for MatrixOneHealthChecker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::{
-        calibration::ProgressiveCalibrator, entity::EntityGraph, learning::PipelineLearningWriter,
-        pattern::PatternLibrary,
+    use astra_pipeline::{
+        calibration::ProgressiveCalibrator, entity::EntityGraph, pattern::PatternLibrary,
     };
+    use astra_turn_core::pipeline_learning::PipelineLearningWriter;
     use std::sync::Mutex;
 
     fn make_test_learning_writer() -> Arc<dyn TurnLearningWriter> {

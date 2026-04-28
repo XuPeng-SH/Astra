@@ -19,8 +19,6 @@ use uuid::Uuid;
 use super::*;
 
 mod admin_handlers;
-pub mod agent_mailbox;
-pub mod agent_mcp;
 mod audit_handlers;
 mod auth_handlers;
 mod bridge_prep;
@@ -29,13 +27,10 @@ pub mod conflict_resolver;
 pub mod delegation_engine;
 mod delegation_handlers;
 mod edge_callback_handlers;
-pub mod edge_connection_pool;
 mod edge_status_handler;
 mod edge_ws_handler;
-pub mod edge_ws_protocol;
 pub(crate) mod header_utils;
 mod http_helpers;
-mod http_types;
 mod learning_handlers;
 mod llm_trusted_domains_handlers;
 mod meta_handlers;
@@ -56,20 +51,11 @@ mod state_builder;
 mod task_handlers;
 mod team_handlers;
 pub mod team_orchestrator;
-pub mod worktree_isolation;
-pub mod ws_approval_gate;
 mod ws_handler;
-pub mod ws_progress_callback;
-pub mod ws_user_prompt_gate;
 
-use self::{
-    bridge_prep::prepare_chat_turn_bridge_body,
-    chat_route::{ChatRouteResponse, classify_chat_route},
-    http_helpers::*,
-    http_types::*,
-};
-
-mod chat_route;
+use self::{bridge_prep::prepare_chat_turn_bridge_body, http_helpers::*};
+use astra_server_types::*;
+use astra_server_types::{ChatRouteResponse, classify_chat_route};
 mod completions;
 
 pub use request_trace::RequestTrace;
@@ -109,7 +95,9 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
     // reach the safety guards. Defaults to Strict; only flipped if the
     // operator explicitly sets `[safety] trust_mode = "trusted"` in
     // runtime.toml.
-    crate::apply_safety_config_from_runtime_config(&crate::runtime_config::RuntimeConfig::load());
+    crate::apply_safety_config_from_runtime_config(
+        &astra_config::runtime_config::RuntimeConfig::load(),
+    );
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let settings = AppSettings::from_env()?;
@@ -250,6 +238,8 @@ fn spawn_data_cleanup(
     })
 }
 
+pub use astra_server_types::edge_connection_pool;
+
 #[cfg(test)]
 mod tests {
     /// U1: build_app must set a DefaultBodyLimit to prevent OOM from
@@ -259,6 +249,7 @@ mod tests {
     #[test]
     fn build_app_has_body_size_limit() {
         let source = include_str!("mod.rs");
+
         let test_start = source.find("#[cfg(test)]").unwrap_or(source.len());
         let prod_code = &source[..test_start];
         assert!(
@@ -271,6 +262,7 @@ mod tests {
     #[test]
     fn shutdown_drains_background_tasks() {
         let source = include_str!("mod.rs");
+
         let test_start = source.find("#[cfg(test)]").unwrap_or(source.len());
         let prod_code = &source[..test_start];
         assert!(

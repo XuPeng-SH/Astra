@@ -71,7 +71,7 @@ pub(crate) struct ReplState {
     pub last_response: Option<String>,
     /// Session-scoped file edit journal — shared with ToolExecutors for undo.
     pub file_journal:
-        std::sync::Arc<std::sync::Mutex<astra_runtime::turn::file_edit_journal::FileEditJournal>>,
+        std::sync::Arc<std::sync::Mutex<astra_turn_core::file_edit_journal::FileEditJournal>>,
     /// Session-scoped file-state cache — shared with ToolExecutors so
     /// read-before-write tracking persists across turns.
     pub file_state: crate::edge_tools::SharedFileState,
@@ -121,7 +121,7 @@ pub(crate) struct ReplState {
     pub skill_dev: Option<SkillDevState>,
     pub active_system_skills: Vec<prompts::SystemSkill>,
     /// Runtime configuration loaded from config files + env vars (M3).
-    pub runtime_config: astra_runtime::runtime_config::RuntimeConfig,
+    pub runtime_config: astra_config::runtime_config::RuntimeConfig,
     pub context_budget: prompts::ContextBudget,
     pub journal: Option<session_journal::JournalWriter>,
     /// Tools used in the last turn — fed into selection for recency boost.
@@ -137,9 +137,9 @@ pub(crate) struct ReplState {
     /// Local task service for /task commands.
     pub task_service: Option<std::sync::Arc<astra_services::LocalTaskService>>,
     /// Cross-session tool health data for error budget persistence.
-    pub tool_health_entries: Vec<astra_runtime::pipeline::persistence::ToolHealthEntry>,
+    pub tool_health_entries: Vec<astra_evolution::persistence::ToolHealthEntry>,
     /// Last successfully synced tool health snapshot, used to compute deltas.
-    pub synced_tool_health_entries: Vec<astra_runtime::pipeline::persistence::ToolHealthEntry>,
+    pub synced_tool_health_entries: Vec<astra_evolution::persistence::ToolHealthEntry>,
     /// Cross-session quality tracker shared with the tool selector so REPL
     /// save path can export cumulative per-tool selection/quality counters.
     pub tool_quality_tracker:
@@ -172,24 +172,21 @@ pub(crate) struct ReplState {
     pub last_turn_event: Option<session_journal::JournalEvent>,
     /// Shared pattern library reference for /learn command.
     pub pattern_library:
-        Option<std::sync::Arc<std::sync::Mutex<astra_runtime::pipeline::pattern::PatternLibrary>>>,
+        Option<std::sync::Arc<std::sync::Mutex<astra_pipeline::pattern::PatternLibrary>>>,
     /// Shared entity graph (learning feedback loop + post-login cloud pull).
-    pub entity_graph:
-        Option<std::sync::Arc<std::sync::Mutex<astra_runtime::pipeline::entity::EntityGraph>>>,
+    pub entity_graph: Option<std::sync::Arc<std::sync::Mutex<astra_pipeline::entity::EntityGraph>>>,
     /// Shared calibrator (learning feedback loop + post-login cloud pull).
     pub calibrator: Option<
-        std::sync::Arc<
-            std::sync::Mutex<astra_runtime::pipeline::calibration::ProgressiveCalibrator>,
-        >,
+        std::sync::Arc<std::sync::Mutex<astra_pipeline::calibration::ProgressiveCalibrator>>,
     >,
     /// Unified skill registry (single source of truth for all skill resolution).
     pub unified_skill_registry: std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
     /// Session-scoped skill quality tracker for learning loop.
-    pub skill_quality_tracker: astra_runtime::skills::quality::SkillQualityTracker,
+    pub skill_quality_tracker: astra_skills::quality::SkillQualityTracker,
     /// Session-scoped skill surfacing config for dynamic tuning.
     pub skill_search: astra_core::SkillSearchSettings,
     /// Skill auto-improvement tracker — detects user corrections and proposes SKILL.md rewrites.
-    pub skill_improvement_tracker: astra_runtime::skills::improvement::ImprovementTracker,
+    pub skill_improvement_tracker: astra_skills::improvement::ImprovementTracker,
     /// Skills pinned by the user — always included in budget (never truncated).
     pub pinned_skills: std::collections::HashSet<String>,
     /// Skills surfaced by `discover_skills` during this REPL session.
@@ -242,16 +239,15 @@ pub(crate) struct ReplState {
     /// Injected into every turn's effective message as `<project_instructions>`.
     pub project_instructions: Option<String>,
     /// Shared messaging metrics (populated when delegation is active).
-    pub messaging_metrics: Option<std::sync::Arc<astra_runtime::messaging::MessagingMetrics>>,
+    pub messaging_metrics: Option<std::sync::Arc<astra_messaging::MessagingMetrics>>,
     /// Shared dead letter queue (populated when delegation is active).
-    pub dead_letter_queue:
-        Option<std::sync::Arc<astra_runtime::messaging::dead_letter::DeadLetterQueue>>,
+    pub dead_letter_queue: Option<std::sync::Arc<astra_messaging::dead_letter::DeadLetterQueue>>,
     /// Dynamic agent spawner for runtime agent creation.
     pub agent_spawner: Option<std::sync::Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
     /// Persistent top-level mailbox so spawned agents can reply across turns.
-    pub root_mailbox: Option<astra_runtime::messaging::router::AgentMailbox>,
+    pub root_mailbox: Option<astra_messaging::router::AgentMailbox>,
     /// Replies received while the REPL is idle at the prompt. Flushed only at safe redraw points.
-    pub pending_idle_agent_messages: Vec<std::sync::Arc<astra_runtime::messaging::AgentMessage>>,
+    pub pending_idle_agent_messages: Vec<std::sync::Arc<astra_messaging::AgentMessage>>,
 
     // ── Drift tracking ──
     /// Redo stack — stores undone turns for `/redo` recovery.
@@ -301,11 +297,11 @@ pub(crate) struct ReplState {
 
     // ── User Profile (M5) ──
     /// User profile manager for preferences and scenario detection.
-    pub user_profile_manager: std::sync::Arc<astra_runtime::user_profile::UserProfileManager>,
+    pub user_profile_manager: std::sync::Arc<astra_config::user_profile::UserProfileManager>,
 
     // ── Auto-Tuning (M6) ──
     /// Auto-tuning engine for adaptive learning.
-    pub auto_tuning_engine: std::sync::Arc<astra_runtime::auto_tuning::AutoTuningEngine>,
+    pub auto_tuning_engine: std::sync::Arc<astra_learning::auto_tuning::AutoTuningEngine>,
 
     // ── Evolution ──
     /// Shared evolution service for multi-axis self-evolution.
@@ -325,7 +321,7 @@ impl Default for ReplState {
             turn: 0,
             last_response: None,
             file_journal: std::sync::Arc::new(std::sync::Mutex::new(
-                astra_runtime::turn::file_edit_journal::FileEditJournal::default(),
+                astra_turn_core::file_edit_journal::FileEditJournal::default(),
             )),
             file_state: std::sync::Arc::new(
                 std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -366,7 +362,7 @@ impl Default for ReplState {
             active_system_skills: Vec::new(),
             // Load RuntimeConfig from config files + env vars, then create
             // ContextBudget using the loaded config (M3 wiring).
-            runtime_config: { astra_runtime::runtime_config::RuntimeConfig::load() },
+            runtime_config: { astra_config::runtime_config::RuntimeConfig::load() },
             // Temporary: will be replaced with from_runtime_config when model is known
             context_budget: prompts::ContextBudget::default(),
             journal: None,
@@ -399,10 +395,9 @@ impl Default for ReplState {
             entity_graph: None,
             calibrator: None,
             unified_skill_registry: astra_runtime::skills::default_unified_registry().clone(),
-            skill_quality_tracker: astra_runtime::skills::quality::SkillQualityTracker::new(),
+            skill_quality_tracker: astra_skills::quality::SkillQualityTracker::new(),
             skill_search: astra_core::SkillSearchSettings::default(),
-            skill_improvement_tracker: astra_runtime::skills::improvement::ImprovementTracker::new(
-            ),
+            skill_improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
             pinned_skills: std::collections::HashSet::new(),
             discovered_skills: std::collections::HashSet::new(),
             mcp_manager: std::sync::Arc::new(tokio::sync::RwLock::new(
@@ -427,11 +422,9 @@ impl Default for ReplState {
             plan_thinking_pane: None,
             project_instructions: None,
             // Create shared messaging infrastructure eagerly so /messaging always has data
-            messaging_metrics: Some(std::sync::Arc::new(
-                astra_runtime::messaging::MessagingMetrics::new(),
-            )),
+            messaging_metrics: Some(std::sync::Arc::new(astra_messaging::MessagingMetrics::new())),
             dead_letter_queue: Some(std::sync::Arc::new(
-                astra_runtime::messaging::dead_letter::DeadLetterQueue::new(),
+                astra_messaging::dead_letter::DeadLetterQueue::new(),
             )),
             agent_spawner: None, // Created lazily when spawn_agent is first used
             root_mailbox: None,
@@ -450,13 +443,13 @@ impl Default for ReplState {
             pending_goal_progress: None,
             user_profile_manager: {
                 let store =
-                    std::sync::Arc::new(astra_runtime::user_profile::UserProfileStore::new());
-                std::sync::Arc::new(astra_runtime::user_profile::UserProfileManager::new(store))
+                    std::sync::Arc::new(astra_config::user_profile::UserProfileStore::new());
+                std::sync::Arc::new(astra_config::user_profile::UserProfileManager::new(store))
             },
             auto_tuning_engine: {
-                let engine = astra_runtime::auto_tuning::AutoTuningEngine::new();
+                let engine = astra_learning::auto_tuning::AutoTuningEngine::new();
                 // Add default evolution rules
-                for rule in astra_runtime::auto_tuning::default_rules() {
+                for rule in astra_learning::auto_tuning::default_rules() {
                     engine.add_rule(rule);
                 }
                 std::sync::Arc::new(engine)

@@ -27,9 +27,9 @@ use serde_json::{Value, json};
 use super::compaction::{
     CompactBoundary, CompactResult, CompactTrigger, compact_tiered_with_result,
 };
-use super::summary::SummaryLlmClient;
 use crate::prompts::{CompactConfig, CompactionTier};
-use crate::str_preview::truncate_str;
+use astra_text_utils::str_preview::truncate_str;
+use astra_turn_core::cloud_summary::SummaryLlmClient;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -105,7 +105,7 @@ pub struct MemoriaCompactParams {
     /// Optional session facts for facts-first compaction (L1a ground truth).
     /// When present, `build_facts_first_injection()` is used as the primary
     /// memory context, with Memoria narrative as supplement.
-    pub session_facts: Option<super::session_facts::SessionFacts>,
+    pub session_facts: Option<astra_turn_types::session_facts::SessionFacts>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1019,7 +1019,7 @@ pub async fn compact_with_memoria(
         && let Some(s_client) = summary_client
         && cfg.should_summarize(params.tier)
     {
-        match super::summary::generate_compact_summary(messages, s_client).await {
+        match astra_turn_core::cloud_summary::generate_compact_summary(messages, s_client).await {
             Some(summary) => {
                 let summary = truncate_summary_for_budget(summary, cfg.summary_token_budget);
                 let summary_msg = json!({
@@ -1057,7 +1057,7 @@ pub async fn compact_with_memoria(
                             &semantic_content,
                             "semantic",
                             Some(sid),
-                            Some(crate::prompts::memory_proto::TIER_INFERRED),
+                            Some(astra_prompts::memory_proto::TIER_INFERRED),
                         )
                         .await
                     {
@@ -1499,7 +1499,7 @@ mod tests {
 
     #[tokio::test]
     async fn compact_facts_first_uses_session_facts() {
-        use super::super::session_facts::{ErrorFact, FileEntry, SessionFacts};
+        use astra_turn_types::session_facts::{ErrorFact, FileEntry, SessionFacts};
         let msgs = vec![
             user("implement OAuth"),
             assistant("I'll help with OAuth"),
@@ -1593,7 +1593,7 @@ mod tests {
 
     #[tokio::test]
     async fn compact_facts_first_works_without_narrative() {
-        use super::super::session_facts::{FileEntry, SessionFacts};
+        use astra_turn_types::session_facts::{FileEntry, SessionFacts};
         let msgs = vec![user("hello"), assistant("hi")];
         let config = MemoriaCompactConfig {
             min_tokens_for_retrieval: 100,
@@ -1684,13 +1684,13 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl super::super::summary::SummaryLlmClient for MockSummaryClient {
+    impl astra_turn_core::cloud_summary::SummaryLlmClient for MockSummaryClient {
         async fn summarize(
             &self,
             _messages: &[Value],
-        ) -> Result<super::super::summary::SummaryResponse, String> {
+        ) -> Result<astra_turn_core::cloud_summary::SummaryResponse, String> {
             match self.response.lock().unwrap().as_ref() {
-                Some(text) => Ok(super::super::summary::SummaryResponse {
+                Some(text) => Ok(astra_turn_core::cloud_summary::SummaryResponse {
                     text: text.clone(),
                     is_ptl_error: false,
                 }),
@@ -1744,7 +1744,7 @@ mod tests {
             &params,
             Some(&mock),
             Some(&compact_config),
-            Some(&summary_client as &dyn super::super::summary::SummaryLlmClient),
+            Some(&summary_client as &dyn astra_turn_core::cloud_summary::SummaryLlmClient),
         )
         .await;
 
@@ -1799,7 +1799,7 @@ mod tests {
             &params,
             Some(&mock),
             Some(&compact_config),
-            Some(&summary_client as &dyn super::super::summary::SummaryLlmClient),
+            Some(&summary_client as &dyn astra_turn_core::cloud_summary::SummaryLlmClient),
         )
         .await;
 
@@ -1848,7 +1848,7 @@ mod tests {
             &params,
             Some(&mock),
             Some(&compact_config),
-            Some(&summary_client as &dyn super::super::summary::SummaryLlmClient),
+            Some(&summary_client as &dyn astra_turn_core::cloud_summary::SummaryLlmClient),
         )
         .await;
 
@@ -1896,7 +1896,7 @@ mod tests {
             &params,
             Some(&mock),
             Some(&compact_config),
-            Some(&summary_client as &dyn super::super::summary::SummaryLlmClient),
+            Some(&summary_client as &dyn astra_turn_core::cloud_summary::SummaryLlmClient),
         )
         .await;
 
@@ -2530,7 +2530,7 @@ mod tests {
             &params,
             Some(&mock),
             Some(&compact_config),
-            Some(&summary_client as &dyn super::super::summary::SummaryLlmClient),
+            Some(&summary_client as &dyn astra_turn_core::cloud_summary::SummaryLlmClient),
         )
         .await;
 
@@ -2600,7 +2600,7 @@ mod tests {
             &params,
             Some(&mock),
             Some(&compact_config),
-            Some(&summary_client as &dyn super::super::summary::SummaryLlmClient),
+            Some(&summary_client as &dyn astra_turn_core::cloud_summary::SummaryLlmClient),
         )
         .await;
 

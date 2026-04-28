@@ -28,6 +28,7 @@
 
 // Re-export core skill types from astra-skills crate.
 // These are the standalone, service-independent types.
+pub use astra_skills::executor;
 pub use astra_skills::{
     activation, arguments, composition, hooks, loader, manifest, pack, quality, traits, version,
 };
@@ -37,12 +38,8 @@ pub use astra_skills::{
 pub use astra_skills::providers::{bundled, local, mcp};
 
 // Runtime-specific modules that depend on astra-services or other runtime types.
-pub mod executor;
 pub mod handlers;
-pub mod improvement;
-pub mod providers;
 pub mod registry;
-pub mod verify;
 pub mod watcher;
 
 // Re-export HTTP handlers at the module root for backward compatibility

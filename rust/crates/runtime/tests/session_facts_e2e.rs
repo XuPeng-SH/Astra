@@ -10,11 +10,11 @@ use astra_runtime::turn::cloud::memoria_compact::{
     SessionMemoryFileCombine, compact_with_memoria,
 };
 use astra_runtime::turn::cloud::session_end_governance::*;
-use astra_runtime::turn::cloud::session_facts::*;
-use astra_runtime::turn::cloud::session_memory_extract::*;
 use astra_runtime::turn::cloud::session_memory_protocol::*;
-use astra_runtime::turn::microcompact::*;
 use astra_services::session_journal::{JournalEvent, JournalEventType, ToolCallRecord};
+use astra_turn_core::cloud_session_memory_extract::*;
+use astra_turn_core::microcompact::*;
+use astra_turn_types::session_facts::*;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -140,7 +140,7 @@ fn assistant_with_tool_call(call_id: &str, tool_name: &str) -> Value {
 /// Simulates a 10-turn coding session: build facts incrementally, persist L1
 /// narrative to Memoria, compact with facts-first, then run session-end governance.
 #[tokio::test]
-#[ignore]
+#[ignore = "requires live Memoria"]
 async fn e2e_full_session_lifecycle() {
     let mut ctx = require_memoria!();
 
@@ -202,7 +202,7 @@ async fn e2e_full_session_lifecycle() {
         make_event(10, vec![make_tc("bash", true, None)], 2000, None),
     ];
     for event in &turns {
-        astra_runtime::turn::cloud::session_facts::update_from_journal_event(&mut facts, event);
+        astra_turn_core::cloud_session_facts::update_from_journal_event(&mut facts, event);
     }
     facts.set_plan_state(Some(PlanFact {
         goal: "Add OAuth support".to_string(),
@@ -355,7 +355,7 @@ async fn e2e_full_session_lifecycle() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires live Memoria"]
 async fn e2e_cross_validation_skips_contradicted_narrative() {
     let ctx = require_memoria!();
 
@@ -414,7 +414,7 @@ async fn e2e_cross_validation_skips_contradicted_narrative() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
-#[ignore]
+#[ignore = "requires live Memoria"]
 fn e2e_error_trigger_captures_corrections_before_compaction() {
     // Simulate: session at 15K tokens, last extraction at 12K, only 1 tool call since.
     // Normal threshold NOT met. But an error occurred → should trigger.
@@ -452,7 +452,7 @@ fn e2e_error_trigger_captures_corrections_before_compaction() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
-#[ignore]
+#[ignore = "requires live Memoria"]
 fn e2e_microcompact_pins_active_files_under_pressure() {
     let mut facts = SessionFacts {
         turn: 20,
@@ -525,7 +525,7 @@ fn e2e_microcompact_pins_active_files_under_pressure() {
 
 /// Memoria is down during compaction — should fall back to truncation, not crash.
 #[tokio::test]
-#[ignore]
+#[ignore = "requires live Memoria"]
 async fn unhappy_memoria_down_during_compaction() {
     // Use a client pointing to a non-existent URL
     let bad_client = HttpMemoriaClient::new(
@@ -595,7 +595,7 @@ async fn unhappy_memoria_down_during_compaction() {
 
 /// Session-end governance with Memoria down — should not crash, report 0.
 #[tokio::test]
-#[ignore]
+#[ignore = "requires live Memoria"]
 async fn unhappy_session_end_memoria_down() {
     let bad_client = HttpMemoriaClient::new(
         "http://localhost:1/nonexistent".to_string(),
@@ -622,7 +622,7 @@ async fn unhappy_session_end_memoria_down() {
 
 /// Empty session — no facts, no narrative, no crash.
 #[tokio::test]
-#[ignore]
+#[ignore = "requires live Memoria"]
 async fn unhappy_empty_session_compaction() {
     let ctx = require_memoria!();
 
@@ -683,7 +683,7 @@ async fn unhappy_empty_session_compaction() {
 
 /// Malformed narrative in Memoria — should not crash, use facts only.
 #[tokio::test]
-#[ignore]
+#[ignore = "requires live Memoria"]
 async fn unhappy_malformed_narrative_in_memoria() {
     let mut ctx = require_memoria!();
 
@@ -760,7 +760,7 @@ async fn unhappy_malformed_narrative_in_memoria() {
 
 /// ToolCallRecord without file_path field (backward compat with old journals).
 #[test]
-#[ignore]
+#[ignore = "requires live Memoria"]
 fn unhappy_old_journal_without_file_path() {
     // Simulate deserializing an old journal entry without file_path
     let old_json = r#"{
@@ -779,7 +779,7 @@ fn unhappy_old_journal_without_file_path() {
     event.turn = Some(1);
     event.tokens_in = Some(1000);
     event.tool_calls = Some(vec![tc]);
-    astra_runtime::turn::cloud::session_facts::update_from_journal_event(&mut facts, &event);
+    astra_turn_core::cloud_session_facts::update_from_journal_event(&mut facts, &event);
 
     assert_eq!(facts.active_files.len(), 1);
     assert_eq!(facts.active_files[0].path, "src/lib.rs");
@@ -787,7 +787,7 @@ fn unhappy_old_journal_without_file_path() {
 
 /// SessionFacts serialization round-trip (for checkpoint persistence).
 #[test]
-#[ignore]
+#[ignore = "requires live Memoria"]
 fn e2e_session_facts_serde_roundtrip() {
     let mut facts = SessionFacts {
         turn: 15,
@@ -826,7 +826,7 @@ fn e2e_session_facts_serde_roundtrip() {
 
 /// Concurrent facts updates don't lose data.
 #[test]
-#[ignore]
+#[ignore = "requires live Memoria"]
 fn e2e_rapid_facts_updates_no_data_loss() {
     let mut facts = SessionFacts::default();
 
@@ -842,7 +842,7 @@ fn e2e_rapid_facts_updates_no_data_loss() {
             None
         };
         let event = make_event(i, tcs, 1000, error);
-        astra_runtime::turn::cloud::session_facts::update_from_journal_event(&mut facts, &event);
+        astra_turn_core::cloud_session_facts::update_from_journal_event(&mut facts, &event);
     }
 
     assert_eq!(facts.turn, 50);

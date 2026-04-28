@@ -11,41 +11,43 @@
 //! NOT from embeddings. With only ~23 tools, keyword coverage + intent rules
 //! achieve high accuracy without ML dependencies.
 
-pub mod chain;
-mod meta;
-pub mod plugin;
+pub use astra_turn_core::tool_registry_meta::{IntentType, Scope, TOOL_CATALOG, ToolMeta};
+
 mod registry;
-mod report;
 pub mod scoring;
-mod selection_edge_hints;
-pub mod state;
 pub mod tool_pool;
 
-pub use chain::{ChainContext, ChainStep, ToolChain};
-pub use meta::{IntentType, Scope, TOOL_CATALOG, ToolMeta};
+pub use astra_turn_core::tool_registry_chain::{ChainContext, ChainStep, ToolChain};
+pub use astra_turn_core::tool_registry_report::{
+    SelectionFeedback, SelectionReport, ToolQualityTracker,
+};
+pub use astra_turn_core::tool_registry_selection_edge_hints::{
+    apply_selector_hints_to_edge_profile, top_unpinned_tool_names_from_report,
+};
+pub use astra_turn_core::tool_registry_state::ConversationState;
 pub use plugin::{PluginRegistry, PluginToolEntry};
 pub use registry::ToolRegistry;
-pub use report::{SelectionFeedback, SelectionReport, ToolQualityTracker};
 pub use scoring::{
     DEFAULT_TOOL_BUDGET_TOKENS, pre_filter_dynamic, pre_filter_dynamic_calibrated,
     pre_filter_dynamic_with_memory, pre_filter_dynamic_with_outcome_bias,
     pre_filter_dynamic_with_pressure, pre_filter_dynamic_with_quality, tfidf_score,
 };
-pub use selection_edge_hints::{
-    apply_selector_hints_to_edge_profile, top_unpinned_tool_names_from_report,
-};
-pub use state::ConversationState;
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
+
+pub use astra_turn_core::tool_registry_chain as chain;
+pub use astra_turn_core::tool_registry_plugin as plugin;
+pub use astra_turn_core::tool_registry_report as report;
+pub use astra_turn_core::tool_registry_state as state;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::text_tokenize::tokenize;
+    use astra_text_utils::text_tokenize::tokenize;
+    use astra_turn_core::tool_registry_state::word_boundary_match;
     use scoring::tfidf_score;
     use serde_json::Value;
     use serde_json::json;
-    use state::word_boundary_match;
     fn mock_schemas() -> Vec<Value> {
         // Build schemas matching TOOL_CATALOG names
         TOOL_CATALOG
@@ -887,7 +889,7 @@ mod tests {
         assert_eq!(disambig.conflict_score, 0.8, "fetch+mutate should conflict");
         assert_eq!(
             disambig.recommendation,
-            crate::turn::routing_metrics::DisambiguationAction::WidenToolSelection
+            astra_turn_core::routing_metrics::DisambiguationAction::WidenToolSelection
         );
     }
 
@@ -934,7 +936,7 @@ mod tests {
 
     #[test]
     fn calibrator_lowers_threshold_for_high_correction_rate() {
-        use crate::turn::routing_metrics::ConfidenceCalibrator;
+        use astra_turn_core::routing_metrics::ConfidenceCalibrator;
         let cal = ConfidenceCalibrator::new(0.7);
         // Record 10 github selections, 8 were corrected (80% correction rate)
         for _ in 0..10 {
@@ -954,7 +956,7 @@ mod tests {
 
     #[test]
     fn calibrated_prefilter_includes_more_tools_with_corrections() {
-        use crate::turn::routing_metrics::ConfidenceCalibrator;
+        use astra_turn_core::routing_metrics::ConfidenceCalibrator;
 
         let state = ConversationState::from_message("list open PRs in matrixone", 3);
 
@@ -985,7 +987,7 @@ mod tests {
 
     #[test]
     fn calibrator_no_effect_with_insufficient_data() {
-        use crate::turn::routing_metrics::ConfidenceCalibrator;
+        use astra_turn_core::routing_metrics::ConfidenceCalibrator;
         let cal = ConfidenceCalibrator::new(0.7);
         // Only 3 records — below the 5-minimum
         for _ in 0..3 {
@@ -1064,7 +1066,7 @@ mod tests {
 
     #[test]
     fn calibrator_100_percent_correction_clamps_at_min() {
-        use crate::turn::routing_metrics::ConfidenceCalibrator;
+        use astra_turn_core::routing_metrics::ConfidenceCalibrator;
         let cal = ConfidenceCalibrator::new(0.7);
         // 100% correction rate
         for _ in 0..20 {
@@ -1091,7 +1093,7 @@ mod tests {
 
     #[test]
     fn disambiguation_five_intents_has_high_conflict() {
-        use crate::turn::routing_metrics::disambiguate_intents;
+        use astra_turn_core::routing_metrics::disambiguate_intents;
         let disambig = disambiguate_intents(true, true, true, true, true, false);
         assert!(
             disambig.conflict_score >= 0.3,
