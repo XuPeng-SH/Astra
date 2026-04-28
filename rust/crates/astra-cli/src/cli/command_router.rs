@@ -2133,6 +2133,78 @@ fn execute_config_command(cmd: ConfigCmd) -> Result<(), String> {
         ConfigCmd::List => config_list(),
         ConfigCmd::Get(args) => config_get(&args.key),
         ConfigCmd::Set(args) => config_set(&args.key, &args.value),
+        ConfigCmd::ShowPolicy(args) => config_show_policy(args.model.as_deref(), args.json),
+    }
+}
+
+fn config_show_policy(model: Option<&str>, json: bool) -> Result<(), String> {
+    let cfg = astra_runtime::runtime_config::RuntimeConfig::load();
+    let policy = cfg.tool_selection.resolve_for_model(model);
+    let trust_mode = match cfg.safety.resolved_trust_mode() {
+        astra_runtime::runtime_config::TrustModeSerde::Strict => "strict",
+        astra_runtime::runtime_config::TrustModeSerde::Trusted => "trusted",
+    };
+    let rejected = cfg.tool_selection.rejected_model_match_patterns();
+    println!(
+        "{}",
+        format_policy_output(model, &policy, trust_mode, &rejected, json)
+    );
+    Ok(())
+}
+
+/// Render a resolved [`EffectiveToolPolicy`] as either JSON or human text.
+///
+/// Kept as a pure function of inputs so it can be unit-tested without
+/// shelling out to the binary or touching the filesystem.
+///
+/// `rejected_patterns` is the list of `model_profiles.model_match` values
+/// that were silently ignored at resolve time because they were too short
+/// (see `ToolSelectionConfig::rejected_model_match_patterns`). When
+/// non-empty, they're surfaced so users can spot misconfigs.
+fn format_policy_output(
+    model: Option<&str>,
+    policy: &astra_runtime::runtime_config::EffectiveToolPolicy,
+    trust_mode: &str,
+    rejected_patterns: &[String],
+    json: bool,
+) -> String {
+    if json {
+        let payload = serde_json::json!({
+            "model": model,
+            "trust_mode": trust_mode,
+            "max_identical_tool_calls": policy.max_identical_tool_calls,
+            "max_tools_per_turn": policy.max_tools_per_turn,
+            "repeated_cache_hit_suppression": policy.repeated_cache_hit_suppression,
+            "max_consecutive_empty_name": policy.max_consecutive_empty_name,
+            // Always present as an array (possibly empty) so json consumers
+            // never have to special-case the absent-vs-empty case.
+            "rejected_model_match_patterns": rejected_patterns,
+        });
+        serde_json::to_string_pretty(&payload)
+            .unwrap_or_else(|_| "{\"error\": \"failed to serialize policy\"}".to_string())
+    } else {
+        let label = model.unwrap_or("<global defaults — no model>");
+        let mut out = format!(
+            "Resolved workflow-guard policy for {label}:\n\
+             \n  trust_mode                     = {trust_mode}\
+             \n  max_identical_tool_calls       = {}\
+             \n  max_tools_per_turn             = {}\
+             \n  repeated_cache_hit_suppression = {}\
+             \n  max_consecutive_empty_name     = {}\n",
+            policy.max_identical_tool_calls,
+            policy.max_tools_per_turn,
+            policy.repeated_cache_hit_suppression,
+            policy.max_consecutive_empty_name,
+        );
+        if !rejected_patterns.is_empty() {
+            out.push_str(
+                "\n⚠  rejected model_match patterns (too short, ignored at resolve time):\n",
+            );
+            for p in rejected_patterns {
+                out.push_str(&format!("    - \"{p}\"\n"));
+            }
+        }
+        out
     }
 }
 
@@ -2796,6 +2868,165 @@ mod arg_render_tests {
     fn bare_permissions_command_renders_empty_arg_for_mode_cycle() {
         let args = PermissionsArgs { command: None };
         assert_eq!(render_permissions_args(&args), "");
+    }
+}
+
+#[cfg(test)]
+mod show_policy_tests {
+    use super::*;
+    use astra_runtime::runtime_config::EffectiveToolPolicy;
+
+    fn fake_policy() -> EffectiveToolPolicy {
+        EffectiveToolPolicy {
+            max_identical_tool_calls: 4,
+            max_tools_per_turn: 20,
+            repeated_cache_hit_suppression: 4,
+            max_consecutive_empty_name: 3,
+        }
+    }
+
+    #[test]
+    fn human_output_includes_all_four_guard_fields_and_model_label() {
+        let out = format_policy_output(Some("opus"), &fake_policy(), "strict", &[], false);
+        assert!(out.contains("opus"), "model label missing: {out}");
+        assert!(
+            out.contains("max_identical_tool_calls"),
+            "field name missing: {out}"
+        );
+        assert!(out.contains("= 4"), "opus's value 4 missing: {out}");
+        assert!(out.contains("max_tools_per_turn"), "field missing: {out}");
+        assert!(out.contains("= 20"), "opus's value 20 missing: {out}");
+        assert!(
+            out.contains("repeated_cache_hit_suppression"),
+            "field missing: {out}"
+        );
+        assert!(
+            out.contains("max_consecutive_empty_name"),
+            "field missing: {out}"
+        );
+        assert!(
+            out.contains("trust_mode") && out.contains("strict"),
+            "trust_mode row missing: {out}"
+        );
+    }
+
+    #[test]
+    fn human_output_shows_trusted_mode_when_configured() {
+        let out = format_policy_output(Some("opus"), &fake_policy(), "trusted", &[], false);
+        assert!(
+            out.contains("trust_mode") && out.contains("trusted"),
+            "expected trust_mode=trusted line: {out}"
+        );
+    }
+
+    #[test]
+    fn human_output_without_model_shows_global_defaults_label() {
+        let out = format_policy_output(None, &fake_policy(), "strict", &[], false);
+        assert!(
+            out.contains("global defaults"),
+            "no-model label missing: {out}"
+        );
+    }
+
+    #[test]
+    fn json_output_is_parseable_and_contains_expected_keys() {
+        let out = format_policy_output(Some("haiku"), &fake_policy(), "strict", &[], true);
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("json output must parse");
+        assert_eq!(parsed["model"], "haiku");
+        assert_eq!(parsed["trust_mode"], "strict");
+        assert_eq!(parsed["max_identical_tool_calls"], 4);
+        assert_eq!(parsed["max_tools_per_turn"], 20);
+        assert_eq!(parsed["repeated_cache_hit_suppression"], 4);
+        assert_eq!(parsed["max_consecutive_empty_name"], 3);
+    }
+
+    #[test]
+    fn json_output_with_none_model_yields_json_null() {
+        let out = format_policy_output(None, &fake_policy(), "strict", &[], true);
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(parsed["model"].is_null());
+    }
+
+    #[test]
+    fn config_show_policy_end_to_end_opus_hits_builtin_profile() {
+        // End-to-end: load config, resolve, format. Asserts the whole
+        // wiring works — not just the string formatter. Opus's built-in
+        // profile is 4 / 20 / 4 / 3 (see
+        // `ToolSelectionConfig::builtin_model_profiles`).
+        let cfg = astra_runtime::runtime_config::RuntimeConfig::load();
+        let policy = cfg.tool_selection.resolve_for_model(Some("opus"));
+        let human = format_policy_output(Some("opus"), &policy, "strict", &[], false);
+        assert!(human.contains("= 4"), "expected 4s for opus: {human}");
+        assert!(human.contains("= 20"), "expected 20 for opus: {human}");
+
+        let json = format_policy_output(Some("opus"), &policy, "strict", &[], true);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["max_identical_tool_calls"], 4);
+        assert_eq!(parsed["max_tools_per_turn"], 20);
+    }
+
+    #[test]
+    fn human_output_surfaces_rejected_short_patterns() {
+        // When the config has model_profiles with patterns shorter than
+        // MIN_MODEL_MATCH_LEN, they're silently ignored at resolve time
+        // but `show-policy` must call it out so the user can spot the
+        // misconfig. Pattern is surfaced verbatim (quoted).
+        let out = format_policy_output(
+            Some("opus"),
+            &fake_policy(),
+            "strict",
+            &["4".to_string(), "op".to_string()],
+            false,
+        );
+        assert!(
+            out.contains("rejected"),
+            "expected 'rejected' warning in output: {out}"
+        );
+        assert!(out.contains("\"4\""), "pattern not quoted: {out}");
+        assert!(out.contains("\"op\""), "pattern not quoted: {out}");
+    }
+
+    #[test]
+    fn human_output_has_no_warning_block_when_no_rejections() {
+        // Don't add a warning section when everything is clean — the output
+        // should be identical to the pre-feature version.
+        let out = format_policy_output(Some("opus"), &fake_policy(), "strict", &[], false);
+        assert!(
+            !out.to_lowercase().contains("rejected"),
+            "output should not contain 'rejected' when no short patterns: {out}"
+        );
+    }
+
+    #[test]
+    fn json_output_includes_rejected_patterns_array() {
+        let out = format_policy_output(
+            Some("opus"),
+            &fake_policy(),
+            "strict",
+            &["4".to_string()],
+            true,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let rejected = parsed["rejected_model_match_patterns"]
+            .as_array()
+            .expect("rejected_model_match_patterns must be an array");
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0], "4");
+    }
+
+    #[test]
+    fn json_output_rejected_patterns_empty_array_when_clean() {
+        // Always present as an array — never missing / null — so json
+        // consumers don't have to special-case the absent-vs-empty case.
+        let out = format_policy_output(Some("opus"), &fake_policy(), "strict", &[], true);
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            parsed["rejected_model_match_patterns"]
+                .as_array()
+                .expect("must be array")
+                .len(),
+            0
+        );
     }
 }
 

@@ -63,6 +63,70 @@ pub struct RuntimeConfig {
     /// Adaptive tuning engine parameters (cooldowns, cycle intervals).
     #[serde(default)]
     pub adaptive_tuning: AdaptiveTuningConfig,
+
+    /// Safety-guard configuration.
+    ///
+    /// Controls shell-obfuscation guard relaxation for trusted local
+    /// environments. Defaults to Strict — never flip this silently.
+    #[serde(default)]
+    pub safety: SafetyConfig,
+}
+
+/// Safety-guard configuration.
+///
+/// Kept deliberately small — this struct is a contract between config files
+/// and the runtime. The `trust_mode` field maps 1:1 to
+/// `astra_turn_core::safety_middleware::TrustMode`.
+///
+/// `trust_mode` is `Option<TrustModeSerde>` so config layering can
+/// distinguish three cases:
+/// - `None` — layer didn't mention safety; defer to earlier layers / default.
+/// - `Some(Strict)` — layer explicitly wants Strict; overrides an earlier
+///   `Some(Trusted)` so a project-level config can re-tighten a local opt-in.
+/// - `Some(Trusted)` — layer explicitly opts in to relaxed checks.
+///
+/// Callers that just want the effective mode should use
+/// [`SafetyConfig::resolved_trust_mode`].
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SafetyConfig {
+    /// Raw trust-mode field from TOML. Use [`Self::resolved_trust_mode`]
+    /// to read the effective value with the default applied.
+    ///
+    /// - `"strict"` — all rules fire. Safe for any environment.
+    /// - `"trusted"` — opt-in developer-local relaxation of high-false-positive
+    ///   rules (command substitution). Prompt-injection defenses still apply.
+    ///
+    /// Unknown values fail to parse (no silent fallback).
+    #[serde(default)]
+    pub trust_mode: Option<TrustModeSerde>,
+}
+
+impl SafetyConfig {
+    /// Effective trust mode, applying the Strict default when unset.
+    ///
+    /// This is what the runtime and CLI should consult — the `Option` is
+    /// only load-bearing for config merging (see the merge semantics in
+    /// [`RuntimeConfig::merge`]).
+    #[must_use]
+    pub fn resolved_trust_mode(&self) -> TrustModeSerde {
+        self.trust_mode.unwrap_or_default()
+    }
+}
+
+/// Serializable trust-mode string. Matches the snake-case variants of
+/// `astra_turn_core::safety_middleware::TrustMode`.
+///
+/// `Copy` + `Hash` + `Ord` are free for a unit-variant enum and let this
+/// value be used as a map key, passed by value on hot paths, and sorted
+/// without a custom impl. No invariants depend on the absence of these.
+#[derive(
+    Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustModeSerde {
+    #[default]
+    Strict,
+    Trusted,
 }
 
 fn default_config_version() -> String {
@@ -83,6 +147,7 @@ impl Default for RuntimeConfig {
             memory_pressure: MemoryPressureConfig::default(),
             context_window: ContextWindowConfig::default(),
             adaptive_tuning: AdaptiveTuningConfig::default(),
+            safety: SafetyConfig::default(),
         }
     }
 }
@@ -389,16 +454,188 @@ pub struct ToolSelectionConfig {
     /// corrective. 0 = use default (3).
     #[serde(default)]
     pub exploration_family_churn_midloop_threshold: u32,
+
+    /// Per-model overrides for workflow-guard thresholds.
+    ///
+    /// Matched against the request's `model` field. The first matching profile
+    /// wins; fields left at 0 fall back to the global `ToolSelectionConfig`
+    /// defaults. Typical layout:
+    ///
+    /// ```toml
+    /// [[tool_selection.model_profiles]]
+    /// model_match = "opus"            # prefix match on model id
+    /// max_identical_tool_calls = 4
+    ///
+    /// [[tool_selection.model_profiles]]
+    /// model_match = "haiku"
+    /// max_identical_tool_calls = 2
+    /// ```
+    ///
+    /// Built-in defaults are seeded from [`ToolSelectionConfig::builtin_model_profiles`]
+    /// when no user profiles match; explicit user entries always take priority.
+    #[serde(default)]
+    pub model_profiles: Vec<ModelPolicyProfile>,
+}
+
+/// Per-model override for workflow-guard thresholds.
+///
+/// A profile only tunes workflow guards (dedup, turn budget, empty-name stall).
+/// Security guards (`shell_obfuscation`, `destructive_sql`) are never affected
+/// — those protect against prompt injection and must stay uniform across models.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ModelPolicyProfile {
+    /// Model match pattern. Matched as a case-insensitive substring against
+    /// the request's `model` id. `"opus"` matches `"claude-opus-4-7"`,
+    /// `"us.anthropic.claude-opus-4-6-v1"`, etc.
+    ///
+    /// Empty string matches any model (use as a fallback profile).
+    #[serde(default)]
+    pub model_match: String,
+
+    /// Override for `max_identical_tool_calls`. 0 = inherit from the global
+    /// [`ToolSelectionConfig`].
+    #[serde(default)]
+    pub max_identical_tool_calls: u32,
+
+    /// Override for `max_tools_per_turn`. 0 = inherit.
+    #[serde(default)]
+    pub max_tools_per_turn: u32,
+
+    /// After this many consecutive cache-hit suppressions on identical args,
+    /// the pipeline switches to hard-refusal instead of a soft hint.
+    /// 0 = inherit. Replaces the former hardcoded
+    /// `REPEATED_CACHE_HIT_SUPPRESSION_THRESHOLD` (was 2).
+    #[serde(default)]
+    pub repeated_cache_hit_suppression: u32,
+
+    /// Abort a headless round after this many consecutive empty-name tool
+    /// calls from the model. 0 = inherit. Replaces the former hardcoded
+    /// `MAX_CONSECUTIVE_EMPTY_NAME` (was 3).
+    #[serde(default)]
+    pub max_consecutive_empty_name: u32,
+}
+
+/// Resolved per-model workflow-guard policy.
+///
+/// Returned by [`ToolSelectionConfig::resolve_for_model`]. All fields are
+/// concrete (no sentinel zeros) — callers can use them directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EffectiveToolPolicy {
+    pub max_identical_tool_calls: u32,
+    pub max_tools_per_turn: u32,
+    /// How many times the same cached (tool, args) may be suppressed with a
+    /// soft hint before switching to hard-refusal.
+    pub repeated_cache_hit_suppression: u32,
+    /// Abort headless round after this many consecutive empty-name calls.
+    pub max_consecutive_empty_name: u32,
 }
 
 impl ToolSelectionConfig {
-    /// Resolved max identical tool calls (0 → default of 2).
+    /// Resolved max identical tool calls (0 → default of 3, floor of 2).
+    ///
+    /// Default raised from 2 → 3 on 2026-04-27: the prior limit fired on the
+    /// common "read → re-check after an edit" flow, which is legitimate rather
+    /// than a loop. Per-model profiles can tighten or loosen this further —
+    /// see [`ToolSelectionConfig::resolve_for_model`].
+    ///
+    /// The floor of 2 is symmetric with the per-profile floor in
+    /// `apply_profile`. A value of 1 would turn every second identical call
+    /// into a dedup hit — almost always a misconfig.
     pub fn effective_max_identical_calls(&self) -> u32 {
         if self.max_identical_tool_calls > 0 {
-            self.max_identical_tool_calls
+            self.max_identical_tool_calls.max(2)
         } else {
-            2
+            3
         }
+    }
+
+    /// Resolve workflow-guard thresholds for a given model id.
+    ///
+    /// Lookup order:
+    /// 1. Explicit user profiles in `model_profiles` (first substring match wins)
+    /// 2. Built-in profiles from [`Self::builtin_model_profiles`]
+    /// 3. Global defaults from `effective_*` methods
+    ///
+    /// `None` (no model id supplied) → global defaults only.
+    pub fn resolve_for_model(&self, model: Option<&str>) -> EffectiveToolPolicy {
+        let base = EffectiveToolPolicy {
+            max_identical_tool_calls: self.effective_max_identical_calls(),
+            max_tools_per_turn: self.effective_max_tools_per_turn(),
+            // Defaults raised from 2 → 3 alongside `max_identical_tool_calls`
+            // on 2026-04-27; same rationale (read-after-edit verification is
+            // legitimate, not a loop).
+            repeated_cache_hit_suppression: 3,
+            max_consecutive_empty_name: 3,
+        };
+
+        let Some(model) = model.map(str::to_ascii_lowercase) else {
+            return base;
+        };
+
+        let user_hit = self
+            .model_profiles
+            .iter()
+            .find(|p| model_profile_matches(&p.model_match, &model));
+        if let Some(profile) = user_hit {
+            return apply_profile(base, profile);
+        }
+
+        let builtin_hit = Self::builtin_model_profiles()
+            .iter()
+            .find(|p| model_profile_matches(&p.model_match, &model));
+        if let Some(profile) = builtin_hit {
+            return apply_profile(base, profile);
+        }
+
+        base
+    }
+
+    /// Built-in per-model profiles, used when the user has not configured a
+    /// matching `model_profiles` entry.
+    ///
+    /// Keep this list small and defensible. Rule of thumb: stronger models
+    /// (less prone to loops) get more rope; weaker/cheaper models stay at
+    /// conservative defaults. Security guards are unaffected.
+    pub fn builtin_model_profiles() -> &'static [ModelPolicyProfile] {
+        // Note: `Default::default()` can't be used in a const context, but
+        // the list is small enough that an explicit literal is clearest.
+        static PROFILES: std::sync::OnceLock<Vec<ModelPolicyProfile>> = std::sync::OnceLock::new();
+        PROFILES.get_or_init(|| {
+            vec![
+                // Opus 4.x — strongest Anthropic tier, least prone to loops.
+                ModelPolicyProfile {
+                    model_match: "opus".to_string(),
+                    max_identical_tool_calls: 4,
+                    max_tools_per_turn: 20,
+                    repeated_cache_hit_suppression: 4,
+                    max_consecutive_empty_name: 3,
+                },
+                // Sonnet 4.x — strong mid tier.
+                ModelPolicyProfile {
+                    model_match: "sonnet-4".to_string(),
+                    max_identical_tool_calls: 4,
+                    max_tools_per_turn: 18,
+                    repeated_cache_hit_suppression: 4,
+                    max_consecutive_empty_name: 3,
+                },
+                // Haiku — fast tier, keep conservative to catch derps early.
+                ModelPolicyProfile {
+                    model_match: "haiku".to_string(),
+                    max_identical_tool_calls: 2,
+                    max_tools_per_turn: 12,
+                    repeated_cache_hit_suppression: 2,
+                    max_consecutive_empty_name: 2,
+                },
+                // GPT-5 / o-series — treat as strong tier.
+                ModelPolicyProfile {
+                    model_match: "gpt-5".to_string(),
+                    max_identical_tool_calls: 4,
+                    max_tools_per_turn: 20,
+                    repeated_cache_hit_suppression: 4,
+                    max_consecutive_empty_name: 3,
+                },
+            ]
+        })
     }
 
     /// Resolved max tools per turn (0 → default of 15, floor of 5).
@@ -486,6 +723,86 @@ fn resolve_threshold(value: u32, default: u32, floor: u32) -> u32 {
     if value > 0 { value.max(floor) } else { default }
 }
 
+/// Minimum pattern length for a non-empty [`ModelPolicyProfile::model_match`].
+///
+/// Shorter patterns are almost always a misconfig (`"4"` would match any
+/// model containing a `4`, `"us"` would match every Bedrock id, etc.).
+/// Rejected patterns are silently ignored at resolve time — use
+/// [`ToolSelectionConfig::rejected_model_match_patterns`] to surface them
+/// (e.g. `astra config show-policy` prints a warning block for each).
+const MIN_MODEL_MATCH_LEN: usize = 3;
+
+/// Case-insensitive substring match for [`ModelPolicyProfile::model_match`].
+///
+/// Rules:
+/// - Empty pattern → matches any model (explicit fallback-profile sentinel).
+/// - Pattern shorter than [`MIN_MODEL_MATCH_LEN`] (non-empty) → never
+///   matches; treated as a misconfig. See the constant's docs for rationale.
+/// - Otherwise → case-insensitive substring match.
+fn model_profile_matches(pattern: &str, model_lower: &str) -> bool {
+    if pattern.is_empty() {
+        return true;
+    }
+    if pattern.chars().count() < MIN_MODEL_MATCH_LEN {
+        return false;
+    }
+    model_lower.contains(&pattern.to_ascii_lowercase())
+}
+
+impl ToolSelectionConfig {
+    /// Return every `model_match` pattern in `model_profiles` that is too
+    /// short to be considered at resolve time (see [`MIN_MODEL_MATCH_LEN`]).
+    ///
+    /// These patterns match nothing — intended to surface them through
+    /// user-facing tooling (e.g. `astra config show-policy`) so the user
+    /// can notice the misconfig. The empty-string fallback pattern is
+    /// intentionally accepted and not reported.
+    pub fn rejected_model_match_patterns(&self) -> Vec<String> {
+        self.model_profiles
+            .iter()
+            .filter(|p| {
+                !p.model_match.is_empty() && p.model_match.chars().count() < MIN_MODEL_MATCH_LEN
+            })
+            .map(|p| p.model_match.clone())
+            .collect()
+    }
+}
+
+/// Apply a profile's non-zero fields over a base policy.
+///
+/// Each field has a floor to defend against user typos:
+/// - `max_identical_tool_calls` floor 2 — a value of 1 would make every
+///   second tool call a dedup hit. Matches the haiku built-in's lower bound.
+/// - `max_tools_per_turn` floor 5 — prevents pathological starvation.
+/// - `repeated_cache_hit_suppression` floor 1 — 0 would effectively disable
+///   the guard.
+/// - `max_consecutive_empty_name` floor 1 — 0 would abort on the very first
+///   empty-name call.
+fn apply_profile(base: EffectiveToolPolicy, profile: &ModelPolicyProfile) -> EffectiveToolPolicy {
+    EffectiveToolPolicy {
+        max_identical_tool_calls: if profile.max_identical_tool_calls > 0 {
+            profile.max_identical_tool_calls.max(2)
+        } else {
+            base.max_identical_tool_calls
+        },
+        max_tools_per_turn: if profile.max_tools_per_turn > 0 {
+            profile.max_tools_per_turn.max(5)
+        } else {
+            base.max_tools_per_turn
+        },
+        repeated_cache_hit_suppression: if profile.repeated_cache_hit_suppression > 0 {
+            profile.repeated_cache_hit_suppression.max(1)
+        } else {
+            base.repeated_cache_hit_suppression
+        },
+        max_consecutive_empty_name: if profile.max_consecutive_empty_name > 0 {
+            profile.max_consecutive_empty_name.max(1)
+        } else {
+            base.max_consecutive_empty_name
+        },
+    }
+}
+
 fn default_max_tools() -> u32 {
     30
 }
@@ -522,6 +839,7 @@ impl Default for ToolSelectionConfig {
             redundant_validation_retries_eval_threshold: 0,
             cache_waste_midloop_threshold: 0,
             exploration_family_churn_midloop_threshold: 0,
+            model_profiles: Vec::new(),
         }
     }
 }
@@ -939,6 +1257,7 @@ impl RuntimeConfig {
             memory_pressure,
             context_window,
             adaptive_tuning,
+            safety,
         } = other;
 
         merge_if_non_default(&mut self.version, version, default_config_version());
@@ -1048,6 +1367,7 @@ impl RuntimeConfig {
             redundant_validation_retries_eval_threshold,
             cache_waste_midloop_threshold,
             exploration_family_churn_midloop_threshold,
+            model_profiles,
         } = tool_selection;
         merge_if_non_default(
             &mut self.tool_selection.max_tools,
@@ -1151,6 +1471,11 @@ impl RuntimeConfig {
             exploration_family_churn_midloop_threshold,
             0,
         );
+        // model_profiles: non-empty override replaces; empty preserves existing.
+        // Merging by model_match would be ambiguous when patterns overlap.
+        if !model_profiles.is_empty() {
+            self.tool_selection.model_profiles = model_profiles;
+        }
 
         let LearningConfig {
             enabled,
@@ -1374,6 +1699,14 @@ impl RuntimeConfig {
             default_tuning_cycle_interval(),
         );
 
+        // SafetyConfig: last layer with an explicit trust_mode wins.
+        // Unset (None) preserves the earlier layer's value. This makes the
+        // merge symmetric — a project config can both opt *in* to Trusted
+        // AND opt *back out* to Strict on top of a Trusted user config.
+        if safety.trust_mode.is_some() {
+            self.safety = safety;
+        }
+
         self
     }
 
@@ -1425,13 +1758,50 @@ mod tests {
     #[test]
     fn test_effective_max_identical_calls() {
         let mut config = ToolSelectionConfig::default();
-        assert_eq!(config.effective_max_identical_calls(), 2);
+        // Default raised from 2 → 3 on 2026-04-27 (see
+        // `effective_max_identical_calls` doc).
+        assert_eq!(config.effective_max_identical_calls(), 3);
 
         config.max_identical_tool_calls = 5;
         assert_eq!(config.effective_max_identical_calls(), 5);
 
+        // Floor applied: 1 would make every second identical call a dedup
+        // hit (see `apply_profile` for the matching per-model floor).
         config.max_identical_tool_calls = 1;
-        assert_eq!(config.effective_max_identical_calls(), 1);
+        assert_eq!(
+            config.effective_max_identical_calls(),
+            2,
+            "global max_identical_tool_calls = 1 must clamp to floor 2, \
+             mirroring the per-model floor in `apply_profile`"
+        );
+    }
+
+    /// The symmetry regression — this asserts the global and per-profile
+    /// floors behave the same when both set `max_identical_tool_calls = 1`.
+    /// Before the fix, `apply_profile` clamped to 2 but the global path
+    /// returned 1 verbatim.
+    #[test]
+    fn global_and_profile_floors_for_max_identical_calls_agree() {
+        let cfg = ToolSelectionConfig {
+            max_identical_tool_calls: 1,
+            ..Default::default()
+        };
+        let global = cfg.effective_max_identical_calls();
+
+        let mut cfg2 = ToolSelectionConfig::default();
+        cfg2.model_profiles.push(ModelPolicyProfile {
+            model_match: "custom".to_string(),
+            max_identical_tool_calls: 1,
+            ..Default::default()
+        });
+        let via_profile = cfg2
+            .resolve_for_model(Some("custom-model"))
+            .max_identical_tool_calls;
+
+        assert_eq!(
+            global, via_profile,
+            "floor must be symmetric between global and per-profile paths"
+        );
     }
 
     #[test]
@@ -1569,6 +1939,7 @@ mod tests {
                 redundant_validation_retries_eval_threshold: 0,
                 cache_waste_midloop_threshold: 0,
                 exploration_family_churn_midloop_threshold: 0,
+                model_profiles: Vec::new(),
             },
             learning: LearningConfig {
                 enabled: false,
@@ -1620,6 +1991,7 @@ mod tests {
                 budget_cooldown_turns: 6,
                 tuning_cycle_interval: 8,
             },
+            safety: SafetyConfig::default(),
         });
 
         assert_eq!(merged.version, "2.0");
@@ -1903,5 +2275,381 @@ selector_model = "qwen-flash"
         assert_eq!(super::resolve_threshold(2, 5, 2), 2);
         // floor of 1 (validation retries case)
         assert_eq!(super::resolve_threshold(1, 2, 1), 1);
+    }
+
+    #[test]
+    fn effective_max_identical_calls_default_is_three() {
+        // Raised from 2 on 2026-04-27 — update the doc in
+        // `effective_max_identical_calls` if this changes.
+        let cfg = ToolSelectionConfig::default();
+        assert_eq!(cfg.effective_max_identical_calls(), 3);
+    }
+
+    #[test]
+    fn resolve_for_model_without_model_id_uses_global_default() {
+        let cfg = ToolSelectionConfig::default();
+        let policy = cfg.resolve_for_model(None);
+        assert_eq!(policy.max_identical_tool_calls, 3);
+        assert_eq!(policy.max_tools_per_turn, 15);
+    }
+
+    #[test]
+    fn resolve_for_model_hits_builtin_opus_profile() {
+        let cfg = ToolSelectionConfig::default();
+        // Full Bedrock-style id with "opus" embedded.
+        let policy = cfg.resolve_for_model(Some("us.anthropic.claude-opus-4-7-v1"));
+        assert_eq!(policy.max_identical_tool_calls, 4);
+        assert_eq!(policy.max_tools_per_turn, 20);
+    }
+
+    #[test]
+    fn resolve_for_model_builtin_haiku_keeps_conservative() {
+        let cfg = ToolSelectionConfig::default();
+        let policy = cfg.resolve_for_model(Some("claude-haiku-4-5-20251001"));
+        assert_eq!(policy.max_identical_tool_calls, 2);
+        assert_eq!(policy.max_tools_per_turn, 12);
+    }
+
+    #[test]
+    fn resolve_for_model_unknown_falls_back_to_global() {
+        let cfg = ToolSelectionConfig::default();
+        let policy = cfg.resolve_for_model(Some("some-obscure-model-id"));
+        // No built-in match → global defaults (3 / 15).
+        assert_eq!(policy.max_identical_tool_calls, 3);
+        assert_eq!(policy.max_tools_per_turn, 15);
+    }
+
+    #[test]
+    fn resolve_for_model_user_profile_overrides_builtin() {
+        let mut cfg = ToolSelectionConfig::default();
+        cfg.model_profiles.push(ModelPolicyProfile {
+            model_match: "opus".to_string(),
+            max_identical_tool_calls: 8,
+            max_tools_per_turn: 0, // 0 → inherit global
+            ..Default::default()
+        });
+        let policy = cfg.resolve_for_model(Some("claude-opus-4-7"));
+        // User override wins over built-in.
+        assert_eq!(policy.max_identical_tool_calls, 8);
+        // Field left at 0 inherits the global default (not the built-in 20).
+        assert_eq!(policy.max_tools_per_turn, 15);
+    }
+
+    #[test]
+    fn resolve_for_model_empty_pattern_matches_any() {
+        let mut cfg = ToolSelectionConfig::default();
+        cfg.model_profiles.push(ModelPolicyProfile {
+            model_match: String::new(),
+            max_identical_tool_calls: 7,
+            max_tools_per_turn: 0,
+            ..Default::default()
+        });
+        let policy = cfg.resolve_for_model(Some("anything-at-all"));
+        assert_eq!(policy.max_identical_tool_calls, 7);
+    }
+
+    #[test]
+    fn resolve_for_model_match_is_case_insensitive() {
+        let cfg = ToolSelectionConfig::default();
+        let policy = cfg.resolve_for_model(Some("CLAUDE-OPUS-4-7"));
+        assert_eq!(policy.max_identical_tool_calls, 4);
+    }
+
+    #[test]
+    fn resolve_for_model_floor_applied_to_user_override() {
+        // Floor of 5 for max_tools_per_turn — defense against misconfig.
+        let mut cfg = ToolSelectionConfig::default();
+        cfg.model_profiles.push(ModelPolicyProfile {
+            model_match: "custom".to_string(),
+            max_identical_tool_calls: 0,
+            max_tools_per_turn: 2, // below floor
+            ..Default::default()
+        });
+        let policy = cfg.resolve_for_model(Some("custom-model"));
+        assert_eq!(policy.max_tools_per_turn, 5);
+    }
+
+    #[test]
+    fn resolve_for_model_rejects_too_short_pattern_as_footgun() {
+        // `model_match = "4"` would match any model containing a "4"
+        // (claude-opus-4-7, gpt-4, etc.) — almost certainly a misconfig
+        // rather than intent. Require ≥ 3 chars. Empty string stays the
+        // explicit fallback-profile sentinel and is unaffected.
+        let mut cfg = ToolSelectionConfig::default();
+        cfg.model_profiles.push(ModelPolicyProfile {
+            model_match: "4".to_string(),
+            max_identical_tool_calls: 99,
+            ..Default::default()
+        });
+        // Should NOT match — too-short pattern ignored.
+        let policy = cfg.resolve_for_model(Some("claude-opus-4-7"));
+        assert_ne!(
+            policy.max_identical_tool_calls, 99,
+            "single-char pattern must not match — it's a footgun"
+        );
+        // Built-in opus profile should still win.
+        assert_eq!(policy.max_identical_tool_calls, 4);
+    }
+
+    #[test]
+    fn resolve_for_model_rejects_two_char_pattern() {
+        // Boundary: "op" is still too short (most pathological match cases
+        // — "o", "4", "us" — are 1–2 chars).
+        let mut cfg = ToolSelectionConfig::default();
+        cfg.model_profiles.push(ModelPolicyProfile {
+            model_match: "op".to_string(),
+            max_identical_tool_calls: 99,
+            ..Default::default()
+        });
+        let policy = cfg.resolve_for_model(Some("claude-opus-4-7"));
+        assert_ne!(policy.max_identical_tool_calls, 99);
+    }
+
+    #[test]
+    fn resolve_for_model_accepts_three_char_pattern() {
+        // Boundary: 3 chars is the minimum allowed — "gpt", "opus" minus
+        // one, etc. Honoring this lets users target narrower model families.
+        let mut cfg = ToolSelectionConfig::default();
+        cfg.model_profiles.push(ModelPolicyProfile {
+            model_match: "4-7".to_string(),
+            max_identical_tool_calls: 7,
+            ..Default::default()
+        });
+        let policy = cfg.resolve_for_model(Some("claude-opus-4-7"));
+        assert_eq!(policy.max_identical_tool_calls, 7);
+    }
+
+    #[test]
+    fn resolve_for_model_floor_applied_to_max_identical_tool_calls() {
+        // A user profile with max_identical_tool_calls = 1 would turn every
+        // tool call after the first into a "duplicate" — indistinguishable
+        // from "disable tool use entirely after N=1". That's almost
+        // certainly a misconfig; clamp to the lowest value any built-in
+        // profile uses (2, matching haiku).
+        let mut cfg = ToolSelectionConfig::default();
+        cfg.model_profiles.push(ModelPolicyProfile {
+            model_match: "custom".to_string(),
+            max_identical_tool_calls: 1,
+            ..Default::default()
+        });
+        let policy = cfg.resolve_for_model(Some("custom-model"));
+        assert_eq!(
+            policy.max_identical_tool_calls, 2,
+            "max_identical_tool_calls=1 should be clamped to floor 2"
+        );
+    }
+
+    #[test]
+    fn resolve_for_model_empty_pattern_still_works_as_fallback() {
+        // Regression guard: after tightening the min-length check, the
+        // empty-string fallback-profile pattern must still match any model.
+        let mut cfg = ToolSelectionConfig::default();
+        cfg.model_profiles.push(ModelPolicyProfile {
+            model_match: String::new(),
+            max_identical_tool_calls: 9,
+            ..Default::default()
+        });
+        let policy = cfg.resolve_for_model(Some("anything"));
+        assert_eq!(policy.max_identical_tool_calls, 9);
+    }
+
+    #[test]
+    fn rejected_model_match_patterns_lists_short_patterns_preserves_order() {
+        // Intent: `show-policy` can read this list verbatim and tell the
+        // user "these patterns are being ignored".
+        let mut cfg = ToolSelectionConfig::default();
+        for p in ["4", "op", "opus", "", "us"] {
+            cfg.model_profiles.push(ModelPolicyProfile {
+                model_match: p.to_string(),
+                ..Default::default()
+            });
+        }
+        let rejected = cfg.rejected_model_match_patterns();
+        // Short non-empty patterns surfaced, in declaration order.
+        // "opus" (valid) and "" (explicit fallback) must be filtered out.
+        assert_eq!(
+            rejected,
+            vec!["4".to_string(), "op".to_string(), "us".to_string()]
+        );
+    }
+
+    #[test]
+    fn rejected_model_match_patterns_empty_when_all_valid() {
+        let mut cfg = ToolSelectionConfig::default();
+        cfg.model_profiles.push(ModelPolicyProfile {
+            model_match: "gpt-5".to_string(),
+            ..Default::default()
+        });
+        assert!(cfg.rejected_model_match_patterns().is_empty());
+    }
+
+    #[test]
+    fn model_profiles_round_trip_through_toml() {
+        let mut cfg = RuntimeConfig::default();
+        cfg.tool_selection.model_profiles.push(ModelPolicyProfile {
+            model_match: "gpt-5".to_string(),
+            max_identical_tool_calls: 6,
+            max_tools_per_turn: 25,
+            repeated_cache_hit_suppression: 0,
+            max_consecutive_empty_name: 0,
+        });
+        let toml = cfg.to_toml().unwrap();
+        assert!(toml.contains("model_profiles"));
+        assert!(toml.contains("gpt-5"));
+        let parsed: RuntimeConfig = toml::from_str(&toml).unwrap();
+        let profile = &parsed.tool_selection.model_profiles[0];
+        assert_eq!(profile.model_match, "gpt-5");
+        assert_eq!(profile.max_identical_tool_calls, 6);
+    }
+
+    #[test]
+    fn safety_config_defaults_to_strict_trust_mode() {
+        // TrustMode::Strict is the safe default. Shipping with Trusted would
+        // turn a fail-closed guard into fail-open — never do that implicitly.
+        let cfg = RuntimeConfig::default();
+        // The resolved value is what every caller reads.
+        assert_eq!(cfg.safety.resolved_trust_mode(), TrustModeSerde::Strict);
+    }
+
+    #[test]
+    fn safety_config_default_has_no_explicit_trust_mode() {
+        // `resolved_trust_mode()` defaults to Strict, but the raw field
+        // distinguishes "unset" from "explicit strict" — this matters for
+        // merge semantics (see the merge tests).
+        let cfg = RuntimeConfig::default();
+        assert!(
+            cfg.safety.trust_mode.is_none(),
+            "default must be None so layered configs can explicitly set Strict too"
+        );
+    }
+
+    /// `TrustModeSerde` is a unit-variant enum — making it `Copy` avoids
+    /// `.clone()` on the read path and is a typical shape for small
+    /// config enums. This is a compile-time assertion; if `Copy` is
+    /// dropped, `fn requires<T: Copy>() {}` stops compiling.
+    #[test]
+    fn trust_mode_serde_is_copy() {
+        fn requires_copy<T: Copy>() {}
+        requires_copy::<TrustModeSerde>();
+    }
+
+    #[test]
+    fn safety_trust_mode_parses_from_toml() {
+        let toml = r#"
+            version = "1.0"
+            [safety]
+            trust_mode = "trusted"
+        "#;
+        let parsed: RuntimeConfig = toml::from_str(toml).unwrap();
+        assert_eq!(parsed.safety.resolved_trust_mode(), TrustModeSerde::Trusted);
+        assert_eq!(parsed.safety.trust_mode, Some(TrustModeSerde::Trusted));
+    }
+
+    #[test]
+    fn safety_trust_mode_explicit_strict_parses_as_some() {
+        // "strict" in the TOML must round-trip as Some(Strict), not None —
+        // so a later merge can use the explicit intent.
+        let toml = r#"
+            version = "1.0"
+            [safety]
+            trust_mode = "strict"
+        "#;
+        let parsed: RuntimeConfig = toml::from_str(toml).unwrap();
+        assert_eq!(parsed.safety.trust_mode, Some(TrustModeSerde::Strict));
+    }
+
+    #[test]
+    fn safety_trust_mode_rejects_unknown_values_by_serde() {
+        let toml = r#"
+            version = "1.0"
+            [safety]
+            trust_mode = "yolo"
+        "#;
+        let result: Result<RuntimeConfig, _> = toml::from_str(toml);
+        assert!(result.is_err(), "unknown trust_mode should fail to parse");
+    }
+
+    #[test]
+    fn safety_merge_project_trusted_overrides_user_strict() {
+        // Layered: user = unset (Strict), project = explicit Trusted.
+        // Later layer wins (standard config convention).
+        let user = RuntimeConfig::default();
+        let mut project = RuntimeConfig::default();
+        project.safety.trust_mode = Some(TrustModeSerde::Trusted);
+
+        let merged = user.merge(project);
+        assert_eq!(merged.safety.resolved_trust_mode(), TrustModeSerde::Trusted);
+    }
+
+    #[test]
+    fn safety_merge_project_strict_overrides_user_trusted() {
+        // The formerly-broken direction: user set Trusted, project explicitly
+        // wants Strict. Project must win — a checked-in project config
+        // should be able to re-tighten a locally-loose user setting.
+        let mut user = RuntimeConfig::default();
+        user.safety.trust_mode = Some(TrustModeSerde::Trusted);
+
+        let mut project = RuntimeConfig::default();
+        project.safety.trust_mode = Some(TrustModeSerde::Strict);
+
+        let merged = user.merge(project);
+        assert_eq!(
+            merged.safety.resolved_trust_mode(),
+            TrustModeSerde::Strict,
+            "explicit Strict in later layer must override earlier Trusted"
+        );
+    }
+
+    #[test]
+    fn safety_merge_project_unset_preserves_user_trusted() {
+        // Project doesn't mention safety → user's explicit Trusted sticks.
+        let mut user = RuntimeConfig::default();
+        user.safety.trust_mode = Some(TrustModeSerde::Trusted);
+        let project = RuntimeConfig::default(); // unset
+
+        let merged = user.merge(project);
+        assert_eq!(merged.safety.resolved_trust_mode(), TrustModeSerde::Trusted);
+    }
+
+    #[test]
+    fn effective_policy_exposes_cache_hit_suppression_and_empty_name_limits() {
+        // Global default: suppression threshold = 3, empty-name cap = 3.
+        // These replaced the hardcoded `REPEATED_CACHE_HIT_SUPPRESSION_THRESHOLD`
+        // and `MAX_CONSECUTIVE_EMPTY_NAME` constants in the runtime pipeline.
+        let cfg = ToolSelectionConfig::default();
+        let policy = cfg.resolve_for_model(None);
+        assert_eq!(policy.repeated_cache_hit_suppression, 3);
+        assert_eq!(policy.max_consecutive_empty_name, 3);
+    }
+
+    #[test]
+    fn opus_profile_loosens_cache_hit_suppression() {
+        // Stronger models repeat reads more deliberately — give them more rope
+        // before suppression kicks in. Haiku stays tight.
+        let cfg = ToolSelectionConfig::default();
+        let opus = cfg.resolve_for_model(Some("claude-opus-4-7"));
+        assert_eq!(opus.repeated_cache_hit_suppression, 4);
+
+        let haiku = cfg.resolve_for_model(Some("claude-haiku-4-5"));
+        assert_eq!(haiku.repeated_cache_hit_suppression, 2);
+    }
+
+    #[test]
+    fn user_profile_overrides_new_fields_independently() {
+        let mut cfg = ToolSelectionConfig::default();
+        cfg.model_profiles.push(ModelPolicyProfile {
+            model_match: "custom".to_string(),
+            max_identical_tool_calls: 0,
+            max_tools_per_turn: 0,
+            repeated_cache_hit_suppression: 5,
+            max_consecutive_empty_name: 4,
+        });
+        let policy = cfg.resolve_for_model(Some("custom-model"));
+        // These two override…
+        assert_eq!(policy.repeated_cache_hit_suppression, 5);
+        assert_eq!(policy.max_consecutive_empty_name, 4);
+        // …while the zero-valued fields inherit the global default.
+        assert_eq!(policy.max_identical_tool_calls, 3);
+        assert_eq!(policy.max_tools_per_turn, 15);
     }
 }
