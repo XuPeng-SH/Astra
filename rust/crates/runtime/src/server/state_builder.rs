@@ -2,7 +2,7 @@ use super::*;
 
 /// Build the same [`AppState`] as production `astra-server` (MatrixOne, auth, in-process bridge, runs).
 ///
-/// Intended for **ignored** integration tests (`ASTRA_SYSTEM_MATRIX_E2E=1`) that hit real HTTP
+/// Intended for **ignored** integration tests (`ASTRA_DB_IT=1`) that hit real HTTP
 /// routes and assert database rows. Load `.env` / secrets the same way as local server startup.
 pub async fn build_server_state(
     settings: AppSettings,
@@ -39,6 +39,9 @@ pub async fn build_server_state(
         Arc::new(MatrixOneHealthChecker::new(settings.matrixone.clone())),
     )
     .with_shared_pool(shared_pool.clone())
+    .with_plan_repository(Arc::new(astra_plan::CloudPlanRepository::new(
+        shared_pool.get().clone(),
+    )))
     .with_auth_service(auth_service)
     .with_session_service(Arc::new(
         DatabaseSessionService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),

@@ -399,9 +399,11 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             ended_at DATETIME(6) NULL,
             last_active_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            active_plan_id VARCHAR(64) NULL,
             INDEX idx_agent_sessions_user_status_updated (user_id, status, updated_at),
             INDEX idx_agent_sessions_user_last_active (user_id, last_active_at),
-            INDEX idx_agent_sessions_agent_status (agent_id, status)
+            INDEX idx_agent_sessions_agent_status (agent_id, status),
+            INDEX idx_agent_sessions_active_plan_id (active_plan_id)
         )",
     )
     .execute(&pool)
@@ -821,6 +823,54 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             INDEX idx_tpl_user_goal_project (user_id, goal_pattern, project_type),
             INDEX idx_tpl_project_success (project_type, success_rate)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // ── Plans: cloud-authoritative plan state (user-owned, session-linked) ──
+    // `subtask_count` is denormalized so list endpoints don't need to parse
+    // `plan_json` just to render a card. Maintained by `PlanRepository::save`.
+    query(
+        "CREATE TABLE IF NOT EXISTS plans (
+            plan_id       VARCHAR(64) PRIMARY KEY,
+            user_id       VARCHAR(64) NOT NULL,
+            session_id    VARCHAR(64) NULL,
+            goal          TEXT NOT NULL,
+            phase         VARCHAR(32) NOT NULL,
+            version       BIGINT NOT NULL DEFAULT 0,
+            plan_json     LONGTEXT NOT NULL,
+            plan_md       LONGTEXT NULL,
+            progress_pct  INT NOT NULL DEFAULT 0,
+            subtask_count INT NOT NULL DEFAULT 0,
+            created_by    VARCHAR(64) NULL,
+            created_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_plans_user_updated (user_id, updated_at DESC),
+            INDEX idx_plans_session (session_id),
+            INDEX idx_plans_user_phase (user_id, phase)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // ── Plan step runs: append-only attempt chain for every subtask ──
+    query(
+        "CREATE TABLE IF NOT EXISTS plan_step_runs (
+            run_id       VARCHAR(64) PRIMARY KEY,
+            plan_id      VARCHAR(64) NOT NULL,
+            subtask_id   VARCHAR(64) NOT NULL,
+            attempt      INT NOT NULL,
+            status       VARCHAR(16) NOT NULL,
+            session_id   VARCHAR(64) NOT NULL,
+            started_at   DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            finished_at  DATETIME(6) NULL,
+            request_id   VARCHAR(64) NOT NULL,
+            error        TEXT NULL,
+            artifact_ref VARCHAR(255) NULL,
+            INDEX idx_step_runs_plan_started (plan_id, started_at DESC),
+            UNIQUE KEY uq_step_runs_subtask_attempt (plan_id, subtask_id, attempt),
+            INDEX idx_step_runs_session (session_id, started_at DESC)
         )",
     )
     .execute(&pool)
@@ -1366,7 +1416,34 @@ async fn run_migration(
         return Ok(());
     }
 
-    query(sql).execute(pool).await?;
+    // Idempotent migrations need tolerance for vendor-specific error codes
+    // when the target is already in the desired state:
+    //   * 1060 — ALTER ADD COLUMN on an existing column (fresh DB where
+    //     CREATE TABLE already installed it).
+    //   * 1061 — ALTER ADD INDEX on an existing index (same reason).
+    //   * 1091 — MySQL's "Can't DROP; check column/key exists".
+    //   * 20101 — MatrixOne's internal error for the same DROP-missing case.
+    //   * 1062 — duplicate key value on an index being added; handled by
+    //     explicit dedupe migrations, not here.
+    //
+    // MySQL's SQLSTATE is a generic "HY000" for these; the real signal is
+    // the numeric error code, which we read via downcast to the driver's
+    // `MySqlDatabaseError`.
+    match query(sql).execute(pool).await {
+        Ok(_) => {}
+        Err(sqlx::Error::Database(db_err)) => {
+            let number = db_err
+                .try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>()
+                .map(|e| e.number());
+            if matches!(number, Some(1060) | Some(1061) | Some(1091) | Some(20101)) {
+                // Already present (or already absent for DROP) — fresh DB
+                // created the schema via CREATE TABLE. Record and continue.
+            } else {
+                return Err(sqlx::Error::Database(db_err));
+            }
+        }
+        Err(e) => return Err(e),
+    }
 
     query("INSERT IGNORE INTO schema_migrations (version, description) VALUES (?, ?)")
         .bind(version)
@@ -1391,6 +1468,84 @@ async fn run_migrations(pool: &sqlx::Pool<MySql>) -> Result<(), sqlx::Error> {
         2,
         "add covering index on skills_registry for listing queries",
         "SELECT 1", // index already in CREATE TABLE above; marker only
+    )
+    .await?;
+
+    run_migration(
+        pool,
+        3,
+        "add active_plan_id to agent_sessions for plan-mode linkage",
+        "ALTER TABLE agent_sessions ADD COLUMN active_plan_id VARCHAR(64) NULL",
+    )
+    .await?;
+
+    run_migration(
+        pool,
+        4,
+        "add subtask_count to plans for denormalized list rendering",
+        "ALTER TABLE plans ADD COLUMN subtask_count INT NOT NULL DEFAULT 0",
+    )
+    .await?;
+
+    // Index on active_plan_id covers the cascade clear in `delete_plan` and
+    // `set_active_plan` (`UPDATE agent_sessions SET active_plan_id = NULL
+    // WHERE active_plan_id = ?`). Without it, every plan deletion triggers a
+    // full table scan of `agent_sessions`.
+    run_migration(
+        pool,
+        5,
+        "add index on agent_sessions.active_plan_id for cascade clears",
+        "ALTER TABLE agent_sessions \
+         ADD INDEX idx_agent_sessions_active_plan_id (active_plan_id)",
+    )
+    .await?;
+
+    // Enforce uniqueness on (plan_id, subtask_id, attempt). Two concurrent
+    // `redo_step` calls would each compute `next_attempt = max+1` from a
+    // stale read and both insert the same tuple; the UNIQUE index makes
+    // exactly one INSERT win so `record_step_run` can surface a Conflict.
+    //
+    // Migrations 6-8 are sequenced for safety on DBs that already
+    // accumulated duplicates under the prior non-unique index:
+    //   6: drop the old non-unique index (1091/20101 tolerance covers the
+    //      fresh-DB case where CREATE TABLE never installed it).
+    //   7: DELETE duplicate rows, keeping the lexicographically smallest
+    //      run_id per (plan_id, subtask_id, attempt). Idempotent — on a
+    //      DB with no dupes this is a no-op DELETE.
+    //   8: ADD UNIQUE. With 7 finished no 1062 can occur; the 1061
+    //      tolerance handles fresh DBs whose CREATE TABLE already installed
+    //      the unique key.
+    run_migration(
+        pool,
+        6,
+        "drop non-unique idx_step_runs_subtask_attempt before upgrading to UNIQUE",
+        "ALTER TABLE plan_step_runs DROP INDEX idx_step_runs_subtask_attempt",
+    )
+    .await?;
+
+    run_migration(
+        pool,
+        7,
+        "dedupe plan_step_runs on (plan_id, subtask_id, attempt) keeping oldest run_id",
+        // MatrixOne silently no-ops the MySQL `DELETE t FROM t JOIN ...`
+        // form, so we use a NOT IN subquery. Plain MySQL also forbids
+        // SELECT from the same target table in a direct subquery, which we
+        // dodge by wrapping the GROUP BY in a derived table.
+        "DELETE FROM plan_step_runs WHERE run_id NOT IN ( \
+             SELECT keep_id FROM ( \
+                 SELECT MIN(run_id) AS keep_id FROM plan_step_runs \
+                 GROUP BY plan_id, subtask_id, attempt \
+             ) keep \
+         )",
+    )
+    .await?;
+
+    run_migration(
+        pool,
+        8,
+        "add UNIQUE (plan_id, subtask_id, attempt) on plan_step_runs",
+        "ALTER TABLE plan_step_runs \
+         ADD UNIQUE KEY uq_step_runs_subtask_attempt (plan_id, subtask_id, attempt)",
     )
     .await?;
 
