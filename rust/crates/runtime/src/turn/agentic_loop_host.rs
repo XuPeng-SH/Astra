@@ -453,6 +453,9 @@ pub struct StallTrackingState {
     /// How many stall correction nudges have been injected this loop.
     /// Limits nudge frequency (at most one per stall type per session).
     pub nudge_count: u32,
+    /// Anomaly-based circuit breaker for the agentic loop.
+    /// Replaces the old countdown-based round budget phase1/phase2 logic.
+    pub circuit_breaker: astra_turn_core::loop_circuit_breaker::LoopCircuitBreaker,
     /// Rolling-stats guardrail auto-tuner for the auto-reflection signal
     /// threshold. Observes per-turn outcomes and adjusts the threshold by
     /// ±1 (bounded to `[MIN, MAX]`) so Astra reacts faster when failures
@@ -626,6 +629,10 @@ pub struct AgenticLoopState {
     /// When set, the loop intercepts `delegate` tool calls and routes them
     /// through the delegation engine instead of the headless tool round.
     pub delegation_engine: Option<Arc<crate::server::delegation_engine::DelegationEngine>>,
+    /// Number of delegations executed in the current turn. Used to prevent
+    /// runaway delegation loops where the parent agent keeps delegating
+    /// without synthesizing results.
+    pub delegations_this_turn: u32,
 
     // ── Composite Snapshot ──
     /// Optional data snapshot provider for building composite snapshots.
@@ -1110,6 +1117,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
         api_token: String::new(),
         delegation_engine: None,
+        delegations_this_turn: 0,
         project_context: None,
         checkpoint_gate: None,
         evolution_service: None,
@@ -1462,6 +1470,7 @@ pub(crate) mod tests {
             api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             api_token: String::new(),
             delegation_engine: None,
+            delegations_this_turn: 0,
             project_context: None,
             checkpoint_gate: None,
             evolution_service: None,

@@ -6,7 +6,9 @@ use astra_runtime::tool_sandbox::{
 };
 use astra_runtime::{compensation_prompt_note, explicit_approval_reason};
 use astra_thin_client::ApprovalKind;
-use astra_turn_core::cloud_approval_policy::{CloudGatedToolKind, cloud_gated_tool_kind};
+use astra_turn_core::cloud_approval_policy::{
+    CloudGatedToolKind, bash_command_approval_reason, cloud_gated_tool_kind,
+};
 use astra_turn_core::tool_argument_hints::{
     command_hint_from_args, path_hint_from_args, permission_prompt_primary_detail,
 };
@@ -287,6 +289,58 @@ pub(super) struct PermissionManager {
 }
 
 impl PermissionManager {
+    /// Format the cloud-approval banner, appending a rationale when the
+    /// classifier can explain *why* a bash command tripped.
+    ///
+    /// For non-bash tools (or bash calls that don't carry a command string)
+    /// the banner falls back to the original `"Cloud approval required: {tool}"`
+    /// so existing UX is preserved.
+    fn cloud_approval_banner(tool: &str, detail: Option<&str>) -> String {
+        if tool == "bash" {
+            match detail {
+                Some(cmd) => match bash_command_approval_reason(cmd) {
+                    Some(reason) => {
+                        return format!(
+                            "  ☁  Cloud approval required: {tool}  ({})",
+                            reason.display()
+                        );
+                    }
+                    None => {
+                        // Contract violation: the CLI entered the cloud
+                        // approval path for a bash command, but the
+                        // classifier reports no reason to require
+                        // approval. This means `bash_command_is_read_only`
+                        // and `bash_command_approval_reason` disagree, or
+                        // the caller routed a read-only command here.
+                        // Surface loudly in dev; degrade gracefully in prod.
+                        debug_assert!(
+                            false,
+                            "bash approval banner: classifier returned None for {cmd:?} \
+                             but approval path was entered — check read-only vs approval_reason drift"
+                        );
+                        tracing::warn!(
+                            command = %cmd,
+                            "cloud_approval_banner: bash command entered approval path but \
+                             classifier reports read-only"
+                        );
+                    }
+                },
+                None => {
+                    // bash without a command string is a caller bug — the
+                    // approval prompt cannot be precise without the text.
+                    debug_assert!(
+                        false,
+                        "bash approval banner: detail=None; caller must forward the command string"
+                    );
+                    tracing::warn!(
+                        "cloud_approval_banner: bash entered approval path without command detail"
+                    );
+                }
+            }
+        }
+        format!("  ☁  Cloud approval required: {tool}")
+    }
+
     fn cloud_approval_is_explicit(approval_kind: ApprovalKind) -> bool {
         matches!(approval_kind, ApprovalKind::Explicit)
     }
@@ -532,10 +586,7 @@ impl PermissionManager {
                 PermissionMode::Auto => return ApprovalDecision::Allow,
                 PermissionMode::Prompt => {}
             }
-            eprintln!(
-                "{}",
-                format!("  ☁  Cloud approval required: {tool}").yellow()
-            );
+            eprintln!("{}", Self::cloud_approval_banner(tool, detail).yellow());
             if let Some(detail) = detail.filter(|s| !s.is_empty()) {
                 eprintln!("{}", Self::format_prompt_detail(detail).dim());
             }
@@ -582,10 +633,7 @@ impl PermissionManager {
             astra_turn_core::approval_fingerprint::DenialAction::Continue => {}
         }
 
-        eprintln!(
-            "{}",
-            format!("  ☁  Cloud approval required: {tool}").yellow()
-        );
+        eprintln!("{}", Self::cloud_approval_banner(tool, detail).yellow());
         if let Some(detail) = detail.filter(|s| !s.is_empty()) {
             eprintln!("{}", Self::format_prompt_detail(detail).dim());
         }
@@ -615,10 +663,7 @@ impl PermissionManager {
         }
         let explicit = Self::cloud_approval_is_explicit(approval_kind);
         if explicit {
-            eprintln!(
-                "{}",
-                format!("  ☁  Cloud approval required: {tool}").yellow()
-            );
+            eprintln!("{}", Self::cloud_approval_banner(tool, detail).yellow());
             if let Some(detail) = detail.filter(|s| !s.is_empty()) {
                 eprintln!("{}", Self::format_prompt_detail(detail).dim());
             }
@@ -641,10 +686,7 @@ impl PermissionManager {
                 _ => ApprovalDecision::Deny,
             };
         }
-        eprintln!(
-            "{}",
-            format!("  ☁  Cloud approval required: {tool}").yellow()
-        );
+        eprintln!("{}", Self::cloud_approval_banner(tool, detail).yellow());
         if let Some(detail) = detail.filter(|s| !s.is_empty()) {
             eprintln!("{}", Self::format_prompt_detail(detail).dim());
         }
@@ -1800,13 +1842,9 @@ fn is_read_only_allowlisted(lower_cmd: &str) -> bool {
     }
 
     // Reject code-injection vectors unconditionally — these can hide arbitrary
-    // commands inside otherwise-read-only wrappers.
-    if cmd.contains("$(")
-        || cmd.contains('`')
-        || cmd.contains("&&")
-        || cmd.contains("||")
-        || cmd.contains(';')
-    {
+    // commands inside otherwise-read-only wrappers. `&&`/`||` are delegated to
+    // the runtime read-only classifier; `;` is intentionally blocked here.
+    if cmd.contains("$(") || cmd.contains('`') || cmd.contains(';') {
         return false;
     }
 
@@ -2007,6 +2045,12 @@ mod tests {
             PermissionManager::execute_decision("bash", &rg),
             ExecuteDecision::AllowSilent
         );
+
+        let sed = serde_json::json!({"command": "sed -n '565,572p' file.rs"});
+        assert_eq!(
+            PermissionManager::execute_decision("bash", &sed),
+            ExecuteDecision::AllowSilent
+        );
     }
 
     #[test]
@@ -2021,6 +2065,20 @@ mod tests {
         let redirected = serde_json::json!({"command": "git status > out.txt"});
         assert_eq!(
             PermissionManager::execute_decision("bash", &redirected),
+            ExecuteDecision::Ask
+        );
+
+        let sed_chain = serde_json::json!({
+            "command": "cd /repo && sed -n '1,20p' a.rs && echo '---' && sed -n '30,40p' b.rs"
+        });
+        assert_eq!(
+            PermissionManager::execute_decision("bash", &sed_chain),
+            ExecuteDecision::AllowSilent
+        );
+
+        let sed_in_place = serde_json::json!({"command": "sed -i 's/a/b/' file.rs"});
+        assert_eq!(
+            PermissionManager::execute_decision("bash", &sed_in_place),
             ExecuteDecision::Ask
         );
     }
@@ -3221,8 +3279,13 @@ mod tests {
         assert!(is_read_only_allowlisted("git diff --cached"));
         assert!(is_read_only_allowlisted("ls -la"));
         assert!(is_read_only_allowlisted("cat README.md"));
+        assert!(is_read_only_allowlisted("sed -n '1,20p' src/lib.rs"));
         assert!(!is_read_only_allowlisted(""));
         assert!(!is_read_only_allowlisted("rm -rf /"));
+        assert!(!is_read_only_allowlisted("sed -i 's/a/b/' src/lib.rs"));
+        assert!(!is_read_only_allowlisted("cd $(malicious)"));
+        assert!(!is_read_only_allowlisted("ls `malicious`"));
+        assert!(!is_read_only_allowlisted("ls ; ls"));
     }
 
     #[test]
@@ -3231,6 +3294,9 @@ mod tests {
         assert!(is_read_only_allowlisted("cargo check 2>&1 | head -50"));
         assert!(is_read_only_allowlisted("git diff | head -100"));
         assert!(is_read_only_allowlisted("ls -la | grep foo"));
+        assert!(is_read_only_allowlisted(
+            "cd /repo && sed -n '1,20p' a.rs && echo '---' && sed -n '30,40p' b.rs"
+        ));
         // Dangerous pipes must still be rejected.
         assert!(!is_read_only_allowlisted("echo foo | sudo tee /etc/passwd"));
     }

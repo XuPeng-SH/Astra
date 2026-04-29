@@ -68,6 +68,12 @@ pub struct ServerSkillSubRunExecutor {
     session_id: String,
     /// Edge connection pool for routing tool calls to connected edges.
     edge_connection_pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
+    /// Shared tool_call dedup state from the parent host. When set, the sub-run
+    /// host will observe the same emitted_tool_call_ids HashSet as the parent,
+    /// preventing duplicate `tool_call` events across host instances within the
+    /// same chat turn. Plumbed only under `bridge-e2e-hooks` (test observability).
+    #[cfg(feature = "bridge-e2e-hooks")]
+    dedup_state: Option<std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>>,
 }
 
 impl ServerSkillSubRunExecutor {
@@ -90,7 +96,21 @@ impl ServerSkillSubRunExecutor {
             request_constraints: Default::default(),
             session_id,
             edge_connection_pool: None,
+            #[cfg(feature = "bridge-e2e-hooks")]
+            dedup_state: None,
         }
+    }
+
+    /// Share the parent host's `emitted_tool_call_ids` HashSet so that sub-run
+    /// hosts dedupe `tool_call` events against the parent's already-emitted
+    /// ids. See `ServerAgenticLoopHostBuilder::with_dedup_state`.
+    #[cfg(feature = "bridge-e2e-hooks")]
+    pub fn with_dedup_state(
+        mut self,
+        shared: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    ) -> Self {
+        self.dedup_state = Some(shared);
+        self
     }
 
     pub fn with_pool(mut self, pool: Option<SharedPool>) -> Self {
@@ -239,6 +259,17 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             builder = builder.with_pool(pool.clone());
         }
 
+        // Wire shared dedup state from the parent host so that tool_call events
+        // emitted by this sub-run host are deduplicated against the parent's
+        // already-emitted ids. Without this, the same `tool_call` id would be
+        // emitted once per host instance within the same chat turn.
+        // See `ServerAgenticLoopHostBuilder::with_dedup_state` and
+        // `ServerSkillSubRunExecutor::with_dedup_state`.
+        #[cfg(feature = "bridge-e2e-hooks")]
+        if let Some(dedup) = &self.dedup_state {
+            builder = builder.with_dedup_state(dedup.clone());
+        }
+
         let mut host = builder.build();
 
         // Build tool restriction set: if allowed_tools is non-empty, only those
@@ -360,6 +391,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
                 .expect("valid dummy URL"),
             api_token: String::new(),
             delegation_engine: None,
+            delegations_this_turn: 0,
             project_context: None,
             checkpoint_gate: None,
             evolution_service: None,
@@ -487,6 +519,49 @@ mod tests {
         assert!(executor.llm_token_service.is_some());
         assert_eq!(executor.edge_tools.len(), 1);
         assert!(executor.cancel_token.is_some());
+    }
+
+    /// Server-side symmetric to `cli_skill_subrun_rejects_when_recursion_depth_limit_reached`:
+    /// the fork sub-run executor must refuse to spawn once the agent recursion
+    /// cap is reached. Without this guard, a fork-context skill could recurse
+    /// into itself indefinitely. The CLI has had this test; the server did not
+    /// — so this closes an asymmetric coverage gap where a misbehaving
+    /// resolver on the server path could recurse without a fast-fail at the
+    /// depth boundary.
+    #[tokio::test]
+    async fn server_skill_subrun_rejects_when_recursion_depth_limit_reached() {
+        let executor = ServerSkillSubRunExecutor::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "test-session".to_string(),
+        );
+        // NOTE: empty `allowed_tools` here is intentional and SAFE because
+        // `execute_skill_subrun` checks recursion depth FIRST (see
+        // `checked_child_recursion_depth` call at ~L197, before any tool
+        // validation). If someone reorders those checks, this test will
+        // start returning a tool-validation error instead of the depth
+        // error we're asserting on — update the test setup accordingly.
+        let allowed_tools: Vec<String> = Vec::new();
+
+        let err = executor
+            .execute_skill_subrun(
+                "depth-test",
+                "Do work",
+                "task",
+                None,
+                None,
+                &allowed_tools,
+                crate::turn::agentic_recursion_guard::MAX_AGENT_RECURSION_DEPTH,
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.contains("recursion depth") && err.contains("reached maximum"),
+            "error must cite depth limit; got: {err}"
+        );
     }
 
     /// audit-#8: turn-count math must not underflow when `remaining_turns`
