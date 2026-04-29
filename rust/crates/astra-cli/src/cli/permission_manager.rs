@@ -249,18 +249,6 @@ impl PermissionSettings {
         let json = serde_json::to_string_pretty(self)?;
         fs::write(path, json)
     }
-
-    /// Save to the user-level settings file (`~/.astra/permissions.json`).
-    pub fn save_user(&self) -> io::Result<()> {
-        let home = dirs::home_dir()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME directory not found"))?;
-        let dir = home.join(".astra");
-        fs::create_dir_all(&dir)?;
-        let path = dir.join("permissions.json");
-        let json = serde_json::to_string_pretty(self)?;
-        fs::write(path, json)
-    }
-
     #[allow(dead_code)] // Used in tests and by with_project
     fn parsed_allow_rules(&self) -> Vec<PermissionRule> {
         self.allow
@@ -342,28 +330,6 @@ impl PermissionManager {
     /// Switch the permission mode at runtime (e.g., via `/allow` command).
     pub(super) fn set_mode(&mut self, mode: PermissionMode) {
         self.mode = mode;
-    }
-
-    /// Label + stable fingerprint of loaded rules (for `edge_profile` / cloud audit).
-    #[allow(dead_code)]
-    pub(super) fn edge_audit_summary(&self) -> (String, String) {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut h = DefaultHasher::new();
-        self.mode.hash(&mut h);
-        for rule in &self.cached_allow {
-            rule.hash(&mut h);
-        }
-        for rule in &self.cached_deny {
-            rule.hash(&mut h);
-        }
-        for rule in &self.cached_user_allow {
-            rule.hash(&mut h);
-        }
-        for rule in &self.cached_user_deny {
-            rule.hash(&mut h);
-        }
-        (self.mode.to_string(), format!("{:016x}", h.finish()))
     }
 
     /// Create without loading project settings. Used in tests and internal auto-approved operations.

@@ -243,12 +243,6 @@ pub mod state_delta {
                 .filter(|e| e.version > since_version)
                 .collect()
         }
-
-        /// Get all changes.
-        pub fn all_changes(&self) -> &[StateChange] {
-            &self.entries
-        }
-
         /// Get current state snapshot.
         pub fn snapshot(&self) -> &HashMap<String, serde_json::Value> {
             &self.current_state
@@ -263,12 +257,6 @@ pub mod state_delta {
         pub fn change_count(&self) -> usize {
             self.entries.len()
         }
-
-        /// Clear all change entries (after sync).
-        pub fn clear_changes(&mut self) {
-            self.entries.clear();
-        }
-
         /// Compact by keeping only latest change per key.
         pub fn compact(&mut self) {
             let mut latest: HashMap<String, StateChange> = HashMap::new();
@@ -1406,19 +1394,7 @@ pub enum SessionEndState {
     Zombie,
 }
 
-impl SessionEndState {
-    #[must_use]
-    pub fn is_recoverable(&self) -> bool {
-        matches!(
-            self,
-            Self::Zombie
-                | Self::Interrupted {
-                    resumable: true,
-                    ..
-                }
-        )
-    }
-}
+impl SessionEndState {}
 
 #[derive(Debug, Deserialize)]
 struct JournalTailEntry {
@@ -1673,102 +1649,6 @@ fn extract_json_str(line: &str, needle: &str) -> Option<String> {
 }
 
 // ── Session listing with metadata ────────────────────────────────────────────
-
-/// Metadata for session listing (mtime, size, staleness).
-#[derive(Debug, Clone)]
-pub struct SessionListMeta {
-    pub session_id: String,
-    /// Journal file modification time.
-    pub last_modified: std::time::SystemTime,
-    /// Journal file size in bytes.
-    pub journal_bytes: u64,
-    /// Total disk usage: journal + workspace dir (recursive).
-    pub total_bytes: u64,
-    /// Turn count (fast count).
-    pub turns: u32,
-}
-
-impl SessionListMeta {
-    /// Check if this session is stale (older than `max_age`).
-    pub fn is_stale(&self, max_age: std::time::Duration) -> bool {
-        let cutoff = std::time::SystemTime::now()
-            .checked_sub(max_age)
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        self.last_modified < cutoff
-    }
-
-    /// Get the age of this session (time since last modified).
-    pub fn age(&self) -> std::time::Duration {
-        self.last_modified
-            .elapsed()
-            .unwrap_or(std::time::Duration::ZERO)
-    }
-}
-
-/// List sessions with metadata, sorted by most recent first.
-///
-/// `limit` — max number of sessions to return.
-/// Returns session IDs with mtime and size info for display purposes.
-pub fn list_sessions_with_meta(limit: usize) -> std::io::Result<Vec<SessionListMeta>> {
-    use std::cmp::Reverse;
-    use std::collections::BinaryHeap;
-
-    let dir = journal_dir();
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-
-    // Min-heap of (mtime, sid) — keeps only the `limit` newest entries
-    let mut heap: BinaryHeap<Reverse<(std::time::SystemTime, String, u64)>> = BinaryHeap::new();
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if let Some(sid) = name.strip_suffix(".jsonl") {
-            // Skip test-generated sessions
-            if sid.starts_with("test-") || sid.starts_with("new-sess-") {
-                continue;
-            }
-            let meta = entry.metadata().ok();
-            let mtime = meta
-                .as_ref()
-                .and_then(|m| m.modified().ok())
-                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            let size = meta.map(|m| m.len()).unwrap_or(0);
-            if heap.len() < limit {
-                heap.push(Reverse((mtime, sid.to_string(), size)));
-            } else if let Some(&Reverse((min_time, _, _))) = heap.peek()
-                && mtime > min_time
-            {
-                heap.pop();
-                heap.push(Reverse((mtime, sid.to_string(), size)));
-            }
-        }
-    }
-
-    // Extract and sort by newest first
-    let mut items: Vec<_> = heap.into_iter().map(|Reverse(item)| item).collect();
-    items.sort_by_key(|b| std::cmp::Reverse(b.0));
-
-    // Enrich with total size and turn count (done after limit for efficiency)
-    let result: Vec<SessionListMeta> = items
-        .into_iter()
-        .map(|(mtime, sid, journal_bytes)| {
-            let ws_dir = crate::session_workspace::workspace_dir_for(&sid);
-            let ws_bytes = dir_size_recursive(&ws_dir);
-            let turns = count_turns(&sid);
-            SessionListMeta {
-                session_id: sid,
-                last_modified: mtime,
-                journal_bytes,
-                total_bytes: journal_bytes + ws_bytes,
-                turns,
-            }
-        })
-        .collect();
-
-    Ok(result)
-}
 
 // ── Session cleanup / lifecycle ──────────────────────────────────────────────
 
@@ -2611,13 +2491,6 @@ impl JournalEvent {
         self.entity_learn_skipped_no_domain = entity_learn_skipped_no_domain;
         self
     }
-
-    /// Attach selection trace for post-hoc tool selection analysis.
-    pub fn with_selection_trace(mut self, trace: SelectionTrace) -> Self {
-        self.selection_trace = Some(trace);
-        self
-    }
-
     /// Stall detection event.
     pub fn stall_detected(
         session_id: Option<&str>,
@@ -3144,13 +3017,6 @@ impl JournalEvent {
         evt.metadata = Some(metadata);
         evt
     }
-
-    /// Builder to attach a context assembly trace to an existing turn event.
-    pub fn with_context_assembly_trace(mut self, trace: serde_json::Value) -> Self {
-        self.context_assembly_trace = Some(trace);
-        self
-    }
-
     /// Focus drift detected — emitted when drift analysis finds significant drift.
     pub fn drift_detected(
         session_id: Option<&str>,

@@ -1194,12 +1194,6 @@ impl DelegationEngine {
     pub fn set_gate(&mut self, gate: Arc<dyn VerificationGate>) {
         self.gate = Some(gate);
     }
-
-    /// Remove the current verification gate (sub-runs will bypass verification).
-    pub fn clear_gate(&mut self) {
-        self.gate = None;
-    }
-
     /// Create a new engine sharing the same components but with a different gate.
     ///
     /// All `Arc`-wrapped internals (registry, run_engine, tracker, executor) are
@@ -1215,20 +1209,6 @@ impl DelegationEngine {
             mailbox_router: self.mailbox_router.clone(),
         }
     }
-
-    /// Clone sharing all Arc components but with the gate cleared.
-    /// Used between subtasks to prevent a previous subtask's gate from leaking.
-    pub fn clone_without_gate(&self) -> Self {
-        Self {
-            registry: self.registry.clone(),
-            run_engine: self.run_engine.clone(),
-            tracker: self.tracker.clone(),
-            executor: self.executor.clone(),
-            gate: None,
-            mailbox_router: self.mailbox_router.clone(),
-        }
-    }
-
     /// Validate a delegation request without executing it.
     pub async fn validate(
         &self,

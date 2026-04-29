@@ -11,7 +11,6 @@
     clippy::unnecessary_map_or
 )]
 
-pub mod agent_progress_ui;
 pub mod agentic_recursion_guard;
 pub mod agentic_verdict_audit;
 pub mod boost_domain_hints;
@@ -27,7 +26,6 @@ pub mod compression_types;
 pub mod concurrency_safety;
 pub mod confidence_contract;
 pub mod context_assembly_trace;
-pub mod continuity;
 pub mod edge_executor_id;
 pub mod error_recovery;
 pub mod evaluation;
@@ -35,7 +33,6 @@ pub mod execution_state;
 pub mod explain;
 pub mod explain_report_lines;
 pub mod file_edit_journal;
-pub mod firewall;
 pub mod followup_suggestion;
 pub mod headless_tool_assembly;
 pub mod headless_tool_status_display;
@@ -48,17 +45,13 @@ pub mod learning_quality_gate;
 pub mod microcompact;
 pub mod observer;
 pub mod parallel_tool_exec;
-pub mod persist_inputs;
 pub mod pipeline_learning;
 pub mod prepare_turn_explain_text;
 pub mod recent_arg_hints;
-pub mod refresh;
 pub mod response_guard;
 pub mod routing;
 pub mod safety_middleware;
-pub mod skill_instructions_merge;
 pub mod skill_selector_metrics;
-pub mod snapshot;
 pub mod sse_blocks;
 pub mod sse_edge_stderr_lines;
 pub mod state;
@@ -78,7 +71,6 @@ pub mod tool_result_semantics;
 pub mod tool_result_storage;
 pub mod tool_schema_prune;
 pub mod tool_selection;
-pub mod unconsumed;
 pub mod view;
 pub mod xml_tool_call_fallback;
 
@@ -90,9 +82,6 @@ pub mod cloud_approval_policy;
 pub mod cloud_attachments;
 pub mod cloud_cache_diagnostics;
 pub mod cloud_grouping;
-pub mod cloud_history;
-pub mod cloud_iteration;
-pub mod cloud_prefilter;
 pub mod cloud_session_facts;
 pub mod cloud_session_memory_extract;
 pub mod counter;
@@ -103,7 +92,6 @@ pub mod orchestration_types;
 pub mod permission_sync;
 pub mod permission_types;
 pub mod persist;
-pub mod progress_display;
 pub mod quality;
 pub mod routing_metrics;
 pub mod tool_registry_chain;
@@ -137,18 +125,15 @@ pub mod agentic_turn_telemetry;
 pub mod chat_turn_edge_profile;
 pub mod cloud_compact_prompt;
 pub mod cloud_summary;
-pub mod session_replay_harness;
 pub mod sse_data_lines;
 
 // Phase 18: contracts, session cache, trace collector
 pub mod contracts;
-pub mod session_cache;
 pub mod turn_trace_collector;
 
 // Phase 19: e2e hooks, llm dump, history apply, edge ledger
 pub mod bridge_e2e_hooks;
 pub mod edge_ledger;
-pub mod history_apply;
 pub mod llm_request_dump;
 
 // Phase 20: decision explainer, cloud tool delivery, sse stream host

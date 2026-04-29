@@ -46,33 +46,6 @@ pub struct PlanMetrics {
 }
 
 impl PlanMetrics {
-    /// Record the start of plan creation.
-    pub fn mark_created(&mut self) {
-        self.created_at = now_unix_secs();
-    }
-
-    /// Record the start of execution.
-    pub fn mark_execution_started(&mut self) {
-        self.execution_started_at = Some(now_unix_ms());
-    }
-
-    /// Record the end of execution.
-    pub fn mark_execution_completed(&mut self) {
-        if let Some(start_ms) = self.execution_started_at {
-            self.execution_duration_ms = Some(now_unix_ms().saturating_sub(start_ms));
-        }
-    }
-
-    /// Record a plan edit.
-    pub fn record_edit(&mut self) {
-        self.edit_count += 1;
-    }
-
-    /// Record a new version.
-    pub fn record_version(&mut self) {
-        self.version_count += 1;
-    }
-
     /// Record token usage from a turn.
     pub fn record_tokens(&mut self, prompt: u64, completion: u64) {
         self.total_prompt_tokens += prompt;
@@ -223,20 +196,6 @@ pub struct SubtaskMetrics {
     pub tool_calls: u32,
     /// Number of retries.
     pub retries: u32,
-}
-
-fn now_unix_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
-fn now_unix_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 #[cfg(test)]

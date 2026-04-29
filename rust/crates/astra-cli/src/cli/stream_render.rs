@@ -87,17 +87,6 @@ impl RenderPolicy {
     pub fn suppress_headless(self) -> bool {
         matches!(self, Self::FinalOnly | Self::Silent)
     }
-
-    /// True when thinking spinner and preview should still be shown.
-    pub fn show_thinking(self) -> bool {
-        !self.is_silent()
-    }
-
-    /// True when the thinking viewport receives reasoning-delta content
-    /// instead of the main text area (plan decompose mode).
-    pub fn reasoning_to_viewport(self) -> bool {
-        matches!(self, Self::PlanDecompose)
-    }
 }
 
 /// Cross-turn tool output cache for the CLI edge tool execution path.
@@ -5221,15 +5210,6 @@ impl StreamRenderState {
             }
         }
     }
-
-    /// Clear tool status region (for intermediate turns before next SSE stream).
-    #[allow(dead_code)]
-    fn clear_tool_region(&mut self) {
-        self.stop_tool_stdout_anim();
-        let mut g = self.tool_ui.lock().unwrap_or_else(|e| e.into_inner());
-        g.region.clear();
-        g.lines.clear();
-    }
 }
 
 fn pluralize_with_count(count: usize, singular: &str, plural: &str) -> String {
@@ -6029,16 +6009,6 @@ pub(super) async fn consume_turn_sse(
     result
 }
 
-/// Whether the re-render pass should print the accumulated text.
-///
-/// Returns `false` when tool calls are pending — the text is an intermediate
-/// draft that would leak into the terminal and never be cleared by subsequent
-/// agentic-loop turns.
-#[allow(dead_code)]
-fn should_rerender_text(has_tool_calls: bool) -> bool {
-    !has_tool_calls
-}
-
 /// Used by `main` test module and stream_render unit tests; production path is [`consume_turn_sse`].
 #[allow(dead_code)]
 pub(super) fn dispatch_turn_event_block(
@@ -6292,52 +6262,6 @@ mod tests {
     }
 
     // ── Regression: intermediate draft text must not leak ─────────────
-
-    #[test]
-    fn rerender_suppressed_when_tool_calls_present() {
-        // When the LLM returns text + tool_calls (intermediate turn),
-        // the re-render must NOT print the draft text.
-        assert!(!should_rerender_text(true));
-    }
-
-    #[test]
-    fn rerender_allowed_when_no_tool_calls() {
-        // Final turn (no tool_calls) — text should be rendered.
-        assert!(should_rerender_text(false));
-    }
-
-    #[test]
-    fn dispatch_turn_complete_with_tool_calls_sets_flag() {
-        // Verify that turn_complete with has_tool_calls=true flows through
-        // to TurnResult so the re-render gate works end-to-end.
-        let mut r = TurnResult::new();
-        let mut s = StreamRenderState::new();
-        let block = format!(
-            "{}{}",
-            sse("text_delta", ",\"content\":\"draft review text\""),
-            sse("turn_complete", ",\"has_tool_calls\":true"),
-        );
-        dispatch_turn_event_block(&block, &mut r, &mut s, RenderPolicy::Silent, &mut vec![]);
-        assert_eq!(r.full_text, "draft review text");
-        assert!(r.has_tool_calls);
-        // The gate must suppress re-render for this result.
-        assert!(!should_rerender_text(r.has_tool_calls));
-    }
-
-    #[test]
-    fn dispatch_turn_complete_without_tool_calls_allows_rerender() {
-        let mut r = TurnResult::new();
-        let mut s = StreamRenderState::new();
-        let block = format!(
-            "{}{}",
-            sse("text_delta", ",\"content\":\"final answer\""),
-            sse("turn_complete", ",\"has_tool_calls\":false"),
-        );
-        dispatch_turn_event_block(&block, &mut r, &mut s, RenderPolicy::Silent, &mut vec![]);
-        assert_eq!(r.full_text, "final answer");
-        assert!(!r.has_tool_calls);
-        assert!(should_rerender_text(r.has_tool_calls));
-    }
 
     #[test]
     fn final_text_cleanup_strips_reflect_tags() {

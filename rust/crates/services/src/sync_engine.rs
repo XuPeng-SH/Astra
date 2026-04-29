@@ -596,22 +596,6 @@ impl SyncOrchestrator {
         self.adapters.insert(domain, adapter);
         self.policies.insert(domain, policy);
     }
-
-    /// Check cloud health and update availability flag.
-    pub async fn check_health(&mut self) -> bool {
-        let prev = self.cloud_available;
-        self.cloud_available = self.transport.health_check().await;
-        if prev != self.cloud_available {
-            tracing::info!(
-                target: "astra_services::sync_engine",
-                user_id = %self.user_id,
-                cloud_available = self.cloud_available,
-                "cloud transport health changed"
-            );
-        }
-        self.cloud_available
-    }
-
     /// Pull all domains that have PullTrigger::SessionStart.
     pub async fn pull_all(&mut self) -> Vec<DomainSyncResult> {
         let mut results = Vec::new();
@@ -963,54 +947,6 @@ impl SyncOrchestrator {
             adapter.set_envelope(envelope);
         }
     }
-
-    /// Record an external sync event in the log.
-    pub fn log_external_event(
-        &mut self,
-        domain: SyncDomain,
-        op: SyncOperation,
-        success: bool,
-        duration_ms: u64,
-        bytes: u64,
-        error: Option<&str>,
-    ) {
-        if self.event_log.len() >= 100 {
-            self.event_log.remove(0);
-        }
-        self.event_log.push(SyncEvent {
-            domain,
-            operation: op,
-            success,
-            duration_ms,
-            bytes_transferred: bytes,
-            version_before: None,
-            version_after: None,
-            error: error.map(|s| s.to_string()),
-            timestamp: epoch_secs(),
-        });
-        if !success {
-            tracing::warn!(
-                target: "astra_services::sync_engine",
-                user_id = %self.user_id,
-                domain = %domain,
-                ?op,
-                duration_ms,
-                err = error.unwrap_or(""),
-                "external sync event failed"
-            );
-        } else {
-            tracing::debug!(
-                target: "astra_services::sync_engine",
-                user_id = %self.user_id,
-                domain = %domain,
-                ?op,
-                duration_ms,
-                bytes,
-                "external sync event ok"
-            );
-        }
-    }
-
     fn log_event(
         &mut self,
         domain: SyncDomain,

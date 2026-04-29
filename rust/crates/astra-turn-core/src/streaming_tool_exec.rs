@@ -304,12 +304,6 @@ impl StreamingToolExecutor {
 
         (done, needed)
     }
-
-    /// Number of currently in-flight speculative executions.
-    pub async fn inflight_count(&self) -> usize {
-        self.inflight.lock().await.len()
-    }
-
     /// Take a metrics snapshot. Does not reset counters.
     pub async fn snapshot(&self) -> StreamingSpeculationMetrics {
         let inflight = self.inflight.lock().await.len() as u64;
@@ -677,19 +671,6 @@ mod tests {
         assert!(
             map.is_empty(),
             "Drop must drain in-flight speculative tasks"
-        );
-    }
-
-    /// audit-#9: when speculative execution is skipped because the semaphore
-    /// is full, the result content must be a descriptive sentinel — not an
-    /// empty string that callers cannot distinguish from a tool that legally
-    /// returned no output.
-    #[test]
-    fn speculative_exec_returns_descriptive_error_on_capacity() {
-        let source = include_str!("streaming_tool_exec.rs");
-        assert!(
-            source.contains("speculative execution skipped: capacity reached"),
-            "try_start must surface a descriptive sentinel when speculation is skipped"
         );
     }
 }

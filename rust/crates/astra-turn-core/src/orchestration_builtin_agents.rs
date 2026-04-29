@@ -57,11 +57,7 @@ pub struct AgentTypeDefinition {
     pub read_only: bool,
 }
 
-impl AgentTypeDefinition {
-    pub fn is_tool_allowed(&self, tool_name: &str) -> bool {
-        self.allowed_tools.contains("*") || self.allowed_tools.contains(tool_name)
-    }
-}
+impl AgentTypeDefinition {}
 
 /// Get all built-in agent type definitions.
 pub fn get_builtin_agent_types() -> Vec<AgentTypeDefinition> {
@@ -113,14 +109,6 @@ pub fn get_builtin_agent_types() -> Vec<AgentTypeDefinition> {
         },
     ]
 }
-
-/// Get the definition for a specific agent type.
-pub fn get_agent_type_definition(agent_type: &str) -> Option<AgentTypeDefinition> {
-    get_builtin_agent_types()
-        .into_iter()
-        .find(|def| def.agent_type == agent_type)
-}
-
 const EXPLORE_PROMPT: &str = r#"
 You are an exploration agent focused on understanding codebases quickly.
 - Search and navigate code to answer questions

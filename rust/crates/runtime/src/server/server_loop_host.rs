@@ -707,12 +707,6 @@ impl ServerAgenticLoopHostBuilder {
         self.full_llm_capture = full_llm_capture;
         self
     }
-
-    pub fn with_event_tx(mut self, tx: tokio::sync::mpsc::Sender<Value>) -> Self {
-        self.event_tx = Some(tx);
-        self
-    }
-
     #[cfg(feature = "bridge-e2e-hooks")]
     pub fn with_test_llm_rounds(mut self, rounds: Vec<Value>) -> Self {
         self.test_llm_rounds_wired = true;
@@ -906,12 +900,6 @@ impl ServerAgenticLoopHost {
         }
         std::mem::take(&mut self.emitted_events)
     }
-
-    /// Returns `true` when no CLI edge agent is connected (tools are server-side).
-    pub fn edge_tools_empty(&self) -> bool {
-        self.server_side_tools
-    }
-
     /// Attach an incremental SSE channel. Events will be pushed through
     /// this sender as they are emitted, enabling streaming to the client.
     /// When the channel closes (client disconnect), `cancel_flag` and
