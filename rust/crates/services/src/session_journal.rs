@@ -35,27 +35,10 @@ pub fn local_sessions_dir() -> PathBuf {
 }
 
 /// Validate that a session ID is safe for use as a filesystem path component.
-/// Rejects path traversal attempts (`..`, `/`, `\`) and empty/whitespace-only IDs.
+///
+/// Delegates to [`astra_core::session_id::validate`] — the single source of truth.
 pub fn validate_session_id(session_id: &str) -> Result<(), String> {
-    if session_id.is_empty() || session_id.trim().is_empty() {
-        return Err("session ID cannot be empty".to_string());
-    }
-    if session_id.contains('/')
-        || session_id.contains('\\')
-        || session_id.contains("..")
-        || session_id.contains('\0')
-    {
-        return Err(format!(
-            "invalid session ID '{session_id}': must not contain '/', '\\\\', '..', or null bytes"
-        ));
-    }
-    // Must be a single path component (no directory separators after normalization)
-    if Path::new(session_id).components().count() != 1 {
-        return Err(format!(
-            "invalid session ID '{session_id}': must be a single path component"
-        ));
-    }
-    Ok(())
+    astra_core::session_id::validate(session_id)
 }
 
 /// Redirect session journal + workspace + step checkpoint paths on **this thread** to `dir`.
@@ -872,6 +855,8 @@ impl JournalWriter {
     /// Create a writer for the given session ID.
     /// Creates the parent directory if needed.
     pub fn new(session_id: &str) -> std::io::Result<Self> {
+        validate_session_id(session_id)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
         let dir = journal_dir();
         std::fs::create_dir_all(&dir)?;
         let path = dir.join(format!("{session_id}.jsonl"));
@@ -1147,6 +1132,8 @@ fn parse_journal_text(content: &str) -> (Vec<JournalEvent>, usize, usize) {
 
 /// Read all events from a session journal file.
 pub fn read_journal(session_id: &str) -> std::io::Result<Vec<JournalEvent>> {
+    validate_session_id(session_id)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let path = journal_dir().join(format!("{session_id}.jsonl"));
     if !path.exists() {
         return Ok(Vec::new());
@@ -1233,6 +1220,8 @@ pub fn find_latest_approval_required(
 pub fn read_journal_for_digest(
     session_id: &str,
 ) -> std::io::Result<(Vec<JournalEvent>, usize, usize)> {
+    validate_session_id(session_id)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let path = journal_dir().join(format!("{session_id}.jsonl"));
     if !path.exists() {
         return Err(std::io::Error::new(
@@ -1319,6 +1308,9 @@ pub fn list_sessions_by_time(limit: usize) -> std::io::Result<Vec<String>> {
 
 /// Count turn events in a journal without fully parsing all events.
 pub fn count_turns(session_id: &str) -> u32 {
+    if validate_session_id(session_id).is_err() {
+        return 0;
+    }
     use std::io::BufRead;
     let path = journal_dir().join(format!("{session_id}.jsonl"));
     let file = match std::fs::File::open(&path) {
@@ -1337,6 +1329,7 @@ pub fn count_turns(session_id: &str) -> u32 {
 /// Returns `(first_user_input, model, timestamp)` without parsing the entire JSONL.
 /// Designed for fast session listing via partial journal reads.
 pub fn peek_session_meta(session_id: &str) -> Option<SessionPeek> {
+    validate_session_id(session_id).ok()?;
     use std::io::BufRead;
     let path = journal_dir().join(format!("{session_id}.jsonl"));
     let file = std::fs::File::open(&path).ok()?;
@@ -5307,14 +5300,25 @@ mod tests {
     // ── Session ID Validation Security Tests ──
 
     #[test]
-    fn validate_session_id_rejects_path_traversal() {
+    fn validate_session_id_rejects_invalid() {
         assert!(validate_session_id("../../etc/passwd").is_err());
         assert!(validate_session_id("../sibling").is_err());
         assert!(validate_session_id("a/b/c").is_err());
         assert!(validate_session_id("a\\b").is_err());
         assert!(validate_session_id("").is_err());
         assert!(validate_session_id("   ").is_err());
+        assert!(validate_session_id(".").is_err());
         assert!(validate_session_id("a\0b").is_err());
+        assert!(validate_session_id("has\nnewline").is_err());
+        assert!(validate_session_id("has\ttab").is_err());
+        assert!(validate_session_id("has\x7Fdel").is_err());
+        // Non-ASCII: Unicode invisible chars, RTL override, homoglyphs
+        assert!(validate_session_id("café").is_err());
+        assert!(validate_session_id("abc\u{200B}def").is_err());
+        assert!(validate_session_id("\u{202E}secret").is_err());
+        // Max length
+        assert!(validate_session_id(&"a".repeat(201)).is_err());
+        assert!(validate_session_id(&"a".repeat(200)).is_ok());
     }
 
     #[test]

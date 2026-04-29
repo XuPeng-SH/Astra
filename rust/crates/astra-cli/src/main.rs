@@ -1498,6 +1498,7 @@ mod tests {
             runtime_continuity: None,
             turn_index: 0,
             evolution_service: None,
+            pre_loaded_messages: None,
         })
         .await
         .unwrap();
@@ -1571,6 +1572,7 @@ mod tests {
             runtime_continuity: None,
             turn_index: 0,
             evolution_service: None,
+            pre_loaded_messages: None,
         })
         .await;
         assert!(result.is_err());
@@ -1660,6 +1662,7 @@ mod tests {
             runtime_continuity: None,
             turn_index: 0,
             evolution_service: None,
+            pre_loaded_messages: None,
         })
         .await
         .unwrap();

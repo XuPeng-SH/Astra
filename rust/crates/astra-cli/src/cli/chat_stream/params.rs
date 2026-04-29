@@ -159,6 +159,9 @@ pub(crate) struct ChatTurnParams<'a> {
     pub(crate) turn_index: u32,
     /// Shared evolution service for multi-axis self-evolution.
     pub(crate) evolution_service: Option<Arc<astra_runtime::evolution::service::EvolutionService>>,
+    /// Pre-loaded CSL messages (from CslManager.load() in repl_turn).
+    /// When present, these are used instead of converting history pairs.
+    pub(crate) pre_loaded_messages: Option<Vec<serde_json::Value>>,
 }
 
 /// Bundle of "basic CLI" fields shared across one-shot CLI chat invocations
@@ -240,6 +243,7 @@ impl<'a> ChatTurnParams<'a> {
             runtime_continuity: None,
             turn_index: 0,
             evolution_service: None,
+            pre_loaded_messages: None,
         }
     }
 }

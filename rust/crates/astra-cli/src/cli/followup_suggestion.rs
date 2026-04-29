@@ -72,6 +72,7 @@ mod tests {
             turn_observability_events: Vec::new(),
             llm_rounds: None,
             interruption: None,
+            final_messages: Vec::new(),
         }
     }
 

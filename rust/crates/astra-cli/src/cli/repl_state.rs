@@ -12,6 +12,7 @@ use crate::slash_team;
 use astra_runtime::plan_decompose;
 use astra_runtime::tool_registry;
 use astra_services::session_journal;
+use astra_turn_core::conversation_log::manager::CslManager;
 
 /// Verbosity level for explain mode.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -303,6 +304,11 @@ pub(crate) struct ReplState {
     /// Shared evolution service for multi-axis self-evolution.
     pub evolution_service:
         Option<std::sync::Arc<astra_runtime::evolution::service::EvolutionService>>,
+
+    // ── Conversation State Log (CSL) ──
+    /// Unified CSL manager for persisting/restoring conversation state.
+    /// Created lazily when session_id is first known.
+    pub csl_manager: Option<CslManager>,
 }
 
 impl Default for ReplState {
@@ -449,6 +455,7 @@ impl Default for ReplState {
                 std::sync::Arc::new(engine)
             },
             evolution_service: None,
+            csl_manager: None,
         }
     }
 }

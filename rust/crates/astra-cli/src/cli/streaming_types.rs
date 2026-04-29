@@ -125,6 +125,8 @@ pub(crate) struct StreamResult {
     /// Structured interruption context when the runtime completed the turn
     /// partially (for example due to budget exhaustion after tool progress).
     pub(crate) interruption: Option<serde_json::Value>,
+    /// Full messages array after this turn — used by CslManager for persistence.
+    pub(crate) final_messages: Vec<serde_json::Value>,
 }
 
 impl StreamResult {

@@ -206,7 +206,7 @@ pub(crate) async fn stream_chat_sse(
             executor.expand_sandbox_path(PathBuf::from(dir));
         }
     }
-    let mut messages = openai_messages_from_repl_history(p.history, p.message);
+    let mut messages = load_turn_messages(p.pre_loaded_messages.take(), p.history, p.message);
 
     // ─── Context pre-fetch (disabled) ─────────────────────────────────────
     let all_schemas = if p.plan_only_chat {
@@ -698,6 +698,8 @@ pub(crate) async fn stream_chat_sse(
         current_session_id: state.current_session_id.as_deref(),
     });
 
+    let final_messages = std::mem::take(&mut state.messages);
+
     let result = build_stream_result(StreamResultBuild {
         tool_health_entries: p.tool_health_entries,
         session_id: state.current_session_id,
@@ -737,9 +739,23 @@ pub(crate) async fn stream_chat_sse(
             .unwrap_or_default(),
         llm_rounds: state.turn_event_buffer.as_ref().map(|b| b.current_round()),
         interruption: state.interruption.as_ref().map(|i| i.to_json()),
+        final_messages,
     });
     Ok(result)
 }
+
+fn load_turn_messages(
+    pre_loaded_messages: Option<Vec<serde_json::Value>>,
+    history: &[(String, String)],
+    current_message: &str,
+) -> Vec<serde_json::Value> {
+    if let Some(mut msgs) = pre_loaded_messages {
+        msgs.push(json!({"role": "user", "content": current_message}));
+        return msgs;
+    }
+    openai_messages_from_repl_history(history, current_message)
+}
+
 #[cfg(test)]
 mod tests {
     use super::detect_turn_hook_sets;

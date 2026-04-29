@@ -200,94 +200,6 @@ async fn emit_user_correction_signal(state: &ReplState, correction_text: &str) {
     .await;
 }
 
-// ─── Relevance-scored history pruning ───────────────────────────────────────
-
-/// Lightweight tokenizer for relevance scoring: lowercase, split on
-/// non-alphanumeric boundaries, filter short tokens.
-fn tokenize_for_relevance(text: &str) -> std::collections::HashSet<String> {
-    text.to_lowercase()
-        .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
-        .filter(|w| w.len() >= 2)
-        .map(|w| w.to_string())
-        .collect()
-}
-
-/// Score a single history turn's relevance to a query token set.
-///
-/// Returns 0.0–1.0 based on keyword overlap (Jaccard-like).
-/// Weighs user message higher than assistant response since user messages
-/// carry intent and decision context.
-fn score_turn_relevance(
-    turn: &(String, String),
-    query_tokens: &std::collections::HashSet<String>,
-) -> f64 {
-    if query_tokens.is_empty() {
-        return 0.0;
-    }
-    let user_tokens = tokenize_for_relevance(&turn.0);
-    let assistant_tokens = tokenize_for_relevance(&turn.1);
-
-    let user_overlap = query_tokens.intersection(&user_tokens).count();
-    let assistant_overlap = query_tokens.intersection(&assistant_tokens).count();
-
-    // User messages carry more intent signal (weight 2x)
-    let weighted_overlap = (user_overlap * 2 + assistant_overlap) as f64;
-    let max_possible = (query_tokens.len() * 3) as f64; // 2x user + 1x assistant
-    (weighted_overlap / max_possible).min(1.0)
-}
-
-/// Select which history turns to keep during compaction using relevance scoring.
-///
-/// Strategy:
-/// - Always keep the last `min_recent` turns (guaranteed recency)
-/// - From remaining older turns, score by relevance and keep top-K
-/// - Returns indices (into original history) that should be PRESERVED as
-///   individual turns (not compacted into the summary)
-///
-/// `keep_budget` is the total number of turns to keep (= `context_budget.keep_recent_turns`).
-/// `min_recent` is the minimum guaranteed recent turns (half of keep_budget, at least 2).
-fn select_turns_for_compaction(
-    history: &[(String, String)],
-    keep_budget: usize,
-    recent_context: &str,
-) -> Vec<usize> {
-    let total = history.len();
-    if total <= keep_budget {
-        return (0..total).collect();
-    }
-
-    // Split budget: guaranteed recent + relevance-scored older turns
-    let min_recent = (keep_budget / 2).max(2).min(keep_budget);
-    let relevance_slots = keep_budget.saturating_sub(min_recent);
-
-    // Guaranteed recent turns (last min_recent)
-    let recent_start = total.saturating_sub(min_recent);
-    let mut kept_indices: Vec<usize> = (recent_start..total).collect();
-
-    if relevance_slots > 0 && recent_start > 0 {
-        // Use the current user message as the primary relevance signal.
-        // Recent turns are already guaranteed by min_recent — no need to
-        // add their tokens, which would dilute the signal.
-        let query_tokens = tokenize_for_relevance(recent_context);
-
-        // Score older turns (0..recent_start) by relevance
-        let mut scored: Vec<(usize, f64)> = (0..recent_start)
-            .map(|i| (i, score_turn_relevance(&history[i], &query_tokens)))
-            .collect();
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        // Keep top-K relevant older turns (only if they have nonzero relevance)
-        for &(idx, score) in scored.iter().take(relevance_slots) {
-            if score > 0.0 {
-                kept_indices.push(idx);
-            }
-        }
-    }
-
-    kept_indices.sort_unstable();
-    kept_indices
-}
-
 enum TurnAttempt {
     Completed(Box<Result<StreamResult, crate::TurnFailure>>),
     Interrupted,
@@ -336,8 +248,6 @@ pub(super) async fn handle_chat_input(
     let mut effective_line = build_effective_line(&line, state);
     effective_line = apply_resume_context(effective_line, resume_guidance, plan_resume_digest);
     let turn_start = Instant::now();
-
-    maybe_auto_compact(state, &ctx, token, &effective_line).await?;
 
     let session_id = state.session_id.clone();
     match run_chat_turn(state, &ctx, token, &effective_line, session_id.as_deref()).await {
@@ -893,93 +803,6 @@ pub(super) fn rebuild_continuation_anchor_from_state(state: &mut ReplState) {
     state.continuation_anchor = Some(sections.join("\n"));
 }
 
-async fn maybe_auto_compact(
-    state: &mut ReplState,
-    ctx: &ReplTurnContext<'_>,
-    token: &str,
-    current_message: &str,
-) -> Result<(), String> {
-    if state.history.len() <= state.context_budget.keep_recent_turns {
-        return Ok(());
-    }
-
-    let est_messages = history_as_messages(&state.history);
-    let est_tokens = prompts::estimate_tokens(&est_messages);
-    if !state.context_budget.should_compact(est_tokens) {
-        return Ok(());
-    }
-
-    eprintln!(
-        "  {}",
-        format!(
-            "⟳ Auto-compacting ({} turns, ~{}k tokens > {}k limit)…",
-            state.history.len(),
-            est_tokens / 1000,
-            state.context_budget.compact_trigger() / 1000,
-        )
-        .dim()
-    );
-
-    let mut auto_pm_compact =
-        PermissionManager::with_project(true, &std::env::current_dir().unwrap_or_default());
-    let obs_hub = state.observability_hub.clone();
-    let obs_session = state.observability_session.clone();
-    let compact_result = stream_chat_sse(ChatTurnParams {
-        api: ctx.api,
-        token,
-        message: prompts::COMPACT_SUMMARY_REQUEST,
-        session_id: state.session_id.as_deref(),
-        model: state.model.as_deref(),
-        provider: None,
-        explain: ExplainMode::Off,
-        render_md: false,
-        history: &state.history,
-        perm_manager: &mut auto_pm_compact,
-        verbose_mode: false,
-        render_policy: crate::stream_render::RenderPolicy::Silent,
-        selector: ctx.selector,
-        recent_tools: &[],
-        tool_health_entries: &[],
-        unified_skill_registry: &state.unified_skill_registry,
-        plan_only_chat: false,
-        is_plan_subtask: false,
-        plan_subtask_id: None,
-        delegation_engine: None,
-        cancel_token: None,
-        plan_assemble_line_release: None,
-        stream_event_tx: None,
-        approval_request_tx: None,
-        mcp_manager: Some(state.mcp_manager.clone()),
-        skill_search: &state.skill_search,
-        skill_quality_tracker: &mut state.skill_quality_tracker,
-        discovered_skills: None,
-        messaging_metrics: state.messaging_metrics.clone(),
-        agent_spawner: state.agent_spawner.clone(),
-        root_agent_id: Some("main"),
-        root_mailbox_slot: Some(&mut state.root_mailbox),
-        observability_hub: obs_hub,
-        observability_session: obs_session,
-        file_journal: Some(state.file_journal.clone()),
-        file_state: Some(state.file_state.clone()),
-        database_snapshot_journal: Some(state.database_snapshot_journal.clone()),
-        git_stash_journal: Some(state.git_stash_journal.clone()),
-        git_commit_journal: Some(state.git_commit_journal.clone()),
-        git_worktree_journal: Some(state.git_worktree_journal.clone()),
-        session_state_journal: Some(state.session_state_journal.clone()),
-        task_manager: Some(state.task_manager.clone()),
-        runtime_continuity: None,
-        turn_index: state.turn,
-        evolution_service: state.evolution_service.clone(),
-    })
-    .await;
-
-    if let Ok(result) = compact_result {
-        apply_auto_compact_result(state, ctx, token, result, current_message).await?;
-    }
-
-    Ok(())
-}
-
 pub(super) fn history_as_messages(history: &[(String, String)]) -> Vec<serde_json::Value> {
     history
         .iter()
@@ -994,176 +817,6 @@ pub(super) fn history_as_messages(history: &[(String, String)]) -> Vec<serde_jso
             pair
         })
         .collect()
-}
-
-async fn apply_auto_compact_result(
-    state: &mut ReplState,
-    ctx: &ReplTurnContext<'_>,
-    token: &str,
-    result: StreamResult,
-    current_message: &str,
-) -> Result<(), String> {
-    let summary = result.full_text.trim().to_string();
-    if summary.is_empty() {
-        return Ok(());
-    }
-
-    let keep = state.context_budget.keep_recent_turns;
-    let total = state.history.len();
-    if total <= keep {
-        return Ok(());
-    }
-
-    // Use relevance scoring to decide which turns to preserve as individual
-    // messages vs. compact into the summary.
-    let kept_indices = select_turns_for_compaction(&state.history, keep, current_message);
-    let compacted_count = total - kept_indices.len();
-    if compacted_count == 0 {
-        return Ok(());
-    }
-
-    // Skip Memoria anchor for short sessions — the summary alone is sufficient
-    // and the anchor would largely duplicate what's already in kept turns.
-    let anchor = if compacted_count >= 4 {
-        fetch_compact_memory_anchor_snippet(ctx.api, token, state.session_id.as_deref(), &summary)
-            .await
-    } else {
-        None
-    };
-    let assistant_text = compact_assistant_message(compacted_count, &summary, anchor.as_deref());
-    let summary_entry = (String::new(), assistant_text);
-    let mut new_history = vec![summary_entry];
-
-    // Append the preserved turns (in original order)
-    for &idx in &kept_indices {
-        new_history.push(state.history[idx].clone());
-    }
-
-    // Record which turns were compacted for drift detection.
-    // Turns not in kept_indices were compacted.
-    for i in 0..total {
-        if !kept_indices.contains(&i) {
-            state.drift_compressed_turns.push(i as u32);
-        }
-    }
-
-    state.history = new_history;
-    state.recent_tools.clear();
-
-    let entry = prompts::memory_proto::MemoryEntry::new(
-        prompts::memory_proto::NS_EPISODE,
-        prompts::memory_proto::ST_AUTO,
-        &summary,
-    );
-    let meta = prompts::memory_proto::EntryMeta::from_session_with_tier(
-        state.session_id.as_deref(),
-        state.turn,
-        prompts::memory_proto::SRC_AUTO_COMPACT,
-        prompts::memory_proto::TIER_INFERRED,
-    );
-    if let Err(e) = ctx
-        .api
-        .post_memory_store_json(token, &entry.to_store_payload_with_meta(&meta))
-        .await
-    {
-        astra_core::agent_warn!("repl_turn", "failed to persist compacted memory: {e}");
-    }
-
-    // Write compact event with summary to journal so finalize_workspace_on_end
-    // can populate the workspace summary for P1/P2 knowledge backflow.
-    if let Some(ref journal) = state.journal {
-        let evt = session_journal::JournalEvent::compact_with_summary(
-            state.session_id.as_deref(),
-            state.turn,
-            compacted_count,
-            0, // facts_stored — auto-compact doesn't extract facts
-            Some(&summary),
-        );
-        let _ = journal.append(&evt);
-    }
-
-    // ─── Observability: record history compression decision ───────────────
-    if let Some(session) = &state.observability_session {
-        use astra_turn_core::decision_explainer::{
-            DecisionExplanation, DecisionType, ExplainableInput,
-        };
-        let compacted_turns: Vec<u32> = (0..(total - kept_indices.len()) as u32).collect();
-        let retained_turns: Vec<u32> = kept_indices.iter().map(|&i| i as u32).collect();
-        let compression_ratio = if total > 0 {
-            compacted_count as f64 / total as f64
-        } else {
-            0.0
-        };
-        let trigger_tokens = state.context_budget.compact_trigger();
-        let explanation = DecisionExplanation {
-            id: format!(
-                "compact-{}-{}",
-                state.session_id.as_deref().unwrap_or("?"),
-                state.turn
-            ),
-            timestamp: std::time::SystemTime::now(),
-            decision_type: DecisionType::HistoryCompression {
-                turns_compressed: compacted_turns,
-                turns_retained: retained_turns.clone(),
-                compression_ratio,
-            },
-            inputs: vec![ExplainableInput {
-                name: "token_budget".to_string(),
-                value: format!("{}k trigger", trigger_tokens / 1000),
-                influence: 1.0,
-                explanation: Some("Exceeded context budget trigger".to_string()),
-            }],
-            reasoning: format!(
-                "Auto-compacted {} turns to {} (kept {} by relevance), ratio {:.1}%",
-                total,
-                state.history.len(),
-                retained_turns.len(),
-                compression_ratio * 100.0
-            ),
-            alternatives: vec![],
-            confidence: 0.9,
-        };
-        let mut session_guard = session.write().unwrap_or_else(|e| e.into_inner());
-        astra_runtime::observability_integration::on_tool_selection(
-            &mut session_guard,
-            explanation,
-        );
-    }
-
-    // Report which turns were kept by relevance (if any older turns survived)
-    let recent_start = total.saturating_sub(keep / 2);
-    let relevance_kept: Vec<usize> = kept_indices
-        .iter()
-        .filter(|&&i| i < recent_start)
-        .copied()
-        .collect();
-    let relevance_note = if relevance_kept.is_empty() {
-        String::new()
-    } else {
-        format!(
-            " ({} older turn{} kept by relevance)",
-            relevance_kept.len(),
-            if relevance_kept.len() == 1 { "" } else { "s" }
-        )
-    };
-
-    eprintln!(
-        "  {}",
-        format!(
-            "{} Compacted {compacted_count} turns → {} in context{relevance_note}",
-            crate::theme::icon_ok(),
-            state.history.len()
-        )
-        .green()
-    );
-    if state.plan_mode.is_some() || state.executing_plan.is_some() {
-        eprintln!(
-            "{}",
-            "  Tip: Plan context was shortened — if steps feel stale, refresh `/plan`.".dim()
-        );
-    }
-
-    Ok(())
 }
 
 async fn run_chat_turn(
@@ -1249,6 +902,7 @@ async fn run_chat_turn(
             runtime_continuity: state.runtime_continuity.as_ref(),
             turn_index: state.turn,
             evolution_service: state.evolution_service.clone(),
+            pre_loaded_messages: None,
         }) => TurnAttempt::Completed(Box::new(result)),
         _ = tokio::signal::ctrl_c() => {
             // Trigger cancellation to interrupt any in-flight SSE streaming.
@@ -1825,10 +1479,29 @@ async fn apply_turn_success_async(
     selector: &dyn tool_selector::ToolSelector,
     profile: Option<&str>,
     line: &str,
-    result: StreamResult,
+    mut result: StreamResult,
     turn_start: Instant,
 ) {
+    let final_messages = std::mem::take(&mut result.final_messages);
+    let csl_checkpoint_fields = extract_csl_fields_from_result(&result);
     apply_turn_success_sync(state, selector, profile, line, result, turn_start);
+
+    // Persist CSL via CslManager.
+    let turn = state.turn;
+    let prev_state = state
+        .csl_manager
+        .as_ref()
+        .map(|m| m.last_session_state().clone())
+        .unwrap_or_default();
+    let session_state = build_full_session_state_compact(state, csl_checkpoint_fields, &prev_state);
+    if let Some(mgr) = state.csl_manager.as_mut() {
+        if let Err(e) = mgr
+            .persist_turn(turn, &final_messages, &session_state)
+            .await
+        {
+            astra_core::agent_warn!("csl", "persist failed: {e}");
+        }
+    }
     check_skill_improvement_async(state).await;
 }
 
@@ -1845,6 +1518,25 @@ fn apply_turn_success_sync(
         initialize_journal(state, session_id);
         state.session_id = Some(session_id.to_string());
         state.run_id = result.run_id.clone();
+
+        if state.csl_manager.is_none() {
+            let store = std::sync::Arc::new(
+                astra_turn_core::conversation_log::file_store::FileCslStore::new(
+                    astra_services::session_journal::local_sessions_dir(),
+                ),
+            );
+            state.csl_manager = match astra_turn_core::conversation_log::manager::CslManager::new(
+                store,
+                session_id.to_string(),
+                Default::default(),
+            ) {
+                Ok(mgr) => Some(mgr),
+                Err(e) => {
+                    astra_core::agent_warn!("csl", "manager init failed: {e}");
+                    None
+                }
+            };
+        }
 
         // Initialize observability session if hub is available and session not yet created
         if state.observability_session.is_none() {
@@ -2261,6 +1953,102 @@ pub(crate) async fn try_llm_skill_improvement(
     );
     state.skill_improvement_tracker.mark_analyzed(state.turn);
     Ok(true)
+}
+
+/// Fields extracted from HeavyCheckpoint for CSL persistence.
+/// `None` on any field means "no data available, preserve previous CSL value".
+/// For nullable fields (approval_overrides, delegation, compaction_tracker,
+/// interruption): `Some(None)` = explicitly cleared, `Some(Some(v))` = new value.
+struct CslCheckpointFields {
+    blocked_tools: Option<Vec<String>>,
+    approval_overrides: Option<Option<serde_json::Value>>,
+    budget_remaining_tokens: Option<u64>,
+    budget_remaining_rounds: Option<u32>,
+    consecutive_ctx_errors: Option<u32>,
+    interruption: Option<Option<serde_json::Value>>,
+    delegation: Option<Option<astra_turn_core::conversation_log::DelegationCompact>>,
+    compaction_tracker: Option<Option<serde_json::Value>>,
+}
+
+fn extract_csl_fields_from_result(result: &StreamResult) -> CslCheckpointFields {
+    if let Some(astra_pipeline::step_protocol::StepCheckpoint::Heavy(ref heavy)) =
+        result.last_heavy_checkpoint
+    {
+        let delegation = match (&heavy.delegation_id, &heavy.delegation_pattern) {
+            (Some(id), Some(pattern)) => {
+                Some(astra_turn_core::conversation_log::DelegationCompact {
+                    id: id.clone(),
+                    pattern: pattern.clone(),
+                    completed_sub_runs: heavy.delegation_sub_run_summaries.clone(),
+                })
+            }
+            _ => None,
+        };
+        CslCheckpointFields {
+            blocked_tools: Some(heavy.blocked_tools.clone()),
+            approval_overrides: Some(heavy.approval_overrides.clone()),
+            budget_remaining_tokens: Some(heavy.budget_remaining_tokens),
+            budget_remaining_rounds: Some(heavy.budget_remaining_rounds),
+            consecutive_ctx_errors: Some(heavy.consecutive_context_window_errors),
+            interruption: Some(heavy.interruption.clone()),
+            delegation: Some(delegation),
+            compaction_tracker: Some(heavy.compaction_state.clone()),
+        }
+    } else {
+        // No HeavyCheckpoint: all fields fall back to prev_state.
+        // interruption from StreamResult is NOT authoritative here —
+        // it's only populated by the agentic loop which also writes
+        // a HeavyCheckpoint, so if there's no checkpoint, interruption
+        // should be preserved from the previous CSL state too.
+        CslCheckpointFields {
+            blocked_tools: None,
+            approval_overrides: None,
+            budget_remaining_tokens: None,
+            budget_remaining_rounds: None,
+            consecutive_ctx_errors: None,
+            interruption: None,
+            delegation: None,
+            compaction_tracker: None,
+        }
+    }
+}
+
+/// Build a full `SessionStateCompact` from REPL state, checkpoint fields, and
+/// the previous CSL state. Fields from `cp` that are `None` fall back to
+/// `prev_state`, so the no-checkpoint path preserves previously persisted values.
+fn build_full_session_state_compact(
+    state: &ReplState,
+    cp: CslCheckpointFields,
+    prev_state: &astra_turn_core::conversation_log::SessionStateCompact,
+) -> astra_turn_core::conversation_log::SessionStateCompact {
+    astra_turn_core::conversation_log::SessionStateCompact {
+        recent_tools: state.recent_tools.clone(),
+        continuity: state.runtime_continuity.clone(),
+        blocked_tools: cp
+            .blocked_tools
+            .unwrap_or_else(|| prev_state.blocked_tools.clone()),
+        approval_overrides: cp
+            .approval_overrides
+            .unwrap_or_else(|| prev_state.approval_overrides.clone()),
+        budget_remaining_tokens: cp
+            .budget_remaining_tokens
+            .unwrap_or(prev_state.budget_remaining_tokens),
+        budget_remaining_rounds: cp
+            .budget_remaining_rounds
+            .unwrap_or(prev_state.budget_remaining_rounds),
+        consecutive_ctx_errors: cp
+            .consecutive_ctx_errors
+            .unwrap_or(prev_state.consecutive_ctx_errors),
+        interruption: cp
+            .interruption
+            .unwrap_or_else(|| prev_state.interruption.clone()),
+        delegation: cp
+            .delegation
+            .unwrap_or_else(|| prev_state.delegation.clone()),
+        compaction_tracker: cp
+            .compaction_tracker
+            .unwrap_or_else(|| prev_state.compaction_tracker.clone()),
+    }
 }
 
 /// Periodically detect user corrections in conversation history and turn them
@@ -4415,6 +4203,7 @@ mod tests {
             turn_observability_events: Vec::new(),
             llm_rounds: None,
             interruption: None,
+            final_messages: Vec::new(),
         }
     }
 
@@ -4989,226 +4778,6 @@ mod tests {
         );
     }
 
-    // ── Relevance scoring tests ──────────────────────────────────────────
-
-    #[test]
-    fn tokenize_for_relevance_basic() {
-        let tokens = tokenize_for_relevance("Hello World, this is a TEST!");
-        assert!(tokens.contains("hello"));
-        assert!(tokens.contains("world"));
-        assert!(tokens.contains("this"));
-        assert!(tokens.contains("test"));
-        // Single-char tokens filtered out
-        assert!(!tokens.contains("a"));
-    }
-
-    #[test]
-    fn tokenize_for_relevance_empty() {
-        let tokens = tokenize_for_relevance("");
-        assert!(tokens.is_empty());
-    }
-
-    #[test]
-    fn score_turn_relevance_exact_overlap() {
-        let context_tokens = tokenize_for_relevance("database migration schema");
-        let turn = (
-            "How to run database migration?".to_string(),
-            "Use the migration tool.".to_string(),
-        );
-        let score = score_turn_relevance(&turn, &context_tokens);
-        assert!(
-            score > 0.0,
-            "overlapping turn should score > 0, got {score}"
-        );
-    }
-
-    #[test]
-    fn score_turn_relevance_no_overlap() {
-        let context_tokens = tokenize_for_relevance("database migration schema");
-        let turn = (
-            "What color is the sky?".to_string(),
-            "It is blue.".to_string(),
-        );
-        let score = score_turn_relevance(&turn, &context_tokens);
-        assert!(
-            score == 0.0,
-            "non-overlapping turn should score 0, got {score}"
-        );
-    }
-
-    #[test]
-    fn score_turn_relevance_user_weighted_higher() {
-        let context_tokens = tokenize_for_relevance("deploy kubernetes cluster");
-        // User message has overlap, assistant doesn't
-        let turn_user_match = (
-            "deploy to kubernetes".to_string(),
-            "Sure, I will help.".to_string(),
-        );
-        // Assistant message has overlap, user doesn't
-        let turn_asst_match = (
-            "Please help me.".to_string(),
-            "deploy to kubernetes cluster".to_string(),
-        );
-        let score_user = score_turn_relevance(&turn_user_match, &context_tokens);
-        let score_asst = score_turn_relevance(&turn_asst_match, &context_tokens);
-        assert!(
-            score_user > score_asst,
-            "user-side match ({score_user}) should score higher than assistant-side ({score_asst})"
-        );
-    }
-
-    #[test]
-    fn select_turns_preserves_recent_and_relevant() {
-        // 10 turns: turns 0,1 are about "database", turns 2-7 are filler, 8-9 are recent
-        let history: Vec<(String, String)> = vec![
-            (
-                "setup database schema".into(),
-                "Done, schema created.".into(),
-            ),
-            (
-                "add database indexes".into(),
-                "Added indexes on user_id.".into(),
-            ),
-            ("what is the weather".into(), "It's sunny.".into()),
-            ("tell me a joke".into(), "Why did the chicken...".into()),
-            ("random topic alpha".into(), "Alpha response.".into()),
-            ("random topic beta".into(), "Beta response.".into()),
-            ("random topic gamma".into(), "Gamma response.".into()),
-            ("random topic delta".into(), "Delta response.".into()),
-            ("recent turn one".into(), "Recent reply one.".into()),
-            ("recent turn two".into(), "Recent reply two.".into()),
-        ];
-        let kept = select_turns_for_compaction(&history, 6, "database query optimization");
-        // Should keep at least turns 8,9 (recent) and turns 0,1 (relevant to "database")
-        assert!(
-            kept.contains(&8) && kept.contains(&9),
-            "recent turns 8,9 must be kept: {kept:?}"
-        );
-        assert!(
-            kept.contains(&0) || kept.contains(&1),
-            "relevant database turns 0/1 should be kept: {kept:?}"
-        );
-        // Should NOT keep all filler turns
-        let filler_kept: Vec<usize> = kept
-            .iter()
-            .filter(|&&i| (2..8).contains(&i))
-            .copied()
-            .collect();
-        assert!(
-            filler_kept.len() < 6,
-            "not all filler turns should be kept: {kept:?}"
-        );
-        assert!(
-            kept.len() <= 6,
-            "total kept should not exceed budget: {kept:?}"
-        );
-    }
-
-    #[test]
-    fn select_turns_small_history_keeps_all() {
-        let history: Vec<(String, String)> = vec![
-            ("hello".into(), "world".into()),
-            ("foo".into(), "bar".into()),
-        ];
-        let kept = select_turns_for_compaction(&history, 6, "anything");
-        assert_eq!(kept.len(), 2, "should keep all when history < budget");
-    }
-
-    #[test]
-    fn select_turns_budget_equals_total_keeps_all() {
-        let history: Vec<(String, String)> =
-            (0..6).map(|i| (format!("q{i}"), format!("a{i}"))).collect();
-        let kept = select_turns_for_compaction(&history, 6, "anything");
-        assert_eq!(kept.len(), 6, "budget == total should keep all");
-    }
-
-    #[test]
-    fn select_turns_budget_one_keeps_last() {
-        let history: Vec<(String, String)> = vec![
-            ("old question".into(), "old answer".into()),
-            ("recent question".into(), "recent answer".into()),
-            ("latest question".into(), "latest answer".into()),
-        ];
-        let kept = select_turns_for_compaction(&history, 1, "irrelevant");
-        assert_eq!(kept.len(), 1, "budget=1 should keep exactly 1 turn");
-        assert_eq!(*kept.last().unwrap(), 2, "should keep the very last turn");
-    }
-
-    #[test]
-    fn select_turns_all_zero_scores_only_recent() {
-        // No overlap at all between context and older turns
-        let history: Vec<(String, String)> = vec![
-            ("alpha beta gamma".into(), "one two three".into()),
-            ("delta epsilon zeta".into(), "four five six".into()),
-            ("eta theta iota".into(), "seven eight nine".into()),
-            ("recent turn A".into(), "response A".into()),
-            ("recent turn B".into(), "response B".into()),
-        ];
-        let kept = select_turns_for_compaction(&history, 4, "completely unrelated xylophone");
-        // Should keep 2 recent (budget/2) + 0 relevant older = 2 recent minimum
-        // But min_recent = max(4/2, 2) = 2, so keeps turns 3,4
-        // relevance_slots = 2, but all scores are 0, so none added
-        assert!(
-            kept.len() <= 4,
-            "should respect budget even with zero scores: {kept:?}"
-        );
-        assert!(
-            kept.contains(&3) && kept.contains(&4),
-            "must keep the most recent turns: {kept:?}"
-        );
-    }
-
-    #[test]
-    fn select_turns_tied_scores_deterministic() {
-        // Two older turns with identical overlap
-        let history: Vec<(String, String)> = vec![
-            ("deploy kubernetes".into(), "done".into()),
-            ("deploy kubernetes".into(), "done again".into()),
-            ("filler unrelated".into(), "filler response".into()),
-            ("recent turn".into(), "recent response".into()),
-        ];
-        let kept1 = select_turns_for_compaction(&history, 3, "deploy kubernetes cluster");
-        let kept2 = select_turns_for_compaction(&history, 3, "deploy kubernetes cluster");
-        assert_eq!(
-            kept1, kept2,
-            "tied scores should produce deterministic results"
-        );
-    }
-
-    #[test]
-    fn tokenize_for_relevance_cjk_characters() {
-        // CJK characters are alphanumeric, should be tokenized
-        let tokens = tokenize_for_relevance("数据库 迁移 schema");
-        assert!(tokens.contains("数据库"), "should tokenize CJK words");
-        assert!(tokens.contains("迁移"));
-        assert!(tokens.contains("schema"));
-    }
-
-    #[test]
-    fn tokenize_for_relevance_hyphenated_words() {
-        let tokens = tokenize_for_relevance("auto-approve real-time");
-        // Hyphens are kept in tokenizer (not split on)
-        assert!(tokens.contains("auto-approve") || tokens.contains("auto"));
-    }
-
-    #[test]
-    fn score_turn_relevance_empty_query_returns_zero() {
-        let empty_tokens = tokenize_for_relevance("");
-        let turn = ("some content here".into(), "and more content".into());
-        let score = score_turn_relevance(&turn, &empty_tokens);
-        assert_eq!(score, 0.0, "empty query should score 0");
-    }
-
-    #[test]
-    fn select_turns_empty_context_still_works() {
-        let history: Vec<(String, String)> = (0..10)
-            .map(|i| (format!("question {i}"), format!("answer {i}")))
-            .collect();
-        let kept = select_turns_for_compaction(&history, 4, "");
-        // With empty context, only recent turns kept
-        assert!(kept.len() <= 4);
-        assert!(kept.contains(&9), "must keep latest turn");
-    }
     // ─── E2E: skill improvement closed loop ─────────────────────────────
     // Seeds a tempdir filesystem skill, injects a user correction into
     // ReplState.history, and calls `check_skill_improvement_inner` to verify:
@@ -5948,6 +5517,488 @@ mod tests {
         assert!(
             all_text.contains("src/journal_digest.rs"),
             "recent paths visible"
+        );
+    }
+
+    // ── CSL persistence tests ────────────────────────────────────────────
+    // These tests now exercise CslManager directly (the unified abstraction).
+    // The old `persist_csl_after_turn` function was deleted in the Phase 2 refactor.
+
+    #[tokio::test]
+    async fn csl_first_turn_writes_snapshot_and_advances_seq() {
+        use astra_turn_core::conversation_log::{
+            CslStore, SessionStateCompact, file_store::FileCslStore, manager::CslManager,
+            materialize,
+        };
+
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let session_id = format!("csl-first-{}", uuid::Uuid::new_v4());
+
+        let store = std::sync::Arc::new(FileCslStore::new(
+            astra_services::session_journal::local_sessions_dir(),
+        ));
+        let mut mgr =
+            CslManager::new(store.clone(), session_id.clone(), Default::default()).unwrap();
+
+        let full_messages = vec![
+            serde_json::json!({"role": "user", "content": "hello"}),
+            serde_json::json!({"role": "assistant", "content": "hi"}),
+        ];
+
+        let mut session_state = SessionStateCompact::default();
+        session_state.recent_tools = vec!["bash".into()];
+
+        mgr.persist_turn(1, &full_messages, &session_state)
+            .await
+            .unwrap();
+
+        assert!(mgr.last_seq() > 0, "seq should advance after first turn");
+
+        let entries = store.load_from_latest_snapshot(&session_id).await.unwrap();
+        assert!(
+            !entries.is_empty(),
+            "should have written at least one entry"
+        );
+        assert!(entries[0].is_snapshot(), "first entry must be a Snapshot");
+
+        let mat = materialize(&entries).unwrap();
+        assert_eq!(mat.messages.len(), 2);
+        assert_eq!(mat.session_state.recent_tools, vec!["bash".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn csl_subsequent_turn_writes_delta_not_snapshot() {
+        use astra_turn_core::conversation_log::{
+            CslEntry, CslStore, SessionStateCompact, file_store::FileCslStore, manager::CslManager,
+            materialize,
+        };
+
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let session_id = format!("csl-delta-{}", uuid::Uuid::new_v4());
+
+        let store = std::sync::Arc::new(FileCslStore::new(
+            astra_services::session_journal::local_sessions_dir(),
+        ));
+        let mut mgr =
+            CslManager::new(store.clone(), session_id.clone(), Default::default()).unwrap();
+
+        let t1_msgs = vec![
+            serde_json::json!({"role": "user", "content": "q1"}),
+            serde_json::json!({"role": "assistant", "content": "a1"}),
+        ];
+        mgr.persist_turn(1, &t1_msgs, &SessionStateCompact::default())
+            .await
+            .unwrap();
+        let seq_after_t1 = mgr.last_seq();
+
+        mgr.mark_turn_start(t1_msgs.len());
+        let t2_full = vec![
+            serde_json::json!({"role": "user", "content": "q1"}),
+            serde_json::json!({"role": "assistant", "content": "a1"}),
+            serde_json::json!({"role": "user", "content": "q2"}),
+            serde_json::json!({"role": "assistant", "content": "a2"}),
+        ];
+        mgr.persist_turn(2, &t2_full, &SessionStateCompact::default())
+            .await
+            .unwrap();
+        let seq_after_t2 = mgr.last_seq();
+        assert!(
+            seq_after_t2 > seq_after_t1,
+            "seq should advance: t1={seq_after_t1}, t2={seq_after_t2}"
+        );
+
+        let entries = store.load_from_latest_snapshot(&session_id).await.unwrap();
+        let snapshot_count = entries.iter().filter(|e| e.is_snapshot()).count();
+        let delta_count = entries
+            .iter()
+            .filter(|e| matches!(e, CslEntry::TurnDelta { .. }))
+            .count();
+        assert_eq!(snapshot_count, 1, "should have exactly 1 snapshot");
+        assert_eq!(delta_count, 1, "should have exactly 1 delta");
+
+        let mat = materialize(&entries).unwrap();
+        assert_eq!(mat.messages.len(), 4);
+        assert_eq!(mat.messages[2]["content"], "q2");
+        assert_eq!(mat.messages[3]["content"], "a2");
+    }
+
+    #[tokio::test]
+    async fn csl_periodic_snapshot_every_5_turns() {
+        use astra_turn_core::conversation_log::{
+            CslStore, SessionStateCompact, file_store::FileCslStore, manager::CslManager,
+            materialize,
+        };
+
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let session_id = format!("csl-snap5-{}", uuid::Uuid::new_v4());
+
+        let store = std::sync::Arc::new(FileCslStore::new(
+            astra_services::session_journal::local_sessions_dir(),
+        ));
+        let mut mgr =
+            CslManager::new(store.clone(), session_id.clone(), Default::default()).unwrap();
+
+        for t in 1..=5u32 {
+            let full: Vec<serde_json::Value> = (1..=t)
+                .map(|i| serde_json::json!({"role": "user", "content": format!("turn {i}")}))
+                .collect();
+            mgr.mark_turn_start(if t == 1 { 0 } else { (t - 1) as usize });
+            mgr.persist_turn(t, &full, &SessionStateCompact::default())
+                .await
+                .unwrap();
+        }
+
+        let entries = store.load_from_latest_snapshot(&session_id).await.unwrap();
+        assert_eq!(entries.len(), 1, "only the latest snapshot should remain");
+        assert!(entries[0].is_snapshot());
+        assert_eq!(entries[0].turn(), 5);
+
+        let mat = materialize(&entries).unwrap();
+        assert_eq!(mat.messages.len(), 5, "snapshot should contain all 5 turns");
+        assert_eq!(mat.messages[4]["content"], "turn 5");
+
+        assert_eq!(mgr.last_seq(), 6);
+
+        let all_entries = store.load_after(&session_id, 0).await.unwrap();
+        let total_snapshots = all_entries.iter().filter(|e| e.is_snapshot()).count();
+        assert_eq!(
+            total_snapshots, 2,
+            "should have initial + periodic snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn csl_persist_and_resume_roundtrip() {
+        use astra_turn_core::conversation_log::{
+            SessionStateCompact, file_store::FileCslStore, manager::CslManager,
+        };
+
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let session_id = format!("csl-rt-{}", uuid::Uuid::new_v4());
+
+        let store = std::sync::Arc::new(FileCslStore::new(
+            astra_services::session_journal::local_sessions_dir(),
+        ));
+        let mut mgr =
+            CslManager::new(store.clone(), session_id.clone(), Default::default()).unwrap();
+
+        for t in 1..=3u32 {
+            let mut session_state = SessionStateCompact::default();
+            session_state.recent_tools = vec![format!("tool_{t}")];
+            let full: Vec<serde_json::Value> = (1..=t)
+                .flat_map(|i| {
+                    vec![
+                        serde_json::json!({"role": "user", "content": format!("q{i}")}),
+                        serde_json::json!({"role": "assistant", "content": format!("a{i}")}),
+                    ]
+                })
+                .collect();
+            mgr.mark_turn_start(if t == 1 { 0 } else { ((t - 1) * 2) as usize });
+            mgr.persist_turn(t, &full, &session_state).await.unwrap();
+        }
+
+        let saved_seq = mgr.last_seq();
+
+        // Resume from CSL in fresh manager
+        let mut mgr2 = CslManager::new(store, session_id.clone(), Default::default()).unwrap();
+        let mat = mgr2.load().await.unwrap().expect("should have entries");
+
+        assert_eq!(mat.messages.len(), 6, "3 turns × 2 messages");
+        assert_eq!(mat.messages[0]["content"], "q1");
+        assert_eq!(mat.messages[5]["content"], "a3");
+        assert_eq!(mat.last_seq, saved_seq);
+        assert_eq!(
+            mat.session_state.recent_tools,
+            vec!["tool_3".to_string()],
+            "should have last turn's recent_tools"
+        );
+    }
+
+    #[tokio::test]
+    async fn csl_undo_resets_seq_and_next_turn_writes_fresh_snapshot() {
+        use astra_turn_core::conversation_log::{
+            CslStore, SessionStateCompact, file_store::FileCslStore, manager::CslManager,
+            materialize,
+        };
+
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let session_id = format!("csl-undo-{}", uuid::Uuid::new_v4());
+
+        let store = std::sync::Arc::new(FileCslStore::new(
+            astra_services::session_journal::local_sessions_dir(),
+        ));
+        let mut mgr =
+            CslManager::new(store.clone(), session_id.clone(), Default::default()).unwrap();
+
+        for t in 1..=2u32 {
+            let full: Vec<serde_json::Value> = (1..=t)
+                .map(|i| serde_json::json!({"role": "user", "content": format!("q{i}")}))
+                .collect();
+            mgr.mark_turn_start(if t == 1 { 0 } else { (t - 1) as usize });
+            mgr.persist_turn(t, &full, &SessionStateCompact::default())
+                .await
+                .unwrap();
+        }
+        assert!(mgr.last_seq() > 0, "seq should be > 0 after 2 turns");
+
+        mgr.reset().await.unwrap();
+        assert_eq!(mgr.last_seq(), 0, "seq should be 0 after reset");
+
+        let post_undo_msgs = vec![serde_json::json!({"role": "user", "content": "after-undo"})];
+        mgr.persist_turn(2, &post_undo_msgs, &SessionStateCompact::default())
+            .await
+            .unwrap();
+
+        let entries = store.load_from_latest_snapshot(&session_id).await.unwrap();
+        let mat = materialize(&entries).unwrap();
+        assert_eq!(mat.messages.len(), 1, "fresh snapshot should have 1 msg");
+        assert_eq!(mat.messages[0]["content"], "after-undo");
+    }
+
+    // ── No-checkpoint path: must preserve prev_state fields ─────────
+
+    #[test]
+    fn no_checkpoint_preserves_blocked_tools_from_prev_state() {
+        let state = &ReplState {
+            recent_tools: vec!["read_file".into()],
+            ..Default::default()
+        };
+        let prev = astra_turn_core::conversation_log::SessionStateCompact {
+            blocked_tools: vec!["bash".into(), "write".into()],
+            ..Default::default()
+        };
+
+        // Simulate no-checkpoint path: all Option fields are None,
+        // blocked_tools would currently be Vec::new() — the bug.
+        let cp = CslCheckpointFields {
+            blocked_tools: None,
+            approval_overrides: None,
+            budget_remaining_tokens: None,
+            budget_remaining_rounds: None,
+            consecutive_ctx_errors: None,
+            interruption: None,
+            delegation: None,
+            compaction_tracker: None,
+        };
+
+        let result = build_full_session_state_compact(state, cp, &prev);
+        assert_eq!(
+            result.blocked_tools,
+            vec!["bash", "write"],
+            "no-checkpoint path must preserve blocked_tools from prev_state"
+        );
+    }
+
+    #[test]
+    fn no_checkpoint_preserves_approval_overrides_from_prev_state() {
+        let state = &ReplState::default();
+        let prev = astra_turn_core::conversation_log::SessionStateCompact {
+            approval_overrides: Some(serde_json::json!({"tool": "bash", "approved": true})),
+            ..Default::default()
+        };
+
+        let cp = CslCheckpointFields {
+            blocked_tools: None,
+            approval_overrides: None,
+            budget_remaining_tokens: None,
+            budget_remaining_rounds: None,
+            consecutive_ctx_errors: None,
+            interruption: None,
+            delegation: None,
+            compaction_tracker: None,
+        };
+
+        let result = build_full_session_state_compact(state, cp, &prev);
+        assert_eq!(
+            result.approval_overrides,
+            Some(serde_json::json!({"tool": "bash", "approved": true})),
+            "no-checkpoint path must preserve approval_overrides from prev_state"
+        );
+    }
+
+    #[test]
+    fn no_checkpoint_preserves_delegation_from_prev_state() {
+        let state = &ReplState::default();
+        let delegation = astra_turn_core::conversation_log::DelegationCompact {
+            id: "d1".into(),
+            pattern: "review".into(),
+            completed_sub_runs: vec![],
+        };
+        let prev = astra_turn_core::conversation_log::SessionStateCompact {
+            delegation: Some(delegation.clone()),
+            ..Default::default()
+        };
+
+        let cp = CslCheckpointFields {
+            blocked_tools: None,
+            approval_overrides: None,
+            budget_remaining_tokens: None,
+            budget_remaining_rounds: None,
+            consecutive_ctx_errors: None,
+            interruption: None,
+            delegation: None,
+            compaction_tracker: None,
+        };
+
+        let result = build_full_session_state_compact(state, cp, &prev);
+        assert_eq!(
+            result.delegation,
+            Some(delegation),
+            "no-checkpoint path must preserve delegation from prev_state"
+        );
+    }
+
+    #[test]
+    fn no_checkpoint_preserves_compaction_tracker_from_prev_state() {
+        let state = &ReplState::default();
+        let prev = astra_turn_core::conversation_log::SessionStateCompact {
+            compaction_tracker: Some(serde_json::json!({"version": 3})),
+            ..Default::default()
+        };
+
+        let cp = CslCheckpointFields {
+            blocked_tools: None,
+            approval_overrides: None,
+            budget_remaining_tokens: None,
+            budget_remaining_rounds: None,
+            consecutive_ctx_errors: None,
+            interruption: None,
+            delegation: None,
+            compaction_tracker: None,
+        };
+
+        let result = build_full_session_state_compact(state, cp, &prev);
+        assert_eq!(
+            result.compaction_tracker,
+            Some(serde_json::json!({"version": 3})),
+            "no-checkpoint path must preserve compaction_tracker from prev_state"
+        );
+    }
+
+    #[test]
+    fn checkpoint_path_overrides_prev_state() {
+        let state = &ReplState {
+            recent_tools: vec!["exec".into()],
+            ..Default::default()
+        };
+        let prev = astra_turn_core::conversation_log::SessionStateCompact {
+            blocked_tools: vec!["old_bash".into()],
+            approval_overrides: Some(serde_json::json!({"old": true})),
+            delegation: Some(astra_turn_core::conversation_log::DelegationCompact {
+                id: "old_d".into(),
+                pattern: "old_p".into(),
+                completed_sub_runs: vec![],
+            }),
+            compaction_tracker: Some(serde_json::json!({"old": 1})),
+            budget_remaining_tokens: 99_999,
+            budget_remaining_rounds: 99,
+            consecutive_ctx_errors: 99,
+            ..Default::default()
+        };
+
+        let cp = CslCheckpointFields {
+            blocked_tools: Some(vec!["new_bash".into()]),
+            approval_overrides: Some(Some(serde_json::json!({"new": true}))),
+            budget_remaining_tokens: Some(50_000),
+            budget_remaining_rounds: Some(5),
+            consecutive_ctx_errors: Some(1),
+            interruption: None,
+            delegation: Some(Some(astra_turn_core::conversation_log::DelegationCompact {
+                id: "new_d".into(),
+                pattern: "new_p".into(),
+                completed_sub_runs: vec![],
+            })),
+            compaction_tracker: Some(Some(serde_json::json!({"new": 2}))),
+        };
+
+        let result = build_full_session_state_compact(state, cp, &prev);
+        assert_eq!(result.blocked_tools, vec!["new_bash"]);
+        assert_eq!(
+            result.approval_overrides,
+            Some(serde_json::json!({"new": true}))
+        );
+        assert_eq!(result.budget_remaining_tokens, 50_000);
+        assert_eq!(result.budget_remaining_rounds, 5);
+        assert_eq!(result.consecutive_ctx_errors, 1);
+        assert_eq!(result.delegation.unwrap().id, "new_d");
+        assert_eq!(
+            result.compaction_tracker,
+            Some(serde_json::json!({"new": 2}))
+        );
+    }
+
+    #[test]
+    fn checkpoint_explicitly_clears_fields() {
+        let state = &ReplState::default();
+        let prev = astra_turn_core::conversation_log::SessionStateCompact {
+            blocked_tools: vec!["bash".into()],
+            approval_overrides: Some(serde_json::json!({"tool": "bash"})),
+            delegation: Some(astra_turn_core::conversation_log::DelegationCompact {
+                id: "d1".into(),
+                pattern: "p1".into(),
+                completed_sub_runs: vec![],
+            }),
+            compaction_tracker: Some(serde_json::json!({"v": 1})),
+            ..Default::default()
+        };
+
+        // Checkpoint says "explicitly empty/cleared"
+        let cp = CslCheckpointFields {
+            blocked_tools: Some(vec![]),
+            approval_overrides: Some(None),
+            budget_remaining_tokens: Some(0),
+            budget_remaining_rounds: Some(0),
+            consecutive_ctx_errors: Some(0),
+            interruption: Some(None),
+            delegation: Some(None),
+            compaction_tracker: Some(None),
+        };
+
+        let result = build_full_session_state_compact(state, cp, &prev);
+        assert!(
+            result.blocked_tools.is_empty(),
+            "should be explicitly cleared"
+        );
+        assert!(
+            result.approval_overrides.is_none(),
+            "should be explicitly cleared"
+        );
+        assert!(
+            result.interruption.is_none(),
+            "should be explicitly cleared"
+        );
+        assert!(result.delegation.is_none(), "should be explicitly cleared");
+        assert!(
+            result.compaction_tracker.is_none(),
+            "should be explicitly cleared"
+        );
+        assert_eq!(result.budget_remaining_tokens, 0);
+    }
+
+    #[test]
+    fn no_checkpoint_preserves_interruption_from_prev_state() {
+        let state = &ReplState::default();
+        let prev = astra_turn_core::conversation_log::SessionStateCompact {
+            interruption: Some(serde_json::json!({"kind": "budget_exhausted"})),
+            ..Default::default()
+        };
+
+        let cp = CslCheckpointFields {
+            blocked_tools: None,
+            approval_overrides: None,
+            budget_remaining_tokens: None,
+            budget_remaining_rounds: None,
+            consecutive_ctx_errors: None,
+            interruption: None,
+            delegation: None,
+            compaction_tracker: None,
+        };
+
+        let result = build_full_session_state_compact(state, cp, &prev);
+        assert_eq!(
+            result.interruption,
+            Some(serde_json::json!({"kind": "budget_exhausted"})),
+            "no-checkpoint path must preserve interruption from prev_state"
         );
     }
 }

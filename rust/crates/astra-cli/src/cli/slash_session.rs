@@ -848,7 +848,7 @@ pub(super) async fn handle_session_command(
                         "  {} New session {} (fork of {})",
                         theme::icon_ok(),
                         new_sid.as_str().cyan(),
-                        parent_id.dim()
+                        parent_id.as_str().dim()
                     );
                     eprintln!(
                         "  {}",
@@ -858,16 +858,53 @@ pub(super) async fn handle_session_command(
                         )
                         .dim()
                     );
+                    // Fork CSL: materialize parent → write child Snapshot(seq=1)
+                    let base_dir = session_journal::local_sessions_dir();
+                    let store = std::sync::Arc::new(
+                        astra_turn_core::conversation_log::file_store::FileCslStore::new(base_dir),
+                    );
+                    // Fork CSL and restore child state.
+                    // Journal provides turn/token counters (not in CSL).
                     let st = repl_runtime::session_state_from_journal(&new_sid);
                     state.session_id = Some(new_sid.clone());
                     state.journal = session_journal::JournalWriter::new(&new_sid).ok();
-                    state.history = st.history;
                     state.turn = st.turn;
                     state.total_prompt_tokens = st.total_prompt_tokens;
                     state.total_completion_tokens = st.total_completion_tokens;
-                    state.recent_tools = st.recent_tools;
                     state.last_turn_event = None;
                     state.run_id = None;
+
+                    // Write child CSL: materialize parent → Snapshot(seq=1).
+                    // On success, reuse the child CslManager (already loaded) to
+                    // restore history — avoids double I/O from restore_journal_history.
+                    let parent_mgr = astra_turn_core::conversation_log::manager::CslManager::new(
+                        store,
+                        parent_id.clone(),
+                        Default::default(),
+                    );
+                    match parent_mgr {
+                        Ok(parent_mgr) => {
+                            match parent_mgr.fork(&new_sid, res.forked_at_turn).await {
+                                Ok((child_mgr, child_mat)) => {
+                                    apply_csl_fork_to_state(state, child_mgr, child_mat);
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "CSL fork failed, child will use journal fallback"
+                                    );
+                                    restore_journal_history_if_available(state, &new_sid).await;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "CSL manager creation failed, child will use journal fallback"
+                            );
+                            restore_journal_history_if_available(state, &new_sid).await;
+                        }
+                    }
                     eprintln!(
                         "  {}",
                         "REPL context is now the forked session (same history; new cloud lineage)."
@@ -4738,16 +4775,92 @@ fn apply_restored_cloud_heavy_state(state: &mut ReplState, restored: &RestoredSe
     );
 }
 
-fn restore_journal_history_if_available(state: &mut ReplState, session_id: &str) {
+/// Apply the child CslManager and its materialized state from `fork()` to REPL
+/// state. No additional I/O — the fork already loaded the child.
+fn apply_csl_fork_to_state(
+    state: &mut ReplState,
+    mgr: astra_turn_core::conversation_log::manager::CslManager,
+    mat: Option<astra_turn_core::conversation_log::MaterializedState>,
+) {
+    if let Some(mat) = mat {
+        state.history = derive_history_pairs_from_messages(&mat.messages);
+        if !mat.session_state.recent_tools.is_empty() {
+            state.recent_tools = mat.session_state.recent_tools;
+        }
+    }
+    state.csl_manager = Some(mgr);
+}
+
+async fn restore_journal_history_if_available(state: &mut ReplState, session_id: &str) {
+    // Try CSL first — full-fidelity message history via CslManager
+    let base_dir = session_journal::local_sessions_dir();
+    let store = std::sync::Arc::new(
+        astra_turn_core::conversation_log::file_store::FileCslStore::new(base_dir),
+    );
+    if let Ok(mut mgr) = astra_turn_core::conversation_log::manager::CslManager::new(
+        store,
+        session_id.to_string(),
+        Default::default(),
+    ) {
+        match mgr.load().await {
+            Ok(Some(mat)) => {
+                state.history = derive_history_pairs_from_messages(&mat.messages);
+                if !mat.session_state.recent_tools.is_empty() {
+                    state.recent_tools = mat.session_state.recent_tools;
+                }
+                state.csl_manager = Some(mgr);
+                return;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(session_id, error = %e, "CSL load failed during session resume");
+            }
+        }
+    }
+
+    // Fall back to journal-based history (pre-CSL sessions)
     let history = repl_runtime::restore_history_from_journal(session_id);
-    // Prefer local journal when it has MORE entries than cloud-restored history,
-    // since more entries likely means a later or more complete session.
-    // When local journal is smaller, keep cloud history (it's fresher).
-    // Tiebreaker: when local and cloud have equal entry count, keep cloud
-    // (cloud restore is the authoritative source; local journal may be stale).
     if history.len() > state.history.len() || state.history.is_empty() {
         state.history = history;
     }
+}
+
+fn derive_history_pairs_from_messages(messages: &[serde_json::Value]) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    let mut current_user = String::new();
+    let mut current_assistant = String::new();
+
+    for msg in messages {
+        let role = msg
+            .get("role")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let content = msg
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+
+        match role {
+            "user" => {
+                if !current_user.is_empty() || !current_assistant.is_empty() {
+                    pairs.push((
+                        std::mem::take(&mut current_user),
+                        std::mem::take(&mut current_assistant),
+                    ));
+                }
+                current_user = content;
+            }
+            "assistant" => {
+                current_assistant = content;
+            }
+            _ => {}
+        }
+    }
+    if !current_user.is_empty() || !current_assistant.is_empty() {
+        pairs.push((current_user, current_assistant));
+    }
+    pairs
 }
 
 async fn apply_restored_session(
@@ -4955,7 +5068,7 @@ async fn apply_restored_session(
         state.learning_snapshot = Some(learning_json.clone());
     }
 
-    restore_journal_history_if_available(state, &restored.session_id);
+    restore_journal_history_if_available(state, &restored.session_id).await;
 
     if let Ok(events) = session_journal::read_journal(&restored.session_id) {
         state.last_turn_event = events
@@ -5692,13 +5805,14 @@ mod resume_tests {
         assert_eq!(serde_json::to_value(exported).unwrap(), approval_json);
     }
 
-    #[test]
-    fn restore_journal_history_if_available_preserves_existing_history_when_journal_missing() {
+    #[tokio::test]
+    async fn restore_journal_history_if_available_preserves_existing_history_when_journal_missing()
+    {
         let (_tmp, _guard) = isolated_sessions_dir();
         let mut state = ReplState::default();
         state.history = vec![("from-cloud".to_string(), "still-here".to_string())];
 
-        restore_journal_history_if_available(&mut state, "missing-session");
+        restore_journal_history_if_available(&mut state, "missing-session").await;
 
         assert_eq!(
             state.history,
@@ -5706,8 +5820,8 @@ mod resume_tests {
         );
     }
 
-    #[test]
-    fn restore_journal_history_if_available_does_not_overwrite_cloud_history() {
+    #[tokio::test]
+    async fn restore_journal_history_if_available_does_not_overwrite_cloud_history() {
         let (_tmp, _guard) = isolated_sessions_dir();
         let session_id = format!("resume-history-{}", uuid::Uuid::new_v4());
         write_local_resumable_session(&session_id, 1);
@@ -5715,7 +5829,7 @@ mod resume_tests {
         let mut state = ReplState::default();
         state.history = vec![("from-cloud".to_string(), "cloud-data".to_string())];
 
-        restore_journal_history_if_available(&mut state, &session_id);
+        restore_journal_history_if_available(&mut state, &session_id).await;
 
         // Cloud-restored history is preserved when non-empty; local journal is not used
         // to overwrite fresher cloud state.
@@ -5725,8 +5839,8 @@ mod resume_tests {
         );
     }
 
-    #[test]
-    fn restore_journal_history_if_available_prefers_local_when_more_entries() {
+    #[tokio::test]
+    async fn restore_journal_history_if_available_prefers_local_when_more_entries() {
         let (_tmp, _guard) = isolated_sessions_dir();
         let session_id = format!("resume-more-{}", uuid::Uuid::new_v4());
         // Write a journal with multiple turn events so local has more history entries.
@@ -5756,7 +5870,7 @@ mod resume_tests {
         let mut state = ReplState::default();
         state.history = vec![("from-cloud".to_string(), "cloud-1".to_string())];
 
-        restore_journal_history_if_available(&mut state, &session_id);
+        restore_journal_history_if_available(&mut state, &session_id).await;
 
         // Local journal wins when it has more entries (3 local vs 1 cloud).
         assert_eq!(
@@ -5765,6 +5879,143 @@ mod resume_tests {
             "local journal should win when it has more entries, got {} entries",
             state.history.len()
         );
+    }
+
+    // ── CSL resume tests ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn restore_from_csl_populates_history_and_state() {
+        use astra_turn_core::conversation_log::{
+            AppendMeta, CslEntry, CslStore, SessionStateCompact, file_store::FileCslStore,
+        };
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let session_id = format!("csl-resume-{}", uuid::Uuid::new_v4());
+
+        let store = FileCslStore::new(session_journal::local_sessions_dir());
+        let snapshot = CslEntry::Snapshot {
+            seq: 0,
+            turn: 1,
+            messages: vec![
+                serde_json::json!({"role": "user", "content": "hello"}),
+                serde_json::json!({"role": "assistant", "content": "hi there"}),
+            ],
+            session_state: SessionStateCompact {
+                recent_tools: vec!["bash".into(), "read_file".into()],
+                ..Default::default()
+            },
+        };
+        store
+            .append(&session_id, &snapshot, &AppendMeta::default())
+            .await
+            .unwrap();
+
+        let delta = CslEntry::TurnDelta {
+            seq: 1,
+            turn: 2,
+            appended: vec![
+                serde_json::json!({"role": "user", "content": "what next?"}),
+                serde_json::json!({"role": "assistant", "content": "let's continue"}),
+            ],
+            state_patch: None,
+        };
+        store
+            .append(&session_id, &delta, &AppendMeta::default())
+            .await
+            .unwrap();
+
+        let mut state = ReplState::default();
+        restore_journal_history_if_available(&mut state, &session_id).await;
+
+        assert_eq!(state.history.len(), 2, "should have 2 user/assistant pairs");
+        assert_eq!(state.history[0].0, "hello");
+        assert_eq!(state.history[0].1, "hi there");
+        assert_eq!(state.history[1].0, "what next?");
+        assert_eq!(state.history[1].1, "let's continue");
+        assert!(state.csl_manager.is_some(), "CSL manager should be set");
+        assert_eq!(
+            state.recent_tools,
+            vec!["bash".to_string(), "read_file".to_string()],
+            "should restore recent_tools from snapshot state"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_without_csl_falls_back_to_journal() {
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let session_id = format!("no-csl-{}", uuid::Uuid::new_v4());
+        write_local_resumable_session(&session_id, 3);
+
+        let mut state = ReplState::default();
+        restore_journal_history_if_available(&mut state, &session_id).await;
+
+        assert!(
+            !state.history.is_empty(),
+            "should fall back to journal history"
+        );
+        assert!(
+            state.csl_manager.is_none(),
+            "CSL manager should remain None"
+        );
+    }
+
+    // ── derive_history_pairs_from_messages tests ─────────────────────────
+
+    #[test]
+    fn derive_history_pairs_simple_conversation() {
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "q1"}),
+            serde_json::json!({"role": "assistant", "content": "a1"}),
+            serde_json::json!({"role": "user", "content": "q2"}),
+            serde_json::json!({"role": "assistant", "content": "a2"}),
+        ];
+        let pairs = derive_history_pairs_from_messages(&messages);
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0], ("q1".into(), "a1".into()));
+        assert_eq!(pairs[1], ("q2".into(), "a2".into()));
+    }
+
+    #[test]
+    fn derive_history_pairs_skips_tool_messages() {
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "fix the bug"}),
+            serde_json::json!({"role": "assistant", "content": "I'll read the file"}),
+            serde_json::json!({"role": "tool", "content": "file contents here"}),
+            serde_json::json!({"role": "assistant", "content": "done, fixed it"}),
+            serde_json::json!({"role": "user", "content": "thanks"}),
+            serde_json::json!({"role": "assistant", "content": "you're welcome"}),
+        ];
+        let pairs = derive_history_pairs_from_messages(&messages);
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0].0, "fix the bug");
+        assert_eq!(pairs[0].1, "done, fixed it");
+        assert_eq!(pairs[1].0, "thanks");
+        assert_eq!(pairs[1].1, "you're welcome");
+    }
+
+    #[test]
+    fn derive_history_pairs_empty_messages() {
+        let pairs = derive_history_pairs_from_messages(&[]);
+        assert!(pairs.is_empty());
+    }
+
+    #[test]
+    fn derive_history_pairs_user_only_no_assistant() {
+        let messages = vec![serde_json::json!({"role": "user", "content": "hello"})];
+        let pairs = derive_history_pairs_from_messages(&messages);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0], ("hello".into(), String::new()));
+    }
+
+    #[test]
+    fn derive_history_pairs_structured_content_becomes_empty() {
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "question"}),
+            serde_json::json!({"role": "assistant", "content": [{"type": "text", "text": "answer"}]}),
+        ];
+        let pairs = derive_history_pairs_from_messages(&messages);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0, "question");
+        assert_eq!(pairs[0].1, "", "non-string content becomes empty string");
     }
 
     #[tokio::test]
@@ -5875,5 +6126,149 @@ mod resume_tests {
         state.session_id = Some(session_id.clone());
 
         handle_session_command("trace on", &api, None, &mut state, Some("test-token")).await;
+    }
+
+    // ── Fork CSL integration tests ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn session_fork_creates_child_csl_snapshot() {
+        use astra_turn_core::conversation_log::{
+            AppendMeta, CslEntry, CslStore, SessionStateCompact, file_store::FileCslStore,
+            manager::CslManager,
+        };
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let parent_id = format!("fork-parent-{}", uuid::Uuid::new_v4());
+        let child_id = format!("fork-child-{}", uuid::Uuid::new_v4());
+
+        let base_dir = session_journal::local_sessions_dir();
+        let store = std::sync::Arc::new(FileCslStore::new(base_dir));
+
+        // Write a 2-turn parent CSL.
+        let snapshot = CslEntry::Snapshot {
+            seq: 1,
+            turn: 1,
+            messages: vec![
+                serde_json::json!({"role": "user", "content": "hello"}),
+                serde_json::json!({"role": "assistant", "content": "hi"}),
+            ],
+            session_state: SessionStateCompact {
+                recent_tools: vec!["bash".into()],
+                ..Default::default()
+            },
+        };
+        store
+            .append(&parent_id, &snapshot, &AppendMeta::default())
+            .await
+            .unwrap();
+
+        let delta = CslEntry::TurnDelta {
+            seq: 2,
+            turn: 2,
+            appended: vec![
+                serde_json::json!({"role": "user", "content": "next"}),
+                serde_json::json!({"role": "assistant", "content": "ok"}),
+            ],
+            state_patch: None,
+        };
+        store
+            .append(&parent_id, &delta, &AppendMeta::default())
+            .await
+            .unwrap();
+
+        // Fork parent → child at turn 2.
+        let parent_mgr =
+            CslManager::new(store.clone(), parent_id.clone(), Default::default()).unwrap();
+        let (child_mgr, child_mat) = parent_mgr.fork(&child_id, 2).await.unwrap();
+
+        // Child should have last_seq=1, last_turn=2.
+        assert_eq!(child_mgr.last_seq(), 1);
+        assert_eq!(child_mgr.last_turn(), 2);
+
+        // fork() returns MaterializedState directly — no need for double load.
+        let mat = child_mat.expect("child should have CSL data");
+        assert_eq!(mat.messages.len(), 4);
+        assert_eq!(mat.messages[0]["content"], "hello");
+        assert_eq!(mat.messages[3]["content"], "ok");
+    }
+
+    #[tokio::test]
+    async fn session_fork_child_resume_uses_csl() {
+        use astra_turn_core::conversation_log::{
+            AppendMeta, CslEntry, CslStore, SessionStateCompact, file_store::FileCslStore,
+            manager::CslManager,
+        };
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let parent_id = format!("fork-resume-parent-{}", uuid::Uuid::new_v4());
+        let child_id = format!("fork-resume-child-{}", uuid::Uuid::new_v4());
+
+        let base_dir = session_journal::local_sessions_dir();
+        let store = std::sync::Arc::new(FileCslStore::new(base_dir));
+
+        let snapshot = CslEntry::Snapshot {
+            seq: 1,
+            turn: 1,
+            messages: vec![
+                serde_json::json!({"role": "user", "content": "q1"}),
+                serde_json::json!({"role": "assistant", "content": "a1"}),
+            ],
+            session_state: SessionStateCompact {
+                recent_tools: vec!["read_file".into()],
+                ..Default::default()
+            },
+        };
+        store
+            .append(&parent_id, &snapshot, &AppendMeta::default())
+            .await
+            .unwrap();
+
+        // Fork and get child manager.
+        let parent_mgr =
+            CslManager::new(store.clone(), parent_id.clone(), Default::default()).unwrap();
+        let (_child_mgr, _) = parent_mgr.fork(&child_id, 1).await.unwrap();
+
+        // Simulate resume: restore_journal_history_if_available should pick up
+        // the child's CSL data (not fall back to journal).
+        let mut state = ReplState::default();
+        restore_journal_history_if_available(&mut state, &child_id).await;
+
+        assert!(state.csl_manager.is_some(), "should use CSL path");
+        assert_eq!(state.history.len(), 1, "should have 1 user/assistant pair");
+        assert_eq!(state.history[0].0, "q1");
+        assert_eq!(state.history[0].1, "a1");
+        assert_eq!(
+            state.recent_tools,
+            vec!["read_file".to_string()],
+            "should restore recent_tools from CSL"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_fork_no_parent_csl_gracefully_skips() {
+        use astra_turn_core::conversation_log::{file_store::FileCslStore, manager::CslManager};
+        let (_tmp, _guard) = isolated_sessions_dir();
+        let parent_id = format!("fork-no-csl-{}", uuid::Uuid::new_v4());
+        let child_id = format!("fork-no-csl-child-{}", uuid::Uuid::new_v4());
+
+        let base_dir = session_journal::local_sessions_dir();
+        let store = std::sync::Arc::new(FileCslStore::new(base_dir));
+
+        // Parent has no CSL data. fork() succeeds but writes nothing to child.
+        let parent_mgr =
+            CslManager::new(store.clone(), parent_id.clone(), Default::default()).unwrap();
+        let (_child_mgr, _) = parent_mgr.fork(&child_id, 0).await.unwrap();
+
+        // Child has no CSL file, so resume falls back to journal (which is also
+        // empty). No error should occur.
+        let mut state = ReplState::default();
+        restore_journal_history_if_available(&mut state, &child_id).await;
+
+        assert!(
+            state.csl_manager.is_none(),
+            "no CSL data written, manager stays None"
+        );
+        assert!(
+            state.history.is_empty(),
+            "no history from either CSL or journal"
+        );
     }
 }

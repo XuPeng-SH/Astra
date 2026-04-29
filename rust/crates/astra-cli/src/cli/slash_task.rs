@@ -316,6 +316,7 @@ pub(super) async fn handle_task_command(
                     runtime_continuity: None,
                     turn_index: 0,
                     evolution_service: bg_evolution_service.clone(),
+                    pre_loaded_messages: None,
                 })
                 .await;
 
