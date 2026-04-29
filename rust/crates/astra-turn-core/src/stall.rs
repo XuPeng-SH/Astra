@@ -5,6 +5,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::tool_call_shape::{tool_call_arguments_value, tool_call_name};
+use crate::tool_categories::registry;
 
 /// Errors from stall / divergence / reward-hacking heuristics (invalid configuration or inputs).
 #[derive(Debug, Clone, Error, PartialEq)]
@@ -33,39 +34,6 @@ pub fn cli_agentic_tool_round_budget_abort_msg(current_limit: usize) -> String {
         current_limit,
     )
 }
-
-/// Tools considered "exploration" — low-value if used repeatedly without
-/// a "productive" tool call in between.
-const EXPLORATION_TOOLS: &[&str] = &[
-    "bash",
-    "list_dir",
-    "read_file",
-    "glob",
-    "grep",
-    "symbol_search",
-    "hover_info",
-    "call_graph",
-    "find_definition",
-    "find_references",
-    "symbols",
-];
-
-/// Tools that NEVER mutate the filesystem — they are purely consultative.
-/// A stream of repeated calls to these, without any interleaved mutating tool
-/// (`write_file`, `str_replace`, `create_file`, bash-with-side-effects, etc.),
-/// is diagnostic of an agent narrating implementation as prose instead of
-/// emitting real edits (observed in session 26f73ee4 where 12 `skill` calls
-/// produced 0 write_file/str_replace calls across an entire plan).
-///
-/// We keep this LIST SEPARATE from `EXPLORATION_TOOLS` because the two signals
-/// serve different detectors:
-///   * `EXPLORATION_TOOLS` drives single-round "all-exploration chain"
-///     detection (reward-hacking guard). Adding `skill` there would
-///     over-aggressively hard-block deferred follow-ups like `read_file`
-///     after a productive skill consultation — a legitimate pattern.
-///   * `CONSULTATIVE_TOOLS` drives the multi-round top-tool diagnostic below,
-///     where repetition across ≥3 rounds is the actual anti-pattern.
-const CONSULTATIVE_TOOLS: &[&str] = &["skill", "discover_skills"];
 
 /// Maximum consecutive exploration-only rounds before triggering correction.
 /// Lowered from 8→5→3: with auto-expanding read_file (full-file on 2nd+ ranged
@@ -283,7 +251,7 @@ pub fn assess_reward_hacking(
     if tool_names.len() >= 2
         && tool_names
             .iter()
-            .all(|name| EXPLORATION_TOOLS.contains(&name.as_str()))
+            .all(|name| registry().is_exploration(name))
     {
         flags.push("exploration-only tool chain".to_string());
         risk += 0.25;
@@ -321,7 +289,7 @@ pub fn reward_hacking_avoid_tools(tool_calls: &[Value]) -> Vec<String> {
     let all_exploration = tool_names.len() >= 2
         && tool_names
             .iter()
-            .all(|name| EXPLORATION_TOOLS.contains(&name.as_str()));
+            .all(|name| registry().is_exploration(name));
 
     let mut counts = HashMap::new();
     for name in tool_names {
@@ -550,6 +518,17 @@ pub fn build_stall_reflection(
 
     // Classify stall type
     let (what_happened, why, what_to_try, confidence) = match top_tool {
+        Some((ref name, count)) if count >= 3 && is_exploration_tool(name) && is_read_only_tool(name) => (
+            format!(
+                "Used '{}' {} times in the last {} turns without progressing.",
+                name, count, window
+            ),
+            "The file content is already in your context from earlier reads. Re-reading won't add new information.".to_string(),
+            "The content you need is already in the conversation. Take direct action: \
+                 use str_replace or write_file to make edits, or synthesize what you've learned \
+                 and respond to the user.".to_string(),
+            0.85,
+        ),
         Some((ref name, count)) if count >= 3 && is_exploration_tool(name) => (
             format!(
                 "Used '{}' {} times in the last {} turns without progressing.",
@@ -607,10 +586,13 @@ pub fn build_stall_reflection(
     };
 
     let mut avoid_tools: Vec<String> = error_tools.iter().map(|s| s.to_string()).collect();
-    // Also suggest avoiding the most-repeated tool if it's not already blocked
+    // Suggest avoiding the most-repeated tool — but never read-only tools.
+    // Read-only tools are always needed for observation and should stay available;
+    // the guidance message already tells the model to act on existing context.
     if let Some((name, count)) = &top_tool
         && *count >= 3
         && !avoid_tools.contains(name)
+        && !is_read_only_tool(name)
     {
         avoid_tools.push(name.clone());
     }
@@ -625,13 +607,11 @@ pub fn build_stall_reflection(
 }
 
 fn is_exploration_tool(name: &str) -> bool {
-    // For the top-tool diagnostic in `build_stall_reflection`, treat
-    // consultative tools (skill/discover_skills) as exploration too so that
-    // an agent repeatedly calling `skill` without writing files triggers the
-    // same "stop exploring, take direct action" nudge that repeat `grep` /
-    // `read_file` triggers. This is scoped to the top-tool diagnostic and
-    // does NOT affect single-round reward-hacking chain classification.
-    EXPLORATION_TOOLS.contains(&name) || CONSULTATIVE_TOOLS.contains(&name)
+    registry().is_exploration_or_consultative(name)
+}
+
+fn is_read_only_tool(name: &str) -> bool {
+    crate::turn_guard::is_read_only_never_restrict(name)
 }
 
 /// Detect if the LLM ignored a previous stall nudge by using tools
@@ -2397,6 +2377,52 @@ mod tests {
             "low user feedback must amplify risk ({} vs {})",
             with_low_feedback.risk,
             without_feedback.risk
+        );
+    }
+
+    // ─── Optimization: read_file stall gives context-aware guidance ──────────
+
+    #[test]
+    fn read_file_stall_reflection_suggests_direct_edit_not_avoid() {
+        let sigs = make_sigs(&[
+            &["read_file"],
+            &["read_file"],
+            &["read_file"],
+            &["read_file"],
+        ]);
+        let reflection = build_stall_reflection(&sigs, &[], 0);
+
+        // The guidance should tell the model to use the content already in context
+        assert!(
+            reflection.what_to_try.contains("already in")
+                || reflection.what_to_try.contains("str_replace")
+                || reflection.what_to_try.contains("write_file")
+                || reflection.what_to_try.contains("direct action"),
+            "read_file stall must suggest using content already in context, not just 'stop using read_file'. Got: {}",
+            reflection.what_to_try
+        );
+        // Must NOT suggest removing read_file from available tools
+        assert!(
+            !reflection.what_to_try.contains("Stop using 'read_file'"),
+            "guidance must not tell model to stop using read_file entirely. Got: {}",
+            reflection.what_to_try
+        );
+    }
+
+    #[test]
+    fn read_file_stall_does_not_add_to_avoid_tools() {
+        let sigs = make_sigs(&[
+            &["read_file"],
+            &["read_file"],
+            &["read_file"],
+            &["read_file"],
+        ]);
+        let reflection = build_stall_reflection(&sigs, &[], 0);
+
+        assert!(
+            !reflection.avoid_tools.contains(&"read_file".to_string()),
+            "read_file must not be in avoid_tools — it's read-only and may be needed later. Got: {:?}",
+            reflection.avoid_tools
         );
     }
 }

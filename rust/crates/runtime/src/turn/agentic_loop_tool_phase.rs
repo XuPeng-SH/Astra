@@ -141,24 +141,21 @@ fn update_runtime_todo_from_tool_records(
     }
 
     let turn = session_turn_number(state);
-    if let Some(failed) = meaningful.iter().find(|record| !record.ok) {
-        let reason = tool_record_result_text(failed);
-        let reason = if reason.trim().is_empty() {
-            format!("{} failed", failed.name)
-        } else {
-            format!("{} failed: {reason}", failed.name)
-        };
-        state
-            .continuity
-            .todos
-            .mark_blocked(&active_id, reason.clone());
-        state.continuity.verification.set(
-            astra_turn_types::continuity::VerificationStatus::Failed,
-            reason,
-            turn,
-        );
-    } else {
-        let evidence = meaningful
+
+    // Partition meaningful records into successes and failures. A mixed
+    // parallel tool batch (e.g. `grep` ok + `read_file` 404) must still
+    // contribute the successful evidence before we consider blocking —
+    // otherwise one incidental failure would permanently suppress all
+    // the accumulated signal from the round and prematurely stall the
+    // todo.
+    let (successes, failures): (Vec<_>, Vec<_>) =
+        meaningful.iter().copied().partition(|rec| rec.ok);
+
+    // Always record success evidence first, independent of any failures
+    // in the same round — successes reflect real progress on the active
+    // todo and must not be discarded by a co-scheduled failure.
+    if !successes.is_empty() {
+        let evidence = successes
             .iter()
             .map(|record| format!("{} ok", record.name))
             .collect::<Vec<_>>()
@@ -167,11 +164,64 @@ fn update_runtime_todo_from_tool_records(
             .continuity
             .todos
             .add_evidence(&active_id, evidence.clone());
-        state.continuity.verification.set(
-            astra_turn_types::continuity::VerificationStatus::Passed,
-            evidence,
-            turn,
-        );
+        // Only raise verification to Passed when nothing failed this
+        // round — a partial success must not mask a co-scheduled
+        // failure from the verification signal.
+        if failures.is_empty() {
+            state.continuity.verification.set(
+                astra_turn_types::continuity::VerificationStatus::Passed,
+                evidence,
+                turn,
+            );
+        }
+    }
+
+    // Decide whether a failure is decisive enough to block the todo.
+    // Heuristic: block only if the LAST meaningful tool failed (the
+    // round's terminal action) or if every tool in the round failed.
+    // This avoids premature stalls from incidental failures co-scheduled
+    // with successful exploratory reads, while still catching rounds
+    // whose primary/terminal action clearly did not land.
+    let last_failed = meaningful.last().is_some_and(|rec| !rec.ok);
+    if !failures.is_empty() {
+        let decisive = last_failed;
+        if decisive {
+            // Use the actual last tool (the terminal/decisive action).
+            let failed = meaningful.last().unwrap();
+            let reason = tool_record_result_text(failed);
+            let reason = if reason.trim().is_empty() {
+                format!("{} failed", failed.name)
+            } else {
+                format!("{} failed: {reason}", failed.name)
+            };
+            state
+                .continuity
+                .todos
+                .mark_blocked(&active_id, reason.clone());
+            state.continuity.verification.set(
+                astra_turn_types::continuity::VerificationStatus::Failed,
+                reason,
+                turn,
+            );
+        } else {
+            // Non-decisive failure (e.g. parallel read 404 alongside
+            // successful work). Record it in the verification signal so
+            // the next round still sees it, but do not block the todo —
+            // evidence from the successful tools has already been added
+            // above.
+            let failed = failures.first().unwrap();
+            let reason = tool_record_result_text(failed);
+            let reason = if reason.trim().is_empty() {
+                format!("{} failed (non-blocking)", failed.name)
+            } else {
+                format!("{} failed (non-blocking): {reason}", failed.name)
+            };
+            state.continuity.verification.set(
+                astra_turn_types::continuity::VerificationStatus::Failed,
+                reason,
+                turn,
+            );
+        }
     }
     state.continuity.sync_facts(state.session_facts.clone());
     state.session_facts = state.continuity.facts.clone();
@@ -1371,20 +1421,9 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             let turn_tokens = state.last_measured_prompt_tokens.unwrap_or(0);
             apply_per_turn_adaptation(state, turn_tokens);
 
-            // P0: Proactive context folding at turn end.
-            // Fold old read-only tool results to maintain predictable context size.
-            let fold_result = super::context_compression::fold_old_read_only_results(
-                &mut state.messages,
-                state.current_round_index,
-            );
-            if fold_result.folded_count > 0 {
-                astra_core::agent_debug!(
-                    "context_folding",
-                    "Folded {} tool results, freed ~{} tokens",
-                    fold_result.folded_count,
-                    fold_result.tokens_freed_estimate
-                );
-            }
+            // Context compaction is handled by the single unified pass in
+            // agentic_loop_lifecycle.rs (compact_tool_results_adaptive) which
+            // runs before each LLM call. No per-round folding needed here.
         }
     }
 
@@ -1582,6 +1621,121 @@ mod tests {
             state.continuity.verification.last_status,
             Some(astra_turn_types::continuity::VerificationStatus::Failed)
         );
+    }
+
+    #[test]
+    fn mixed_batch_non_blocking_failure_preserves_evidence() {
+        // Failure is NOT last → non-blocking: evidence recorded, todo stays in-progress
+        let mut state = make_state();
+        state.continuity.ensure_tracked_goal(
+            "Implement mixed batch handling and validate non-blocking failures",
+        );
+        advance_runtime_todo_before_tool_round(&mut state);
+
+        update_runtime_todo_from_tool_records(
+            &mut state,
+            &[tool_record("read_file", false), tool_record("grep", true)],
+        );
+
+        let active = state.continuity.todos.active_or_next().unwrap();
+        assert_eq!(
+            active.status,
+            astra_turn_types::continuity::TodoStatus::InProgress
+        );
+        assert_eq!(active.evidence, vec!["grep ok".to_string()]);
+        assert_eq!(
+            state.continuity.verification.last_status,
+            Some(astra_turn_types::continuity::VerificationStatus::Failed)
+        );
+    }
+
+    #[test]
+    fn mixed_batch_last_failed_blocks_todo() {
+        // Failure IS last → blocking
+        let mut state = make_state();
+        state
+            .continuity
+            .ensure_tracked_goal("Implement last-failed detection and validate blocking behavior");
+        advance_runtime_todo_before_tool_round(&mut state);
+
+        update_runtime_todo_from_tool_records(
+            &mut state,
+            &[tool_record("grep", true), tool_record("cargo", false)],
+        );
+
+        let item = state
+            .continuity
+            .todos
+            .items
+            .iter()
+            .find(|i| i.id == "runtime-goal")
+            .unwrap();
+        assert_eq!(
+            item.status,
+            astra_turn_types::continuity::TodoStatus::Blocked
+        );
+        assert!(item.evidence.contains(&"grep ok".to_string()));
+    }
+
+    #[test]
+    fn all_failed_batch_blocks_todo() {
+        let mut state = make_state();
+        state
+            .continuity
+            .ensure_tracked_goal("Implement all-failed detection and validate batch blocking");
+        advance_runtime_todo_before_tool_round(&mut state);
+
+        update_runtime_todo_from_tool_records(
+            &mut state,
+            &[tool_record("bash", false), tool_record("cargo", false)],
+        );
+
+        let item = state
+            .continuity
+            .todos
+            .items
+            .iter()
+            .find(|i| i.id == "runtime-goal")
+            .unwrap();
+        assert_eq!(
+            item.status,
+            astra_turn_types::continuity::TodoStatus::Blocked
+        );
+    }
+
+    /// The "last tool failed" heuristic uses REQUEST order (the order the
+    /// model emitted tool_calls), not completion order. The parallel executor
+    /// reassembles results by original_index, so the slice passed to
+    /// update_runtime_todo_from_tool_records always reflects request order.
+    /// This test verifies: if the last tool in request order succeeded but
+    /// an earlier tool failed, the todo is NOT blocked.
+    #[test]
+    fn mixed_batch_last_tool_heuristic_uses_request_order() {
+        let mut state = make_state();
+        state.continuity.ensure_tracked_goal(
+            "Validate request-order semantics for last-tool blocking heuristic",
+        );
+        advance_runtime_todo_before_tool_round(&mut state);
+
+        // Request order: [read_file(FAIL), grep(OK), bash(OK)]
+        // Last tool in request order is bash(OK) → non-blocking
+        update_runtime_todo_from_tool_records(
+            &mut state,
+            &[
+                tool_record("read_file", false),
+                tool_record("grep", true),
+                tool_record("bash", true),
+            ],
+        );
+
+        let item = state.continuity.todos.active_or_next().unwrap();
+        assert_eq!(
+            item.status,
+            astra_turn_types::continuity::TodoStatus::InProgress,
+            "todo must NOT be blocked when last tool in request order succeeded"
+        );
+        // Evidence from successful tools must still be recorded
+        assert!(item.evidence.contains(&"grep ok, bash ok".to_string()));
     }
 
     fn tool_record(name: &str, ok: bool) -> ToolCallRecord {
