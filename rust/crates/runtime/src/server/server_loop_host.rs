@@ -1180,32 +1180,28 @@ impl ServerAgenticLoopHost {
             }
             self.emit_event(json!({ "type": "tool_call", "tool_call": tc }));
         }
-        let prompt = usage
-            .get("prompt_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(10);
-        let completion = usage
-            .get("completion_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(5);
-        // Accept both the flat naming (mock-friendly) and the Anthropic
-        // `*_input_tokens` variants so fixtures can model either provider.
-        let cache_read = usage
-            .get("cache_read_tokens")
-            .or_else(|| usage.get("cache_read_input_tokens"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let cache_creation = usage
-            .get("cache_creation_tokens")
-            .or_else(|| usage.get("cache_creation_input_tokens"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
+        // Mock fixtures use upstream OpenAI-native keys (`prompt_tokens` /
+        // `completion_tokens` / `prompt_tokens_details.cached_tokens`), plus
+        // direct Anthropic-style aliases. Normalize through the shared
+        // [`TokenUsage`] extractor so the emitted SSE uses canonical keys
+        // regardless of fixture provenance.
+        let extracted = crate::turn::token_usage::extract_usage(
+            crate::turn::token_usage::UsageDialect::OpenAi,
+            &usage,
+        );
+        let u = extracted.unwrap_or(crate::turn::token_usage::TokenUsage {
+            input_tokens: 10,
+            cached_input_tokens: 0,
+            cache_creation_tokens: 0,
+            output_tokens: 5,
+        });
         self.emit_event(json!({
             "type": "usage",
-            "prompt_tokens": prompt,
-            "completion_tokens": completion,
-            "cache_read_tokens": cache_read,
-            "cache_creation_tokens": cache_creation,
+            "input_tokens": u.input_tokens,
+            "cached_input_tokens": u.cached_input_tokens,
+            "cache_creation_tokens": u.cache_creation_tokens,
+            "output_tokens": u.output_tokens,
+            "total_tokens": u.total_tokens(),
         }));
 
         let edge_tool_round =
@@ -1220,10 +1216,10 @@ impl ServerAgenticLoopHost {
             reasoning_content: reasoning,
             tool_calls: tool_calls.clone(),
             has_tool_calls: !tool_calls.is_empty(),
-            prompt_tokens: prompt,
-            completion_tokens: completion,
-            cache_read_tokens: cache_read,
-            cache_creation_tokens: cache_creation,
+            prompt_tokens: u.input_tokens,
+            completion_tokens: u.output_tokens,
+            cache_read_tokens: u.cached_input_tokens,
+            cache_creation_tokens: u.cache_creation_tokens,
             has_usage: true,
             system_prompt_tokens: Some(system_prompt_breakdown.total_tokens),
             system_prompt_breakdown: serde_json::to_value(&system_prompt_breakdown).ok(),
@@ -1258,10 +1254,11 @@ impl ServerAgenticLoopHost {
                     "reasoning": accum.reasoning_content.clone(),
                     "tool_calls": tool_calls.clone(),
                     "usage": {
-                        "prompt_tokens": prompt,
-                        "completion_tokens": completion,
-                        "cache_read_tokens": cache_read,
-                        "cache_creation_tokens": cache_creation,
+                        "input_tokens": u.input_tokens,
+                        "cached_input_tokens": u.cached_input_tokens,
+                        "cache_creation_tokens": u.cache_creation_tokens,
+                        "output_tokens": u.output_tokens,
+                        "total_tokens": u.total_tokens(),
                     },
                 }),
                 Some(crate::turn::llm_exchange_capture::CaptureTrace {
@@ -1275,8 +1272,8 @@ impl ServerAgenticLoopHost {
 
         state.final_text_streamed = !full_text.is_empty();
         state.final_text = full_text;
-        state.total_prompt += prompt;
-        state.total_completion += completion;
+        state.total_prompt += u.input_tokens as u64;
+        state.total_completion += u.output_tokens as u64;
         state.has_any_usage = true;
 
         Ok(HostTurnResult {
@@ -2149,26 +2146,11 @@ impl ServerAgenticLoopHost {
 
     /// Convert an [`LlmCallResult`] into a [`ChatTurnSseAccum`].
     fn result_to_accum(result: &LlmCallResult) -> ChatTurnSseAccum {
-        let prompt_tokens = result
-            .usage
-            .get("prompt")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let completion_tokens = result
-            .usage
-            .get("completion")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let cache_read_tokens = result
-            .usage
-            .get("cache_read_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let cache_creation_tokens = result
-            .usage
-            .get("cache_creation_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
+        let u = crate::turn::token_usage::TokenUsage::from_json_map(&result.usage);
+        let prompt_tokens = u.input_tokens;
+        let completion_tokens = u.output_tokens;
+        let cache_read_tokens = u.cached_input_tokens;
+        let cache_creation_tokens = u.cache_creation_tokens;
 
         ChatTurnSseAccum {
             full_text: result.full_text.clone(),
@@ -2686,10 +2668,14 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         }
         self.push_reasoning_events(&result.reasoning);
         if !result.usage.is_empty() {
+            let u = crate::turn::token_usage::TokenUsage::from_json_map(&result.usage);
             self.emit_event(json!({
                 "type": "usage",
-                "prompt_tokens": result.usage.get("prompt"),
-                "completion_tokens": result.usage.get("completion"),
+                "input_tokens": u.input_tokens,
+                "cached_input_tokens": u.cached_input_tokens,
+                "cache_creation_tokens": u.cache_creation_tokens,
+                "output_tokens": u.output_tokens,
+                "total_tokens": u.total_tokens(),
             }));
         }
 
@@ -3236,13 +3222,13 @@ mod tests {
         .with_details_json(
             json!({
                 "partial_full_text": "half answer",
-                "usage": { "prompt": 10, "completion": 4 }
+                "usage": { "input_tokens": 10, "output_tokens": 4, "total_tokens": 14 }
             })
             .to_string(),
         );
         let response = llm_capture_error_response(&error);
         assert_eq!(response["partial_full_text"].as_str(), Some("half answer"));
-        assert_eq!(response["usage"]["prompt"].as_i64(), Some(10));
+        assert_eq!(response["usage"]["input_tokens"].as_i64(), Some(10));
         assert_eq!(response["kind"].as_str(), Some("stream_transport"));
     }
 
@@ -3593,8 +3579,11 @@ mod tests {
             reasoning: "thinking...".to_string(),
             tool_calls: vec![json!({"id": "tc1", "function": {"name": "bash"}})],
             usage: Map::from_iter([
-                ("prompt".to_string(), json!(100)),
-                ("completion".to_string(), json!(50)),
+                ("input_tokens".to_string(), json!(100)),
+                ("output_tokens".to_string(), json!(50)),
+                ("cached_input_tokens".to_string(), json!(0)),
+                ("cache_creation_tokens".to_string(), json!(0)),
+                ("total_tokens".to_string(), json!(150)),
             ]),
             model_used: "gpt-4".to_string(),
             duration_ms: 500,
@@ -4749,7 +4738,7 @@ mod tests {
             Some("journal capture reply")
         );
         assert_eq!(
-            llm_events[1]["metadata"]["response"]["response"]["usage"]["completion"].as_i64(),
+            llm_events[1]["metadata"]["response"]["response"]["usage"]["output_tokens"].as_i64(),
             Some(5)
         );
         assert_eq!(
@@ -4943,7 +4932,7 @@ mod tests {
                 "kind": "stream_transport",
                 "details": {
                     "partial_full_text": "half answer",
-                    "usage": { "prompt": 17, "completion": 3 }
+                    "usage": { "input_tokens": 17, "output_tokens": 3, "total_tokens": 20 }
                 }
             }
         })])
@@ -4960,7 +4949,7 @@ mod tests {
         let details: Value =
             serde_json::from_str(error.details_json.as_deref().expect("details json")).unwrap();
         assert_eq!(details["partial_full_text"].as_str(), Some("half answer"));
-        assert_eq!(details["usage"]["prompt"].as_i64(), Some(17));
+        assert_eq!(details["usage"]["input_tokens"].as_i64(), Some(17));
     }
 
     #[tokio::test]
