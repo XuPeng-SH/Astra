@@ -689,7 +689,7 @@ fn build_bedrock_tool_blocks(tool_calls: Option<&Vec<Value>>) -> Vec<Value> {
         .collect()
 }
 
-fn build_bedrock_message_content(msg: &Value) -> Vec<Value> {
+fn build_bedrock_message_content(msg: &Value, include_reasoning_content: bool) -> Vec<Value> {
     let role = msg.get("role").and_then(Value::as_str).unwrap_or_default();
     match role {
         "tool" => {
@@ -727,8 +727,10 @@ fn build_bedrock_message_content(msg: &Value) -> Vec<Value> {
         }
         "assistant" => {
             let mut blocks = Vec::new();
-            // Bedrock requires reasoningContent FIRST in the content array.
-            if let Some(rc) = msg.get("reasoning_content").and_then(Value::as_str) {
+            // Bedrock requires reasoningContent FIRST when thinking is enabled.
+            if include_reasoning_content
+                && let Some(rc) = msg.get("reasoning_content").and_then(Value::as_str)
+            {
                 if !rc.is_empty() {
                     let mut reasoning_text = json!({"text": rc});
                     if let Some(sig) = msg.get("reasoning_signature").and_then(Value::as_str) {
@@ -871,7 +873,10 @@ fn flush_tool_buffer(out: &mut Vec<Value>, buffer: &mut Vec<Value>) {
     }));
 }
 
-fn build_bedrock_messages(messages: &[Value]) -> (Vec<Value>, Vec<Value>) {
+fn build_bedrock_messages(
+    messages: &[Value],
+    include_reasoning_content: bool,
+) -> (Vec<Value>, Vec<Value>) {
     let mut system = Vec::new();
     let mut out = Vec::new();
     // Bedrock Converse requires all toolResult blocks for a given assistant
@@ -890,10 +895,13 @@ fn build_bedrock_messages(messages: &[Value]) -> (Vec<Value>, Vec<Value>) {
                 system.extend(build_bedrock_text_content_blocks(msg.get("content")));
             }
             "tool" => {
-                tool_buffer.extend(build_bedrock_message_content(msg));
+                tool_buffer.extend(build_bedrock_message_content(
+                    msg,
+                    include_reasoning_content,
+                ));
             }
             "user" | "assistant" => {
-                let content = build_bedrock_message_content(msg);
+                let content = build_bedrock_message_content(msg, include_reasoning_content);
                 if !content.is_empty() {
                     out.push(json!({
                         "role": role,
@@ -952,6 +960,82 @@ fn bedrock_messages_contain_tool_blocks(messages: &[Value]) -> bool {
     })
 }
 
+/// Global counter: number of Bedrock thinking requests observed with a
+/// `reasoningContent.text` block but no `signature`. Incremented by
+/// [`assert_bedrock_thinking_signature_contract`] whenever the invariant is
+/// violated. Exposed as a `pub static` so health/metric handlers can surface
+/// it without plumbing a handle through every call site — matches the
+/// convention used by `PERSIST_FAIL_COUNT` / `PERSIST_OK_COUNT`.
+///
+/// Any non-zero value in production means at least one turn will 400 at
+/// Bedrock; on-call should page and check `astra_core::agent_warn!` logs
+/// tagged `llm` for `bedrock signature contract violation`.
+pub static BEDROCK_THINKING_SIGNATURE_VIOLATION_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Guard against the recurring Bedrock thinking-mode regression:
+/// `messages.N.content.0.thinking.signature: Field required` (HTTP 400).
+///
+/// When thinking is enabled, every assistant `reasoningContent` block MUST
+/// carry a signature. If the upstream pipeline ever drops it (as PR #284
+/// and its follow-up showed, twice), Bedrock will reject the turn with the
+/// message above.
+///
+/// Behavior:
+/// - Debug builds / tests: `debug_assert!` — fails loud so the offending
+///   refactor can't merge.
+/// - Release builds: structured warn log + counter increment. On-call
+///   monitors [`BEDROCK_THINKING_SIGNATURE_VIOLATION_COUNT`] as a
+///   continuous-signal tripwire rather than scanning logs.
+fn assert_bedrock_thinking_signature_contract(bedrock_messages: &[Value]) {
+    for (idx, msg) in bedrock_messages.iter().enumerate() {
+        let Some(blocks) = msg.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        for block in blocks {
+            let Some(reasoning_text) = block
+                .get("reasoningContent")
+                .and_then(|rc| rc.get("reasoningText"))
+            else {
+                continue;
+            };
+            let text = reasoning_text
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if text.is_empty() {
+                continue;
+            }
+            let has_signature = reasoning_text
+                .get("signature")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty());
+            if has_signature {
+                continue;
+            }
+            // This combo will 400. Count it so on-call can trigger on a
+            // non-zero tripwire instead of grepping logs; panic in debug/test
+            // so regressions can't merge silently.
+            BEDROCK_THINKING_SIGNATURE_VIOLATION_COUNT
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            debug_assert!(
+                false,
+                "Bedrock thinking contract violation: messages[{idx}] has \
+                 reasoningContent.text but no signature — Bedrock will reject \
+                 with `messages.{idx}.content.0.thinking.signature: Field required`. \
+                 The signature must be captured from the provider stream and replayed \
+                 on every continuation turn (see chat_turn_sse_dispatch::reasoning_done)."
+            );
+            astra_core::agent_warn!(
+                "llm",
+                "bedrock signature contract violation: messages[{}].reasoningContent \
+                 is non-empty but signature is missing — turn will 400",
+                idx
+            );
+        }
+    }
+}
+
 pub(crate) fn build_provider_request_body(
     messages: &[Value],
     tools: &[Value],
@@ -965,7 +1049,8 @@ pub(crate) fn build_provider_request_body(
     match llm_provider_protocol(provider) {
         LlmProviderProtocol::BedrockConverse => {
             let repaired = repair_openai_tool_pairing_for_bedrock(messages);
-            let (system, bedrock_messages) = build_bedrock_messages(&repaired);
+            let (system, bedrock_messages) =
+                build_bedrock_messages(&repaired, thinking.is_enabled());
             let mut body = json!({
                 "messages": bedrock_messages,
             });
@@ -989,6 +1074,9 @@ pub(crate) fn build_provider_request_body(
                 body["toolConfig"] = json!({ "tools": [] });
             }
             thinking.apply_bedrock(&mut body);
+            if thinking.is_enabled() {
+                assert_bedrock_thinking_signature_contract(&bedrock_messages);
+            }
             body
         }
         LlmProviderProtocol::AnthropicMessages | LlmProviderProtocol::OpenAiCompatible => {
@@ -5535,7 +5623,9 @@ mod tests {
             Some(4096),
             None,
             true,
-            &ThinkingConfig::Off,
+            &ThinkingConfig::Enabled {
+                budget_tokens: 1024,
+            },
         );
         let bedrock_msgs = body["messages"].as_array().unwrap();
         // First message is user "hello"
@@ -5656,6 +5746,160 @@ mod tests {
         assert!(
             !content.iter().any(|b| b.get("reasoningContent").is_some()),
             "empty reasoning_content must NOT produce a reasoningContent block"
+        );
+    }
+
+    /// Helper for counter tests: build a body that would violate the
+    /// signature contract, catching the debug_assert panic so the test can
+    /// observe the counter's post-increment state.
+    fn attempt_violating_bedrock_thinking_build() {
+        let messages = vec![
+            json!({"role": "user", "content": "q"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "tc1", "type": "function",
+                    "function": {"name": "noop", "arguments": "{}"}
+                }],
+                "reasoning_content": "thinking without signature",
+            }),
+            json!({"role": "tool", "tool_call_id": "tc1", "content": "ok"}),
+        ];
+        let _ = build_provider_request_body(
+            &messages,
+            &[],
+            "us.anthropic.claude-sonnet-4-6",
+            "bedrock",
+            Some(4096),
+            None,
+            true,
+            &ThinkingConfig::Enabled {
+                budget_tokens: 1024,
+            },
+        );
+    }
+
+    // Counter increments alongside the debug_assert so release builds can
+    // expose a continuous-signal tripwire (BEDROCK_THINKING_SIGNATURE_VIOLATION_COUNT).
+    // The counter must increment even if the panic short-circuits the rest of
+    // the build — otherwise monitoring misses the first violation.
+    #[test]
+    fn bedrock_thinking_signature_violation_increments_counter() {
+        use std::sync::atomic::Ordering;
+        let before = BEDROCK_THINKING_SIGNATURE_VIOLATION_COUNT.load(Ordering::Relaxed);
+        // debug_assert panics in test/debug builds; catch so we can read the
+        // counter afterward. The fetch_add runs *before* the debug_assert so
+        // the counter observes the violation even when the assert fires.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            attempt_violating_bedrock_thinking_build,
+        ));
+        let after = BEDROCK_THINKING_SIGNATURE_VIOLATION_COUNT.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "counter must advance on every signature-contract violation \
+             (before={before}, after={after})"
+        );
+    }
+
+    // Guard that the debug_assert in `assert_bedrock_thinking_signature_contract`
+    // actually fires when a reasoning block arrives without signature. This is
+    // the "scream if this ever regresses again" safety net for PR #284's class
+    // of bug. Expected outcome: Bedrock would 400 — we want a test panic first.
+    #[test]
+    #[should_panic(expected = "Bedrock thinking contract violation")]
+    fn bedrock_thinking_signature_contract_panics_on_missing_signature() {
+        // Simulate what happens if the SSE → accum → next-assistant-message
+        // pipeline ever drops the signature: reasoning_content is present but
+        // reasoning_signature is empty.
+        let messages = vec![
+            json!({"role": "user", "content": "What is 2+2?"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{"id": "tc1", "type": "function", "function": {"name": "calc", "arguments": "{}"}}],
+                "reasoning_content": "let me compute",
+                // reasoning_signature intentionally MISSING
+            }),
+            json!({"role": "tool", "tool_call_id": "tc1", "content": "4"}),
+        ];
+        let _ = build_provider_request_body(
+            &messages,
+            &[],
+            "us.anthropic.claude-sonnet-4-6",
+            "bedrock",
+            Some(4096),
+            None,
+            true,
+            &ThinkingConfig::Enabled {
+                budget_tokens: 1024,
+            },
+        );
+    }
+
+    // Contract positive: signature present → no panic, body built normally.
+    #[test]
+    fn bedrock_thinking_signature_contract_passes_when_signature_present() {
+        let messages = vec![
+            json!({"role": "user", "content": "What is 2+2?"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{"id": "tc1", "type": "function", "function": {"name": "calc", "arguments": "{}"}}],
+                "reasoning_content": "let me compute",
+                "reasoning_signature": "sig_from_bedrock"
+            }),
+            json!({"role": "tool", "tool_call_id": "tc1", "content": "4"}),
+        ];
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "us.anthropic.claude-sonnet-4-6",
+            "bedrock",
+            Some(4096),
+            None,
+            true,
+            &ThinkingConfig::Enabled {
+                budget_tokens: 1024,
+            },
+        );
+        // Assistant reasoningContent block must carry the signature.
+        let rc_sig =
+            body["messages"][1]["content"][0]["reasoningContent"]["reasoningText"]["signature"]
+                .as_str()
+                .unwrap();
+        assert_eq!(rc_sig, "sig_from_bedrock");
+    }
+
+    // Contract negative-bypass: thinking disabled → stale reasoning history
+    // is not serialized, so the signature guard has nothing to enforce.
+    #[test]
+    fn bedrock_thinking_signature_contract_silent_when_thinking_off() {
+        let messages = vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{"id": "tc1", "type": "function", "function": {"name": "bash", "arguments": "{}"}}],
+                "reasoning_content": "some leftover"
+            }),
+            json!({"role": "tool", "tool_call_id": "tc1", "content": "ok"}),
+        ];
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "us.anthropic.claude-sonnet-4-6",
+            "bedrock",
+            Some(4096),
+            None,
+            true,
+            &ThinkingConfig::Off,
+        );
+        let assistant = &body["messages"][1];
+        let content = assistant["content"].as_array().unwrap();
+        assert!(
+            !content.iter().any(|b| b.get("reasoningContent").is_some()),
+            "thinking=off must suppress stale reasoningContent so Bedrock never sees an unsigned reasoning block"
         );
     }
 
@@ -5846,5 +6090,287 @@ mod tests {
 
         assert!(body.get("reasoning_effort").is_none());
         assert_eq!(body["temperature"], 0.7);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Provider × Thinking × Tool-call × Multi-turn capability matrix
+    // ─────────────────────────────────────────────────────────────────────
+    //
+    // This matrix exists because PR #284 was followed by a silent follow-up
+    // regression: the Bedrock signature stopped flowing through the SSE hop
+    // between bridge and CLI. Unit tests passed; the end-to-end contract
+    // broke anyway. The rule now is:
+    //
+    //   For every (provider, thinking_mode, has_tool_call, turn_number)
+    //   combination that reaches a live provider, assert the exact shape of
+    //   the request body produced by `build_provider_request_body`.
+    //
+    // Adding a new provider / thinking mode without a matrix row is a bug.
+    // If the scenario is not supported yet, add a `#[ignore]` placeholder
+    // with a comment — don't silently skip.
+    //
+    // Columns pinned per row:
+    //  - reasoning block shape (or absence)
+    //  - signature presence (Bedrock + Anthropic thinking only)
+    //  - tool_use / toolUse block presence on turn-2+ assistant messages
+    //  - top-level `thinking` config applied correctly
+    mod thinking_matrix {
+        use super::*;
+
+        fn user(text: &str) -> Value {
+            json!({"role": "user", "content": text})
+        }
+
+        fn assistant_with_tool_call(
+            reasoning: &str,
+            signature: Option<&str>,
+            tool_name: &str,
+            tool_id: &str,
+        ) -> Value {
+            let mut msg = json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": tool_id,
+                    "type": "function",
+                    "function": {"name": tool_name, "arguments": "{}"}
+                }]
+            });
+            if !reasoning.is_empty() {
+                msg["reasoning_content"] = Value::String(reasoning.to_string());
+            }
+            if let Some(sig) = signature {
+                msg["reasoning_signature"] = Value::String(sig.to_string());
+            }
+            msg
+        }
+
+        fn tool_result(tool_id: &str, output: &str) -> Value {
+            json!({"role": "tool", "tool_call_id": tool_id, "content": output})
+        }
+
+        // ── Row: Bedrock + Thinking::Enabled + tool_call + turn-2 ──
+        // This is the exact scenario that caused the HTTP 400 that led
+        // to this matrix's existence.
+        #[test]
+        fn bedrock_thinking_tool_call_multi_turn_serializes_signature() {
+            let messages = vec![
+                user("compute 2+2"),
+                assistant_with_tool_call("thinking...", Some("real_sig"), "calc", "tc1"),
+                tool_result("tc1", "4"),
+            ];
+            let body = build_provider_request_body(
+                &messages,
+                &[],
+                "us.anthropic.claude-sonnet-4-6",
+                "bedrock",
+                Some(4096),
+                None,
+                true,
+                &ThinkingConfig::Enabled {
+                    budget_tokens: 1024,
+                },
+            );
+            let assistant = &body["messages"][1];
+            let content = assistant["content"].as_array().unwrap();
+            let rc = &content[0]["reasoningContent"]["reasoningText"];
+            assert_eq!(rc["text"], "thinking...");
+            assert_eq!(
+                rc["signature"], "real_sig",
+                "signature MUST appear on assistant reasoningContent — \
+                 Bedrock returns 400 `thinking.signature: Field required` otherwise"
+            );
+            let has_tool_use = content.iter().any(|b| b.get("toolUse").is_some());
+            assert!(has_tool_use, "toolUse block must follow reasoningContent");
+            assert_eq!(
+                body["additionalModelRequestFields"]["thinking"]["type"],
+                "enabled"
+            );
+        }
+
+        // ── Row: Bedrock + Thinking::Off + tool_call + turn-2 ──
+        // No thinking → no reasoningContent block even if historic
+        // reasoning_content is present (e.g. session resumed with stale state).
+        #[test]
+        fn bedrock_thinking_off_tool_call_omits_reasoning_block() {
+            let messages = vec![
+                user("hi"),
+                assistant_with_tool_call("old thinking", None, "bash", "tc1"),
+                tool_result("tc1", "ok"),
+            ];
+            let body = build_provider_request_body(
+                &messages,
+                &[],
+                "us.anthropic.claude-sonnet-4-6",
+                "bedrock",
+                Some(4096),
+                None,
+                true,
+                &ThinkingConfig::Off,
+            );
+            assert!(body.get("additionalModelRequestFields").is_none());
+            let assistant = &body["messages"][1];
+            let content = assistant["content"].as_array().unwrap();
+            assert!(
+                !content.iter().any(|b| b.get("reasoningContent").is_some()),
+                "thinking=off should not serialize stale reasoningContent"
+            );
+        }
+
+        // ── Row: Bedrock + Thinking::Enabled + no tool_call + turn-1 ──
+        // No historic assistant message yet → no signature contract to honor.
+        #[test]
+        fn bedrock_thinking_first_turn_no_history() {
+            let messages = vec![user("compute 2+2")];
+            let body = build_provider_request_body(
+                &messages,
+                &[],
+                "us.anthropic.claude-sonnet-4-6",
+                "bedrock",
+                Some(4096),
+                None,
+                true,
+                &ThinkingConfig::Enabled {
+                    budget_tokens: 1024,
+                },
+            );
+            assert_eq!(
+                body["additionalModelRequestFields"]["thinking"]["type"],
+                "enabled"
+            );
+        }
+
+        // ── Row: Anthropic + Thinking::Enabled + no tool_call + turn-1 ──
+        #[test]
+        fn anthropic_thinking_first_turn_top_level_config() {
+            let messages = vec![user("compute 2+2")];
+            let body = build_provider_request_body(
+                &messages,
+                &[],
+                "claude-opus-4-7",
+                "anthropic",
+                Some(8192),
+                None,
+                true,
+                &ThinkingConfig::Enabled {
+                    budget_tokens: 4000,
+                },
+            );
+            assert_eq!(body["thinking"]["type"], "enabled");
+            assert_eq!(body["thinking"]["budget_tokens"], 4000);
+        }
+
+        // ── Row: Anthropic + Thinking::Enabled + tool_call + turn-2 ──
+        //
+        // KNOWN GAP — tracked (created 2026-05-01): Anthropic native API
+        // requires assistant.content as an array of typed blocks
+        // (`{"type":"thinking","thinking":"...","signature":"..."}`,
+        // `{"type":"tool_use",...}`). Today's code path passes OpenAI-shape
+        // `reasoning_content` / `reasoning_signature` directly, which
+        // Anthropic will reject with the same class of 400 as Bedrock's
+        // `thinking.signature: Field required`.
+        //
+        // Pinned here as `#[ignore]` so: (a) nobody accidentally ships
+        // Anthropic native multi-turn thinking in a broken state, and
+        // (b) when a future PR implements the typed-block serializer
+        // (equivalent to `build_bedrock_messages` for Anthropic) plus the
+        // matching SSE signature capture, this test becomes real coverage
+        // by removing the `#[ignore]`.
+        //
+        // TODO(anthropic-thinking): remove `#[ignore]` and implement the
+        // typed-block serializer + SSE signature capture before enabling
+        // native Anthropic multi-turn thinking.
+        #[test]
+        #[ignore = "blocked on typed-block serializer for native Anthropic thinking"]
+        fn anthropic_thinking_tool_call_multi_turn_needs_typed_blocks() {
+            let messages = vec![
+                user("compute 2+2"),
+                assistant_with_tool_call("thinking...", Some("real_sig"), "calc", "tc1"),
+                tool_result("tc1", "4"),
+            ];
+            let body = build_provider_request_body(
+                &messages,
+                &[],
+                "claude-opus-4-7",
+                "anthropic",
+                Some(8192),
+                None,
+                true,
+                &ThinkingConfig::Enabled {
+                    budget_tokens: 4000,
+                },
+            );
+            // When this is implemented, the assistant message content MUST be
+            // a typed-block array: first a thinking block carrying signature,
+            // then the tool_use block.
+            let assistant_content = body["messages"][1]["content"].as_array().unwrap();
+            assert_eq!(assistant_content[0]["type"], "thinking");
+            assert_eq!(assistant_content[0]["thinking"], "thinking...");
+            assert_eq!(assistant_content[0]["signature"], "real_sig");
+            assert_eq!(assistant_content[1]["type"], "tool_use");
+        }
+
+        // ── Row: OpenAI + Thinking::Adaptive(effort) ──
+        // Adaptive maps to `reasoning_effort` on OpenAI. No signature mechanic.
+        #[test]
+        fn openai_thinking_adaptive_maps_to_reasoning_effort() {
+            let messages = vec![user("hi")];
+            let body = build_provider_request_body(
+                &messages,
+                &[],
+                "gpt-4o",
+                "openai",
+                Some(4096),
+                Some(0.7),
+                true,
+                &ThinkingConfig::Adaptive {
+                    effort: astra_turn_core::thinking_config::ThinkingEffort::Medium,
+                },
+            );
+            assert_eq!(body["reasoning_effort"], "medium");
+        }
+
+        // ── Row: OpenAI + Thinking::Enabled (budget) ──
+        // OpenAI has no budget-based thinking; the config must be a no-op
+        // rather than silently sending an unsupported field.
+        #[test]
+        fn openai_thinking_enabled_budget_is_noop() {
+            let messages = vec![user("hi")];
+            let body = build_provider_request_body(
+                &messages,
+                &[],
+                "gpt-4o",
+                "openai",
+                Some(4096),
+                Some(0.7),
+                true,
+                &ThinkingConfig::Enabled {
+                    budget_tokens: 5000,
+                },
+            );
+            assert!(body.get("reasoning_effort").is_none());
+            assert!(body.get("thinking").is_none());
+            assert!(body.get("enable_thinking").is_none());
+        }
+
+        // ── Row: DashScope/Qwen + Thinking::Enabled ──
+        // Qwen uses a binary `enable_thinking` flag, not budget/effort.
+        #[test]
+        fn dashscope_thinking_enabled_sends_binary_flag() {
+            let messages = vec![user("hi")];
+            let body = build_provider_request_body(
+                &messages,
+                &[],
+                "qwen3-max",
+                "dashscope",
+                Some(4096),
+                Some(0.7),
+                true,
+                &ThinkingConfig::Enabled {
+                    budget_tokens: 1024,
+                },
+            );
+            assert_eq!(body["enable_thinking"], true);
+        }
     }
 }
