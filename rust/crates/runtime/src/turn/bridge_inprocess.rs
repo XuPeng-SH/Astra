@@ -4,7 +4,7 @@
 ///
 /// | Behavior | Implementation |
 /// |------------------------|------|
-/// | Long-lived stream "stall" / no chunks | [`super::llm_client::stream_idle_timeout`] on SSE `next()` (5 min default, `ASTRA_STREAM_IDLE_TIMEOUT_MS`) |
+/// | Long-lived stream "stall" / no chunks | [`super::llm_client::stream_idle_timeout`] on SSE `next()` (5 min default; shortened only by the `bridge-e2e-hooks` test hook) |
 /// | Recover via one-shot completion | [`super::llm_client::call_llm_nonstream_fallback`] after idle in both `call_llm_and_collect` and [`call_llm_stream`] below |
 /// | User cancel clears in-flight work | HTTP `/chat/turn` passes `CancellationToken`; dropping the SSE body (client disconnect) cancels in-flight LLM byte/SSE consumption in-process |
 /// | Cooldown / 429 wait cannot ignore disconnect | [`super::llm_client::sleep_ms_or_llm_cancel`] on retry backoff + rate-limit waits in [`call_llm_stream`]; initial cooldown wait `select!`s [`wait_until_cancelled_or_pending`](super::llm_client::wait_until_cancelled_or_pending) in the bridge stream |
@@ -3415,6 +3415,14 @@ mod tests {
     use std::sync::Mutex;
 
     /// RAII guard that restores an environment variable on drop (panic-safe).
+    ///
+    /// **Not safe under parallel tests sharing the same env key.** Two tests
+    /// entering with `previous = None` race: whichever guard drops first
+    /// clears the env out from under the other test, which then sees the
+    /// variable unset mid-assertion. Every test that sets
+    /// `ASTRA_TEST_BRIDGE_SECRET` via this guard MUST therefore carry
+    /// `#[serial_test::serial(astra_test_bridge_secret)]` so the five
+    /// `forward_…` journal tests run exclusively against each other.
     #[cfg(feature = "bridge-e2e-hooks")]
     struct EnvVarGuard {
         key: &'static str,
@@ -6071,6 +6079,7 @@ mod tests {
 
     #[cfg(feature = "bridge-e2e-hooks")]
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(astra_test_bridge_secret)]
     async fn forward_persists_full_journal_request_and_response_when_session_capture_enabled() {
         let temp = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
@@ -6152,6 +6161,7 @@ mod tests {
 
     #[cfg(feature = "bridge-e2e-hooks")]
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(astra_test_bridge_secret)]
     async fn forward_does_not_persist_full_journal_events_when_session_capture_disabled() {
         let temp = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
@@ -6222,6 +6232,7 @@ mod tests {
     }
     #[cfg(feature = "bridge-e2e-hooks")]
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(astra_test_bridge_secret)]
     async fn forward_persists_full_journal_rounds_from_round_index_across_same_session_turn() {
         let temp = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
@@ -6310,6 +6321,7 @@ mod tests {
 
     #[cfg(feature = "bridge-e2e-hooks")]
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(astra_test_bridge_secret)]
     async fn forward_persists_full_journal_error_response_with_partial_state_when_session_capture_enabled()
      {
         let temp = tempfile::tempdir().unwrap();
@@ -6381,6 +6393,7 @@ mod tests {
 
     #[cfg(feature = "bridge-e2e-hooks")]
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(astra_test_bridge_secret)]
     async fn forward_persists_full_journal_context_with_reasoning_when_session_capture_enabled() {
         let temp = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());

@@ -142,13 +142,22 @@ struct RawTransportServerHits {
     nonstream_hits: Arc<AtomicU32>,
 }
 
-/// Stream idle timeout override was previously env-controlled; now hardcoded. This is a
-/// no-op placeholder so test call sites keep compiling. Callers should expect full-length
-/// timeouts (5 minutes) — the tests that used short overrides may take longer.
-struct StreamIdleEnvGuard;
+type StreamIdleEnvGuard = astra_runtime::turn::stream_idle_test_hooks::StreamIdleTimeoutGuard;
 
-fn set_stream_idle_timeouts_for_test(_pre_ms: u64, _post_ms: u64) -> StreamIdleEnvGuard {
-    StreamIdleEnvGuard
+fn set_stream_idle_timeouts_for_test(pre_ms: u64, post_ms: u64) -> StreamIdleEnvGuard {
+    astra_runtime::turn::stream_idle_test_hooks::set_stream_idle_timeouts_for_test(pre_ms, post_ms)
+}
+
+#[test]
+fn stream_idle_timeout_guard_sets_runtime_override_for_integration_tests() {
+    let _guard = set_stream_idle_timeouts_for_test(123, 456);
+    assert_eq!(
+        astra_runtime::turn::stream_idle_test_hooks::current_stream_idle_timeouts_for_test(),
+        (
+            Some(std::time::Duration::from_millis(123)),
+            Some(std::time::Duration::from_millis(456))
+        )
+    );
 }
 
 /// Asserts the number of non-stream fallback hits falls inside `min..=max`.
@@ -1399,9 +1408,21 @@ pub async fn run_failed_session_artifact_latest_and_download_routes() {
         latest_j["content"]["response"]["partial_full_text"].as_str(),
         Some(partial_text)
     );
+    // Artifacts carry the canonical token-usage schema
+    // (`input_tokens` / `output_tokens`) regardless of which wire dialect the
+    // upstream provider spoke. `llm_capture_error_response` is responsible
+    // for normalizing `ClassifiedError.details.usage` from OpenAI-style
+    // (`prompt_tokens`/`completion_tokens`) into the canonical form before
+    // flattening. If this assertion regresses, error artifacts have drifted
+    // away from the canonical schema shared by the SSE path
+    // (see `bridge_sse_helpers::apply_forward_llm_sse_event`).
     assert_eq!(
-        latest_j["content"]["response"]["usage"]["prompt"].as_i64(),
+        latest_j["content"]["response"]["usage"]["input_tokens"].as_i64(),
         Some(17)
+    );
+    assert_eq!(
+        latest_j["content"]["response"]["usage"]["output_tokens"].as_i64(),
+        Some(3)
     );
 
     let download_path = format!("/sessions/{session_id}/artifacts/{artifact_id}/download");
@@ -1434,9 +1455,14 @@ pub async fn run_failed_session_artifact_latest_and_download_routes() {
         download_j["content"]["response"]["partial_full_text"].as_str(),
         Some(partial_text)
     );
+    // Same canonical-schema rationale as the `latest_j` assertion above.
     assert_eq!(
-        download_j["content"]["response"]["usage"]["prompt"].as_i64(),
+        download_j["content"]["response"]["usage"]["input_tokens"].as_i64(),
         Some(17)
+    );
+    assert_eq!(
+        download_j["content"]["response"]["usage"]["output_tokens"].as_i64(),
+        Some(3)
     );
 
     let _ = sqlx::query("DELETE FROM session_artifacts WHERE session_id = ?")
@@ -2997,12 +3023,18 @@ pub async fn run_bridge_tail_parse_error_artifact_preserves_partial_state_routes
         latest_j["content"]["response"]["tool_calls"][0]["function"]["name"].as_str(),
         Some("bash")
     );
+    // SSE `usage` frames use the canonical token-usage schema
+    // (see `turn::token_usage::TokenUsage::to_json_map` and
+    // `bridge_sse_helpers::apply_forward_llm_sse_event` for the allow-listed
+    // keys). The artifact preserves them verbatim, so the assertion must
+    // match the wire shape — `input_tokens` / `output_tokens`, NOT the
+    // OpenAI-style `prompt_tokens` / `completion_tokens`.
     assert_eq!(
-        latest_j["content"]["response"]["usage"]["prompt_tokens"].as_i64(),
+        latest_j["content"]["response"]["usage"]["input_tokens"].as_i64(),
         Some(13)
     );
     assert_eq!(
-        latest_j["content"]["response"]["usage"]["completion_tokens"].as_i64(),
+        latest_j["content"]["response"]["usage"]["output_tokens"].as_i64(),
         Some(5)
     );
 
@@ -3032,12 +3064,13 @@ pub async fn run_bridge_tail_parse_error_artifact_preserves_partial_state_routes
         download_j["content"]["response"]["tool_calls"][0]["function"]["name"].as_str(),
         Some("bash")
     );
+    // Same canonical-schema rationale as the `latest_j` assertion above.
     assert_eq!(
-        download_j["content"]["response"]["usage"]["prompt_tokens"].as_i64(),
+        download_j["content"]["response"]["usage"]["input_tokens"].as_i64(),
         Some(13)
     );
     assert_eq!(
-        download_j["content"]["response"]["usage"]["completion_tokens"].as_i64(),
+        download_j["content"]["response"]["usage"]["output_tokens"].as_i64(),
         Some(5)
     );
 
