@@ -3,7 +3,8 @@
 //! This module provides the ability for LLMs to dynamically spawn sub-agents
 //! at runtime without pre-defined team configurations.
 
-mod spawner;
+mod fork_cache_probe;
+pub(crate) mod spawner;
 
 pub use astra_turn_core::orchestration_context_cache::{
     AgentFindings, CacheStats, CachedFile, Finding, FindingCategory, Knowledge, SharedContextCache,
@@ -22,8 +23,9 @@ pub use permission_sync::{
     PermissionRequest, PermissionRequestHandler, PermissionRequestMessaging, PermissionResponse,
     PermissionResponseMessaging, PermissionRule, PermissionSyncContext, PermissionUpdate,
 };
+pub use fork_cache_probe::{ForkCacheProbeState, maybe_emit_fork_cache_probe};
 pub use spawner::{
-    AgentHistoryRecord, AgentStatus, DynamicAgentSpawner, PermissionSummary, SpawnAgentExecutor,
-    SpawnContext, SpawnError, SpawnRunConfig, SpawnRunResult, SpawnedAgentInfo,
+    AgentHistoryRecord, AgentStatus, DynamicAgentSpawner, InheritedChildPrefix, PermissionSummary,
+    SpawnAgentExecutor, SpawnContext, SpawnError, SpawnRunConfig, SpawnRunResult, SpawnedAgentInfo,
     SpawnedAgentMetrics, SpawnedAgentState,
 };

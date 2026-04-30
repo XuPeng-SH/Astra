@@ -108,6 +108,20 @@ pub(crate) struct CliDelegateSubRunExecutor {
         Option<tokio::sync::mpsc::UnboundedSender<super::skill_subrun::SubRunProgressEvent>>,
     /// Global progress broadcaster for emitting events visible in /agent watch.
     progress_broadcaster: Option<Arc<astra_runtime::orchestration::ProgressBroadcaster>>,
+    /// Optional fork-cache event sink. When set, the delegated
+    /// child's `on_turn_completed` hook fires a ForkCacheEvent on
+    /// its first successful ingested turn — same pattern as
+    /// spawn_subrun. `None` (the default) keeps delegate behavior
+    /// pre-fork-prefix.
+    ///
+    /// Note: populating `inherited_prefix` on the delegated child's
+    /// SubRunConfig requires DelegationEngine changes not done in
+    /// this PR; without that wiring, the probe helper always sees
+    /// `inherited_prefix: None` and no event ever fires. The sink
+    /// is accepted here so the follow-up wire-up PR only touches
+    /// the engine, not the executor.
+    fork_cache_sink:
+        Option<Arc<dyn astra_turn_core::fork_cache_event::ForkCacheEventSink>>,
 }
 
 impl CliDelegateSubRunExecutor {
@@ -130,7 +144,21 @@ impl CliDelegateSubRunExecutor {
             skill_search: SkillSearchSettings::default(),
             progress_tx: None,
             progress_broadcaster: None,
+            fork_cache_sink: None,
         }
+    }
+
+    /// Install a fork-cache event sink. See the struct-level field
+    /// doc for the completeness caveat: until DelegationEngine
+    /// populates `SubRunConfig.inherited_prefix`, delegated children
+    /// won't fire events even with a sink installed — it's a no-op
+    /// until the other half of the wiring lands.
+    pub fn with_fork_cache_sink(
+        mut self,
+        sink: Arc<dyn astra_turn_core::fork_cache_event::ForkCacheEventSink>,
+    ) -> Self {
+        self.fork_cache_sink = Some(sink);
+        self
     }
 
     pub fn with_skill_resolver(
@@ -253,6 +281,17 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             tool_cache: super::stream_render::EdgeToolCache::new(
                 resolved_tool_policy.max_identical_tool_calls,
             ),
+            // Bug B step 2: consume the inherited_prefix the
+            // DelegationEngine resolved (from its prefix_store + the
+            // parent's run id). When None, the child runs fresh —
+            // same as pre-fork-prefix. The probe helper inside
+            // `on_turn_completed` early-returns on None, so a delegate
+            // without resolved inheritance emits nothing, just like
+            // the spawn_agent path.
+            inherited_prefix: config.inherited_prefix.clone(),
+            fork_cache_sink: self.fork_cache_sink.clone(),
+            fork_cache_probe_state:
+                astra_runtime::orchestration::ForkCacheProbeState::new(),
         };
 
         // Build system message from agent profile.
@@ -285,10 +324,24 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
         }
         let user_message = user_parts.join("");
 
-        let messages = vec![
-            json!({ "role": "system", "content": system_prompt }),
-            json!({ "role": "user", "content": user_message }),
-        ];
+        // Bug B step 2: prepend the parent's captured messages when
+        // the engine resolved a ForkPrefix for this delegation.
+        // Mirrors the spawn_subrun ordering: system prompt stays
+        // at [0] as the child's identity, the parent transcript
+        // sits behind it as cacheable context, and the child's
+        // task message is the fresh suffix. When no prefix was
+        // resolved, this degenerates to the pre-fix 2-message layout.
+        let mut messages = Vec::with_capacity(
+            2 + config
+                .inherited_prefix
+                .as_ref()
+                .map_or(0, |ip| ip.prefix_messages.len()),
+        );
+        messages.push(json!({ "role": "system", "content": system_prompt }));
+        if let Some(ref ip) = config.inherited_prefix {
+            messages.extend(ip.prefix_messages.iter().cloned());
+        }
+        messages.push(json!({ "role": "user", "content": user_message }));
 
         let restricted_tools = build_restricted_tools(&profile.skill_filter, &valid_tool_names);
 
@@ -951,6 +1004,42 @@ mod tests {
             restricted.is_empty(),
             "coder agent should have no tool restrictions, but got: {:?}",
             restricted
+        );
+    }
+
+    // ─── Bug B regression: fork-cache sink propagates through delegate ───
+    //
+    // The ask: `CliDelegateSubRunExecutor` must accept a
+    // `ForkCacheEventSink` and pass it to the internal `SubRunHost`
+    // so that when `DelegationEngine` eventually populates
+    // `SubRunConfig.inherited_prefix` (follow-up PR), the probe
+    // helper can actually emit events. Without the sink, even a
+    // correctly-resolved inherited prefix would fire into a void.
+    //
+    // Structural tests — avoiding the trait-mocking rabbit hole
+    // from the `basic_cli` tests earlier.
+
+    #[test]
+    fn delegate_executor_accepts_fork_cache_sink() {
+        let src = include_str!("delegate_subrun.rs");
+        assert!(
+            src.contains("pub fn with_fork_cache_sink"),
+            "CliDelegateSubRunExecutor must expose with_fork_cache_sink; \
+             without it, agent_runtime can't wire observability into \
+             the delegate path"
+        );
+    }
+
+    #[test]
+    fn delegate_subrun_host_consumes_executor_sink() {
+        // When the executor holds a sink, the SubRunHost it builds
+        // must receive it (not `None`). Grep the production code
+        // path for the assignment.
+        let src = include_str!("delegate_subrun.rs");
+        assert!(
+            src.contains("fork_cache_sink: self.fork_cache_sink.clone()"),
+            "delegate_subrun must propagate executor.fork_cache_sink \
+             into SubRunHost, not hardcode None"
         );
     }
 }

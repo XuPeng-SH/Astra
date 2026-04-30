@@ -79,6 +79,17 @@ pub(crate) struct CliAgenticLoopHost<'a> {
     pub repl_turn_index: u32,
     /// Cross-turn tool output cache for edge-path dedup.
     pub tool_cache: crate::stream_render::EdgeToolCache,
+    /// Optional fork-prefix store: when set + fork flag enabled,
+    /// this host calls `capture_parent_prefix` in its
+    /// `on_turn_completed` hook, feeding the store that the
+    /// DynamicAgentSpawner and DelegationEngine share. Without
+    /// this, a captured parent prefix never exists and children
+    /// always resolve to None — which was the exact observation
+    /// during live MiniMax verification (spawn succeeded,
+    /// delegate succeeded, but fork-cache events never fired
+    /// because no parent capture happened).
+    pub prefix_store:
+        Option<std::sync::Arc<dyn astra_turn_core::fork_prefix_store::PrefixCaptureSink>>,
 }
 
 fn derive_turn_interaction_mode(
@@ -468,6 +479,67 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             let _ = std::io::stdout().flush();
         }
     }
+
+    fn on_turn_completed(
+        &mut self,
+        state: &astra_runtime::turn::agentic_loop_host::AgenticLoopState,
+    ) {
+        // Bug B step 3: capture the parent turn's cacheable prefix
+        // so subsequent spawn_agent / delegate calls can inherit it
+        // for prompt-cache reuse. No-op unless:
+        //   - the `prefix_store` Arc was plumbed in (CLI startup
+        //     sets this on every host when fork_prefix.enabled)
+        //   - feature flag is on (capture_parent_prefix
+        //     early-returns otherwise, preserving the
+        //     FeatureDisabled contract)
+        //   - ingest populated the expected state fields
+        let Some(store) = self.prefix_store.as_ref() else {
+            return;
+        };
+        let parent_run_id = match state.current_run_id.as_deref() {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => return,
+        };
+        let model_id = self.model.unwrap_or("").to_string();
+        let provider = astra_turn_core::fork_prefix::ProviderKind::from_provider_hint(&model_id);
+        // Canonical prefix bytes: JSON-serialize the messages as-is.
+        // This is the format `fork_reconstruct::reconstruct_messages`
+        // expects on the consuming end. System prompts and tool
+        // schemas are captured separately; for step 3 we ship a
+        // minimal-but-correct subset — the messages array is what
+        // downstream prepending into child state cares about.
+        let Ok(canonical_prefix_bytes) = serde_json::to_vec(&state.messages) else {
+            return;
+        };
+        let captured_at_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // G1 payload fill: `all_schemas` is exactly the tool list the
+        // CLI advertised to the LLM this turn, so it's the honest
+        // source for `tool_schemas`. `system_blocks` stays empty here
+        // because the CLI doesn't assemble the final system prompt
+        // locally — the server-side bridge does that. A future PR on
+        // the server host (G2) will populate system_blocks where the
+        // real bytes exist.
+        let tool_schemas =
+            astra_turn_core::fork_prefix::build_tool_schema_entries(&self.all_schemas);
+        let req = astra_turn_core::fork_capture::CaptureRequest {
+            parent_run_id,
+            parent_turn_seq: self.repl_turn_index,
+            provider,
+            model_id,
+            thinking: None,
+            system_blocks: vec![],
+            tool_schemas,
+            beta_headers: vec![],
+            canonical_prefix_bytes,
+            cache_mode: astra_turn_core::fork_prefix::CacheMode::Write,
+            captured_at_secs,
+            microcompact_fired_in_turn: false,
+        };
+        let _ = astra_turn_core::fork_capture::capture_parent_prefix(req, store.as_ref());
+    }
 }
 
 #[cfg(test)]
@@ -513,4 +585,5 @@ mod tests {
             TurnInteractionMode::NonInteractive
         );
     }
+
 }

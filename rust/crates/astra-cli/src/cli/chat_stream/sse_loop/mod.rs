@@ -298,7 +298,16 @@ pub(crate) async fn stream_chat_sse(
         }
         schemas
     };
-    let registry = ToolRegistry::new(all_schemas.clone());
+    let mut registry = ToolRegistry::new(all_schemas.clone());
+    // G3: when a DynamicAgentSpawner is wired, force-pin spawn_agent's
+    // schema so the tfidf selector always surfaces it. Without this,
+    // spawn_agent sits in all_schemas but TOOL_CATALOG has no entry
+    // for it — so resolve_pinned skips it and tfidf can't score it,
+    // leaving spawn_agent invisible to the LLM even when calls to it
+    // would succeed. Mirrors the lifecycle-level delegate injection
+    // pattern (`agentic_loop_lifecycle.rs:279`) but gated on the CLI
+    // side because the spawner is a CLI-level dependency.
+    maybe_pin_spawn_agent_schema(&mut registry, p.agent_spawner.is_some());
     let pinned_schema_tokens = registry.total_pinned_token_cost() as u64;
     let valid_tool_names = openai_tool_names_from_schemas(&all_schemas);
 
@@ -404,6 +413,17 @@ pub(crate) async fn stream_chat_sse(
     // Snapshot approval overrides for checkpoint persistence.
     let initial_approval_overrides = p.perm_manager.export_session_overrides();
 
+    // Bug B step 3: share the spawner's prefix_store with the
+    // CLI host so on_turn_completed can write captured parent
+    // prefixes into the same map the DelegationEngine + spawner
+    // read from. Without shared state, a capture fires but lands
+    // in a different store than resolvers look at — delegate
+    // children always see None.
+    let prefix_store_for_host = p
+        .agent_spawner
+        .as_ref()
+        .and_then(|s| s.prefix_store().cloned());
+
     // ─── Build host + state ──────────────────────────────────────────────
     let mut host = CliAgenticLoopHost {
         api: p.api,
@@ -436,6 +456,7 @@ pub(crate) async fn stream_chat_sse(
         tool_cache: crate::stream_render::EdgeToolCache::new(
             resolved_tool_policy.max_identical_tool_calls,
         ),
+        prefix_store: prefix_store_for_host,
     };
 
     let hook_sets = detect_turn_hook_sets(&project_root, task_profile, p.is_plan_subtask);
@@ -802,6 +823,24 @@ fn load_turn_messages(
     openai_messages_from_repl_history(history, current_message)
 }
 
+/// Conditionally force-pin the `spawn_agent` schema into the registry
+/// so the tfidf selector always surfaces it when a spawner is wired.
+///
+/// Rationale: `spawn_agent` sits in `all_tool_schemas()` (so the edge
+/// knows how to dispatch it) but has no entry in `TOOL_CATALOG` —
+/// which is the metadata table tfidf uses for scoring + pinning. As
+/// a result, the selector can't score it and `resolve_pinned` skips
+/// it. The only way it becomes visible to the LLM is `registry.upsert_schema`,
+/// which defaults to pinned. Models then see spawn_agent every turn
+/// exactly when it's callable (spawner present) and never when it's
+/// not — no dead schema, no wasted tokens.
+fn maybe_pin_spawn_agent_schema(registry: &mut ToolRegistry, spawner_wired: bool) {
+    if !spawner_wired {
+        return;
+    }
+    registry.upsert_schema(astra_runtime::orchestration::spawn_agent_schema());
+}
+
 #[cfg(test)]
 mod tests {
     use super::circuit_breaker_config_from_tool_selection;
@@ -1000,5 +1039,75 @@ hooks:
         extend_restricted_with_blocked_tools(&mut restricted, Some(&hub));
 
         assert!(restricted.contains("grep"));
+    }
+
+    // ── G3: spawn_agent visibility gate ──
+    //
+    // Regression for the tool-selector gap: without a catalog entry,
+    // spawn_agent was invisible to the LLM even when the CLI had a
+    // spawner wired. `maybe_pin_spawn_agent_schema` makes the schema
+    // visible iff the spawner is wired, so the model sees it exactly
+    // when calls would succeed.
+
+    #[test]
+    fn maybe_pin_spawn_agent_schema_adds_pinned_entry_when_spawner_wired() {
+        use super::maybe_pin_spawn_agent_schema;
+        use astra_runtime::tool_registry::ToolRegistry;
+        use crate::edge_tools;
+
+        let mut registry = ToolRegistry::new(edge_tools::all_tool_schemas());
+        let initial_pinned: std::collections::HashSet<String> = registry
+            .pinned_schemas()
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect();
+        // spawn_agent is in all_schemas but not pinned by default —
+        // that's the bug G3 fixes.
+        assert!(
+            !initial_pinned.contains("spawn_agent"),
+            "pre-fix invariant: spawn_agent starts NOT pinned; if this fails the catalog changed"
+        );
+
+        maybe_pin_spawn_agent_schema(&mut registry, true);
+        let after_pinned: std::collections::HashSet<String> = registry
+            .pinned_schemas()
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect();
+        assert!(
+            after_pinned.contains("spawn_agent"),
+            "spawn_agent must be pinned after helper runs with spawner wired"
+        );
+    }
+
+    #[test]
+    fn maybe_pin_spawn_agent_schema_is_noop_without_spawner() {
+        use super::maybe_pin_spawn_agent_schema;
+        use astra_runtime::tool_registry::ToolRegistry;
+        use crate::edge_tools;
+
+        let mut registry = ToolRegistry::new(edge_tools::all_tool_schemas());
+        let before: std::collections::HashSet<String> = registry
+            .pinned_schemas()
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect();
+
+        maybe_pin_spawn_agent_schema(&mut registry, false);
+        let after: std::collections::HashSet<String> = registry
+            .pinned_schemas()
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect();
+
+        assert_eq!(
+            before, after,
+            "no-spawner branch must leave the pinned set unchanged — \
+             pinning a dead schema would waste tokens and mislead the LLM"
+        );
+        assert!(
+            !after.contains("spawn_agent"),
+            "spawn_agent must NOT become visible without a spawner"
+        );
     }
 }
