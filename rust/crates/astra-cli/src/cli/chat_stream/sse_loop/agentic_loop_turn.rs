@@ -330,21 +330,33 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     touch_prep_ui_phase(&ctx.prep_ui_phase, "Starting…");
 
     let git_branch = read_git_branch_abbrev();
-    let thinking_budget_tokens: Option<u32> = std::env::var("MO_THINKING_BUDGET")
-        .ok()
-        .and_then(|v| v.parse().ok());
+    let (resolved_model, thinking_config) = match ctx.model {
+        Some(m) => {
+            let (name, cfg) = astra_turn_core::thinking_config::resolve_model_thinking(m);
+            // Per-turn dampener: the model suffix encodes the user's CEILING
+            // (e.g. `thinking:high`), not a command to burn that budget on every
+            // turn regardless of content. Short read-only questions get a
+            // capped effort — multi-step / modification turns pass through
+            // unchanged. See `ThinkingConfig::scale_for_turn` for the policy.
+            let signals =
+                astra_turn_core::thinking_config::TurnComplexitySignals::from_message(ctx.message);
+            let cfg = cfg.scale_for_turn(signals);
+            (Some(name), cfg)
+        }
+        None => (None, astra_turn_core::thinking_config::ThinkingConfig::Off),
+    };
     let mut payload = chat_turn_base_payload(ChatTurnBasePayloadInput {
         messages: ctx.messages,
         session_id: ctx.current_session_id,
         agent_id: Some("astra-cli"),
-        model: ctx.model,
+        model: resolved_model,
         explain_verbose: ctx.explain.explain_verbose,
         explain_on: ctx.explain.explain_on,
         edge_executor_id: edge_executor_instance_id(),
         capabilities: astra_thin_client::builtin_capability_preset(),
         project_root: ctx.project_root,
         git_branch,
-        thinking_budget_tokens,
+        thinking: thinking_config,
     });
 
     // Inject ephemeral prefix (e.g., skill listing) at the start of messages.
@@ -908,6 +920,7 @@ fn inject_bridge_turn_identity(
 pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub api: &'a astra_thin_client::ThinClient,
     pub token: &'a str,
+    pub auth_profile: Option<&'a str>,
     pub model: Option<&'a str>,
     pub explain: ExplainMode,
     pub render_md: bool,
@@ -1059,6 +1072,7 @@ pub(crate) async fn fetch_chat_turn_sse(
     let ChatTurnSseFetchRequest {
         api,
         token,
+        auth_profile,
         model,
         explain,
         render_md,
@@ -1206,6 +1220,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         render_policy,
         Some(edge_ctx),
         pre_clear_lines,
+        auth_profile,
         cancel_token,
     )
     .await;

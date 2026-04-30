@@ -43,6 +43,36 @@ pub struct QuirksData {
     /// Must reference an active model in `infra_llm_models`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fallback_model: Option<String>,
+    /// Thinking behaviour declaration.
+    ///   - `"controllable"` — needs explicit API parameter (Bedrock adaptive, DashScope enable_thinking).
+    ///   - `"native"` — model returns reasoning_content by default (GLM, Qwen3).
+    ///   - `None` / absent — no thinking support.
+    ///
+    /// Validated on deserialization: unknown values (e.g. typos like
+    /// `"Controllable"` or `"enabled"`) are rejected so bad YAML/admin payloads
+    /// fail loudly instead of silently disabling the thinking picker.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_thinking_mode"
+    )]
+    pub thinking_mode: Option<String>,
+}
+
+/// Accepts only canonical thinking_mode values. See [`QuirksData::thinking_mode`].
+fn deserialize_thinking_mode<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let opt: Option<String> = Option::deserialize(deserializer)?;
+    match opt.as_deref() {
+        None => Ok(None),
+        Some("controllable") | Some("native") => Ok(opt),
+        Some(other) => Err(D::Error::custom(format!(
+            "invalid thinking_mode {other:?}: expected \"controllable\", \"native\", or null"
+        ))),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -111,6 +141,7 @@ pub struct ModelListItem {
     pub context_window: i32,
     pub max_completion_tokens: Option<i32>,
     pub architecture: Option<String>,
+    pub thinking_mode: Option<String>,
 }
 
 /// Decrypted credentials for the active (or preferred) row in `infra_llm_models`.
@@ -413,7 +444,8 @@ pub const MODEL_SELECT_COLS: &str = "\
     IFNULL(CAST(quirks AS CHAR), '{}') AS quirks_json";
 const MODEL_LIST_SELECT_COLS: &str = "\
     model_id, model_name, provider, description, is_active, \
-    IFNULL(context_window, 128000) AS context_window, max_completion_tokens, architecture";
+    IFNULL(context_window, 128000) AS context_window, max_completion_tokens, architecture, \
+    IFNULL(CAST(quirks AS CHAR), '{}') AS quirks_json";
 const MAX_MODEL_LIST_ROWS: i64 = 200;
 
 #[async_trait]
@@ -540,6 +572,11 @@ impl ModelService for DatabaseModelService {
         let mut models = Vec::with_capacity(rows.len());
         for row in rows {
             let is_active_int: i16 = row.try_get("is_active").unwrap_or(1);
+            let quirks_json: String = row
+                .try_get("quirks_json")
+                .unwrap_or_else(|_| "{}".to_string());
+            let quirks: QuirksData =
+                parse_json_column("quirks_json", &quirks_json, Default::default);
             models.push(ModelListItem {
                 model_id: row.try_get("model_id").map_err(internal_error)?,
                 name: row.try_get("model_name").map_err(internal_error)?,
@@ -549,6 +586,7 @@ impl ModelService for DatabaseModelService {
                 context_window: row.try_get("context_window").unwrap_or(128000),
                 max_completion_tokens: row.try_get("max_completion_tokens").ok(),
                 architecture: row.try_get("architecture").ok(),
+                thinking_mode: quirks.thinking_mode,
             });
         }
         Ok(models)
@@ -1054,6 +1092,8 @@ pub struct ModelListItemResponse {
     pub context_window: i32,
     pub max_completion_tokens: Option<i32>,
     pub architecture: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_mode: Option<String>,
 }
 
 impl From<ModelRecord> for ModelResponse {
@@ -1090,6 +1130,7 @@ impl From<ModelListItem> for ModelListItemResponse {
             context_window: r.context_window,
             max_completion_tokens: r.max_completion_tokens,
             architecture: r.architecture,
+            thinking_mode: r.thinking_mode,
         }
     }
 }
@@ -1225,6 +1266,7 @@ mod tests {
             no_system_message: false,
             system_as_user_prefix: true,
             fallback_model: Some("claude-haiku".into()),
+            thinking_mode: Some("controllable".into()),
         };
         let json = serde_json::to_string(&q).unwrap();
         let restored: QuirksData = serde_json::from_str(&json).unwrap();
@@ -1252,11 +1294,13 @@ mod tests {
             context_window: 128000,
             max_completion_tokens: Some(16384),
             architecture: Some("transformer".into()),
+            thinking_mode: Some("controllable".into()),
         };
         let resp = ModelListItemResponse::from(item.clone());
         assert_eq!(resp.model_id, item.model_id);
         assert_eq!(resp.name, item.name);
         assert_eq!(resp.context_window, 128000);
+        assert_eq!(resp.thinking_mode, Some("controllable".into()));
     }
 
     #[test]
@@ -1270,11 +1314,13 @@ mod tests {
             context_window: 4096,
             max_completion_tokens: None,
             architecture: None,
+            thinking_mode: None,
         };
         let resp = ModelListItemResponse::from(item);
         assert!(resp.description.is_none());
         assert!(resp.max_completion_tokens.is_none());
         assert!(resp.architecture.is_none());
+        assert!(resp.thinking_mode.is_none());
     }
 
     /// CLI and other clients must read `is_active` from GET /models — not `active`.
@@ -1313,10 +1359,15 @@ mod tests {
             context_window: 128000,
             max_completion_tokens: None,
             architecture: None,
+            thinking_mode: Some("controllable".into()),
         };
         let resp = ModelListItemResponse::from(item);
         let v = serde_json::to_value(&resp).expect("serialize ModelListItemResponse");
         assert_eq!(v.get("is_active"), Some(&serde_json::Value::Bool(false)));
+        assert_eq!(
+            v.get("thinking_mode"),
+            Some(&serde_json::json!("controllable"))
+        );
         assert!(
             v.get("active").is_none(),
             "legacy key `active` must not be emitted; clients should use is_active"

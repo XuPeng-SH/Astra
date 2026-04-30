@@ -427,6 +427,15 @@ pub struct StallTrackingState {
     /// Set when phase-1 fired and the model still attempted tool calls on
     /// the very next round. One-shot per turn.
     pub forced_round_budget_phase2: bool,
+    /// Monotonic count of circuit-breaker introspection (self-check) prompts
+    /// injected this turn. Used for post-turn telemetry so operators can see
+    /// how often the breaker nudged the model on long read-only sessions.
+    ///
+    /// Note: this counter is distinct from the breaker's internal
+    /// `introspect_emissions()` counter — the breaker's counter resets on
+    /// mutation (for cap enforcement), while this counter monotonically
+    /// accumulates across the whole turn (for diagnostics).
+    pub introspection_count: u32,
     /// Whether the redundant-reads mid-loop corrective injected a guidance
     /// message this loop. Fires when the model has re-read overlapping line
     /// ranges of the same file enough times to cross
@@ -687,10 +696,10 @@ pub struct AgenticLoopState {
     /// Skill subruns set this to cap total cost.
     pub max_cumulative_tokens: u64,
 
-    // ── Thinking budget ──
-    /// Optional thinking/reasoning budget in tokens for models with extended thinking.
-    /// When Some, passed to the API request so the server constrains thinking output.
-    pub thinking_budget_tokens: Option<u32>,
+    // ── Thinking config ──
+    /// Thinking/reasoning configuration for extended thinking models.
+    /// Applied to the LLM request body via provider-specific wire format.
+    pub thinking: astra_turn_core::thinking_config::ThinkingConfig,
 
     // ── Recently accessed files ──
     /// Recently accessed file paths tracked for post-compaction restoration.
@@ -1142,7 +1151,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         budget_wrapup_injected: false,
         skill_produced_output: false,
         max_cumulative_tokens: 0,
-        thinking_budget_tokens: None,
+        thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
         recent_file_reads: Vec::new(),
         permission_context: None,
         permission_handler: None,
@@ -1495,7 +1504,7 @@ pub(crate) mod tests {
             budget_wrapup_injected: false,
             skill_produced_output: false,
             max_cumulative_tokens: 0,
-            thinking_budget_tokens: None,
+            thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
             recent_file_reads: Vec::new(),
             permission_context: None,
             permission_handler: None,

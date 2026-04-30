@@ -39,6 +39,7 @@ use astra_turn_core::sse_data_lines::{
     json_events_from_sse_event_block, validate_sse_event_block_json,
     validated_drain_sse_data_lines, validated_finish_sse_data_buffer,
 };
+use astra_turn_core::thinking_config::ThinkingConfig;
 
 /// Redact common provider secret patterns from a string before logging.
 ///
@@ -96,6 +97,17 @@ pub(crate) fn provider_uses_anthropic_messages(provider: &str) -> bool {
 
 pub(crate) fn provider_uses_bedrock_converse(provider: &str) -> bool {
     llm_provider_protocol(provider) == LlmProviderProtocol::BedrockConverse
+}
+
+/// Returns true only when the *provider* is known to be DashScope / Aliyun / Alibaba.
+///
+/// We intentionally do NOT match on model name here: Qwen models are also served
+/// through generic OpenAI-compatible proxies (vLLM, Ollama, SGLang, …) that do not
+/// accept `enable_thinking` and may 400 on unknown top-level fields. Matching the
+/// provider name alone avoids false positives on those deployments.
+pub(crate) fn provider_uses_dashscope_thinking(provider: &str) -> bool {
+    let provider = provider.to_ascii_lowercase();
+    provider.contains("dashscope") || provider.contains("aliyun") || provider.contains("alibaba")
 }
 
 /// Global HTTP client for LLM requests (connection pooling, reuse).
@@ -842,6 +854,18 @@ fn build_bedrock_tools(tools: &[Value]) -> Vec<Value> {
     out
 }
 
+fn bedrock_messages_contain_tool_blocks(messages: &[Value]) -> bool {
+    messages.iter().any(|msg| {
+        msg.get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|blocks| {
+                blocks
+                    .iter()
+                    .any(|b| b.get("toolUse").is_some() || b.get("toolResult").is_some())
+            })
+    })
+}
+
 pub(crate) fn build_provider_request_body(
     messages: &[Value],
     tools: &[Value],
@@ -850,6 +874,7 @@ pub(crate) fn build_provider_request_body(
     max_output_tokens: Option<usize>,
     temperature: Option<f64>,
     streaming: bool,
+    thinking: &astra_turn_core::thinking_config::ThinkingConfig,
 ) -> Value {
     match llm_provider_protocol(provider) {
         LlmProviderProtocol::BedrockConverse => {
@@ -874,7 +899,10 @@ pub(crate) fn build_provider_request_body(
             let bedrock_tools = build_bedrock_tools(tools);
             if !bedrock_tools.is_empty() {
                 body["toolConfig"] = json!({ "tools": bedrock_tools });
+            } else if bedrock_messages_contain_tool_blocks(&bedrock_messages) {
+                body["toolConfig"] = json!({ "tools": [] });
             }
+            thinking.apply_bedrock(&mut body);
             body
         }
         LlmProviderProtocol::AnthropicMessages | LlmProviderProtocol::OpenAiCompatible => {
@@ -904,6 +932,27 @@ pub(crate) fn build_provider_request_body(
                 } else {
                     body["tool_choice"] = Value::String("auto".to_string());
                 }
+            }
+            if is_anthropic {
+                thinking.apply_anthropic(&mut body);
+            } else if provider_uses_dashscope_thinking(provider) {
+                // DashScope/Qwen uses a binary `enable_thinking` flag; there is no equivalent
+                // of `reasoning_effort`. For `Enabled` this is a direct mapping. For `Adaptive`
+                // we enable thinking but the `effort` level is silently dropped — warn so
+                // operators can diagnose unexpected latency or cost behaviour.
+                if thinking.is_enabled() {
+                    body["enable_thinking"] = json!(true);
+                } else if let ThinkingConfig::Adaptive { effort } = thinking {
+                    tracing::warn!(
+                        provider,
+                        effort = ?effort,
+                        "DashScope/Qwen does not support `reasoning_effort`; \
+                         Adaptive mode mapped to `enable_thinking: true` — effort level ignored"
+                    );
+                    body["enable_thinking"] = json!(true);
+                }
+            } else {
+                thinking.apply_openai(&mut body);
             }
             body
         }
@@ -1202,6 +1251,7 @@ pub(crate) async fn call_llm_and_collect(
     max_output_tokens: Option<usize>,
     has_fallback: bool,
     cancel: LlmCancel<'_>,
+    thinking: &ThinkingConfig,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
     call_llm_and_collect_with_request_overrides(
         messages,
@@ -1216,6 +1266,7 @@ pub(crate) async fn call_llm_and_collect(
         None,
         None,
         None,
+        thinking,
     )
     .await
 }
@@ -1234,6 +1285,7 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides(
     header_overrides: Option<&HashMap<String, String>>,
     completions_url_override: Option<&str>,
     request_timeout: Option<std::time::Duration>,
+    thinking: &ThinkingConfig,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
     let cooldown = rate_limit_cooldown();
     let model_key = model_name;
@@ -1258,6 +1310,7 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides(
         max_output_tokens,
         None,
         true,
+        thinking,
     );
 
     let url = llm_request_url(
@@ -1469,6 +1522,7 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides(
                             header_overrides,
                             completions_url_override,
                             request_timeout,
+                            thinking,
                         )
                         .await
                         .map_err(|error| error.with_details_json(details_json));
@@ -1546,6 +1600,7 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides(
                         header_overrides,
                         completions_url_override,
                         request_timeout,
+                        thinking,
                     )
                     .await
                     .map_err(|error| attach_partial_details(error, &partial));
@@ -2032,6 +2087,7 @@ pub(crate) async fn call_llm_nonstream_fallback(
         None,
         None,
         None,
+        &ThinkingConfig::Off,
     )
     .await
 }
@@ -2050,6 +2106,7 @@ pub(crate) async fn call_llm_nonstream_fallback_with_request_overrides(
     header_overrides: Option<&HashMap<String, String>>,
     completions_url_override: Option<&str>,
     request_timeout: Option<std::time::Duration>,
+    thinking: &ThinkingConfig,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
     let started = Instant::now();
 
@@ -2063,6 +2120,7 @@ pub(crate) async fn call_llm_nonstream_fallback_with_request_overrides(
         max_output_tokens,
         None,
         false,
+        thinking,
     );
 
     let url = llm_request_url(
@@ -2638,6 +2696,7 @@ mod tests {
             Some(&overrides),
             Some(&gateway_url),
             None,
+            &ThinkingConfig::Off,
         )
         .await
         .expect("gateway llm call");
@@ -2696,6 +2755,7 @@ mod tests {
             None,
             false,
             LlmCancel::None,
+            &ThinkingConfig::Off,
         )
         .await
         .expect("llm ok");
@@ -3671,6 +3731,7 @@ mod tests {
                 None,
                 false,
                 LlmCancel::None,
+                &ThinkingConfig::Off,
             )
             .await
             .expect("llm ok");
@@ -3703,6 +3764,7 @@ mod tests {
                 None,
                 false,
                 LlmCancel::Token(&token_for_call),
+                &ThinkingConfig::Off,
             )
             .await
         });
@@ -3734,6 +3796,7 @@ mod tests {
                 None,
                 false,
                 LlmCancel::None,
+                &ThinkingConfig::Off,
             )
             .await
             .expect("llm ok");
@@ -3764,6 +3827,7 @@ mod tests {
                 None,
                 false,
                 LlmCancel::None,
+                &ThinkingConfig::Off,
             )
             .await
             .expect("llm ok");
@@ -3796,6 +3860,7 @@ mod tests {
                 None,
                 false,
                 LlmCancel::Token(&token_for_call),
+                &ThinkingConfig::Off,
             )
             .await
         });
@@ -3858,6 +3923,7 @@ mod tests {
                 Some(1000),
                 false,
                 LlmCancel::None,
+                &ThinkingConfig::Off,
             )
             .await
             .expect("llm ok");
@@ -3875,6 +3941,7 @@ mod tests {
                 Some(4000),
                 false,
                 LlmCancel::None,
+                &ThinkingConfig::Off,
             )
             .await
             .expect("llm ok");
@@ -3917,6 +3984,7 @@ mod tests {
                 Some(1000),
                 false,
                 LlmCancel::None,
+                &ThinkingConfig::Off,
             )
             .await
             .expect("llm ok");
@@ -3981,6 +4049,7 @@ mod tests {
             None,
             false,
             LlmCancel::None,
+            &ThinkingConfig::Off,
         )
         .await
         .expect("fallback succeeds");
@@ -4019,6 +4088,7 @@ mod tests {
             None,
             false,
             LlmCancel::None,
+            &ThinkingConfig::Off,
         )
         .await
         .expect_err("fallback should fail");
@@ -4055,6 +4125,7 @@ mod tests {
             None,
             false,
             LlmCancel::None,
+            &ThinkingConfig::Off,
         )
         .await
         .expect("transport fallback succeeds");
@@ -4086,6 +4157,7 @@ mod tests {
             None,
             false,
             LlmCancel::None,
+            &ThinkingConfig::Off,
         )
         .await
         .expect_err("transport fallback should fail");
@@ -4122,6 +4194,7 @@ mod tests {
             None,
             false,
             LlmCancel::None,
+            &ThinkingConfig::Off,
         )
         .await
         .expect("stream retry succeeds");
@@ -4156,6 +4229,7 @@ mod tests {
                 None,
                 false,
                 LlmCancel::None,
+                &ThinkingConfig::Off,
             )
             .await
             .expect_err("should fail with context window");
@@ -4191,6 +4265,7 @@ mod tests {
                 None,
                 false,
                 LlmCancel::None,
+                &ThinkingConfig::Off,
             )
             .await
             .expect_err("should fail with auth");
@@ -4436,6 +4511,7 @@ mod tests {
             Some(128),
             None,
             false,
+            &ThinkingConfig::Off,
         );
         assert_eq!(body["system"][0]["text"], "sys");
         assert_eq!(body["messages"][0]["role"], "user");
@@ -4490,6 +4566,7 @@ mod tests {
                 None,
                 None,
                 false,
+                &ThinkingConfig::Off,
             );
             let result_block = &body["messages"][1]["content"][0]["toolResult"]["content"][0];
             // Bedrock-legal: either `json` with an object, or `text` with a string.
@@ -4531,6 +4608,7 @@ mod tests {
             None,
             None,
             false,
+            &ThinkingConfig::Off,
         );
         let result_block = &body["messages"][1]["content"][0]["toolResult"]["content"][0];
         assert!(result_block["json"].is_object(), "{result_block:?}");
@@ -4568,6 +4646,7 @@ mod tests {
             Some(64),
             None,
             false,
+            &ThinkingConfig::Off,
         );
         let out = body["messages"].as_array().expect("messages array");
         assert_eq!(
@@ -4608,6 +4687,7 @@ mod tests {
             None,
             None,
             false,
+            &ThinkingConfig::Off,
         );
         let content = body["messages"][1]["content"]
             .as_array()
@@ -4651,6 +4731,7 @@ mod tests {
             None,
             None,
             false,
+            &ThinkingConfig::Off,
         );
         let out = body["messages"].as_array().expect("messages array");
         // assistant / user(tool x) / user(interrupt) / assistant / user(tool y)
@@ -4782,6 +4863,7 @@ mod tests {
             None,
             None,
             false,
+            &ThinkingConfig::Off,
         );
         let merged = body["messages"][1]["content"]
             .as_array()
@@ -4791,6 +4873,63 @@ mod tests {
             .filter_map(|b| b.get("toolResult")?.get("toolUseId")?.as_str())
             .collect();
         assert_eq!(ids, vec!["a", "b"], "{body:#?}");
+        // empty tools + tool blocks in history ⇒ toolConfig must still be present
+        assert!(
+            body.get("toolConfig").is_some(),
+            "toolConfig missing: {body:#?}"
+        );
+    }
+
+    #[test]
+    fn build_bedrock_body_includes_tool_config_when_history_has_tool_blocks() {
+        let messages = vec![
+            json!({"role": "user", "content": "list files"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": "{\"cmd\":\"ls\"}"}
+                }]
+            }),
+            json!({"role": "tool", "tool_call_id": "c1", "name": "bash", "content": "file.txt"}),
+            json!({"role": "user", "content": "thanks"}),
+        ];
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "us.anthropic.claude-sonnet-4-6",
+            "bedrock",
+            None,
+            None,
+            false,
+            &ThinkingConfig::Off,
+        );
+        assert_eq!(
+            body["toolConfig"]["tools"],
+            json!([]),
+            "empty tools array required when history contains tool blocks"
+        );
+    }
+
+    #[test]
+    fn build_bedrock_body_omits_tool_config_when_no_tools_anywhere() {
+        let messages = vec![json!({"role": "user", "content": "hello"})];
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "us.anthropic.claude-sonnet-4-6",
+            "bedrock",
+            None,
+            None,
+            false,
+            &ThinkingConfig::Off,
+        );
+        assert!(
+            body.get("toolConfig").is_none(),
+            "toolConfig should be absent when no tools: {body:#?}"
+        );
     }
 
     #[test]
@@ -4879,6 +5018,7 @@ mod tests {
             Some(128),
             None,
             false,
+            &ThinkingConfig::Off,
         );
         assert_eq!(body["system"][0]["text"], "stable");
         assert_eq!(body["system"][1]["cachePoint"]["type"], "default");
@@ -4913,6 +5053,7 @@ mod tests {
             Some(128),
             None,
             false,
+            &ThinkingConfig::Off,
         );
         let system = body["system"].as_array().unwrap();
         assert_eq!(system[0]["text"], "stable");
@@ -4945,6 +5086,7 @@ mod tests {
             Some(128),
             None,
             false,
+            &ThinkingConfig::Off,
         );
         assert!(body.get("system").is_none());
     }
@@ -5307,5 +5449,286 @@ mod tests {
             "llm_client.rs must not define its own COOLDOWN singleton; \
              use the shared one from bridge_llm_stream"
         );
+    }
+
+    // ─── Thinking config integration tests ──────────────────────────────
+
+    #[test]
+    fn build_bedrock_body_with_thinking_enabled() {
+        let messages = vec![
+            json!({"role": "system", "content": "You are helpful."}),
+            json!({"role": "user", "content": "hello"}),
+        ];
+        let tools = vec![json!({
+            "type": "function",
+            "function": {"name": "read_file", "parameters": {"type": "object", "properties": {}}}
+        })];
+        let body = build_provider_request_body(
+            &messages,
+            &tools,
+            "us.anthropic.claude-sonnet-4-20250514-v1:0",
+            "bedrock",
+            Some(8192),
+            None,
+            false,
+            &ThinkingConfig::Enabled {
+                budget_tokens: 5000,
+            },
+        );
+
+        // Core structure
+        assert!(!body.get("messages").unwrap().as_array().unwrap().is_empty());
+        assert!(body.get("system").is_some());
+        assert_eq!(body["inferenceConfig"]["maxTokens"], 8192);
+        // Temperature must be absent (incompatible with thinking)
+        assert!(body["inferenceConfig"].get("temperature").is_none());
+        // Tools present
+        assert!(!body["toolConfig"]["tools"].as_array().unwrap().is_empty());
+        // Thinking config via additionalModelRequestFields
+        assert_eq!(
+            body["additionalModelRequestFields"]["thinking"]["type"],
+            "enabled"
+        );
+        assert_eq!(
+            body["additionalModelRequestFields"]["thinking"]["budget_tokens"],
+            5000
+        );
+    }
+
+    #[test]
+    fn build_bedrock_body_with_thinking_adaptive() {
+        let messages = vec![json!({"role": "user", "content": "hi"})];
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "us.anthropic.claude-opus-4-6-v1",
+            "bedrock",
+            Some(16000),
+            Some(0.7),
+            false,
+            &ThinkingConfig::Adaptive {
+                effort: astra_turn_core::thinking_config::ThinkingEffort::Low,
+            },
+        );
+
+        assert_eq!(
+            body["additionalModelRequestFields"]["thinking"]["type"],
+            "adaptive"
+        );
+        assert_eq!(
+            body["additionalModelRequestFields"]["output_config"]["effort"],
+            "low"
+        );
+        // Temperature removed even though it was requested
+        assert!(body["inferenceConfig"].get("temperature").is_none());
+    }
+
+    #[test]
+    fn build_bedrock_body_with_thinking_off() {
+        let messages = vec![json!({"role": "user", "content": "hi"})];
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "us.anthropic.claude-sonnet-4-20250514-v1:0",
+            "bedrock",
+            Some(4096),
+            Some(0.5),
+            false,
+            &ThinkingConfig::Off,
+        );
+
+        // No thinking fields
+        assert!(body.get("additionalModelRequestFields").is_none());
+        // Temperature preserved
+        assert_eq!(body["inferenceConfig"]["temperature"], 0.5);
+    }
+
+    #[test]
+    fn build_anthropic_body_with_thinking_enabled() {
+        let messages = vec![json!({"role": "user", "content": "hello"})];
+        let tools = vec![json!({
+            "name": "read_file",
+            "description": "Read a file",
+            "input_schema": {"type": "object", "properties": {}}
+        })];
+        let body = build_provider_request_body(
+            &messages,
+            &tools,
+            "claude-sonnet-4-20250514",
+            "anthropic",
+            Some(8192),
+            Some(0.7),
+            true,
+            &ThinkingConfig::Enabled {
+                budget_tokens: 4000,
+            },
+        );
+
+        // Core structure
+        assert_eq!(body["model"], "claude-sonnet-4-20250514");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["max_tokens"], 8192);
+        // Temperature removed
+        assert!(body.get("temperature").is_none());
+        // Tools present
+        assert!(!body["tools"].as_array().unwrap().is_empty());
+        assert_eq!(body["tool_choice"]["type"], "auto");
+        // Thinking config
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["thinking"]["budget_tokens"], 4000);
+    }
+
+    #[test]
+    fn build_anthropic_body_with_thinking_adaptive_uses_output_config_effort() {
+        let messages = vec![json!({"role": "user", "content": "hello"})];
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "claude-opus-4-7",
+            "anthropic",
+            Some(16000),
+            Some(0.7),
+            true,
+            &ThinkingConfig::Adaptive {
+                effort: astra_turn_core::thinking_config::ThinkingEffort::High,
+            },
+        );
+
+        assert_eq!(
+            body["thinking"],
+            json!({"type": "adaptive", "display": "summarized"})
+        );
+        assert_eq!(body["output_config"], json!({"effort": "high"}));
+        assert!(body.get("temperature").is_none());
+    }
+
+    #[test]
+    fn build_anthropic_body_with_thinking_off() {
+        let messages = vec![json!({"role": "user", "content": "hello"})];
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "claude-sonnet-4-20250514",
+            "anthropic",
+            Some(4096),
+            Some(0.5),
+            true,
+            &ThinkingConfig::Off,
+        );
+
+        assert!(body.get("thinking").is_none());
+        assert_eq!(body["temperature"], 0.5);
+    }
+
+    #[test]
+    fn build_openai_body_with_thinking_adaptive() {
+        let messages = vec![json!({"role": "user", "content": "hello"})];
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "o3",
+            "openai",
+            Some(4096),
+            None,
+            true,
+            &ThinkingConfig::Adaptive {
+                effort: astra_turn_core::thinking_config::ThinkingEffort::Medium,
+            },
+        );
+
+        assert_eq!(body["model"], "o3");
+        assert_eq!(body["reasoning_effort"], "medium");
+        assert_eq!(body["stream"], true);
+    }
+
+    /// Qwen models served through the *DashScope* provider use `enable_thinking`.
+    /// The provider name (not model name) is the discriminator — the same Qwen model
+    /// served through a generic vLLM/Ollama proxy with provider="openai" must NOT
+    /// receive `enable_thinking` because those proxies reject unknown top-level fields.
+    #[test]
+    fn build_dashscope_qwen_body_with_thinking_enabled() {
+        let messages = vec![json!({"role": "user", "content": "hello"})];
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "qwen3.6-plus",
+            "dashscope",
+            Some(4096),
+            Some(0.7),
+            true,
+            &ThinkingConfig::Enabled {
+                budget_tokens: 10_000,
+            },
+        );
+
+        assert_eq!(body["model"], "qwen3.6-plus");
+        assert_eq!(body["enable_thinking"], true);
+        assert!(body.get("reasoning_effort").is_none());
+        assert_eq!(body["temperature"], 0.7);
+    }
+
+    /// Same Qwen model through a generic OpenAI-compatible proxy must NOT get
+    /// `enable_thinking` — the proxy does not know about that field and may 400.
+    #[test]
+    fn build_generic_proxy_qwen_body_does_not_set_dashscope_flag() {
+        let messages = vec![json!({"role": "user", "content": "hello"})];
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "qwen3.6-plus",
+            "openai",
+            Some(4096),
+            Some(0.7),
+            true,
+            &ThinkingConfig::Enabled {
+                budget_tokens: 10_000,
+            },
+        );
+
+        assert_eq!(body["model"], "qwen3.6-plus");
+        // Generic OpenAI-compatible proxy: no DashScope-specific field.
+        assert!(body.get("enable_thinking").is_none());
+        // Enabled thinking has no OpenAI mapping (no reasoning_effort either).
+        assert!(body.get("reasoning_effort").is_none());
+        assert_eq!(body["temperature"], 0.7);
+    }
+
+    #[test]
+    fn build_standard_openai_body_with_budget_thinking_does_not_send_dashscope_flag() {
+        let messages = vec![json!({"role": "user", "content": "hello"})];
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "gpt-4o",
+            "openai",
+            Some(4096),
+            Some(0.7),
+            true,
+            &ThinkingConfig::Enabled {
+                budget_tokens: 10_000,
+            },
+        );
+
+        assert!(body.get("enable_thinking").is_none());
+        assert!(body.get("reasoning_effort").is_none());
+        assert_eq!(body["temperature"], 0.7);
+    }
+
+    #[test]
+    fn build_openai_body_with_thinking_off() {
+        let messages = vec![json!({"role": "user", "content": "hello"})];
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "gpt-4o",
+            "openai",
+            Some(4096),
+            Some(0.7),
+            true,
+            &ThinkingConfig::Off,
+        );
+
+        assert!(body.get("reasoning_effort").is_none());
+        assert_eq!(body["temperature"], 0.7);
     }
 }

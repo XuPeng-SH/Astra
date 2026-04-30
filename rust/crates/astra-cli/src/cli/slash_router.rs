@@ -1,5 +1,7 @@
 //! Slash command routing for the REPL.
 
+use std::io::IsTerminal;
+
 use super::*;
 use crate::command_usage;
 
@@ -32,6 +34,27 @@ fn model_list_entry_name(entry: &serde_json::Value) -> Option<&str> {
         .get("name")
         .or_else(|| entry.get("model_name"))
         .and_then(|v| v.as_str())
+}
+
+fn model_list_entry_thinking_mode(entry: &serde_json::Value) -> Option<&str> {
+    // Flattened `thinking_mode` is the canonical shape emitted by the current
+    // /models response. The `quirks.thinking_mode` branch is a transitional
+    // fallback for older server builds still nesting the value inside quirks.
+    // TODO: remove the nested-quirks fallback once all deployments are past
+    // the flattened-response rollout.
+    entry
+        .get("thinking_mode")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            entry
+                .get("quirks")
+                .and_then(|q| q.get("thinking_mode"))
+                .and_then(|v| v.as_str())
+        })
+}
+
+fn model_list_entry_provider(entry: &serde_json::Value) -> Option<&str> {
+    entry.get("provider").and_then(|v| v.as_str())
 }
 
 fn find_model_list_entry<'a>(
@@ -141,7 +164,60 @@ pub(super) async fn handle_slash_command(
                     &items,
                     state.model.as_deref(),
                 ) {
-                    state.model = Some(chosen.clone());
+                    // Two-level selection: if model supports thinking, prompt for mode
+                    let selected_model = find_model_list_entry(&models, &chosen);
+                    if selected_model.is_none() {
+                        tracing::warn!(
+                            model = %chosen,
+                            "selected model not found in model list — \
+                             thinking-mode detection unavailable, falling back to defaults"
+                        );
+                        if std::io::stderr().is_terminal() {
+                            eprintln!(
+                                "  ⚠ Unknown model '{}' — thinking mode detection unavailable.",
+                                chosen
+                            );
+                        }
+                    }
+                    let thinking_mode = selected_model.and_then(model_list_entry_thinking_mode);
+                    let provider = selected_model.and_then(model_list_entry_provider);
+                    let opts = astra_turn_core::thinking_config::thinking_options_with_capability(
+                        &chosen,
+                        provider,
+                        thinking_mode,
+                    );
+                    let model_with_suffix = if opts.is_empty() {
+                        chosen.clone()
+                    } else {
+                        let thinking_items: Vec<(String, String)> = opts
+                            .iter()
+                            .map(|o| {
+                                let marker = if o.is_default { " (default)" } else { "" };
+                                (o.label.to_string(), marker.to_string())
+                            })
+                            .collect();
+                        let default_idx = opts.iter().position(|o| o.is_default);
+                        let default_label = default_idx.map(|i| opts[i].label);
+                        if let Some(picked) = interactive_select(
+                            "Select thinking mode:",
+                            &thinking_items,
+                            default_label,
+                        ) {
+                            let selected_opt = opts.iter().find(|o| o.label == picked);
+                            let suffix = selected_opt
+                                .map(|o| {
+                                    astra_turn_core::thinking_config::thinking_suffix_for(&o.config)
+                                })
+                                .unwrap_or_default();
+                            format!("{chosen}{suffix}")
+                        } else {
+                            // Cancelled thinking selection — use model without thinking
+                            eprintln!("{}", "  Thinking mode: Normal".dim());
+                            chosen.clone()
+                        }
+                    };
+
+                    state.model = Some(model_with_suffix.clone());
                     state.cached_pricing = slash_stats::extract_pricing_for_model(&models, &chosen)
                         .unwrap_or_else(|| slash_stats::fallback_pricing(&chosen));
                     state.context_budget = prompts::ContextBudget::from_runtime_config(
@@ -151,7 +227,7 @@ pub(super) async fn handle_slash_command(
                     eprintln!(
                         "  {} {}",
                         theme::icon_ok(),
-                        format!("Model set to: {chosen}").green()
+                        format!("Model set to: {model_with_suffix}").green()
                     );
                 } else {
                     eprintln!("{}", "  Cancelled.".dim());
@@ -227,9 +303,12 @@ pub(super) async fn handle_slash_command(
             }
 
             state.model = Some(arg.to_string());
-            state.cached_pricing = slash_stats::fallback_pricing(arg);
-            state.context_budget =
-                prompts::ContextBudget::from_runtime_config(&state.runtime_config, Some(arg));
+            let base_model = astra_turn_core::thinking_config::resolve_model_thinking(arg).0;
+            state.cached_pricing = slash_stats::fallback_pricing(base_model);
+            state.context_budget = prompts::ContextBudget::from_runtime_config(
+                &state.runtime_config,
+                Some(base_model),
+            );
             eprintln!("{}", format!("  \u{2713}  Model set to: {}", arg).green());
             if let Some(ref j) = state.journal {
                 let _ = j.append(&session_journal::JournalEvent::config_change(
@@ -272,11 +351,11 @@ pub(super) async fn handle_slash_command(
 
         "/history" | "/grep" | "/review" | "/copy" | "/diagnostics" | "/lsp" | "/context"
         | "/version" | "/whoami" | "/rewind" | "/turn" | "/report" => {
-            handle_info_command(cmd, arg, api, state, token).await?;
+            handle_info_command(cmd, arg, api, state, profile, token).await?;
         }
 
         "/skill" => {
-            handle_skill_command(arg, api, state, token).await?;
+            handle_skill_command(arg, api, state, profile, token).await?;
         }
 
         "/mcp" => {
@@ -464,7 +543,7 @@ pub(super) async fn handle_slash_command(
         }
 
         "/task" => {
-            slash_task::handle_task_command(arg, state, api, token).await;
+            slash_task::handle_task_command(arg, state, api, profile, token).await;
         }
 
         "/resume" => {
@@ -545,5 +624,36 @@ mod model_list_json_tests {
     fn is_active_numeric_zero_means_inactive() {
         let v = serde_json::json!({"name": "m", "is_active": 0});
         assert!(!model_list_entry_is_active(&v));
+    }
+
+    #[test]
+    fn reads_flattened_thinking_mode_from_model_list() {
+        let v = serde_json::json!({"name": "claude", "thinking_mode": "controllable"});
+        assert_eq!(model_list_entry_thinking_mode(&v), Some("controllable"));
+    }
+
+    #[test]
+    fn reads_nested_quirks_thinking_mode() {
+        let v = serde_json::json!({
+            "name": "glm",
+            "quirks": { "thinking_mode": "native" }
+        });
+        assert_eq!(model_list_entry_thinking_mode(&v), Some("native"));
+    }
+
+    #[test]
+    fn flattened_thinking_mode_wins_over_nested_quirks() {
+        let v = serde_json::json!({
+            "name": "claude",
+            "thinking_mode": "controllable",
+            "quirks": { "thinking_mode": "native" }
+        });
+        assert_eq!(model_list_entry_thinking_mode(&v), Some("controllable"));
+    }
+
+    #[test]
+    fn missing_thinking_mode_returns_none() {
+        let v = serde_json::json!({"name": "minimax"});
+        assert_eq!(model_list_entry_thinking_mode(&v), None);
     }
 }
