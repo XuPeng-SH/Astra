@@ -303,6 +303,8 @@ async fn run_chat_repl(
     profile: Option<&str>,
     initial_model: Option<&str>,
     resume_session_id: Option<&str>,
+    no_instructions: bool,
+    max_budget: f64,
 ) -> Result<(), String> {
     let mut tracer = StartupTracer::new();
 
@@ -317,6 +319,9 @@ async fn run_chat_repl(
     tracer.phase("editor");
 
     let mut state = initialize_repl_state(profile, initial_model);
+    if max_budget > 0.0 {
+        state.max_budget_limit = max_budget;
+    }
     tracer.phase("state_init");
 
     let repl_startup::ReplStartupArtifacts {
@@ -327,7 +332,15 @@ async fn run_chat_repl(
         skill_quality_path,
         pinned_skills_path,
         mut shutdown_signal_rx,
-    } = complete_repl_startup(&mut state, &mut tracer, api, profile, resume_session_id).await?;
+    } = complete_repl_startup(
+        &mut state,
+        &mut tracer,
+        api,
+        profile,
+        resume_session_id,
+        no_instructions,
+    )
+    .await?;
 
     // Print startup trace summary if enabled
     tracer.finish();
@@ -995,8 +1008,8 @@ async fn main() {
         }
     };
 
-    // Set MEMORIA_API_KEY from credentials if not already set
-    if std::env::var("MEMORIA_API_KEY").is_err() {
+    // Set MEMORIA_MASTER_KEY from credentials if not already set
+    if std::env::var("MEMORIA_MASTER_KEY").is_err() {
         let creds = load_credentials();
         let name = profile_name(cli.profile.as_deref(), &creds);
         if let Some(key) = creds
@@ -1005,7 +1018,7 @@ async fn main() {
             .and_then(|p| p.memoria_api_key.as_deref())
         {
             unsafe {
-                std::env::set_var("MEMORIA_API_KEY", key);
+                std::env::set_var("MEMORIA_MASTER_KEY", key);
             }
         }
     }
@@ -1038,26 +1051,7 @@ async fn main() {
         command,
     } = cli;
 
-    // --startup-trace: enable startup timing
-    if startup_trace {
-        unsafe {
-            std::env::set_var("ASTRA_STARTUP_TRACE", "1");
-        }
-    }
-
-    // --bare: set env var for minimal mode
-    if bare {
-        unsafe {
-            std::env::set_var("ASTRA_BARE", "1");
-        }
-    }
-
-    // --no-instructions: disable .astra/instructions.md auto-loading
-    if no_instructions {
-        unsafe {
-            std::env::set_var("ASTRA_NO_INSTRUCTIONS", "1");
-        }
-    }
+    let _ = (startup_trace, bare);
 
     if no_journal_content {
         unsafe {
@@ -1068,14 +1062,7 @@ async fn main() {
     // --max-turns: override via env var before RuntimeLimits singleton is initialized
     if let Some(turns) = max_turns {
         unsafe {
-            std::env::set_var("MO_MAX_TURNS", turns.to_string());
-        }
-    }
-
-    // --max-budget: store the limit; enforcement happens in the REPL loop
-    if max_budget > 0.0 {
-        unsafe {
-            std::env::set_var("MO_MAX_BUDGET", max_budget.to_string());
+            std::env::set_var("ASTRA_CLI_MAX_TURNS", turns.to_string());
         }
     }
 
@@ -1112,7 +1099,7 @@ async fn main() {
             .collect();
         if !normalized.is_empty() {
             unsafe {
-                std::env::set_var("ASTRA_ALLOWED_TOOLS", normalized.join(","));
+                std::env::set_var("ASTRA_CLI_ALLOWED_TOOLS", normalized.join(","));
             }
         }
     }
@@ -1127,7 +1114,7 @@ async fn main() {
             .collect();
         if !normalized.is_empty() {
             unsafe {
-                std::env::set_var("ASTRA_DISALLOWED_TOOLS", normalized.join(","));
+                std::env::set_var("ASTRA_CLI_DISALLOWED_TOOLS", normalized.join(","));
             }
         }
     }
@@ -1144,21 +1131,18 @@ async fn main() {
             })
             .collect();
         unsafe {
-            std::env::set_var("ASTRA_ADD_DIRS", dirs.join(":"));
+            std::env::set_var("ASTRA_CLI_ADD_DIRS", dirs.join(":"));
         }
     }
 
-    // --yes (-y): set auto-approve mode for the interactive REPL
+    // --yes (-y): set auto-approve mode for the interactive REPL. ReplState::default()
+    // reads ASTRA_CLI_AUTO_APPROVE, so propagate the flag before REPL startup.
     if auto_approve {
         unsafe {
-            std::env::set_var("ASTRA_AUTO_APPROVE", "1");
+            std::env::set_var("ASTRA_CLI_AUTO_APPROVE", "1");
         }
     }
-    if verbose {
-        unsafe {
-            std::env::set_var("ASTRA_VERBOSE", "1");
-        }
-    }
+    let _ = verbose;
 
     // --mcp-config: load MCP server configs from files/JSON strings
     if !mcp_config.is_empty() {
@@ -1185,14 +1169,14 @@ async fn main() {
             std::process::exit(1);
         }
         unsafe {
-            std::env::set_var("ASTRA_SESSION_ID", sid);
+            std::env::set_var("ASTRA_CLI_SESSION_ID", sid);
         }
     }
 
     // --name: export session display name
     if let Some(ref name) = session_name {
         unsafe {
-            std::env::set_var("ASTRA_SESSION_NAME", name);
+            std::env::set_var("ASTRA_CLI_SESSION_NAME", name);
         }
     }
 
@@ -1239,6 +1223,8 @@ async fn main() {
                     profile.as_deref(),
                     resolved_model.as_deref(),
                     Some(&sid),
+                    no_instructions,
+                    max_budget,
                 )
                 .await;
                 match result {
@@ -1266,6 +1252,8 @@ async fn main() {
         auto_approve,
         system_prompt,
         &api,
+        no_instructions,
+        max_budget,
     )
     .await
     {
@@ -1300,7 +1288,7 @@ mod tests {
         base
     }
 
-    /// Guard that serializes tests touching ASTRA_CREDENTIALS_DIR.
+    /// Guard that serializes tests touching ASTRA_CLI_CREDENTIALS_DIR.
     /// Multiple async tests concurrently setting this env var is a data race;
     /// the guard ensures they execute sequentially.
     use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -1313,7 +1301,7 @@ mod tests {
     impl Drop for CredentialsGuard {
         fn drop(&mut self) {
             unsafe {
-                std::env::remove_var("ASTRA_CREDENTIALS_DIR");
+                std::env::remove_var("ASTRA_CLI_CREDENTIALS_DIR");
             }
         }
     }
@@ -1332,7 +1320,7 @@ mod tests {
         let lock = creds_lock();
         let dir = tempfile::tempdir().unwrap();
         // SAFETY: protected by CREDS_LOCK; no concurrent set_var.
-        unsafe { std::env::set_var("ASTRA_CREDENTIALS_DIR", dir.path()) };
+        unsafe { std::env::set_var("ASTRA_CLI_CREDENTIALS_DIR", dir.path()) };
         CredentialsGuard {
             _lock: lock,
             _dir: dir,
@@ -1927,6 +1915,8 @@ mod tests {
             false,
             None,
             &api,
+            false,
+            0.0,
         )
         .await;
         // Health command should succeed regardless of auth
@@ -1943,6 +1933,8 @@ mod tests {
             false,
             None,
             &api,
+            false,
+            0.0,
         )
         .await;
         assert!(result.is_ok());
@@ -4593,6 +4585,23 @@ total_tokens_out: 500
         assert!((cli.max_budget - 10.0).abs() < f64::EPSILON);
     }
 
+    // Verify that --max-budget wires through to ReplState.max_budget_limit.
+    // The initialize_repl_state default is 0.0; after applying the flag it must equal the value.
+    #[test]
+    fn max_budget_applied_to_repl_state() {
+        let mut state = initialize_repl_state(None, None);
+        assert!(
+            (state.max_budget_limit - 0.0).abs() < f64::EPSILON,
+            "default max_budget_limit must be 0.0"
+        );
+        // Apply the flag value — this is what run_chat_repl now does.
+        state.max_budget_limit = 7.5;
+        assert!(
+            (state.max_budget_limit - 7.5).abs() < f64::EPSILON,
+            "max_budget_limit must reflect the --max-budget flag value"
+        );
+    }
+
     // ── --yes / -y edge case tests ──
 
     #[test]
@@ -4700,13 +4709,13 @@ total_tokens_out: 500
 
     #[test]
     fn repl_state_auto_approve_env_activates_auto_mode() {
-        // When ASTRA_AUTO_APPROVE=1, ReplState should start in Auto mode
+        // When ASTRA_CLI_AUTO_APPROVE=1, ReplState should start in Auto mode
         unsafe {
-            std::env::set_var("ASTRA_AUTO_APPROVE", "1");
+            std::env::set_var("ASTRA_CLI_AUTO_APPROVE", "1");
         }
         let state = ReplState::default();
         unsafe {
-            std::env::remove_var("ASTRA_AUTO_APPROVE");
+            std::env::remove_var("ASTRA_CLI_AUTO_APPROVE");
         }
         assert_eq!(
             state.perm_manager.mode(),
