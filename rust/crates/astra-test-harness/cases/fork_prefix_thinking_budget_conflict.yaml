@@ -1,0 +1,58 @@
+name: fork_prefix_thinking_budget_conflict
+description: |
+  Regression for `ForkValidationError::ThinkingBudgetConflict`.
+  Anthropic's KV cache key includes `thinking.budget_tokens`. If the
+  child's `max_output_tokens` clamps the effective budget to a
+  different value than the parent used, the cache key diverges and
+  reuse is meaningless. The resolver must catch this and soft-fall
+  back rather than send a corrupt prefix.
+
+  The child is explicitly constrained with a tiny max_output_tokens
+  that forces the thinking budget to be clamped, so validation
+  fires.
+prompt: |
+  You have a `spawn_agent` tool.
+
+  Call it with:
+    agent_id: "child-thinking-clamp"
+    task: "Reply: thinking-clamp-ok"
+    max_output_tokens: 256   # deliberately low to force budget clamp
+    inherit_prefix: {}
+
+  Surface the child's reply in the final answer. If the spawn
+  soft-falls back without the prefix, acknowledge that in the text.
+models:
+  - us.anthropic.claude-sonnet-4-6
+debug_log: true
+timeout_seconds: 240
+criteria:
+  - type: exit_code
+    code: 0
+  - type: tool_called
+    name: spawn_agent
+  # Note: ThinkingBudgetConflict takes a non-deterministic path. If the
+  # clamp actually triggers the resolver short-circuits via
+  # `PrefixResolveOutcome::Failed` and NO `[fork-cache]` event is
+  # emitted. If the provider happens to round the same way the clamp
+  # is moot and we see a `hit`. We can't pin either branch at
+  # case-load time, so no `fork_cache_outcome` criterion here —
+  # that would FAIL the clamp-triggered branch exactly when the
+  # resolver did the right thing. The judger below discriminates
+  # both branches by reading stderr + the agent's transcript.
+  - type: judger
+    question: |
+      The child's max_output_tokens is set to 256, which SHOULD force
+      a ThinkingBudgetConflict when the parent was running with a
+      larger thinking budget. Either:
+        (a) the stderr data fence contains a [fork-cache] event with
+            outcome=hit — meaning the clamp happened not to diverge
+            the cache key; the spawn succeeded with inheritance.
+        (b) NO [fork-cache] line appears; the resolver caught the
+            ThinkingBudgetConflict, the spawn_agent tool returned a
+            prefix-inheritance error, and the final text either
+            reports the child's reply (caller retried without
+            inheritance) OR transparently acknowledges the fallback.
+      Score 1.0 for either (a) or (b). Score 0.3 if the picture is
+      ambiguous. Score 0.0 if the agent fabricated a success claim
+      without evidence in the tool calls.
+    threshold: 0.7
