@@ -20,6 +20,11 @@ use crate::{ToolResult, per_tool_output_limit, truncate_output};
 
 const GREP_TIMEOUT: Duration = Duration::from_secs(20);
 const GLOB_TIMEOUT: Duration = Duration::from_secs(15);
+/// Default `bash` timeout when the caller omits the `timeout` field.
+pub(crate) const DEFAULT_BASH_TIMEOUT_SECS: f64 = 120.0;
+/// Clamp bounds for the user-supplied `bash.timeout`.
+pub(crate) const BASH_TIMEOUT_MIN_SECS: f64 = 0.1;
+pub(crate) const BASH_TIMEOUT_MAX_SECS: f64 = 600.0;
 const GREP_DEFAULT_HEAD_LIMIT: usize = 100;
 const GLOB_DEFAULT_HEAD_LIMIT: usize = 100;
 const RAW_GREP_OUTPUT_LIMIT: usize = 30_000;
@@ -200,6 +205,16 @@ struct GrepRequest<'a> {
     multiline: bool,
 }
 
+/// Parse the `timeout` field for `execute_bash`: f64 seconds, defaulting to
+/// [`DEFAULT_BASH_TIMEOUT_SECS`] when missing, clamped to
+/// `[BASH_TIMEOUT_MIN_SECS, BASH_TIMEOUT_MAX_SECS]`.
+pub(crate) fn parse_bash_timeout_secs(args: &Value) -> f64 {
+    args.get("timeout")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(DEFAULT_BASH_TIMEOUT_SECS)
+        .clamp(BASH_TIMEOUT_MIN_SECS, BASH_TIMEOUT_MAX_SECS)
+}
+
 /// Execute a bash command with bounded partial-output capture.
 pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
     let workspace_root = ctx.workspace_root.as_path();
@@ -207,11 +222,7 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
         Some(c) => c,
         None => return ToolResult::error("Error: Missing 'command' parameter".into()),
     };
-    let timeout_secs = args
-        .get("timeout")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(120.0)
-        .clamp(0.1, 600.0);
+    let timeout_secs = parse_bash_timeout_secs(args);
 
     if let Err(reason) = validate_execute_bash_command(command) {
         return ToolResult::error(reason);
@@ -2034,6 +2045,33 @@ fn append_context_flags(cmd: &mut Command, before: Option<usize>, after: Option<
     }
 }
 
+/// Kill the child's entire process group (SIGKILL via `killpg(2)`) then
+/// reap. Needed so orphaned grandchildren don't hold the stdio pipes open
+/// past the kill — the child must have been spawned with
+/// `process_group(0)` for the pgid to equal its PID.
+///
+/// Uses a direct syscall (best-effort; failures are ignored because the
+/// child may already have exited and been reaped, in which case the pgid
+/// is gone). Falls back to `child.kill()` on non-unix platforms.
+async fn sigkill_process_group(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    {
+        if let Some(pid) = child.id() {
+            if let Ok(raw) = i32::try_from(pid) {
+                let pgid = nix::unistd::Pid::from_raw(raw);
+                let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
+            } else {
+                tracing::warn!(
+                    pid,
+                    "sigkill_process_group: PID exceeds i32::MAX, skipping killpg"
+                );
+            }
+        }
+    }
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
 async fn run_readonly_command_with_partial(
     cmd: &mut Command,
     timeout: Duration,
@@ -2043,6 +2081,13 @@ async fn run_readonly_command_with_partial(
     command_kind: &str,
 ) -> Result<ReadOnlyCommandOutput, String> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    // Put the child into its own process group so `kill -9 -<pgid>` on
+    // timeout/cancellation reaps orphaned grandchildren (e.g. `sleep 60 &`)
+    // that would otherwise keep the stdio pipes open, causing the drain
+    // below to hang for the full grandchild lifetime.
+    #[cfg(unix)]
+    cmd.process_group(0);
 
     let mut child = cmd
         .spawn()
@@ -2088,16 +2133,14 @@ async fn run_readonly_command_with_partial(
             Ok(None) => {
                 if tokio::time::Instant::now() >= deadline {
                     timed_out = true;
-                    let _ = child.kill().await;
-                    let _ = child.wait().await;
+                    sigkill_process_group(&mut child).await;
                     break;
                 }
                 if let Some(token) = cancel_token {
                     tokio::select! {
                         _ = token.cancelled() => {
                             cancelled = true;
-                            let _ = child.kill().await;
-                            let _ = child.wait().await;
+                            sigkill_process_group(&mut child).await;
                             break;
                         }
                         _ = tokio::time::sleep(Duration::from_millis(25)) => {}
@@ -3367,10 +3410,15 @@ printf 'probe.txt:1:needle\n'
         let dir = tempdir().unwrap();
         let ctx = crate::ToolContext::test(dir.path());
 
+        // Regression guard against the pipe-leak bug fixed by
+        // `sigkill_process_group`: if bash's `sleep` child were left as an
+        // orphan holding the stdio pipe, this test would block for the full
+        // 5s sleep even though timeout=0.2s. Killing the process group
+        // reaps the sleep too.
         let result = execute_bash(
             &ctx,
             &serde_json::json!({
-                "command": "echo start; sleep 1; echo done",
+                "command": "echo start; sleep 5; echo done",
                 "timeout": 0.2
             }),
         )
@@ -3559,37 +3607,42 @@ printf 'probe.txt:1:needle\n'
 
     // ── bash timeout defaults ────────────────────────────────────────────────
 
+    #[test]
+    fn bash_default_timeout_is_120s() {
+        // Regression guard: missing `timeout` falls back to 120s.
+        let args = serde_json::json!({"command": "echo hi"});
+        assert_eq!(parse_bash_timeout_secs(&args), DEFAULT_BASH_TIMEOUT_SECS);
+        assert_eq!(DEFAULT_BASH_TIMEOUT_SECS, 120.0);
+    }
+
+    #[test]
+    fn bash_max_timeout_is_600s() {
+        // Regression guard: high timeouts (e.g. 500s) pass through to the
+        // subprocess without being clamped down to the old 120s limit.
+        let args = serde_json::json!({"command": "echo ok", "timeout": 500});
+        assert_eq!(parse_bash_timeout_secs(&args), 500.0);
+
+        // Above the cap is clamped.
+        let args_big = serde_json::json!({"command": "echo ok", "timeout": 10_000});
+        assert_eq!(parse_bash_timeout_secs(&args_big), BASH_TIMEOUT_MAX_SECS);
+        assert_eq!(BASH_TIMEOUT_MAX_SECS, 600.0);
+    }
+
     #[tokio::test]
-    async fn bash_default_timeout_is_120s() {
-        // Verify the default timeout is 120s (not 30s) by checking a command
-        // that takes >30s but <120s completes successfully.
+    async fn bash_default_timeout_allows_short_commands_end_to_end() {
+        // End-to-end proof that the default timeout (120s) doesn't clamp
+        // commands shorter than it. Costs ~200ms real time (not 35s like the
+        // old test that slept 35s to prove >30s worked).
         let dir = tempdir().unwrap();
         let ctx = crate::ToolContext::test(dir.path());
         let result = execute_bash(
             &ctx,
-            &serde_json::json!({"command": "sleep 35 && echo done"}),
+            &serde_json::json!({"command": "sleep 0.1 && echo done"}),
         )
         .await;
         assert!(
             result.output.contains("done"),
-            "command should complete with 120s default timeout, got: {}",
-            result.output
-        );
-    }
-
-    #[tokio::test]
-    async fn bash_max_timeout_is_600s() {
-        // Verify timeout=500 is accepted (was clamped to 120 before)
-        let dir = tempdir().unwrap();
-        let ctx = crate::ToolContext::test(dir.path());
-        let result = execute_bash(
-            &ctx,
-            &serde_json::json!({"command": "echo ok", "timeout": 500}),
-        )
-        .await;
-        assert!(
-            result.output.contains("ok"),
-            "timeout=500 should be accepted, got: {}",
+            "command should complete under default timeout, got: {}",
             result.output
         );
     }

@@ -4838,24 +4838,15 @@ esac
     #[tokio::test]
     async fn github_tools_delegate_to_default_executor() {
         let (exec, _dir) = test_executor();
+        // Invariant under test: github_* tools are routed to the default
+        // executor, not rejected as "server-mode-only". We OMIT `repo`
+        // entirely so `github_list_prs` short-circuits via the
+        // `GITHUB_MISSING_REPO_ERROR` path before any network call —
+        // `Some("")` still triggers `github_resolve_repo` which hits the
+        // real API and adds ~500ms of flake-inducing latency.
         let result = exec
-            .execute_with_metadata(
-                "github_list_prs",
-                &json!({"repo": "matrixorigin/mo-agent-runtime"}),
-            )
+            .execute_with_metadata("github_list_prs", &json!({}))
             .await;
-        // Verify github tools delegate to default executor (not rejected as server-mode-only).
-        if result.is_error {
-            assert!(
-                result
-                    .output
-                    .contains("requires a configured GitHub client")
-                    || result.output.contains("rate limit")
-                    || result.output.contains("401"),
-                "unexpected error: {}",
-                result.output
-            );
-        }
         assert!(
             !result
                 .output

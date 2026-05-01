@@ -513,7 +513,7 @@ async fn orchestrator_writes_start_then_complete_not_duplicate() {
 
 // ─── Budget Timeout Enforcement ─────────────────────────────────────────────
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn budget_timeout_aborts_slow_execution() {
     use astra_services::team_persistence::TeamBudget;
 
@@ -625,8 +625,11 @@ async fn fan_out_respects_max_parallel() {
             let concurrent = prev + 1;
             // Update peak
             self.peak.fetch_max(concurrent, Ordering::SeqCst);
-            // Hold for a bit so other tasks have a chance to start
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            // Hold just long enough that a second would-be-parallel task gets
+            // scheduled and observed by `current` if the orchestrator ever
+            // violated `max_parallel`. 5ms is plenty; 50ms was slowing this
+            // test to ~150ms real time for no extra coverage.
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             self.current.fetch_sub(1, Ordering::SeqCst);
             Ok(AgentResult {
                 agent_id: config.agent_profile.agent_id.clone(),
@@ -840,8 +843,13 @@ async fn concurrent_team_executions_isolated() {
         async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
             let agent_id = config.agent_profile.agent_id.clone();
             self.log.lock().await.push(format!("start:{agent_id}"));
-            // Simulate work
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            // Yield once so the runtime can interleave the two concurrent
+            // executions; `tokio::time::sleep(50ms)` would do the same but
+            // also wait 50ms of real wall-clock time for no extra coverage.
+            // The assertion below only cares that both executions start and
+            // end with distinct delegation_ids, not that they overlap for
+            // any specific duration.
+            tokio::task::yield_now().await;
             self.log.lock().await.push(format!("end:{agent_id}"));
             Ok(AgentResult {
                 agent_id,
@@ -1232,8 +1240,11 @@ async fn team_execution_respects_cancellation() {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 
-    // Brief delay to let delegation spawn records be created
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // Brief delay to let delegation spawn records be created. `started`
+    // fires when the executor is entered; the delegation tracker write
+    // happens a handful of awaits later. 10ms is empirically sufficient
+    // for the write to land — was 50ms, which was over-conservative.
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
     // Just drop the handle (simulates cancellation)
     exec_handle.abort();

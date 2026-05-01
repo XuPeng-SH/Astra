@@ -54,7 +54,16 @@ pub(crate) fn redact_provider_secrets(s: &str) -> String {
 /// Maximum retries for transient LLM errors (429, 5xx, network).
 pub(crate) const LLM_MAX_RETRIES: u32 = 3;
 /// Base delay between retries (doubles each attempt: 1s, 2s, 4s).
+/// Override: `ASTRA_LLM_RETRY_BASE_MS` (e.g. `10` in E2E tests that
+/// intentionally exhaust retries to assert error-surface behavior).
 pub(crate) const LLM_RETRY_BASE_MS: u64 = 1000;
+
+fn llm_retry_base_ms() -> u64 {
+    std::env::var("ASTRA_LLM_RETRY_BASE_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(LLM_RETRY_BASE_MS)
+}
 /// Extended delay for TPM (tokens per minute) exhaustion (60 seconds).
 /// TPM limits typically reset after 60 seconds, so we wait longer.
 const TPM_EXHAUST_DELAY_MS: u64 = 60_000;
@@ -454,6 +463,43 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static TEST_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS: std::cell::RefCell<Option<std::time::Duration>> =
         const { std::cell::RefCell::new(None) };
+    // Retry-backoff override for tests: when `Some(ms)`, the between-attempts
+    // backoff (normally `LLM_RETRY_BASE_MS * 2^(attempt-1)` or TPM_EXHAUST_DELAY_MS)
+    // is replaced by this flat value. Lets retry-logic tests run in <100ms
+    // instead of waiting on real time.
+    static TEST_RETRY_BACKOFF_MS: std::cell::RefCell<Option<u64>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Compute the between-attempts backoff in ms. `attempt` is 1-indexed (the
+/// first retry after the initial failure has attempt=1).
+fn retry_backoff_ms(attempt: u32, tpm_exhausted: bool) -> u64 {
+    #[cfg(test)]
+    if let Some(ms) = TEST_RETRY_BACKOFF_MS.with(|c| *c.borrow()) {
+        return ms;
+    }
+    if tpm_exhausted {
+        TPM_EXHAUST_DELAY_MS
+    } else {
+        llm_retry_base_ms() * (1 << (attempt - 1))
+    }
+}
+
+/// Override the between-retry backoff to `ms` for the duration of a test.
+/// Without this, every retry incurs a real 1s/2s/4s sleep — with it,
+/// retry-logic tests run in <100ms. Returns a guard that clears the override
+/// on drop. `pub(crate)` so other runtime modules (e.g. server_loop_host
+/// end-to-end tests) can use the same knob.
+#[cfg(test)]
+pub(crate) fn set_test_retry_backoff_ms(ms: u64) -> impl Drop {
+    TEST_RETRY_BACKOFF_MS.with(|c| *c.borrow_mut() = Some(ms));
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            TEST_RETRY_BACKOFF_MS.with(|c| *c.borrow_mut() = None);
+        }
+    }
+    Guard
 }
 
 /// Apply HTTP(S)/ALL proxy env vars to a reqwest::ClientBuilder.
@@ -471,19 +517,42 @@ pub(crate) use astra_core::net::apply_env_proxy;
 // Tests for `apply_env_proxy` live with its authoritative implementation in
 // `astra_core::net`. Do not duplicate them here.
 
-/// TCP connect timeout for LLM API requests.
+/// Resolve an LLM duration-in-seconds constant, consulting its env-var
+/// override and falling back to the compile-time default. Used by
+/// `LLM_CONNECT_TIMEOUT_S`, `LLM_FALLBACK_TIMEOUT_S`, and
+/// `LLM_TOTAL_BUDGET_S`. Operators set these to lower values in
+/// degraded conditions (tight SLOs) or raise them for slow providers;
+/// the const defaults are the production baseline.
+fn llm_secs_from_env(var: &str, default_secs: u64) -> u64 {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(default_secs)
+}
+
+/// TCP connect timeout for LLM API requests. Override: `ASTRA_LLM_CONNECT_TIMEOUT_S`.
 pub(crate) fn llm_connect_timeout() -> std::time::Duration {
-    std::time::Duration::from_secs(LLM_CONNECT_TIMEOUT_S)
+    std::time::Duration::from_secs(llm_secs_from_env(
+        "ASTRA_LLM_CONNECT_TIMEOUT_S",
+        LLM_CONNECT_TIMEOUT_S,
+    ))
 }
 
-/// Hard timeout for the non-stream fallback request.
+/// Hard timeout for the non-stream fallback request. Override: `ASTRA_LLM_FALLBACK_TIMEOUT_S`.
 pub(crate) fn llm_fallback_timeout() -> std::time::Duration {
-    std::time::Duration::from_secs(LLM_FALLBACK_TIMEOUT_S)
+    std::time::Duration::from_secs(llm_secs_from_env(
+        "ASTRA_LLM_FALLBACK_TIMEOUT_S",
+        LLM_FALLBACK_TIMEOUT_S,
+    ))
 }
 
-/// Total budget across all retries + fallback for a single LLM call.
+/// Total budget across all retries + fallback for a single LLM call. Override: `ASTRA_LLM_TOTAL_BUDGET_S`.
 pub(crate) fn llm_total_budget() -> std::time::Duration {
-    std::time::Duration::from_secs(LLM_TOTAL_BUDGET_S)
+    std::time::Duration::from_secs(llm_secs_from_env(
+        "ASTRA_LLM_TOTAL_BUDGET_S",
+        LLM_TOTAL_BUDGET_S,
+    ))
 }
 
 #[cfg(test)]
@@ -1549,11 +1618,7 @@ pub(crate) async fn call_llm_and_collect_with_request_overrides(
         }
         if attempt > 0 {
             // Use longer delay for TPM exhaustion (60s) vs standard exponential (1s, 2s, 4s)
-            let delay = if tpm_exhaustion_detected {
-                TPM_EXHAUST_DELAY_MS
-            } else {
-                LLM_RETRY_BASE_MS * (1 << (attempt - 1))
-            };
+            let delay = retry_backoff_ms(attempt, tpm_exhaustion_detected);
             if tpm_exhaustion_detected {
                 astra_core::agent_warn!(
                     "llm",
@@ -3818,6 +3883,7 @@ mod tests {
     #[tokio::test]
     async fn call_llm_and_collect_retries_after_429_retry_after_zero() {
         reset_rate_limit_cooldown_for_tests();
+        let _backoff = set_test_retry_backoff_ms(0);
         let hits = Arc::new(AtomicU32::new(0));
         let app = Router::new()
             .route("/chat/completions", post(mock_429_retry_zero_then_sse))
@@ -3879,6 +3945,7 @@ mod tests {
     #[tokio::test]
     async fn call_llm_and_collect_retries_after_529_retry_after_zero() {
         reset_rate_limit_cooldown_for_tests();
+        let _backoff = set_test_retry_backoff_ms(0);
         let hits = Arc::new(AtomicU32::new(0));
         let app = Router::new()
             .route("/chat/completions", post(mock_529_retry_zero_then_sse))
@@ -3906,6 +3973,7 @@ mod tests {
     #[tokio::test]
     async fn call_llm_and_collect_retries_after_503_retry_after_zero() {
         reset_rate_limit_cooldown_for_tests();
+        let _backoff = set_test_retry_backoff_ms(0);
         let hits = Arc::new(AtomicU32::new(0));
         let app = Router::new()
             .route("/chat/completions", post(mock_503_retry_zero_then_sse))
@@ -4250,6 +4318,7 @@ mod tests {
     #[tokio::test]
     async fn call_llm_and_collect_retries_stream_once_when_idle_before_output() {
         let _guard = set_test_stream_timeouts(10, None);
+        let _backoff = set_test_retry_backoff_ms(0);
         let hits = Arc::new(AtomicU32::new(0));
         let app = Router::new()
             .route(
@@ -6270,18 +6339,27 @@ mod tests {
         // Anthropic will reject with the same class of 400 as Bedrock's
         // `thinking.signature: Field required`.
         //
-        // Pinned here as `#[ignore]` so: (a) nobody accidentally ships
-        // Anthropic native multi-turn thinking in a broken state, and
-        // (b) when a future PR implements the typed-block serializer
-        // (equivalent to `build_bedrock_messages` for Anthropic) plus the
-        // matching SSE signature capture, this test becomes real coverage
-        // by removing the `#[ignore]`.
+        // Pinned here as `#[should_panic]` + `#[ignore]` so: (a) nobody
+        // accidentally ships Anthropic native multi-turn thinking in a broken
+        // state, and (b) when a future PR implements the typed-block
+        // serializer (equivalent to `build_bedrock_messages` for Anthropic)
+        // plus the matching SSE signature capture, this test becomes real
+        // coverage by flipping to a normal `#[test]`.
         //
-        // TODO(anthropic-thinking): remove `#[ignore]` and implement the
-        // typed-block serializer + SSE signature capture before enabling
-        // native Anthropic multi-turn thinking.
+        // Today the request body is OpenAI-shape, so `body["messages"][1]
+        // ["content"].as_array()` returns `None` and the first assertion
+        // panics with "called `Option::unwrap()` on a `None` value". That
+        // panic is the canary — `#[should_panic]` pins the current broken
+        // state so `make test-online`'s `--run-ignored only` stage doesn't
+        // surface it as a false failure. Remove both attributes together
+        // with the serializer implementation.
+        //
+        // TODO(anthropic-thinking): remove `#[ignore]` + `#[should_panic]`
+        // and implement the typed-block serializer + SSE signature capture
+        // before enabling native Anthropic multi-turn thinking.
         #[test]
         #[ignore = "blocked on typed-block serializer for native Anthropic thinking"]
+        #[should_panic(expected = "called `Option::unwrap()` on a `None` value")]
         fn anthropic_thinking_tool_call_multi_turn_needs_typed_blocks() {
             let messages = vec![
                 user("compute 2+2"),

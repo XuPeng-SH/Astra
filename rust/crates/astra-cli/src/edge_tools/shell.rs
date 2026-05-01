@@ -2548,19 +2548,7 @@ fn run_command_with_cleanup(
             Ok(None) => {
                 if std::time::Instant::now() > deadline {
                     // Kill entire process group (command + all children)
-                    #[cfg(unix)]
-                    {
-                        let pid = child.id();
-                        // Negative PID = kill process group via /bin/kill
-                        let _ = Command::new("kill")
-                            .args(["-9", &format!("-{pid}")])
-                            .output();
-                        let _ = child.kill();
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        let _ = child.kill();
-                    }
+                    sigkill_process_group(&mut child);
                     // Reap the zombie process to prevent resource leak
                     let _ = child.wait();
                     return Err(format!("Error: command timed out after {timeout_secs}s"));
@@ -2583,6 +2571,52 @@ const MAX_OUTPUT_CHARS: usize = 30_000;
 
 /// Size watchdog poll interval for backgrounded tasks.
 const SIZE_WATCHDOG_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Production default for bash's post-exit pipe read timeout. After bash
+/// exits, we wait this long to drain stdout/stderr before giving up on
+/// orphaned background descendants keeping the pipes open.
+const BASH_PIPE_READ_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// SIGKILL the child's entire process group via `killpg(2)` (the child must
+/// have been spawned with `process_group(0)`), then SIGKILL the child
+/// directly as a belt-and-suspenders fallback. Uses a direct syscall
+/// instead of fork-execing `/usr/bin/kill` — cheaper and doesn't block
+/// a surrounding async runtime for the fork+exec latency.
+///
+/// Failures are silently ignored because the child may already have been
+/// reaped by the caller in a race; this helper is strictly best-effort.
+fn sigkill_process_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let pid = child.id();
+        if let Ok(raw) = i32::try_from(pid) {
+            let pgid = nix::unistd::Pid::from_raw(raw);
+            let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
+        } else {
+            tracing::warn!(
+                pid,
+                "sigkill_process_group: PID exceeds i32::MAX, skipping killpg"
+            );
+        }
+    }
+    let _ = child.kill();
+}
+
+/// Resolve the pipe-read timeout. Tests can shorten it via
+/// `set_test_bash_pipe_read_timeout` to avoid waiting the real 500ms.
+fn bash_pipe_read_timeout() -> Duration {
+    #[cfg(test)]
+    if let Some(ms) = TEST_BASH_PIPE_READ_TIMEOUT_MS.with(|c| *c.borrow()) {
+        return Duration::from_millis(ms);
+    }
+    BASH_PIPE_READ_TIMEOUT
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_BASH_PIPE_READ_TIMEOUT_MS: std::cell::RefCell<Option<u64>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 /// Execute a command with streaming output and optional auto-backgrounding on timeout.
 ///
@@ -2717,18 +2751,7 @@ fn run_command_streaming(
                         });
                     } else {
                         // Hard kill.
-                        #[cfg(unix)]
-                        {
-                            let pid = child.id();
-                            let _ = Command::new("kill")
-                                .args(["-9", &format!("-{pid}")])
-                                .output();
-                            let _ = child.kill();
-                        }
-                        #[cfg(not(unix))]
-                        {
-                            let _ = child.kill();
-                        }
+                        sigkill_process_group(&mut child);
                         let _ = child.wait();
                         let _ = stdout_thread.join();
                         let _ = stderr_thread.join();
@@ -2784,18 +2807,7 @@ fn size_watchdog(
 
         // Kill if running too long.
         if start.elapsed() > max_duration {
-            #[cfg(unix)]
-            {
-                let pid = child.id();
-                let _ = Command::new("kill")
-                    .args(["-9", &format!("-{pid}")])
-                    .output();
-                let _ = child.kill();
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = child.kill();
-            }
+            sigkill_process_group(&mut child);
             let _ = child.wait();
             break;
         }
@@ -2886,20 +2898,9 @@ fn run_readonly_command_with_partial(
             }
             Ok(None) => {
                 if std::time::Instant::now() > deadline {
-                    #[cfg(unix)]
-                    {
-                        let pid = child.id();
-                        // Kill the entire process group (catches child processes).
-                        // Fall back to direct kill so child.wait() never blocks forever.
-                        let _ = Command::new("kill")
-                            .args(["-9", &format!("-{pid}")])
-                            .output();
-                        let _ = child.kill();
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        let _ = child.kill();
-                    }
+                    // Kill the entire process group (catches child processes).
+                    // Fall back to direct kill so child.wait() never blocks forever.
+                    sigkill_process_group(&mut child);
                     let _ = child.wait();
                     let _ = reader.join();
                     let _ = stderr_reader.join();
@@ -3096,19 +3097,7 @@ impl ToolExecutor {
                 Ok(None) => {
                     if std::time::Instant::now() > deadline {
                         // Kill entire process group (bash + all children)
-                        #[cfg(unix)]
-                        {
-                            let pid = child.id();
-                            // Negative PID = kill process group via /bin/kill
-                            let _ = Command::new("kill")
-                                .args(["-9", &format!("-{pid}")])
-                                .output();
-                            let _ = child.kill();
-                        }
-                        #[cfg(not(unix))]
-                        {
-                            let _ = child.kill();
-                        }
+                        sigkill_process_group(&mut child);
                         // Reap the zombie process to prevent resource leak
                         let _ = child.wait();
                         return Err(format!("Error: command timed out after {timeout_secs}s"));
@@ -3126,7 +3115,7 @@ impl ToolExecutor {
         //
         // Solution: Set pipes to non-blocking mode and read until timeout.
         use std::io::Read;
-        let read_timeout = Duration::from_millis(500);
+        let read_timeout = bash_pipe_read_timeout();
 
         // Helper to read from a pipe with timeout using non-blocking I/O
         fn read_with_timeout(mut pipe: std::process::ChildStdout, timeout: Duration) -> Vec<u8> {
@@ -4211,6 +4200,21 @@ mod tests {
         ToolExecutor::new(dir)
     }
 
+    /// Shorten the post-exit pipe read timeout for the duration of a test.
+    /// Production uses 500ms; tests can drop it to e.g. 50ms so "background
+    /// command does not block" assertions don't burn the budget on an
+    /// artefact of the pipe-drain wait. Returns a guard that resets on drop.
+    fn set_test_bash_pipe_read_timeout_ms(ms: u64) -> impl Drop {
+        TEST_BASH_PIPE_READ_TIMEOUT_MS.with(|c| *c.borrow_mut() = Some(ms));
+        struct Guard;
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                TEST_BASH_PIPE_READ_TIMEOUT_MS.with(|c| *c.borrow_mut() = None);
+            }
+        }
+        Guard
+    }
+
     #[test]
     fn shell_escape_simple() {
         assert_eq!(shell_escape("hello"), "'hello'");
@@ -4430,6 +4434,11 @@ mod tests {
     /// stdout/stderr pipes open. We must not wait for pipes to close.
     #[test]
     fn bash_background_command_does_not_block() {
+        // Tighten the per-pipe drain timeout from 500ms → 50ms so the test
+        // runs in <200ms instead of >1s. The invariant under test is "doesn't
+        // wait for the backgrounded child to finish"; the absolute drain
+        // timeout is not the point.
+        let _guard = set_test_bash_pipe_read_timeout_ms(50);
         let executor = test_executor();
         let start = std::time::Instant::now();
         // This command starts a long-running background process and exits immediately.
@@ -4439,7 +4448,8 @@ mod tests {
             "timeout": 5.0
         }));
         let elapsed = start.elapsed();
-        // Should complete in ~1 second (500ms read timeout + overhead), not 60s
+        // Must return well before the 60s sleep completes — with the 50ms
+        // drain timeout in tests, ~200ms is typical.
         assert!(
             elapsed.as_secs() < 3,
             "background command blocked for {elapsed:?}, should return quickly"
@@ -6645,12 +6655,18 @@ mod tests {
 
     #[test]
     fn grep_scope_context_parameter() {
-        // Test that scope_context parameter is properly parsed
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let executor = super::ToolExecutor::new(root.to_path_buf());
+        // Small fixture with a known function — avoids the ~1s overhead of
+        // grepping the whole crate source tree under CARGO_MANIFEST_DIR.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("sample.rs"),
+            "fn annotate_grep_with_scope(input: &str) -> String {\n    String::new()\n}\n",
+        )
+        .unwrap();
+        let executor = super::ToolExecutor::new(dir.path());
         let result = executor.grep(&serde_json::json!({
             "pattern": "fn annotate_grep_with_scope",
-            "path": "src/edge_tools/shell.rs",
+            "path": "sample.rs",
             "scope_context": true
         }));
         assert!(
@@ -6789,7 +6805,8 @@ mod tests {
         cmd.current_dir(dir.path());
 
         let (output, _stderr, exit_code, timed_out) =
-            super::run_readonly_command_with_partial(&mut cmd, 2.0).expect("should not return Err");
+            super::run_readonly_command_with_partial(&mut cmd, 0.25)
+                .expect("should not return Err");
         // Should have captured partial stdout before timeout
         assert!(
             output.contains("match_line_1"),
@@ -6934,7 +6951,8 @@ mod tests {
         cmd.current_dir(dir.path());
 
         let (output, _stderr, _, timed_out) =
-            super::run_readonly_command_with_partial(&mut cmd, 2.0).expect("should not return Err");
+            super::run_readonly_command_with_partial(&mut cmd, 0.25)
+                .expect("should not return Err");
         assert!(timed_out);
         assert!(
             output.contains("complete_line_1"),
@@ -6972,7 +6990,7 @@ mod tests {
         cmd.current_dir(dir.path());
 
         let (output, _stderr, _exit, timed_out) =
-            super::run_readonly_command_with_partial(&mut cmd, 1.0).expect("should not return Err");
+            super::run_readonly_command_with_partial(&mut cmd, 0.2).expect("should not return Err");
         assert!(timed_out);
         assert!(
             output.trim().is_empty(),
@@ -7056,7 +7074,8 @@ mod tests {
         cmd.current_dir(dir.path());
 
         let (output, _stderr, _, timed_out) =
-            super::run_readonly_command_with_partial(&mut cmd, 2.0).expect("should not return Err");
+            super::run_readonly_command_with_partial(&mut cmd, 0.25)
+                .expect("should not return Err");
         assert!(timed_out);
         assert!(output.contains("needle_1"), "should have partial results");
         // The grep function would append the timeout note — verify the raw

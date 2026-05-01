@@ -66,16 +66,28 @@ fn require_db_it_env() -> Option<MatrixOneSettings> {
     })
 }
 
+/// Per-binary cached schema-bootstrap + pool. `ensure_core_schema` is
+/// ~55ms solo on MatrixOne but serialises under concurrency — 16 parallel
+/// callers ≈ 915ms p95. Without this cache, running all 22 tests in
+/// parallel (default nextest) made each test's setup blow the 2s strict
+/// budget just waiting on the schema lock.
+static SHARED_SETUP: tokio::sync::OnceCell<SharedPool> = tokio::sync::OnceCell::const_new();
+
 /// Returns `None` when the env gate refuses (`ASTRA_TEST_DB_IT != "1"`).
 /// Call sites pattern-match and `return;` to skip cleanly.
 async fn setup_app() -> Option<(Router, sqlx::Pool<sqlx::MySql>)> {
     let settings = require_db_it_env()?;
-    let catalog =
-        std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
-    ensure_core_schema(&settings, &catalog)
+    let shared = SHARED_SETUP
+        .get_or_init(|| async {
+            let catalog = std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG")
+                .unwrap_or_else(|_| "mysql".into());
+            ensure_core_schema(&settings, &catalog)
+                .await
+                .expect("ensure_core_schema; is MatrixOne up?");
+            SharedPool::new(&settings).await.expect("SharedPool::new")
+        })
         .await
-        .expect("ensure_core_schema; is MatrixOne up?");
-    let shared = SharedPool::new(&settings).await.expect("SharedPool::new");
+        .clone();
     let pool = shared.get().clone();
     let state = AppState::new(ServiceInfo::default(), Arc::new(HealthyStub))
         .with_auth_service(Arc::new(astra_services::auth::StubAuthService))
@@ -149,7 +161,12 @@ async fn ensure_session(pool: &sqlx::Pool<sqlx::MySql>, session_id: &str) {
     .await;
 }
 
-async fn seed_plan_with_subtasks(app: &Router, goal: &str, subtasks: &[&str]) -> (String, u64) {
+async fn seed_plan_with_subtasks(
+    app: &Router,
+    pool: &sqlx::Pool<sqlx::MySql>,
+    goal: &str,
+    subtasks: &[&str],
+) -> (String, u64) {
     let (status, body) =
         request_json(app.clone(), "POST", "/plans", Some(json!({ "goal": goal }))).await;
     assert_eq!(status, StatusCode::CREATED, "create: {body}");
@@ -167,12 +184,11 @@ async fn seed_plan_with_subtasks(app: &Router, goal: &str, subtasks: &[&str]) ->
     let version = get_body["version"].as_u64().expect("get version");
 
     // Patch plan_json via direct DB UPDATE so subtasks exist for execute/rewind.
-    // Callers only reach this helper after `setup_app()` succeeded, so the env
-    // gate is known to be satisfied here.
-    let settings =
-        require_db_it_env().expect("seed_plan_with_subtasks called without ASTRA_TEST_DB_IT");
-    let shared = SharedPool::new(&settings).await.unwrap();
-    let pool = shared.get();
+    // Uses the caller's pool (cached per-binary via setup_app's OnceCell) —
+    // calling `SharedPool::new` here would build a fresh 10-connection pool
+    // for every test case, and 22 concurrent tests × 10 connections floods
+    // MatrixOne's auth/accept queue hard enough to push the test over the
+    // 2s strict-online budget even when each query is fast.
     let subtask_json: Vec<Value> = subtasks
         .iter()
         .map(|id| {
@@ -264,7 +280,8 @@ async fn put_plan_with_stale_expected_version_returns_409() {
     let Some((app, pool)) = setup_app().await else {
         return;
     };
-    let (plan_id, version) = seed_plan_with_subtasks(&app, "http-ver-conflict", &["a", "b"]).await;
+    let (plan_id, version) =
+        seed_plan_with_subtasks(&app, &pool, "http-ver-conflict", &["a", "b"]).await;
 
     // First edit with the correct version → 200.
     let (s, b) = request_json(
@@ -303,7 +320,7 @@ async fn rewind_resets_suffix_and_records_timeline_event() {
     let Some((app, pool)) = setup_app().await else {
         return;
     };
-    let (plan_id, _) = seed_plan_with_subtasks(&app, "http-rewind", &["a", "b", "c"]).await;
+    let (plan_id, _) = seed_plan_with_subtasks(&app, &pool, "http-rewind", &["a", "b", "c"]).await;
 
     // Mark all three as completed so rewind from 2 resets b+c.
     sqlx::query(
@@ -376,7 +393,7 @@ async fn redo_step_resets_single_subtask_only() {
     let Some((app, pool)) = setup_app().await else {
         return;
     };
-    let (plan_id, _) = seed_plan_with_subtasks(&app, "http-redo", &["a", "b"]).await;
+    let (plan_id, _) = seed_plan_with_subtasks(&app, &pool, "http-redo", &["a", "b"]).await;
 
     // Mark a + b as completed.
     let plan_json: String = sqlx::query_scalar("SELECT plan_json FROM plans WHERE plan_id = ?")
@@ -426,7 +443,7 @@ async fn start_and_finish_step_run_round_trips_through_plan_step_runs_table() {
     let Some((app, pool)) = setup_app().await else {
         return;
     };
-    let (plan_id, _) = seed_plan_with_subtasks(&app, "http-runs", &["s1", "s2"]).await;
+    let (plan_id, _) = seed_plan_with_subtasks(&app, &pool, "http-runs", &["s1", "s2"]).await;
 
     let session_id = format!("sit-http-{}", Uuid::new_v4().simple());
     ensure_session(&pool, &session_id).await;
@@ -511,7 +528,7 @@ async fn execute_pins_active_plan_id_on_session() {
     let Some((app, pool)) = setup_app().await else {
         return;
     };
-    let (plan_id, v0) = seed_plan_with_subtasks(&app, "http-exec", &["s1"]).await;
+    let (plan_id, v0) = seed_plan_with_subtasks(&app, &pool, "http-exec", &["s1"]).await;
     let session_id = format!("sit-exec-{}", Uuid::new_v4().simple());
     ensure_session(&pool, &session_id).await;
 
@@ -560,7 +577,7 @@ async fn delete_plan_clears_active_plan_id_on_any_session() {
     let Some((app, pool)) = setup_app().await else {
         return;
     };
-    let (plan_id, _) = seed_plan_with_subtasks(&app, "http-del", &["s1"]).await;
+    let (plan_id, _) = seed_plan_with_subtasks(&app, &pool, "http-del", &["s1"]).await;
     let session_id = format!("sit-del-{}", Uuid::new_v4().simple());
     ensure_session(&pool, &session_id).await;
 
@@ -606,7 +623,7 @@ async fn post_completed_step_run_persists_finalized_row_in_one_call() {
     let Some((app, pool)) = setup_app().await else {
         return;
     };
-    let (plan_id, _) = seed_plan_with_subtasks(&app, "cli-oneshot", &["s1"]).await;
+    let (plan_id, _) = seed_plan_with_subtasks(&app, &pool, "cli-oneshot", &["s1"]).await;
     let session_id = format!("sit-oneshot-{}", Uuid::new_v4().simple());
     ensure_session(&pool, &session_id).await;
 
@@ -663,7 +680,7 @@ async fn post_completed_step_run_rejects_in_progress_status() {
     let Some((app, pool)) = setup_app().await else {
         return;
     };
-    let (plan_id, _) = seed_plan_with_subtasks(&app, "cli-oneshot-bad", &["s1"]).await;
+    let (plan_id, _) = seed_plan_with_subtasks(&app, &pool, "cli-oneshot-bad", &["s1"]).await;
     let session_id = format!("sit-oneshot-bad-{}", Uuid::new_v4().simple());
     ensure_session(&pool, &session_id).await;
 
@@ -699,7 +716,7 @@ async fn end_to_end_thin_client_posts_step_run_pair_and_persists_row() {
     let Some((app, pool)) = setup_app().await else {
         return;
     };
-    let (plan_id, _) = seed_plan_with_subtasks(&app, "cli-e2e-step-run", &["s1"]).await;
+    let (plan_id, _) = seed_plan_with_subtasks(&app, &pool, "cli-e2e-step-run", &["s1"]).await;
     let session_id = format!("sit-cli-{}", Uuid::new_v4().simple());
     ensure_session(&pool, &session_id).await;
 
@@ -797,7 +814,7 @@ async fn exit_plan_mode_approved_clears_session_active_plan_id() {
     let Some((app, pool)) = setup_app().await else {
         return;
     };
-    let (plan_id, _) = seed_plan_with_subtasks(&app, "http-exit-clears", &["s1"]).await;
+    let (plan_id, _) = seed_plan_with_subtasks(&app, &pool, "http-exit-clears", &["s1"]).await;
     let session_id = format!("sit-exit-{}", Uuid::new_v4().simple());
     ensure_session(&pool, &session_id).await;
 
@@ -860,7 +877,7 @@ async fn exit_plan_mode_rejected_leaves_active_plan_id_pinned() {
     let Some((app, pool)) = setup_app().await else {
         return;
     };
-    let (plan_id, _) = seed_plan_with_subtasks(&app, "http-exit-keeps", &["s1"]).await;
+    let (plan_id, _) = seed_plan_with_subtasks(&app, &pool, "http-exit-keeps", &["s1"]).await;
     let session_id = format!("sit-reject-{}", Uuid::new_v4().simple());
     ensure_session(&pool, &session_id).await;
 
@@ -906,7 +923,7 @@ async fn exit_plan_mode_records_lifecycle_decision() {
     let Some((app, pool)) = setup_app().await else {
         return;
     };
-    let (plan_id, _) = seed_plan_with_subtasks(&app, "http-exit", &["s1"]).await;
+    let (plan_id, _) = seed_plan_with_subtasks(&app, &pool, "http-exit", &["s1"]).await;
 
     let (_, get_body) = request_json(app.clone(), "GET", &format!("/plans/{plan_id}"), None).await;
     let v = get_body["version"].as_u64().unwrap();
@@ -953,7 +970,7 @@ async fn start_step_run_rejects_attempt_out_of_range() {
     let Some((app, pool)) = setup_app().await else {
         return;
     };
-    let (plan_id, _) = seed_plan_with_subtasks(&app, "http-attempt-range", &["s1"]).await;
+    let (plan_id, _) = seed_plan_with_subtasks(&app, &pool, "http-attempt-range", &["s1"]).await;
     let session_id = format!("sit-attempt-{}", Uuid::new_v4().simple());
     ensure_session(&pool, &session_id).await;
 
@@ -995,7 +1012,7 @@ async fn post_completed_step_run_rejects_attempt_out_of_range() {
     let Some((app, pool)) = setup_app().await else {
         return;
     };
-    let (plan_id, _) = seed_plan_with_subtasks(&app, "http-cattempt", &["s1"]).await;
+    let (plan_id, _) = seed_plan_with_subtasks(&app, &pool, "http-cattempt", &["s1"]).await;
     let session_id = format!("sit-cattempt-{}", Uuid::new_v4().simple());
     ensure_session(&pool, &session_id).await;
 
@@ -1032,7 +1049,7 @@ async fn rewind_rejects_oversized_reason_string() {
     let Some((app, pool)) = setup_app().await else {
         return;
     };
-    let (plan_id, _) = seed_plan_with_subtasks(&app, "http-rewind-big", &["a", "b"]).await;
+    let (plan_id, _) = seed_plan_with_subtasks(&app, &pool, "http-rewind-big", &["a", "b"]).await;
 
     // 20k > the 5k cap we'll install.
     let huge = "A".repeat(20_000);
@@ -1058,7 +1075,7 @@ async fn finish_step_run_rejects_oversized_error_and_artifact_ref() {
     let Some((app, pool)) = setup_app().await else {
         return;
     };
-    let (plan_id, _) = seed_plan_with_subtasks(&app, "http-finish-big", &["s1"]).await;
+    let (plan_id, _) = seed_plan_with_subtasks(&app, &pool, "http-finish-big", &["s1"]).await;
     let session_id = format!("sit-finish-big-{}", Uuid::new_v4().simple());
     ensure_session(&pool, &session_id).await;
 
@@ -1131,7 +1148,8 @@ async fn rewind_cancels_open_step_runs_for_reset_subtasks() {
     let Some((app, pool)) = setup_app().await else {
         return;
     };
-    let (plan_id, _) = seed_plan_with_subtasks(&app, "http-rewind-abort", &["a", "b", "c"]).await;
+    let (plan_id, _) =
+        seed_plan_with_subtasks(&app, &pool, "http-rewind-abort", &["a", "b", "c"]).await;
     let session_id = format!("sit-rewind-abort-{}", Uuid::new_v4().simple());
     ensure_session(&pool, &session_id).await;
 
@@ -1225,7 +1243,7 @@ async fn execute_plan_handler_rejects_empty_session_id_with_400() {
     let Some((app, pool)) = setup_app().await else {
         return;
     };
-    let (plan_id, _) = seed_plan_with_subtasks(&app, "http-exec-nosess", &["s1"]).await;
+    let (plan_id, _) = seed_plan_with_subtasks(&app, &pool, "http-exec-nosess", &["s1"]).await;
 
     let (_, get_body) = request_json(app.clone(), "GET", &format!("/plans/{plan_id}"), None).await;
     let v = get_body["version"].as_u64().unwrap();
@@ -1271,7 +1289,7 @@ async fn start_step_run_rejects_unknown_subtask_id_with_400() {
     let Some((app, pool)) = setup_app().await else {
         return;
     };
-    let (plan_id, _) = seed_plan_with_subtasks(&app, "http-run-nosub", &["s1"]).await;
+    let (plan_id, _) = seed_plan_with_subtasks(&app, &pool, "http-run-nosub", &["s1"]).await;
     let session_id = format!("sit-nosub-{}", Uuid::new_v4().simple());
     ensure_session(&pool, &session_id).await;
 

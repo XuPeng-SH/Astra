@@ -4802,25 +4802,35 @@ mod tests {
         assert!(report.results.iter().all(|r| r.passed));
     }
 
-    #[tokio::test]
-    async fn verification_timeout() {
+    // Command-path timeout: `timeout_sec: 0` means `Duration::from_secs(0)`
+    // which fires the `tokio::time::timeout` wrapper before `spawn_blocking`
+    // can complete. This exercises the Err(Elapsed) → "verification timed out"
+    // path without waiting for a real subprocess. Uses `start_paused = true`
+    // so the zero-duration timeout fires synchronously before the blocking
+    // task is polled, and the runtime doesn't wait for the orphaned task.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn verification_command_timeout_returns_failure() {
         let tmp = tempfile::TempDir::new().unwrap();
         let runner = VerificationRunner::new(tmp.path().to_path_buf());
 
         let criterion = VerificationCriterion {
-            id: "timeout".into(),
+            id: "cmd-timeout".into(),
             description: "should timeout".into(),
             verifier: VerifierKind::Command {
-                cmd: "sleep 2".into(),
+                cmd: "echo fast".into(),
                 expected_exit: 0,
             },
             required: true,
-            timeout_sec: 1, // 1 second timeout
+            timeout_sec: 0, // instant timeout
             global_only: false,
         };
         let result = runner.run_criterion(&criterion).await;
         assert!(!result.passed);
-        assert!(result.error.as_deref().unwrap_or("").contains("timed out"));
+        assert!(
+            result.error.as_deref().unwrap_or("").contains("timed out"),
+            "expected 'timed out' error, got: {:?}",
+            result.error
+        );
     }
 
     #[test]
@@ -6131,8 +6141,13 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn llm_judge_timeout_returns_failure_with_error() {
+        // Virtual time lets `tokio::time::timeout(1s, SlowLlmJudge::evaluate)`
+        // fire instantly. The original `duration_ms >= 900` assertion relied
+        // on wall-clock time and is meaningless under virtual time — drop it;
+        // the invariant under test is "timeout produces a failure with an
+        // error message mentioning timed out".
         let tmp = tempfile::TempDir::new().unwrap();
         let judge: Arc<dyn LlmJudge> = Arc::new(SlowLlmJudge);
         let runner = VerificationRunner::with_llm_judge(tmp.path().to_path_buf(), judge);
@@ -6155,11 +6170,6 @@ mod tests {
             result.error.as_deref().unwrap_or("").contains("timed out"),
             "error should mention timeout, got: {:?}",
             result.error
-        );
-        assert!(
-            result.duration_ms >= 900,
-            "should have waited ~1s, got {}ms",
-            result.duration_ms
         );
     }
 

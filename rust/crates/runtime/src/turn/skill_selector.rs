@@ -527,16 +527,17 @@ fn overlap_count(query_tokens: &HashSet<String>, field_tokens: &[String]) -> usi
         .count()
 }
 
-fn exact_signals(query_lower: &str, query_chars: &[char], entry: &SelectorEntry) -> ExactSignals {
-    let name_hit = !entry.name_exact.is_empty()
-        && word_boundary_match(query_lower, query_chars, &entry.name_exact);
+fn exact_signals(query_lower: &str, entry: &SelectorEntry) -> ExactSignals {
+    let name_hit =
+        !entry.name_exact.is_empty() && word_boundary_match(query_lower, &entry.name_exact);
     let alias_hit = entry
         .alias_exact
         .iter()
-        .any(|alias| !alias.is_empty() && word_boundary_match(query_lower, query_chars, alias));
-    let trigger_hit = entry.trigger_exact.iter().any(|trigger| {
-        !trigger.is_empty() && word_boundary_match(query_lower, query_chars, trigger)
-    });
+        .any(|alias| !alias.is_empty() && word_boundary_match(query_lower, alias));
+    let trigger_hit = entry
+        .trigger_exact
+        .iter()
+        .any(|trigger| !trigger.is_empty() && word_boundary_match(query_lower, trigger));
     ExactSignals {
         name_hit,
         alias_hit,
@@ -605,14 +606,13 @@ fn lexical_candidates(
 ) -> Vec<LexicalCandidate> {
     let index = catalog_index(skills);
     let query_lower = query.trim().to_lowercase();
-    let query_chars: Vec<char> = query_lower.chars().collect();
     let query_tokens = canonical_tokens(query);
     let mut out = index
         .entries
         .iter()
         .enumerate()
         .map(|(idx, entry)| {
-            let exact = exact_signals(&query_lower, &query_chars, entry);
+            let exact = exact_signals(&query_lower, entry);
             LexicalCandidate {
                 idx,
                 score: lexical_score(&query_tokens, entry, quality_tracker, &exact),

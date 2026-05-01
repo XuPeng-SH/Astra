@@ -105,17 +105,20 @@ pub fn tfidf_score(query_terms: &[String], tool_idx: usize) -> f64 {
 /// Returns a score in [0.0, 1.0] based on match quality.
 /// This is COMPLEMENTARY to TF-IDF — triggers capture multilingual synonyms
 /// and phrase patterns that TF-IDF might miss (e.g., "关注" → github tools).
-pub fn trigger_match_score(tool: &ToolMeta, query_lower: &str, query_chars: &[char]) -> f64 {
-    use astra_turn_core::tool_registry_state::word_boundary_match;
+pub fn trigger_match_score(tool: &ToolMeta, query_lower: &str) -> f64 {
+    use astra_turn_core::tool_registry_state::{
+        split_haystack_words, word_boundary_match_prepared,
+    };
 
     let mut best_score = 0.0;
-    let query_words: Vec<&str> = query_lower
-        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-        .filter(|w| !w.is_empty())
-        .collect();
+    // Split the haystack once and reuse across all triggers. The haystack
+    // split is O(haystack_len), which dominates for long user messages (see
+    // `SCORING_QUERY_BYTE_CAP` in this crate); re-doing it per trigger used
+    // to be the super-linear term behind the slow-test audit.
+    let query_words = split_haystack_words(query_lower);
 
     for trigger in tool.triggers {
-        if word_boundary_match(query_lower, query_chars, trigger) {
+        if word_boundary_match_prepared(query_lower, &query_words, trigger) {
             // Longer triggers = more specific = higher score
             let specificity = (trigger.chars().count() as f64 / 10.0).min(1.0);
             let score = 0.5 + 0.5 * specificity; // range: 0.5 – 1.0
@@ -221,8 +224,10 @@ fn file_context_tool_boost(tool_name: &str, file_context: &[String]) -> f64 {
     if boost { 0.05 } else { 0.0 }
 }
 
-fn explicit_lsp_signal(query_lower: &str, query_chars: &[char]) -> bool {
-    use astra_turn_core::tool_registry_state::word_boundary_match;
+fn explicit_lsp_signal(query_lower: &str) -> bool {
+    use astra_turn_core::tool_registry_state::{
+        split_haystack_words, word_boundary_match_prepared,
+    };
 
     const LSP_SIGNALS: &[&str] = &[
         "lsp",
@@ -294,9 +299,10 @@ fn explicit_lsp_signal(query_lower: &str, query_chars: &[char]) -> bool {
         "调用层次",
     ];
 
+    let words = split_haystack_words(query_lower);
     LSP_SIGNALS
         .iter()
-        .any(|signal| word_boundary_match(query_lower, query_chars, signal))
+        .any(|signal| word_boundary_match_prepared(query_lower, &words, signal))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -306,7 +312,6 @@ fn tool_relevance_score(
     state: &ConversationState,
     query_terms: &[String],
     query_lower: &str,
-    query_chars: &[char],
     memory_domain_hints: &[crate::pipeline::routing::DomainHint],
     co_occurrence: &HashMap<String, f64>,
     file_context: &[String],
@@ -320,7 +325,7 @@ fn tool_relevance_score(
     let text_score = tfidf_score(query_terms, tool_idx);
     score += text_score * 0.40;
 
-    let trigger_score = trigger_match_score(tool, query_lower, query_chars);
+    let trigger_score = trigger_match_score(tool, query_lower);
     score += trigger_score * 0.25;
 
     // Content relevance = weighted sum of objective textual signals.
@@ -387,7 +392,7 @@ fn tool_relevance_score(
     // ── Phase 3b: Explicit code-intel boost ──
     // Queries that explicitly ask for LSP-style editor intelligence should
     // prefer the unified lsp tool over generic file/text tools.
-    if tool.name == "lsp" && explicit_lsp_signal(query_lower, query_chars) {
+    if tool.name == "lsp" && explicit_lsp_signal(query_lower) {
         score += 0.30;
     }
 
@@ -711,6 +716,39 @@ fn pre_filter_dynamic_with_pressure_and_cooccurrence(
     result
 }
 
+/// Cap the query length (in **bytes**) for scoring purposes. Triggers are
+/// short keywords; nothing past the first few hundred characters of a user
+/// message moves the needle for tool selection, and scanning longer queries
+/// costs roughly O(query_len × tools × terms_per_query) — a raw 10 KB paste
+/// turns one `pre_filter_dynamic` call into multi-second CPU on debug
+/// builds.
+///
+/// Size rationale (4 KiB):
+/// - Covers the first ~4000 ASCII chars (more than any LLM trigger cares
+///   about).
+/// - ~2000 mixed-Latin chars.
+/// - ~1360 pure-CJK chars (3 bytes per codepoint under UTF-8) — comfortably
+///   above realistic tool-selection prompts in Chinese, even with pasted
+///   code snippets.
+///
+/// If this ever needs raising, fix the per-query super-linear term first
+/// (dedup `query_terms` before feeding TF-IDF, cache the haystack split
+/// inside the per-tool loop) — then the cap can grow without paying CPU.
+const SCORING_QUERY_BYTE_CAP: usize = 4096;
+
+/// Return the longest prefix of `s` whose byte length ≤ `max_bytes`, snapped
+/// down to a UTF-8 character boundary. Never splits a multi-byte codepoint.
+fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// Core pre-filter implementation.
 #[allow(clippy::too_many_arguments)]
 fn pre_filter_dynamic_core(
@@ -728,8 +766,11 @@ fn pre_filter_dynamic_core(
         return vec![];
     }
 
+    // Truncate first — downstream callees do O(haystack_len) work per trigger
+    // per tool (~500 calls per scoring), so an un-truncated 10k-char paste
+    // would burn seconds of CPU on every turn.
+    let query: &str = truncate_at_char_boundary(query, SCORING_QUERY_BYTE_CAP);
     let query_lower = query.to_lowercase();
-    let query_chars: Vec<char> = query.chars().collect();
     let query_terms = tokenize(query);
     let mut scored: Vec<(usize, f64)> = TOOL_CATALOG
         .iter()
@@ -742,7 +783,6 @@ fn pre_filter_dynamic_core(
                 state,
                 &query_terms,
                 &query_lower,
-                &query_chars,
                 memory_domain_hints,
                 co_occurrence,
                 file_context,
@@ -1082,9 +1122,8 @@ mod tests {
             "这里能自动导入吗",
         ] {
             let lower = query.to_lowercase();
-            let chars: Vec<char> = query.chars().collect();
             assert!(
-                explicit_lsp_signal(&lower, &chars),
+                explicit_lsp_signal(&lower),
                 "expected explicit LSP signal for query: {query}"
             );
         }
@@ -1294,10 +1333,44 @@ mod tests {
 
     #[test]
     fn pre_filter_very_long_query() {
+        // Regression guard: `pre_filter_dynamic_core` truncates via
+        // `SCORING_QUERY_BYTE_CAP` so even huge pastes (10 000+ chars) stay
+        // cheap. Before truncation this test ran ~5s because every trigger
+        // in every tool re-split the full haystack.
         let state = state_at_turn(1);
         let long_query = "read ".repeat(2000);
         let results = pre_filter_dynamic(&state, &long_query);
-        // Should not panic on very long queries
+        for (_, score) in &results {
+            assert!(*score >= 0.0 && *score <= 10.0);
+        }
+    }
+
+    #[test]
+    fn truncate_at_char_boundary_never_splits_codepoint() {
+        // ASCII: exactly at cap — keep all.
+        assert_eq!(truncate_at_char_boundary("abcd", 4), "abcd");
+        assert_eq!(truncate_at_char_boundary("abcd", 3), "abc");
+        // Multi-byte: cap inside a 3-byte CJK char snaps down.
+        // "中" is 3 bytes; at max_bytes=2 we must return "" (nothing fits).
+        assert_eq!(truncate_at_char_boundary("中国", 2), "");
+        // At max_bytes=3 one full char fits.
+        assert_eq!(truncate_at_char_boundary("中国", 3), "中");
+        // At max_bytes=5, one char fits (the second would cross byte 6).
+        assert_eq!(truncate_at_char_boundary("中国", 5), "中");
+        // Exactly at char boundary.
+        assert_eq!(truncate_at_char_boundary("中国", 6), "中国");
+    }
+
+    #[test]
+    fn pre_filter_long_cjk_query_is_bounded() {
+        // Regression guard: a long CJK query must also be bounded. With the
+        // previous 1024-byte cap only ~340 CJK chars passed through, which
+        // was a silent behaviour change for non-Latin prompts. The new
+        // 4096-byte cap keeps >1000 CJK chars.
+        let state = state_at_turn(1);
+        // "查询代码 " = 13 bytes (3×3-byte CJK + 1×ASCII space).
+        let long_cjk = "查询代码 ".repeat(2000);
+        let results = pre_filter_dynamic(&state, &long_cjk);
         for (_, score) in &results {
             assert!(*score >= 0.0 && *score <= 10.0);
         }
