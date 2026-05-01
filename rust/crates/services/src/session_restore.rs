@@ -1351,84 +1351,47 @@ impl SessionRestoreService for HybridRestoreService {
     }
 }
 
-/// Push a checkpoint to MatrixOne for cross-device availability.
-/// Also logs to session_sync_log for audit trail.
-pub async fn push_checkpoint_to_cloud(
-    pool: &sqlx::Pool<sqlx::MySql>,
-    session_id: &str,
-    user_id: &str,
-    checkpoint: &super::session_checkpoint::Checkpoint,
-) -> Result<(), String> {
-    let checkpoint_id = uuid::Uuid::new_v4().to_string();
-    let tools_json =
-        serde_json::to_string(&checkpoint.tools_used).unwrap_or_else(|_| "[]".to_string());
+// ─── MatrixOneSyncService push methods ─────────────────────────────────────
 
-    // Calculate payload_size for sync log (estimate based on serialized fields)
-    let payload_size = checkpoint.title.len()
-        + checkpoint.summary.len()
-        + tools_json.len()
-        + checkpoint
-            .contract_state_json
-            .as_ref()
-            .map_or(0, |s| s.len());
+impl crate::state_sync::MatrixOneSyncService {
+    /// Push a checkpoint to MatrixOne for cross-device availability.
+    pub async fn push_checkpoint(
+        &self,
+        session_id: &str,
+        user_id: &str,
+        checkpoint: &super::session_checkpoint::Checkpoint,
+    ) -> Result<(), String> {
+        let checkpoint_id = uuid::Uuid::new_v4().to_string();
+        let tools_json =
+            serde_json::to_string(&checkpoint.tools_used).unwrap_or_else(|_| "[]".to_string());
 
-    // Helper: log sync result (success or failure) and propagate result
-    let log_and_return = |result: Result<(), String>, size: usize| async move {
-        let (status, error_msg) = match &result {
-            Ok(()) => ("success", None),
-            Err(e) => ("error", Some(e.as_str())),
+        let payload_size = checkpoint.title.len()
+            + checkpoint.summary.len()
+            + tools_json.len()
+            + checkpoint
+                .contract_state_json
+                .as_ref()
+                .map_or(0, |s| s.len());
+
+        let log_result = |status: &str, error_msg: Option<&str>| {
+            log_checkpoint_sync(
+                &self.audit,
+                user_id,
+                session_id,
+                "checkpoint",
+                checkpoint.number,
+                payload_size,
+                status,
+                error_msg,
+            );
         };
-        let _ = log_checkpoint_sync(
-            pool,
-            user_id,
-            session_id,
-            "checkpoint",
-            checkpoint.number,
-            size,
-            status,
-            error_msg,
-        )
-        .await;
-        result
-    };
 
-    let updated = match sqlx::query(
-        "UPDATE session_checkpoints SET \
-            turn = ?, title = ?, summary = ?, tools_json = ?, total_tokens = ?, \
-            had_stalls = ?, error_count = ?, contract_state_json = ? \
-         WHERE session_id = ? AND number = ?",
-    )
-    .bind(checkpoint.turn as i32)
-    .bind(&checkpoint.title)
-    .bind(&checkpoint.summary)
-    .bind(&tools_json)
-    .bind(checkpoint.total_tokens as i64)
-    .bind(if checkpoint.had_stalls { 1i32 } else { 0 })
-    .bind(checkpoint.error_count as i32)
-    .bind(&checkpoint.contract_state_json)
-    .bind(session_id)
-    .bind(checkpoint.number as i32)
-    .execute(pool)
-    .await
-    {
-        Ok(u) => u,
-        Err(e) => {
-            let err = format!("push_checkpoint update: {e}");
-            return log_and_return(Err(err), payload_size).await;
-        }
-    };
-
-    if updated.rows_affected() == 0 {
-        let inserted = sqlx::query(
-            "INSERT INTO session_checkpoints \
-             (checkpoint_id, session_id, user_id, number, turn, title, summary, \
-              tools_json, total_tokens, had_stalls, error_count, contract_state_json, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
+        let updated = match sqlx::query(
+            "UPDATE session_checkpoints SET \
+                turn = ?, title = ?, summary = ?, tools_json = ?, total_tokens = ?, \
+                had_stalls = ?, error_count = ?, contract_state_json = ? \
+             WHERE session_id = ? AND number = ?",
         )
-        .bind(&checkpoint_id)
-        .bind(session_id)
-        .bind(user_id)
-        .bind(checkpoint.number as i32)
         .bind(checkpoint.turn as i32)
         .bind(&checkpoint.title)
         .bind(&checkpoint.summary)
@@ -1437,103 +1400,356 @@ pub async fn push_checkpoint_to_cloud(
         .bind(if checkpoint.had_stalls { 1i32 } else { 0 })
         .bind(checkpoint.error_count as i32)
         .bind(&checkpoint.contract_state_json)
-        .execute(pool)
-        .await;
+        .bind(session_id)
+        .bind(checkpoint.number as i32)
+        .execute(&self.pool)
+        .await
+        {
+            Ok(u) => u,
+            Err(e) => {
+                let err = format!("push_checkpoint update: {e}");
+                log_result("error", Some(&err));
+                return Err(err);
+            }
+        };
 
-        if let Err(e) = inserted {
-            if is_duplicate_key_error(&e) {
-                if let Err(e) = sqlx::query(
-                    "UPDATE session_checkpoints SET \
-                        turn = ?, title = ?, summary = ?, tools_json = ?, total_tokens = ?, \
-                        had_stalls = ?, error_count = ?, contract_state_json = ? \
-                     WHERE session_id = ? AND number = ?",
-                )
-                .bind(checkpoint.turn as i32)
-                .bind(&checkpoint.title)
-                .bind(&checkpoint.summary)
-                .bind(&tools_json)
-                .bind(checkpoint.total_tokens as i64)
-                .bind(if checkpoint.had_stalls { 1i32 } else { 0 })
-                .bind(checkpoint.error_count as i32)
-                .bind(&checkpoint.contract_state_json)
-                .bind(session_id)
-                .bind(checkpoint.number as i32)
-                .execute(pool)
-                .await
-                {
-                    let err = format!("push_checkpoint retry update: {e}");
-                    return log_and_return(Err(err), payload_size).await;
+        if updated.rows_affected() == 0 {
+            let inserted = sqlx::query(
+                "INSERT INTO session_checkpoints \
+                 (checkpoint_id, session_id, user_id, number, turn, title, summary, \
+                  tools_json, total_tokens, had_stalls, error_count, contract_state_json, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
+            )
+            .bind(&checkpoint_id)
+            .bind(session_id)
+            .bind(user_id)
+            .bind(checkpoint.number as i32)
+            .bind(checkpoint.turn as i32)
+            .bind(&checkpoint.title)
+            .bind(&checkpoint.summary)
+            .bind(&tools_json)
+            .bind(checkpoint.total_tokens as i64)
+            .bind(if checkpoint.had_stalls { 1i32 } else { 0 })
+            .bind(checkpoint.error_count as i32)
+            .bind(&checkpoint.contract_state_json)
+            .execute(&self.pool)
+            .await;
+
+            if let Err(e) = inserted {
+                if is_duplicate_key_error(&e) {
+                    if let Err(e) = sqlx::query(
+                        "UPDATE session_checkpoints SET \
+                            turn = ?, title = ?, summary = ?, tools_json = ?, total_tokens = ?, \
+                            had_stalls = ?, error_count = ?, contract_state_json = ? \
+                         WHERE session_id = ? AND number = ?",
+                    )
+                    .bind(checkpoint.turn as i32)
+                    .bind(&checkpoint.title)
+                    .bind(&checkpoint.summary)
+                    .bind(&tools_json)
+                    .bind(checkpoint.total_tokens as i64)
+                    .bind(if checkpoint.had_stalls { 1i32 } else { 0 })
+                    .bind(checkpoint.error_count as i32)
+                    .bind(&checkpoint.contract_state_json)
+                    .bind(session_id)
+                    .bind(checkpoint.number as i32)
+                    .execute(&self.pool)
+                    .await
+                    {
+                        let err = format!("push_checkpoint retry update: {e}");
+                        log_result("error", Some(&err));
+                        return Err(err);
+                    }
+                } else {
+                    let err = format!("push_checkpoint insert: {e}");
+                    log_result("error", Some(&err));
+                    return Err(err);
                 }
-            } else {
-                let err = format!("push_checkpoint insert: {e}");
-                return log_and_return(Err(err), payload_size).await;
             }
         }
+
+        log_result("success", None);
+        Ok(())
     }
 
-    log_and_return(Ok(()), payload_size).await
+    /// Push a Step Protocol checkpoint to MatrixOne with full state_json.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn push_step_checkpoint(
+        &self,
+        session_id: &str,
+        user_id: &str,
+        checkpoint_number: u32,
+        turn: u32,
+        tier: &str,
+        title: &str,
+        tools_json: &str,
+        state_json: &str,
+    ) -> Result<(), String> {
+        let checkpoint_id = uuid::Uuid::new_v4().to_string();
+        let cloud_number = cloud_step_checkpoint_number(checkpoint_number)?;
+        let payload_size = title.len() + tier.len() + tools_json.len() + state_json.len();
+
+        let log_result = |status: &str, error_msg: Option<&str>| {
+            log_checkpoint_sync(
+                &self.audit,
+                user_id,
+                session_id,
+                "step_checkpoint",
+                checkpoint_number,
+                payload_size,
+                status,
+                error_msg,
+            );
+        };
+
+        let updated = match sqlx::query(
+            "UPDATE session_checkpoints SET \
+                turn = ?, title = ?, summary = ?, tools_json = ?, state_json = ? \
+             WHERE session_id = ? AND number = ?",
+        )
+        .bind(turn as i32)
+        .bind(title)
+        .bind(tier)
+        .bind(tools_json)
+        .bind(state_json)
+        .bind(session_id)
+        .bind(cloud_number)
+        .execute(&self.pool)
+        .await
+        {
+            Ok(updated) => updated,
+            Err(e) => {
+                let err = format!("push_step_checkpoint update: {e}");
+                log_result("error", Some(&err));
+                return Err(err);
+            }
+        };
+
+        if updated.rows_affected() == 0 {
+            let inserted = sqlx::query(
+                "INSERT INTO session_checkpoints \
+                 (checkpoint_id, session_id, user_id, number, turn, title, summary, \
+                  tools_json, state_json, total_tokens, had_stalls, error_count, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, NOW())",
+            )
+            .bind(&checkpoint_id)
+            .bind(session_id)
+            .bind(user_id)
+            .bind(cloud_number)
+            .bind(turn as i32)
+            .bind(title)
+            .bind(tier)
+            .bind(tools_json)
+            .bind(state_json)
+            .execute(&self.pool)
+            .await;
+
+            if let Err(e) = inserted {
+                if is_duplicate_key_error(&e) {
+                    if let Err(err) = sqlx::query(
+                        "UPDATE session_checkpoints SET \
+                            turn = ?, title = ?, summary = ?, tools_json = ?, state_json = ? \
+                         WHERE session_id = ? AND number = ?",
+                    )
+                    .bind(turn as i32)
+                    .bind(title)
+                    .bind(tier)
+                    .bind(tools_json)
+                    .bind(state_json)
+                    .bind(session_id)
+                    .bind(cloud_number)
+                    .execute(&self.pool)
+                    .await
+                    {
+                        let err = format!("push_step_checkpoint retry update: {err}");
+                        log_result("error", Some(&err));
+                        return Err(err);
+                    }
+                } else {
+                    let err = format!("push_step_checkpoint insert: {e}");
+                    log_result("error", Some(&err));
+                    return Err(err);
+                }
+            }
+        }
+
+        log_result("success", None);
+        Ok(())
+    }
+
+    /// Push resumable session state to cloud via the agent_sessions.metadata JSON column.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn push_session_state(
+        &self,
+        session_id: &str,
+        user_id: &str,
+        executing_plan_json: Option<&str>,
+        plan_goal: Option<&str>,
+        plan_config_json: Option<&str>,
+        plan_execution_rounds: usize,
+        git_branch: Option<&str>,
+        model: Option<&str>,
+    ) -> Result<(), String> {
+        use sqlx::Row;
+
+        let existing_metadata_json = sqlx::query(
+            "SELECT CAST(metadata AS CHAR) AS metadata_json \
+             FROM agent_sessions WHERE session_id = ? LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| format!("load session metadata: {e}"))?
+        .and_then(|row| {
+            row.try_get::<Option<String>, _>("metadata_json")
+                .ok()
+                .flatten()
+        });
+
+        let metadata_json = merge_session_state_metadata(
+            existing_metadata_json.as_deref(),
+            executing_plan_json,
+            plan_goal,
+            plan_config_json,
+            plan_execution_rounds,
+            git_branch,
+            model,
+        );
+        let payload_size = metadata_json.len();
+
+        let result = sqlx::query(
+            "INSERT INTO agent_sessions \
+             (session_id, user_id, status, metadata, created_at, updated_at, last_active_at) \
+             VALUES (?, ?, 'active', ?, NOW(), NOW(), NOW()) \
+             ON DUPLICATE KEY UPDATE metadata = ?, updated_at = NOW(), last_active_at = NOW()",
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .bind(&metadata_json)
+        .bind(&metadata_json)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("push_session_state: {e}"));
+
+        let (status, error_msg) = match &result {
+            Ok(()) => ("success", None),
+            Err(e) => ("error", Some(e.as_str())),
+        };
+        log_session_sync(
+            &self.audit,
+            user_id,
+            session_id,
+            "session_state",
+            payload_size,
+            status,
+            error_msg,
+        );
+
+        result
+    }
+
+    /// Push a structured context-trace signal as a first-class cloud event.
+    pub async fn push_context_trace_signal(
+        &self,
+        session_id: &str,
+        user_id: &str,
+        signal: &super::session_workspace::ContextTraceSignal,
+    ) -> Result<(), String> {
+        let metadata_json = serde_json::to_string(signal)
+            .map_err(|e| format!("serialize context_trace_signal: {e}"))?;
+        let duration_ms = signal
+            .timing
+            .as_ref()
+            .map(|timing| timing.total_ms.min(i32::MAX as u64) as i32);
+        let content = {
+            let preview = signal.preview();
+            if preview.is_empty() {
+                "context trace signal".to_string()
+            } else {
+                preview
+            }
+        };
+        let payload_size = metadata_json.len() + content.len();
+
+        let log_result = |status: &str, error_msg: Option<&str>| {
+            log_session_sync(
+                &self.audit,
+                user_id,
+                session_id,
+                "context_trace",
+                payload_size,
+                status,
+                error_msg,
+            );
+        };
+
+        if let Err(e) = sqlx::query(
+            "INSERT INTO agent_events \
+             (event_id, session_id, user_id, agent_id, agent_version, event_type, content, \
+              parent_event_id, causal_chain_id, metadata, reasoning_content, meta_tool_name, \
+              meta_duration_ms, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
+        )
+        .bind(uuid::Uuid::now_v7().to_string())
+        .bind(session_id)
+        .bind(user_id)
+        .bind("astra-cli")
+        .bind(env!("CARGO_PKG_VERSION"))
+        .bind("context_trace_signal")
+        .bind(content)
+        .bind(None::<String>)
+        .bind(&signal.turn_id)
+        .bind(metadata_json)
+        .bind(None::<String>)
+        .bind(
+            signal
+                .tool_selection
+                .as_ref()
+                .and_then(|selection| selection.selected_tools.first().cloned()),
+        )
+        .bind(duration_ms)
+        .execute(&self.pool)
+        .await
+        {
+            let err = format!("push_context_trace_signal: {e}");
+            log_result("error", Some(&err));
+            return Err(err);
+        }
+
+        if let Err(e) = reconcile_session_event_count(&self.pool, session_id, user_id).await {
+            log_result("error", Some(&e));
+            return Err(e);
+        }
+
+        log_result("success", None);
+        Ok(())
+    }
 }
 
-/// Log session sync activity to session_sync_log for audit trail.
-/// This helps diagnose sync issues like Session 7875e355 where cloud work reached
-/// MatrixOne through some paths but left no sync-log breadcrumb.
-async fn log_session_sync(
-    pool: &sqlx::Pool<sqlx::MySql>,
+fn log_session_sync(
+    audit: &crate::state_sync::SyncAuditWriter,
     user_id: &str,
     session_id: &str,
     sync_type: &str,
     payload_size: usize,
     status: &str,
     error_msg: Option<&str>,
-) -> Result<(), String> {
-    let inserted = sqlx::query(
-        "INSERT INTO session_sync_log \
-         (sync_id, user_id, session_id, sync_type, sync_direction, payload_size, status, error_message, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())",
-    )
-    .bind(uuid::Uuid::new_v4().to_string())
-    .bind(user_id)
-    .bind(session_id)
-    .bind(sync_type)
-    .bind("push")
-    .bind(payload_size as i64)
-    .bind(status)
-    .bind(error_msg)
-    .execute(pool)
-    .await
-    .map_err(|e| format!("log_session_sync: {e}"))?;
-
-    // Apply retention pruning using the same policy as state_sync.
-    // This prevents unbounded sync_log growth for long-running sessions.
-    if inserted.rows_affected() > 0
-        && let Some(retain) = crate::state_sync::sync_log_retain_limit(status)
-        && let Err(e) = sqlx::query(crate::state_sync::build_sync_log_prune_query())
-            .bind(user_id)
-            .bind(status)
-            .bind(sync_type)
-            .bind(user_id)
-            .bind(status)
-            .bind(sync_type)
-            .bind(retain as i64)
-            .execute(pool)
-            .await
-    {
-        tracing::warn!(
-            target: "astra_services::session_restore",
-            user_id = %user_id,
-            sync_type = %sync_type,
-            error = %e,
-            "failed to prune sync logs"
-        );
-    }
-
-    Ok(())
+) {
+    audit.log(crate::state_sync::SyncAuditEntry {
+        user_id: user_id.to_string(),
+        session_id: session_id.to_string(),
+        sync_type: sync_type.to_string(),
+        direction: crate::state_sync::SyncDirection::Push,
+        payload_size,
+        status: status.to_string(),
+        error_message: error_msg.map(|s| s.to_string()),
+    });
 }
 
-/// Log checkpoint sync with checkpoint-number context preserved in the error field.
 #[allow(clippy::too_many_arguments)]
-async fn log_checkpoint_sync(
-    pool: &sqlx::Pool<sqlx::MySql>,
+fn log_checkpoint_sync(
+    audit: &crate::state_sync::SyncAuditWriter,
     user_id: &str,
     session_id: &str,
     sync_type: &str,
@@ -1541,126 +1757,17 @@ async fn log_checkpoint_sync(
     payload_size: usize,
     status: &str,
     error_msg: Option<&str>,
-) -> Result<(), String> {
+) {
     let error_with_number = error_msg.map(|e| format!("[checkpoint #{}] {}", checkpoint_number, e));
     log_session_sync(
-        pool,
+        audit,
         user_id,
         session_id,
         sync_type,
         payload_size,
         status,
         error_with_number.as_deref().or(error_msg),
-    )
-    .await
-}
-
-/// Push a Step Protocol checkpoint to MatrixOne with full state_json.
-/// Accepts pre-serialized JSON to avoid coupling services crate to runtime types.
-/// The caller serializes the StepCheckpoint; this function stores it.
-#[allow(clippy::too_many_arguments)]
-pub async fn push_step_checkpoint_to_cloud(
-    pool: &sqlx::Pool<sqlx::MySql>,
-    session_id: &str,
-    user_id: &str,
-    checkpoint_number: u32,
-    turn: u32,
-    tier: &str,
-    title: &str,
-    tools_json: &str,
-    state_json: &str,
-) -> Result<(), String> {
-    let checkpoint_id = uuid::Uuid::new_v4().to_string();
-    let cloud_number = cloud_step_checkpoint_number(checkpoint_number)?;
-    let payload_size = title.len() + tier.len() + tools_json.len() + state_json.len();
-    let log_and_return = |result: Result<(), String>, size: usize| async move {
-        let (status, error_msg) = match &result {
-            Ok(()) => ("success", None),
-            Err(e) => ("error", Some(e.as_str())),
-        };
-        let _ = log_checkpoint_sync(
-            pool,
-            user_id,
-            session_id,
-            "step_checkpoint",
-            checkpoint_number,
-            size,
-            status,
-            error_msg,
-        )
-        .await;
-        result
-    };
-
-    let updated = match sqlx::query(
-        "UPDATE session_checkpoints SET \
-            turn = ?, title = ?, summary = ?, tools_json = ?, state_json = ? \
-         WHERE session_id = ? AND number = ?",
-    )
-    .bind(turn as i32)
-    .bind(title)
-    .bind(tier)
-    .bind(tools_json)
-    .bind(state_json)
-    .bind(session_id)
-    .bind(cloud_number)
-    .execute(pool)
-    .await
-    {
-        Ok(updated) => updated,
-        Err(e) => {
-            let err = format!("push_step_checkpoint update: {e}");
-            return log_and_return(Err(err), payload_size).await;
-        }
-    };
-
-    if updated.rows_affected() == 0 {
-        let inserted = sqlx::query(
-            "INSERT INTO session_checkpoints \
-             (checkpoint_id, session_id, user_id, number, turn, title, summary, \
-              tools_json, state_json, total_tokens, had_stalls, error_count, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, NOW())",
-        )
-        .bind(&checkpoint_id)
-        .bind(session_id)
-        .bind(user_id)
-        .bind(cloud_number)
-        .bind(turn as i32)
-        .bind(title)
-        .bind(tier)
-        .bind(tools_json)
-        .bind(state_json)
-        .execute(pool)
-        .await;
-
-        if let Err(e) = inserted {
-            if is_duplicate_key_error(&e) {
-                if let Err(err) = sqlx::query(
-                    "UPDATE session_checkpoints SET \
-                        turn = ?, title = ?, summary = ?, tools_json = ?, state_json = ? \
-                     WHERE session_id = ? AND number = ?",
-                )
-                .bind(turn as i32)
-                .bind(title)
-                .bind(tier)
-                .bind(tools_json)
-                .bind(state_json)
-                .bind(session_id)
-                .bind(cloud_number)
-                .execute(pool)
-                .await
-                {
-                    let err = format!("push_step_checkpoint retry update: {err}");
-                    return log_and_return(Err(err), payload_size).await;
-                }
-            } else {
-                let err = format!("push_step_checkpoint insert: {e}");
-                return log_and_return(Err(err), payload_size).await;
-            }
-        }
-    }
-
-    log_and_return(Ok(()), payload_size).await
+    );
 }
 
 /// Pull the latest Heavy step checkpoint JSON from MatrixOne for session recovery.
@@ -1693,164 +1800,6 @@ pub async fn pull_step_checkpoint_from_cloud(
 }
 
 // ─── Plan State Cloud Sync ──────────────────────────────────────────────────
-
-/// Push resumable session state to cloud via the agent_sessions.metadata JSON column.
-/// Called at checkpoint boundaries and session end to enable cross-device restore.
-#[allow(clippy::too_many_arguments)]
-pub async fn push_session_state_to_cloud(
-    pool: &sqlx::Pool<sqlx::MySql>,
-    session_id: &str,
-    user_id: &str,
-    executing_plan_json: Option<&str>,
-    plan_goal: Option<&str>,
-    plan_config_json: Option<&str>,
-    plan_execution_rounds: usize,
-    git_branch: Option<&str>,
-    model: Option<&str>,
-) -> Result<(), String> {
-    use sqlx::Row;
-
-    let existing_metadata_json = sqlx::query(
-        "SELECT CAST(metadata AS CHAR) AS metadata_json \
-         FROM agent_sessions WHERE session_id = ? LIMIT 1",
-    )
-    .bind(session_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| format!("load session metadata: {e}"))?
-    .and_then(|row| {
-        row.try_get::<Option<String>, _>("metadata_json")
-            .ok()
-            .flatten()
-    });
-
-    let metadata_json = merge_session_state_metadata(
-        existing_metadata_json.as_deref(),
-        executing_plan_json,
-        plan_goal,
-        plan_config_json,
-        plan_execution_rounds,
-        git_branch,
-        model,
-    );
-    let payload_size = metadata_json.len();
-    let log_and_return = |result: Result<(), String>, size: usize| async move {
-        let (status, error_msg) = match &result {
-            Ok(()) => ("success", None),
-            Err(e) => ("error", Some(e.as_str())),
-        };
-        let _ = log_session_sync(
-            pool,
-            user_id,
-            session_id,
-            "session_state",
-            size,
-            status,
-            error_msg,
-        )
-        .await;
-        result
-    };
-
-    match sqlx::query(
-        "INSERT INTO agent_sessions \
-         (session_id, user_id, status, metadata, created_at, updated_at, last_active_at) \
-         VALUES (?, ?, 'active', ?, NOW(), NOW(), NOW()) \
-         ON DUPLICATE KEY UPDATE metadata = ?, updated_at = NOW(), last_active_at = NOW()",
-    )
-    .bind(session_id)
-    .bind(user_id)
-    .bind(&metadata_json)
-    .bind(&metadata_json)
-    .execute(pool)
-    .await
-    {
-        Ok(_) => log_and_return(Ok(()), payload_size).await,
-        Err(e) => {
-            let err = format!("push_session_state: {e}");
-            log_and_return(Err(err), payload_size).await
-        }
-    }
-}
-
-/// Push a structured context-trace signal as a first-class cloud event.
-pub async fn push_context_trace_signal_to_cloud(
-    pool: &sqlx::Pool<sqlx::MySql>,
-    session_id: &str,
-    user_id: &str,
-    signal: &super::session_workspace::ContextTraceSignal,
-) -> Result<(), String> {
-    let metadata_json = serde_json::to_string(signal)
-        .map_err(|e| format!("serialize context_trace_signal: {e}"))?;
-    let duration_ms = signal
-        .timing
-        .as_ref()
-        .map(|timing| timing.total_ms.min(i32::MAX as u64) as i32);
-    let content = {
-        let preview = signal.preview();
-        if preview.is_empty() {
-            "context trace signal".to_string()
-        } else {
-            preview
-        }
-    };
-    let payload_size = metadata_json.len() + content.len();
-    let log_and_return = |result: Result<(), String>, size: usize| async move {
-        let (status, error_msg) = match &result {
-            Ok(()) => ("success", None),
-            Err(e) => ("error", Some(e.as_str())),
-        };
-        let _ = log_session_sync(
-            pool,
-            user_id,
-            session_id,
-            "context_trace",
-            size,
-            status,
-            error_msg,
-        )
-        .await;
-        result
-    };
-
-    if let Err(e) = sqlx::query(
-        "INSERT INTO agent_events \
-         (event_id, session_id, user_id, agent_id, agent_version, event_type, content, \
-          parent_event_id, causal_chain_id, metadata, reasoning_content, meta_tool_name, \
-          meta_duration_ms, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
-    )
-    .bind(uuid::Uuid::now_v7().to_string())
-    .bind(session_id)
-    .bind(user_id)
-    .bind("astra-cli")
-    .bind(env!("CARGO_PKG_VERSION"))
-    .bind("context_trace_signal")
-    .bind(content)
-    .bind(None::<String>)
-    .bind(&signal.turn_id)
-    .bind(metadata_json)
-    .bind(None::<String>)
-    .bind(
-        signal
-            .tool_selection
-            .as_ref()
-            .and_then(|selection| selection.selected_tools.first().cloned()),
-    )
-    .bind(duration_ms)
-    .execute(pool)
-    .await
-    {
-        let err = format!("push_context_trace_signal: {e}");
-        return log_and_return(Err(err), payload_size).await;
-    }
-
-    if let Err(e) = reconcile_session_event_count(pool, session_id, user_id).await {
-        return log_and_return(Err(e), payload_size).await;
-    }
-
-    log_and_return(Ok(()), payload_size).await
-}
 
 async fn reconcile_session_event_count(
     pool: &sqlx::Pool<sqlx::MySql>,
@@ -2397,7 +2346,7 @@ mod tests {
 
     #[test]
     fn checkpoint_fields_for_cloud_push() {
-        // Verify Checkpoint struct has all fields needed by push_checkpoint_to_cloud
+        // Verify Checkpoint struct has all fields needed by MatrixOneSyncService::push_checkpoint
         let ckpt = crate::session_checkpoint::Checkpoint {
             number: 3,
             turn: 15,
