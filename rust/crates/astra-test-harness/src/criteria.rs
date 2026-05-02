@@ -122,6 +122,46 @@ pub enum Criterion {
         #[serde(default)]
         model: Option<String>,
     },
+
+    /// Passes when total tokens (prompt + completion) is within range.
+    /// Catches token efficiency regressions — a case that used to cost
+    /// 500 tokens suddenly costing 5000 means something broke.
+    TokensBetween { min: u64, max: u64 },
+
+    /// Passes when wall-clock duration (ms) is within range.
+    /// Catches latency regressions and hung subprocesses that
+    /// complete just under the timeout.
+    DurationBetween { min_ms: u64, max_ms: u64 },
+
+    /// Passes when the tools_used list contains the given names
+    /// as an ordered subsequence. Does NOT require exact match —
+    /// extra tools between the expected ones are allowed.
+    /// Example: `[read_file, str_replace]` passes for
+    /// `[bash, read_file, bash, str_replace, bash]`.
+    ToolSequence { tools: Vec<String> },
+
+    /// Passes when the number of LLM round-trips (turns) is within range.
+    /// Catches inefficient multi-turn loops where the agent should have
+    /// completed in fewer rounds.
+    TurnRoundsBetween { min: u32, max: u32 },
+
+    /// Passes when the tool cache hit rate >= threshold (0.0 to 1.0).
+    /// A high cache rate means the agent is efficiently reusing
+    /// idempotent tool results. Requires at least one tool call.
+    CacheRateAbove {
+        /// Minimum cache hit rate (0.0 = no caching required, 1.0 = all cached).
+        threshold: f64,
+        /// Minimum number of tool calls required for the criterion to
+        /// apply. When the agent makes fewer calls than this, the
+        /// criterion FAILs instead of skip-passing. Default 1 — set
+        /// higher if the case expects a specific tool-call volume.
+        #[serde(default = "default_cache_min_calls")]
+        min_calls: u32,
+    },
+}
+
+fn default_cache_min_calls() -> u32 {
+    1
 }
 
 fn default_judger_threshold() -> f64 {
@@ -132,11 +172,29 @@ fn default_event_min() -> u32 {
     1
 }
 
+/// How severe a criterion failure is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CriterionSeverity {
+    /// Hard requirement: exit_code, tool_called, text_contains.
+    /// Failure means the case fundamentally didn't work.
+    Hard,
+    /// Soft bound: tokens_between, duration_between, turn_rounds, cache_rate.
+    /// Failure means the case worked but outside acceptable efficiency bounds.
+    Soft,
+    /// Quality score: judger, session checks.
+    /// Uses a 0-1 continuous score rather than binary pass/fail.
+    Quality,
+}
+
 /// Result of evaluating a single criterion.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CriterionResult {
     pub criterion: Criterion,
     pub passed: bool,
+    /// Severity level — tells the frontend how to treat this result.
+    #[serde(default = "default_severity")]
+    pub severity: CriterionSeverity,
     /// Short human explanation (≤ 200 chars). Surfaces in report
     /// on FAIL; suppressed on PASS unless `--verbose`.
     pub detail: String,
@@ -149,6 +207,32 @@ pub struct CriterionResult {
     /// For Judger only: the score the judger returned.
     #[serde(default)]
     pub score: Option<f64>,
+}
+
+fn default_severity() -> CriterionSeverity {
+    CriterionSeverity::Hard
+}
+
+/// Classify the severity of a criterion type.
+pub fn criterion_severity(c: &Criterion) -> CriterionSeverity {
+    match c {
+        Criterion::ExitCode { .. }
+        | Criterion::ToolCalled { .. }
+        | Criterion::TextContains { .. }
+        | Criterion::ToolSequence { .. }
+        | Criterion::ForkCacheOutcome { .. } => CriterionSeverity::Hard,
+
+        Criterion::ToolsCountBetween { .. }
+        | Criterion::TokensBetween { .. }
+        | Criterion::DurationBetween { .. }
+        | Criterion::TurnRoundsBetween { .. }
+        | Criterion::CacheRateAbove { .. }
+        | Criterion::StderrMatches { .. } => CriterionSeverity::Soft,
+
+        Criterion::Judger { .. }
+        | Criterion::SessionEventCount { .. }
+        | Criterion::JournalToolCalled { .. } => CriterionSeverity::Quality,
+    }
 }
 
 /// Evaluate every criterion against the outcome in list order.
@@ -193,6 +277,7 @@ fn evaluate_one(
             let hit = outcome.tools_used.iter().any(|t| t == name);
             CriterionResult {
                 criterion: c.clone(),
+                severity: criterion_severity(c),
                 passed: hit,
                 detail: if hit {
                     format!("tool {name} was called")
@@ -210,6 +295,7 @@ fn evaluate_one(
             let pass = outcome.exit_code == *code;
             CriterionResult {
                 criterion: c.clone(),
+                severity: criterion_severity(c),
                 passed: pass,
                 detail: format!("exit_code {} (expected {})", outcome.exit_code, code),
                 full_detail: None,
@@ -221,6 +307,7 @@ fn evaluate_one(
             let pass = n >= *min && n <= *max;
             CriterionResult {
                 criterion: c.clone(),
+                severity: criterion_severity(c),
                 passed: pass,
                 detail: format!("tool_calls_count={n}, expected {min}..={max}"),
                 full_detail: None,
@@ -236,6 +323,7 @@ fn evaluate_one(
                     let hit = re.is_match(&outcome.stderr);
                     CriterionResult {
                         criterion: c.clone(),
+                        severity: criterion_severity(c),
                         passed: hit,
                         detail: if hit {
                             format!("stderr matches /{pattern}/")
@@ -251,6 +339,7 @@ fn evaluate_one(
                 }
                 Err(e) => CriterionResult {
                     criterion: c.clone(),
+                    severity: criterion_severity(c),
                     passed: false,
                     detail: format!("invalid regex /{pattern}/: {e}"),
                     full_detail: None,
@@ -262,6 +351,7 @@ fn evaluate_one(
             let hit = outcome.text.contains(needle);
             CriterionResult {
                 criterion: c.clone(),
+                severity: criterion_severity(c),
                 passed: hit,
                 detail: if hit {
                     format!("text contains {needle:?}")
@@ -300,20 +390,22 @@ fn evaluate_one(
                 };
                 return CriterionResult {
                     criterion: c.clone(),
+                    severity: criterion_severity(c),
                     passed,
                     detail,
                     full_detail: None,
-                    score: None,
+                    score: if passed { Some(1.0) } else { Some(0.0) },
                 };
             };
             let n = sess.count_events(event_type);
             let pass = n as u32 >= *min;
             CriterionResult {
                 criterion: c.clone(),
+                severity: criterion_severity(c),
                 passed: pass,
                 detail: format!("session events type={event_type} count={n} (expected >= {min})"),
                 full_detail: None,
-                score: None,
+                score: if pass { Some(1.0) } else { Some(0.0) },
             }
         }
         Criterion::JournalToolCalled { name, optional } => {
@@ -330,16 +422,18 @@ fn evaluate_one(
                 };
                 return CriterionResult {
                     criterion: c.clone(),
+                    severity: criterion_severity(c),
                     passed,
                     detail,
                     full_detail: None,
-                    score: None,
+                    score: if passed { Some(1.0) } else { Some(0.0) },
                 };
             };
             let tools = sess.tools_invoked();
             let hit = tools.iter().any(|t| t == name);
             CriterionResult {
                 criterion: c.clone(),
+                severity: criterion_severity(c),
                 passed: hit,
                 detail: if hit {
                     format!("journal tool {name} was invoked")
@@ -355,6 +449,7 @@ fn evaluate_one(
             let pass = hits.iter().any(|c| expect.iter().any(|e| e == c));
             CriterionResult {
                 criterion: c.clone(),
+                severity: criterion_severity(c),
                 passed: pass,
                 detail: if pass {
                     format!(
@@ -371,11 +466,149 @@ fn evaluate_one(
         }
         Criterion::Judger { .. } => CriterionResult {
             criterion: c.clone(),
+            severity: criterion_severity(c),
             passed: false,
             detail: "judger not yet evaluated (handled by runner)".into(),
             full_detail: None,
             score: None,
         },
+
+        Criterion::TokensBetween { min, max } => {
+            let total = outcome
+                .prompt_tokens
+                .saturating_add(outcome.completion_tokens);
+            let passed = total >= *min && total <= *max;
+            CriterionResult {
+                criterion: c.clone(),
+                severity: criterion_severity(c),
+                passed,
+                detail: format!("tokens_total={total}, expected {min}..={max}"),
+                full_detail: None,
+                score: None,
+            }
+        }
+
+        Criterion::DurationBetween { min_ms, max_ms } => {
+            let dur = outcome.duration_ms;
+            let passed = dur >= *min_ms && dur <= *max_ms;
+            CriterionResult {
+                criterion: c.clone(),
+                severity: criterion_severity(c),
+                passed,
+                detail: format!("duration={dur}ms, expected {min_ms}..={max_ms}ms"),
+                full_detail: None,
+                score: None,
+            }
+        }
+
+        Criterion::ToolSequence { tools } => {
+            // Check if `tools` is an ordered subsequence of `outcome.tools_used`.
+            let mut iter = outcome.tools_used.iter();
+            let mut matched = 0;
+            for expected in tools {
+                if iter.any(|t| t == expected) {
+                    matched += 1;
+                }
+            }
+            let passed = matched == tools.len();
+            CriterionResult {
+                criterion: c.clone(),
+                severity: criterion_severity(c),
+                passed,
+                detail: if passed {
+                    format!("tool sequence {:?} found", tools)
+                } else {
+                    format!(
+                        "tool sequence {:?} NOT found (matched {}/{}, actual: {:?})",
+                        tools,
+                        matched,
+                        tools.len(),
+                        outcome.tools_used
+                    )
+                },
+                full_detail: None,
+                score: None,
+            }
+        }
+
+        Criterion::TurnRoundsBetween { min, max } => {
+            let rounds = outcome.turn_rounds;
+            let passed = rounds >= *min && rounds <= *max;
+            CriterionResult {
+                criterion: c.clone(),
+                severity: criterion_severity(c),
+                passed,
+                detail: format!("turn_rounds={rounds}, expected {min}..={max}"),
+                full_detail: None,
+                score: None,
+            }
+        }
+
+        Criterion::CacheRateAbove {
+            threshold,
+            min_calls,
+        } => {
+            let effective_calls = if outcome.total_tool_calls > 0 {
+                outcome.total_tool_calls
+            } else {
+                outcome.tool_calls_count
+            };
+            if effective_calls < *min_calls {
+                return CriterionResult {
+                    criterion: c.clone(),
+                    severity: criterion_severity(c),
+                    passed: false,
+                    detail: format!(
+                        "too few tool calls: {effective_calls} < min_calls={min_calls} \
+                         (cache rate requires at least {min_calls} calls)"
+                    ),
+                    full_detail: None,
+                    score: None,
+                };
+            }
+            if outcome.total_tool_calls == 0 && outcome.tool_calls_count == 0 {
+                CriterionResult {
+                    criterion: c.clone(),
+                    severity: criterion_severity(c),
+                    passed: true,
+                    detail: "no tool calls — cache rate N/A (skip-pass)".into(),
+                    full_detail: None,
+                    score: None,
+                }
+            } else if outcome.total_tool_calls == 0 {
+                // tool_calls_count > 0 but step_events weren't parsed.
+                // This means step_events.jsonl was missing or unreadable.
+                CriterionResult {
+                    criterion: c.clone(),
+                    severity: criterion_severity(c),
+                    passed: false,
+                    detail: format!(
+                        "step_events missing: tool_calls_count={} but total_tool_calls=0 \
+                         (cannot compute cache rate)",
+                        outcome.tool_calls_count
+                    ),
+                    full_detail: None,
+                    score: None,
+                }
+            } else {
+                let rate = outcome.cache_hits as f64 / outcome.total_tool_calls as f64;
+                let passed = rate >= *threshold;
+                CriterionResult {
+                    criterion: c.clone(),
+                    severity: criterion_severity(c),
+                    passed,
+                    detail: format!(
+                        "cache_rate={:.1}% ({}/{}), threshold={:.0}%",
+                        rate * 100.0,
+                        outcome.cache_hits,
+                        outcome.total_tool_calls,
+                        threshold * 100.0
+                    ),
+                    full_detail: None,
+                    score: None,
+                }
+            }
+        }
     }
 }
 
@@ -480,6 +713,45 @@ pub fn validate_criterion(c: &Criterion) -> Result<(), String> {
             Ok(())
         }
         Criterion::ExitCode { .. } => Ok(()),
+        Criterion::TokensBetween { min, max } => {
+            if min > max {
+                return Err(format!("TokensBetween: min ({min}) > max ({max})"));
+            }
+            Ok(())
+        }
+        Criterion::DurationBetween { min_ms, max_ms } => {
+            if min_ms > max_ms {
+                return Err(format!(
+                    "DurationBetween: min_ms ({min_ms}) > max_ms ({max_ms})"
+                ));
+            }
+            Ok(())
+        }
+        Criterion::ToolSequence { tools } => {
+            if tools.is_empty() {
+                return Err("ToolSequence.tools must not be empty".into());
+            }
+            for (i, t) in tools.iter().enumerate() {
+                if t.trim().is_empty() {
+                    return Err(format!("ToolSequence.tools[{i}] must not be empty"));
+                }
+            }
+            Ok(())
+        }
+        Criterion::TurnRoundsBetween { min, max } => {
+            if min > max {
+                return Err(format!("TurnRoundsBetween: min ({min}) > max ({max})"));
+            }
+            Ok(())
+        }
+        Criterion::CacheRateAbove { threshold, .. } => {
+            if !threshold.is_finite() || *threshold < 0.0 || *threshold > 1.0 {
+                return Err(format!(
+                    "CacheRateAbove.threshold must be in [0.0, 1.0]; got {threshold}"
+                ));
+            }
+            Ok(())
+        }
     }
 }
 
@@ -490,25 +762,6 @@ pub fn validate_criteria(criteria: &[Criterion]) -> Result<(), String> {
         validate_criterion(c).map_err(|e| format!("criteria[{}]: {e}", i + 1))?;
     }
     Ok(())
-}
-
-/// True when every non-Judger criterion passed. Used by the runner
-/// to decide whether to even bother invoking the LLM judger — if a
-/// deterministic check already failed, the case is known-FAIL and
-/// the judger call would waste a provider round-trip.
-///
-/// The slice length of `results` must equal `criteria.len()` (they
-/// come out of `evaluate_deterministic`). Mismatched lengths return
-/// `false` conservatively.
-pub fn non_judger_all_pass(criteria: &[Criterion], results: &[CriterionResult]) -> bool {
-    if results.len() != criteria.len() {
-        return false;
-    }
-    criteria
-        .iter()
-        .zip(results.iter())
-        .filter(|(c, _)| !matches!(c, Criterion::Judger { .. }))
-        .all(|(_, r)| r.passed)
 }
 
 #[cfg(test)]
@@ -529,6 +782,10 @@ mod tests {
             completion_tokens: 0,
             prompt_tokens: 0,
             duration_ms: 0,
+            turn_rounds: 0,
+            cache_hits: 0,
+            total_tool_calls: 0,
+            ttft_ms: 0,
         }
     }
 
@@ -602,46 +859,6 @@ mod tests {
         // Placeholder-failed; caller runs the async judger separately.
         assert!(!r[0].passed);
         assert!(r[0].detail.contains("judger"));
-    }
-
-    // Regression: the judger placeholder `passed=false` must NOT
-    // gate the judger from running. `non_judger_all_pass` only
-    // considers the deterministic checks. Before this fix,
-    // every Judger-bearing case short-circuited to FAIL and the
-    // judger never ran.
-    #[test]
-    fn non_judger_all_pass_ignores_judger_placeholder() {
-        let out = outcome_with_tools(&["Read"]);
-        let criteria = vec![
-            Criterion::ExitCode { code: 0 },
-            Criterion::ToolCalled {
-                name: "Read".into(),
-            },
-            Criterion::Judger {
-                question: "ok?".into(),
-                threshold: 0.7,
-                model: None,
-            },
-        ];
-        let results = evaluate_deterministic(&criteria, &out);
-        assert!(non_judger_all_pass(&criteria, &results));
-    }
-
-    #[test]
-    fn non_judger_all_pass_fails_when_deterministic_fails() {
-        let out = outcome_with_tools(&[]);
-        let criteria = vec![
-            Criterion::ToolCalled {
-                name: "nonexistent".into(),
-            },
-            Criterion::Judger {
-                question: "ok?".into(),
-                threshold: 0.7,
-                model: None,
-            },
-        ];
-        let results = evaluate_deterministic(&criteria, &out);
-        assert!(!non_judger_all_pass(&criteria, &results));
     }
 
     fn mk_session(events: &[(&str, serde_json::Value)]) -> SessionCapture {
@@ -780,16 +997,6 @@ mod tests {
         );
         assert!(r[0].passed);
         assert!(r[0].detail.contains("skipped"));
-    }
-
-    #[test]
-    fn non_judger_all_pass_false_on_length_mismatch() {
-        // Defensive guard — callers should never pass mismatched
-        // slices, but if they do we must NOT proceed to run a judger
-        // against a case whose results we can't align.
-        let criteria = vec![Criterion::ExitCode { code: 0 }];
-        let results: Vec<CriterionResult> = vec![];
-        assert!(!non_judger_all_pass(&criteria, &results));
     }
 
     // ── validate_criterion / validate_criteria (R3 #2) ──
@@ -1002,5 +1209,187 @@ mod tests {
             &out,
         );
         assert!(r[0].passed);
+    }
+
+    #[test]
+    fn tokens_between_passes_in_range() {
+        let mut out = RunOutcome::new("m");
+        out.prompt_tokens = 100;
+        out.completion_tokens = 200;
+        let r = evaluate_deterministic(&[Criterion::TokensBetween { min: 200, max: 400 }], &out);
+        assert!(r[0].passed, "{}", r[0].detail);
+    }
+
+    #[test]
+    fn tokens_between_fails_over_max() {
+        let mut out = RunOutcome::new("m");
+        out.prompt_tokens = 5000;
+        out.completion_tokens = 5000;
+        let r = evaluate_deterministic(&[Criterion::TokensBetween { min: 0, max: 1000 }], &out);
+        assert!(!r[0].passed);
+        assert!(r[0].detail.contains("10000"));
+    }
+
+    #[test]
+    fn duration_between_passes_in_range() {
+        let mut out = RunOutcome::new("m");
+        out.duration_ms = 5000;
+        let r = evaluate_deterministic(
+            &[Criterion::DurationBetween {
+                min_ms: 1000,
+                max_ms: 10000,
+            }],
+            &out,
+        );
+        assert!(r[0].passed);
+    }
+
+    #[test]
+    fn duration_between_fails_too_slow() {
+        let mut out = RunOutcome::new("m");
+        out.duration_ms = 60000;
+        let r = evaluate_deterministic(
+            &[Criterion::DurationBetween {
+                min_ms: 0,
+                max_ms: 30000,
+            }],
+            &out,
+        );
+        assert!(!r[0].passed);
+        assert!(r[0].detail.contains("60000"));
+    }
+
+    #[test]
+    fn tool_sequence_passes_subsequence() {
+        let out = RunOutcome::new("m").with_tools_used(vec![
+            "bash".into(),
+            "read_file".into(),
+            "bash".into(),
+            "str_replace".into(),
+        ]);
+        let r = evaluate_deterministic(
+            &[Criterion::ToolSequence {
+                tools: vec!["read_file".into(), "str_replace".into()],
+            }],
+            &out,
+        );
+        assert!(r[0].passed, "{}", r[0].detail);
+    }
+
+    #[test]
+    fn tool_sequence_fails_wrong_order() {
+        let out =
+            RunOutcome::new("m").with_tools_used(vec!["str_replace".into(), "read_file".into()]);
+        let r = evaluate_deterministic(
+            &[Criterion::ToolSequence {
+                tools: vec!["read_file".into(), "str_replace".into()],
+            }],
+            &out,
+        );
+        assert!(!r[0].passed);
+    }
+
+    #[test]
+    fn tool_sequence_fails_missing_tool() {
+        let out = RunOutcome::new("m").with_tools_used(vec!["bash".into()]);
+        let r = evaluate_deterministic(
+            &[Criterion::ToolSequence {
+                tools: vec!["read_file".into(), "str_replace".into()],
+            }],
+            &out,
+        );
+        assert!(!r[0].passed);
+        assert!(r[0].detail.contains("matched 0/2"));
+    }
+
+    #[test]
+    fn turn_rounds_between_passes() {
+        let mut out = RunOutcome::new("m");
+        out.turn_rounds = 2;
+        let r = evaluate_deterministic(&[Criterion::TurnRoundsBetween { min: 1, max: 3 }], &out);
+        assert!(r[0].passed, "{}", r[0].detail);
+    }
+
+    #[test]
+    fn turn_rounds_between_fails_too_many() {
+        let mut out = RunOutcome::new("m");
+        out.turn_rounds = 10;
+        let r = evaluate_deterministic(&[Criterion::TurnRoundsBetween { min: 1, max: 3 }], &out);
+        assert!(!r[0].passed);
+        assert!(r[0].detail.contains("10"));
+    }
+
+    #[test]
+    fn cache_rate_above_passes() {
+        let mut out = RunOutcome::new("m");
+        out.total_tool_calls = 10;
+        out.cache_hits = 8;
+        let r = evaluate_deterministic(
+            &[Criterion::CacheRateAbove {
+                threshold: 0.5,
+                min_calls: 1,
+            }],
+            &out,
+        );
+        assert!(r[0].passed, "{}", r[0].detail);
+    }
+
+    #[test]
+    fn cache_rate_above_fails() {
+        let mut out = RunOutcome::new("m");
+        out.total_tool_calls = 10;
+        out.cache_hits = 1;
+        let r = evaluate_deterministic(
+            &[Criterion::CacheRateAbove {
+                threshold: 0.5,
+                min_calls: 1,
+            }],
+            &out,
+        );
+        assert!(!r[0].passed);
+        assert!(r[0].detail.contains("10.0%"));
+    }
+
+    #[test]
+    fn cache_rate_above_fails_when_no_tools_and_min_calls_set() {
+        let out = RunOutcome::new("m");
+        let r = evaluate_deterministic(
+            &[Criterion::CacheRateAbove {
+                threshold: 0.9,
+                min_calls: 1,
+            }],
+            &out,
+        );
+        assert!(!r[0].passed, "min_calls=1 with 0 tool calls must FAIL");
+        assert!(r[0].detail.contains("too few tool calls"));
+    }
+
+    #[test]
+    fn cache_rate_above_skip_passes_no_tools_when_min_calls_zero() {
+        let out = RunOutcome::new("m");
+        let r = evaluate_deterministic(
+            &[Criterion::CacheRateAbove {
+                threshold: 0.9,
+                min_calls: 0,
+            }],
+            &out,
+        );
+        assert!(r[0].passed, "min_calls=0 with no tools should skip-pass");
+    }
+
+    #[test]
+    fn cache_rate_above_fails_when_step_events_missing() {
+        let mut out = RunOutcome::new("m");
+        out.tool_calls_count = 3; // envelope says tools were called
+        out.total_tool_calls = 0; // but step_events weren't parsed
+        let r = evaluate_deterministic(
+            &[Criterion::CacheRateAbove {
+                threshold: 0.5,
+                min_calls: 1,
+            }],
+            &out,
+        );
+        assert!(!r[0].passed);
+        assert!(r[0].detail.contains("step_events missing"));
     }
 }

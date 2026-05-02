@@ -26,6 +26,19 @@ impl From<ExitCode> for i32 {
     }
 }
 
+/// Load conversation messages from a session's latest heavy checkpoint.
+/// Used by one-shot mode (`-m "..." --session-id <id>`) to provide
+/// conversation history that the model needs for multi-turn continuity.
+///
+/// Returns `None` if the session has no checkpoint (first turn) or
+/// the checkpoint is unreadable.
+fn load_session_messages_for_continuation(session_id: &str) -> Option<Vec<serde_json::Value>> {
+    match astra_pipeline::step_checkpoint::read_latest_heavy_checkpoint(session_id) {
+        Ok(Some(cp)) if !cp.messages.is_empty() => Some(cp.messages),
+        _ => None,
+    }
+}
+
 /// Prepend system prompt to user message when `--system-prompt` is set.
 fn apply_system_prompt(message: &str, system_prompt: Option<&str>) -> String {
     match system_prompt {
@@ -409,6 +422,9 @@ pub(super) async fn execute_cli_command(
             let message = apply_system_prompt(&raw_message, system_prompt.as_deref());
             let (mut creds, name, _, token) = get_profile_and_token(profile.as_deref())?;
             let session_id = validated_resumable_last_session_id(api, profile.as_deref()).await;
+            let mut continuation_messages = session_id
+                .as_deref()
+                .and_then(load_session_messages_for_continuation);
             let selector = create_tool_selector(api, profile.as_deref());
             let mut pm = PermissionManager::with_project(
                 auto_approve,
@@ -436,15 +452,15 @@ pub(super) async fn execute_cli_command(
                 agent_spawner: None,
                 root_agent_id: None,
             };
-            let sr = match stream_chat_sse(ChatTurnParams::basic_cli(
+            let mut params = ChatTurnParams::basic_cli(
                 &chat_ctx,
                 &token,
                 session_id.as_deref(),
                 &mut pm,
                 &mut skill_qt,
-            ))
-            .await
-            {
+            );
+            params.pre_loaded_messages = continuation_messages.take();
+            let sr = match stream_chat_sse(params).await {
                 Ok(sr) => sr,
                 Err(e) if is_session_not_found_error(&e.error) && session_id.is_some() => {
                     let _ = clear_profile_last_session(profile.as_deref());
@@ -806,6 +822,10 @@ pub(super) async fn execute_cli_command(
                 Some(session_id) => Some(session_id),
                 None => validated_resumable_last_session_id(api, profile.as_deref()).await,
             };
+            // Load previous conversation for multi-turn continuity.
+            let mut continuation_messages = session_id
+                .as_deref()
+                .and_then(load_session_messages_for_continuation);
             let is_tty = terminal::size().is_ok();
             let selector = create_tool_selector(api, profile.as_deref());
             let mut pm = {
@@ -885,15 +905,15 @@ pub(super) async fn execute_cli_command(
                 agent_spawner: Some(one_shot_spawner),
                 root_agent_id: Some(&root_agent_id),
             };
-            let sr = match stream_chat_sse(ChatTurnParams::basic_cli(
+            let mut params = ChatTurnParams::basic_cli(
                 &chat_ctx,
                 &token,
                 session_id.as_deref(),
                 &mut pm,
                 &mut skill_qt,
-            ))
-            .await
-            {
+            );
+            params.pre_loaded_messages = continuation_messages.take();
+            let mut sr = match stream_chat_sse(params).await {
                 Ok(sr) => sr,
                 Err(e) if is_session_not_found_error(&e.error) && session_id.is_some() => {
                     let _ = clear_profile_last_session(profile.as_deref());
@@ -929,7 +949,7 @@ pub(super) async fn execute_cli_command(
             // [fork-cache] stderr lines (if any) appear before the
             // JSON/text result — operators grepping stderr don't
             // see the order swap.
-            spawner_handle_for_drain
+            sr.background_agent_results = spawner_handle_for_drain
                 .shutdown_and_wait(std::time::Duration::from_secs(30))
                 .await;
 
@@ -942,7 +962,7 @@ pub(super) async fn execute_cli_command(
                     "session_id": sr.session_id,
                     "run_id": sr.run_id,
                     "text": sr.full_text,
-                    "prompt_tokens": sr.prompt_tokens,
+                    "prompt_tokens": sr.prompt_tokens + sr.cache_read_tokens + sr.cache_creation_tokens,
                     "completion_tokens": sr.completion_tokens,
                     "tool_calls_count": sr.tool_calls_count,
                     "tools_used": sr.tools_used,
@@ -951,6 +971,9 @@ pub(super) async fn execute_cli_command(
                     "selector_strategy": sr.selector_strategy,
                     "exit_code": i32::from(exit_code),
                     "success": exit_code == ExitCode::Success,
+                    "background_agent_results": sr.background_agent_results.iter()
+                        .map(|(id, text)| serde_json::json!({"agent_id": id, "result": text}))
+                        .collect::<Vec<_>>(),
                 });
                 println!(
                     "{}",
@@ -1397,9 +1420,21 @@ fn compute_exit_code(sr: &StreamResult) -> ExitCode {
         }
     }
 
-    // Check for tool failures
-    for record in &sr.tool_call_records {
-        if !record.ok {
+    // Check for unrecovered tool failures. Agents self-correct by
+    // retrying with the same or different tools (write_file fails →
+    // bash echo succeeds). Only fail if the LAST tool call failed —
+    // any successful tool call after a failure means the agent recovered.
+    let has_any_failure = sr.tool_call_records.iter().any(|r| !r.ok);
+    if has_any_failure {
+        let last_ok = sr
+            .tool_call_records
+            .iter()
+            .rev()
+            .find(|r| r.ok)
+            .map(|_| true)
+            .unwrap_or(false);
+        let last_record_ok = sr.tool_call_records.last().map(|r| r.ok).unwrap_or(true);
+        if !last_ok || !last_record_ok {
             return ExitCode::ToolFailure;
         }
     }
@@ -1440,6 +1475,9 @@ pub(super) async fn run_print_mode(
 
     let (mut creds, name, _, token) = get_profile_and_token(profile)?;
     let session_id = validated_resumable_last_session_id(api, profile).await;
+    let mut continuation_messages = session_id
+        .as_deref()
+        .and_then(load_session_messages_for_continuation);
     let selector = create_tool_selector(api, profile);
     let mut pm = PermissionManager::with_project(
         true, // print mode is headless, always auto-approve
@@ -1466,15 +1504,15 @@ pub(super) async fn run_print_mode(
         root_agent_id: None,
     };
 
-    let sr = match stream_chat_sse(ChatTurnParams::basic_cli(
+    let mut params = ChatTurnParams::basic_cli(
         &chat_ctx,
         &token,
         session_id.as_deref(),
         &mut pm,
         &mut skill_qt,
-    ))
-    .await
-    {
+    );
+    params.pre_loaded_messages = continuation_messages.take();
+    let sr = match stream_chat_sse(params).await {
         Ok(sr) => sr,
         Err(e) if is_session_not_found_error(&e.error) && session_id.is_some() => {
             let _ = clear_profile_last_session(profile);
@@ -1506,7 +1544,7 @@ pub(super) async fn run_print_mode(
                 "session_id": sr.session_id,
                 "run_id": sr.run_id,
                 "text": sr.full_text,
-                "prompt_tokens": sr.prompt_tokens,
+                "prompt_tokens": sr.prompt_tokens + sr.cache_read_tokens + sr.cache_creation_tokens,
                 "completion_tokens": sr.completion_tokens,
                 "tool_calls_count": sr.tool_calls_count,
                 "tools_used": sr.tools_used,
@@ -2815,6 +2853,7 @@ mod exit_code_tests {
             llm_rounds: None,
             interruption: None,
             final_messages: Vec::new(),
+            background_agent_results: Vec::new(),
         }
     }
 
@@ -2915,6 +2954,73 @@ mod exit_code_tests {
                 ..Default::default()
             });
         assert_eq!(compute_exit_code(&sr), ExitCode::Success);
+    }
+
+    #[test]
+    fn exit_code_success_same_tool_retry() {
+        let mut sr = empty_stream_result();
+        // bash fails first
+        sr.tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                name: "Bash".to_string(),
+                ok: false,
+                ms: 50,
+                error: Some("exit 1".to_string()),
+                ..Default::default()
+            });
+        // agent retries bash successfully
+        sr.tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                name: "Bash".to_string(),
+                ok: true,
+                ms: 80,
+                ..Default::default()
+            });
+        assert_eq!(compute_exit_code(&sr), ExitCode::Success);
+    }
+
+    #[test]
+    fn exit_code_success_cross_tool_recovery() {
+        let mut sr = empty_stream_result();
+        // write_file fails (sandbox denied)
+        sr.tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                name: "write_file".to_string(),
+                ok: false,
+                ms: 30,
+                error: Some("SANDBOX_DENIED".to_string()),
+                ..Default::default()
+            });
+        // agent self-corrects by using bash instead
+        sr.tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                name: "Bash".to_string(),
+                ok: true,
+                ms: 100,
+                ..Default::default()
+            });
+        assert_eq!(compute_exit_code(&sr), ExitCode::Success);
+    }
+
+    #[test]
+    fn exit_code_failure_when_last_call_fails() {
+        let mut sr = empty_stream_result();
+        sr.tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                name: "Bash".to_string(),
+                ok: true,
+                ms: 50,
+                ..Default::default()
+            });
+        sr.tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                name: "Bash".to_string(),
+                ok: false,
+                ms: 100,
+                error: Some("exit 1".to_string()),
+                ..Default::default()
+            });
+        assert_eq!(compute_exit_code(&sr), ExitCode::ToolFailure);
     }
 
     #[test]
@@ -3311,5 +3417,75 @@ mod api_url_config_tests {
         let target = dir.path().join("nested").join("capture.json");
         write_downloaded_capture(&target, br#"{"ok":true}"#).unwrap();
         assert_eq!(std::fs::read_to_string(&target).unwrap(), r#"{"ok":true}"#);
+    }
+}
+
+#[cfg(test)]
+mod session_continuation_tests {
+    #[allow(unused_imports)]
+    use serde_json::json;
+
+    /// Regression test: `--session-id` in one-shot mode must load previous
+    /// messages from the session's heavy checkpoint. Before the fix, messages
+    /// were always empty — the model couldn't see prior conversation turns.
+    #[test]
+    fn load_session_messages_returns_checkpoint_messages() {
+        let session_id = format!("test-session-cont-{}", uuid::Uuid::new_v4());
+
+        // Write a heavy checkpoint to the standard sessions dir.
+        let home = dirs::home_dir().unwrap();
+        let cp_dir = home
+            .join(".astra/sessions")
+            .join(&session_id)
+            .join("step_checkpoints");
+        std::fs::create_dir_all(&cp_dir).unwrap();
+
+        // Use the same format as a real checkpoint (read from step_protocol.rs).
+        // The key insight: serde will skip unknown fields with #[serde(default)],
+        // so we only need the required fields.
+        let checkpoint_json = r#"{
+            "Heavy": {
+                "light": {
+                    "protocol_version": 1,
+                    "cursor": {"phase": "Done", "slots": [], "parallel": false, "wait_trigger": null, "sub_step": null},
+                    "step_id": "s1",
+                    "task_id": "t1",
+                    "agent_id": "astra-cli",
+                    "progress": 1.0,
+                    "total_tokens": 100,
+                    "created_at": 1700000000
+                },
+                "messages": [
+                    {"role": "user", "content": "Remember: code is ZEBRA-99"},
+                    {"role": "assistant", "content": "OK, noted."}
+                ],
+                "budget_remaining_tokens": 100000,
+                "budget_remaining_rounds": 50,
+                "blocked_tools": [],
+                "recent_tools": []
+            }
+        }"#;
+        std::fs::write(cp_dir.join("000002-heavy.json"), checkpoint_json).unwrap();
+
+        // The function under test: load messages for session continuation.
+        let messages = super::load_session_messages_for_continuation(&session_id);
+
+        // Cleanup
+        let home = dirs::home_dir().unwrap();
+        let _ = std::fs::remove_dir_all(home.join(".astra/sessions").join(&session_id));
+
+        // Assert: must return the 2 messages from the checkpoint.
+        let messages = messages.expect("should load messages from checkpoint");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "Remember: code is ZEBRA-99");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"], "OK, noted.");
+    }
+
+    #[test]
+    fn load_session_messages_returns_none_for_missing_session() {
+        let messages = super::load_session_messages_for_continuation("nonexistent-session-xyz-42");
+        assert!(messages.is_none());
     }
 }

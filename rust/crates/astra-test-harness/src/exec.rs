@@ -105,6 +105,9 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
 
     let start = Instant::now();
     let mut cmd = Command::new(&cfg.astra_bin);
+    if let Some(ref profile) = cfg.profile {
+        cmd.arg("--profile").arg(profile);
+    }
     cmd.arg("chat")
         .arg("-m")
         .arg(&case.prompt)
@@ -142,6 +145,10 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
                 completion_tokens: 0,
                 prompt_tokens: 0,
                 duration_ms: start.elapsed().as_millis() as u64,
+                turn_rounds: 0,
+                cache_hits: 0,
+                total_tool_calls: 0,
+                ttft_ms: 0,
             };
         }
     };
@@ -161,6 +168,14 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
             out.stderr = stderr;
             out.exit_code = output.status.code().unwrap_or(-1);
             out.duration_ms = start.elapsed().as_millis() as u64;
+            // Extract turn_rounds and cache_hits from step_events if available.
+            if let Some(ref sid) = out.session_id
+                && let Some(stats) = crate::session_capture::load_step_event_stats(sid)
+            {
+                out.turn_rounds = stats.turn_rounds;
+                out.cache_hits = stats.cache_hits;
+                out.total_tool_calls = stats.total_tool_calls;
+            }
             out
         }
         Ok(Err(e)) => RunOutcome {
@@ -175,6 +190,10 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
             completion_tokens: 0,
             prompt_tokens: 0,
             duration_ms: start.elapsed().as_millis() as u64,
+            turn_rounds: 0,
+            cache_hits: 0,
+            total_tool_calls: 0,
+            ttft_ms: 0,
         },
         Err(_timed_out) => RunOutcome {
             model: model.into(),
@@ -197,7 +216,141 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
             completion_tokens: 0,
             prompt_tokens: 0,
             duration_ms: start.elapsed().as_millis() as u64,
+            turn_rounds: 0,
+            cache_hits: 0,
+            total_tool_calls: 0,
+            ttft_ms: 0,
         },
+    }
+}
+
+// ── External command executor adapter ────────────────────────────────
+
+/// Executor that delegates case execution to an external process.
+///
+/// Usage: `--executor-cmd "python3 my_agent.py"`
+///
+/// The external process receives the case JSON on stdin:
+/// ```json
+/// {"name": "...", "prompt": "...", "model": "...", "timeout_seconds": 180}
+/// ```
+/// And must return a RunOutcome-compatible JSON on stdout:
+/// ```json
+/// {"exit_code": 0, "text": "...", "tools_used": [...], ...}
+/// ```
+pub struct ExternalCmdExecutor {
+    cmd: String,
+    timeout_seconds: u64,
+}
+
+impl ExternalCmdExecutor {
+    pub fn new(cmd: impl Into<String>, timeout_seconds: u64) -> Self {
+        Self {
+            cmd: cmd.into(),
+            timeout_seconds,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl CaseExecutor for ExternalCmdExecutor {
+    async fn execute(&self, case: &Case, model: &str) -> RunOutcome {
+        use tokio::process::Command;
+
+        let input = serde_json::json!({
+            "protocol_version": "1.1",
+            "case": {
+                "name": case.name,
+                "description": case.description,
+                "prompt": case.prompt,
+                "capability": case.capability,
+                "difficulty": case.difficulty,
+                "weight": case.weight,
+                "setup_cmd": case.setup_cmd,
+                "teardown_cmd": case.teardown_cmd,
+                "timeout_seconds": case.timeout_seconds,
+                "extra_cli_args": case.extra_cli_args,
+            },
+            "model": model,
+            "run_index": 0,
+        });
+
+        if self.cmd.trim().is_empty() {
+            return RunOutcome {
+                model: model.into(),
+                exit_code: -1,
+                text: "executor-cmd is empty".into(),
+                ..Default::default()
+            };
+        }
+
+        let start = std::time::Instant::now();
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg(&self.cmd)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn();
+
+        let mut child = match child {
+            Ok(c) => c,
+            Err(e) => {
+                return RunOutcome {
+                    model: model.into(),
+                    exit_code: -1,
+                    text: format!("spawn executor-cmd {}: {e}", self.cmd),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    ..Default::default()
+                };
+            }
+        };
+
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            let payload = serde_json::to_vec(&input).unwrap();
+            let _ = stdin.write_all(&payload).await;
+            drop(stdin);
+        }
+
+        let timeout = std::time::Duration::from_secs(self.timeout_seconds);
+        let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+            Ok(Ok(o)) => o,
+            Ok(Err(e)) => {
+                return RunOutcome {
+                    model: model.into(),
+                    exit_code: -1,
+                    text: format!("executor-cmd wait: {e}"),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    ..Default::default()
+                };
+            }
+            Err(_) => {
+                return RunOutcome {
+                    model: model.into(),
+                    exit_code: 124,
+                    text: format!("executor-cmd timed out after {}s", self.timeout_seconds),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    ..Default::default()
+                };
+            }
+        };
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let mut out = parse_json_outcome(&stdout, model);
+        out.stderr = stderr;
+        out.exit_code = output.status.code().unwrap_or(-1);
+        out.duration_ms = start.elapsed().as_millis() as u64;
+        out
+    }
+
+    fn reproducer(&self, case: &Case, model: &str) -> String {
+        format!(
+            "echo '{{\"name\":\"{}\",\"prompt\":\"...\",\"model\":\"{}\"}}' | {}",
+            case.name, model, self.cmd
+        )
     }
 }
 
@@ -257,6 +410,10 @@ pub(crate) mod test_support {
                     completion_tokens: 0,
                     prompt_tokens: 0,
                     duration_ms: 0,
+                    turn_rounds: 0,
+                    cache_hits: 0,
+                    total_tool_calls: 0,
+                    ttft_ms: 0,
                 })
         }
         fn reproducer(&self, case: &Case, model: &str) -> String {
@@ -283,6 +440,12 @@ mod tests {
             debug_log: false,
             extra_cli_args: vec!["--verbose".into()],
             timeout_seconds: 60,
+            capability: None,
+            difficulty: None,
+            weight: 1.0,
+            steps: vec![],
+            setup_cmd: None,
+            teardown_cmd: None,
         };
         let repro = exec.reproducer(&case, "qwen-flash");
         assert!(repro.contains("/usr/local/bin/astra"));
@@ -368,6 +531,12 @@ mod tests {
             debug_log: false,
             extra_cli_args: vec![],
             timeout_seconds: 1,
+            capability: None,
+            difficulty: None,
+            weight: 1.0,
+            steps: vec![],
+            setup_cmd: None,
+            teardown_cmd: None,
         };
         let start = std::time::Instant::now();
         let outcome = exec.execute(&case, "ignored").await;
@@ -413,6 +582,10 @@ mod tests {
             completion_tokens: 0,
             prompt_tokens: 0,
             duration_ms: 0,
+            turn_rounds: 0,
+            cache_hits: 0,
+            total_tool_calls: 0,
+            ttft_ms: 0,
         };
         seed.exit_code = 0;
         fe.seed("c1", "qwen-flash", seed.clone());
@@ -426,6 +599,12 @@ mod tests {
             debug_log: false,
             extra_cli_args: vec![],
             timeout_seconds: 60,
+            capability: None,
+            difficulty: None,
+            weight: 1.0,
+            steps: vec![],
+            setup_cmd: None,
+            teardown_cmd: None,
         };
         let out = fe.execute(&case, "qwen-flash").await;
         assert_eq!(out.text, "hello");
@@ -435,5 +614,97 @@ mod tests {
         let out2 = fe.execute(&case, "never-seeded").await;
         assert_eq!(out2.exit_code, -1);
         assert!(out2.text.contains("fake"));
+    }
+
+    // ── ExternalCmdExecutor tests ──
+
+    fn simple_case() -> Case {
+        Case {
+            name: "ext".into(),
+            description: None,
+            prompt: "test prompt".into(),
+            models: Some(vec!["m".into()]),
+            criteria: vec![],
+            debug_log: false,
+            extra_cli_args: vec![],
+            timeout_seconds: 60,
+            capability: None,
+            difficulty: None,
+            weight: 1.0,
+            steps: vec![],
+            setup_cmd: None,
+            teardown_cmd: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn external_executor_happy_path() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let script = r#"cat <<'REPLY'
+{"text":"external-hello","exit_code":0,"session_id":"s1","tool_calls_count":2,"tools_used":["Read","Write"],"completion_tokens":10,"prompt_tokens":20}
+REPLY"#;
+        let exec = ExternalCmdExecutor::new(script, 10);
+        let out = exec.execute(&simple_case(), "m").await;
+        assert_eq!(out.exit_code, 0);
+        assert_eq!(out.text, "external-hello");
+        assert_eq!(out.tools_used, vec!["Read", "Write"]);
+        assert!(out.duration_ms < 5000);
+    }
+
+    #[tokio::test]
+    async fn external_executor_receives_protocol_version_and_case_metadata() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        // Read stdin, verify it contains expected fields, return a
+        // signal via the text field.
+        let script = r#"
+INPUT=$(cat)
+OK="yes"
+echo "$INPUT" | grep -q '"protocol_version":"1.1"' || OK="no_protocol"
+echo "$INPUT" | grep -q '"model":"test-model"' || OK="no_model"
+echo "$INPUT" | grep -q '"case"' || OK="no_case"
+echo "{\"text\":\"$OK\"}"
+"#;
+        let exec = ExternalCmdExecutor::new(script, 10);
+        let out = exec.execute(&simple_case(), "test-model").await;
+        assert_eq!(
+            out.text, "yes",
+            "external executor must receive protocol_version, model, and case: got {:?}",
+            out.text
+        );
+    }
+
+    #[tokio::test]
+    async fn external_executor_empty_cmd_returns_error() {
+        let exec = ExternalCmdExecutor::new("  ", 10);
+        let out = exec.execute(&simple_case(), "m").await;
+        assert_eq!(out.exit_code, -1);
+        assert!(out.text.contains("empty"));
+    }
+
+    #[tokio::test]
+    async fn external_executor_timeout_returns_124() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let exec = ExternalCmdExecutor::new("sleep 30", 1);
+        let start = std::time::Instant::now();
+        let out = exec.execute(&simple_case(), "m").await;
+        assert_eq!(out.exit_code, 124);
+        assert!(out.text.contains("timed out"));
+        assert!(start.elapsed().as_secs() <= 3);
+    }
+
+    #[tokio::test]
+    async fn external_executor_nonzero_exit() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let exec = ExternalCmdExecutor::new("echo '{}'; exit 42", 10);
+        let out = exec.execute(&simple_case(), "m").await;
+        assert_eq!(out.exit_code, 42);
     }
 }

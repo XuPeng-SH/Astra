@@ -1,0 +1,35 @@
+name: reasoning_multi_step_logic
+description: |
+  **What**: Pose the classic river-crossing puzzle and verify the agent computes the correct minimum number of crossings (7).
+  **Tests**: Pure multi-step logical reasoning without tool assistance — the model must reason through constraints and state transitions.
+  **Why**: Validates that the model can handle constraint-satisfaction problems, which underpin planning and debugging tasks in production.
+  **Pass means**: The model correctly reasoned through the fox-chicken-grain constraints and arrived at the answer (7 crossings).
+  **Fail means**: Model reasoning failure (wrong answer) — not an infrastructure issue; indicates the model struggles with multi-step logic at this difficulty level.
+prompt: |
+  A farmer has a fox, a chicken, and a bag of grain. He needs to cross
+  a river in a boat that can only carry him and one item. If left alone,
+  the fox will eat the chicken, and the chicken will eat the grain.
+  What is the minimum number of crossings needed? Just give the number.
+capability: reasoning
+difficulty: 3
+weight: 1.0
+timeout_seconds: 60
+criteria:
+  - type: exit_code
+    code: 0
+  - type: text_contains
+    needle: "7"
+  - type: tokens_between
+    min: 1
+    max: 25000
+  - type: turn_rounds_between
+    min: 1
+    max: 5
+  - type: judger
+    question: |
+      The correct answer to the fox-chicken-grain river crossing puzzle
+      is 7 crossings. Did the agent output exactly 7 (not 17, 27, 70,
+      or any other number containing 7)?
+      Score 1.0 if the answer is clearly 7.
+      Score 0.0 if the answer is wrong or ambiguous.
+    threshold: 0.7

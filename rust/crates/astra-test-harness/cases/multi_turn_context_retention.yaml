@@ -1,0 +1,27 @@
+name: multi_turn_context_retention
+description: |
+  **What**: Establish a fact in turn 1, then ask about it in turn 2, verifying the agent recalls it.
+  **Tests**: Multi-turn context retention — session state (via --session-id) must carry user-provided facts across turns.
+  **Why**: If context is lost between turns, multi-turn workflows (debugging, planning, iterative coding) all break silently.
+  **Pass means**: The agent correctly recalls the exact secret code from turn 1 in turn 2, proving session continuity works.
+  **Fail means**: Session state was dropped between turns — either --session-id plumbing is broken or context compaction discarded the fact.
+prompt: |
+  The secret code is ALPHA-7742. Acknowledge with a short sentence.
+  Do not use any tools — just reply in text.
+capability: memory
+difficulty: 2
+weight: 1.5
+timeout_seconds: 120
+steps:
+  - prompt: "What was the secret code I told you earlier? Reply in text only, no tools."
+    criteria:
+      - type: text_contains
+        needle: "ALPHA-7742"
+criteria:
+  - type: exit_code
+    code: 0
+  - type: text_contains
+    needle: "ALPHA-7742"
+  - type: turn_rounds_between
+    min: 1
+    max: 5

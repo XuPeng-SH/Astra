@@ -59,6 +59,146 @@ pub struct Case {
     /// Caps runaway models without silently skewing matrix totals.
     #[serde(default = "default_timeout_seconds")]
     pub timeout_seconds: u64,
+
+    /// Capability dimension this case tests. Used for aggregated
+    /// reporting by capability × model.
+    #[serde(default)]
+    pub capability: Option<Capability>,
+
+    /// Difficulty level 1–5. Higher = harder. Used for weighted scoring.
+    #[serde(default)]
+    pub difficulty: Option<u8>,
+
+    /// Scoring weight (default 1.0). Cases with higher weight
+    /// contribute more to the aggregate pass rate.
+    #[serde(default = "default_weight")]
+    pub weight: f64,
+
+    /// Multi-turn steps. When present, `prompt` is the first step
+    /// and `steps` contains follow-up turns. Each step has its own
+    /// prompt and optional criteria.
+    #[serde(default)]
+    pub steps: Vec<CaseStep>,
+
+    /// Shell command to run before the case (e.g., create temp files).
+    /// Runs in `working_dir` or CWD. Non-zero exit aborts the case.
+    #[serde(default)]
+    pub setup_cmd: Option<String>,
+
+    /// Shell command to run after the case (cleanup). Always runs,
+    /// even on failure.
+    #[serde(default)]
+    pub teardown_cmd: Option<String>,
+}
+
+/// A follow-up turn in a multi-turn case.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CaseStep {
+    /// Prompt for this turn.
+    pub prompt: String,
+    /// Per-step criteria evaluated against this step's outcome.
+    /// If any step criterion fails, the overall case FAILs.
+    #[serde(default)]
+    pub criteria: Vec<super::criteria::Criterion>,
+    /// Optional per-step timeout override.
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
+}
+
+/// Capability dimension for aggregated reporting.
+///
+/// Known variants use snake_case. Custom capabilities MUST use the
+/// `"custom:my_name"` prefix — bare unknown strings are rejected at
+/// load time so typos don't silently pass.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Capability {
+    ToolUse,
+    Delegation,
+    InstructionFollowing,
+    AntiHallucination,
+    Efficiency,
+    CodeGeneration,
+    Reasoning,
+    Memory,
+    Planning,
+    /// Custom capability — YAML must use `"custom:my_name"` syntax.
+    Custom(String),
+}
+
+impl<'de> serde::Deserialize<'de> for Capability {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.as_str() {
+            "tool_use" => Ok(Self::ToolUse),
+            "delegation" => Ok(Self::Delegation),
+            "instruction_following" => Ok(Self::InstructionFollowing),
+            "anti_hallucination" => Ok(Self::AntiHallucination),
+            "efficiency" => Ok(Self::Efficiency),
+            "code_generation" => Ok(Self::CodeGeneration),
+            "reasoning" => Ok(Self::Reasoning),
+            "memory" => Ok(Self::Memory),
+            "planning" => Ok(Self::Planning),
+            other if other.starts_with("custom:") => {
+                let name = other.strip_prefix("custom:").unwrap().to_string();
+                if name.is_empty() {
+                    return Err(serde::de::Error::custom(
+                        "capability 'custom:' requires a name after the colon",
+                    ));
+                }
+                Ok(Self::Custom(name))
+            }
+            other => Err(serde::de::Error::custom(format!(
+                "unknown capability {other:?}. Known: {}. \
+                 For custom capabilities use \"custom:my_name\" syntax.",
+                KNOWN_CAPABILITIES.join(", ")
+            ))),
+        }
+    }
+}
+
+impl serde::Serialize for Capability {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl std::fmt::Display for Capability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ToolUse => write!(f, "tool_use"),
+            Self::Delegation => write!(f, "delegation"),
+            Self::InstructionFollowing => write!(f, "instruction_following"),
+            Self::AntiHallucination => write!(f, "anti_hallucination"),
+            Self::Efficiency => write!(f, "efficiency"),
+            Self::CodeGeneration => write!(f, "code_generation"),
+            Self::Reasoning => write!(f, "reasoning"),
+            Self::Memory => write!(f, "memory"),
+            Self::Planning => write!(f, "planning"),
+            Self::Custom(s) => write!(f, "custom:{s}"),
+        }
+    }
+}
+
+const KNOWN_CAPABILITIES: &[&str] = &[
+    "tool_use",
+    "delegation",
+    "instruction_following",
+    "anti_hallucination",
+    "efficiency",
+    "code_generation",
+    "reasoning",
+    "memory",
+    "planning",
+];
+
+fn default_weight() -> f64 {
+    1.0
 }
 
 fn default_timeout_seconds() -> u64 {
@@ -97,16 +237,20 @@ pub(crate) const RESERVED_CLI_ARGS: &[&str] = &[
     // `prompt:`; allowing --system-prompt would bypass the judger's
     // anti-gaming preamble assumptions.
     "--system-prompt",
+    // Session ID — the harness manages --session-id for multi-turn
+    // steps; a case overriding it would break session continuation.
+    "--session-id",
 ];
 
 /// Validate that `args` does not contain any reserved flag. Returns
-/// the first offender so the error message is precise. Exact-string
-/// match: a user that really needs `--model-prefix` (hypothetical)
-/// isn't blocked.
+/// the first offender so the error message is precise. Matches both
+/// exact form (`--model`) and `=` syntax (`--model=gpt-4`) so the
+/// denylist cannot be bypassed by appending `=value`.
 pub(crate) fn validate_extra_cli_args(args: &[String]) -> Result<(), String> {
     for a in args {
+        let flag_part = a.split('=').next().unwrap_or(a);
         for r in RESERVED_CLI_ARGS {
-            if a == r {
+            if flag_part == *r {
                 return Err(format!(
                     "reserved CLI flag {a:?} in extra_cli_args — the harness \
                      manages this flag; pick a different mechanism (adjust \
@@ -117,6 +261,20 @@ pub(crate) fn validate_extra_cli_args(args: &[String]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Simple glob filter: `*` matches any sequence, `?` matches one char.
+/// Used by both the CLI `--filter` and the dashboard filter.
+pub fn matches_filter(name: &str, pattern: &str) -> bool {
+    let regex_str = format!(
+        "^{}$",
+        regex::escape(pattern)
+            .replace(r"\*", ".*")
+            .replace(r"\?", ".")
+    );
+    regex::Regex::new(&regex_str)
+        .map(|re| re.is_match(name))
+        .unwrap_or(false)
 }
 
 impl Case {
@@ -166,6 +324,18 @@ impl Case {
         // the child even runs. A YAML typo turns the whole suite into
         // "harness hang". Require at least 1 second; realistic cases
         // want tens or hundreds.
+        if !case.weight.is_finite() || case.weight < 0.0 {
+            anyhow::bail!(
+                "case {}: weight must be finite and >= 0.0 (got {})",
+                path.display(),
+                case.weight,
+            );
+        }
+        if let Some(d) = case.difficulty
+            && !(1..=5).contains(&d)
+        {
+            anyhow::bail!("case {}: difficulty must be 1–5 (got {d})", path.display(),);
+        }
         if case.timeout_seconds == 0 {
             anyhow::bail!(
                 "case {}: timeout_seconds must be >= 1 (got 0 — every case would \
@@ -180,6 +350,12 @@ impl Case {
         // regression.
         crate::criteria::validate_criteria(&case.criteria)
             .map_err(|e| anyhow::anyhow!("case {}: {e}", path.display()))?;
+        for (i, step) in case.steps.iter().enumerate() {
+            // Validate step criteria at load time.
+            if let Err(e) = crate::criteria::validate_criteria(&step.criteria) {
+                anyhow::bail!("case {}: steps[{i}].{e}", path.display(),);
+            }
+        }
         Ok(case)
     }
 
@@ -411,5 +587,135 @@ mod tests {
     fn validate_extra_cli_args_accepts_empty_and_unknown() {
         assert!(validate_extra_cli_args(&[]).is_ok());
         assert!(validate_extra_cli_args(&["--whatever".into()]).is_ok());
+    }
+
+    #[test]
+    fn reserved_flag_bypass_via_equals_syntax_rejected() {
+        for bypass in [
+            "--model=gpt-4",
+            "--message=hello",
+            "--json=true",
+            "--permission-mode=auto",
+            "--system-prompt=override",
+            "--session-id=hijack",
+        ] {
+            let err = validate_extra_cli_args(&[bypass.into()]);
+            assert!(
+                err.is_err(),
+                "{bypass:?} should be rejected (= syntax bypass)"
+            );
+        }
+    }
+
+    #[test]
+    fn non_reserved_flag_with_equals_accepted() {
+        assert!(validate_extra_cli_args(&["--verbose=true".into()]).is_ok());
+        assert!(validate_extra_cli_args(&["--explain=yes".into()]).is_ok());
+    }
+
+    #[test]
+    fn negative_weight_rejected() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bad.yaml");
+        std::fs::write(&path, "name: c\nprompt: p\nweight: -1.0\n").unwrap();
+        let err = Case::from_path(&path).expect_err("negative weight must fail");
+        assert!(err.to_string().contains("weight"), "{err}");
+    }
+
+    #[test]
+    fn difficulty_out_of_range_rejected() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bad.yaml");
+        std::fs::write(&path, "name: c\nprompt: p\ndifficulty: 200\n").unwrap();
+        let err = Case::from_path(&path).expect_err("difficulty 200 must fail");
+        assert!(err.to_string().contains("difficulty"), "{err}");
+    }
+
+    #[test]
+    fn difficulty_zero_rejected() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bad.yaml");
+        std::fs::write(&path, "name: c\nprompt: p\ndifficulty: 0\n").unwrap();
+        let err = Case::from_path(&path).expect_err("difficulty 0 must fail");
+        assert!(err.to_string().contains("difficulty"), "{err}");
+    }
+
+    #[test]
+    fn capability_typo_warns_on_near_miss() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("typo.yaml");
+        std::fs::write(&path, "name: c\nprompt: p\ncapability: Tool_Use\n").unwrap();
+        let err = Case::from_path(&path).expect_err("near-miss capability must fail");
+        assert!(
+            err.to_string().contains("unknown capability"),
+            "error should reject unknown variant: {err}"
+        );
+    }
+
+    #[test]
+    fn capability_known_variant_accepted() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("ok.yaml");
+        std::fs::write(&path, "name: c\nprompt: p\ncapability: tool_use\n").unwrap();
+        let c = Case::from_path(&path).expect("known capability");
+        assert_eq!(c.capability, Some(Capability::ToolUse));
+    }
+
+    #[test]
+    fn capability_truly_custom_accepted() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("ok.yaml");
+        std::fs::write(
+            &path,
+            "name: c\nprompt: p\ncapability: \"custom:my_special_cap\"\n",
+        )
+        .unwrap();
+        let c = Case::from_path(&path).expect("custom capability");
+        assert_eq!(
+            c.capability,
+            Some(Capability::Custom("my_special_cap".into()))
+        );
+    }
+
+    #[test]
+    fn capability_bare_unknown_rejected() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bad.yaml");
+        std::fs::write(&path, "name: c\nprompt: p\ncapability: fast_response\n").unwrap();
+        let err = Case::from_path(&path).expect_err("bare unknown must fail");
+        assert!(
+            err.to_string().contains("unknown capability"),
+            "should reject: {err}"
+        );
+    }
+
+    #[test]
+    fn valid_weight_and_difficulty_accepted() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("ok.yaml");
+        std::fs::write(&path, "name: c\nprompt: p\nweight: 2.5\ndifficulty: 3\n").unwrap();
+        let c = Case::from_path(&path).expect("valid weight+difficulty");
+        assert!((c.weight - 2.5).abs() < f64::EPSILON);
+        assert_eq!(c.difficulty, Some(3));
+    }
+
+    // ── matches_filter (glob) ──
+
+    #[test]
+    fn matches_filter_star_glob() {
+        assert!(matches_filter("fork_prefix_hit", "fork_*"));
+        assert!(!matches_filter("hello_world", "fork_*"));
+    }
+
+    #[test]
+    fn matches_filter_question_mark_glob() {
+        assert!(matches_filter("abc", "a?c"));
+        assert!(!matches_filter("abbc", "a?c"));
+    }
+
+    #[test]
+    fn matches_filter_exact_match() {
+        assert!(matches_filter("hello", "hello"));
+        assert!(!matches_filter("hello_world", "hello"));
     }
 }

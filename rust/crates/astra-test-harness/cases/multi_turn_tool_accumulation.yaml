@@ -1,0 +1,38 @@
+name: multi_turn_tool_accumulation
+description: |
+  **What**: Read a file in turn 1, then append to it in turn 2, verifying tool results carry forward across turns.
+  **Tests**: Multi-turn tool accumulation — tool outputs from earlier turns must inform decisions and actions in later turns.
+  **Why**: Real agent workflows chain tool calls across turns (read then modify); if tool results are lost, the agent operates blind in subsequent turns.
+  **Pass means**: The agent uses knowledge from the turn 1 read_file to correctly target the file for modification in turn 2.
+  **Fail means**: Tool results dropped between turns (session state bug), or the agent failed to connect the read output with the write target.
+  **Note**: setup_cmd force-creates the file fresh before each run to prevent cross-contamination in parallel mode.
+prompt: |
+  Read the file /tmp/astra_harness_mt_test.txt and tell me what's in it.
+  Include the file contents in your answer.
+capability: tool_use
+difficulty: 2
+weight: 2.0
+timeout_seconds: 180
+setup_cmd: "printf 'hello world 42\\n' > /tmp/astra_harness_mt_test.txt"
+teardown_cmd: "rm -f /tmp/astra_harness_mt_test.txt"
+steps:
+  - prompt: "Now append the line 'second line' to that same file and confirm it was done."
+    criteria:
+      - type: tools_count_between
+        min: 1
+        max: 8
+criteria:
+  - type: exit_code
+    code: 0
+  - type: tool_called
+    name: read_file
+  - type: text_contains
+    needle: "hello world 42"
+  - type: judger
+    question: |
+      Evaluate based on the tool calls and text output only.
+      Do NOT try to read files yourself.
+      Turn 1: did the agent read the file and show "hello world 42"?
+      Turn 2: did the agent append "second line" using any tool?
+      Score 1.0 if both turns worked, 0.5 if partial, 0.0 if fabricated.
+    threshold: 0.7

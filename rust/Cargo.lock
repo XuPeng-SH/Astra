@@ -534,13 +534,19 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "axum 0.8.9",
+ "chrono",
  "clap",
+ "futures",
  "regex",
  "serde",
  "serde_json",
  "serde_yaml_ng",
  "tempfile",
+ "thiserror 1.0.69",
  "tokio",
+ "tokio-util",
+ "tower-http",
 ]
 
 [[package]]

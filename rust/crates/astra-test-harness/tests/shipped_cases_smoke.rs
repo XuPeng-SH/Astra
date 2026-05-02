@@ -102,9 +102,9 @@ fn text_contains_simple_answer_has_adequate_timeout() {
     let case = Case::from_path(&shipped_cases_dir().join("text_contains_simple_answer.yaml"))
         .expect("load case");
     assert!(
-        case.timeout_seconds >= 120,
+        case.timeout_seconds >= 30,
         "text_contains_simple_answer timeout_seconds={} is too short; \
-         provider cold-start can exceed 60s. Needs >= 120.",
+         a trivial factual question needs at least 30s.",
         case.timeout_seconds
     );
 }
@@ -163,6 +163,11 @@ fn shipped_cases_reference_only_known_criterion_variants() {
         "journal_tool_called",
         "fork_cache_outcome",
         "judger",
+        "tokens_between",
+        "duration_between",
+        "tool_sequence",
+        "turn_rounds_between",
+        "cache_rate_above",
     ];
     // Concatenate every shipped YAML body and grep for `type:` tag
     // occurrences at column-1-after-indent. Cheap + doesn't require

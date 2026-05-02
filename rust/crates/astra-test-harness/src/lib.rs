@@ -38,15 +38,21 @@
 //! programmatically (custom criteria, custom judger backends)
 //! without building from the `astra-test` binary.
 
+pub mod artifacts;
 pub mod case;
+pub mod classify;
 pub mod criteria;
+pub mod dashboard;
 pub mod digest;
+pub mod eval;
 pub mod exec;
 pub mod judger;
+pub mod preflight;
 pub mod report;
 pub mod runner;
 pub mod session_capture;
 pub mod suite;
+pub mod summarizer;
 
 /// Well-known prefix for every stderr line this harness emits.
 /// Grepping `stderr_matches { pattern: '^\[astra-test\]' }` finds

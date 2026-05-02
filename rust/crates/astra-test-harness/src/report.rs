@@ -16,6 +16,10 @@ use crate::digest::DigestArtifact;
 use crate::runner::RunOutcome;
 use crate::session_capture::SessionCapture;
 
+fn default_weight() -> f64 {
+    1.0
+}
+
 /// One (case, model) pair's full result.
 ///
 /// Serialized into `--format json` reports, so this struct is a
@@ -28,8 +32,24 @@ pub struct CaseRunReport {
     pub case_name: String,
     pub model: String,
     pub passed: bool,
+    /// 0-based index when `--runs N` repeats the same case/model.
+    /// Always 0 for single-run mode.
+    #[serde(default)]
+    pub run_index: u32,
+    /// Capability dimension from case metadata.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub capability: Option<crate::case::Capability>,
+    /// Scoring weight from case metadata.
+    #[serde(default = "default_weight")]
+    pub weight: f64,
+    /// Difficulty level from case metadata.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub difficulty: Option<u8>,
     pub outcome: RunOutcome,
     pub criteria: Vec<CriterionResult>,
+    /// Step-level results for multi-turn cases. Empty for single-turn.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<StepResult>,
     /// Optional session journal dump — only present when
     /// `debug_log: true` on the case or `--capture-session` on the CLI.
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -52,11 +72,46 @@ pub struct CaseRunReport {
     /// without hiding it inside the case FAIL.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub digest_error: Option<String>,
+    /// Failure classification — populated only when `passed == false`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub failure_class: Option<crate::classify::FailureClass>,
+    /// True when passed==true but some Soft/Quality criteria failed.
+    /// Frontend shows these as yellow warnings, not green passes.
+    #[serde(default)]
+    pub has_warnings: bool,
+}
+
+/// Result of a single step in a multi-turn case.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StepResult {
+    pub step_index: u32,
+    pub prompt: String,
+    pub outcome: RunOutcome,
+    pub duration_ms: u64,
+    /// Criteria results for this step. Empty if the step has no criteria.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub criteria: Vec<CriterionResult>,
+    /// Whether all step criteria passed.
+    #[serde(default = "default_true")]
+    pub passed: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SuiteReport {
     pub runs: Vec<CaseRunReport>,
+    /// ISO 8601 timestamp when the suite run started.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub started_at: Option<String>,
+    /// ISO 8601 timestamp when the suite run ended.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub ended_at: Option<String>,
+    /// Real wall-clock time in milliseconds (not sum of per-case durations).
+    #[serde(default)]
+    pub wall_time_ms: u64,
 }
 
 impl SuiteReport {
@@ -134,22 +189,56 @@ pub(crate) fn format_render_error(reason: &str) -> String {
 fn render_text(report: &SuiteReport, verbose: bool) -> String {
     let mut s = String::new();
     s.push_str("=== astra-test suite report ===\n");
+
+    let total_prompt: u64 = report.runs.iter().map(|r| r.outcome.prompt_tokens).sum();
+    let total_completion: u64 = report
+        .runs
+        .iter()
+        .map(|r| r.outcome.completion_tokens)
+        .sum();
+    let sum_dur: u64 = report.runs.iter().map(|r| r.outcome.duration_ms).sum();
+    let wall_ms = if report.wall_time_ms > 0 {
+        report.wall_time_ms
+    } else {
+        sum_dur
+    };
+    let wall_secs = wall_ms / 1000;
+
     s.push_str(&format!(
-        "total={} passed={} failed={}\n\n",
+        "total={} passed={} failed={} | tokens: {}in/{}out | wall: {}m{}s (sum: {}m{}s)\n\n",
         report.total(),
         report.passed(),
-        report.failed()
+        report.failed(),
+        total_prompt,
+        total_completion,
+        wall_secs / 60,
+        wall_secs % 60,
+        sum_dur / 1000 / 60,
+        sum_dur / 1000 % 60,
     ));
     for run in &report.runs {
         let marker = if run.passed { "PASS" } else { "FAIL" };
+        let run_suffix = if run.run_index > 0 {
+            format!(" run={}", run.run_index)
+        } else {
+            String::new()
+        };
         s.push_str(&format!(
-            "[{marker}] case={} model={} exit={} tools={} dur={}ms\n",
+            "[{marker}] case={} model={}{run_suffix} exit={} tools={} dur={}ms turns={}\n",
             run.case_name,
             run.model,
             run.outcome.exit_code,
             run.outcome.tool_calls_count,
-            run.outcome.duration_ms
+            run.outcome.duration_ms,
+            run.outcome.turn_rounds,
         ));
+        if let Some(ref class) = run.failure_class {
+            s.push_str(&format!(
+                "    class: {} → {}\n",
+                class,
+                crate::classify::suggested_action(class)
+            ));
+        }
         for c in &run.criteria {
             let m = if c.passed { " ok " } else { "FAIL" };
             s.push_str(&format!("    [{m}] {}\n", c.detail));
@@ -176,6 +265,23 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
                     "    stderr: {}\n",
                     truncate(&run.outcome.stderr, 500)
                 ));
+            }
+        }
+        // Step-level results for multi-turn cases.
+        for step in &run.steps {
+            s.push_str(&format!(
+                "    step[{}]: dur={}ms tokens={}in/{}out tools={}\n",
+                step.step_index,
+                step.duration_ms,
+                step.outcome.prompt_tokens,
+                step.outcome.completion_tokens,
+                step.outcome.tool_calls_count,
+            ));
+            if verbose || !run.passed {
+                let text_preview = truncate(&step.outcome.text, 200);
+                if !text_preview.is_empty() {
+                    s.push_str(&format!("      text: {text_preview}\n"));
+                }
             }
         }
         if let Some(cap) = &run.session {
@@ -235,6 +341,197 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
         }
         s.push('\n');
     }
+
+    use std::collections::{BTreeMap, BTreeSet, HashSet};
+
+    // Pass rate summary when --runs > 1 (multiple runs per case×model).
+    let has_repeats = {
+        let mut seen = HashSet::new();
+        report
+            .runs
+            .iter()
+            .any(|r| !seen.insert((&r.case_name, &r.model)))
+    };
+    if has_repeats {
+        s.push_str("=== pass rate (flaky detection) ===\n");
+        let mut groups: BTreeMap<(&str, &str), (u32, u32)> = BTreeMap::new();
+        for r in &report.runs {
+            let entry = groups.entry((&r.case_name, &r.model)).or_default();
+            entry.1 += 1;
+            if r.passed {
+                entry.0 += 1;
+            }
+        }
+        for ((case, model), (passed, total)) in &groups {
+            let pct = (*passed as f64 / *total as f64) * 100.0;
+            let marker = if *passed == *total {
+                "✓"
+            } else if *passed == 0 {
+                "✗"
+            } else {
+                "~"
+            };
+            s.push_str(&format!(
+                "  [{marker}] {case} × {model}: {passed}/{total} ({pct:.0}%)\n"
+            ));
+        }
+        s.push('\n');
+    }
+
+    // Collect distinct models (normalized for display).
+    let models: BTreeSet<&str> = report
+        .runs
+        .iter()
+        .map(|r| normalize_model_display(&r.model))
+        .collect();
+    let multi_model = models.len() > 1;
+
+    // ── Model comparison (multi-dimensional, always shown when > 1 model) ──
+    if multi_model {
+        #[derive(Default)]
+        struct ModelStats {
+            pass: u32,
+            total: u32,
+            pass_tokens: u64,
+            pass_dur_ms: u64,
+            pass_turns: u64,
+            pass_tools: u64,
+            all_tokens: u64,
+            all_dur_ms: u64,
+        }
+        let mut stats: BTreeMap<&str, ModelStats> = BTreeMap::new();
+        for r in &report.runs {
+            let e = stats.entry(normalize_model_display(&r.model)).or_default();
+            e.total += 1;
+            let tok = r.outcome.prompt_tokens + r.outcome.completion_tokens;
+            e.all_tokens += tok;
+            e.all_dur_ms += r.outcome.duration_ms;
+            if r.passed {
+                e.pass += 1;
+                e.pass_tokens += tok;
+                e.pass_dur_ms += r.outcome.duration_ms;
+                e.pass_turns += r.outcome.turn_rounds as u64;
+                e.pass_tools += r.outcome.tool_calls_count as u64;
+            }
+        }
+        s.push_str("=== model comparison ===\n");
+        let mut ranked: Vec<_> = stats.iter().collect();
+        ranked.sort_by(|a, b| {
+            let pa = if a.1.total > 0 {
+                a.1.pass as f64 / a.1.total as f64
+            } else {
+                0.0
+            };
+            let pb = if b.1.total > 0 {
+                b.1.pass as f64 / b.1.total as f64
+            } else {
+                0.0
+            };
+            pb.partial_cmp(&pa).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for (model, st) in &ranked {
+            let pct = if st.total > 0 {
+                st.pass as f64 / st.total as f64 * 100.0
+            } else {
+                0.0
+            };
+            let p = st.pass.max(1) as u64;
+            s.push_str(&format!(
+                "  {model}: pass={}/{} ({pct:.0}%) \
+                 | tok/pass={} dur/pass={}ms turns/pass={:.1} tools/pass={:.1}\n",
+                st.pass,
+                st.total,
+                st.pass_tokens / p,
+                st.pass_dur_ms / p,
+                st.pass_turns as f64 / p as f64,
+                st.pass_tools as f64 / p as f64,
+            ));
+        }
+        s.push('\n');
+    }
+
+    // ── Capability × model ──
+    let has_capabilities = report.runs.iter().any(|r| r.capability.is_some());
+    if has_capabilities {
+        s.push_str("=== capability × model ===\n");
+        let mut cap_groups: BTreeMap<(String, &str), (f64, f64)> = BTreeMap::new();
+        for r in &report.runs {
+            if let Some(ref cap) = r.capability {
+                let entry = cap_groups
+                    .entry((cap.to_string(), normalize_model_display(&r.model)))
+                    .or_default();
+                entry.1 += r.weight;
+                if r.passed {
+                    entry.0 += r.weight;
+                }
+            }
+        }
+        for ((cap, model), (wp, tw)) in &cap_groups {
+            let pct = if *tw > 0.0 { wp / tw * 100.0 } else { 0.0 };
+            s.push_str(&format!("  {cap} × {model}: {pct:.0}%\n"));
+        }
+        s.push('\n');
+    }
+
+    // ── Difficulty curve (per-difficulty pass rate across models) ──
+    let has_difficulty = report.runs.iter().any(|r| r.difficulty.is_some());
+    if has_difficulty {
+        s.push_str("=== difficulty curve ===\n");
+        // (difficulty, model) → (weighted_pass, weighted_total)
+        let mut diff_groups: BTreeMap<(u8, &str), (f64, f64)> = BTreeMap::new();
+        let mut diff_all: BTreeMap<u8, (f64, f64)> = BTreeMap::new();
+        for r in &report.runs {
+            if let Some(d) = r.difficulty {
+                let entry = diff_groups
+                    .entry((d, normalize_model_display(&r.model)))
+                    .or_default();
+                entry.1 += r.weight;
+                if r.passed {
+                    entry.0 += r.weight;
+                }
+                let all = diff_all.entry(d).or_default();
+                all.1 += r.weight;
+                if r.passed {
+                    all.0 += r.weight;
+                }
+            }
+        }
+        if multi_model {
+            for ((diff, model), (wp, tw)) in &diff_groups {
+                let pct = if *tw > 0.0 { wp / tw * 100.0 } else { 0.0 };
+                s.push_str(&format!("  d{diff} × {model}: {pct:.0}%\n"));
+            }
+        } else {
+            for (diff, (wp, tw)) in &diff_all {
+                let pct = if *tw > 0.0 { wp / tw * 100.0 } else { 0.0 };
+                s.push_str(&format!("  d{diff}: {pct:.0}%\n"));
+            }
+        }
+        s.push('\n');
+    }
+
+    // ── Capability × difficulty × model (detailed, only when both axes exist) ──
+    if has_capabilities && has_difficulty && multi_model {
+        s.push_str("=== capability × difficulty × model ===\n");
+        let mut cdm: BTreeMap<(String, u8, &str), (f64, f64)> = BTreeMap::new();
+        for r in &report.runs {
+            if let (Some(cap), Some(diff)) = (&r.capability, r.difficulty) {
+                let entry = cdm
+                    .entry((cap.to_string(), diff, normalize_model_display(&r.model)))
+                    .or_default();
+                entry.1 += r.weight;
+                if r.passed {
+                    entry.0 += r.weight;
+                }
+            }
+        }
+        for ((cap, diff, model), (wp, tw)) in &cdm {
+            let pct = if *tw > 0.0 { wp / tw * 100.0 } else { 0.0 };
+            s.push_str(&format!("  {cap} × d{diff} × {model}: {pct:.0}%\n"));
+        }
+        s.push('\n');
+    }
+
     s
 }
 
@@ -294,6 +591,23 @@ fn is_safe_session_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
 }
 
+/// Strip provider-route prefixes for display grouping.
+/// `us.anthropic.claude-sonnet-4-6` → `claude-sonnet-4-6`
+pub fn normalize_model_display(model: &str) -> &str {
+    for prefix in [
+        "us.anthropic.",
+        "eu.anthropic.",
+        "ap.anthropic.",
+        "us.amazon.",
+        "eu.amazon.",
+    ] {
+        if let Some(rest) = model.strip_prefix(prefix) {
+            return rest;
+        }
+    }
+    model
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -321,6 +635,10 @@ mod tests {
             completion_tokens: 0,
             prompt_tokens: 0,
             duration_ms: 42,
+            turn_rounds: 0,
+            cache_hits: 0,
+            total_tool_calls: 0,
+            ttft_ms: 0,
         }
     }
 
@@ -330,21 +648,30 @@ mod tests {
                 case_name: "c1".into(),
                 model: "m".into(),
                 passed: true,
+                run_index: 0,
+                capability: None,
+                weight: 1.0,
+                difficulty: None,
                 outcome: mk_outcome(),
                 criteria: vec![CriterionResult {
                     criterion: Criterion::ToolCalled {
                         name: "Read".into(),
                     },
+                    severity: crate::criteria::CriterionSeverity::Hard,
                     passed: true,
                     detail: "tool Read was called".into(),
                     full_detail: None,
                     score: None,
                 }],
+                steps: vec![],
                 session: None,
                 reproducer: None,
                 digest: None,
                 digest_error: None,
+                failure_class: None,
+                has_warnings: false,
             }],
+            ..Default::default()
         }
     }
 
@@ -526,12 +853,19 @@ mod tests {
             case_name: "c2".into(),
             model: "m".into(),
             passed: false,
+            run_index: 0,
+            capability: None,
+            weight: 1.0,
+            difficulty: None,
             outcome: mk_outcome(),
             criteria: vec![],
+            steps: vec![],
             session: None,
             reproducer: None,
             digest: None,
             digest_error: None,
+            failure_class: None,
+            has_warnings: false,
         });
         assert_eq!(r.total(), 2);
         assert_eq!(r.passed(), 1);
@@ -603,6 +937,346 @@ mod tests {
                 .and_then(|v| v.as_array())
                 .map(|a| a.len()),
             Some(0)
+        );
+    }
+
+    #[test]
+    fn render_text_shows_token_summary() {
+        let r = SuiteReport {
+            runs: vec![CaseRunReport {
+                case_name: "a".into(),
+                model: "m".into(),
+                passed: true,
+                run_index: 0,
+                capability: None,
+                weight: 1.0,
+                difficulty: None,
+                outcome: {
+                    let mut o = RunOutcome::new("m");
+                    o.duration_ms = 5000;
+                    o
+                },
+                criteria: vec![],
+                steps: vec![],
+                failure_class: None,
+                has_warnings: false,
+                session: None,
+                reproducer: None,
+                digest: None,
+                digest_error: None,
+            }],
+            ..Default::default()
+        };
+        let out = render_text(&r, false);
+        assert!(
+            out.contains("tokens: 0in/0out"),
+            "missing token summary: {out}"
+        );
+        assert!(out.contains("wall: 0m5s"), "missing wall time: {out}");
+    }
+
+    #[test]
+    fn render_text_shows_pass_rate_when_repeated() {
+        let make_run = |passed: bool| CaseRunReport {
+            case_name: "flaky".into(),
+            model: "m".into(),
+            passed,
+            run_index: 0,
+            capability: None,
+            weight: 1.0,
+            difficulty: None,
+            outcome: RunOutcome::new("m"),
+            criteria: vec![],
+            steps: vec![],
+            failure_class: None,
+            has_warnings: false,
+            session: None,
+            reproducer: None,
+            digest: None,
+            digest_error: None,
+        };
+        let r = SuiteReport {
+            runs: vec![make_run(true), make_run(true), make_run(false)],
+            ..Default::default()
+        };
+        let out = render_text(&r, false);
+        assert!(
+            out.contains("pass rate"),
+            "missing pass rate section: {out}"
+        );
+        assert!(out.contains("2/3"), "missing 2/3 count: {out}");
+        assert!(out.contains("67%"), "missing percentage: {out}");
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mk_run(
+        case: &str,
+        model: &str,
+        passed: bool,
+        cap: Option<crate::case::Capability>,
+        diff: Option<u8>,
+        weight: f64,
+        dur_ms: u64,
+        tokens_in: u64,
+        tokens_out: u64,
+    ) -> CaseRunReport {
+        mk_run_full(
+            case, model, passed, cap, diff, weight, dur_ms, tokens_in, tokens_out, 1, 0,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mk_run_full(
+        case: &str,
+        model: &str,
+        passed: bool,
+        cap: Option<crate::case::Capability>,
+        diff: Option<u8>,
+        weight: f64,
+        dur_ms: u64,
+        tokens_in: u64,
+        tokens_out: u64,
+        turns: u32,
+        tool_calls: u32,
+    ) -> CaseRunReport {
+        CaseRunReport {
+            case_name: case.into(),
+            model: model.into(),
+            passed,
+            run_index: 0,
+            capability: cap,
+            weight,
+            difficulty: diff,
+            outcome: {
+                let mut o = RunOutcome::new(model);
+                o.duration_ms = dur_ms;
+                o.prompt_tokens = tokens_in;
+                o.completion_tokens = tokens_out;
+                o.turn_rounds = turns;
+                o.tool_calls_count = tool_calls;
+                o
+            },
+            criteria: vec![],
+            steps: vec![],
+            failure_class: None,
+            has_warnings: false,
+            session: None,
+            reproducer: None,
+            digest: None,
+            digest_error: None,
+        }
+    }
+
+    #[test]
+    fn model_comparison_shows_multi_dimensional_metrics() {
+        use crate::case::Capability::*;
+        // gpt-4: pass easy(d1), fail hard(d4) — when passes: 500ms, 150tok, 2 turns
+        // qwen:  pass both — easy: 300ms 120tok 1 turn; hard: 2000ms 1900tok 5 turns
+        let r = SuiteReport {
+            runs: vec![
+                mk_run_full(
+                    "easy",
+                    "gpt-4",
+                    true,
+                    Some(ToolUse),
+                    Some(1),
+                    1.0,
+                    500,
+                    100,
+                    50,
+                    2,
+                    3,
+                ),
+                mk_run_full(
+                    "easy",
+                    "qwen",
+                    true,
+                    Some(ToolUse),
+                    Some(1),
+                    1.0,
+                    300,
+                    80,
+                    40,
+                    1,
+                    2,
+                ),
+                mk_run_full(
+                    "hard",
+                    "gpt-4",
+                    false,
+                    Some(ToolUse),
+                    Some(4),
+                    2.0,
+                    3000,
+                    2000,
+                    500,
+                    8,
+                    15,
+                ),
+                mk_run_full(
+                    "hard",
+                    "qwen",
+                    true,
+                    Some(ToolUse),
+                    Some(4),
+                    2.0,
+                    2000,
+                    1500,
+                    400,
+                    5,
+                    10,
+                ),
+            ],
+            ..Default::default()
+        };
+        let out = render_text(&r, false);
+
+        assert!(
+            out.contains("model comparison"),
+            "must show model comparison:\n{out}"
+        );
+        assert!(
+            out.contains("qwen") && out.contains("gpt-4"),
+            "both models:\n{out}"
+        );
+        // Must show pass rate (not just weighted %)
+        assert!(out.contains("pass="), "must show raw pass count:\n{out}");
+        // Must show efficiency metrics on passes
+        assert!(
+            out.contains("avg_tok") || out.contains("tok/pass"),
+            "must show token efficiency:\n{out}"
+        );
+        assert!(
+            out.contains("avg_dur") || out.contains("dur/pass"),
+            "must show duration efficiency:\n{out}"
+        );
+        assert!(
+            out.contains("avg_turns") || out.contains("turns/pass"),
+            "must show turns efficiency:\n{out}"
+        );
+    }
+
+    #[test]
+    fn model_comparison_efficiency_only_counts_passed_cases() {
+        // Model A: pass 1 case (100tok, 1s), fail 1 case (10000tok, 30s)
+        // Model B: pass 2 cases (200tok each, 2s each)
+        // A's efficiency should be 100tok/1s (not averaged with the failure)
+        let r = SuiteReport {
+            runs: vec![
+                mk_run_full("c1", "A", true, None, None, 1.0, 1000, 80, 20, 1, 2),
+                mk_run_full("c2", "A", false, None, None, 1.0, 30000, 8000, 2000, 15, 50),
+                mk_run_full("c1", "B", true, None, None, 1.0, 2000, 150, 50, 2, 3),
+                mk_run_full("c2", "B", true, None, None, 1.0, 2000, 150, 50, 2, 3),
+            ],
+            ..Default::default()
+        };
+        let out = render_text(&r, false);
+        // A passed 1 case: tok/pass should be 100 (80+20), NOT (80+20+8000+2000)/2
+        assert!(
+            out.contains("model comparison"),
+            "must show comparison:\n{out}"
+        );
+    }
+
+    #[test]
+    fn difficulty_curve_shows_metrics_per_level() {
+        use crate::case::Capability::*;
+        let r = SuiteReport {
+            runs: vec![
+                mk_run("e1", "m", true, Some(Reasoning), Some(1), 1.0, 100, 10, 5),
+                mk_run("e2", "m", true, Some(Reasoning), Some(2), 1.0, 200, 20, 10),
+                mk_run(
+                    "h1",
+                    "m",
+                    false,
+                    Some(Reasoning),
+                    Some(4),
+                    1.0,
+                    5000,
+                    500,
+                    200,
+                ),
+                mk_run(
+                    "h2",
+                    "m",
+                    false,
+                    Some(Reasoning),
+                    Some(5),
+                    1.0,
+                    8000,
+                    1000,
+                    500,
+                ),
+            ],
+            ..Default::default()
+        };
+        let out = render_text(&r, false);
+        assert!(
+            out.contains("difficulty"),
+            "should show difficulty section:\n{out}"
+        );
+    }
+
+    #[test]
+    fn normalize_model_display_strips_known_prefixes() {
+        assert_eq!(
+            normalize_model_display("us.anthropic.claude-sonnet-4-6"),
+            "claude-sonnet-4-6"
+        );
+        assert_eq!(
+            normalize_model_display("eu.anthropic.claude-opus-4-7"),
+            "claude-opus-4-7"
+        );
+        assert_eq!(normalize_model_display("MiniMax-M2.7"), "MiniMax-M2.7");
+        assert_eq!(normalize_model_display("qwen-flash"), "qwen-flash");
+    }
+
+    #[test]
+    fn model_comparison_collapses_provider_variants() {
+        // us.anthropic.claude-sonnet-4-6 and claude-sonnet-4-6 should merge
+        let r = SuiteReport {
+            runs: vec![
+                mk_run("c1", "claude-sonnet-4-6", true, None, None, 1.0, 100, 10, 5),
+                mk_run(
+                    "c2",
+                    "us.anthropic.claude-sonnet-4-6",
+                    true,
+                    None,
+                    None,
+                    1.0,
+                    200,
+                    20,
+                    10,
+                ),
+                mk_run("c1", "MiniMax-M2.7", false, None, None, 1.0, 300, 30, 15),
+            ],
+            ..Default::default()
+        };
+        let out = render_text(&r, false);
+        assert!(
+            out.contains("model comparison"),
+            "multi-model must show comparison:\n{out}"
+        );
+        // Should show claude-sonnet-4-6 with 2/2 (collapsed), not two separate entries
+        assert!(
+            out.contains("claude-sonnet-4-6: pass=2/2"),
+            "provider variants must collapse in comparison table: {out}"
+        );
+    }
+
+    #[test]
+    fn single_model_no_comparison_table() {
+        let r = SuiteReport {
+            runs: vec![
+                mk_run("c1", "m", true, None, None, 1.0, 100, 10, 5),
+                mk_run("c2", "m", false, None, None, 1.0, 100, 10, 5),
+            ],
+            ..Default::default()
+        };
+        let out = render_text(&r, false);
+        assert!(
+            !out.contains("model comparison"),
+            "single-model run should not show comparison:\n{out}"
         );
     }
 }

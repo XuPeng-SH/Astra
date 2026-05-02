@@ -41,6 +41,14 @@ pub struct RunOutcome {
     pub completion_tokens: u64,
     pub prompt_tokens: u64,
     pub duration_ms: u64,
+    /// Number of LLM round-trips (StepStarted events in step_events).
+    pub turn_rounds: u32,
+    /// Number of tool calls that hit the idempotency cache.
+    pub cache_hits: u32,
+    /// Total tool calls (for computing cache rate = cache_hits / total).
+    pub total_tool_calls: u32,
+    /// Time to first token in ms (from JSON envelope).
+    pub ttft_ms: u64,
 }
 
 impl RunOutcome {
@@ -102,6 +110,10 @@ pub struct RunnerConfig {
     /// Optional shared working directory — harness runs from here
     /// so relative paths in cases (if ever added) are stable.
     pub working_dir: Option<PathBuf>,
+    /// Optional profile name passed as `--profile <name>` to astra
+    /// subprocesses. Set by preflight auto-register to isolate
+    /// harness credentials from the user's active profile.
+    pub profile: Option<String>,
 }
 
 impl RunnerConfig {
@@ -110,6 +122,7 @@ impl RunnerConfig {
             astra_bin: astra_bin.into(),
             fallback_models: Vec::new(),
             working_dir: None,
+            profile: None,
         }
     }
     pub fn with_fallback_models(mut self, models: Vec<String>) -> Self {
@@ -150,7 +163,7 @@ pub(crate) fn parse_json_outcome(stdout: &str, model: &str) -> RunOutcome {
             }
             return RunOutcome {
                 model: model.into(),
-                exit_code: 0,
+                exit_code: -1,
                 text: trimmed.to_string(),
                 stderr: String::new(),
                 session_id: None,
@@ -160,17 +173,34 @@ pub(crate) fn parse_json_outcome(stdout: &str, model: &str) -> RunOutcome {
                 completion_tokens: 0,
                 prompt_tokens: 0,
                 duration_ms: 0,
+                turn_rounds: 0,
+                cache_hits: 0,
+                total_tool_calls: 0,
+                ttft_ms: 0,
             };
         }
     };
+    // Merge background agent results into the visible text so
+    // criteria (text_contains, judger) can see child output.
+    let mut text = v
+        .get("text")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    if let Some(bg) = v.get("background_agent_results").and_then(|x| x.as_array()) {
+        for entry in bg {
+            let agent_id = entry
+                .get("agent_id")
+                .and_then(|x| x.as_str())
+                .unwrap_or("?");
+            let result = entry.get("result").and_then(|x| x.as_str()).unwrap_or("");
+            text.push_str(&format!("\n[background:{agent_id}]: {result}"));
+        }
+    }
     RunOutcome {
         model: model.into(),
         exit_code: v.get("exit_code").and_then(|x| x.as_i64()).unwrap_or(0) as i32,
-        text: v
-            .get("text")
-            .and_then(|x| x.as_str())
-            .unwrap_or("")
-            .to_string(),
+        text,
         stderr: String::new(),
         session_id: v
             .get("session_id")
@@ -214,6 +244,10 @@ pub(crate) fn parse_json_outcome(stdout: &str, model: &str) -> RunOutcome {
             .unwrap_or(0),
         prompt_tokens: v.get("prompt_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
         duration_ms: 0,
+        turn_rounds: 0,
+        cache_hits: 0,
+        total_tool_calls: 0,
+        ttft_ms: v.get("ttft_ms").and_then(|x| x.as_u64()).unwrap_or(0),
     }
 }
 
@@ -263,6 +297,39 @@ mod tests {
         let out = parse_json_outcome("not json", "m");
         assert_eq!(out.text, "not json");
         assert_eq!(out.tool_calls_count, 0);
+        assert_eq!(
+            out.exit_code, -1,
+            "fallback must signal anomaly via exit_code=-1"
+        );
+    }
+
+    #[test]
+    fn parse_json_outcome_merges_background_agent_results() {
+        let stdout = r#"{
+            "text": "parent output",
+            "exit_code": 0,
+            "tool_calls_count": 1,
+            "tools_used": ["spawn_agent"],
+            "background_agent_results": [
+                {"agent_id": "child-G1", "result": "inherited-ok"},
+                {"agent_id": "child-G2", "result": "delegate-G2-ok"}
+            ]
+        }"#;
+        let out = parse_json_outcome(stdout, "m");
+        assert!(
+            out.text.contains("inherited-ok"),
+            "background result must appear in text: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains("delegate-G2-ok"),
+            "second background result must appear in text: {}",
+            out.text
+        );
+        assert!(
+            out.text.starts_with("parent output"),
+            "parent text must come first"
+        );
     }
 
     #[test]
@@ -276,6 +343,12 @@ mod tests {
             debug_log: false,
             extra_cli_args: vec![],
             timeout_seconds: 180,
+            capability: None,
+            difficulty: None,
+            weight: 1.0,
+            steps: vec![],
+            setup_cmd: None,
+            teardown_cmd: None,
         };
         let cfg = RunnerConfig::new("astra").with_fallback_models(vec!["sonnet".into()]);
         assert_eq!(resolve_models(&case, &cfg).unwrap(), vec!["opus"]);
@@ -292,6 +365,12 @@ mod tests {
             debug_log: false,
             extra_cli_args: vec![],
             timeout_seconds: 180,
+            capability: None,
+            difficulty: None,
+            weight: 1.0,
+            steps: vec![],
+            setup_cmd: None,
+            teardown_cmd: None,
         };
         let cfg = RunnerConfig::new("astra")
             .with_fallback_models(vec!["sonnet".into(), "minimax".into()]);
@@ -310,6 +389,12 @@ mod tests {
             debug_log: false,
             extra_cli_args: vec![],
             timeout_seconds: 180,
+            capability: None,
+            difficulty: None,
+            weight: 1.0,
+            steps: vec![],
+            setup_cmd: None,
+            teardown_cmd: None,
         };
         let cfg = RunnerConfig::new("astra");
         assert!(resolve_models(&case, &cfg).is_err());

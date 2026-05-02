@@ -1,8 +1,10 @@
 name: hello_text_contains
 description: |
-  Smoke case — send the model a trivial prompt and assert that the
-  reply mentions the magic phrase. No tool calls expected. Used to
-  verify the harness end-to-end before richer cases.
+  **What**: Send a trivial prompt and verify the response contains a specific word.
+  **Tests**: Basic model responsiveness and instruction following.
+  **Why**: Smoke test — if this fails, nothing else will work (auth, routing, model access).
+  **Pass means**: The model is reachable and can follow simple instructions.
+  **Fail means**: Infrastructure issue (auth expired, model unavailable) — not a model capability problem.
 prompt: |
   Please reply with a single short sentence that contains the word
   "astra-harness-ok" verbatim. Do not use any tools.
@@ -12,3 +14,17 @@ criteria:
     code: 0
   - type: text_contains
     needle: astra-harness-ok
+  - type: tokens_between
+    min: 1
+    max: 15000
+  - type: turn_rounds_between
+    min: 1
+    max: 3
+  - type: judger
+    question: |
+      The agent was asked to reply with a sentence containing
+      "astra-harness-ok" and use no tools. Score 1.0 if the output
+      contains the exact token and zero tools were used. Score 0.5 if
+      the token is present but tools were used. Score 0.0 if the token
+      is missing.
+    threshold: 0.5

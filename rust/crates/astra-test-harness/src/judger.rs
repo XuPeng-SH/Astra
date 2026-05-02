@@ -68,7 +68,7 @@ impl JudgerConfig {
         Self {
             astra_bin: astra_bin.into(),
             default_model: default_model.into(),
-            timeout_seconds: 60,
+            timeout_seconds: 120,
         }
     }
 }
@@ -129,6 +129,7 @@ pub async fn evaluate_judger(
                 format!(" votes=[{}]", rendered.join(", "))
             };
             Some(CriterionResult {
+                severity: crate::criteria::CriterionSeverity::Quality,
                 criterion: criterion.clone(),
                 passed,
                 detail: format!(
@@ -141,6 +142,7 @@ pub async fn evaluate_judger(
         }
         Err(e) => Some(CriterionResult {
             criterion: criterion.clone(),
+            severity: crate::criteria::CriterionSeverity::Quality,
             passed: false,
             detail: format!("judger call failed: {e}"),
             full_detail: None,
@@ -334,11 +336,34 @@ pub(crate) fn parse_score_from_response(stdout_body: &str) -> Result<JudgerScore
     // in case the model repeats itself.
     let re = regex::Regex::new(r"(?i)SCORE:\s*([0-9]+(?:\.[0-9]+)?)")
         .map_err(|e| format!("regex compile: {e}"))?;
-    let captured = re
-        .captures_iter(&text)
-        .last()
-        .and_then(|c| c.get(1))
-        .ok_or_else(|| format!("no SCORE: line in judger response; text={text:?}"))?;
+    let captured = match re.captures_iter(&text).last().and_then(|c| c.get(1)) {
+        Some(m) => m,
+        None => {
+            // Fallback: some models output a bare float on the last
+            // line (e.g. "0.85") without the SCORE: prefix. Try to
+            // parse the last non-empty line as a float in [0,1].
+            let fallback = text
+                .lines()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+                .and_then(|l| l.trim().parse::<f64>().ok())
+                .filter(|&v| (0.0..=1.0).contains(&v));
+            if let Some(score) = fallback {
+                eprintln!(
+                    "[astra-test] WARNING: judger omitted SCORE: prefix; \
+                     inferred {score} from last line"
+                );
+                let rationale = text.trim().to_string();
+                return Ok(JudgerScore {
+                    score,
+                    rationale: rationale.chars().take(200).collect(),
+                    full_rationale: rationale,
+                    votes: Vec::new(),
+                });
+            }
+            return Err(format!("no SCORE: line in judger response; text={text:?}"));
+        }
+    };
     let score: f64 = captured
         .as_str()
         .parse()
@@ -561,6 +586,130 @@ pub fn warn_if_same_family(judger_model: &str, tested_models: &[String]) -> bool
     true
 }
 
+// ── External command judger adapter ──────────────────────────────────
+
+/// Judger that pipes `{question, outcome}` JSON to an external process
+/// on stdin and reads `{score, rationale}` JSON from stdout.
+///
+/// Usage: `--judger-cmd "python3 my_judge.py"`
+///
+/// The external process receives:
+/// ```json
+/// {"question": "...", "outcome": {"text": "...", "stderr": "...", ...}}
+/// ```
+/// And must return:
+/// ```json
+/// {"score": 0.85, "rationale": "..."}
+/// ```
+pub struct ExternalCmdJudger {
+    cmd: String,
+    timeout_seconds: u64,
+}
+
+impl ExternalCmdJudger {
+    pub fn new(cmd: impl Into<String>, timeout_seconds: u64) -> Self {
+        Self {
+            cmd: cmd.into(),
+            timeout_seconds,
+        }
+    }
+}
+
+#[async_trait]
+impl Judger for ExternalCmdJudger {
+    async fn score(
+        &self,
+        question: &str,
+        _model_override: Option<&str>,
+        outcome: &RunOutcome,
+    ) -> Result<JudgerScore, String> {
+        use tokio::process::Command;
+
+        let input = serde_json::json!({
+            "protocol_version": "1.1",
+            "question": question,
+            "outcome": {
+                "text": outcome.text,
+                "stderr": outcome.stderr,
+                "exit_code": outcome.exit_code,
+                "tools_used": outcome.tools_used,
+                "tool_calls_count": outcome.tool_calls_count,
+                "completion_tokens": outcome.completion_tokens,
+                "prompt_tokens": outcome.prompt_tokens,
+                "duration_ms": outcome.duration_ms,
+                "turn_rounds": outcome.turn_rounds,
+            }
+        });
+
+        if self.cmd.trim().is_empty() {
+            return Err("judger-cmd is empty".to_string());
+        }
+
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(&self.cmd)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| format!("spawn judger-cmd {}: {e}", self.cmd))?;
+
+        // Write input
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            let payload = serde_json::to_vec(&input).unwrap();
+            // Ignore BrokenPipe — the child may not read stdin (e.g.,
+            // a simple `echo` script). We still proceed to read stdout.
+            let _ = stdin.write_all(&payload).await;
+            drop(stdin);
+        }
+
+        let timeout = std::time::Duration::from_secs(self.timeout_seconds);
+        let output = tokio::time::timeout(timeout, child.wait_with_output())
+            .await
+            .map_err(|_| format!("judger-cmd timed out after {}s", self.timeout_seconds))?
+            .map_err(|e| format!("judger-cmd wait: {e}"))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!(
+                "judger-cmd exited {}: {}",
+                output.status,
+                stderr.chars().take(500).collect::<String>()
+            ));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let v: serde_json::Value = serde_json::from_str(stdout.trim())
+            .map_err(|e| format!("judger-cmd stdout not valid JSON: {e}"))?;
+
+        let raw_score = v
+            .get("score")
+            .and_then(|s| s.as_f64())
+            .ok_or("judger-cmd output missing numeric 'score' field")?;
+        if !(0.0..=1.0).contains(&raw_score) {
+            eprintln!(
+                "[astra-test] WARNING: external judger returned out-of-range score {raw_score}; \
+                 clamped to [0.0, 1.0]"
+            );
+        }
+        let score = raw_score.clamp(0.0, 1.0);
+        let rationale = v
+            .get("rationale")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        Ok(JudgerScore {
+            score,
+            rationale: rationale.clone(),
+            full_rationale: rationale,
+            votes: vec![score],
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,6 +741,19 @@ mod tests {
     #[test]
     fn parse_score_missing_line_fails() {
         let body = r#"{"text":"I have no opinion"}"#;
+        assert!(parse_score_from_response(body).is_err());
+    }
+
+    #[test]
+    fn parse_score_bare_float_fallback() {
+        let body = r#"{"text":"The agent did well.\n0.85"}"#;
+        let s = parse_score_from_response(body).unwrap();
+        assert!((s.score - 0.85).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_score_bare_float_out_of_range_still_fails() {
+        let body = r#"{"text":"Some text\n5.0"}"#;
         assert!(parse_score_from_response(body).is_err());
     }
 
@@ -628,6 +790,8 @@ mod tests {
         let mut perms = std::fs::metadata(&shim).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&shim, perms).unwrap();
+        // Ensure the file is fully flushed before exec (prevents ETXTBSY under load).
+        std::process::Command::new("sync").status().ok();
 
         let cfg = JudgerConfig::new(shim, "sonnet");
         let j = AstraCliJudger::new(cfg);
@@ -664,6 +828,10 @@ mod tests {
             completion_tokens: 0,
             prompt_tokens: 0,
             duration_ms: 0,
+            turn_rounds: 0,
+            cache_hits: 0,
+            total_tool_calls: 0,
+            ttft_ms: 0,
         }
     }
 
@@ -770,6 +938,10 @@ mod tests {
             completion_tokens: 0,
             prompt_tokens: 0,
             duration_ms: 0,
+            turn_rounds: 0,
+            cache_hits: 0,
+            total_tool_calls: 0,
+            ttft_ms: 0,
         }
     }
 
@@ -1039,5 +1211,119 @@ mod tests {
             "some-unknown-model",
             &["claude-sonnet-4-6".into()],
         ));
+    }
+
+    // ── ExternalCmdJudger tests ──
+
+    #[tokio::test]
+    async fn external_judger_happy_path() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let script = r#"echo '{"score": 0.85, "rationale": "looks good"}'"#;
+        let j = ExternalCmdJudger::new(script, 10);
+        let s = j
+            .score("is it good?", None, &dummy_outcome())
+            .await
+            .unwrap();
+        assert!((s.score - 0.85).abs() < 1e-9);
+        assert_eq!(s.rationale, "looks good");
+        assert_eq!(s.votes, vec![0.85]);
+    }
+
+    #[tokio::test]
+    async fn external_judger_clamps_out_of_range_score() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let script = r#"echo '{"score": 1.5, "rationale": "overconfident"}'"#;
+        let j = ExternalCmdJudger::new(script, 10);
+        let s = j.score("q", None, &dummy_outcome()).await.unwrap();
+        assert!((s.score - 1.0).abs() < 1e-9, "score must be clamped to 1.0");
+    }
+
+    #[tokio::test]
+    async fn external_judger_empty_cmd() {
+        let j = ExternalCmdJudger::new("", 10);
+        let err = j
+            .score("q", None, &dummy_outcome())
+            .await
+            .expect_err("empty cmd must fail");
+        assert!(err.contains("empty"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn external_judger_nonzero_exit_is_error() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let script = r#"echo 'provider crashed' >&2; exit 1"#;
+        let j = ExternalCmdJudger::new(script, 10);
+        let err = j
+            .score("q", None, &dummy_outcome())
+            .await
+            .expect_err("non-zero exit must fail");
+        assert!(err.contains("provider crashed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn external_judger_invalid_json_is_error() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let script = r#"echo 'not json at all'"#;
+        let j = ExternalCmdJudger::new(script, 10);
+        let err = j
+            .score("q", None, &dummy_outcome())
+            .await
+            .expect_err("garbage stdout must fail");
+        assert!(err.contains("not valid JSON"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn external_judger_missing_score_field_is_error() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let script = r#"echo '{"rationale": "no score field"}'"#;
+        let j = ExternalCmdJudger::new(script, 10);
+        let err = j
+            .score("q", None, &dummy_outcome())
+            .await
+            .expect_err("missing score field must fail");
+        assert!(err.contains("score"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn external_judger_timeout() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let j = ExternalCmdJudger::new("sleep 30", 1);
+        let err = j
+            .score("q", None, &dummy_outcome())
+            .await
+            .expect_err("timeout must fail");
+        assert!(err.contains("timed out"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn external_judger_receives_protocol_version() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        // Read stdin, check for protocol_version, output a valid score.
+        let script = r#"
+INPUT=$(cat)
+if echo "$INPUT" | grep -q '"protocol_version":"1.1"'; then
+  echo '{"score": 1.0, "rationale": "protocol ok"}'
+else
+  echo '{"score": 0.0, "rationale": "no protocol_version"}' >&2
+  exit 1
+fi
+"#;
+        let j = ExternalCmdJudger::new(script, 10);
+        let s = j.score("q", None, &dummy_outcome()).await.unwrap();
+        assert!((s.score - 1.0).abs() < 1e-9);
     }
 }
