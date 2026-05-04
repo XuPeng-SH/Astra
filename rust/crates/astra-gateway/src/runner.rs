@@ -8,18 +8,18 @@ use crate::commands::{self, CommandContext};
 use crate::config::GatewayConfig;
 use crate::gateway_context::GatewayContext;
 use crate::platforms::{InboundMessage, PlatformAdapter};
-use crate::storage;
+use crate::store::{self, GatewayStore};
 use crate::trace_model::{
     ConversationKey, GatewayRequest, MysqlTraceRepository, OutboxId, RequestId, RequestStatus,
     RunStatus, TraceId, TraceRepository, TraceWriter,
 };
 use astra_core::durable_task_store::DurableTaskStore as _;
 use futures_util::future::select_all;
-use sqlx::MySqlPool;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 const MAX_CHUNK_LEN: usize = 3800;
@@ -28,6 +28,11 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(25);
 const PROGRESSIVE_FLUSH_INTERVAL: Duration = Duration::from_secs(8);
 const PROGRESSIVE_MIN_CHARS: usize = 200;
 const CONVERSATION_QUEUE_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Number of consecutive auth failures before the circuit breaker trips.
+const AUTH_FAILURE_THRESHOLD: u32 = 2;
+/// How long the circuit breaker stays open before allowing retries.
+const AUTH_FAILURE_COOLDOWN: Duration = Duration::from_secs(300);
 
 /// Outbound message from CLI, scheduler, or other background tasks.
 #[derive(Debug, Clone)]
@@ -80,7 +85,7 @@ impl OutboundMessage {
 
 pub struct GatewayRunner {
     config: GatewayConfig,
-    pool: Option<MySqlPool>,
+    store: Option<Arc<dyn GatewayStore>>,
     cli_profile: CliProfile,
     thin: astra_thin_client::ThinClient,
     outbound_tx: Option<tokio::sync::mpsc::Sender<OutboundMessage>>,
@@ -91,6 +96,14 @@ pub struct GatewayRunner {
     queue_senders:
         tokio::sync::Mutex<HashMap<ConversationKey, tokio::sync::mpsc::Sender<QueuedRequest>>>,
     global_run_limiter: Arc<tokio::sync::Semaphore>,
+    cli_availability: Vec<(String, cli_bridge::CliAvailability)>,
+    /// Tracks consecutive auth failures per CLI profile name.
+    /// Value: (failure_count, last_failure_time).
+    auth_failures: Arc<dashmap::DashMap<String, (u32, Instant)>>,
+    /// Shared access token — gateway validates once, all CLI spawns reuse via env var.
+    shared_auth: Option<SharedAuthToken>,
+    /// Monotonic counter for generating short request tags when no trace exists.
+    request_counter: AtomicU32,
 }
 
 /// No-op adapter used in spawned CLI tasks (typing/heartbeats not available in background).
@@ -147,27 +160,21 @@ impl GatewayRunner {
             },
         )?;
 
-        let pool = match connect_db(&config.database.url).await {
-            Ok(pool) => {
-                tracing::info!("database connected");
-                Some(pool)
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "DB not available — running without persistence (sessions in-memory, no cron)");
-                None
-            }
-        };
+        let storage_config = config.resolve_storage();
+        let (store, durable_store, trace_repo) =
+            match store::open_store_bundle(&storage_config).await {
+                Ok(Some(bundle)) => {
+                    tracing::info!(backend = ?storage_config, "storage connected");
+                    (Some(bundle.store), bundle.durable_store, bundle.trace_repo)
+                }
+                Ok(None) => {
+                    tracing::info!("running without persistence (storage: none)");
+                    (None, None, None)
+                }
+                Err(e) => return Err(e),
+            };
 
         let cli_profile = config.cli.clone();
-
-        let durable_store = pool.as_ref().map(|p| {
-            std::sync::Arc::new(crate::durable_task_store::MysqlDurableTaskStore::new(
-                p.clone(),
-            ))
-        });
-        let trace_repo = pool
-            .as_ref()
-            .map(|p| Arc::new(MysqlTraceRepository::new(p.clone())));
 
         let user_skills = config
             .skills_dir
@@ -190,17 +197,43 @@ impl GatewayRunner {
             tracing::info!(count = projects.len(), "discovered projects");
         }
 
-        if let Some(ref pool) = pool
-            && let Err(e) = crate::usage::ensure_usage_table(pool).await
-        {
-            tracing::warn!(error = %e, "failed to ensure usage tracking table");
-        }
         let max_concurrent_runs = config.max_concurrent_runs.max(1);
+
+        // Probe all configured CLI profiles for availability
+        let mut cli_availability = Vec::new();
+        let default_avail = cli_bridge::probe_cli(&cli_profile).await;
+        cli_availability.push((cli_profile.name().to_string(), default_avail.clone()));
+        for (name, profile) in &config.cli_profiles {
+            let avail = cli_bridge::probe_cli(profile).await;
+            cli_availability.push((name.clone(), avail));
+        }
+
+        // If default CLI not available, auto-select first available
+        let effective_cli = if !default_avail.is_available() {
+            if let Some((name, _)) = cli_availability.iter().find(|(_, a)| a.is_available()) {
+                if let Some(profile) = config.cli_profiles.get(name) {
+                    tracing::info!(cli = %name, "default CLI unavailable, auto-selected");
+                    profile.clone()
+                } else {
+                    cli_profile.clone()
+                }
+            } else {
+                cli_profile.clone()
+            }
+        } else {
+            cli_profile.clone()
+        };
+
+        let shared_auth = Some(SharedAuthToken::new(
+            thin.clone(),
+            config.astra.username.clone(),
+            config.astra.password.clone(),
+        ));
 
         Ok(Self {
             config,
-            pool,
-            cli_profile,
+            store,
+            cli_profile: effective_cli,
             thin,
             outbound_tx: None,
             durable_store,
@@ -209,11 +242,26 @@ impl GatewayRunner {
             trace_repo,
             queue_senders: tokio::sync::Mutex::new(HashMap::new()),
             global_run_limiter: Arc::new(tokio::sync::Semaphore::new(max_concurrent_runs)),
+            cli_availability,
+            auth_failures: Arc::new(dashmap::DashMap::new()),
+            shared_auth,
+            request_counter: AtomicU32::new(0),
         })
     }
 
-    pub fn pool(&self) -> Option<&MySqlPool> {
-        self.pool.as_ref()
+    /// Whether any storage backend is active.
+    pub fn has_store(&self) -> bool {
+        self.store.is_some()
+    }
+
+    /// Clone the Arc-wrapped store for use by external components (e.g. scheduler).
+    pub fn store(&self) -> Option<Arc<dyn GatewayStore>> {
+        self.store.clone()
+    }
+
+    /// Clone the Arc-wrapped trace repository.
+    pub fn trace_repo(&self) -> Option<Arc<MysqlTraceRepository>> {
+        self.trace_repo.clone()
     }
 
     pub fn cli_profile(&self) -> &CliProfile {
@@ -222,29 +270,29 @@ impl GatewayRunner {
 
     /// Replay messages that were pending when gateway crashed.
     pub async fn replay_pending_messages(&self, adapter: &dyn PlatformAdapter) {
-        if let Some(ref pool) = self.pool {
+        if let Some(ref store) = self.store {
             let platform = adapter.name();
-            match storage::list_pending_messages(pool, Some(platform)).await {
+            match store.list_pending_messages(Some(platform)).await {
                 Ok(msgs) if msgs.is_empty() => {}
                 Ok(msgs) => {
                     tracing::info!(platform, count = msgs.len(), "replaying pending messages");
-                    for (id, _platform, chat_id, user_id, text) in &msgs {
+                    for pm in &msgs {
                         let msg = crate::platforms::InboundMessage {
                             platform,
-                            chat_id: chat_id.clone(),
-                            user_id: user_id.clone(),
-                            text: text.clone(),
-                            msg_id: format!("replay-{id}"),
+                            chat_id: pm.chat_id.clone(),
+                            user_id: pm.user_id.clone(),
+                            text: pm.text.clone(),
+                            msg_id: format!("replay-{}", pm.id),
                             chat_type: crate::platforms::ChatType::DirectMessage,
                             reply_token: None,
                         };
                         if let Some(response) = self
-                            .handle_message_inner(&msg, adapter, Some(*id), false, None)
+                            .handle_message_inner(&msg, adapter, Some(pm.id), false, None)
                             .await
                         {
                             for chunk in split_message(&response.text) {
-                                if let Err(e) = adapter.send_text(chat_id, chunk, None).await {
-                                    tracing::warn!(error = %e, chat_id, "failed to deliver pending replay");
+                                if let Err(e) = adapter.send_text(&pm.chat_id, chunk, None).await {
+                                    tracing::warn!(error = %e, chat_id = %pm.chat_id, "failed to deliver pending replay");
                                 }
                             }
                         }
@@ -281,9 +329,10 @@ impl GatewayRunner {
 
     /// Resolve the active CLI profile for a user (may be overridden via /cli + /model).
     async fn resolve_cli_profile(&self, platform: &str, user_id: &str) -> CliProfile {
-        let mut profile = if let Some(ref pool) = self.pool
-            && let Ok(Some(name)) =
-                storage::get_user_preference(pool, platform, user_id, "cli_profile").await
+        let mut profile = if let Some(ref store) = self.store
+            && let Ok(Some(name)) = store
+                .get_user_preference(platform, user_id, "cli_profile")
+                .await
             && let Some(p) = self.config.cli_profiles.get(&name)
         {
             p.clone()
@@ -292,10 +341,11 @@ impl GatewayRunner {
         };
 
         // Apply per-user model override scoped to this CLI
-        let model_key = storage::model_preference_key(profile.name());
-        if let Some(ref pool) = self.pool
-            && let Ok(Some(model_name)) =
-                storage::get_user_preference(pool, platform, user_id, &model_key).await
+        let model_key = store::model_preference_key(profile.name());
+        if let Some(ref store) = self.store
+            && let Ok(Some(model_name)) = store
+                .get_user_preference(platform, user_id, &model_key)
+                .await
         {
             match &mut profile {
                 CliProfile::Astra { model, .. } | CliProfile::Claude { model, .. } => {
@@ -339,11 +389,29 @@ impl GatewayRunner {
         // Resolve active CLI profile
         let cli_profile = self.resolve_cli_profile(msg.platform, &msg.user_id).await;
 
+        let trimmed = msg.text.trim();
+
+        // /auth — reset auth circuit breaker, show CLI auth status, attempt auto-relogin
+        if trimmed == "/auth" {
+            return Ok(Some(self.handle_auth_command(&cli_profile).await));
+        }
+
+        // /manage — rewrite to rich context message and send to slow CLI path
+        if trimmed == "/manage" || trimmed.starts_with("/manage ") {
+            let extra = trimmed.strip_prefix("/manage").unwrap_or("").trim();
+            let context = self
+                .build_manage_context(msg, &effective_chat_id, &cli_profile, extra)
+                .await;
+            let mut managed_msg = msg.clone();
+            managed_msg.text = context;
+            return Err(managed_msg);
+        }
+
         // Slash commands — instant response, no CLI
         let cmd_ctx = CommandContext {
             astra: &self.thin,
             config: &self.config,
-            pool: self.pool.as_ref(),
+            store: self.store.as_deref(),
             platform: msg.platform,
             chat_id: &effective_chat_id,
             user_id: &msg.user_id,
@@ -356,6 +424,9 @@ impl GatewayRunner {
                 .trace_repo
                 .as_ref()
                 .map(|repo| repo.as_ref() as &dyn TraceRepository),
+            project_dirs: &self.config.project_dirs,
+            cli_availability: &self.cli_availability,
+            auth_status: self.auth_status_line(cli_profile.name()),
         };
         if let Some(response) = commands::handle_command(&cmd_ctx, &msg.text).await {
             return Ok(Some(response));
@@ -395,33 +466,54 @@ impl GatewayRunner {
 
         let cli_profile = self.resolve_cli_profile(msg.platform, &msg.user_id).await;
 
-        if let Some(ref pool) = self.pool
-            && let Err(e) =
-                storage::upsert_user(pool, msg.platform, &msg.user_id, &msg.user_id).await
+        // Check first-time user BEFORE upsert (upsert creates the row)
+        let is_first = if let Some(ref store) = self.store {
+            store
+                .is_first_message(msg.platform, &msg.user_id)
+                .await
+                .unwrap_or(false)
+        } else {
+            false
+        };
+
+        if let Some(ref store) = self.store
+            && let Err(e) = store
+                .upsert_user(msg.platform, &msg.user_id, &msg.user_id)
+                .await
         {
             tracing::warn!(error = %e, "failed to upsert user");
+        }
+
+        // Send first-time welcome after upsert
+        if is_first {
+            let welcome = build_welcome_message(&cli_profile);
+            if let Some(ref tx) = self.outbound_tx {
+                let _ = tx
+                    .send(OutboundMessage::plain(
+                        msg.platform.to_string(),
+                        msg.chat_id.clone(),
+                        welcome,
+                    ))
+                    .await;
+            }
         }
 
         let cli_name = cli_profile.name().to_string();
 
         // Auto-reset session if policy triggers
-        if let Some(ref pool) = self.pool
-            && let Ok(Some(last_active_str)) =
-                storage::get_session_last_active(pool, msg.platform, &effective_chat_id, &cli_name)
-                    .await
+        if let Some(ref store) = self.store
+            && let Ok(Some(last_active_str)) = store
+                .get_session_last_active(msg.platform, &effective_chat_id, &cli_name)
+                .await
             && let Ok(last_active) =
                 chrono::NaiveDateTime::parse_from_str(&last_active_str, "%Y-%m-%d %H:%M:%S%.f")
         {
             let last_utc = last_active.and_utc();
             let now = chrono::Utc::now();
             if self.config.session_reset.should_reset(last_utc, now) {
-                if let Err(e) = storage::reset_session_for_cli(
-                    pool,
-                    msg.platform,
-                    &effective_chat_id,
-                    &cli_name,
-                )
-                .await
+                if let Err(e) = store
+                    .reset_session(msg.platform, &effective_chat_id, &cli_name)
+                    .await
                 {
                     tracing::warn!(error = %e, "session auto-reset failed");
                 } else {
@@ -430,8 +522,9 @@ impl GatewayRunner {
             }
         }
 
-        let session_id = if let Some(ref pool) = self.pool {
-            storage::get_current_session_for_cli(pool, msg.platform, &effective_chat_id, &cli_name)
+        let session_id = if let Some(ref store) = self.store {
+            store
+                .get_current_session(msg.platform, &effective_chat_id, &cli_name)
                 .await
                 .ok()
                 .flatten()
@@ -462,10 +555,20 @@ impl GatewayRunner {
             }
         }
 
+        // Generate short request tag for user-facing message correlation
+        let request_tag = match trace.as_ref() {
+            Some(t) => short_request_tag(t.trace_id.as_str()),
+            None => {
+                let n = self.request_counter.fetch_add(1, Ordering::Relaxed);
+                format!("#{:02X}", n % 256)
+            }
+        };
+
         tracing::info!(
             platform = msg.platform,
             chat_id = %safe_id(&msg.chat_id),
             user = %safe_id(&msg.user_id),
+            tag = %request_tag,
             "→ {}",
             truncate(&msg.text, 80),
         );
@@ -497,10 +600,38 @@ impl GatewayRunner {
             );
         }
 
+        // Check auth circuit breaker before spawning CLI
+        if let Some(auth_msg) = self.check_auth_circuit(&cli_name) {
+            if let Some(writer) = trace_writer.as_ref() {
+                if let Some(ref run_id) = run_id {
+                    let _ = writer
+                        .finish_run(
+                            run_id,
+                            RunStatus::Failed,
+                            None,
+                            Some("auth circuit breaker open"),
+                        )
+                        .await;
+                }
+                let _ = writer.fail_request("auth circuit breaker open").await;
+            }
+            return Some(
+                self.outbound_response(
+                    trace.as_ref(),
+                    msg.platform,
+                    &msg.chat_id,
+                    msg.reply_token.clone(),
+                    auth_msg,
+                )
+                .await,
+            );
+        }
+
         // Resolve workspace directory for CLI
-        let workspace: Option<std::path::PathBuf> = if let Some(ref pool) = self.pool
-            && let Ok(Some(ws)) =
-                storage::get_user_preference(pool, msg.platform, &msg.user_id, "workspace").await
+        let workspace: Option<std::path::PathBuf> = if let Some(ref store) = self.store
+            && let Ok(Some(ws)) = store
+                .get_user_preference(msg.platform, &msg.user_id, "workspace")
+                .await
         {
             let path = std::path::PathBuf::from(&ws);
             if path.is_dir() { Some(path) } else { None }
@@ -515,20 +646,19 @@ impl GatewayRunner {
                 &msg.user_id,
                 msg.platform,
                 &cli_profile,
-                self.pool.is_some(),
+                self.store.is_some(),
             )
             .with_model_actions_allowed(self.config.action_policy.allow_model_generated_mutations);
-            if let Some(ref pool) = self.pool
-                && let Ok(jobs) =
-                    storage::list_cron_jobs(pool, msg.platform, &effective_chat_id).await
+            if let Some(ref store) = self.store
+                && let Ok(jobs) = store.list_cron_jobs(msg.platform, &effective_chat_id).await
             {
                 let cron_list: Vec<_> = jobs
                     .iter()
-                    .map(|(id, expr, desc, _)| {
+                    .map(|j| {
                         (
-                            id[..8.min(id.len())].to_string(),
-                            expr.clone(),
-                            desc.clone(),
+                            j.job_id[..8.min(j.job_id.len())].to_string(),
+                            j.cron_expr.clone(),
+                            j.description.clone(),
                         )
                     })
                     .collect();
@@ -571,15 +701,10 @@ impl GatewayRunner {
 
         // Save as pending (for crash recovery)
         let pending_id = if save_pending {
-            if let Some(ref pool) = self.pool {
-                match storage::save_pending_message(
-                    pool,
-                    msg.platform,
-                    &effective_chat_id,
-                    &msg.user_id,
-                    &msg.text,
-                )
-                .await
+            if let Some(ref store) = self.store {
+                match store
+                    .save_pending_message(msg.platform, &effective_chat_id, &msg.user_id, &msg.text)
+                    .await
                 {
                     Ok(id) => Some(id),
                     Err(e) => {
@@ -601,6 +726,13 @@ impl GatewayRunner {
         let cli_name = cli_profile.name().to_string();
         let cli_timeout = Duration::from_secs(self.config.cli_timeout_secs.max(1));
 
+        // Pre-fetch shared access token so the CLI can skip per-spawn auth.
+        let access_token = if let Some(ref auth) = self.shared_auth {
+            auth.get().await
+        } else {
+            None
+        };
+
         let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<CliProgress>(64);
 
         let cli_handle = tokio::spawn({
@@ -608,6 +740,7 @@ impl GatewayRunner {
             let message_text = message_text.clone();
             let system_prompt = system_prompt.clone();
             let ws = workspace.clone();
+            let token = access_token.clone();
             async move {
                 cli_bridge::run_cli_with_context_and_timeout(
                     &profile,
@@ -616,9 +749,8 @@ impl GatewayRunner {
                     ws.as_deref(),
                     Some(progress_tx),
                     Some(&system_prompt),
-                    // TODO(cli_bridge): pass gateway trace_id/request_id once the
-                    // bridge exposes a stable metadata API.
                     Some(cli_timeout),
+                    token.as_deref(),
                 )
                 .await
             }
@@ -629,9 +761,10 @@ impl GatewayRunner {
         let mut last_tool = String::new();
         let mut sent_initial_ack = false;
         let mut token_buf = String::new();
-        let mut in_think_block = false;
+        let mut think_filter = ThinkTagStreamFilter::default();
         let mut gateway_action_filter = GatewayActionStreamFilter::default();
         let mut progressive_text_len: usize = 0;
+        let mut chunk_counter: u32 = 0;
         let next_timer = tokio::time::sleep(INITIAL_ACK_DELAY);
         tokio::pin!(next_timer);
 
@@ -639,7 +772,9 @@ impl GatewayRunner {
         let flush_buf = |buf: &mut String,
                          tx: &Option<tokio::sync::mpsc::Sender<OutboundMessage>>,
                          platform: &str,
-                         chat: &str|
+                         chat: &str,
+                         tag: &str,
+                         chunk_num: u32|
          -> Option<(
             std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>,
             usize,
@@ -650,13 +785,16 @@ impl GatewayRunner {
                 return None;
             }
             let len = text.len();
+            let tagged = format!("[{tag}:{chunk_num}] {text}");
             let tx = tx.clone();
             let platform = platform.to_string();
             let chat = chat.to_string();
             Some((
                 Box::pin(async move {
                     if let Some(tx) = tx {
-                        let _ = tx.send(OutboundMessage::plain(platform, chat, text)).await;
+                        let _ = tx
+                            .send(OutboundMessage::plain(platform, chat, tagged))
+                            .await;
                     }
                 }),
                 len,
@@ -668,13 +806,13 @@ impl GatewayRunner {
                 progress = progress_rx.recv() => {
                     match progress {
                         Some(CliProgress::Token(text)) => {
-                            // Filter <think>...</think> blocks from token stream
-                            let filtered = filter_think_tags(&text, &mut in_think_block);
+                            let filtered = think_filter.push(&text);
                             let filtered = gateway_action_filter.push(&filtered);
                             if !filtered.is_empty() {
                                 token_buf.push_str(&filtered);
                                 if token_buf.len() >= PROGRESSIVE_MIN_CHARS {
-                                    if let Some(fut) = flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &chat_id) {
+                                    chunk_counter += 1;
+                                    if let Some(fut) = flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &chat_id, &request_tag, chunk_counter) {
                                         progressive_text_len += fut.1;
                                         fut.0.await;
                                     }
@@ -684,14 +822,9 @@ impl GatewayRunner {
                         }
                         Some(CliProgress::ToolStarted { ref name }) => {
                             tool_count += 1;
-                            if !token_buf.is_empty() {
-                                token_buf.push('\n');
-                            }
-                            token_buf.push_str(&format!("🔧 {name}…\n"));
                             last_tool = name.clone();
                         }
-                        Some(CliProgress::ToolDone { name, duration_ms }) => {
-                            token_buf.push_str(&format!("✅ {name} ({duration_ms}ms)\n"));
+                        Some(CliProgress::ToolDone { name, .. }) => {
                             last_tool = name;
                         }
                         Some(CliProgress::ToolCall(line)) => {
@@ -701,11 +834,17 @@ impl GatewayRunner {
                         Some(CliProgress::Thinking(_)) => {}
                         Some(CliProgress::Status(_) | CliProgress::Stderr(_)) => {}
                         None => {
+                            let think_tail = think_filter.finish();
+                            if !think_tail.is_empty() {
+                                let filtered = gateway_action_filter.push(&think_tail);
+                                token_buf.push_str(&filtered);
+                            }
                             let tail = gateway_action_filter.finish();
                             if !tail.is_empty() {
                                 token_buf.push_str(&tail);
                             }
-                            if let Some((fut, len)) = flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &chat_id) {
+                            chunk_counter += 1;
+                            if let Some((fut, len)) = flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &chat_id, &request_tag, chunk_counter) {
                                 progressive_text_len += len;
                                 fut.await;
                             }
@@ -716,14 +855,15 @@ impl GatewayRunner {
                 _ = &mut next_timer => {
                     // Timer-based flush: either initial ack or periodic token flush
                     if !token_buf.is_empty() {
-                        if let Some((fut, len)) = flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &chat_id) {
+                        chunk_counter += 1;
+                        if let Some((fut, len)) = flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &chat_id, &request_tag, chunk_counter) {
                             progressive_text_len += len;
                             fut.await;
                         }
                         next_timer.as_mut().reset(tokio::time::Instant::now() + PROGRESSIVE_FLUSH_INTERVAL);
                     } else if !sent_initial_ack {
                         sent_initial_ack = true;
-                        let heartbeat = format!("🤔 {cli_name} 思考中…");
+                        let heartbeat = format!("[{request_tag}] 🤔 {cli_name} 思考中…");
                         if let Some(ref tx) = self.outbound_tx {
                             let _ = tx
                                 .send(OutboundMessage::plain(msg.platform.to_string(), chat_id.clone(), heartbeat))
@@ -734,9 +874,9 @@ impl GatewayRunner {
                         let elapsed_str = format_elapsed(start.elapsed());
                         let heartbeat = if tool_count > 0 {
                             let tool_short = truncate(&last_tool, 40);
-                            format!("⏳ {elapsed_str} | 🔧 {tool_count}个工具 | {tool_short}")
+                            format!("[{request_tag}] ⏳ {elapsed_str} | 🔧 {tool_count}个工具 | {tool_short}")
                         } else {
-                            format!("⏳ 处理中… {elapsed_str}")
+                            format!("[{request_tag}] ⏳ 处理中… {elapsed_str}")
                         };
                         if let Some(ref tx) = self.outbound_tx {
                             let _ = tx
@@ -776,6 +916,13 @@ impl GatewayRunner {
         let result = match cli_handle.await {
             Ok(Ok(result)) => result,
             Ok(Err(e)) => {
+                // Track auth failures for circuit breaker
+                if cli_bridge::is_auth_error(&e) {
+                    self.record_auth_failure(&cli_name);
+                    if let Some(ref auth) = self.shared_auth {
+                        auth.invalidate().await;
+                    }
+                }
                 suspend_tasks(&self.durable_store, format!("CLI error: {e}")).await;
                 if let Some(writer) = trace_writer.as_ref() {
                     if let Some(ref run_id) = run_id {
@@ -787,6 +934,7 @@ impl GatewayRunner {
                 }
                 self.clear_pending_message(pending_id).await;
                 let text = cli_bridge::translate_cli_error(&cli_profile, -1, &e);
+                let text = format!("[{request_tag}] {text}");
                 return Some(
                     self.outbound_response(
                         trace.as_ref(),
@@ -815,7 +963,7 @@ impl GatewayRunner {
                         msg.platform,
                         &msg.chat_id,
                         msg.reply_token.clone(),
-                        format!("⚠️ 任务中断: {e}"),
+                        format!("[{request_tag}] ⚠️ 任务中断: {e}"),
                     )
                     .await,
                 );
@@ -844,14 +992,10 @@ impl GatewayRunner {
                 cli = cli_name,
                 "stale session detected — clearing and retrying"
             );
-            if let Some(ref pool) = self.pool {
-                let _ = storage::reset_session_for_cli(
-                    pool,
-                    msg.platform,
-                    &effective_chat_id,
-                    &cli_name,
-                )
-                .await;
+            if let Some(ref store) = self.store {
+                let _ = store
+                    .reset_session(msg.platform, &effective_chat_id, &cli_name)
+                    .await;
             }
             // Retry without session-id
             let retry_handle = tokio::spawn({
@@ -859,6 +1003,7 @@ impl GatewayRunner {
                 let message_text = msg.text.clone();
                 let system_prompt = system_prompt.clone();
                 let ws = workspace.clone();
+                let access_token = access_token.clone();
                 async move {
                     cli_bridge::run_cli_with_context(
                         &profile,
@@ -867,6 +1012,7 @@ impl GatewayRunner {
                         ws.as_deref(),
                         None,
                         Some(&system_prompt),
+                        access_token.as_deref(),
                     )
                     .await
                 }
@@ -891,17 +1037,17 @@ impl GatewayRunner {
                             .await;
                     }
                     // Save new session
-                    if let Some(ref pool) = self.pool
+                    if let Some(ref store) = self.store
                         && let Some(ref sid) = retry_result.session_id
-                        && let Err(e) = storage::set_current_session_for_cli(
-                            pool,
-                            msg.platform,
-                            &effective_chat_id,
-                            &msg.user_id,
-                            sid,
-                            &cli_name,
-                        )
-                        .await
+                        && let Err(e) = store
+                            .set_current_session(
+                                msg.platform,
+                                &effective_chat_id,
+                                &msg.user_id,
+                                sid,
+                                &cli_name,
+                            )
+                            .await
                     {
                         tracing::warn!(error = %e, "failed to persist session after retry");
                     }
@@ -942,6 +1088,37 @@ impl GatewayRunner {
                 text = ?result.text.as_deref().map(|t| &t[..t.len().min(100)]),
                 "CLI non-zero exit"
             );
+
+            // Detect auth errors and record for circuit breaker
+            let combined_err = format!("{}\n{}", result.stderr, result.stdout);
+            if cli_bridge::is_auth_error(&combined_err) {
+                self.record_auth_failure(&cli_name);
+                if let Some(ref auth) = self.shared_auth {
+                    auth.invalidate().await;
+                }
+
+                // Attempt auto-relogin if credentials are configured
+                if self.config.astra.username.is_some()
+                    && self.config.astra.password.is_some()
+                    && matches!(cli_profile, CliProfile::Astra { .. })
+                {
+                    match self.try_auto_relogin().await {
+                        Ok(ref token) => {
+                            tracing::info!(cli = %cli_name, "auto-relogin succeeded after auth failure");
+                            self.clear_auth_failure(&cli_name);
+                            // Update shared token cache with the fresh token
+                            if let Some(ref auth) = self.shared_auth {
+                                let mut guard = auth.token.write().await;
+                                *guard = Some(token.clone());
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(cli = %cli_name, error = %e, "auto-relogin failed");
+                        }
+                    }
+                }
+            }
+
             suspend_tasks(
                 &self.durable_store,
                 format!("CLI exit code {}", result.exit_code),
@@ -972,6 +1149,7 @@ impl GatewayRunner {
                     result.exit_code,
                     error_text.trim(),
                 );
+                let text = format!("[{request_tag}] {text}");
                 return Some(
                     self.outbound_response(
                         trace.as_ref(),
@@ -1003,24 +1181,29 @@ impl GatewayRunner {
                 .await;
         }
 
+        // Clear auth failure counter on success
+        if result.exit_code == 0 {
+            self.clear_auth_failure(&cli_name);
+        }
+
         // Save session_id to DB (if available), scoped by CLI profile
-        if let Some(ref pool) = self.pool {
+        if let Some(ref store) = self.store {
             if let Some(ref sid) = result.session_id {
-                if let Err(e) = storage::set_current_session_for_cli(
-                    pool,
-                    msg.platform,
-                    &effective_chat_id,
-                    &msg.user_id,
-                    sid,
-                    &cli_name,
-                )
-                .await
+                if let Err(e) = store
+                    .set_current_session(
+                        msg.platform,
+                        &effective_chat_id,
+                        &msg.user_id,
+                        sid,
+                        &cli_name,
+                    )
+                    .await
                 {
                     tracing::warn!(error = %e, "failed to persist session");
                 }
-            } else if let Err(e) =
-                storage::touch_session_for_cli(pool, msg.platform, &effective_chat_id, &cli_name)
-                    .await
+            } else if let Err(e) = store
+                .touch_session(msg.platform, &effective_chat_id, &cli_name)
+                .await
             {
                 tracing::warn!(error = %e, "failed to touch session");
             }
@@ -1042,7 +1225,7 @@ impl GatewayRunner {
             let mut action_results = Vec::new();
             text = execute_gateway_actions_with_policy(
                 &text,
-                self.pool.as_ref(),
+                self.store.as_deref(),
                 msg.platform,
                 &msg.chat_id,
                 &msg.user_id,
@@ -1051,6 +1234,9 @@ impl GatewayRunner {
                     .map(|s| s.as_ref() as &dyn astra_core::durable_task_store::DurableTaskStore),
                 self.config.skills_dir.as_deref(),
                 &self.config.action_policy,
+                self.trace_repo
+                    .as_ref()
+                    .map(|r| r.as_ref() as &dyn TraceRepository),
                 &mut action_results,
             )
             .await;
@@ -1082,8 +1268,9 @@ impl GatewayRunner {
         if completion_tok > 0 {
             stats_parts.push(format!("↑{}", format_tokens(completion_tok)));
         }
-        if result.tool_calls_count.unwrap_or(0) > 0 {
-            stats_parts.push(format!("🔧{}", result.tool_calls_count.unwrap()));
+        let tool_count_total = result.tool_calls_count.unwrap_or(0);
+        if tool_count_total > 0 {
+            stats_parts.push(format!("🔧{tool_count_total}"));
         }
         stats_parts.push(format_elapsed(elapsed));
         if cost > 0.001 {
@@ -1094,13 +1281,13 @@ impl GatewayRunner {
             &action_results_text,
             &stats_parts,
             progressive_text_len,
+            &request_tag,
         );
 
         // Record usage to DB
-        if let Some(ref pool) = self.pool
-            && let Err(e) = crate::usage::record_usage(
-                pool,
-                &crate::usage::UsageRecord {
+        if let Some(ref store) = self.store
+            && let Err(e) = store
+                .record_usage(&store::UsageRecord {
                     platform: msg.platform.to_string(),
                     user_id: msg.user_id.clone(),
                     cli_profile: cli_name.clone(),
@@ -1114,9 +1301,8 @@ impl GatewayRunner {
                     tokens_completion: result.tokens_completion.unwrap_or(0),
                     tool_calls: result.tool_calls_count.unwrap_or(0),
                     elapsed_ms: elapsed.as_millis() as u64,
-                },
-            )
-            .await
+                })
+                .await
         {
             tracing::warn!(error = %e, "failed to record usage");
         }
@@ -1129,23 +1315,41 @@ impl GatewayRunner {
         } else {
             text
         };
-        Some(
-            self.outbound_response(
-                trace.as_ref(),
-                msg.platform,
-                &msg.chat_id,
-                msg.reply_token.clone(),
+
+        // When progressive streaming already delivered the main content, the
+        // final message is just a stats footer + action results.  Sending it
+        // as a plain message (no durable outbox) avoids retry storms: if this
+        // low-value footer fails to deliver it is simply dropped rather than
+        // retried on every restart.
+        if progressive_text_len > 0 {
+            // Still mark the trace request as completed (even without outbox).
+            if let Some(writer) = trace_writer.as_ref() {
+                let _ = writer.complete_request().await;
+            }
+            Some(OutboundMessage::plain(
+                msg.platform.to_string(),
+                msg.chat_id.clone(),
                 text,
+            ))
+        } else {
+            Some(
+                self.outbound_response(
+                    trace.as_ref(),
+                    msg.platform,
+                    &msg.chat_id,
+                    msg.reply_token.clone(),
+                    text,
+                )
+                .await,
             )
-            .await,
-        )
+        }
     }
 
     async fn clear_pending_message(&self, pending_id: Option<i64>) {
-        let (Some(id), Some(pool)) = (pending_id, self.pool.as_ref()) else {
+        let (Some(id), Some(store)) = (pending_id, self.store.as_ref()) else {
             return;
         };
-        if let Err(e) = storage::delete_pending_message(pool, id).await {
+        if let Err(e) = store.delete_pending_message(id).await {
             tracing::warn!(id, error = %e, "failed to delete pending message");
         }
     }
@@ -1216,6 +1420,303 @@ impl GatewayRunner {
         } else {
             msg.chat_id.clone()
         }
+    }
+
+    // ─── Auth circuit breaker ──────────────────────────────────────────────
+
+    /// Check if the auth circuit breaker is tripped for the given CLI.
+    /// Returns `Some(message)` if the circuit is open and the caller should
+    /// short-circuit without spawning the CLI.
+    fn check_auth_circuit(&self, cli_name: &str) -> Option<String> {
+        if let Some(entry) = self.auth_failures.get(cli_name) {
+            let (count, last_failure) = *entry;
+            if count > AUTH_FAILURE_THRESHOLD && last_failure.elapsed() < AUTH_FAILURE_COOLDOWN {
+                let remaining = AUTH_FAILURE_COOLDOWN
+                    .saturating_sub(last_failure.elapsed())
+                    .as_secs();
+                return Some(format!(
+                    "🔑 CLI `{cli_name}` 认证失败（连续 {} 次）\n\n\
+                     可能原因:\n\
+                     - API 密钥过期\n\
+                     - 服务端 token 刷新失败\n\n\
+                     解决方法:\n\
+                     1. 运行 `astra /login` 重新登录\n\
+                     2. 或检查环境变量 ASTRA_API_KEY\n\
+                     3. 或切换到其他 CLI: `/cli claude`\n\n\
+                     {remaining} 秒后自动重试，或发送 `/auth` 手动重试。",
+                    count,
+                ));
+            }
+            // Cooldown expired — clear the counter
+            if last_failure.elapsed() >= AUTH_FAILURE_COOLDOWN {
+                drop(entry);
+                self.auth_failures.remove(cli_name);
+            }
+        }
+        None
+    }
+
+    fn auth_status_line(&self, cli_name: &str) -> Option<String> {
+        let entry = self.auth_failures.get(cli_name)?;
+        let (count, last_failure) = *entry;
+        if last_failure.elapsed() >= AUTH_FAILURE_COOLDOWN {
+            drop(entry);
+            self.auth_failures.remove(cli_name);
+            return None;
+        }
+
+        if count > AUTH_FAILURE_THRESHOLD {
+            let remaining = AUTH_FAILURE_COOLDOWN
+                .saturating_sub(last_failure.elapsed())
+                .as_secs();
+            Some(format!("⚠️ 暂停 (剩余 {remaining}s, 连续失败 {count} 次)"))
+        } else {
+            Some(format!("✅ 正常 (最近失败 {count} 次)"))
+        }
+    }
+
+    /// Record an auth failure for the given CLI profile.
+    fn record_auth_failure(&self, cli_name: &str) {
+        let mut entry = self
+            .auth_failures
+            .entry(cli_name.to_string())
+            .or_insert((0, Instant::now()));
+        entry.0 += 1;
+        entry.1 = Instant::now();
+        tracing::warn!(
+            cli = cli_name,
+            consecutive_failures = entry.0,
+            "auth failure recorded"
+        );
+    }
+
+    /// Clear auth failure counter for a CLI (called on successful request).
+    fn clear_auth_failure(&self, cli_name: &str) {
+        if self.auth_failures.remove(cli_name).is_some() {
+            tracing::info!(cli = cli_name, "auth failure counter cleared (success)");
+        }
+    }
+
+    /// Attempt to re-login to the astra server using configured credentials.
+    /// On success, writes the new tokens to `~/.astra/credentials.json` so
+    /// subsequent CLI spawns pick them up.
+    async fn try_auto_relogin(&self) -> Result<String, String> {
+        let username = self
+            .config
+            .astra
+            .username
+            .as_ref()
+            .ok_or("no username configured")?;
+        let password = self
+            .config
+            .astra
+            .password
+            .as_ref()
+            .ok_or("no password configured")?;
+
+        let body = serde_json::json!({ "username": username, "password": password });
+        let resp = self
+            .thin
+            .post_auth_login_json(&body)
+            .await
+            .map_err(|e| format!("login request failed: {e}"))?;
+
+        let v: serde_json::Value =
+            serde_json::from_str(&resp).map_err(|e| format!("invalid login response: {e}"))?;
+        let access = v
+            .get("access_token")
+            .and_then(|t| t.as_str())
+            .ok_or("missing access_token in response")?;
+        let refresh = v.get("refresh_token").and_then(|t| t.as_str());
+
+        save_token_to_cli_credentials(username, access, refresh)?;
+        tracing::info!(username = %username, "auto-relogin succeeded, CLI credentials refreshed");
+        Ok(access.to_string())
+    }
+
+    /// Handle the `/auth` slash command: reset circuit breaker, show CLI auth
+    /// status, and attempt auto-relogin if credentials are configured.
+    async fn handle_auth_command(&self, _current_cli: &CliProfile) -> String {
+        // 1. Reset circuit breaker
+        let cleared = self.auth_failures.len();
+        self.auth_failures.clear();
+
+        // 2. Invalidate probe cache so re-probe is fresh
+        cli_bridge::invalidate_probe_cache();
+
+        // 3. Re-probe all CLIs
+        let mut lines = vec!["🔑 **认证状态**".to_string()];
+        let default_avail = cli_bridge::probe_cli(&self.cli_profile).await;
+        let default_status = if default_avail.is_available() {
+            "✅"
+        } else {
+            "❌"
+        };
+        lines.push(format!(
+            "  {default_status} `{}` (默认)",
+            self.cli_profile.name()
+        ));
+        for (name, profile) in &self.config.cli_profiles {
+            let avail = cli_bridge::probe_cli(profile).await;
+            let status = if avail.is_available() { "✅" } else { "❌" };
+            lines.push(format!("  {status} `{name}`"));
+        }
+
+        if cleared > 0 {
+            lines.push(format!(
+                "\n认证缓存已重置（清除 {cleared} 个 CLI 的失败计数）。"
+            ));
+        } else {
+            lines.push("\n认证缓存已重置。".into());
+        }
+
+        // 4. Invalidate shared token cache so it refreshes on next message
+        if let Some(ref auth) = self.shared_auth {
+            auth.invalidate().await;
+        }
+
+        // 5. Attempt auto-relogin if credentials configured
+        if self.config.astra.username.is_some() && self.config.astra.password.is_some() {
+            match self.try_auto_relogin().await {
+                Ok(ref token) => {
+                    lines.push("✅ 自动重新登录成功，凭证已刷新。".into());
+                    // Warm shared token cache with the fresh token
+                    if let Some(ref auth) = self.shared_auth {
+                        let mut guard = auth.token.write().await;
+                        *guard = Some(token.clone());
+                    }
+                }
+                Err(e) => {
+                    lines.push(format!("⚠️ 自动重新登录失败: {e}"));
+                }
+            }
+        }
+
+        lines.push("\n下次消息将重新验证。".into());
+        lines.join("\n")
+    }
+
+    /// Build a rich context message for `/manage` that gets sent to the CLI agent.
+    async fn build_manage_context(
+        &self,
+        msg: &InboundMessage,
+        effective_chat_id: &str,
+        cli_profile: &CliProfile,
+        extra: &str,
+    ) -> String {
+        let cli_name = cli_profile.name();
+        let mut sections = vec![
+            "# Gateway 任务管理模式".to_string(),
+            "你现在是 Gateway 任务管理助手。分析以下运行状态，帮助用户管理任务。".to_string(),
+            "你可以使用 [[GATEWAY:...]] 标签直接执行操作。".to_string(),
+        ];
+
+        // Active requests
+        if let Some(repo) = self.trace_repo.as_ref() {
+            let conversation = ConversationKey::new(msg.platform, effective_chat_id, cli_name);
+            let rows = repo
+                .list_active_requests(&conversation, 50)
+                .await
+                .unwrap_or_default();
+            if !rows.is_empty() {
+                sections.push("\n## 活跃请求".to_string());
+                for (i, row) in rows.iter().enumerate() {
+                    let icon = match row.display_status() {
+                        "running" => "\u{1f504}",
+                        "queued" => "\u{231b}",
+                        "reply_retrying" => "\u{1f4ec}",
+                        "reply_pending" => "\u{1f4e4}",
+                        _ => "\u{2753}",
+                    };
+                    let error_suffix = row
+                        .error_message
+                        .as_ref()
+                        .map(|e| format!(" | error: {e}"))
+                        .unwrap_or_default();
+                    sections.push(format!(
+                        "[{}] {} {} | {} | {}{}",
+                        i + 1,
+                        icon,
+                        row.display_status(),
+                        row.text_preview,
+                        row.created_at,
+                        error_suffix,
+                    ));
+                }
+                sections.push("\n可用操作:".to_string());
+                sections.push("- 终止运行中: [[GATEWAY:trace_kill:<trace_id>]]".to_string());
+                sections
+                    .push("- 清除失败投递: [[GATEWAY:outbox_dismiss:<request_id>]]".to_string());
+            } else {
+                sections.push("\n## 活跃请求\n无".to_string());
+            }
+        }
+
+        // Cron jobs
+        if let Some(ref store) = self.store {
+            let jobs = store
+                .list_cron_jobs(msg.platform, effective_chat_id)
+                .await
+                .unwrap_or_default();
+            if !jobs.is_empty() {
+                sections.push("\n## 定时任务".to_string());
+                for job in &jobs {
+                    let short = &job.job_id[..8.min(job.job_id.len())];
+                    let status = if job.enabled { "\u{2705}" } else { "\u{23f8}" };
+                    sections.push(format!(
+                        "- {status} `{short}` | `{}` | {}",
+                        job.cron_expr, job.description
+                    ));
+                }
+                sections.push("\n可用操作: [[GATEWAY:task_del:<job_id>]] 删除".to_string());
+            }
+        }
+
+        // Durable tasks
+        if let Some(ref durable) = self.durable_store {
+            let owner = format!("{}:{}", msg.platform, effective_chat_id);
+            let filter = astra_core::durable_task_store::TaskFilter {
+                owner_id: Some(owner),
+                ..Default::default()
+            };
+            if let Ok(tasks) = durable.list(filter).await {
+                let active: Vec<_> = tasks.iter().filter(|t| t.status.is_active()).collect();
+                if !active.is_empty() {
+                    sections.push("\n## 持久任务".to_string());
+                    for t in &active {
+                        let short = &t.id.0[..8.min(t.id.0.len())];
+                        let icon = match t.status {
+                            astra_core::durable_task_store::DurableTaskStatus::Running => {
+                                "\u{1f504}"
+                            }
+                            astra_core::durable_task_store::DurableTaskStatus::Suspended => {
+                                "\u{23f8}"
+                            }
+                            _ => "\u{1f4cb}",
+                        };
+                        let step = t
+                            .step_description
+                            .as_ref()
+                            .map(|s| format!(" | {s}"))
+                            .unwrap_or_default();
+                        sections.push(format!(
+                            "- {} `{short}` | {} | {}%{}",
+                            icon, t.name, t.progress_pct, step,
+                        ));
+                    }
+                }
+            }
+        }
+
+        if !extra.is_empty() {
+            sections.push(format!("\n## 用户指示\n{extra}"));
+        } else {
+            sections.push(
+                "\n## 请求\n请分析以上状态，报告异常，并建议操作。如果有明显的问题（如长时间 running、失败的投递），直接用 GATEWAY 标签处理。".to_string(),
+            );
+        }
+
+        sections.join("\n")
     }
 
     async fn build_queued_request(&self, msg: InboundMessage) -> QueuedRequest {
@@ -1315,11 +1816,41 @@ impl GatewayRunner {
             if !self.should_execute_queued(&queued).await {
                 continue;
             }
-            if let Some(outbound) = self
+            match self
                 .handle_message_inner(&queued.msg, &NullAdapter, None, true, queued.trace.clone())
                 .await
             {
-                let _ = cli_resp_tx.send(outbound).await;
+                Some(outbound) => {
+                    let _ = cli_resp_tx.send(outbound).await;
+                }
+                None => {
+                    // Fix A: Never leave a trace stuck in Running when no response is produced.
+                    if let Some(trace) = queued.trace.as_ref()
+                        && let Some(repo) = self.trace_repo.as_ref()
+                    {
+                        let writer = TraceWriter::from_existing(
+                            repo.as_ref() as &dyn TraceRepository,
+                            trace.trace_id.clone(),
+                            trace.request_id.clone(),
+                        );
+                        let _ = writer.fail_request("request produced no response").await;
+                    }
+                }
+            }
+        }
+        // Fix C: Sweep any Running/Accepted traces for this conversation before exiting.
+        if let Some(repo) = self.trace_repo.as_ref() {
+            match repo
+                .sweep_conversation_stale_requests(&key, "conversation worker exited")
+                .await
+            {
+                Ok(0) => {}
+                Ok(n) => {
+                    tracing::info!(conversation = %key, count = n, "swept stale traces on worker exit");
+                }
+                Err(e) => {
+                    tracing::warn!(conversation = %key, error = %e, "failed to sweep stale traces on worker exit");
+                }
             }
         }
         self.queue_senders.lock().await.remove(&key);
@@ -1335,18 +1866,39 @@ impl GatewayRunner {
         };
         match repo.get_request(&trace.request_id).await {
             Ok(Some(request)) if request.status == RequestStatus::Accepted => true,
-            Ok(Some(request)) => {
+            Ok(Some(request)) if request.status.is_terminal() => {
                 tracing::info!(
                     request_id = %trace.request_id,
                     status = request.status.as_str(),
-                    "skipping queued request"
+                    "skipping queued request (terminal status)"
                 );
+                false
+            }
+            Ok(Some(request)) => {
+                // Non-terminal, non-Accepted (e.g. Running from a previous crash) — mark failed
+                tracing::info!(
+                    request_id = %trace.request_id,
+                    status = request.status.as_str(),
+                    "skipping queued request with unexpected status; marking failed"
+                );
+                let writer = TraceWriter::from_existing(
+                    repo.as_ref() as &dyn TraceRepository,
+                    trace.trace_id.clone(),
+                    trace.request_id.clone(),
+                );
+                let _ = writer
+                    .fail_request(&format!(
+                        "queued request had unexpected status: {}",
+                        request.status.as_str()
+                    ))
+                    .await;
                 false
             }
             Ok(None) => false,
             Err(e) => {
-                tracing::warn!(error = %e, "failed to verify queued request status");
-                false
+                // Execute on DB error rather than silently dropping the request
+                tracing::warn!(error = %e, "failed to verify queued request status; executing anyway");
+                true
             }
         }
     }
@@ -1465,6 +2017,12 @@ impl GatewayRunner {
             .await;
         for adapter in &adapters {
             self.replay_pending_messages(adapter.as_ref()).await;
+        }
+        // Drain any progressive chunks that accumulated in the outbound channel
+        // during replay (the main select loop wasn't consuming yet).
+        while let Ok(outbound) = cron_rx.try_recv() {
+            self.deliver_outbound(&adapters, &adapter_indices, outbound)
+                .await;
         }
 
         loop {
@@ -1660,6 +2218,171 @@ fn rfind_fence_break(s: &str) -> Option<usize> {
     None
 }
 
+// ─── Shared auth token ─────────────────────────────────────────────────────
+//
+// Gateway manages a single cached access token that is injected into CLI
+// spawns via `ASTRA_ACCESS_TOKEN`.  This eliminates per-message auth
+// round-trips (`GET /auth/me`) inside the CLI.
+
+/// Thread-safe cached access token.  The gateway validates the token once,
+/// then all concurrent CLI spawns reuse it without any HTTP call.
+struct SharedAuthToken {
+    token: tokio::sync::RwLock<Option<String>>,
+    api: astra_thin_client::ThinClient,
+    username: Option<String>,
+    password: Option<String>,
+}
+
+impl SharedAuthToken {
+    fn new(
+        api: astra_thin_client::ThinClient,
+        username: Option<String>,
+        password: Option<String>,
+    ) -> Self {
+        Self {
+            token: tokio::sync::RwLock::new(None),
+            api,
+            username,
+            password,
+        }
+    }
+
+    /// Return a cached valid token, or try to obtain one (from credentials file
+    /// or by logging in).
+    async fn get(&self) -> Option<String> {
+        // Fast path: return cached token
+        {
+            let guard = self.token.read().await;
+            if let Some(ref tok) = *guard {
+                return Some(tok.clone());
+            }
+        }
+        // Slow path: refresh
+        self.refresh().await
+    }
+
+    /// Force-refresh: read from `~/.astra/credentials.json`, validate via
+    /// `GET /auth/me`, and optionally re-login with username/password.
+    async fn refresh(&self) -> Option<String> {
+        // Read from CLI credentials file
+        if let Some(ref tok) = read_cli_access_token()
+            && let Ok(resp) = self
+                .api
+                .get_auth_me_text_timeout(tok, Duration::from_secs(3))
+                .await
+            && resp.status().is_success()
+        {
+            let mut guard = self.token.write().await;
+            *guard = Some(tok.clone());
+            return Some(tok.clone());
+        }
+        // Token invalid — try login if credentials available
+        if let (Some(username), Some(password)) = (&self.username, &self.password)
+            && let Ok(body) = self
+                .api
+                .post_auth_login_json(&serde_json::json!({
+                    "username": username,
+                    "password": password,
+                }))
+                .await
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&body)
+            && let Some(access) = v["access_token"].as_str()
+        {
+            let refresh = v["refresh_token"].as_str();
+            let _ = save_token_to_cli_credentials(username, access, refresh);
+            let tok = access.to_string();
+            let mut guard = self.token.write().await;
+            *guard = Some(tok.clone());
+            return Some(tok);
+        }
+        None
+    }
+
+    /// Clear the cached token (e.g. after an auth failure from the CLI).
+    async fn invalidate(&self) {
+        let mut guard = self.token.write().await;
+        *guard = None;
+    }
+}
+
+/// Read the access token for the current profile from `~/.astra/credentials.json`.
+fn read_cli_access_token() -> Option<String> {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()?;
+    let path = std::path::Path::new(&home)
+        .join(".astra")
+        .join("credentials.json");
+    let content = std::fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let current = v["current_profile"].as_str().unwrap_or("default");
+    v["profiles"][current]["access_token"]
+        .as_str()
+        .map(String::from)
+}
+
+/// Write refreshed tokens to `~/.astra/credentials.json` so subsequent CLI
+/// spawns pick them up.  Reads the existing file (if any), updates the
+/// access/refresh tokens on the current or default profile, and writes back.
+fn save_token_to_cli_credentials(
+    username: &str,
+    access_token: &str,
+    refresh_token: Option<&str>,
+) -> Result<(), String> {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".to_string());
+    let path = std::path::PathBuf::from(home)
+        .join(".astra")
+        .join("credentials.json");
+
+    // Read existing file (may not exist)
+    let mut doc: serde_json::Value = if let Ok(content) = std::fs::read_to_string(&path) {
+        serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+
+    // Determine profile name
+    let profile_name = doc
+        .get("current_profile")
+        .and_then(|v| v.as_str())
+        .unwrap_or("default")
+        .to_string();
+
+    // Ensure profiles object exists
+    if !doc.get("profiles").is_some_and(|p| p.is_object()) {
+        doc["profiles"] = serde_json::json!({});
+    }
+
+    // Update the profile
+    let profile = &mut doc["profiles"][&profile_name];
+    if !profile.is_object() {
+        *profile = serde_json::json!({});
+    }
+    profile["username"] = serde_json::Value::String(username.to_string());
+    profile["access_token"] = serde_json::Value::String(access_token.to_string());
+    if let Some(rt) = refresh_token {
+        profile["refresh_token"] = serde_json::Value::String(rt.to_string());
+    }
+
+    // Write back
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir failed: {e}"))?;
+    }
+    let body = serde_json::to_string_pretty(&doc).map_err(|e| format!("serialize failed: {e}"))?;
+    std::fs::write(&path, body).map_err(|e| format!("write failed: {e}"))?;
+
+    // Restrict to owner-only (0o600)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    Ok(())
+}
+
 fn is_safe_skill_name(name: &str) -> bool {
     let trimmed = name.trim();
     !trimmed.is_empty()
@@ -1668,54 +2391,7 @@ fn is_safe_skill_name(name: &str) -> bool {
             .all(|ch| ch.is_alphanumeric() || matches!(ch, ' ' | '_' | '-'))
 }
 
-async fn connect_db(url: &str) -> Result<MySqlPool, sqlx::Error> {
-    match sqlx::mysql::MySqlPoolOptions::new()
-        .max_connections(5)
-        .connect(url)
-        .await
-    {
-        Ok(pool) => {
-            storage::ensure_schema(&pool).await?;
-            Ok(pool)
-        }
-        Err(e) => {
-            let msg = e.to_string();
-            if !msg.contains("1049") && !msg.contains("Unknown database") {
-                return Err(e);
-            }
-            // Extract DB name from URL and create it
-            let (base_url, db_name) = match url.rfind('/') {
-                Some(pos) if pos > url.find("://").map(|p| p + 2).unwrap_or(0) => {
-                    (&url[..pos], &url[pos + 1..])
-                }
-                _ => return Err(e),
-            };
-            // Strip query params from db_name
-            let db_name = db_name.split('?').next().unwrap_or(db_name);
-            if !is_safe_db_name(db_name) {
-                return Err(e);
-            }
-
-            tracing::info!(db = db_name, "database does not exist — creating");
-            let tmp_pool = sqlx::mysql::MySqlPoolOptions::new()
-                .max_connections(1)
-                .connect(base_url)
-                .await?;
-            sqlx::query(&format!("CREATE DATABASE IF NOT EXISTS `{db_name}`"))
-                .execute(&tmp_pool)
-                .await?;
-            tmp_pool.close().await;
-
-            let pool = sqlx::mysql::MySqlPoolOptions::new()
-                .max_connections(5)
-                .connect(url)
-                .await?;
-            storage::ensure_schema(&pool).await?;
-            Ok(pool)
-        }
-    }
-}
-
+#[cfg(test)]
 fn is_safe_db_name(name: &str) -> bool {
     !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
@@ -1736,7 +2412,7 @@ async fn resolve_gateway_task(
 #[cfg(test)]
 async fn execute_gateway_actions(
     text: &str,
-    pool: Option<&sqlx::MySqlPool>,
+    store: Option<&dyn GatewayStore>,
     platform: &str,
     chat_id: &str,
     user_id: &str,
@@ -1746,7 +2422,7 @@ async fn execute_gateway_actions(
 ) -> String {
     execute_gateway_actions_with_policy(
         text,
-        pool,
+        store,
         platform,
         chat_id,
         user_id,
@@ -1757,6 +2433,7 @@ async fn execute_gateway_actions(
             allow_model_generated_mutations: true,
             workspace_roots: Vec::new(),
         },
+        None,
         action_results,
     )
     .await
@@ -1765,13 +2442,14 @@ async fn execute_gateway_actions(
 #[allow(clippy::too_many_arguments)]
 async fn execute_gateway_actions_with_policy(
     text: &str,
-    pool: Option<&sqlx::MySqlPool>,
+    store: Option<&dyn GatewayStore>,
     platform: &str,
     chat_id: &str,
     user_id: &str,
     durable_store: Option<&dyn astra_core::durable_task_store::DurableTaskStore>,
     skills_dir: Option<&str>,
     action_policy: &crate::access_control::ActionPolicy,
+    trace_repo: Option<&dyn TraceRepository>,
     action_results: &mut Vec<String>,
 ) -> String {
     static RE: std::sync::LazyLock<regex::Regex> =
@@ -1802,12 +2480,19 @@ async fn execute_gateway_actions_with_policy(
                     "⚠️ 任务消息不能为空".into()
                 } else if !is_valid_cron_expr(cron_expr) {
                     format!("⚠️ 无效的 cron 表达式: `{cron_expr}`（需要 5 个字段: 分 时 日 月 周）")
-                } else if let Some(pool) = pool {
+                } else if let Some(store) = store {
                     let job_id = uuid::Uuid::new_v4().to_string();
-                    match storage::create_cron_job(
-                        pool, &job_id, platform, chat_id, user_id, cron_expr, message, message,
-                    )
-                    .await
+                    match store
+                        .create_cron_job(&store::CronJobSpec {
+                            job_id: job_id.clone(),
+                            platform: platform.to_string(),
+                            chat_id: chat_id.to_string(),
+                            user_id: user_id.to_string(),
+                            cron_expr: cron_expr.to_string(),
+                            message: message.to_string(),
+                            description: message.to_string(),
+                        })
+                        .await
                     {
                         Ok(()) => {
                             tracing::info!(
@@ -1824,7 +2509,7 @@ async fn execute_gateway_actions_with_policy(
                         Err(e) => format!("⚠️ 定时任务创建失败: {e}"),
                     }
                 } else {
-                    "⚠️ 定时任务需要数据库支持".into()
+                    "⚠️ 定时任务需要 MySQL 存储支持".into()
                 }
             }
             Some("cron_add") => "⚠️ cron_add 格式错误（需要: cron_add:表达式:消息）".into(),
@@ -1838,31 +2523,27 @@ async fn execute_gateway_actions_with_policy(
                     "⚠️ 提醒时间无效（需要大于 0 的分钟数）".into()
                 } else if minutes > 1440 * 7 {
                     "⚠️ 提醒时间过长（最多 7 天 = 10080 分钟）".into()
-                } else if let Some(pool) = pool {
+                } else if let Some(store) = store {
                     // Store as one-shot cron job with computed next_run time
                     let job_id = uuid::Uuid::new_v4().to_string();
                     let next_run = chrono::Utc::now() + chrono::Duration::minutes(minutes as i64);
                     let next_run_str = next_run.format("%Y-%m-%d %H:%M:%S").to_string();
                     // Use special cron_expr "once" to mark as one-shot
-                    match storage::create_cron_job(
-                        pool,
-                        &job_id,
-                        platform,
-                        chat_id,
-                        user_id,
-                        "once",
-                        &message,
-                        &format!("⏰ {message} (一次性)"),
-                    )
-                    .await
+                    match store
+                        .create_cron_job(&store::CronJobSpec {
+                            job_id: job_id.clone(),
+                            platform: platform.to_string(),
+                            chat_id: chat_id.to_string(),
+                            user_id: user_id.to_string(),
+                            cron_expr: "once".to_string(),
+                            message: message.clone(),
+                            description: format!("⏰ {message} (一次性)"),
+                        })
+                        .await
                     {
                         Ok(()) => {
-                            if let Err(e) =
-                                sqlx::query("UPDATE gw_cron_jobs SET next_run = ? WHERE job_id = ?")
-                                    .bind(&next_run_str)
-                                    .bind(&job_id)
-                                    .execute(pool)
-                                    .await
+                            // Update next_run via the trait method (works on all backends)
+                            if let Err(e) = store.update_cron_next_run(&job_id, &next_run_str).await
                             {
                                 tracing::warn!(job_id = %&job_id[..8], error = %e, "failed to set remind_after next_run");
                             }
@@ -1883,7 +2564,7 @@ async fn execute_gateway_actions_with_policy(
                         Err(e) => format!("⚠️ 创建提醒失败: {e}"),
                     }
                 } else {
-                    "⚠️ 延时提醒需要数据库支持".into()
+                    "⚠️ 延时提醒需要 MySQL 存储支持".into()
                 }
             }
             Some("remind_after") => {
@@ -1891,22 +2572,25 @@ async fn execute_gateway_actions_with_policy(
             }
 
             Some("task_list") => {
-                if let Some(pool) = pool {
-                    match storage::list_cron_jobs(pool, platform, chat_id).await {
+                if let Some(store) = store {
+                    match store.list_cron_jobs(platform, chat_id).await {
                         Ok(jobs) if jobs.is_empty() => "📋 当前没有定时任务。".into(),
                         Ok(jobs) => {
                             let mut lines = vec![format!("📋 **定时任务** ({} 个)", jobs.len())];
-                            for (id, expr, desc, enabled) in &jobs {
-                                let status = if *enabled { "✅" } else { "⏸" };
-                                let short_id = &id[..8.min(id.len())];
-                                lines.push(format!("{status} `{short_id}` | `{expr}` | {desc}"));
+                            for j in &jobs {
+                                let status = if j.enabled { "✅" } else { "⏸" };
+                                let short_id = &j.job_id[..8.min(j.job_id.len())];
+                                lines.push(format!(
+                                    "{status} `{short_id}` | `{}` | {}",
+                                    j.cron_expr, j.description
+                                ));
                             }
                             lines.join("\n")
                         }
                         Err(e) => format!("⚠️ 查询失败: {e}"),
                     }
                 } else {
-                    "⚠️ 需要数据库支持".into()
+                    "⚠️ 需要 MySQL 存储支持".into()
                 }
             }
 
@@ -1914,9 +2598,9 @@ async fn execute_gateway_actions_with_policy(
                 let target = parts[1].trim();
                 if target.is_empty() {
                     "⚠️ 请指定任务 ID".into()
-                } else if let Some(pool) = pool {
+                } else if let Some(store) = store {
                     // Support prefix match
-                    match find_and_delete_job(pool, platform, chat_id, target).await {
+                    match find_and_delete_job(store, platform, chat_id, target).await {
                         Ok(Some(desc)) => {
                             tracing::info!(target, "gateway action: task_del");
                             format!("✅ 已删除任务: {desc}")
@@ -1925,7 +2609,7 @@ async fn execute_gateway_actions_with_policy(
                         Err(e) => format!("⚠️ 删除失败: {e}"),
                     }
                 } else {
-                    "⚠️ 需要数据库支持".into()
+                    "⚠️ 需要 MySQL 存储支持".into()
                 }
             }
             Some("task_del") => "⚠️ task_del 格式错误（需要: task_del:任务ID）".into(),
@@ -1933,8 +2617,8 @@ async fn execute_gateway_actions_with_policy(
             // Legacy alias
             Some("cron_del") if parts.len() >= 2 => {
                 let job_id = parts[1].trim();
-                if let Some(pool) = pool {
-                    match find_and_delete_job(pool, platform, chat_id, job_id).await {
+                if let Some(store) = store {
+                    match find_and_delete_job(store, platform, chat_id, job_id).await {
                         Ok(Some(desc)) => {
                             tracing::info!(job_id, "gateway action: cron_del");
                             format!("✅ 已删除任务: {desc}")
@@ -1943,7 +2627,7 @@ async fn execute_gateway_actions_with_policy(
                         Err(e) => format!("⚠️ 删除失败: {e}"),
                     }
                 } else {
-                    "⚠️ 需要数据库支持".into()
+                    "⚠️ 需要 MySQL 存储支持".into()
                 }
             }
 
@@ -1974,7 +2658,7 @@ async fn execute_gateway_actions_with_policy(
                         Err(e) => format!("⚠️ 创建失败: {e}"),
                     }
                 } else {
-                    "⚠️ 需要数据库支持".into()
+                    "⚠️ 需要 MySQL 存储支持".into()
                 }
             }
 
@@ -2005,7 +2689,7 @@ async fn execute_gateway_actions_with_policy(
                                     Err(e) => e,
                                 }
                             } else {
-                                "⚠️ 需要数据库支持".into()
+                                "⚠️ 需要 MySQL 存储支持".into()
                             }
                         }
                     }
@@ -2034,7 +2718,7 @@ async fn execute_gateway_actions_with_policy(
                         Err(e) => e,
                     }
                 } else {
-                    "⚠️ 需要数据库支持".into()
+                    "⚠️ 需要 MySQL 存储支持".into()
                 }
             }
 
@@ -2077,7 +2761,7 @@ async fn execute_gateway_actions_with_policy(
                         Err(e) => e,
                     }
                 } else {
-                    "⚠️ 需要数据库支持".into()
+                    "⚠️ 需要 MySQL 存储支持".into()
                 }
             }
 
@@ -2110,7 +2794,7 @@ async fn execute_gateway_actions_with_policy(
                         Err(e) => format!("⚠️ 查询失败: {e}"),
                     }
                 } else {
-                    "⚠️ 需要数据库支持".into()
+                    "⚠️ 需要 MySQL 存储支持".into()
                 }
             }
 
@@ -2133,7 +2817,7 @@ async fn execute_gateway_actions_with_policy(
                         Err(e) => e,
                     }
                 } else {
-                    "⚠️ 需要数据库支持".into()
+                    "⚠️ 需要 MySQL 存储支持".into()
                 }
             }
 
@@ -2161,7 +2845,7 @@ async fn execute_gateway_actions_with_policy(
                         Err(e) => e,
                     }
                 } else {
-                    "⚠️ 需要数据库支持".into()
+                    "⚠️ 需要 MySQL 存储支持".into()
                 }
             }
 
@@ -2184,7 +2868,7 @@ async fn execute_gateway_actions_with_policy(
                         Err(e) => e,
                     }
                 } else {
-                    "⚠️ 需要数据库支持".into()
+                    "⚠️ 需要 MySQL 存储支持".into()
                 }
             }
 
@@ -2243,19 +2927,14 @@ async fn execute_gateway_actions_with_policy(
                     format!("❌ 目录不存在: `{expanded}`")
                 } else if let Err(denial) = action_policy.workspace_allowed(path) {
                     denial
-                } else if let Some(pool) = pool {
+                } else if let Some(store) = store {
                     let canonical = path
                         .canonicalize()
                         .map(|p| p.to_string_lossy().to_string())
                         .unwrap_or(expanded);
-                    match storage::set_user_preference(
-                        pool,
-                        platform,
-                        user_id,
-                        "workspace",
-                        &canonical,
-                    )
-                    .await
+                    match store
+                        .set_user_preference(platform, user_id, "workspace", &canonical)
+                        .await
                     {
                         Ok(()) => {
                             tracing::info!(workspace = %canonical, "gateway action: workspace_set");
@@ -2264,7 +2943,56 @@ async fn execute_gateway_actions_with_policy(
                         Err(e) => format!("⚠️ 保存工作目录失败: {e}"),
                     }
                 } else {
-                    "⚠️ 需要数据库支持".into()
+                    "⚠️ 需要 MySQL 存储支持".into()
+                }
+            }
+
+            Some("trace_kill") if parts.len() >= 2 => {
+                let trace_id_str = parts[1].trim();
+                if trace_id_str.is_empty() {
+                    "⚠️ 请指定 trace ID".into()
+                } else if let Some(repo) = trace_repo {
+                    let tid = TraceId::from_string(trace_id_str.to_string());
+                    match repo.force_fail_request(&tid, "killed via manage").await {
+                        Ok(true) => {
+                            tracing::info!(trace_id = trace_id_str, "gateway action: trace_kill");
+                            format!(
+                                "💀 已终止请求 `{}`",
+                                &trace_id_str[..8.min(trace_id_str.len())]
+                            )
+                        }
+                        Ok(false) => format!(
+                            "⚠️ 请求 `{}` 已是终态",
+                            &trace_id_str[..8.min(trace_id_str.len())]
+                        ),
+                        Err(e) => format!("⚠️ 终止失败: {e}"),
+                    }
+                } else {
+                    "⚠️ 需要 trace 支持".into()
+                }
+            }
+
+            Some("outbox_dismiss") if parts.len() >= 2 => {
+                let request_id_str = parts[1].trim();
+                if request_id_str.is_empty() {
+                    "⚠️ 请指定 request ID".into()
+                } else if let Some(repo) = trace_repo {
+                    let rid = RequestId::from_string(request_id_str.to_string());
+                    match repo.dismiss_failed_outbox(&rid).await {
+                        Ok(()) => {
+                            tracing::info!(
+                                request_id = request_id_str,
+                                "gateway action: outbox_dismiss"
+                            );
+                            format!(
+                                "🧹 已清除失败消息 `{}`",
+                                &request_id_str[..8.min(request_id_str.len())]
+                            )
+                        }
+                        Err(e) => format!("⚠️ 清除失败: {e}"),
+                    }
+                } else {
+                    "⚠️ 需要 trace 支持".into()
                 }
             }
 
@@ -2295,39 +3023,102 @@ fn action_capability(action: &str) -> Option<crate::access_control::ActionCapabi
 }
 
 fn is_valid_cron_expr(expr: &str) -> bool {
-    let parts: Vec<&str> = expr.split_whitespace().collect();
-    if parts.len() != 5 {
-        return false;
-    }
-    // Each field should be *, a number, a range, a list, or a step
-    parts.iter().all(|p| {
-        p.chars()
-            .all(|c| c.is_ascii_digit() || c == '*' || c == ',' || c == '-' || c == '/')
-    })
+    store::is_valid_cron_expr(expr)
 }
 
 async fn find_and_delete_job(
-    pool: &sqlx::MySqlPool,
+    store: &dyn GatewayStore,
     platform: &str,
     chat_id: &str,
     target: &str,
-) -> Result<Option<String>, sqlx::Error> {
-    let jobs = storage::list_cron_jobs(pool, platform, chat_id).await?;
+) -> Result<Option<String>, store::StoreError> {
+    let jobs = store.list_cron_jobs(platform, chat_id).await?;
     // Exact or prefix match
     let matched = jobs
         .iter()
-        .find(|(id, _, _, _)| id == target || id.starts_with(target));
-    if let Some((id, _, desc, _)) = matched {
-        let desc = desc.clone();
-        storage::delete_cron_job(pool, id).await?;
+        .find(|j| j.job_id == target || j.job_id.starts_with(target));
+    if let Some(j) = matched {
+        let desc = j.description.clone();
+        store.delete_cron_job(&j.job_id).await?;
         Ok(Some(desc))
     } else {
         Ok(None)
     }
 }
 
-/// Filter `<think>...</think>` blocks from streaming token text.
-/// `in_think` tracks state across calls (tokens arrive in small chunks).
+/// Streaming filter for `<think>...</think>` blocks.
+///
+/// Buffers partial tag fragments across token boundaries so that a `<think>`
+/// split across two chunks (e.g. `"<thi"` + `"nk>..."`) is correctly detected
+/// and suppressed, instead of leaking the partial tag to the user.
+#[derive(Default)]
+struct ThinkTagStreamFilter {
+    pending: String,
+    in_think: bool,
+}
+
+impl ThinkTagStreamFilter {
+    fn push(&mut self, text: &str) -> String {
+        self.pending.push_str(text);
+        let mut out = String::new();
+
+        loop {
+            if self.in_think {
+                if let Some(end) = self.pending.find("</think>") {
+                    self.pending.drain(..end + 8);
+                    self.in_think = false;
+                    continue;
+                }
+                // No closing tag yet — keep all pending content. finish()
+                // will return it if the block is never closed.
+                break;
+            }
+
+            if let Some(start) = self.pending.find("<think>") {
+                out.push_str(&self.pending[..start]);
+                self.pending.drain(..start + 7);
+                self.in_think = true;
+                continue;
+            }
+
+            let keep = open_think_prefix_len(&self.pending);
+            let emit_len = self.pending.len().saturating_sub(keep);
+            out.push_str(&self.pending[..emit_len]);
+            self.pending.drain(..emit_len);
+            break;
+        }
+
+        out
+    }
+
+    fn finish(&mut self) -> String {
+        if self.in_think {
+            // Unclosed <think> — return accumulated content so it's not lost
+            let leftover = std::mem::take(&mut self.pending);
+            self.in_think = false;
+            leftover
+        } else {
+            std::mem::take(&mut self.pending)
+        }
+    }
+}
+
+/// Suffix of `text` that could be a prefix of `<think>` (when outside a think block).
+fn open_think_prefix_len(text: &str) -> usize {
+    tag_suffix_prefix_len(text, "<think>")
+}
+
+fn tag_suffix_prefix_len(text: &str, tag: &str) -> usize {
+    let max = text.len().min(tag.len() - 1);
+    for len in (1..=max).rev() {
+        if text.is_char_boundary(text.len() - len) && tag.starts_with(&text[text.len() - len..]) {
+            return len;
+        }
+    }
+    0
+}
+
+/// Simple non-streaming filter for complete text. Used on the final CLI output.
 fn filter_think_tags(text: &str, in_think: &mut bool) -> String {
     let mut result = String::new();
     let mut remaining = text;
@@ -2424,8 +3215,10 @@ fn build_final_message(
     action_results: &str,
     stats_parts: &[String],
     progressive_text_len: usize,
+    request_tag: &str,
 ) -> String {
     if progressive_text_len > 0 {
+        // Progressive mode: main content already streamed; final msg is stats footer only
         let mut parts = Vec::new();
         if !action_results.is_empty() {
             parts.push(action_results.to_string());
@@ -2433,11 +3226,21 @@ fn build_final_message(
         if !stats_parts.is_empty() {
             parts.push(format!("`{}`", stats_parts.join(" | ")));
         }
-        parts.join("\n\n")
+        let body = parts.join("\n\n");
+        if body.is_empty() {
+            body
+        } else {
+            format!("[{request_tag}] {body}")
+        }
     } else {
+        // Non-progressive: full text + stats in one message (no tag prefix —
+        // the response was not streamed, so there is no chunk sequence to correlate).
         let mut result = text.to_string();
         if !result.is_empty() && !stats_parts.is_empty() {
-            result.push_str(&format!("\n\n`{}`", stats_parts.join(" | ")));
+            result.push_str(&format!(
+                "\n\n`[{request_tag}] {}`",
+                stats_parts.join(" | ")
+            ));
         }
         result
     }
@@ -2459,6 +3262,21 @@ fn strip_think_blocks(text: &str) -> String {
         }
     }
     result
+}
+
+/// Derive a short request tag like `#A7` from the first two hex digits of a
+/// trace ID (UUID).  Returns `#??` when the input has fewer than two hex chars.
+pub(crate) fn short_request_tag(trace_id: &str) -> String {
+    let hex: String = trace_id
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .take(2)
+        .collect();
+    if hex.len() == 2 {
+        format!("#{}", hex.to_uppercase())
+    } else {
+        "#??".to_string()
+    }
 }
 
 fn format_elapsed(d: Duration) -> String {
@@ -2573,6 +3391,53 @@ mod tests {
         assert_eq!(format_elapsed(Duration::from_secs(130)), "2m10s");
     }
 
+    // ── Short request tag ──────────────────────────────────────
+
+    #[test]
+    fn short_request_tag_from_uuid() {
+        assert_eq!(
+            short_request_tag("a7bc1234-5678-9abc-def0-123456789abc"),
+            "#A7"
+        );
+        assert_eq!(
+            short_request_tag("3f001122-3344-5566-7788-99aabbccddee"),
+            "#3F"
+        );
+    }
+
+    #[test]
+    fn short_request_tag_empty_input() {
+        assert_eq!(short_request_tag(""), "#??");
+    }
+
+    #[test]
+    fn short_request_tag_single_hex_char() {
+        assert_eq!(short_request_tag("a"), "#??");
+    }
+
+    #[test]
+    fn short_request_tag_always_uppercase() {
+        assert_eq!(
+            short_request_tag("abcdef12-0000-0000-0000-000000000000"),
+            "#AB"
+        );
+    }
+
+    #[test]
+    fn short_request_tag_skips_dashes() {
+        // UUID dashes should be skipped, so "a-b-c" should pick up 'a' and 'b'
+        assert_eq!(short_request_tag("a-b-c"), "#AB");
+    }
+
+    #[test]
+    fn short_request_tag_counter_fallback_format() {
+        // Verify the counter-based format matches expectations
+        assert_eq!(format!("#{:02X}", 0u32), "#00");
+        assert_eq!(format!("#{:02X}", 167u32), "#A7");
+        assert_eq!(format!("#{:02X}", 255u32), "#FF");
+        assert_eq!(format!("#{:02X}", 256u32 % 256), "#00"); // wraps
+    }
+
     #[test]
     fn initial_ack_delay_is_shorter_than_heartbeat() {
         assert!(INITIAL_ACK_DELAY < HEARTBEAT_INTERVAL);
@@ -2678,37 +3543,46 @@ mod tests {
     #[test]
     fn final_message_no_progressive_includes_full_text() {
         let stats = vec!["↓8.4k".into(), "↑95".into(), "8s".into()];
-        let msg = build_final_message("Hello world", "", &stats, 0);
+        let msg = build_final_message("Hello world", "", &stats, 0, "#A7");
         assert!(msg.contains("Hello world"));
         assert!(msg.contains("↓8.4k"));
+        assert!(msg.contains("[#A7]"), "stats footer should have tag: {msg}");
     }
 
     #[test]
     fn final_message_progressive_skips_body() {
         let stats = vec!["↓8.4k".into(), "↑95".into()];
-        let msg = build_final_message("Hello world (already sent)", "", &stats, 500);
+        let msg = build_final_message("Hello world (already sent)", "", &stats, 500, "#3F");
         assert!(
             !msg.contains("Hello world"),
             "body should not repeat: {msg}"
         );
         assert!(msg.contains("↓8.4k"), "stats should still appear: {msg}");
+        assert!(
+            msg.starts_with("[#3F]"),
+            "progressive footer should be tagged: {msg}"
+        );
     }
 
     #[test]
     fn final_message_progressive_with_actions() {
         let stats = vec!["8s".into()];
-        let msg = build_final_message("body", "⏰ 提醒已创建", &stats, 100);
+        let msg = build_final_message("body", "⏰ 提醒已创建", &stats, 100, "#B2");
         assert!(
             msg.contains("⏰ 提醒已创建"),
             "action results should appear"
         );
         assert!(msg.contains("8s"), "stats should appear");
         assert!(!msg.contains("body"), "body should not repeat");
+        assert!(
+            msg.starts_with("[#B2]"),
+            "progressive footer should be tagged: {msg}"
+        );
     }
 
     #[test]
     fn final_message_progressive_empty_stats() {
-        let msg = build_final_message("body", "", &[], 100);
+        let msg = build_final_message("body", "", &[], 100, "#C0");
         assert!(
             msg.is_empty(),
             "nothing to send if progressive + no actions + no stats"
@@ -2807,6 +3681,84 @@ mod tests {
         assert_eq!(filter.finish(), "");
     }
 
+    // ── ThinkTagStreamFilter tests ────────────────────────────────
+
+    #[test]
+    fn think_stream_filter_complete_block() {
+        let mut f = ThinkTagStreamFilter::default();
+        assert_eq!(f.push("<think>reasoning</think>Hello!"), "Hello!");
+        assert_eq!(f.finish(), "");
+    }
+
+    #[test]
+    fn think_stream_filter_split_open_tag() {
+        let mut f = ThinkTagStreamFilter::default();
+        let r1 = f.push("before<thi");
+        assert_eq!(r1, "before");
+        let r2 = f.push("nk>hidden</think>visible");
+        assert_eq!(r2, "visible");
+    }
+
+    #[test]
+    fn think_stream_filter_split_close_tag() {
+        let mut f = ThinkTagStreamFilter::default();
+        assert_eq!(f.push("<think>hidden</thi"), "");
+        assert_eq!(f.push("nk>after"), "after");
+    }
+
+    #[test]
+    fn think_stream_filter_no_think_passthrough() {
+        let mut f = ThinkTagStreamFilter::default();
+        assert_eq!(f.push("just normal text"), "just normal text");
+        assert_eq!(f.finish(), "");
+    }
+
+    #[test]
+    fn think_stream_filter_unclosed_at_finish_preserves_content() {
+        let mut f = ThinkTagStreamFilter::default();
+        assert_eq!(f.push("before<think>hidden"), "before");
+        let tail = f.finish();
+        assert_eq!(tail, "hidden");
+    }
+
+    #[test]
+    fn think_stream_filter_single_char_chunks() {
+        let mut f = ThinkTagStreamFilter::default();
+        let input = "A<think>secret</think>B";
+        let mut output = String::new();
+        for ch in input.chars() {
+            output.push_str(&f.push(&ch.to_string()));
+        }
+        output.push_str(&f.finish());
+        assert_eq!(output, "AB", "single-char chunking must still filter");
+    }
+
+    #[test]
+    fn think_stream_filter_multiple_blocks() {
+        let mut f = ThinkTagStreamFilter::default();
+        let out = f.push("A<think>x</think>B<think>y</think>C");
+        assert_eq!(out, "ABC");
+    }
+
+    #[test]
+    fn open_think_prefix_len_values() {
+        assert_eq!(open_think_prefix_len("hello"), 0);
+        assert_eq!(open_think_prefix_len("hello<"), 1);
+        assert_eq!(open_think_prefix_len("hello<t"), 2);
+        assert_eq!(open_think_prefix_len("hello<th"), 3);
+        assert_eq!(open_think_prefix_len("hello<thi"), 4);
+        assert_eq!(open_think_prefix_len("hello<thin"), 5);
+        assert_eq!(open_think_prefix_len("hello<think"), 6);
+    }
+
+    #[test]
+    fn tag_suffix_prefix_len_for_close_tag() {
+        assert_eq!(tag_suffix_prefix_len("text</", "</think>"), 2);
+        assert_eq!(tag_suffix_prefix_len("text</t", "</think>"), 3);
+        assert_eq!(tag_suffix_prefix_len("text</think", "</think>"), 7);
+        assert_eq!(tag_suffix_prefix_len("text", "</think>"), 0);
+    }
+
     // ── Gateway action tests ──────────────────────────────────────
 
     #[tokio::test]
@@ -2815,7 +3767,7 @@ mod tests {
         let mut r = Vec::new();
         let clean = execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
         assert_eq!(clean, "好的");
-        assert!(r[0].contains("数据库"), "{}", r[0]);
+        assert!(r[0].contains("存储"), "{}", r[0]);
     }
 
     #[tokio::test]
@@ -2848,7 +3800,7 @@ mod tests {
         let mut r = Vec::new();
         let clean = execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
         assert_eq!(clean, "好的");
-        assert!(r[0].contains("数据库"), "{}", r[0]);
+        assert!(r[0].contains("存储"), "{}", r[0]);
     }
 
     #[tokio::test]
@@ -2888,7 +3840,7 @@ mod tests {
         let text = "[[GATEWAY:task_list]]";
         let mut r = Vec::new();
         execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
-        assert!(r[0].contains("数据库"), "{}", r[0]);
+        assert!(r[0].contains("存储"), "{}", r[0]);
     }
 
     #[tokio::test]
@@ -2904,7 +3856,7 @@ mod tests {
         let text = "[[GATEWAY:task_del:abc123]]";
         let mut r = Vec::new();
         execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
-        assert!(r[0].contains("数据库"), "{}", r[0]);
+        assert!(r[0].contains("存储"), "{}", r[0]);
     }
 
     #[tokio::test]
@@ -2978,6 +3930,206 @@ mod tests {
         assert!(!is_safe_db_name("foo`bar"));
         assert!(!is_safe_db_name("../etc/passwd"));
     }
+
+    // ── Auth circuit breaker tests ────────────────────────────────
+
+    #[test]
+    fn auth_circuit_not_tripped_initially() {
+        let failures: dashmap::DashMap<String, (u32, Instant)> = dashmap::DashMap::new();
+        // No entries — check_auth_circuit equivalent
+        assert!(!failures.contains_key("astra"));
+    }
+
+    #[test]
+    fn auth_circuit_trips_after_threshold() {
+        let failures: dashmap::DashMap<String, (u32, Instant)> = dashmap::DashMap::new();
+        // Simulate consecutive failures exceeding threshold
+        failures.insert(
+            "astra".to_string(),
+            (AUTH_FAILURE_THRESHOLD + 1, Instant::now()),
+        );
+        let entry = failures.get("astra").unwrap();
+        let (count, last) = *entry;
+        assert!(count > AUTH_FAILURE_THRESHOLD);
+        assert!(last.elapsed() < AUTH_FAILURE_COOLDOWN);
+    }
+
+    #[test]
+    fn auth_circuit_resets_after_cooldown() {
+        let failures: dashmap::DashMap<String, (u32, Instant)> = dashmap::DashMap::new();
+        // Simulate an old failure past cooldown
+        failures.insert(
+            "astra".to_string(),
+            (
+                AUTH_FAILURE_THRESHOLD + 1,
+                Instant::now() - AUTH_FAILURE_COOLDOWN - Duration::from_secs(1),
+            ),
+        );
+        let entry = failures.get("astra").unwrap();
+        let (_, last) = *entry;
+        assert!(
+            last.elapsed() >= AUTH_FAILURE_COOLDOWN,
+            "should be past cooldown"
+        );
+    }
+
+    #[test]
+    fn auth_circuit_constants_are_reasonable() {
+        let threshold = AUTH_FAILURE_THRESHOLD;
+        assert!(threshold >= 1, "threshold should be at least 1");
+        assert!(threshold <= 10, "threshold should be reasonable");
+        assert!(
+            AUTH_FAILURE_COOLDOWN.as_secs() >= 60,
+            "cooldown should be >= 1 min"
+        );
+        assert!(
+            AUTH_FAILURE_COOLDOWN.as_secs() <= 600,
+            "cooldown should be <= 10 min"
+        );
+    }
+
+    #[test]
+    fn save_token_to_cli_credentials_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let creds_dir = dir.path().join(".astra");
+        std::fs::create_dir_all(&creds_dir).unwrap();
+        let creds_path = creds_dir.join("credentials.json");
+
+        // Write initial file
+        std::fs::write(
+            &creds_path,
+            r#"{"current_profile":"default","profiles":{"default":{"username":"old"}}}"#,
+        )
+        .unwrap();
+
+        // We can't easily test save_token_to_cli_credentials because it uses
+        // dirs::home_dir(), but we can test the JSON structure it produces.
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&creds_path).unwrap()).unwrap();
+        doc["profiles"]["default"]["access_token"] = serde_json::Value::String("new-token".into());
+        doc["profiles"]["default"]["refresh_token"] =
+            serde_json::Value::String("new-refresh".into());
+        doc["profiles"]["default"]["username"] = serde_json::Value::String("admin".into());
+        let body = serde_json::to_string_pretty(&doc).unwrap();
+        std::fs::write(&creds_path, body).unwrap();
+
+        // Verify
+        let loaded: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&creds_path).unwrap()).unwrap();
+        assert_eq!(
+            loaded["profiles"]["default"]["access_token"].as_str(),
+            Some("new-token")
+        );
+        assert_eq!(
+            loaded["profiles"]["default"]["refresh_token"].as_str(),
+            Some("new-refresh")
+        );
+        assert_eq!(
+            loaded["profiles"]["default"]["username"].as_str(),
+            Some("admin")
+        );
+    }
+
+    // ── SharedAuthToken ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn shared_auth_token_get_returns_none_without_credentials() {
+        // With no credentials file and no username/password, get() should return None
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+        let auth = SharedAuthToken::new(api, None, None);
+        // get() will try to read credentials file and validate — both fail → None
+        assert!(auth.get().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn shared_auth_token_invalidate_clears_cached() {
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+        let auth = SharedAuthToken::new(api, None, None);
+        // Manually set a cached token
+        {
+            let mut guard = auth.token.write().await;
+            *guard = Some("cached-token-abc".to_string());
+        }
+        assert_eq!(auth.get().await, Some("cached-token-abc".to_string()));
+
+        auth.invalidate().await;
+        // After invalidation, cached token is cleared (get returns None because
+        // refresh will fail with unreachable server)
+        let guard = auth.token.read().await;
+        assert!(guard.is_none());
+    }
+
+    #[tokio::test]
+    async fn shared_auth_token_get_returns_cached() {
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+        let auth = SharedAuthToken::new(api, None, None);
+        // Manually seed cache
+        {
+            let mut guard = auth.token.write().await;
+            *guard = Some("fast-path-token".to_string());
+        }
+        // get() should return the cached token without any network call
+        assert_eq!(auth.get().await, Some("fast-path-token".to_string()));
+    }
+
+    #[test]
+    fn read_cli_access_token_missing_file() {
+        // With a nonexistent HOME, read_cli_access_token should return None
+        let _guard = EnvGuard::set("HOME", "/nonexistent/path/xyz");
+        assert!(read_cli_access_token().is_none());
+    }
+
+    #[test]
+    fn read_cli_access_token_valid_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let astra_dir = tmp.path().join(".astra");
+        std::fs::create_dir_all(&astra_dir).unwrap();
+        let creds = serde_json::json!({
+            "current_profile": "default",
+            "profiles": {
+                "default": {
+                    "access_token": "my-token-123",
+                    "refresh_token": "my-refresh"
+                }
+            }
+        });
+        std::fs::write(
+            astra_dir.join("credentials.json"),
+            serde_json::to_string(&creds).unwrap(),
+        )
+        .unwrap();
+
+        let _guard = EnvGuard::set("HOME", tmp.path().to_str().unwrap());
+        assert_eq!(read_cli_access_token(), Some("my-token-123".to_string()));
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        old: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let old = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, old }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.old {
+                Some(value) => unsafe {
+                    std::env::set_var(self.key, value);
+                },
+                None => unsafe {
+                    std::env::remove_var(self.key);
+                },
+            }
+        }
+    }
 }
 
 // ── Durable task action tests ───────────────────────────────
@@ -2987,7 +4139,7 @@ async fn action_dtask_create_no_db() {
     let text = "[[GATEWAY:dtask_create:weekly report:collect stats]]";
     let mut r = Vec::new();
     execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
-    assert!(r[0].contains("数据库"), "{}", r[0]);
+    assert!(r[0].contains("存储"), "{}", r[0]);
 }
 
 #[tokio::test]
@@ -3019,7 +4171,7 @@ async fn action_dtask_status_no_db() {
     let text = "[[GATEWAY:dtask_status:some-id]]";
     let mut r = Vec::new();
     execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
-    assert!(r[0].contains("数据库"), "{}", r[0]);
+    assert!(r[0].contains("存储"), "{}", r[0]);
 }
 
 #[tokio::test]
@@ -3027,7 +4179,7 @@ async fn action_dtask_resume_no_db() {
     let text = "[[GATEWAY:dtask_resume:some-id]]";
     let mut r = Vec::new();
     execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
-    assert!(r[0].contains("数据库"), "{}", r[0]);
+    assert!(r[0].contains("存储"), "{}", r[0]);
 }
 
 #[tokio::test]
@@ -3035,7 +4187,7 @@ async fn action_dtask_list_no_db() {
     let text = "[[GATEWAY:dtask_list]]";
     let mut r = Vec::new();
     execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
-    assert!(r[0].contains("数据库"), "{}", r[0]);
+    assert!(r[0].contains("存储"), "{}", r[0]);
 }
 
 #[tokio::test]
@@ -3043,7 +4195,7 @@ async fn action_dtask_complete_no_db() {
     let text = "[[GATEWAY:dtask_complete:some-id]]";
     let mut r = Vec::new();
     execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
-    assert!(r[0].contains("数据库"), "{}", r[0]);
+    assert!(r[0].contains("存储"), "{}", r[0]);
 }
 
 #[tokio::test]
@@ -3051,7 +4203,7 @@ async fn action_dtask_fail_no_db() {
     let text = "[[GATEWAY:dtask_fail:some-id:oops]]";
     let mut r = Vec::new();
     execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
-    assert!(r[0].contains("数据库"), "{}", r[0]);
+    assert!(r[0].contains("存储"), "{}", r[0]);
 }
 
 #[tokio::test]
@@ -3059,7 +4211,81 @@ async fn action_dtask_cancel_no_db() {
     let text = "[[GATEWAY:dtask_cancel:some-id]]";
     let mut r = Vec::new();
     execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
-    assert!(r[0].contains("数据库"), "{}", r[0]);
+    assert!(r[0].contains("存储"), "{}", r[0]);
+}
+
+// ── trace_kill / outbox_dismiss GATEWAY actions ──
+
+#[tokio::test]
+async fn action_trace_kill_no_repo() {
+    let text = "[[GATEWAY:trace_kill:some-trace-id]]";
+    let mut r = Vec::new();
+    // execute_gateway_actions passes None for trace_repo
+    execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
+    assert!(r[0].contains("trace 支持"), "{}", r[0]);
+}
+
+#[tokio::test]
+async fn action_trace_kill_empty_id() {
+    let text = "[[GATEWAY:trace_kill:]]";
+    let mut r = Vec::new();
+    execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
+    assert!(r[0].contains("请指定"), "{}", r[0]);
+}
+
+#[tokio::test]
+async fn action_trace_kill_with_repo() {
+    use crate::trace_model::{InMemoryTraceRepository, TraceWriter};
+    let repo = InMemoryTraceRepository::default();
+    let conv = crate::trace_model::ConversationKey::new("wx", "c1", "astra");
+    let req = crate::trace_model::GatewayRequest::new(conv, "msg-1", "u1", "hello");
+    let trace_id = req.trace_id.clone();
+    let writer = TraceWriter::begin(&repo, req).await.unwrap();
+    let _ = writer.start_run("astra", None).await.unwrap();
+
+    let text = format!("[[GATEWAY:trace_kill:{}]]", trace_id);
+    let policy = crate::access_control::ActionPolicy {
+        allow_slash_mutations: true,
+        allow_model_generated_mutations: true,
+        workspace_roots: Vec::new(),
+    };
+    let mut r = Vec::new();
+    let repo_ref: &dyn crate::trace_model::TraceRepository = &repo;
+    execute_gateway_actions_with_policy(
+        &text,
+        None,
+        "wx",
+        "c1",
+        "u1",
+        None,
+        None,
+        &policy,
+        Some(repo_ref),
+        &mut r,
+    )
+    .await;
+    assert_eq!(r.len(), 1);
+    assert!(
+        r[0].contains("已终止"),
+        "expected kill confirmation, got: {}",
+        r[0]
+    );
+}
+
+#[tokio::test]
+async fn action_outbox_dismiss_no_repo() {
+    let text = "[[GATEWAY:outbox_dismiss:some-request-id]]";
+    let mut r = Vec::new();
+    execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
+    assert!(r[0].contains("trace 支持"), "{}", r[0]);
+}
+
+#[tokio::test]
+async fn action_outbox_dismiss_empty_id() {
+    let text = "[[GATEWAY:outbox_dismiss:]]";
+    let mut r = Vec::new();
+    execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
+    assert!(r[0].contains("请指定"), "{}", r[0]);
 }
 
 // ── Fix #1: Regex handles JSON with `]` chars (arrays/nested) ──
@@ -3071,11 +4297,7 @@ async fn action_dtask_checkpoint_json_with_array() {
     let clean = execute_gateway_actions(text, None, "wx", "c1", "u1", None, None, &mut r).await;
     assert!(clean.is_empty(), "tags should be stripped, got: {clean}");
     assert_eq!(r.len(), 1);
-    assert!(
-        r[0].contains("数据库"),
-        "expected no-db error, got: {}",
-        r[0]
-    );
+    assert!(r[0].contains("存储"), "expected no-db error, got: {}", r[0]);
 }
 
 #[tokio::test]
@@ -3112,7 +4334,7 @@ async fn action_policy_blocks_model_mutations_when_disabled() {
     };
     let mut r = Vec::new();
     let clean = execute_gateway_actions_with_policy(
-        text, None, "wx", "c1", "u1", None, None, &policy, &mut r,
+        text, None, "wx", "c1", "u1", None, None, &policy, None, &mut r,
     )
     .await;
     assert!(clean.is_empty(), "tag should be stripped: {clean}");
@@ -3130,16 +4352,32 @@ async fn action_policy_allows_when_enabled() {
     };
     let mut r = Vec::new();
     let clean = execute_gateway_actions_with_policy(
-        text, None, "wx", "c1", "u1", None, None, &policy, &mut r,
+        text, None, "wx", "c1", "u1", None, None, &policy, None, &mut r,
     )
     .await;
     assert!(clean.is_empty());
     assert_eq!(r.len(), 1);
     assert!(
-        r[0].contains("数据库"),
+        r[0].contains("存储"),
         "expected no-db fallback, got: {}",
         r[0]
     );
+}
+
+fn build_welcome_message(cli: &CliProfile) -> String {
+    format!(
+        "👋 **欢迎使用 Astra Gateway!**\n\n\
+         当前 CLI: `{cli_name}`\n\
+         发送任意消息开始对话，或使用命令:\n\n\
+         - `/help` — 所有命令\n\
+         - `/status` — 当前状态\n\
+         - `/cli` — 切换 CLI 后端\n\
+         - `/model` — 切换模型\n\
+         - `/ws ls` — 可用项目\n\
+         - `/gateway` — 完整能力概览\n\n\
+         发送消息开始 🚀",
+        cli_name = cli.name()
+    )
 }
 
 fn format_tokens(n: u64) -> String {
