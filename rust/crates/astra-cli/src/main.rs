@@ -160,6 +160,8 @@ mod slash_debug;
 mod slash_health;
 #[path = "cli/slash_info.rs"]
 mod slash_info;
+#[path = "cli/slash_inspect.rs"]
+mod slash_inspect;
 #[path = "cli/slash_mcp.rs"]
 mod slash_mcp;
 #[path = "cli/slash_memory.rs"]
@@ -198,6 +200,8 @@ mod spawn_subrun;
 mod sse_utils;
 #[path = "cli/startup_trace.rs"]
 mod startup_trace;
+#[path = "cli/stream_events_writer.rs"]
+mod stream_events_writer;
 #[path = "cli/stream_render.rs"]
 mod stream_render;
 #[path = "cli/streaming_md.rs"]
