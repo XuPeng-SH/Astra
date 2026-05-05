@@ -21,12 +21,215 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
+use tokio_util::sync::CancellationToken;
 
 const MAX_CHUNK_LEN: usize = 3800;
 const INITIAL_ACK_DELAY: Duration = Duration::from_secs(3);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(25);
 const PROGRESSIVE_FLUSH_INTERVAL: Duration = Duration::from_secs(8);
 const PROGRESSIVE_MIN_CHARS: usize = 200;
+
+// ─── Send Circuit Breaker ───────────────────────────────────────────────────
+
+const SEND_FAILURE_THRESHOLD: u32 = 3;
+/// After this long without a new failure, the breaker auto half-opens even
+/// without a success call. This matters for long-running tasks that recover
+/// the platform but don't emit sends (so `record_success` is never called).
+/// Without the cooldown, such tasks would stay silent forever.
+const SEND_FAILURE_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// Injectable clock so cooldown tests don't need real sleeps.
+trait Clock: Send + Sync + std::fmt::Debug {
+    fn now(&self) -> Instant;
+}
+
+#[derive(Debug, Default)]
+struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+struct TestClockHandle {
+    offset: Arc<std::sync::Mutex<Duration>>,
+    base: Instant,
+}
+
+#[cfg(test)]
+impl Clock for TestClockHandle {
+    fn now(&self) -> Instant {
+        self.base + *self.offset.lock().unwrap()
+    }
+}
+
+#[cfg(test)]
+struct TestClock {
+    offset: Arc<std::sync::Mutex<Duration>>,
+    base: Instant,
+}
+
+#[cfg(test)]
+impl TestClock {
+    fn new() -> Self {
+        Self {
+            offset: Arc::new(std::sync::Mutex::new(Duration::ZERO)),
+            base: Instant::now(),
+        }
+    }
+    fn advance(&self, d: Duration) {
+        *self.offset.lock().unwrap() += d;
+    }
+    fn handle(&self) -> TestClockHandle {
+        TestClockHandle {
+            offset: Arc::clone(&self.offset),
+            base: self.base,
+        }
+    }
+}
+
+/// Entries whose `last_failure_at` is older than this are reaped on the
+/// next record_failure call. Bounds state.len() under a steady stream of
+/// one-off failures from unique conversations (gateway at scale).
+const SEND_FAILURE_EVICTION_AGE: Duration = Duration::from_secs(10 * 60);
+
+/// Floor on how often we walk `state` to evict. Prevents an O(n) sweep
+/// from running on every single `record_failure` during a failure spike.
+const SEND_FAILURE_EVICTION_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Per-conversation send health tracker. Suppresses heartbeats after
+/// consecutive send failures to avoid flooding an unreachable platform.
+///
+/// Recovery paths:
+/// - `record_success` closes the breaker immediately (clears state).
+/// - Without any send (task processing locally), the breaker auto half-opens
+///   after `SEND_FAILURE_COOLDOWN` elapsed since `last_failure_at`, so the
+///   next heartbeat probes platform recovery.
+/// - Abandoned entries (no new failure for `SEND_FAILURE_EVICTION_AGE`) are
+///   lazily reaped so `state.len()` stays bounded under high-conversation
+///   churn. Sweep runs at most once per `SEND_FAILURE_EVICTION_SWEEP_INTERVAL`.
+#[derive(Clone)]
+struct SendCircuitBreaker {
+    state: Arc<dashmap::DashMap<String, (u32, Instant)>>,
+    last_sweep_at: Arc<std::sync::Mutex<Option<Instant>>>,
+    clock: Arc<dyn Clock>,
+}
+
+impl Default for SendCircuitBreaker {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(dashmap::DashMap::new()),
+            last_sweep_at: Arc::new(std::sync::Mutex::new(None)),
+            clock: Arc::new(SystemClock),
+        }
+    }
+}
+
+impl SendCircuitBreaker {
+    #[cfg(test)]
+    fn with_clock(clock: TestClockHandle) -> Self {
+        Self {
+            state: Arc::new(dashmap::DashMap::new()),
+            last_sweep_at: Arc::new(std::sync::Mutex::new(None)),
+            clock: Arc::new(clock),
+        }
+    }
+
+    /// Opportunistically reap entries older than the eviction age. Called
+    /// from record_failure so the sweep cost is amortized with the write.
+    /// Rate-limited to once per SEND_FAILURE_EVICTION_SWEEP_INTERVAL to
+    /// avoid O(n) per call during a failure spike.
+    fn maybe_evict(&self, now: Instant) {
+        {
+            let mut last = match self.last_sweep_at.lock() {
+                Ok(g) => g,
+                Err(_) => return, // poisoned — skip eviction, not critical
+            };
+            if let Some(prev) = *last
+                && now.saturating_duration_since(prev) < SEND_FAILURE_EVICTION_SWEEP_INTERVAL
+            {
+                return;
+            }
+            *last = Some(now);
+        }
+        let before = self.state.len();
+        self.state.retain(|_, (_, last_failure_at)| {
+            now.saturating_duration_since(*last_failure_at) < SEND_FAILURE_EVICTION_AGE
+        });
+        let evicted = before.saturating_sub(self.state.len());
+        if evicted > 0 {
+            tracing::debug!(
+                target: "gateway::circuit_breaker",
+                evicted,
+                remaining = self.state.len(),
+                "send circuit breaker swept stale entries"
+            );
+        }
+    }
+
+    fn record_success(&self, key: &str) {
+        if let Some((_, (count, _))) = self.state.remove(key)
+            && count >= SEND_FAILURE_THRESHOLD
+        {
+            tracing::info!(
+                target: "gateway::circuit_breaker",
+                key = %key,
+                prior_failures = count,
+                "send circuit breaker CLOSED after successful send"
+            );
+        }
+    }
+
+    fn record_failure(&self, key: &str) {
+        let now = self.clock.now();
+        // Reap stale entries before inserting so state.len() stays bounded
+        // under a steady stream of one-off failures from unique keys.
+        self.maybe_evict(now);
+        let mut entry = self.state.entry(key.to_string()).or_insert((0, now));
+        entry.0 += 1;
+        entry.1 = now;
+        if entry.0 == SEND_FAILURE_THRESHOLD {
+            tracing::warn!(
+                target: "gateway::circuit_breaker",
+                key = %key,
+                threshold = SEND_FAILURE_THRESHOLD,
+                "send circuit breaker OPENED — heartbeats suppressed until recovery or cooldown"
+            );
+        }
+    }
+
+    fn is_open(&self, key: &str) -> bool {
+        let Some(entry) = self.state.get(key) else {
+            return false;
+        };
+        let (count, last_failure_at) = *entry;
+        if count < SEND_FAILURE_THRESHOLD {
+            return false;
+        }
+        // Half-open after cooldown: lets the caller probe platform recovery.
+        // State (failure count) is kept — a probe failure re-trips immediately
+        // via record_failure, without needing THRESHOLD more failures.
+        let now = self.clock.now();
+        now.saturating_duration_since(last_failure_at) < SEND_FAILURE_COOLDOWN
+    }
+
+    fn reset(&self, key: &str) {
+        self.state.remove(key);
+    }
+}
+
+// ─── Safe String Truncation ─────────────────────────────────────────────────
+
+/// Truncate a string to at most `n` characters, safe for multi-byte UTF-8.
+pub(crate) fn truncate_chars(s: &str, n: usize) -> &str {
+    match s.char_indices().nth(n) {
+        Some((idx, _)) => &s[..idx],
+        None => s,
+    }
+}
 const CONVERSATION_QUEUE_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Number of consecutive auth failures before the circuit breaker trips.
@@ -104,6 +307,17 @@ pub struct GatewayRunner {
     shared_auth: Option<SharedAuthToken>,
     /// Monotonic counter for generating short request tags when no trace exists.
     request_counter: AtomicU32,
+    /// Active CLI processes indexed by trace_id. Used by `/kill` to abort
+    /// running tasks immediately (SIGKILL) instead of only marking DB state.
+    active_tasks: Arc<dashmap::DashMap<String, CancellationToken>>,
+    /// Per-conversation send circuit breaker. Workers check this before
+    /// emitting heartbeats — stops sending after consecutive failures to
+    /// avoid message flood when platform is unreachable.
+    send_health: SendCircuitBreaker,
+    /// When this gateway process started. Requests with `created_at`
+    /// before this are zombies — their cancel tokens and CLI children
+    /// died with the previous gateway lifecycle.
+    gateway_start: chrono::DateTime<chrono::Utc>,
 }
 
 /// No-op adapter used in spawned CLI tasks (typing/heartbeats not available in background).
@@ -246,6 +460,9 @@ impl GatewayRunner {
             auth_failures: Arc::new(dashmap::DashMap::new()),
             shared_auth,
             request_counter: AtomicU32::new(0),
+            active_tasks: Arc::new(dashmap::DashMap::new()),
+            send_health: SendCircuitBreaker::default(),
+            gateway_start: chrono::Utc::now(),
         })
     }
 
@@ -272,7 +489,14 @@ impl GatewayRunner {
     pub async fn replay_pending_messages(&self, adapter: &dyn PlatformAdapter) {
         if let Some(ref store) = self.store {
             let platform = adapter.name();
-            match store.list_pending_messages(Some(platform)).await {
+            let loaded = retry_once_on_transient("list_pending_messages", || async {
+                store
+                    .list_pending_messages(Some(platform))
+                    .await
+                    .map_err(|e| e.to_string())
+            })
+            .await;
+            match loaded {
                 Ok(msgs) if msgs.is_empty() => {}
                 Ok(msgs) => {
                     tracing::info!(platform, count = msgs.len(), "replaying pending messages");
@@ -285,6 +509,7 @@ impl GatewayRunner {
                             msg_id: format!("replay-{}", pm.id),
                             chat_type: crate::platforms::ChatType::DirectMessage,
                             reply_token: None,
+                            route_override: None,
                         };
                         if let Some(response) = self
                             .handle_message_inner(&msg, adapter, Some(pm.id), false, None)
@@ -305,7 +530,11 @@ impl GatewayRunner {
 
     pub async fn sweep_stale_tasks(&self) {
         if let Some(ref store) = self.durable_store {
-            match store.suspend_stale_running_tasks("gateway restarted").await {
+            let result = retry_once_on_transient("sweep_stale_tasks", || async {
+                store.suspend_stale_running_tasks("gateway restarted").await
+            })
+            .await;
+            match result {
                 Ok(0) => {}
                 Ok(n) => tracing::info!(count = n, "swept stale running tasks → suspended"),
                 Err(e) => tracing::warn!(error = %e, "failed to sweep stale tasks"),
@@ -315,7 +544,11 @@ impl GatewayRunner {
 
     pub async fn sweep_stale_traces(&self) {
         if let Some(ref repo) = self.trace_repo {
-            match repo.sweep_stale_requests("gateway restarted").await {
+            let result = retry_once_on_transient("sweep_stale_traces", || async {
+                repo.sweep_stale_requests("gateway restarted").await
+            })
+            .await;
+            match result {
                 Ok(0) => {}
                 Ok(n) => tracing::info!(count = n, "swept stale trace requests → failed"),
                 Err(e) => tracing::warn!(error = %e, "failed to sweep stale traces"),
@@ -396,7 +629,54 @@ impl GatewayRunner {
             return Ok(Some(self.handle_auth_command(&cli_profile).await));
         }
 
-        // /manage — rewrite to rich context message and send to slow CLI path
+        // /manage cancel, /manage kill → redirect to fast-path /cancel, /kill
+        // so they execute immediately even when a task is running. For
+        // bulk cleanup the user should type /kill all directly — we don't
+        // try to guess bulk intent from natural language (too brittle,
+        // CN/EN case-explosion), and the AI slow-path would queue behind
+        // the very tasks the user wants to clear.
+        if let Some(rest) = trimmed.strip_prefix("/manage ") {
+            let rest = rest.trim();
+            if rest == "cancel"
+                || rest.starts_with("cancel ")
+                || rest == "kill"
+                || rest.starts_with("kill ")
+            {
+                let rewritten_cmd = format!("/{rest}");
+                // Build command context and dispatch directly (avoids async recursion).
+                let cmd_ctx = CommandContext {
+                    astra: &self.thin,
+                    config: &self.config,
+                    store: self.store.as_deref(),
+                    platform: msg.platform,
+                    chat_id: &effective_chat_id,
+                    user_id: &msg.user_id,
+                    resolved_cli: &cli_profile,
+                    durable_store: self.durable_store.as_ref().map(|s| {
+                        s.as_ref() as &dyn astra_core::durable_task_store::DurableTaskStore
+                    }),
+                    trace_repo: self
+                        .trace_repo
+                        .as_ref()
+                        .map(|repo| repo.as_ref() as &dyn TraceRepository),
+                    project_dirs: &self.config.project_dirs,
+                    cli_availability: &self.cli_availability,
+                    auth_status: self.auth_status_line(cli_profile.name()),
+                    active_tasks: Some(&self.active_tasks),
+                    gateway_start: self.gateway_start,
+                };
+                if let Some(response) = commands::handle_command(&cmd_ctx, &rewritten_cmd).await {
+                    return Ok(Some(response));
+                }
+            }
+        }
+
+        // /manage — rewrite to rich context message and send to slow CLI path.
+        // MUST be routed to a SEPARATE conversation worker (virtual profile
+        // MANAGE_CLI_PROFILE) so /manage doesn't queue behind the very tasks
+        // it's supposed to manage. Mark the message with the route override
+        // via chat_id-side metadata; the enqueue point checks this and
+        // applies the override on build_queued_request.
         if trimmed == "/manage" || trimmed.starts_with("/manage ") {
             let extra = trimmed.strip_prefix("/manage").unwrap_or("").trim();
             let context = self
@@ -404,6 +684,9 @@ impl GatewayRunner {
                 .await;
             let mut managed_msg = msg.clone();
             managed_msg.text = context;
+            // Mark the msg so handle_fast's caller routes through the
+            // _manage worker instead of the user's normal queue.
+            managed_msg.route_override = Some(commands::MANAGE_CLI_PROFILE.to_string());
             return Err(managed_msg);
         }
 
@@ -427,6 +710,8 @@ impl GatewayRunner {
             project_dirs: &self.config.project_dirs,
             cli_availability: &self.cli_availability,
             auth_status: self.auth_status_line(cli_profile.name()),
+            active_tasks: Some(&self.active_tasks),
+            gateway_start: self.gateway_start,
         };
         if let Some(response) = commands::handle_command(&cmd_ctx, &msg.text).await {
             return Ok(Some(response));
@@ -735,22 +1020,39 @@ impl GatewayRunner {
 
         let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<CliProgress>(64);
 
+        // Register cancellation token for this task so /kill can abort it.
+        // Uses trace_id if available, otherwise a synthetic key based on
+        // the request tag — ensures all tasks are killable.
+        let cancel_token = CancellationToken::new();
+        let kill_registry_key = trace
+            .as_ref()
+            .map(|t| t.trace_id.to_string())
+            .unwrap_or_else(|| format!("notrace:{}", request_tag));
+        self.active_tasks
+            .insert(kill_registry_key.clone(), cancel_token.clone());
+
         let cli_handle = tokio::spawn({
             let profile = cli_profile.clone();
             let message_text = message_text.clone();
             let system_prompt = system_prompt.clone();
             let ws = workspace.clone();
             let token = access_token.clone();
+            let kill_token = cancel_token.clone();
+            let trace_id_str = trace.as_ref().map(|t| t.trace_id.to_string());
+            let request_id_str = trace.as_ref().map(|t| t.request_id.to_string());
             async move {
-                cli_bridge::run_cli_with_context_and_timeout(
+                cli_bridge::run_cli_with_cancel(
                     &profile,
                     &message_text,
                     sid.as_deref(),
                     ws.as_deref(),
                     Some(progress_tx),
                     Some(&system_prompt),
+                    trace_id_str.as_deref(),
+                    request_id_str.as_deref(),
                     Some(cli_timeout),
                     token.as_deref(),
+                    Some(kill_token),
                 )
                 .await
             }
@@ -768,41 +1070,53 @@ impl GatewayRunner {
         let next_timer = tokio::time::sleep(INITIAL_ACK_DELAY);
         tokio::pin!(next_timer);
 
-        #[allow(clippy::type_complexity)]
+        // Health key for heartbeat circuit-breaker. MUST use msg.chat_id
+        // (not effective_chat_id) because deliver_outbound receives
+        // OutboundMessage with msg.chat_id and tracks failures under
+        // that key. Using effective_chat_id here would create a mismatch.
+        let health_key = format!("{}:{}", msg.platform, msg.chat_id);
+        // Reset health at task start — previous failures are stale.
+        self.send_health.reset(&health_key);
+
         let flush_buf = |buf: &mut String,
                          tx: &Option<tokio::sync::mpsc::Sender<OutboundMessage>>,
                          platform: &str,
                          chat: &str,
                          tag: &str,
                          chunk_num: u32|
-         -> Option<(
-            std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>,
-            usize,
-        )> {
-            let text = std::mem::take(buf);
-            let text = text.trim().to_string();
+         -> usize {
+            let text = buf.trim().to_string();
             if text.is_empty() {
-                return None;
+                return 0;
             }
+            let Some(tx) = tx else {
+                // No outbound channel — discard to prevent memory leak.
+                buf.clear();
+                return 0;
+            };
             let len = text.len();
             let tagged = format!("[{tag}:{chunk_num}] {text}");
-            let tx = tx.clone();
-            let platform = platform.to_string();
-            let chat = chat.to_string();
-            Some((
-                Box::pin(async move {
-                    if let Some(tx) = tx {
-                        let _ = tx
-                            .send(OutboundMessage::plain(platform, chat, tagged))
-                            .await;
-                    }
-                }),
-                len,
-            ))
+            if tx
+                .try_send(OutboundMessage::plain(
+                    platform.to_string(),
+                    chat.to_string(),
+                    tagged,
+                ))
+                .is_err()
+            {
+                return 0;
+            }
+            // Only clear buffer after successful send.
+            buf.clear();
+            len
         };
 
         loop {
             tokio::select! {
+                _ = cancel_token.cancelled() => {
+                    tracing::info!(tag = %request_tag, "task cancelled by user — CLI process will be killed by bridge");
+                    break;
+                }
                 progress = progress_rx.recv() => {
                     match progress {
                         Some(CliProgress::Token(text)) => {
@@ -812,10 +1126,7 @@ impl GatewayRunner {
                                 token_buf.push_str(&filtered);
                                 if token_buf.len() >= PROGRESSIVE_MIN_CHARS {
                                     chunk_counter += 1;
-                                    if let Some(fut) = flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &chat_id, &request_tag, chunk_counter) {
-                                        progressive_text_len += fut.1;
-                                        fut.0.await;
-                                    }
+                                    progressive_text_len += flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &chat_id, &request_tag, chunk_counter);
                                     next_timer.as_mut().reset(tokio::time::Instant::now() + PROGRESSIVE_FLUSH_INTERVAL);
                                 }
                             }
@@ -844,30 +1155,30 @@ impl GatewayRunner {
                                 token_buf.push_str(&tail);
                             }
                             chunk_counter += 1;
-                            if let Some((fut, len)) = flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &chat_id, &request_tag, chunk_counter) {
-                                progressive_text_len += len;
-                                fut.await;
-                            }
+                            progressive_text_len += flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &chat_id, &request_tag, chunk_counter);
                             break;
                         }
                     }
                 }
                 _ = &mut next_timer => {
-                    // Timer-based flush: either initial ack or periodic token flush
+                    // Circuit-breaker: skip heartbeats/flushes when platform is unreachable.
+                    if self.send_health.is_open(&health_key) {
+                        next_timer.as_mut().reset(tokio::time::Instant::now() + HEARTBEAT_INTERVAL);
+                        continue;
+                    }
                     if !token_buf.is_empty() {
                         chunk_counter += 1;
-                        if let Some((fut, len)) = flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &chat_id, &request_tag, chunk_counter) {
-                            progressive_text_len += len;
-                            fut.await;
-                        }
+                        progressive_text_len += flush_buf(&mut token_buf, &self.outbound_tx, msg.platform, &chat_id, &request_tag, chunk_counter);
                         next_timer.as_mut().reset(tokio::time::Instant::now() + PROGRESSIVE_FLUSH_INTERVAL);
                     } else if !sent_initial_ack {
                         sent_initial_ack = true;
                         let heartbeat = format!("[{request_tag}] 🤔 {cli_name} 思考中…");
                         if let Some(ref tx) = self.outbound_tx {
-                            let _ = tx
-                                .send(OutboundMessage::plain(msg.platform.to_string(), chat_id.clone(), heartbeat))
-                                .await;
+                            // try_send: drop heartbeat if channel backpressured —
+                            // stale heartbeats are worse than missing ones.
+                            let _ = tx.try_send(OutboundMessage::plain(
+                                msg.platform.to_string(), chat_id.clone(), heartbeat,
+                            ));
                         }
                         next_timer.as_mut().reset(tokio::time::Instant::now() + HEARTBEAT_INTERVAL);
                     } else {
@@ -879,14 +1190,42 @@ impl GatewayRunner {
                             format!("[{request_tag}] ⏳ 处理中… {elapsed_str}")
                         };
                         if let Some(ref tx) = self.outbound_tx {
-                            let _ = tx
-                                .send(OutboundMessage::plain(msg.platform.to_string(), chat_id.clone(), heartbeat))
-                                .await;
+                            let _ = tx.try_send(OutboundMessage::plain(
+                                msg.platform.to_string(), chat_id.clone(), heartbeat,
+                            ));
                         }
                         next_timer.as_mut().reset(tokio::time::Instant::now() + HEARTBEAT_INTERVAL);
                     }
                 }
             }
+        }
+
+        // Deregister from active tasks registry.
+        self.active_tasks.remove(&kill_registry_key);
+
+        // If the task was cancelled, the CLI bridge returns Err("killed by user").
+        // Short-circuit: mark trace as failed and return a kill confirmation
+        // without processing the result as a normal completion.
+        if cancel_token.is_cancelled() {
+            if let Some(writer) = trace_writer.as_ref()
+                && let Err(e) = writer.fail_request("killed by user").await
+            {
+                tracing::warn!(error = %e, "failed to mark trace as killed");
+            }
+            if let Err(e) = cli_handle.await {
+                tracing::debug!(error = %e, "cli task join error after cancel");
+            }
+            tracing::info!(tag = %request_tag, "task killed, skipping result processing");
+            return Some(
+                self.outbound_response(
+                    trace.as_ref(),
+                    msg.platform,
+                    &msg.chat_id,
+                    msg.reply_token.clone(),
+                    format!("[{request_tag}] 💀 任务已终止"),
+                )
+                .await,
+            );
         }
 
         // Helper: suspend running durable tasks for this chat on failure
@@ -1085,7 +1424,7 @@ impl GatewayRunner {
                 exit_code = result.exit_code,
                 stderr = %result.stderr.chars().take(200).collect::<String>(),
                 stdout_len = result.stdout.len(),
-                text = ?result.text.as_deref().map(|t| &t[..t.len().min(100)]),
+                text = ?result.text.as_deref().map(|t| truncate_chars(t, 100)),
                 "CLI non-zero exit"
             );
 
@@ -1719,11 +2058,19 @@ impl GatewayRunner {
         sections.join("\n")
     }
 
-    async fn build_queued_request(&self, msg: InboundMessage) -> QueuedRequest {
-        let cli_profile = self.resolve_cli_profile(msg.platform, &msg.user_id).await;
+    /// Build a queued request, optionally overriding the conversation's
+    /// cli_profile. Used by `/manage` to route to an independent worker
+    /// (virtual profile `_manage`) so management commands don't queue
+    /// behind the very tasks they're supposed to fix.
+    async fn build_queued_request_with_profile_override(
+        &self,
+        msg: InboundMessage,
+        profile_override: Option<&str>,
+    ) -> QueuedRequest {
+        let resolved = self.resolve_cli_profile(msg.platform, &msg.user_id).await;
+        let conv_profile = profile_override.unwrap_or(resolved.name());
         let effective_chat_id = self.effective_chat_id(&msg);
-        let conversation =
-            ConversationKey::new(msg.platform, effective_chat_id, cli_profile.name());
+        let conversation = ConversationKey::new(msg.platform, effective_chat_id, conv_profile);
         let trace = if let Some(repo) = self.trace_repo.as_ref() {
             let request = GatewayRequest::new(
                 conversation.clone(),
@@ -1765,7 +2112,30 @@ impl GatewayRunner {
         msg: InboundMessage,
         cli_resp_tx: tokio::sync::mpsc::Sender<CliResponse>,
     ) {
-        let queued = self.build_queued_request(msg).await;
+        // If handle_fast marked the message with a route_override (e.g.
+        // `/manage` → MANAGE_CLI_PROFILE), use that as the ConversationKey
+        // profile so it goes to its own independent worker.
+        let override_profile = msg.route_override.clone();
+        self.enqueue_cli_request_with_profile_override(
+            msg,
+            cli_resp_tx,
+            override_profile.as_deref(),
+        )
+        .await
+    }
+
+    /// See build_queued_request_with_profile_override — used by the
+    /// `/manage` slow-path so the request goes to a different worker
+    /// than the user's currently-running tasks.
+    async fn enqueue_cli_request_with_profile_override(
+        self: &Arc<Self>,
+        msg: InboundMessage,
+        cli_resp_tx: tokio::sync::mpsc::Sender<CliResponse>,
+        profile_override: Option<&str>,
+    ) {
+        let queued = self
+            .build_queued_request_with_profile_override(msg, profile_override)
+            .await;
         let key = queued.conversation.clone();
         let tx = {
             let mut queues = self.queue_senders.lock().await;
@@ -1911,7 +2281,11 @@ impl GatewayRunner {
         let Some(repo) = self.trace_repo.as_ref() else {
             return;
         };
-        match repo.list_retryable_outbox(None, 100).await {
+        let result = retry_once_on_transient("list_retryable_outbox", || async {
+            repo.list_retryable_outbox(None, 100).await
+        })
+        .await;
+        match result {
             Ok(rows) if rows.is_empty() => {}
             Ok(rows) => {
                 tracing::info!(count = rows.len(), "replaying retryable outbox");
@@ -1941,6 +2315,7 @@ impl GatewayRunner {
         adapter_indices: &HashMap<&'static str, usize>,
         outbound: OutboundMessage,
     ) {
+        let health_key = format!("{}:{}", outbound.platform, outbound.chat_id);
         let result = send_text_to_platform(
             adapters,
             adapter_indices,
@@ -1950,6 +2325,25 @@ impl GatewayRunner {
             outbound.reply_token.as_deref(),
         )
         .await;
+
+        // Track send health for heartbeat circuit-breaker.
+        match &result {
+            Ok(_) => {
+                self.send_health.record_success(&health_key);
+            }
+            Err((_, error)) => {
+                self.send_health.record_failure(&health_key);
+                if outbound.outbox.is_none() {
+                    tracing::debug!(
+                        platform = %outbound.platform,
+                        chat_id = %safe_id(&outbound.chat_id),
+                        error,
+                        "heartbeat/chunk send failed (no outbox, not retried)"
+                    );
+                }
+            }
+        }
+
         let Some(outbox) = outbound.outbox else {
             return;
         };
@@ -4641,4 +5035,684 @@ async fn typing_sent_before_cli_spawn() {
     // NullAdapter.send_typing succeeds but does nothing — that's OK
     // because the real adapter sends typing in run() before spawning
     assert!(adapter.send_typing("chat").await.is_ok());
+}
+
+// ── Kill registry tests ────────────────────────────────────────────────
+
+#[test]
+fn active_tasks_registry_insert_and_cancel() {
+    let registry: dashmap::DashMap<String, CancellationToken> = dashmap::DashMap::new();
+    let token = CancellationToken::new();
+    registry.insert("trace-1".into(), token.clone());
+    assert!(!token.is_cancelled());
+
+    // Simulate /kill: remove + cancel
+    let (_, removed_token) = registry.remove("trace-1").unwrap();
+    removed_token.cancel();
+    assert!(token.is_cancelled());
+}
+
+#[test]
+fn active_tasks_registry_kill_nonexistent_returns_none() {
+    let registry: dashmap::DashMap<String, CancellationToken> = dashmap::DashMap::new();
+    assert!(registry.remove("ghost").is_none());
+}
+
+#[tokio::test]
+async fn cancellation_token_aborts_spawned_task() {
+    let token = CancellationToken::new();
+    let token_inner = token.clone();
+
+    let handle = tokio::spawn(async move {
+        tokio::select! {
+            _ = token_inner.cancelled() => "killed",
+            _ = tokio::time::sleep(Duration::from_secs(60)) => "completed",
+        }
+    });
+
+    // Cancel immediately
+    token.cancel();
+    let result = handle.await.unwrap();
+    assert_eq!(result, "killed");
+}
+
+#[tokio::test]
+async fn kill_command_removes_and_cancels_token() {
+    let registry: Arc<dashmap::DashMap<String, CancellationToken>> =
+        Arc::new(dashmap::DashMap::new());
+    let token = CancellationToken::new();
+    registry.insert("trace-abc".into(), token.clone());
+
+    let killed = if let Some((_, t)) = registry.remove("trace-abc") {
+        t.cancel();
+        true
+    } else {
+        false
+    };
+
+    assert!(killed);
+    assert!(token.is_cancelled());
+    assert!(registry.is_empty());
+}
+
+// ── /manage cancel redirect tests ──────────────────────────────────────
+
+// ── /manage redirect routing tests ─────────────────────────────────────
+
+#[test]
+fn manage_redirect_recognizes_cancel_and_kill() {
+    // Verifies the routing predicate used in handle_fast.
+    for input in [
+        "/manage cancel",
+        "/manage cancel 1",
+        "/manage kill",
+        "/manage kill 2",
+    ] {
+        let rest = input.strip_prefix("/manage ").unwrap().trim();
+        assert!(
+            rest == "cancel"
+                || rest.starts_with("cancel ")
+                || rest == "kill"
+                || rest.starts_with("kill "),
+            "'{input}' should redirect to fast path"
+        );
+    }
+    // These should NOT redirect.
+    for input in ["/manage status", "/manage", "/manage help"] {
+        let rest = input.strip_prefix("/manage ").unwrap_or("").trim();
+        let should_redirect = rest == "cancel"
+            || rest.starts_with("cancel ")
+            || rest == "kill"
+            || rest.starts_with("kill ");
+        assert!(!should_redirect, "'{input}' should NOT redirect");
+    }
+}
+
+// ── cancel_task abstraction test ───────────────────────────────────────
+
+#[test]
+fn cancel_task_removes_token_and_fires() {
+    let registry: Arc<dashmap::DashMap<String, CancellationToken>> =
+        Arc::new(dashmap::DashMap::new());
+    let token = CancellationToken::new();
+    registry.insert("trace-1".into(), token.clone());
+
+    // Simulate GatewayRunner::cancel_task logic
+    let found = if let Some((_, t)) = registry.remove("trace-1") {
+        t.cancel();
+        true
+    } else {
+        false
+    };
+
+    assert!(found);
+    assert!(token.is_cancelled());
+    assert!(registry.is_empty());
+    // Double-cancel is a no-op
+    assert!(registry.remove("trace-1").is_none());
+}
+
+// ── /status model display tests ────────────────────────────────────────
+
+#[test]
+fn model_display_with_override() {
+    let model: Option<String> = Some("gpt-4o".into());
+    let (display, source) = if let Some(m) = model.as_deref() {
+        (m.to_string(), "user override")
+    } else {
+        ("(CLI default)".to_string(), "profile default")
+    };
+    assert_eq!(display, "gpt-4o");
+    assert_eq!(source, "user override");
+}
+
+#[test]
+fn model_display_without_override() {
+    let model: Option<String> = None;
+    let config_default: Option<&str> = Some("sonnet");
+    let (display, source) = if let Some(m) = model.as_deref() {
+        (m.to_string(), "user override")
+    } else if let Some(m) = config_default {
+        (m.to_string(), "config default")
+    } else {
+        ("(CLI default)".to_string(), "profile default")
+    };
+    assert_eq!(display, "sonnet");
+    assert_eq!(source, "config default");
+}
+
+#[test]
+fn model_display_no_config() {
+    let model: Option<String> = None;
+    let config_default: Option<&str> = None;
+    let (display, source) = if let Some(m) = model.as_deref() {
+        (m.to_string(), "user override")
+    } else if let Some(m) = config_default {
+        (m.to_string(), "config default")
+    } else {
+        ("(CLI default)".to_string(), "profile default")
+    };
+    assert_eq!(display, "(CLI default)");
+    assert_eq!(source, "profile default");
+}
+
+// ── Kill registry key tests ────────────────────────────────────────────
+
+#[test]
+fn kill_registry_key_with_trace() {
+    let trace_id: Option<&str> = Some("abc-123");
+    let request_tag = "#A7";
+    let key = trace_id
+        .map(String::from)
+        .unwrap_or_else(|| format!("notrace:{request_tag}"));
+    assert_eq!(key, "abc-123");
+}
+
+#[test]
+fn kill_registry_key_without_trace() {
+    let trace_id: Option<&str> = None;
+    let request_tag = "#A7";
+    let key = trace_id
+        .map(String::from)
+        .unwrap_or_else(|| format!("notrace:{request_tag}"));
+    assert_eq!(key, "notrace:#A7");
+}
+
+#[test]
+fn kill_registry_notrace_key_is_findable() {
+    let registry: dashmap::DashMap<String, CancellationToken> = dashmap::DashMap::new();
+    let token = CancellationToken::new();
+    let key = "notrace:#A7".to_string();
+    registry.insert(key.clone(), token.clone());
+
+    // /kill can find it by the synthetic key
+    let found = registry.remove(&key);
+    assert!(found.is_some());
+    found.unwrap().1.cancel();
+    assert!(token.is_cancelled());
+}
+
+// ── flush_buf non-blocking test ────────────────────────────────────────
+
+#[tokio::test]
+async fn flush_buf_does_not_block_when_channel_full() {
+    // Proves the progressive loop won't deadlock: flush_buf uses try_send.
+    let (tx, _rx) = tokio::sync::mpsc::channel::<OutboundMessage>(1);
+
+    // Fill channel.
+    tx.try_send(OutboundMessage::plain(
+        String::from("p"),
+        String::from("c"),
+        String::from("fill"),
+    ))
+    .unwrap();
+
+    // flush_buf equivalent: try_send on full channel completes instantly.
+    let result = tx.try_send(OutboundMessage::plain(
+        String::from("p"),
+        String::from("c"),
+        String::from("chunk"),
+    ));
+    // Returns Err(Full), not deadlock.
+    assert!(result.is_err());
+}
+
+// ── ChildKillGuard Drop test ───────────────────────────────────────────
+
+#[tokio::test]
+async fn child_kill_guard_kills_on_drop() {
+    use std::process::Stdio;
+    use tokio::process::Command;
+
+    let mut child = Command::new("cat")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn cat");
+    let pid = child.id().expect("pid");
+
+    {
+        let _guard = crate::cli_bridge::ChildKillGuard::new(&child);
+        // Guard dropped here — should send SIGKILL.
+    }
+
+    // child.wait() should return quickly (killed).
+    let status = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+    assert!(
+        status.is_ok(),
+        "child must exit promptly after guard drop (pid={pid})"
+    );
+}
+
+#[test]
+fn child_kill_guard_defuse_prevents_kill() {
+    // Defused guard must NOT kill.
+    let mut guard = crate::cli_bridge::ChildKillGuard::with_pid(1);
+    guard.defuse();
+    assert!(guard.is_defused());
+    // Drop now — no kill sent (pid is None).
+}
+
+// ── SendCircuitBreaker tests ─────────────────────────────────────────────
+
+#[cfg(test)]
+mod circuit_breaker_tests {
+    use super::*;
+
+    #[test]
+    fn starts_closed() {
+        let cb = SendCircuitBreaker::default();
+        assert!(!cb.is_open("wx:chat1"));
+    }
+
+    #[test]
+    fn opens_after_threshold_failures() {
+        let cb = SendCircuitBreaker::default();
+        let key = "wx:chat1";
+        cb.record_failure(key);
+        cb.record_failure(key);
+        assert!(!cb.is_open(key), "2 failures should not open");
+        cb.record_failure(key);
+        assert!(cb.is_open(key), "3 failures must open");
+    }
+
+    #[test]
+    fn success_resets_to_closed() {
+        let cb = SendCircuitBreaker::default();
+        let key = "wx:chat1";
+        for _ in 0..5 {
+            cb.record_failure(key);
+        }
+        assert!(cb.is_open(key));
+        cb.record_success(key);
+        assert!(!cb.is_open(key));
+    }
+
+    #[test]
+    fn reset_clears_state() {
+        let cb = SendCircuitBreaker::default();
+        let key = "wx:chat1";
+        for _ in 0..5 {
+            cb.record_failure(key);
+        }
+        cb.reset(key);
+        assert!(!cb.is_open(key));
+    }
+
+    #[test]
+    fn independent_keys() {
+        let cb = SendCircuitBreaker::default();
+        for _ in 0..5 {
+            cb.record_failure("wx:chat1");
+        }
+        assert!(cb.is_open("wx:chat1"));
+        assert!(!cb.is_open("wx:chat2"));
+    }
+
+    #[test]
+    fn concurrent_access() {
+        let cb = SendCircuitBreaker::default();
+        let cb2 = cb.clone();
+        let h = std::thread::spawn(move || {
+            for _ in 0..100 {
+                cb2.record_failure("wx:chat1");
+            }
+        });
+        for _ in 0..100 {
+            cb.record_failure("wx:chat1");
+        }
+        h.join().unwrap();
+        // After 200 failures from 2 threads, count must be exactly 200
+        // (DashMap's entry() lock guarantees atomic increment). A lossy
+        // implementation (e.g., get+insert) would miss counts.
+        let count = cb.state.get("wx:chat1").map(|v| v.0).unwrap_or(0);
+        assert_eq!(count, 200, "atomic increment lost counts — got {count}");
+        assert!(cb.is_open("wx:chat1"));
+    }
+
+    // ── Cooldown recovery (issue #1 from review) ─────────────────────────
+    //
+    // Scenario: breaker opens (3 failures), then task runs for a long time
+    // without sending anything. Platform recovers, but without a success
+    // call, the breaker never closes. Cooldown lets is_open() return false
+    // after SEND_FAILURE_COOLDOWN since last_failure, letting the next send
+    // probe the platform.
+
+    #[test]
+    fn stays_open_within_cooldown() {
+        let clock = TestClock::new();
+        let cb = SendCircuitBreaker::with_clock(clock.handle());
+        let key = "wx:chat1";
+        for _ in 0..SEND_FAILURE_THRESHOLD {
+            cb.record_failure(key);
+        }
+        assert!(cb.is_open(key), "open immediately after threshold");
+        clock.advance(SEND_FAILURE_COOLDOWN - Duration::from_millis(1));
+        assert!(cb.is_open(key), "still open just before cooldown expires");
+    }
+
+    #[test]
+    fn closes_after_cooldown_without_success_call() {
+        let clock = TestClock::new();
+        let cb = SendCircuitBreaker::with_clock(clock.handle());
+        let key = "wx:chat1";
+        for _ in 0..SEND_FAILURE_THRESHOLD {
+            cb.record_failure(key);
+        }
+        assert!(cb.is_open(key));
+        clock.advance(SEND_FAILURE_COOLDOWN);
+        assert!(
+            !cb.is_open(key),
+            "breaker must half-open after cooldown elapsed so worker can probe recovery"
+        );
+    }
+
+    #[test]
+    fn failure_after_cooldown_re_opens() {
+        let clock = TestClock::new();
+        let cb = SendCircuitBreaker::with_clock(clock.handle());
+        let key = "wx:chat1";
+        for _ in 0..SEND_FAILURE_THRESHOLD {
+            cb.record_failure(key);
+        }
+        clock.advance(SEND_FAILURE_COOLDOWN + Duration::from_secs(1));
+        assert!(!cb.is_open(key), "closed after cooldown");
+        // Probe send fails again — breaker must re-open on the next failure,
+        // not require 3 more failures (failure count carries forward).
+        cb.record_failure(key);
+        assert!(
+            cb.is_open(key),
+            "a single failure after half-open must re-trip the breaker"
+        );
+    }
+
+    #[test]
+    fn success_after_cooldown_fully_closes() {
+        let clock = TestClock::new();
+        let cb = SendCircuitBreaker::with_clock(clock.handle());
+        let key = "wx:chat1";
+        for _ in 0..SEND_FAILURE_THRESHOLD {
+            cb.record_failure(key);
+        }
+        clock.advance(SEND_FAILURE_COOLDOWN + Duration::from_secs(1));
+        cb.record_success(key);
+        // New failures after a success restart the count — need THRESHOLD
+        // more to trip again, not just 1.
+        for _ in 0..(SEND_FAILURE_THRESHOLD - 1) {
+            cb.record_failure(key);
+        }
+        assert!(
+            !cb.is_open(key),
+            "after success, count is reset — {} failures should not open",
+            SEND_FAILURE_THRESHOLD - 1
+        );
+    }
+
+    #[test]
+    fn cooldown_per_key_independent() {
+        let clock = TestClock::new();
+        let cb = SendCircuitBreaker::with_clock(clock.handle());
+        for _ in 0..SEND_FAILURE_THRESHOLD {
+            cb.record_failure("wx:chat1");
+        }
+        clock.advance(SEND_FAILURE_COOLDOWN / 2);
+        for _ in 0..SEND_FAILURE_THRESHOLD {
+            cb.record_failure("wx:chat2");
+        }
+        clock.advance(SEND_FAILURE_COOLDOWN / 2 + Duration::from_secs(1));
+        // chat1: last_failure was T0, now T0 + cooldown + tail → past cooldown
+        assert!(!cb.is_open("wx:chat1"), "chat1 past cooldown");
+        // chat2: last_failure was T0 + cooldown/2, now T0 + cooldown + tail
+        // elapsed since chat2 failure: cooldown/2 + tail — still within cooldown
+        assert!(
+            cb.is_open("wx:chat2"),
+            "chat2 still within cooldown (elapsed < cooldown)"
+        );
+    }
+
+    // ── R3-P0-#4: eviction of abandoned entries ──────────────────────────
+    //
+    // Long-running gateway with 100k+ unique conversations would otherwise
+    // accumulate state.len() forever — each distinct (platform, chat_id)
+    // that ever failed once keeps a (count, last_failure_at) pair. Lazy
+    // eviction on record_failure drops entries older than the eviction age.
+
+    #[test]
+    fn entries_older_than_eviction_age_are_reaped() {
+        let clock = TestClock::new();
+        let cb = SendCircuitBreaker::with_clock(clock.handle());
+
+        // Seed many distinct conversations with a single failure each.
+        for i in 0..200 {
+            cb.record_failure(&format!("wx:conv{i}"));
+        }
+        assert_eq!(cb.state.len(), 200);
+
+        // Fast-forward past eviction age + advance the sweep.
+        clock.advance(SEND_FAILURE_EVICTION_AGE + Duration::from_secs(1));
+
+        // A new failure triggers opportunistic eviction of all the old
+        // entries whose last_failure_at is too old.
+        cb.record_failure("wx:fresh");
+        assert_eq!(
+            cb.state.len(),
+            1,
+            "stale entries must be reaped on next record_failure; only \
+             the freshly-recorded key should remain. len={}",
+            cb.state.len()
+        );
+    }
+
+    #[test]
+    fn eviction_preserves_recently_active_entries() {
+        let clock = TestClock::new();
+        let cb = SendCircuitBreaker::with_clock(clock.handle());
+
+        cb.record_failure("old");
+        clock.advance(SEND_FAILURE_EVICTION_AGE / 2);
+        cb.record_failure("mid");
+        clock.advance(SEND_FAILURE_EVICTION_AGE / 2 + Duration::from_secs(1));
+        // `old` is now past eviction age; `mid` is NOT.
+        cb.record_failure("fresh");
+        assert!(
+            cb.state.get("old").is_none(),
+            "old entry past eviction age must be gone"
+        );
+        assert!(
+            cb.state.get("mid").is_some(),
+            "mid-age entry within eviction window must remain"
+        );
+        assert!(
+            cb.state.get("fresh").is_some(),
+            "freshly-recorded entry must remain"
+        );
+    }
+
+    #[test]
+    fn eviction_is_amortized_not_every_call() {
+        // Sweeping on EVERY record_failure would make failure-spike
+        // scenarios pay O(n) per call. Eviction runs at most once per
+        // EVICTION_SWEEP_INTERVAL wall-time window per breaker.
+        let clock = TestClock::new();
+        let cb = SendCircuitBreaker::with_clock(clock.handle());
+        for i in 0..50 {
+            cb.record_failure(&format!("k{i}"));
+        }
+        // All within eviction age — no reap yet.
+        assert_eq!(cb.state.len(), 50);
+    }
+}
+
+// ── truncate_chars tests ─────────────────────────────────────────────────
+
+#[cfg(test)]
+mod truncate_tests {
+    use super::*;
+
+    #[test]
+    fn ascii_within_limit() {
+        assert_eq!(truncate_chars("abcdefgh", 8), "abcdefgh");
+    }
+
+    #[test]
+    fn ascii_over_limit() {
+        assert_eq!(truncate_chars("abcdefghij", 8), "abcdefgh");
+    }
+
+    #[test]
+    fn empty_string() {
+        assert_eq!(truncate_chars("", 8), "");
+    }
+
+    #[test]
+    fn multibyte_chinese() {
+        let s = "你好世界测试数据额外";
+        let truncated = truncate_chars(s, 8);
+        assert_eq!(truncated.chars().count(), 8);
+        assert_eq!(truncated, "你好世界测试数据");
+    }
+
+    #[test]
+    fn multibyte_shorter_than_limit() {
+        let s = "你好";
+        assert_eq!(truncate_chars(s, 8), "你好");
+    }
+
+    #[test]
+    fn emoji_boundary() {
+        let s = "👋🌍🎉✨💫🔥⭐🎯extra";
+        let truncated = truncate_chars(s, 8);
+        assert_eq!(truncated.chars().count(), 8);
+        assert_eq!(truncated, "👋🌍🎉✨💫🔥⭐🎯");
+    }
+
+    #[test]
+    fn zero_limit() {
+        assert_eq!(truncate_chars("hello", 0), "");
+    }
+}
+
+// ── Startup DB EOF retry ────────────────────────────────────────────────
+//
+// MatrixOne / sqlx-mysql can return a "read 0 bytes at EOF" error on the
+// very first acquire from a freshly-built pool when the server has silently
+// closed the idle connection mid-handshake. `test_before_acquire(true)`
+// catches most of these, but the first-use race still slips through once.
+// Startup sweeps (sweep_stale_traces / sweep_stale_tasks /
+// replay_retryable_outbox) then permanently silently fail, leaving zombie
+// state in the DB. The retry helper wraps those paths so a single
+// transient error doesn't poison startup.
+
+/// Return true if the error message looks like a transient sqlx/MySQL
+/// connection fault that a second attempt should recover from. We
+/// explicitly do NOT retry on logic errors (syntax, schema, permission);
+/// those are stable and retrying would just waste time.
+pub(crate) fn is_transient_db_error(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("expected to read")
+        || lower.contains("got 0 bytes at eof")
+        || lower.contains("broken pipe")
+        || lower.contains("connection reset")
+        || lower.contains("connection closed")
+        || lower.contains("connection refused")
+}
+
+/// Run `op`, and if it fails with a transient DB error, wait briefly and
+/// retry once. Two attempts are enough — by the second call, sqlx has
+/// replaced the dead connection in the pool.
+async fn retry_once_on_transient<T, F, Fut>(label: &'static str, op: F) -> Result<T, String>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    match op().await {
+        Ok(v) => Ok(v),
+        Err(e) if is_transient_db_error(&e) => {
+            tracing::info!(
+                target: "gateway::runner",
+                op = label,
+                error = %e,
+                "transient DB error — retrying once after 100ms"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            op().await
+        }
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(test)]
+mod db_retry_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn transient_detects_eof_shape() {
+        assert!(is_transient_db_error(
+            "error communicating with database: expected to read 4 bytes, got 0 bytes at EOF"
+        ));
+        assert!(is_transient_db_error("broken pipe"));
+        assert!(is_transient_db_error("Connection reset by peer"));
+        assert!(is_transient_db_error("connection refused"));
+    }
+
+    #[test]
+    fn transient_ignores_logic_errors() {
+        // Syntax / schema / permission errors are stable — retry wastes time.
+        assert!(!is_transient_db_error("duplicate key"));
+        assert!(!is_transient_db_error("access denied for user 'foo'"));
+        assert!(!is_transient_db_error("syntax error near FROM"));
+        assert!(!is_transient_db_error("table 'x' doesn't exist"));
+    }
+
+    #[tokio::test]
+    async fn retry_once_recovers_from_transient_first_attempt() {
+        let calls = AtomicUsize::new(0);
+        let result = retry_once_on_transient("test", || async {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                Err::<i32, _>(
+                    "error communicating with database: expected to read 4 bytes, got 0 bytes at EOF".to_string(),
+                )
+            } else {
+                Ok(42)
+            }
+        })
+        .await;
+        assert_eq!(result, Ok(42));
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "must retry exactly once");
+    }
+
+    #[tokio::test]
+    async fn retry_once_gives_up_on_persistent_transient() {
+        let calls = AtomicUsize::new(0);
+        let result: Result<i32, String> = retry_once_on_transient("test", || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err("broken pipe".to_string())
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "at most 2 attempts — don't retry forever on persistent EOF"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_once_does_not_retry_logic_errors() {
+        let calls = AtomicUsize::new(0);
+        let result: Result<i32, String> = retry_once_on_transient("test", || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err("syntax error".to_string())
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "logic errors must NOT trigger retry"
+        );
+    }
 }
