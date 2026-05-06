@@ -31,6 +31,7 @@ pub enum StreamEvent {
         status: String,
         duration_ms: u64,
         output_summary: Option<String>,
+        output: Option<String>,
     },
     /// Waiting for first SSE frame (TTFT gap).
     WaitingForModel,
@@ -42,6 +43,30 @@ pub enum StreamEvent {
 
 pub type StreamEventTx = mpsc::UnboundedSender<StreamEvent>;
 
+/// User's response to an approval prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalResponse {
+    /// Allow this one invocation.
+    AllowOnce,
+    /// Deny this invocation.
+    Deny,
+    /// Always allow this tool pattern (persistent rule).
+    AlwaysAllow,
+    /// Switch to auto-run mode for the rest of the session.
+    AutoRunSession,
+    /// Skip this tool (deny without recording).
+    Skip,
+}
+
+impl ApprovalResponse {
+    pub fn is_approved(self) -> bool {
+        matches!(
+            self,
+            Self::AllowOnce | Self::AlwaysAllow | Self::AutoRunSession
+        )
+    }
+}
+
 /// Approval request sent from the SSE stream host to the plan executor / REPL
 /// when a tool requires interactive approval (bypass-immune check).
 pub struct ApprovalRequest {
@@ -49,7 +74,7 @@ pub struct ApprovalRequest {
     pub header: String,
     pub detail: Option<String>,
     pub reason: String,
-    pub response_tx: tokio::sync::oneshot::Sender<bool>,
+    pub response_tx: tokio::sync::oneshot::Sender<ApprovalResponse>,
 }
 
 pub type ApprovalRequestTx = mpsc::UnboundedSender<ApprovalRequest>;

@@ -18,7 +18,7 @@ use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
     fs,
-    io::{self, Write},
+    io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
     process::{Command as SysCommand, Stdio},
     sync::{Mutex, OnceLock},
@@ -221,6 +221,9 @@ mod theme;
 #[path = "cli/tool_call_groups.rs"]
 mod tool_call_groups;
 mod tool_safety_guard;
+mod tui;
+#[path = "cli/ui_adapter.rs"]
+mod ui_adapter;
 
 use agent_runtime::initialize_multi_agent_runtime;
 use astra_turn_core::chat_turn_heuristics::{
@@ -313,6 +316,52 @@ use cloud_sync::{
 // ══════════════════════════════════════════════════════ Slash Commands ════
 
 // ═══════════════════════════════════════════════════════════════ REPL ════
+
+async fn run_interactive_chat(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    initial_model: Option<&str>,
+    resume_session_id: Option<&str>,
+    no_instructions: bool,
+    max_budget: f64,
+    use_tui: bool,
+) -> Result<(), String> {
+    if use_tui {
+        if !tui::can_run_tui() {
+            eprintln!("TUI mode requires an interactive terminal. Falling back to line mode.");
+            return run_chat_repl(
+                api,
+                profile,
+                initial_model,
+                resume_session_id,
+                no_instructions,
+                max_budget,
+            )
+            .await;
+        }
+        // Box::pin to reduce the parent future's stack frame size (avoids stack
+        // overflow in debug-mode tests that instantiate execute_cli_command).
+        Box::pin(tui::run_tui_repl(
+            api,
+            profile,
+            initial_model,
+            resume_session_id,
+            no_instructions,
+            max_budget,
+        ))
+        .await
+    } else {
+        run_chat_repl(
+            api,
+            profile,
+            initial_model,
+            resume_session_id,
+            no_instructions,
+            max_budget,
+        )
+        .await
+    }
+}
 
 async fn run_chat_repl(
     api: &astra_thin_client::ThinClient,
@@ -451,7 +500,14 @@ async fn run_chat_repl(
                         let autorun = trimmed == "!" || trimmed == "all" || trimmed == "yolo";
                         let denied = trimmed == "n" || trimmed == "no";
                         if approved || autorun || denied {
-                            let _ = tx.send(approved || autorun);
+                            let response = if autorun {
+                                chat_stream::ApprovalResponse::AutoRunSession
+                            } else if denied {
+                                chat_stream::ApprovalResponse::Deny
+                            } else {
+                                chat_stream::ApprovalResponse::AllowOnce
+                            };
+                            let _ = tx.send(response);
                             if autorun {
                                 state
                                     .perm_manager
@@ -473,7 +529,7 @@ async fn run_chat_repl(
                             continue;
                         } else {
                             // Unrecognized — treat as deny and fall through
-                            let _ = tx.send(false);
+                            let _ = tx.send(chat_stream::ApprovalResponse::Deny);
                             eprintln!(
                                 "  {} Unrecognized response, treating as denied",
                                 theme::icon_err()
@@ -1059,6 +1115,7 @@ async fn main() {
         session_id: cli_session_id,
         session_name,
         bare,
+        tui: enable_tui,
         no_instructions,
         no_journal_content,
         startup_trace,
@@ -1200,6 +1257,12 @@ async fn main() {
     let resolved_model =
         cli_model.or_else(|| command_router::read_config_default_model().ok().flatten());
 
+    let use_tui = enable_tui
+        && std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
+        && std::env::var("TERM").map_or(true, |t| t != "dumb")
+        && std::env::var("NO_COLOR").is_err();
+
     // --print mode: headless single-shot, always auto-approve (can't prompt)
     if print_mode {
         match run_print_mode(
@@ -1234,13 +1297,14 @@ async fn main() {
 
         match resolved_sid {
             Some(sid) => {
-                let result = run_chat_repl(
+                let result = run_interactive_chat(
                     &api,
                     profile.as_deref(),
                     resolved_model.as_deref(),
                     Some(&sid),
                     no_instructions,
                     max_budget,
+                    use_tui,
                 )
                 .await;
                 match result {
@@ -1270,6 +1334,7 @@ async fn main() {
         &api,
         no_instructions,
         max_budget,
+        use_tui,
     )
     .await
     {
@@ -1686,6 +1751,7 @@ mod tests {
             &api,
             false,
             0.0,
+            false,
         )
         .await;
         // Health command should succeed regardless of auth
@@ -1704,6 +1770,7 @@ mod tests {
             &api,
             false,
             0.0,
+            false,
         )
         .await;
         assert!(result.is_ok());
@@ -1740,7 +1807,8 @@ mod tests {
     #[test]
     fn build_effective_line_plain() {
         let state = ReplState::default();
-        let result = repl_turn::build_effective_line("hello", &state);
+        let result =
+            repl_turn::build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
         assert_eq!(result, "hello");
     }
 
@@ -1751,7 +1819,8 @@ mod tests {
         if let Some(md) = skills.iter().find(|s| s.name == "markdown") {
             state.active_system_skills.push(md.clone());
         }
-        let result = repl_turn::build_effective_line("hello", &state);
+        let result =
+            repl_turn::build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
         assert!(result.contains("hello"));
         assert!(result.contains("Markdown"));
     }
@@ -4744,7 +4813,8 @@ total_tokens_out: 500
     fn build_effective_line_includes_project_instructions() {
         let mut state = ReplState::default();
         state.project_instructions = Some("Always use Rust.".to_string());
-        let result = repl_turn::build_effective_line("hello", &state);
+        let result =
+            repl_turn::build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
         assert!(
             result.contains("<project_instructions>"),
             "should wrap in tags"
@@ -4759,7 +4829,8 @@ total_tokens_out: 500
     #[test]
     fn build_effective_line_no_instructions_when_none() {
         let state = ReplState::default();
-        let result = repl_turn::build_effective_line("hello", &state);
+        let result =
+            repl_turn::build_effective_line("hello", &state, &mut crate::ui_adapter::LineUiAdapter);
         assert!(
             !result.contains("<project_instructions>"),
             "should not inject when None"
