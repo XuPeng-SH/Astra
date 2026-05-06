@@ -91,6 +91,51 @@ pub(crate) use file_state::ReadDedupKey;
 
 /// Shared file-state cache handle for cross-turn read-before-write tracking.
 pub(crate) type SharedFileState = std::sync::Arc<std::sync::Mutex<HashMap<PathBuf, FileState>>>;
+
+/// Per-session directory for persisted file-edit checkpoints.
+/// Default location: `~/.astra/sessions/<session_id>/file_checkpoints/`.
+///
+/// Test-only override: `_ASTRA_FILE_CHECKPOINT_ROOT` (underscore-prefix
+/// = internal; **not** a supported production configuration knob). When
+/// set, checkpoints live at `$_ASTRA_FILE_CHECKPOINT_ROOT/<session_id>/
+/// file_checkpoints/`. Used by `#[serial]` tests to redirect writes away
+/// from the developer's real `~/.astra/`.
+///
+/// Returns `None` when neither override nor `HOME` is available, or the
+/// session_id is empty / whitespace-only — in those cases persistence is
+/// silently disabled and the journal runs in-memory only.
+///
+/// **Single-writer invariant**: two CLI instances against the same
+/// `session_id` will share this directory and destructively prune each
+/// other's entries (see `FileEditJournal::save_to_dir` docstring).
+/// This is a known limitation. Callers with multiple concurrent
+/// executors for the same session SHOULD share one `FileEditJournal`
+/// via `with_shared_file_journal` — that's how the sse_loop path wires
+/// it in production, and the in-process Mutex then serializes writes.
+/// Cross-process (two separate CLI invocations) has no enforcement;
+/// either avoid the setup or accept the data loss.
+fn file_checkpoint_dir_for(session_id: &str) -> Option<PathBuf> {
+    if session_id.trim().is_empty() {
+        return None;
+    }
+    // Test-only override takes precedence so tests don't pollute the real HOME.
+    if let Ok(root) = std::env::var("_ASTRA_FILE_CHECKPOINT_ROOT") {
+        if !root.is_empty() {
+            return Some(
+                PathBuf::from(root)
+                    .join(session_id)
+                    .join("file_checkpoints"),
+            );
+        }
+    }
+    let home = dirs::home_dir()?;
+    Some(
+        home.join(".astra")
+            .join("sessions")
+            .join(session_id)
+            .join("file_checkpoints"),
+    )
+}
 #[path = "edge_tools/worktree.rs"]
 mod worktree;
 pub(crate) use worktree::GitWorktreeRollbackJournal;
@@ -572,6 +617,61 @@ impl ToolExecutor {
                 *deprioritized = ws.deprioritized_tools.clone();
             }
         }
+        // File-edit checkpoint persistence: on session-id set, rebind the
+        // journal to an auto-persist directory keyed by session.
+        //
+        // True merge (R9.1): load any prior-run entries from disk,
+        // then merge them UNDER any pre-session in-memory entries via
+        // `merge_older_entries`. Both sides survive, sequences are
+        // re-issued contiguously, and `enable_persistence`'s initial
+        // flush pushes the combined state back to disk.
+        //
+        // This handles all four quadrants of (memory empty/not) ×
+        // (disk empty/not):
+        // - (empty, empty): no-op merge, empty journal + persistence
+        // - (empty, has): merge loads disk entries → memory reflects disk
+        // - (has, empty): merge is no-op, flush writes memory to disk
+        // - (has, has): both preserved, resequenced, flushed together
+        if let Some(dir) = file_checkpoint_dir_for(&session_id)
+            && let Ok(mut journal) = self.file_journal.lock()
+        {
+            // Three cases:
+            //   (a) Already bound to the same dir → idempotent short-circuit.
+            //       Skipping the merge prevents re-reading our own flushed
+            //       entries and prepending them as older duplicates.
+            //   (b) Bound to a DIFFERENT dir → rebinding sessions.
+            //       Sessions are isolation boundaries: sid1's entries must
+            //       NOT leak into sid2's dir. Reset in-memory state
+            //       before loading sid2's own disk history.
+            //   (c) Unbound → first binding. Merge disk entries under any
+            //       pre-session in-memory entries (R9.1).
+            match journal.persist_dir() {
+                Some(existing) if existing == dir.as_path() => {
+                    // Case (a): nothing to do.
+                }
+                Some(_) => {
+                    // Case (b): different session. Clear memory first so
+                    // sid1 entries don't flow into sid2's dir via the
+                    // initial flush. Then load sid2's own disk state.
+                    *journal = astra_turn_core::file_edit_journal::FileEditJournal::new(500);
+                    if let Ok(disk_journal) =
+                        astra_turn_core::file_edit_journal::FileEditJournal::load_from_dir(&dir, 500)
+                    {
+                        journal.merge_older_entries(disk_journal);
+                    }
+                    journal.enable_persistence(dir);
+                }
+                None => {
+                    // Case (c): first binding — R9.1 merge policy.
+                    if let Ok(disk_journal) =
+                        astra_turn_core::file_edit_journal::FileEditJournal::load_from_dir(&dir, 500)
+                    {
+                        journal.merge_older_entries(disk_journal);
+                    }
+                    journal.enable_persistence(dir);
+                }
+            }
+        }
         if let Ok(mut guard) = self.active_session_id.lock() {
             *guard = Some(session_id);
         }
@@ -603,6 +703,28 @@ impl ToolExecutor {
     }
 
     /// Use a shared file edit journal (session-scoped) instead of the default.
+    ///
+    /// If an `active_session_id` is already set when this is called, the
+    /// persistence binding is re-applied to the incoming journal so the
+    /// `ToolExecutor::new(..).with_active_session_id(sid).with_shared_file_journal(arc)`
+    /// order (as used by `sse_loop/mod.rs`) preserves crash-recovery
+    /// semantics. Without this, the prior call to `with_active_session_id`
+    /// would be silently discarded by the journal swap.
+    ///
+    /// **First-binding-wins policy**: if the incoming journal is already
+    /// persistence-enabled (e.g. it was configured by an earlier
+    /// ToolExecutor sharing the same Arc), this is a no-op. Rebinding
+    /// mid-life would churn disk writes and is surprising — a shared
+    /// journal carries its first binding. Set session_id on the first
+    /// executor that sees the journal.
+    ///
+    /// **True merge policy**: if the incoming journal already holds
+    /// in-memory entries AND the session's on-disk dir has prior-run
+    /// entries, BOTH sides are preserved via
+    /// [`FileEditJournal::merge_older_entries`] — disk entries go first
+    /// (chronologically earlier), pre-session entries follow, all
+    /// re-sequenced contiguously. The initial flush then writes the
+    /// combined state to disk.
     pub fn with_shared_file_journal(
         mut self,
         journal: std::sync::Arc<
@@ -610,6 +732,24 @@ impl ToolExecutor {
         >,
     ) -> Self {
         self.file_journal = journal;
+        // Re-apply persistence to the new journal if a session is already active.
+        // Guarded by session_id presence so pure in-memory callers (no session
+        // set) keep the original zero-side-effect behavior.
+        if let Some(sid) = self.active_session_id()
+            && let Some(dir) = file_checkpoint_dir_for(&sid)
+            && let Ok(mut j) = self.file_journal.lock()
+            && j.persist_dir().is_none()
+        {
+            // True merge (R9.1): load disk into a temp journal, then
+            // merge_older_entries into self's in-memory state. See
+            // set_active_session_id for the rationale matrix.
+            if let Ok(disk_journal) =
+                astra_turn_core::file_edit_journal::FileEditJournal::load_from_dir(&dir, 500)
+            {
+                j.merge_older_entries(disk_journal);
+            }
+            j.enable_persistence(dir);
+        }
         self
     }
 
@@ -1709,6 +1849,487 @@ mod tests {
 
         executor.set_cloud_token("new-token");
         assert_eq!(executor.cloud_token().as_deref(), Some("new-token"));
+    }
+
+    // ── File-journal persistence wiring (regression guard) ──────────────
+
+    /// RAII guard that scrubs `_ASTRA_FILE_CHECKPOINT_ROOT` on drop so the
+    /// test's override doesn't bleed into other tests running in the same
+    /// process. Also restores any prior value so running under a hostile
+    /// parent env stays idempotent.
+    struct CheckpointRootGuard {
+        prior: Option<String>,
+    }
+    impl CheckpointRootGuard {
+        fn set(dir: &std::path::Path) -> Self {
+            let prior = std::env::var("_ASTRA_FILE_CHECKPOINT_ROOT").ok();
+            // SAFETY: test-only; callers are `#[serial]` so no parallel
+            // reads race this write.
+            unsafe { std::env::set_var("_ASTRA_FILE_CHECKPOINT_ROOT", dir) };
+            Self { prior }
+        }
+    }
+    impl Drop for CheckpointRootGuard {
+        fn drop(&mut self) {
+            // SAFETY: see set().
+            match &self.prior {
+                Some(v) => unsafe { std::env::set_var("_ASTRA_FILE_CHECKPOINT_ROOT", v) },
+                None => unsafe { std::env::remove_var("_ASTRA_FILE_CHECKPOINT_ROOT") },
+            }
+        }
+    }
+
+    /// Baseline: setting the active session-id binds persistence on the
+    /// executor's journal. Without the shared-journal override, this is the
+    /// simple path that already worked before the regression fix.
+    #[serial_test::serial]
+    #[test]
+    fn active_session_id_enables_persistence_on_default_journal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = CheckpointRootGuard::set(tmp.path());
+
+        let executor = test_executor().with_active_session_id("session-a");
+
+        let journal = executor.file_journal.lock().unwrap();
+        assert!(
+            journal.persist_dir().is_some(),
+            "persistence must be enabled after session-id is set"
+        );
+        let expected = tmp.path().join("session-a").join("file_checkpoints");
+        assert_eq!(journal.persist_dir(), Some(expected.as_path()));
+    }
+
+    /// REGRESSION: the production wiring order is
+    /// `ToolExecutor::new(..).with_active_session_id(sid).with_shared_file_journal(arc)`
+    /// (see sse_loop/mod.rs:192-201). Before this fix, `with_shared_file_journal`
+    /// replaced the executor's journal wholesale, discarding the
+    /// persistence binding that `with_active_session_id` had just installed.
+    ///
+    /// Invariant: after both builder calls, the FINAL journal on the
+    /// executor must have `persist_dir == Some(dir for sid)`.
+    #[serial_test::serial]
+    #[test]
+    fn shared_journal_inherits_persistence_from_active_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = CheckpointRootGuard::set(tmp.path());
+
+        // Simulate ReplState: a shared in-memory journal with no persistence.
+        let shared: std::sync::Arc<std::sync::Mutex<astra_turn_core::file_edit_journal::FileEditJournal>> =
+            std::sync::Arc::new(std::sync::Mutex::new(
+                astra_turn_core::file_edit_journal::FileEditJournal::new(500),
+            ));
+        assert!(
+            shared.lock().unwrap().persist_dir().is_none(),
+            "fresh shared journal starts in-memory"
+        );
+
+        // Production wiring order from sse_loop/mod.rs.
+        let executor = test_executor()
+            .with_active_session_id("session-b")
+            .with_shared_file_journal(shared.clone());
+
+        let expected = tmp.path().join("session-b").join("file_checkpoints");
+
+        // The executor must see the shared journal as its own (Arc ptr eq).
+        assert!(
+            std::sync::Arc::ptr_eq(&executor.file_journal, &shared),
+            "executor should hold the shared journal Arc"
+        );
+
+        // AND that shared journal must now carry the persistence binding.
+        let journal = shared.lock().unwrap();
+        assert_eq!(
+            journal.persist_dir(),
+            Some(expected.as_path()),
+            "with_shared_file_journal after with_active_session_id must re-apply persistence"
+        );
+    }
+
+    /// Reverse order: `with_shared_file_journal(arc).with_active_session_id(sid)`
+    /// — legacy builder call sequence. Persistence must still end up on
+    /// the shared journal (because set_active_session_id operates on
+    /// whatever journal is currently bound) AND any entries recorded
+    /// before the session-id was set must survive.
+    #[serial_test::serial]
+    #[test]
+    fn shared_journal_gets_persistence_when_session_id_set_last() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = CheckpointRootGuard::set(tmp.path());
+
+        let shared: std::sync::Arc<std::sync::Mutex<astra_turn_core::file_edit_journal::FileEditJournal>> =
+            std::sync::Arc::new(std::sync::Mutex::new(
+                astra_turn_core::file_edit_journal::FileEditJournal::new(500),
+            ));
+
+        // Record something into the shared journal BEFORE either builder
+        // call. This validates R8.7: the reverse order must preserve
+        // pre-session entries, not just bind persistence.
+        let work = tempfile::tempdir().unwrap();
+        let file = work.path().join("pre.txt");
+        std::fs::write(&file, b"v0").unwrap();
+        {
+            let mut j = shared.lock().unwrap();
+            j.record_before(&file, "pre", 0);
+            j.record_after(&file, "pre", b"v1");
+        }
+
+        let executor = test_executor()
+            .with_shared_file_journal(shared.clone())
+            .with_active_session_id("session-c");
+
+        let expected = tmp.path().join("session-c").join("file_checkpoints");
+        let j = shared.lock().unwrap();
+        assert_eq!(j.persist_dir(), Some(expected.as_path()));
+        assert!(std::sync::Arc::ptr_eq(&executor.file_journal, &shared));
+        assert_eq!(j.len(), 1, "pre-session entry must survive late session binding");
+        // Entry was also flushed to disk via enable_persistence's initial save.
+        let on_disk = std::fs::read_dir(&expected)
+            .map(|r| r.flatten().count())
+            .unwrap_or(0);
+        assert!(on_disk >= 1, "pre-session entry should have been flushed to disk");
+    }
+
+    /// R8.2 regression: if the shared journal already has in-memory entries
+    /// (because a prior call recorded something before session-id was set),
+    /// calling `set_active_session_id` must NOT silently drop them.
+    /// Before the fix, `*journal = loaded` blindly replaced the journal
+    /// with whatever `load_from_dir` returned — typically empty on a fresh
+    /// checkpoint dir — so the prior entry vanished.
+    #[serial_test::serial]
+    #[test]
+    fn set_active_session_id_preserves_existing_in_memory_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = CheckpointRootGuard::set(tmp.path());
+
+        // Create a shared journal and record an entry into it BEFORE any
+        // session binding.
+        let work = tempfile::tempdir().unwrap();
+        let file = work.path().join("pre-session.txt");
+        std::fs::write(&file, b"before").unwrap();
+
+        let shared: std::sync::Arc<std::sync::Mutex<astra_turn_core::file_edit_journal::FileEditJournal>> =
+            std::sync::Arc::new(std::sync::Mutex::new(
+                astra_turn_core::file_edit_journal::FileEditJournal::new(500),
+            ));
+        {
+            let mut j = shared.lock().unwrap();
+            j.record_before(&file, "early-call", 0);
+            j.record_after(&file, "early-call", b"after");
+        }
+        assert_eq!(shared.lock().unwrap().len(), 1);
+
+        // Now wire into an executor and set the session id.
+        let _executor = test_executor()
+            .with_shared_file_journal(shared.clone())
+            .with_active_session_id("session-d");
+
+        // The pre-session entry MUST survive the binding.
+        let j = shared.lock().unwrap();
+        assert_eq!(
+            j.len(),
+            1,
+            "pre-session in-memory entry must not be lost"
+        );
+        let entries: Vec<_> = j.entries().collect();
+        assert_eq!(entries[0].path, file);
+        assert_eq!(entries[0].after_content, b"after");
+    }
+
+    /// Corollary: when the shared journal is empty at session-binding
+    /// time AND disk has entries from a prior run, those disk entries
+    /// should load into memory (the crash-recovery happy path).
+    #[serial_test::serial]
+    #[test]
+    fn set_active_session_id_loads_disk_entries_when_memory_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = CheckpointRootGuard::set(tmp.path());
+
+        // Pre-seed the disk dir with an entry from a "prior run".
+        let dir = tmp.path().join("session-e").join("file_checkpoints");
+        std::fs::create_dir_all(&dir).unwrap();
+        let prior = astra_turn_core::file_edit_journal::FileEditEntry {
+            sequence: 0,
+            path: PathBuf::from("/tmp/prior.txt"),
+            turn_index: 5,
+            timestamp: std::time::SystemTime::UNIX_EPOCH,
+            before_content: Some(b"p".to_vec()),
+            after_content: b"q".to_vec(),
+            tool_call_id: "prior".into(),
+            edit_type: astra_turn_core::file_edit_journal::EditType::Overwrite,
+        };
+        std::fs::write(
+            dir.join("000000.json"),
+            serde_json::to_vec(&prior).unwrap(),
+        )
+        .unwrap();
+
+        // Empty shared journal + set session-id → should load the disk entry.
+        let shared: std::sync::Arc<std::sync::Mutex<astra_turn_core::file_edit_journal::FileEditJournal>> =
+            std::sync::Arc::new(std::sync::Mutex::new(
+                astra_turn_core::file_edit_journal::FileEditJournal::new(500),
+            ));
+
+        let _executor = test_executor()
+            .with_shared_file_journal(shared.clone())
+            .with_active_session_id("session-e");
+
+        let j = shared.lock().unwrap();
+        assert_eq!(j.len(), 1, "prior-run entry must load from disk");
+        let entries: Vec<_> = j.entries().collect();
+        assert_eq!(entries[0].tool_call_id, "prior");
+        assert_eq!(entries[0].after_content, b"q");
+    }
+
+    /// T61 / R9.1: when the shared journal has pre-session entries AND
+    /// the on-disk dir holds prior-run entries, BOTH sides must survive
+    /// the session binding. Before the merge fix, `save_to_dir`'s
+    /// destructive pruning would delete disk entries whose sequences
+    /// were not in memory.
+    #[serial_test::serial]
+    #[test]
+    fn set_active_session_id_merges_pre_session_entries_with_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = CheckpointRootGuard::set(tmp.path());
+
+        // Seed disk with 2 prior-run entries.
+        let dir = tmp.path().join("session-f").join("file_checkpoints");
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..2u64 {
+            let entry = astra_turn_core::file_edit_journal::FileEditEntry {
+                sequence: i,
+                path: PathBuf::from(format!("/tmp/prior-{i}.txt")),
+                turn_index: 0,
+                timestamp: std::time::SystemTime::UNIX_EPOCH,
+                before_content: None,
+                after_content: b"p".to_vec(),
+                tool_call_id: format!("prior-{i}"),
+                edit_type: astra_turn_core::file_edit_journal::EditType::Create,
+            };
+            std::fs::write(
+                dir.join(format!("{i:06}.json")),
+                serde_json::to_vec(&entry).unwrap(),
+            )
+            .unwrap();
+        }
+
+        // Pre-seed shared journal with 1 pre-session entry.
+        let work = tempfile::tempdir().unwrap();
+        let pre_file = work.path().join("pre.txt");
+        std::fs::write(&pre_file, b"v0").unwrap();
+        let shared: std::sync::Arc<std::sync::Mutex<astra_turn_core::file_edit_journal::FileEditJournal>> =
+            std::sync::Arc::new(std::sync::Mutex::new(
+                astra_turn_core::file_edit_journal::FileEditJournal::new(500),
+            ));
+        {
+            let mut j = shared.lock().unwrap();
+            j.record_before(&pre_file, "pre-session", 0);
+            j.record_after(&pre_file, "pre-session", b"v1");
+        }
+
+        // Bind session — triggers the merge path.
+        let _executor = test_executor()
+            .with_shared_file_journal(shared.clone())
+            .with_active_session_id("session-f");
+
+        // Must have ALL 3 entries (2 disk + 1 pre-session).
+        let j = shared.lock().unwrap();
+        assert_eq!(
+            j.len(),
+            3,
+            "both disk (2) and pre-session (1) entries must survive"
+        );
+        let tags: Vec<String> = j
+            .entries()
+            .map(|e| e.tool_call_id.clone())
+            .collect();
+        assert_eq!(tags, vec!["prior-0", "prior-1", "pre-session"]);
+
+        // All 3 entries should now be on disk.
+        let on_disk_count = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.path().extension().and_then(|x| x.to_str()) == Some("json")
+                    && !e.file_name().to_string_lossy().starts_with('.')
+            })
+            .count();
+        assert_eq!(
+            on_disk_count, 3,
+            "all 3 merged entries must be persisted to disk"
+        );
+    }
+
+    /// T62: calling `set_active_session_id` twice with the same sid
+    /// must NOT double-merge the disk entries. After the first bind, the
+    /// journal is persistence-enabled and disk matches memory. A second
+    /// bind with the same sid should be a no-op on content (possibly a
+    /// no-op on disk state too, though the flush is idempotent).
+    #[serial_test::serial]
+    #[test]
+    fn set_active_session_id_idempotent_for_same_sid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = CheckpointRootGuard::set(tmp.path());
+        let work = tempfile::tempdir().unwrap();
+        let file = work.path().join("f.txt");
+        std::fs::write(&file, b"v0").unwrap();
+
+        let executor = test_executor().with_active_session_id("session-g");
+        {
+            let mut j = executor.file_journal.lock().unwrap();
+            j.record_before(&file, "call", 0);
+            j.record_after(&file, "call", b"v1");
+        }
+
+        let before_len = executor.file_journal.lock().unwrap().len();
+        assert_eq!(before_len, 1);
+
+        // Second call with same sid.
+        executor.set_active_session_id("session-g");
+
+        let after_len = executor.file_journal.lock().unwrap().len();
+        assert_eq!(
+            after_len, before_len,
+            "re-binding same sid must not duplicate entries"
+        );
+    }
+
+    /// T63: binding a DIFFERENT sid after an initial bind redirects
+    /// persistence to the new dir but leaves the old dir's files alone
+    /// (no destructive cross-session cleanup).
+    #[serial_test::serial]
+    #[test]
+    fn rebind_different_sid_leaves_old_dir_files_intact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = CheckpointRootGuard::set(tmp.path());
+        let work = tempfile::tempdir().unwrap();
+        let file = work.path().join("f.txt");
+        std::fs::write(&file, b"v0").unwrap();
+
+        let executor = test_executor().with_active_session_id("session-h1");
+        {
+            let mut j = executor.file_journal.lock().unwrap();
+            j.record_before(&file, "call-h1", 0);
+            j.record_after(&file, "call-h1", b"v1");
+        }
+        let h1_dir = tmp.path().join("session-h1").join("file_checkpoints");
+        let h1_count_before = std::fs::read_dir(&h1_dir).unwrap().count();
+        assert!(h1_count_before >= 1, "h1 dir should have entries");
+
+        executor.set_active_session_id("session-h2");
+        let h2_dir = tmp.path().join("session-h2").join("file_checkpoints");
+        assert_eq!(
+            executor.file_journal.lock().unwrap().persist_dir(),
+            Some(h2_dir.as_path()),
+            "persist_dir must redirect to the new session"
+        );
+
+        // h1's dir must NOT have been pruned by the rebind.
+        let h1_count_after = std::fs::read_dir(&h1_dir).unwrap().count();
+        assert_eq!(
+            h1_count_before, h1_count_after,
+            "rebinding must not touch the old session's dir"
+        );
+    }
+
+    /// R10.1: rebinding to a different session starts that new session
+    /// with a **clean slate** — the old session's in-memory entries
+    /// do NOT carry forward into the new session's disk dir.
+    ///
+    /// Rationale: sessions are isolation boundaries. An entry recorded
+    /// under sid1 is logically part of sid1's history. If a user
+    /// rebinds to sid2 (e.g. switching working contexts mid-process),
+    /// sid2 should not inherit ghost entries that were never part of
+    /// its own edit history.
+    ///
+    /// Before this policy, rebind carried memory forward and
+    /// `enable_persistence`'s initial flush wrote those carryover
+    /// entries into sid2's dir.
+    #[serial_test::serial]
+    #[test]
+    fn rebind_different_sid_does_not_leak_entries_into_new_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = CheckpointRootGuard::set(tmp.path());
+        let work = tempfile::tempdir().unwrap();
+        let file = work.path().join("f.txt");
+        std::fs::write(&file, b"v0").unwrap();
+
+        let executor = test_executor().with_active_session_id("session-i1");
+        {
+            let mut j = executor.file_journal.lock().unwrap();
+            j.record_before(&file, "call-i1", 0);
+            j.record_after(&file, "call-i1", b"v1");
+        }
+        // Confirm sid1 has an entry in memory.
+        assert_eq!(executor.file_journal.lock().unwrap().len(), 1);
+
+        // Rebind to a fresh session.
+        executor.set_active_session_id("session-i2");
+        let i2_dir = tmp.path().join("session-i2").join("file_checkpoints");
+
+        // In-memory journal starts clean under the new session.
+        assert_eq!(
+            executor.file_journal.lock().unwrap().len(),
+            0,
+            "memory must be cleared on rebind-to-different-sid"
+        );
+        // sid2's dir must NOT contain sid1's entry.
+        let i2_count = std::fs::read_dir(&i2_dir)
+            .map(|r| {
+                r.flatten()
+                    .filter(|e| {
+                        e.path().extension().and_then(|x| x.to_str()) == Some("json")
+                            && !e.file_name().to_string_lossy().starts_with('.')
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        assert_eq!(
+            i2_count, 0,
+            "sid2 dir must be empty — sid1 entries must not leak"
+        );
+    }
+
+    /// T64: `file_checkpoint_dir_for` rejects empty / whitespace session
+    /// ids — persistence stays off. We pin this at the function level
+    /// rather than through `set_active_session_id`, because an upstream
+    /// validator in `session_workspace::workspace_dir` panics on
+    /// invalid ids before our code runs (pre-existing defensive panic,
+    /// out of scope to redesign here).
+    #[test]
+    fn file_checkpoint_dir_for_rejects_empty_and_whitespace() {
+        assert!(file_checkpoint_dir_for("").is_none());
+        assert!(file_checkpoint_dir_for("   ").is_none());
+        assert!(file_checkpoint_dir_for("\t\n").is_none());
+    }
+
+    /// T65: with the test-only override set, `file_checkpoint_dir_for`
+    /// honors it regardless of `HOME` state. We pin this at the function
+    /// level rather than through the executor; the executor path goes
+    /// through `read_workspace` and other HOME-touching code we can't
+    /// isolate cleanly.
+    ///
+    /// The "HOME fully unset → None" case is not portable: `dirs::home_dir()`
+    /// has platform-specific passwd-file fallbacks. Document the
+    /// degradation contract by exercising the override path instead.
+    #[serial_test::serial]
+    #[test]
+    fn file_checkpoint_dir_for_override_wins_regardless_of_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        // SAFETY: test-only; #[serial]; env is serialised.
+        let prior = std::env::var("_ASTRA_FILE_CHECKPOINT_ROOT").ok();
+        unsafe { std::env::set_var("_ASTRA_FILE_CHECKPOINT_ROOT", tmp.path()) };
+
+        let dir = file_checkpoint_dir_for("test-session");
+        let expected = tmp.path().join("test-session").join("file_checkpoints");
+        assert_eq!(dir, Some(expected));
+
+        // Restore.
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("_ASTRA_FILE_CHECKPOINT_ROOT", v),
+                None => std::env::remove_var("_ASTRA_FILE_CHECKPOINT_ROOT"),
+            }
+        }
     }
 
     mod aggregate_tests;
