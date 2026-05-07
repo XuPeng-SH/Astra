@@ -3381,7 +3381,11 @@ impl StreamRenderState {
             }
             "write_file" => {
                 let path = args.get("path").and_then(Value::as_str).unwrap_or("");
-                format!("Writing: {}", shorten_path(path, path_budget(9)))
+                if args.get("delete").and_then(Value::as_bool).unwrap_or(false) {
+                    format!("Deleting: {}", shorten_path(path, path_budget(10)))
+                } else {
+                    format!("Writing: {}", shorten_path(path, path_budget(9)))
+                }
             }
             "str_replace" | "multi_edit" => {
                 let path = args.get("path").and_then(Value::as_str).unwrap_or("");
@@ -3414,6 +3418,286 @@ impl StreamRenderState {
                 let pattern = args.get("pattern").and_then(Value::as_str).unwrap_or("");
                 format!("Glob: {}", truncate_line(pattern, path_budget(6)))
             }
+            "git" => {
+                let action = args
+                    .get("action")
+                    .and_then(Value::as_str)
+                    .unwrap_or("status");
+                match action {
+                    "status" => "Git status".to_string(),
+                    "log" => {
+                        let n = args.get("n").and_then(Value::as_u64);
+                        let branch = args.get("branch").and_then(Value::as_str);
+                        match (n, branch) {
+                            (Some(n), Some(b)) => format!("Git log -{n} {b}"),
+                            (Some(n), None) => format!("Git log -{n}"),
+                            (None, Some(b)) => format!("Git log {b}"),
+                            _ => "Git log".to_string(),
+                        }
+                    }
+                    "show" => {
+                        let commit = args
+                            .get("commit")
+                            .or_else(|| args.get("ref"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        format!("Git show {}", truncate_line(commit, path_budget(9)))
+                    }
+                    "diff" => {
+                        let staged = args.get("staged").and_then(Value::as_bool).unwrap_or(false);
+                        let path = args.get("path").and_then(Value::as_str);
+                        let stat_only = args
+                            .get("stat_only")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        let suffix = if stat_only { " --stat" } else { "" };
+                        match (staged, path) {
+                            (true, Some(p)) => format!(
+                                "Git diff --staged{suffix} {}",
+                                shorten_path(p, path_budget(18))
+                            ),
+                            (true, None) => format!("Git diff --staged{suffix}"),
+                            (false, Some(p)) => {
+                                format!("Git diff{suffix} {}", shorten_path(p, path_budget(10)))
+                            }
+                            _ => format!("Git diff{suffix}"),
+                        }
+                    }
+                    "blame" => {
+                        let path = args.get("path").and_then(Value::as_str).unwrap_or("");
+                        format!("Git blame {}", shorten_path(path, path_budget(10)))
+                    }
+                    "file_history" => {
+                        let file = args.get("file").and_then(Value::as_str).unwrap_or("");
+                        format!("Git history {}", shorten_path(file, path_budget(12)))
+                    }
+                    "log_search" => {
+                        let query = args.get("query").and_then(Value::as_str).unwrap_or("");
+                        format!(
+                            "Git log search \"{}\"",
+                            truncate_line(query, path_budget(17))
+                        )
+                    }
+                    "contributors" => {
+                        let path = args.get("path").and_then(Value::as_str);
+                        match path {
+                            Some(p) => {
+                                format!("Git contributors {}", shorten_path(p, path_budget(17)))
+                            }
+                            None => "Git contributors".to_string(),
+                        }
+                    }
+                    "commit" => {
+                        let msg = args.get("message").and_then(Value::as_str).unwrap_or("");
+                        format!("Git commit \"{}\"", truncate_line(msg, path_budget(13)))
+                    }
+                    "stash" => {
+                        let sub = args
+                            .get("stash_action")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        format!("Git stash {sub}")
+                    }
+                    _ => format!("Git {action}"),
+                }
+            }
+            "github" => {
+                let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+                let owner = args.get("owner").and_then(Value::as_str);
+                let repo = args.get("repo").and_then(Value::as_str);
+                let repo_display = github_repo_display(owner, repo).unwrap_or_default();
+                match action {
+                    "list_prs" => format!("GitHub: list PRs {repo_display}"),
+                    "get_pr" => {
+                        let pr = args.get("pr_number").and_then(Value::as_u64);
+                        match pr {
+                            Some(n) => format!("GitHub: PR #{n} {repo_display}"),
+                            None => format!("GitHub: get PR {repo_display}"),
+                        }
+                    }
+                    "ci_status" => format!("GitHub: CI status {repo_display}"),
+                    "list_issues" => format!("GitHub: list issues {repo_display}"),
+                    "get_issue" => {
+                        let n = args.get("issue_number").and_then(Value::as_u64);
+                        match n {
+                            Some(n) => format!("GitHub: issue #{n} {repo_display}"),
+                            None => format!("GitHub: get issue {repo_display}"),
+                        }
+                    }
+                    "repo_stats" => format!("GitHub: stats {repo_display}"),
+                    "create_issue" => {
+                        let title = args.get("title").and_then(Value::as_str).unwrap_or("");
+                        format!(
+                            "GitHub: create issue \"{}\"",
+                            truncate_line(title, path_budget(22))
+                        )
+                    }
+                    _ => format!("GitHub: {action}"),
+                }
+            }
+            "memory" => {
+                let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+                match action {
+                    "retrieve" => {
+                        let query = args.get("query").and_then(Value::as_str).unwrap_or("");
+                        format!("Recalling: \"{}\"", truncate_line(query, path_budget(13)))
+                    }
+                    "store" => {
+                        let content = args.get("content").and_then(Value::as_str).unwrap_or("");
+                        format!("Storing: \"{}\"", truncate_line(content, path_budget(11)))
+                    }
+                    "search" => {
+                        let query = args.get("query").and_then(Value::as_str).unwrap_or("");
+                        format!(
+                            "Searching memory: \"{}\"",
+                            truncate_line(query, path_budget(20))
+                        )
+                    }
+                    "purge" => "Purging memory".to_string(),
+                    "correct" => "Correcting memory".to_string(),
+                    "profile" => "Checking profile".to_string(),
+                    "feedback" => "Memory feedback".to_string(),
+                    _ => format!("Memory: {action}"),
+                }
+            }
+            "session" => {
+                let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+                match action {
+                    "config" => {
+                        let path = args.get("path").and_then(Value::as_str).unwrap_or("");
+                        format!("Adjust config: {}", truncate_line(path, path_budget(15)))
+                    }
+                    "prioritize" => {
+                        let tool = args.get("tool").and_then(Value::as_str).unwrap_or("");
+                        format!("Prioritize: {}", truncate_line(tool, path_budget(12)))
+                    }
+                    "deprioritize" => {
+                        let tool = args.get("tool").and_then(Value::as_str).unwrap_or("");
+                        format!("Deprioritize: {}", truncate_line(tool, path_budget(14)))
+                    }
+                    "set_goal" => {
+                        let goal = args.get("goal").and_then(Value::as_str).unwrap_or("");
+                        format!("Set goal: \"{}\"", truncate_line(goal, path_budget(12)))
+                    }
+                    "compact" => "Compress context".to_string(),
+                    "enter_plan" => {
+                        let goal = args.get("goal").and_then(Value::as_str).unwrap_or("");
+                        format!(
+                            "Enter plan mode: \"{}\"",
+                            truncate_line(goal, path_budget(18))
+                        )
+                    }
+                    "exit_plan" => "Exit plan mode".to_string(),
+                    "rollback_edits" => {
+                        let scope = args.get("scope").and_then(Value::as_str);
+                        match scope {
+                            Some(s) => {
+                                format!("Revert file edits: {}", truncate_line(s, path_budget(19)))
+                            }
+                            None => "Revert file edits".to_string(),
+                        }
+                    }
+                    "ask_user" => {
+                        let question = args.get("question").and_then(Value::as_str).unwrap_or("");
+                        format!(
+                            "Asking user: \"{}\"",
+                            truncate_line(question, path_budget(15))
+                        )
+                    }
+                    "sleep" => {
+                        let duration_ms =
+                            args.get("duration_ms").and_then(Value::as_u64).unwrap_or(0);
+                        format!("Sleeping: {duration_ms}ms")
+                    }
+                    "tool_search" => {
+                        let query = args.get("query").and_then(Value::as_str).unwrap_or("");
+                        format!(
+                            "Searching tools: \"{}\"",
+                            truncate_line(query, path_budget(18))
+                        )
+                    }
+                    _ => format!("Session: {action}"),
+                }
+            }
+            "mo" => {
+                let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+                match action {
+                    "query" => {
+                        let sql = args.get("sql").and_then(Value::as_str).unwrap_or("");
+                        format!("MO query: \"{}\"", truncate_line(sql, path_budget(11)))
+                    }
+                    "snapshot" => {
+                        let name = args.get("name").and_then(Value::as_str).unwrap_or("");
+                        format!("MO snapshot: {}", truncate_line(name, path_budget(13)))
+                    }
+                    "branch" => {
+                        let name = args.get("name").and_then(Value::as_str).unwrap_or("");
+                        format!("MO branch: {}", truncate_line(name, path_budget(11)))
+                    }
+                    _ => format!("MO: {action}"),
+                }
+            }
+            "agent" => {
+                let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+                match action {
+                    "delegate" => {
+                        let task = args.get("task").and_then(Value::as_str).unwrap_or("");
+                        format!("Delegating: \"{}\"", truncate_line(task, path_budget(14)))
+                    }
+                    "run_chain" => {
+                        let chain = args.get("chain_name").and_then(Value::as_str).unwrap_or("");
+                        format!("Running chain: {}", truncate_line(chain, path_budget(15)))
+                    }
+                    "spawn" => {
+                        let description = args.get("description").and_then(Value::as_str);
+                        let agent_type = args.get("agent_type").and_then(Value::as_str);
+                        match (description, agent_type) {
+                            (Some(desc), Some(at)) => format!(
+                                "Spawn agent: {} ({})",
+                                truncate_line(desc, path_budget(13)),
+                                truncate_line(at, path_budget(8))
+                            ),
+                            (Some(desc), None) => {
+                                format!("Spawn agent: {}", truncate_line(desc, path_budget(13)))
+                            }
+                            (None, Some(at)) => {
+                                format!("Spawn agent: {}", truncate_line(at, path_budget(13)))
+                            }
+                            _ => "Spawn agent".to_string(),
+                        }
+                    }
+                    "get_result" => {
+                        let agent_id = args.get("agent_id").and_then(Value::as_str).unwrap_or("");
+                        format!(
+                            "Get agent result: {}",
+                            truncate_line(agent_id, path_budget(19))
+                        )
+                    }
+                    "send_message" => {
+                        let to = args.get("to").and_then(Value::as_str).unwrap_or("");
+                        let summary = args.get("summary").and_then(Value::as_str);
+                        let message = args.get("message").and_then(Value::as_str);
+                        match (summary, message) {
+                            (Some(s), _) => format!(
+                                "Send message: {}: {}",
+                                truncate_line(to, path_budget(12)),
+                                truncate_line(s, path_budget(16))
+                            ),
+                            (None, Some(m)) => format!(
+                                "Send message: {}: {}",
+                                truncate_line(to, path_budget(12)),
+                                truncate_line(m, path_budget(16))
+                            ),
+                            (None, None) => {
+                                format!("Send message: {}", truncate_line(to, path_budget(14)))
+                            }
+                        }
+                    }
+                    _ => format!("Agent: {action}"),
+                }
+            }
+            "introspect" => "Introspecting…".to_string(),
+            // Legacy individual tool names (kept for backward compat)
             "git_status" => "Git status".to_string(),
             "git_log" => {
                 let n = args.get("n").and_then(Value::as_u64);
@@ -3776,20 +4060,6 @@ impl StreamRenderState {
                     _ => "Context analysis".to_string(),
                 }
             }
-            "run_chain" => {
-                let name = args.get("name").and_then(Value::as_str);
-                let description = args.get("description").and_then(Value::as_str);
-                match (name, description) {
-                    (Some(name), _) => {
-                        format!("Running chain: {}", truncate_line(name, path_budget(15)))
-                    }
-                    (None, Some(description)) => format!(
-                        "Running chain: {}",
-                        truncate_line(description, path_budget(15))
-                    ),
-                    (None, None) => "Running chain".to_string(),
-                }
-            }
             "rollback_file_edits" => {
                 let scope = args.get("scope").and_then(Value::as_str);
                 let turn_index = args.get("turn_index").and_then(Value::as_i64);
@@ -3840,48 +4110,6 @@ impl StreamRenderState {
                         truncate_line(scope, path_budget(24))
                     ),
                     _ => "Rollback turn actions".to_string(),
-                }
-            }
-            "send_message" => {
-                let to = args.get("to").and_then(Value::as_str).unwrap_or("");
-                let summary = args.get("summary").and_then(Value::as_str);
-                let message = args.get("message").and_then(Value::as_str);
-                match (summary, message) {
-                    (Some(summary), _) => format!(
-                        "Send message: {}: {}",
-                        truncate_line(to, path_budget(12)),
-                        truncate_line(summary, path_budget(16))
-                    ),
-                    (None, Some(message)) => format!(
-                        "Send message: {}: {}",
-                        truncate_line(to, path_budget(12)),
-                        truncate_line(message, path_budget(16))
-                    ),
-                    (None, None) => {
-                        format!("Send message: {}", truncate_line(to, path_budget(14)))
-                    }
-                }
-            }
-            "spawn_agent" => {
-                let description = args.get("description").and_then(Value::as_str);
-                let agent_type = args.get("agent_type").and_then(Value::as_str);
-                match (description, agent_type) {
-                    (Some(description), Some(agent_type)) => format!(
-                        "Spawn agent: {} ({})",
-                        truncate_line(description, path_budget(13)),
-                        truncate_line(agent_type, path_budget(8))
-                    ),
-                    (Some(description), None) => format!(
-                        "Spawn agent: {}",
-                        truncate_line(description, path_budget(13))
-                    ),
-                    (None, Some(agent_type)) => {
-                        format!(
-                            "Spawn agent: {}",
-                            truncate_line(agent_type, path_budget(13))
-                        )
-                    }
-                    _ => "Spawn agent".to_string(),
                 }
             }
             "diagnose" => {
@@ -4164,16 +4392,31 @@ impl StreamRenderState {
                 }
             }
             "memory_profile" => "Checking profile".to_string(),
-            // Skill tool — show specific skill name
+            // Skill tool — show specific skill name or discover query
             "skill" => {
-                let skill_name = args
-                    .get("skill_name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown");
-                format!(
-                    "Running skill: {}",
-                    truncate_line(skill_name, path_budget(16))
-                )
+                let action = args.get("action").and_then(Value::as_str).unwrap_or("run");
+                match action {
+                    "discover" => {
+                        let query = args
+                            .get("query")
+                            .and_then(Value::as_str)
+                            .unwrap_or("skills");
+                        format!(
+                            "Discovering skills: \"{}\"",
+                            truncate_line(query, path_budget(22))
+                        )
+                    }
+                    _ => {
+                        let skill_name = args
+                            .get("skill_name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown");
+                        format!(
+                            "Running skill: {}",
+                            truncate_line(skill_name, path_budget(16))
+                        )
+                    }
+                }
             }
             other if other.starts_with("mcp_") => {
                 let rest = &other[4..];
@@ -5805,6 +6048,8 @@ pub(crate) fn format_tool_display_from_preview(name: &str, args_preview: Option<
         "list_dir" => format!("Listing: {preview}"),
         "grep" => format!("Grep: {preview}"),
         "glob" => format!("Glob: {preview}"),
+        "git" => format!("Git {preview}"),
+        // Legacy individual names (kept for old sessions/journal replay)
         "git_status" => "Git status".to_string(),
         "git_log" => format!("Git log {preview}"),
         "git_show" => format!("Git show {preview}"),
@@ -5837,6 +6082,13 @@ pub(crate) fn format_tool_display_from_preview(name: &str, args_preview: Option<
         "lsp" => format!("LSP: {preview}"),
         "web_fetch" => format!("Fetching: {preview}"),
         "web_search" => format!("Searching web: \"{preview}\""),
+        "github" => format!("GitHub: {preview}"),
+        "memory" => format!("Memory: {preview}"),
+        "session" => format!("Session: {preview}"),
+        "mo" => format!("MO: {preview}"),
+        "agent" => format!("Agent: {preview}"),
+        "introspect" => "Introspecting…".to_string(),
+        // Legacy individual names
         "github_get_pr" => format!("Getting PR: {preview}"),
         "github_list_prs" => format!("Listing PRs: {preview}"),
         "github_get_issue" => format!("Getting issue: {preview}"),
@@ -5870,6 +6122,8 @@ pub(crate) fn format_tool_display_from_preview(name: &str, args_preview: Option<
         "ask_user" => format!("Asking user: \"{preview}\""),
         "sleep" => format!("Sleeping: {preview}"),
         "tool_search" => format!("Searching tools: {preview}"),
+        "enter_plan_mode" => format!("Enter plan mode: \"{preview}\""),
+        "exit_plan_mode" => "Exit plan mode".to_string(),
         "task_create" => format!("Creating task: \"{preview}\""),
         "task_list" => {
             if preview.is_empty() {
@@ -5891,6 +6145,7 @@ pub(crate) fn format_tool_display_from_preview(name: &str, args_preview: Option<
         "memory_correct" => format!("Correcting memory: {preview}"),
         "memory_profile" => "Checking profile".to_string(),
         "skill" => format!("Running skill: {preview}"),
+        "discover_skills" => format!("Discovering skills: \"{preview}\""),
         other if other.starts_with("mcp_") => {
             let rest = &other[4..];
             if let Some(sep) = rest.find('_') {
@@ -6925,9 +7180,10 @@ mod tests {
     #[test]
     fn format_meta_tool_descriptions() {
         let r = StreamRenderState::new();
+        // send_message is now an action within the `agent` consolidated tool
         let send = r.format_tool_description(
-            "send_message",
-            &serde_json::json!({"to": "agent-2", "summary": "Need review"}),
+            "agent",
+            &serde_json::json!({"action": "send_message", "to": "agent-2", "summary": "Need review"}),
         );
         let env = r.format_tool_description(
             "env",
@@ -7030,8 +7286,11 @@ mod tests {
             "context_analysis",
             &serde_json::json!({"mode": "compare", "turn_a": 3, "turn_b": 7}),
         );
-        let chain =
-            r.format_tool_description("run_chain", &serde_json::json!({"name": "search-and-read"}));
+        // run_chain is now an action within the `agent` consolidated tool
+        let chain = r.format_tool_description(
+            "agent",
+            &serde_json::json!({"action": "run_chain", "chain_name": "search-and-read"}),
+        );
 
         assert_eq!(info, "Getting agent info: budget");
         assert_eq!(reflect, "Reflecting: \"why did the tool fail?\"");
@@ -7929,9 +8188,10 @@ diff --git a/src/a.rs b/src/a.rs\n\
             .execute_tools_batch(vec![
                 ToolBatchRequest {
                     request_id: "tr-1".to_string(),
-                    tool: "delete_file".to_string(),
+                    tool: "write_file".to_string(),
                     args: serde_json::json!({
                         "path": "txn.txt",
+                        "delete": true,
                         "transaction_id": "tx-del",
                         "rollback_on_failure": true,
                     }),

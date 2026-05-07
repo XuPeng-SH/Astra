@@ -502,13 +502,26 @@ pub fn discover_skills_tool_schema() -> Value {
     })
 }
 
-/// True if this tool call targets `discover_skills`.
+/// True if this tool call targets `discover_skills` (legacy name) or
+/// the consolidated `skill {action: "discover"}` form.
 pub fn is_discover_skills_call(tool_call: &Value) -> bool {
-    tool_call
+    let name = tool_call
         .get("function")
         .and_then(|f| f.get("name"))
-        .and_then(Value::as_str)
-        == Some(DISCOVER_SKILLS_TOOL_NAME)
+        .and_then(Value::as_str);
+    if name == Some(DISCOVER_SKILLS_TOOL_NAME) {
+        return true;
+    }
+    // Consolidated form: skill {action: "discover", query: "..."}
+    if name == Some(SKILL_TOOL_NAME) {
+        let args = extract_tool_args(tool_call);
+        if let Some(args) = args {
+            if args.get("action").and_then(Value::as_str) == Some("discover") {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Run discovery; returns assistant-facing text and canonical names to merge into session state.
@@ -555,6 +568,9 @@ pub fn execute_discover_skills(
 }
 
 fn skill_enum_names(skills: &[SkillToolInfo]) -> Vec<String> {
+    // Sort for deterministic ordering — the skill cache is a HashMap, so the
+    // incoming `skills` slice has non-deterministic iteration order. Any byte
+    // drift in the JSON schema breaks Bedrock/Anthropic prompt cache hits.
     let mut seen: HashSet<&str> = skills.iter().map(|s| s.name.as_str()).collect();
     let mut names: Vec<String> = skills.iter().map(|s| s.name.clone()).collect();
     for skill in skills {
@@ -564,6 +580,7 @@ fn skill_enum_names(skills: &[SkillToolInfo]) -> Vec<String> {
             }
         }
     }
+    names.sort();
     names
 }
 
@@ -591,14 +608,14 @@ pub fn skill_tool_schema(skills: &[SkillToolInfo], open_skill_name: bool) -> Val
     }
 
     let dynamic_note = if open_skill_name {
-        " If no visible skill applies, call `discover_skills` before improvising."
+        " If no visible skill applies, use action 'discover' or call `discover_skills` before improvising."
     } else {
         ""
     };
 
     let description = format!(
-        "Execute a specialized skill in the current conversation. Use a skill from the \
-         <available_skills> system listing or a skill returned by discover_skills. Invoke \
+        "Skill operations. Actions: run (default), discover. Use a skill from the \
+         <available_skills> system listing or a skill returned by discover. Invoke \
          before other tools when the user's request matches a skill; optionally include \
          task for extra context. Do not re-invoke after a <skill-loaded/> result.{}",
         dynamic_note
@@ -611,12 +628,20 @@ pub fn skill_tool_schema(skills: &[SkillToolInfo], open_skill_name: bool) -> Val
             "description": description,
             "parameters": {
                 "type": "object",
-                "required": ["skill_name"],
                 "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["run", "discover"],
+                        "description": "Skill operation: run (execute a skill, default) or discover (search the full catalog)."
+                    },
                     "skill_name": skill_name_prop,
                     "task": {
                         "type": "string",
                         "description": "Optional task description or additional context for the skill. If omitted, the skill uses the current conversation context."
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Search query for discover action. Describe what you are trying to do next."
                     }
                 }
             }
@@ -2233,10 +2258,39 @@ mod tests {
             },
         ];
 
+        // Sorted alphabetically for byte-stable tool schema across turns —
+        // prompt cache hits require deterministic ordering.
         assert_eq!(
             skill_enum_names(&skills),
-            vec!["review", "audit", "inspect", "check"]
+            vec!["audit", "check", "inspect", "review"]
         );
+    }
+
+    /// Regression test: `skill_enum_names` output must be identical across
+    /// calls even when the input slice order changes (upstream cache is a
+    /// HashMap). A drifting enum breaks Bedrock/Anthropic prompt cache hits.
+    #[test]
+    fn skill_enum_names_are_stable_under_input_reorder() {
+        let a = SkillToolInfo {
+            name: "alpha".into(),
+            aliases: vec!["a1".into()],
+            ..Default::default()
+        };
+        let b = SkillToolInfo {
+            name: "beta".into(),
+            aliases: vec!["b1".into()],
+            ..Default::default()
+        };
+        let c = SkillToolInfo {
+            name: "charlie".into(),
+            ..Default::default()
+        };
+
+        let order1 = skill_enum_names(&[a.clone(), b.clone(), c.clone()]);
+        let order2 = skill_enum_names(&[c.clone(), a.clone(), b.clone()]);
+        let order3 = skill_enum_names(&[b.clone(), c.clone(), a.clone()]);
+        assert_eq!(order1, order2);
+        assert_eq!(order1, order3);
     }
 
     #[test]

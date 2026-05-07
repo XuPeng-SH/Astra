@@ -65,6 +65,7 @@ use astra_text_utils::semantic_dedup::SemanticDedup;
 use astra_turn_core::agentic_verdict_audit::AgenticVerdictAuditEvent;
 use astra_turn_core::chat_turn_heuristics::TaskExecutionProfile;
 use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
+use astra_turn_core::compaction_types::CompactionTier;
 use astra_turn_core::headless_types::HeadlessStderrStyle;
 use astra_turn_core::sse_stream_host::EdgeToolExecResult;
 use astra_turn_core::turn_guard::TurnGuard;
@@ -171,6 +172,36 @@ pub trait AgenticLoopHost: Send {
 
     /// Whether output is suppressed (quiet mode).
     fn is_quiet(&self) -> bool;
+
+    /// Optional LLM summary client for summary-based compaction helpers.
+    ///
+    /// Hosts can provide a client that uses the same model/credentials as the
+    /// main LLM path for summary-related work. Cache-friendly pre-turn inline
+    /// compaction is handled by [`AgenticLoopHost::maybe_pre_turn_compact`],
+    /// which can build the exact main-turn prefix when the host supports it.
+    ///
+    /// Default: `None` (no pre-turn compaction available — falls back to
+    /// mechanical compression only).
+    fn summary_client(&self) -> Option<Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>> {
+        None
+    }
+
+    /// Optional host-specific pre-turn compaction hook.
+    ///
+    /// Hosts that can build the exact next-turn system prompt may override
+    /// this to run cache-friendly inline summarization before the next LLM
+    /// round. On success the implementation must bump
+    /// [`AgenticLoopState::compact_tier_applied`] to at least
+    /// [`CompactionTier::CompactHistory`] so the downstream budget guard
+    /// skips redundant mechanical compression. Default is a no-op so
+    /// non-server hosts preserve legacy behavior.
+    async fn maybe_pre_turn_compact(
+        &mut self,
+        _state: &mut AgenticLoopState,
+        _pressure: f64,
+        _quiet: bool,
+    ) {
+    }
 
     /// Valid tool names from the host's tool schemas.
     fn valid_tool_names(&self) -> &HashSet<String>;
@@ -472,6 +503,10 @@ pub struct StallTrackingState {
     /// mutation (for cap enforcement), while this counter monotonically
     /// accumulates across the whole turn (for diagnostics).
     pub introspection_count: u32,
+    /// Whether a completion-aware soft-stop prompt was injected after a
+    /// successful task-completion signal (for example a successful git commit).
+    /// One-shot per turn; advisory only, tools remain available.
+    pub forced_completion_soft_stop: bool,
     /// Whether the redundant-reads mid-loop corrective injected a guidance
     /// message this loop. Fires when the model has re-read overlapping line
     /// ranges of the same file enough times to cross
@@ -669,6 +704,12 @@ pub struct AgenticLoopState {
     pub cancellation: CancellationState,
     pub error_recovery: ErrorRecoveryState,
 
+    // ── Context Pipeline ──
+    /// Session-scoped pipeline orchestrator. When `Some`, the pipeline manages
+    /// context assembly, cache optimization, and pressure-adaptive compaction.
+    /// Initialized on first turn; carries stats/latches/emergent across turns.
+    pub pipeline_session: Option<astra_turn_core::pipeline_session::PipelineSession>,
+
     // ── Host-provided context (read-only by runtime) ──
     pub message: String,
     pub recent_tools: Vec<String>,
@@ -720,6 +761,15 @@ pub struct AgenticLoopState {
     /// Set to `true` once the budget-exceeded wrap-up message has been injected.
     /// The loop allows exactly one more LLM iteration after injection.
     pub budget_wrapup_injected: bool,
+
+    /// Highest [`CompactionTier`] applied to this turn so far.
+    ///
+    /// `Normal` = no compaction; `CompactHistory` = pre-turn LLM summary or
+    /// tier-1 mechanical compression already ran; `AggressivePrune` = reserved
+    /// for future tiered escalation. Paths that would otherwise re-compact
+    /// check this and stay their hand when the current tier already covers
+    /// them. Not persisted — starts `Normal` every time the loop runs.
+    pub compact_tier_applied: CompactionTier,
 
     /// Set to `true` when a skill produced substantial output in the current
     /// turn. The CLI host reads this to suppress intermediate text rendering
@@ -905,6 +955,7 @@ pub(crate) use super::agentic_delegate_interception::{
 };
 
 #[allow(unused_imports)]
+// threshold const is test-only; re-exported here so tests can reach it
 pub(crate) use super::agentic_auto_reflection::{
     AUTO_REFLECTION_SIGNAL_THRESHOLD, maybe_trigger_auto_reflection,
 };
@@ -1363,6 +1414,9 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         messaging: Default::default(),
         cancellation: Default::default(),
         error_recovery: Default::default(),
+        pipeline_session: Some(astra_turn_core::pipeline_session::PipelineSession::new(
+            astra_turn_core::pipeline_config::PipelineConfig::default(),
+        )),
         message: "test query".to_string(),
         recent_tools: Vec::new(),
         task_profile: TaskExecutionProfile::default(),
@@ -1383,6 +1437,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         pinned_tool_schema_tokens: 0,
         max_turn_input_tokens: 0,
         budget_wrapup_injected: false,
+        compact_tier_applied: CompactionTier::Normal,
         skill_produced_output: false,
         max_cumulative_tokens: 0,
         thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
@@ -1416,6 +1471,18 @@ pub(crate) mod tests {
 
     use astra_services::session_journal::SURGICAL_REMOVAL_TOOL_NAME;
     use serde_json::json;
+
+    /// Unwind-safe cleanup guard for tests that write under
+    /// `session_journal::local_sessions_dir()`. Removes the provided directory
+    /// on drop — including during panic unwinds from failed assertions — so
+    /// repeated runs don't leak `tier-gate-*` / `precompact-spill-*` siblings.
+    struct SpillDirGuard(std::path::PathBuf);
+
+    impl Drop for SpillDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     // ── Flexible mock host for multi-turn scenarios ─────────────────────────
 
@@ -1729,6 +1796,7 @@ pub(crate) mod tests {
             messaging: Default::default(),
             cancellation: Default::default(),
             error_recovery: Default::default(),
+            pipeline_session: None,
             message: "test query".to_string(),
             recent_tools: Vec::new(),
             task_profile: TaskExecutionProfile::default(),
@@ -1749,6 +1817,7 @@ pub(crate) mod tests {
             pinned_tool_schema_tokens: 0,
             max_turn_input_tokens: 0,
             budget_wrapup_injected: false,
+            compact_tier_applied: CompactionTier::Normal,
             skill_produced_output: false,
             max_cumulative_tokens: 0,
             thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
@@ -1783,7 +1852,7 @@ pub(crate) mod tests {
         let policy = TurnInteractionPolicy::from_visible_tool_names(
             TurnInteractionMode::Prompt,
             vec![
-                "mo_query".to_string(),
+                "mo".to_string(),
                 ASK_USER_TOOL_NAME.to_string(),
                 "read_file".to_string(),
             ],
@@ -1793,7 +1862,7 @@ pub(crate) mod tests {
         assert!(policy.can_pause_for_user);
         assert_eq!(
             policy.evidence_tool_names,
-            vec!["mo_query".to_string(), "read_file".to_string()]
+            vec!["mo".to_string(), "read_file".to_string()]
         );
     }
 
@@ -2960,7 +3029,7 @@ pub(crate) mod tests {
             ),
         ];
 
-        let mut host = MockHost::new(turns);
+        let mut host = MockHost::new(turns).with_valid_tools(&["delegate"]);
         host.quiet = false;
         let mut state = make_state();
         state.messages.push(
@@ -3069,7 +3138,7 @@ pub(crate) mod tests {
             text_result("Mixed delegation + tool complete.", 60, 20, None),
         ];
 
-        let mut host = MockHost::new(turns).with_valid_tools(&["bash"]);
+        let mut host = MockHost::new(turns).with_valid_tools(&["bash", "delegate"]);
         let mut state = make_state();
         state
             .messages
@@ -3100,7 +3169,7 @@ pub(crate) mod tests {
             text_result("Recovered after bad delegation.", 60, 20, None),
         ];
 
-        let mut host = MockHost::new(turns);
+        let mut host = MockHost::new(turns).with_valid_tools(&["delegate"]);
         let mut state = make_state();
         state
             .messages
@@ -3137,7 +3206,7 @@ pub(crate) mod tests {
             text_result("Fan-out complete.", 60, 20, None),
         ];
 
-        let mut host = MockHost::new(turns);
+        let mut host = MockHost::new(turns).with_valid_tools(&["delegate"]);
         let mut state = make_state();
         state
             .messages
@@ -3209,7 +3278,7 @@ pub(crate) mod tests {
             text_result("Adversarial review complete.", 80, 40, None),
         ];
 
-        let mut host = MockHost::new(turns);
+        let mut host = MockHost::new(turns).with_valid_tools(&["delegate"]);
         let mut state = make_state();
         state
             .messages
@@ -3225,9 +3294,9 @@ pub(crate) mod tests {
     // ── Auto-injection tests ────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn auto_inject_only_once_across_loop() {
-        // Even with multiple turns, injection should happen only once (in preamble).
-        // Use a delegate call followed by final text — two turns total.
+    async fn no_schema_injection_without_skill_resolver() {
+        // With no skill resolver configured, no schemas should be injected.
+        // Delegation is now handled via the always-present `agent` tool.
         let mut host = MockHost::new(vec![
             text_result("still going", 100, 50, Some(10)),
             text_result("done", 50, 20, None),
@@ -3240,8 +3309,9 @@ pub(crate) mod tests {
 
         let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
 
-        // Only one injection, not one per turn
-        assert_eq!(host.injected_schemas.len(), 1);
+        // No injection: delegation is handled by the consolidated agent tool,
+        // and no skill resolver is configured in make_state().
+        assert_eq!(host.injected_schemas.len(), 0);
     }
 
     // ── is_valid_model_string tests ──────────────────────────────────────
@@ -4554,6 +4624,135 @@ pub(crate) mod tests {
         // Should complete (hard stop), not error.
         assert!(outcome.is_ok());
         assert!(state.budget_wrapup_injected);
+    }
+
+    #[tokio::test]
+    async fn budget_after_pre_turn_compact_still_spills_old_messages() {
+        let session_id = format!(
+            "precompact-spill-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        );
+        let _guard =
+            SpillDirGuard(astra_services::session_journal::local_sessions_dir().join(&session_id));
+
+        let mut host = MockHost::new(vec![
+            edge_tool_result(
+                vec![make_edge_tool("bash", "large output")],
+                90_000,
+                2_000,
+                Some(100),
+            ),
+            text_result("Done after spill.", 40_000, 500, None),
+        ]);
+        let mut state = make_state();
+        state.max_turn_input_tokens = 80_000;
+        state.current_session_id = Some(session_id.clone());
+        state.compact_tier_applied = CompactionTier::CompactHistory;
+        state
+            .messages
+            .push(json!({"role": "user", "content": "keep debugging"}));
+        for i in 0..12 {
+            state
+                .messages
+                .push(json!({"role": "assistant", "content": format!("analysis step {i}")}));
+            state
+                .messages
+                .push(json!({"role": "user", "content": format!("follow-up {i}")}));
+        }
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+        assert!(outcome.is_ok());
+        assert_eq!(state.final_text, "Done after spill.");
+        let has_spill_msg = state.messages.iter().any(|m| {
+            m.get("content")
+                .and_then(|c| c.as_str())
+                .is_some_and(|s| s.contains("[Context compressed"))
+        });
+        assert!(
+            has_spill_msg,
+            "expected spill-to-disk system message after budget recovery"
+        );
+        let has_budget_wrapup_msg = state.messages.iter().any(|m| {
+            m.get("content")
+                .and_then(|c| c.as_str())
+                .is_some_and(|s| s.contains("token budget limit"))
+        });
+        assert!(
+            !has_budget_wrapup_msg,
+            "spill recovery should avoid injecting the hard wrap-up message"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_tier_gate_skips_mechanical_compression() {
+        // When compact_tier_applied >= CompactHistory (e.g. after a pre-turn LLM
+        // summary), handle_token_budget must NOT run the tier-1 mechanical
+        // CompressionPipeline again. We verify this by populating the history
+        // with otherwise-compressible tool_result payloads: if the guard is
+        // broken, CompressionPipeline would rewrite them to `[Cleared]` and the
+        // original text would disappear. With the guard honoured the messages
+        // stay intact and spill-to-disk (an independent tier-2 recovery) runs.
+        let session_id = format!(
+            "tier-gate-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        );
+        let _guard =
+            SpillDirGuard(astra_services::session_journal::local_sessions_dir().join(&session_id));
+
+        let mut host = MockHost::new(vec![
+            edge_tool_result(
+                vec![make_edge_tool("bash", "large output")],
+                90_000,
+                2_000,
+                Some(100),
+            ),
+            text_result("Compacted result.", 40_000, 500, None),
+        ]);
+        let mut state = make_state();
+        state.max_turn_input_tokens = 80_000;
+        state.current_session_id = Some(session_id.clone());
+        // Simulate a pre-turn LLM compact having already run.
+        state.compact_tier_applied = CompactionTier::CompactHistory;
+        let distinctive_tool_payload = "SENTINEL_RESULT_PAYLOAD_DO_NOT_CLEAR_".repeat(200);
+        state
+            .messages
+            .push(json!({"role": "user", "content": "kick off"}));
+        state.messages.push(json!({
+            "role": "assistant",
+            "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "bash", "arguments": "{}"}}
+            ],
+        }));
+        state.messages.push(json!({
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": distinctive_tool_payload.clone(),
+        }));
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok());
+        assert_eq!(state.final_text, "Compacted result.");
+
+        // Either the payload still appears verbatim in live messages, OR it was
+        // moved to disk via tier-2 spill (whose system marker shows up instead).
+        // What must NOT happen: the mechanical pipeline rewriting it to
+        // `[Cleared]` in place — that would mean the tier guard failed.
+        let has_cleared_tombstone = state.messages.iter().any(|m| {
+            m.get("content")
+                .and_then(|c| c.as_str())
+                .is_some_and(|s| s.contains("[Cleared") && !s.contains("[Context compressed"))
+        });
+        assert!(
+            !has_cleared_tombstone,
+            "tier-1 mechanical compression must be skipped when compact_tier_applied >= CompactHistory",
+        );
     }
 
     // ── Rate-limit graceful degradation tests ───────────────────────────────

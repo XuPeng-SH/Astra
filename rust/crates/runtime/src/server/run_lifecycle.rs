@@ -2183,6 +2183,9 @@ impl AgenticRunLifecycleService {
             cancellation: Default::default(),
             messaging: Default::default(),
             error_recovery: Default::default(),
+            pipeline_session: Some(astra_turn_core::pipeline_session::PipelineSession::new(
+                astra_turn_core::pipeline_config::PipelineConfig::default(),
+            )),
             message: request.message.clone(),
             recent_tools: Vec::new(),
             task_profile,
@@ -2204,6 +2207,7 @@ impl AgenticRunLifecycleService {
             pinned_tool_schema_tokens: 0,
             max_turn_input_tokens: astra_core::RuntimeLimits::global().max_turn_input_tokens,
             budget_wrapup_injected: false,
+            compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
             skill_produced_output: false,
             max_cumulative_tokens: 0,
             thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
@@ -2628,6 +2632,28 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         }
         loop_state.session_turn = infer_session_turn(self.shared_pool.as_ref(), &session_id).await;
 
+        // ── Pipeline warm-start: restore PipelineSession from checkpoint ──
+        // Overwrites the fresh `PipelineSession::new()` with a snapshot that
+        // carries cache hit ratios, reserve estimates, latches, and escalation
+        // counters from the last checkpoint. Without this, every server-side
+        // session resume starts with cold pipeline state — the write side
+        // (agentic_loop_finalization) persists it, but nothing was reading it
+        // back until now.
+        if let Ok(Some(restored)) =
+            astra_pipeline::step_restore::restore_session_with_continuity_validator(
+                &session_id,
+                |_| Ok(()), // already validated continuity above
+            )
+        {
+            if restored.pipeline_state.is_some() {
+                loop_state.pipeline_session =
+                    Some(astra_turn_core::pipeline_session_serde::restore_or_new(
+                        astra_turn_core::pipeline_config::PipelineConfig::default(),
+                        restored.pipeline_state.as_ref(),
+                    ));
+            }
+        }
+
         // ── CSL: Load conversation history from the log ─────────────
         let csl_manager = if request.session_id.is_some() {
             self.restore_csl_history(&session_id, &run_id, &mut loop_state)
@@ -3039,6 +3065,24 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             }
         }
         state.session_turn = infer_session_turn(self.shared_pool.as_ref(), &session_id).await;
+
+        // ── Pipeline warm-start from step checkpoint ────────────────
+        if request.session_id.is_some() {
+            if let Ok(Some(restored)) =
+                astra_pipeline::step_restore::restore_session_with_continuity_validator(
+                    &session_id,
+                    |_| Ok(()),
+                )
+            {
+                if restored.pipeline_state.is_some() {
+                    state.pipeline_session =
+                        Some(astra_turn_core::pipeline_session_serde::restore_or_new(
+                            astra_turn_core::pipeline_config::PipelineConfig::default(),
+                            restored.pipeline_state.as_ref(),
+                        ));
+                }
+            }
+        }
 
         // ── CSL: Load conversation history from the log ─────────────
         let csl_manager = if request.session_id.is_some() {
@@ -3908,6 +3952,9 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 ..Default::default()
             },
             error_recovery: Default::default(),
+            pipeline_session: Some(astra_turn_core::pipeline_session::PipelineSession::new(
+                astra_turn_core::pipeline_config::PipelineConfig::default(),
+            )),
             message: full_task,
             recent_tools: Vec::new(),
             task_profile,
@@ -3929,6 +3976,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             pinned_tool_schema_tokens: 0,
             max_turn_input_tokens: astra_core::RuntimeLimits::global().max_turn_input_tokens,
             budget_wrapup_injected: false,
+            compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
             skill_produced_output: false,
             max_cumulative_tokens: 0,
             thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,

@@ -52,61 +52,67 @@ pub const LOW_CONFIDENCE_THRESHOLD: f64 = 0.3;
 
 // ── Static/Dynamic prompt boundary for provider-level caching ────────
 
-/// Cache scope for a prompt section, indicating how stable it is across turns.
-///
-/// Providers like Anthropic can cache content blocks annotated with
-/// `cache_control: {type: "ephemeral"}`.  Separating static from dynamic
-/// sections maximises prefix-cache hit rates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CacheScope {
-    /// Stable across sessions — identity, core rules, output format.
-    /// Changes only on agent code updates (weeks/months).
-    Global,
-    /// Stable within a session — tool-conditional guidance, task-type rules.
-    /// Changes when tool set or task type changes (per turn, but usually stable).
-    Session,
-    /// Changes every turn — project profile, skills, memory signals.
-    None,
-}
+// CacheScope, PromptTokenBucket, and PromptSection now live in astra-turn-core
+// so they can be used by both turn-core (optimizer, planner) and runtime
+// (prompt builders) without a circular dependency.
+pub use astra_turn_core::section_types::{CacheScope, PromptSection, PromptTokenBucket};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PromptTokenBucket {
-    BasePersona,
-    Environment,
-    UserPreferences,
-}
+/// Build the static sections for the context pipeline.
+/// These are the Global-scope sections that never change between turns.
+/// Compile once at session start and pass to PipelineSession's TurnInput.
+pub fn build_pipeline_static_sections() -> astra_turn_core::context_sources::StaticSections {
+    use astra_turn_core::context_assembly_trace::PromptTraceSignals;
+    use astra_turn_core::context_sources::StaticSections;
+    use astra_turn_core::section_types::PromptTokenBucket;
 
-/// A section of the system prompt with cache scope metadata.
-#[derive(Debug, Clone)]
-pub struct PromptSection {
-    pub text: String,
-    pub scope: CacheScope,
-    pub token_bucket: PromptTokenBucket,
-    pub trace_signals: PromptTraceSignals,
-}
+    // Apply prompt overrides from $ASTRA_PROMPT_OVERRIDES_DIR (or ~/.astra/prompts).
+    // assembly time; the pipeline applies them here so both paths surface
+    // the same Global text.
+    let overrides = load_overrides(&default_overrides_dir());
+    let resolve =
+        |key: &str, default: String| -> String { overrides.get(key).cloned().unwrap_or(default) };
 
-impl PromptSection {
-    pub fn stable(text: impl Into<String>, scope: CacheScope) -> Self {
-        Self {
-            text: text.into(),
-            scope,
+    StaticSections {
+        core_rules: PromptSection {
+            text: resolve("core_rules", core_rules_section()),
+            scope: CacheScope::Global,
             token_bucket: PromptTokenBucket::BasePersona,
             trace_signals: PromptTraceSignals::default(),
-        }
-    }
-
-    pub fn dynamic(text: impl Into<String>, token_bucket: PromptTokenBucket) -> Self {
-        Self {
-            text: text.into(),
-            scope: CacheScope::None,
-            token_bucket,
-            trace_signals: PromptTraceSignals::default(),
-        }
-    }
-
-    pub fn with_trace_signals(mut self, trace_signals: PromptTraceSignals) -> Self {
-        self.trace_signals = trace_signals;
-        self
+        },
+        planning_protocol: PromptSection::stable(
+            resolve("planning", planning_section().to_string()),
+            CacheScope::Global,
+        ),
+        coding_discipline: PromptSection::stable(
+            resolve("coding_discipline", coding_discipline_section().to_string()),
+            CacheScope::Global,
+        ),
+        turn_discipline: PromptSection::stable(
+            resolve("turn_discipline", turn_discipline_section().to_string()),
+            CacheScope::Global,
+        ),
+        parallel_efficiency: PromptSection::stable(
+            resolve(
+                "parallel_and_efficiency",
+                format!(
+                    "{}\n{}",
+                    parallel_and_efficiency_section(),
+                    plan_execution_section()
+                ),
+            ),
+            CacheScope::Global,
+        ),
+        output_format: PromptSection::stable(
+            resolve("output_format", output_format_section().to_string()),
+            CacheScope::Global,
+        ),
+        tool_error_recovery: PromptSection::stable(
+            resolve(
+                "tool_error_recovery",
+                tool_error_recovery_section().to_string(),
+            ),
+            CacheScope::Global,
+        ),
     }
 }
 
@@ -147,10 +153,9 @@ fn planning_section() -> &'static str {
      ## Context Strategy\n\
      Before acting, identify WHAT context you need:\n\
      1. **Plan context needs**: What files/functions/tests must I understand first?\n\
-     2. **Batch the fetch**: Call all needed reads/greps in ONE turn (parallel).\n\
-     3. **Check inventory**: If context was already fetched, use it — don't re-fetch.\n\
-     4. **Then act**: Only after understanding, make your changes.\n\
-     Example: To fix a bug in auth.rs, plan: \"Need auth.rs:50-100, the test file, and git blame on line 75\" → fetch all 3 → then edit.\n"
+      2. **Batch the fetch**: Call all needed reads/greps in ONE turn (parallel).\n\
+      3. **Check inventory**: If context was already fetched, use it — don't re-fetch.\n\
+      4. **Then act**: Only after understanding, make your changes.\n"
 }
 
 /// Discovery + coding discipline. Pure static.
@@ -193,29 +198,27 @@ fn parallel_and_efficiency_section() -> &'static str {
      4. Only make sequential calls when one result determines the next call's arguments.\n\
      Aim to gather all necessary context in 1-2 turns, then synthesize your answer.\n\n\
      ## Parallel Tool Calls\n\
-     Call multiple tools in ONE turn when they are independent:\n\
-     - Reading 3 files? Call read_file 3× in parallel.\n\
-     - Need git_status AND git_diff? Call both.\n\
-     - Need glob AND grep with different patterns? Call both.\n\
-     - Reviewing a commit? Call git_log AND git_show (or git_diff) in the SAME turn.\n\
-     - Analyzing a project? Call list_dir + read_file for multiple key files in ONE turn.\n\
-     Do NOT parallelize when one result determines the next call's arguments.\n\
-      **Limit**: Keep parallel tool calls to ≤5 per turn. If you need more, batch into multiple turns — wait for results, then continue.\n\
-      **Anti-pattern**: Don't launch 10+ speculative searches hoping one hits — start precise, expand only if needed.\n\
-      **Anti-pattern**: Don't call one tool, wait for results, then call the next independent tool — batch them.\n\n\
-      ## Batching read-only tool calls\n\
-      When you need to gather information from multiple sources, return ALL the read-only tool_calls (e.g. read_file / grep / glob / list_dir / git_show / git_log / git_diff / git_status / web_fetch / memory_retrieve / find_definition / find_references) in a single assistant message — they execute in parallel. Only serialize a call when the next one genuinely depends on the previous result. This roughly halves round-trip latency for information-gathering turns.\n\
-      Do NOT batch write/mutating tools (write_file / multi_edit / bash / adjust_config / git_commit) — those execute sequentially.\n\n\
+      Call multiple independent tools in ONE turn (e.g., several reads, git_status+git_diff, glob+grep, git_log+git_show).\n\
+      Do NOT parallelize when one result determines the next call's arguments.\n\
+       **Limit**: Keep parallel tool calls to ≤5 per turn. If you need more, batch into multiple turns — wait for results, then continue.\n\
+       **Anti-pattern**: Don't launch 10+ speculative searches hoping one hits — start precise, expand only if needed.\n\
+       **Anti-pattern**: Don't call one tool, wait for results, then call the next independent tool — batch them.\n\n\
+       ## Batching read-only tool calls\n\
+       Return all independent read-only tool calls in one assistant message. Only serialize when the next call depends on the previous result.\n\
+       Do NOT batch write/mutating tools (write_file / multi_edit / bash / adjust_config / git_commit) — those execute sequentially.\n\n\
       ## Token Efficiency\n\
      - Prefer targeted reads (line ranges) over full-file reads.\n\
      - Use glob to narrow candidates before grep.\n\
      - Request only the data you need — avoid fetching entire files when a section suffices.\n\
      - Summarize findings concisely. Show relevant code, not the whole file.\n\
-     - If you've already fetched something, reference it from history — don't re-fetch.\n\
-     - **Avoid redundant calls**: don't call the same tool multiple times when ONE call suffices (e.g., git_diff once covers all files).\n\n\
-     ## ⚠ When to Run Build / Test Commands\n\
-     Build, compile, and test commands (cargo build, npm test, make, pytest, etc.) are EXPENSIVE.\n\
-     - **Run them ONLY to verify YOUR changes** — after you edited or created files.\n\
+      - If you've already fetched something, reference it from history — don't re-fetch.\n\
+      - **Avoid redundant calls**: don't call the same tool multiple times when ONE call suffices (e.g., git_diff once covers all files).\n\n\
+      ## Runaway Exploration Guard\n\
+      - For open-ended loops (\"keep going\", \"as many as you can\", repeated list/read), do one useful pass, then stop and say more would be busywork/a busy-loop.\n\n\
+      - Hard cap open-ended file exploration at 2 directory listings and 2 file reads unless the user names a concrete target.\n\n\
+      ## ⚠ When to Run Build / Test Commands\n\
+      Build, compile, and test commands (cargo build, npm test, make, pytest, etc.) are EXPENSIVE.\n\
+      - **Run them ONLY to verify YOUR changes** — after you edited or created files.\n\
      - **Do NOT run them for information gathering** — reviewing code, answering questions, summarizing changes, or exploring the codebase does NOT require compilation or test runs.\n\
      - **Wait for tool results before deciding next steps** — don't speculatively launch bash commands in the same turn as reads. Read first, then decide if bash is needed.\n"
 }
@@ -279,7 +282,7 @@ fn tool_error_recovery_section() -> &'static str {
 }
 
 /// Self-model (tool list). Session-scoped — changes when tool set changes.
-fn self_model_section(tool_names: &[&str]) -> String {
+pub(crate) fn self_model_section(tool_names: &[&str]) -> String {
     format!(
         "\n## Self-Model\nTools: {}\n\
          Refer to 'Runtime Identity' below for model, session, and environment details.\n",
@@ -314,10 +317,10 @@ fn memory_prompt_mode(tool_names: &[&str], profile_desc: &str) -> MemoryPromptMo
 
 /// Tool-conditional guidance (git, code nav, editing, build/test, memory, etc.).
 /// Session-scoped — depends on which tools are selected.
-fn tool_conditional_section(
+pub(crate) fn tool_conditional_section(
     tool_names: &[&str],
     profile_desc: &str,
-    selection_confidence: f64,
+    _selection_confidence: f64,
 ) -> String {
     let memory_mode = memory_prompt_mode(tool_names, profile_desc);
     let has_github = tool_names.iter().any(|n| n.starts_with("github"));
@@ -337,6 +340,13 @@ fn tool_conditional_section(
     let has_turn_rollback = tool_names.contains(&"rollback_turn_actions");
 
     let mut s = String::new();
+
+    if tool_names.contains(&"bash") {
+        s.push_str(
+            "\n## Explicit Tool Requests\n\
+             - If the user explicitly asks to use `bash`, call the `bash` tool rather than substituting file/navigation tools. Batch safe shell steps with `&&`.\n",
+        );
+    }
 
     if has_git || has_github {
         s.push_str(
@@ -469,14 +479,20 @@ fn tool_conditional_section(
             s.push_str(&memory_section);
         }
     }
-    if selection_confidence < LOW_CONFIDENCE_THRESHOLD {
-        s.push_str(
-            "\n## ⚠ Low-Confidence Tool Selection\n\
-             Tool selection confidence is LOW. If available tools seem insufficient, ASK the user to clarify.\n\
-             Do NOT guess with bash/find/read_file when a more specific tool would be needed.\n",
-        );
-    }
     s
+}
+
+/// Per-turn advisory for tool-selector uncertainty.
+///
+/// This must stay out of Session-scoped prompt blocks: confidence is computed
+/// per turn from the current request and selected tools.
+pub(crate) fn low_confidence_tool_selection_section(selection_confidence: f64) -> Option<String> {
+    (selection_confidence < LOW_CONFIDENCE_THRESHOLD).then(|| {
+        "\n## ⚠ Low-Confidence Tool Selection\n\
+         Tool selection confidence is LOW. If available tools seem insufficient, ASK the user to clarify.\n\
+         Do NOT guess with bash/find/read_file when a more specific tool would be needed.\n"
+            .to_string()
+    })
 }
 
 /// Task-type specific strategy. Session-scoped — depends on detected task type.
@@ -738,25 +754,43 @@ pub fn build_system_prompt_sections_with_style(
         ),
     ];
 
-    // ── Session sections (stable within a session) ──
-    sections.push(PromptSection::stable(
+    // ── Tool-dependent sections (CacheScope::None — change when tool selector
+    //    picks different tools per turn, so they MUST go after the cache marker
+    //    to keep the Global prefix stable) ──
+    sections.push(PromptSection::dynamic(
         self_model_section(tool_names),
-        CacheScope::Session,
+        PromptTokenBucket::BasePersona,
     ));
 
     let tool_cond = tool_conditional_section(tool_names, profile_desc, selection_confidence);
     if !tool_cond.is_empty() {
-        sections.push(PromptSection::stable(tool_cond, CacheScope::Session));
+        sections.push(PromptSection::dynamic(
+            tool_cond,
+            PromptTokenBucket::BasePersona,
+        ));
+    }
+
+    if let Some(low_confidence) = low_confidence_tool_selection_section(selection_confidence) {
+        sections.push(PromptSection::dynamic(
+            low_confidence,
+            PromptTokenBucket::Environment,
+        ));
     }
 
     let tt = task_type_section(task_type);
     if !tt.is_empty() {
-        sections.push(PromptSection::stable(tt.to_string(), CacheScope::Session));
+        sections.push(PromptSection::dynamic(
+            tt.to_string(),
+            PromptTokenBucket::BasePersona,
+        ));
     }
 
     let ss = search_strategy_section(tool_names);
     if !ss.is_empty() {
-        sections.push(PromptSection::stable(ss.to_string(), CacheScope::Session));
+        sections.push(PromptSection::dynamic(
+            ss.to_string(),
+            PromptTokenBucket::BasePersona,
+        ));
     }
 
     // ── Dynamic sections (change every turn) ──
@@ -804,11 +838,11 @@ pub fn self_awareness_prompt_section(
 
 /// Flatten sections into a single string (backward-compatible convenience).
 pub fn sections_to_string(sections: &[PromptSection]) -> String {
-    sections
-        .iter()
-        .map(|s| s.text.as_str())
-        .collect::<Vec<_>>()
-        .join("")
+    let serialized = astra_turn_core::context_serializer::serialize_prompt_sections(
+        sections,
+        &astra_turn_core::pipeline_config::ProviderCachePolicy::default(),
+    );
+    astra_turn_core::context_serializer::flatten_serialized_system_blocks(&serialized)
 }
 
 // ─── Prompt Section Overrides ─────────────────────────────────────────────
@@ -1133,7 +1167,7 @@ const TASK_TYPE_KEYWORDS: &[(&str, &[&str])] = &[
             "analysis",
             "research",
             "investigate",
-            "diagnose",
+            "introspect",
             "root cause",
             "why does",
             "why is",
@@ -1857,6 +1891,22 @@ mod tests {
     }
 
     #[test]
+    fn prompt_honors_explicit_bash_requests() {
+        let p = build_main_system_prompt(&["bash", "read_file", "list_dir"], "", 0.5, None);
+        assert!(p.contains("If the user explicitly asks to use `bash`"));
+        assert!(p.contains("rather than substituting file/navigation tools"));
+    }
+
+    #[test]
+    fn prompt_bounds_runaway_file_exploration() {
+        let p = build_main_system_prompt(&["bash", "read_file", "list_dir"], "", 0.5, None);
+        assert!(p.contains("Runaway Exploration Guard"));
+        assert!(p.contains("\"as many as you can\""));
+        assert!(p.contains("2 directory listings and 2 file reads"));
+        assert!(p.contains("busy-loop"));
+    }
+
+    #[test]
     fn prompt_git_tool_guidance_for_compound_ops() {
         let p = build_main_system_prompt(&["git_diff", "git_log", "bash"], "", 0.5, None);
         assert!(p.contains("git_status, git_diff"));
@@ -2174,7 +2224,7 @@ mod tests {
     #[test]
     fn session_state_rollback_guidance_omits_turn_rollback_when_unavailable() {
         let p = build_main_system_prompt(
-            &["rollback_session_state", "adjust_config"],
+            &["rollback_session_state", "session"],
             "",
             0.5,
             Some("implementation"),
@@ -2192,11 +2242,7 @@ mod tests {
     #[test]
     fn session_state_rollback_guidance_mentions_turn_rollback_when_available() {
         let p = build_main_system_prompt(
-            &[
-                "rollback_session_state",
-                "rollback_turn_actions",
-                "adjust_config",
-            ],
+            &["rollback_session_state", "rollback_turn_actions", "session"],
             "",
             0.5,
             Some("implementation"),
@@ -2254,7 +2300,12 @@ mod tests {
             "should have multiple Global sections, got {}",
             globals.len()
         );
-        assert!(!sessions.is_empty(), "should have Session sections");
+        // NOTE: tool-dependent sections (self-model, tool-conditional, task-type,
+        // search-strategy) are intentionally `CacheScope::None` so they sit
+        // AFTER the cache marker and can change per turn without invalidating
+        // the cached prefix. The Session scope remains available for future
+        // use but is not populated by the current build_system_prompt_sections.
+        let _ = sessions; // kept to document the intent; no assertion on count
 
         // First section should be Global
         assert_eq!(
@@ -2263,15 +2314,15 @@ mod tests {
             "first section should be Global"
         );
 
-        // Profile section should be CacheScope::None
-        let profile = sections.iter().find(|s| s.scope == CacheScope::None);
+        // Profile lives in the None-scoped post-cache segment alongside
+        // other tool-dependent sections. Search by content rather than
+        // by scope+first-match.
+        let profile = sections
+            .iter()
+            .find(|s| s.scope == CacheScope::None && s.text.contains("cwd: /tmp"));
         assert!(
             profile.is_some(),
-            "should have a None-scoped profile section"
-        );
-        assert!(
-            profile.unwrap().text.contains("cwd: /tmp"),
-            "profile section should contain the cwd"
+            "should have a None-scoped profile section containing cwd"
         );
     }
 
@@ -2309,27 +2360,34 @@ mod tests {
     }
 
     #[test]
-    fn sections_session_contains_tool_guidance() {
+    fn sections_tool_dependent_guidance_is_none_scoped() {
+        // Tool-dependent guidance (code-nav, task-type strategies) sits in
+        // the None-scoped post-cache segment so it can vary per turn without
+        // invalidating the cached Global prefix.
         let tools = vec!["bash", "find_definition", "find_references", "git_commit"];
         let sections = build_system_prompt_sections(&tools, "", 0.8, Some("debugging"));
 
-        let session_text: String = sections
+        let post_cache_text: String = sections
             .iter()
-            .filter(|s| s.scope == CacheScope::Session)
+            .filter(|s| s.scope == CacheScope::None)
             .map(|s| s.text.as_str())
             .collect();
         assert!(
-            session_text.contains("Code Navigation"),
-            "session should include code nav guidance"
+            post_cache_text.contains("Code Navigation"),
+            "code nav guidance should land in None-scoped (post-cache) segment"
         );
         assert!(
-            session_text.contains("Debugging Strategy"),
-            "session should include task-type strategy"
+            post_cache_text.contains("Debugging Strategy"),
+            "task-type strategy should land in None-scoped (post-cache) segment"
         );
     }
 
     #[test]
-    fn sections_no_profile_when_empty() {
+    fn sections_profile_and_toolset_populate_none_scope() {
+        // Even with empty profile, the None segment still holds tool-dependent
+        // sections (self-model, tool-conditional guidance, etc.). Prior to
+        // the cache-stability refactor this was empty; now it's the
+        // per-turn dynamic bucket.
         let tools = vec!["bash"];
         let sections = build_system_prompt_sections(&tools, "", 0.8, None);
 
@@ -2338,8 +2396,8 @@ mod tests {
             .filter(|s| s.scope == CacheScope::None)
             .collect();
         assert!(
-            none_scoped.is_empty(),
-            "no None-scoped section when profile is empty"
+            !none_scoped.is_empty(),
+            "None-scoped segment should carry tool-dependent sections (self-model, etc.)"
         );
     }
 
@@ -2391,18 +2449,21 @@ mod tests {
     }
 
     #[test]
-    fn sections_low_confidence_in_session_scope() {
+    fn sections_low_confidence_in_post_cache_segment() {
+        // Low-confidence advisory is tool-selector-driven (depends on which
+        // tools were chosen), so it lives in the None-scoped post-cache
+        // segment alongside other per-turn content.
         let tools = vec!["bash"];
         let sections = build_system_prompt_sections(&tools, "", 0.1, None);
 
-        let session_text: String = sections
+        let post_cache_text: String = sections
             .iter()
-            .filter(|s| s.scope == CacheScope::Session)
+            .filter(|s| s.scope == CacheScope::None)
             .map(|s| s.text.as_str())
             .collect();
         assert!(
-            session_text.contains("Low-Confidence Tool Selection"),
-            "low confidence advisory should be in session section"
+            post_cache_text.contains("Low-Confidence Tool Selection"),
+            "low confidence advisory should land in None-scoped post-cache segment"
         );
     }
 
@@ -2552,10 +2613,13 @@ mod tests {
         );
     }
 
-    // ── All code-nav tools in session scope ──────────────────────
+    // ── Code-nav guidance lives in the post-cache segment ────────────
 
     #[test]
-    fn sections_all_code_nav_tools_in_session_scope() {
+    fn sections_all_code_nav_tools_appear_in_post_cache_segment() {
+        // Code-nav guidance references the active tool names, so it lives
+        // in the None-scoped post-cache segment (varies per turn with tool
+        // selection) rather than Session.
         let tools = vec![
             "find_definition",
             "find_references",
@@ -2567,33 +2631,33 @@ mod tests {
             "lsp",
         ];
         let sections = build_system_prompt_sections(&tools, "", 0.8, None);
-        let session_text: String = sections
+        let post_cache_text: String = sections
             .iter()
-            .filter(|s| s.scope == CacheScope::Session)
+            .filter(|s| s.scope == CacheScope::None)
             .map(|s| s.text.as_str())
             .collect();
-        assert!(session_text.contains("Code Navigation"));
-        assert!(session_text.contains("call_graph"));
-        assert!(session_text.contains("rename_symbol"));
-        assert!(session_text.contains("dead_code"));
-        assert!(session_text.contains("extract_members"));
-        assert!(session_text.contains("type_hierarchy"));
-        assert!(session_text.contains("lsp"));
+        assert!(post_cache_text.contains("Code Navigation"));
+        assert!(post_cache_text.contains("call_graph"));
+        assert!(post_cache_text.contains("rename_symbol"));
+        assert!(post_cache_text.contains("dead_code"));
+        assert!(post_cache_text.contains("extract_members"));
+        assert!(post_cache_text.contains("type_hierarchy"));
+        assert!(post_cache_text.contains("lsp"));
     }
 
     #[test]
     fn sections_lsp_alone_adds_code_navigation_guidance() {
         let sections = build_system_prompt_sections(&["lsp"], "", 0.8, None);
-        let session_text: String = sections
+        let post_cache_text: String = sections
             .iter()
-            .filter(|s| s.scope == CacheScope::Session)
+            .filter(|s| s.scope == CacheScope::None)
             .map(|s| s.text.as_str())
             .collect();
-        assert!(session_text.contains("Code Navigation"));
-        assert!(session_text.contains("item_index"));
-        assert!(session_text.contains("action_index"));
-        assert!(session_text.contains("quick fixes"));
-        assert!(session_text.contains("autocomplete"));
+        assert!(post_cache_text.contains("Code Navigation"));
+        assert!(post_cache_text.contains("item_index"));
+        assert!(post_cache_text.contains("action_index"));
+        assert!(post_cache_text.contains("quick fixes"));
+        assert!(post_cache_text.contains("autocomplete"));
     }
 
     // ── Empty-tools + empty-profile section behavior ─────────────

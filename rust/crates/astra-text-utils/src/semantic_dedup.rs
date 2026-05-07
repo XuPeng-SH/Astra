@@ -321,9 +321,19 @@ impl SemanticDedup {
         if current_turn <= *prev_turn {
             return None;
         }
-        // Find the most recent output from the same tool in output_log
+        // Find the most recent output from the same tool in output_log.
+        // Skip outputs that have been microcompact-cleared or are stubs —
+        // returning "[Cleared]" or a short placeholder instead of real content
+        // would leave the caller with nothing useful, forcing them to re-fetch
+        // anyway. In that case, allow the tool to re-execute.
         for (prev_tool, _out_turn, prev_output) in self.output_log.iter().rev() {
             if prev_tool == tool_name {
+                if prev_output.starts_with("[Cleared")
+                    || prev_output.starts_with("(cached")
+                    || prev_output.len() < 20
+                {
+                    return None; // Force re-execution — cached content is gone
+                }
                 return Some((*prev_turn, prev_output.clone()));
             }
         }
@@ -1120,6 +1130,66 @@ mod tests {
         );
         let block = dedup.pre_check_block("read_file", &json!({"path": "src/main.rs/"}), 1);
         assert!(block.is_some(), "normalized path should match");
+    }
+
+    /// When microcompact has cleared the cached output to `[Cleared]`,
+    /// pre_check_block must allow re-execution rather than returning a
+    /// useless stub. Without this, long sessions hit a deadlock:
+    /// old content cleared for pressure → agent tries to re-read →
+    /// dedup blocks because "same file seen before" → agent stuck.
+    #[test]
+    fn pre_check_block_allows_reexecution_when_output_cleared() {
+        let mut dedup = SemanticDedup::new(0.75);
+        // First call — record a real output
+        dedup.check_and_record(
+            "read_file",
+            &json!({"path": "src/lib.rs"}),
+            "pub fn important() { /* ... */ }",
+            0,
+        );
+        // Simulate microcompact clearing the output_log entry
+        for entry in dedup.output_log.iter_mut() {
+            if entry.0 == "read_file" {
+                entry.2 = "[Cleared]".to_string();
+            }
+        }
+        // Re-read same file — must NOT be blocked (content is gone)
+        let block = dedup.pre_check_block("read_file", &json!({"path": "src/lib.rs"}), 2);
+        assert!(
+            block.is_none(),
+            "must allow re-execution when cached output is [Cleared]"
+        );
+    }
+
+    /// Same as above but for the "(cached — identical call)" stub that an
+    /// earlier dedup pass may have stored into output_log.
+    #[test]
+    fn pre_check_block_allows_reexecution_when_output_is_dedup_stub() {
+        let mut dedup = SemanticDedup::new(0.75);
+        dedup.check_and_record(
+            "read_file",
+            &json!({"path": "Cargo.toml"}),
+            "(cached — identical call already executed in this conversation. Re-read the file only if you need the content again.)",
+            0,
+        );
+        let block = dedup.pre_check_block("read_file", &json!({"path": "Cargo.toml"}), 1);
+        assert!(
+            block.is_none(),
+            "must allow re-execution when prior output was itself a dedup stub"
+        );
+    }
+
+    /// Very short outputs (< 20 chars) are likely placeholders or errors,
+    /// not meaningful cached content. Allow re-execution.
+    #[test]
+    fn pre_check_block_allows_reexecution_for_trivially_short_output() {
+        let mut dedup = SemanticDedup::new(0.75);
+        dedup.check_and_record("read_file", &json!({"path": "x.rs"}), "err", 0);
+        let block = dedup.pre_check_block("read_file", &json!({"path": "x.rs"}), 1);
+        assert!(
+            block.is_none(),
+            "trivially short output should not block re-execution"
+        );
     }
 
     // ── P1-H: Semantic dedup behavioral tests ───────────────────────

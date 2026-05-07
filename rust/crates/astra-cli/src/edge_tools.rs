@@ -459,6 +459,11 @@ pub struct ToolExecutor {
             std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>,
         >,
     >,
+    /// Budget-adaptive introspection snapshot, updated each turn by the
+    /// execution phase. The `introspect` tool reads this to return runtime
+    /// state to the model.
+    introspect_snapshot:
+        std::sync::Arc<std::sync::RwLock<Option<astra_turn_core::introspect::IntrospectSnapshot>>>,
     /// Session id for persisting self-modification state and serving `astra self`
     /// compatible diagnostics from inside the live agent loop.
     active_session_id: std::sync::Mutex<Option<String>>,
@@ -543,6 +548,7 @@ impl ToolExecutor {
             agent_id: None,
             send_message_context: std::sync::Mutex::new(None),
             observability_session: None,
+            introspect_snapshot: std::sync::Arc::new(std::sync::RwLock::new(None)),
             active_session_id: std::sync::Mutex::new(None),
             self_mod_pinned_tools: std::sync::Mutex::new(Vec::new()),
             self_mod_deprioritized_tools: std::sync::Mutex::new(Vec::new()),
@@ -943,6 +949,37 @@ impl ToolExecutor {
         env_tools::env_tool(args)
     }
 
+    fn handle_introspect(&self, args: &Value) -> String {
+        let detail_arg = args
+            .get("detail")
+            .and_then(Value::as_str)
+            .unwrap_or("summary");
+        let detail = astra_turn_core::introspect::IntrospectDetail::from_arg(detail_arg);
+
+        let snapshot = self
+            .introspect_snapshot
+            .read()
+            .unwrap_or_else(|poisoned| {
+                astra_core::agent_warn!("introspect", "recovering from poisoned RwLock");
+                poisoned.into_inner()
+            })
+            .clone();
+
+        match snapshot {
+            Some(snap) => astra_turn_core::introspect::render_introspect(&snap, detail),
+            None => "No introspection data available yet (first turn).".to_string(),
+        }
+    }
+
+    pub fn update_introspect_snapshot(
+        &self,
+        snapshot: astra_turn_core::introspect::IntrospectSnapshot,
+    ) {
+        if let Ok(mut guard) = self.introspect_snapshot.write() {
+            *guard = Some(snapshot);
+        }
+    }
+
     /// Check if a variable name suggests it contains sensitive data.
     fn is_sensitive_var(name: &str) -> bool {
         env_tools::is_sensitive_var(name)
@@ -1097,6 +1134,39 @@ impl ToolExecutor {
             outcome.output = output;
             return outcome;
         }
+        if name == "git" {
+            let action = args
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or("status");
+            match action {
+                "commit" => {
+                    let mut outcome = self.git_commit_with_metadata(args);
+                    outcome.output = self.finalize_tool_output(outcome.output, name);
+                    self.record_output_size(outcome.output.len());
+                    return outcome;
+                }
+                "revert_commit" => {
+                    let mut outcome = self.git_revert_commit_with_metadata(args);
+                    outcome.output = self.finalize_tool_output(outcome.output, name);
+                    self.record_output_size(outcome.output.len());
+                    return outcome;
+                }
+                "stash" => {
+                    let mut outcome = self.git_stash_with_metadata(args);
+                    outcome.output = self.finalize_tool_output(outcome.output, name);
+                    self.record_output_size(outcome.output.len());
+                    return outcome;
+                }
+                "worktree" => {
+                    let mut outcome = self.git_worktree_with_metadata(args);
+                    outcome.output = self.finalize_tool_output(outcome.output, name);
+                    self.record_output_size(outcome.output.len());
+                    return outcome;
+                }
+                _ => {} // Other git actions handled in execute() below
+            }
+        }
         if name == "git_stash" {
             let mut outcome = self.git_stash_with_metadata(args);
             let output = self.finalize_tool_output(outcome.output, name);
@@ -1137,19 +1207,67 @@ impl ToolExecutor {
         } else {
             match name {
                 "bash" => self.bash(args),
+                #[cfg(windows)]
                 "powershell" => self.powershell(args),
                 "read_file" => self.read_file(args),
-                "write_file" => self.write_file(args),
-                "rollback_file_edits" => self.rollback_file_edits(args),
+                "write_file" => {
+                    // delete=true routes to delete_file handler
+                    if args.get("delete").and_then(Value::as_bool).unwrap_or(false) {
+                        self.delete_file(args)
+                    } else {
+                        self.write_file(args)
+                    }
+                }
                 "rollback_database_snapshots" => self.rollback_database_snapshots(args),
                 "rollback_session_state" => self.rollback_session_state(args),
                 "rollback_turn_actions" => self.rollback_turn_actions(args),
-                "str_replace" => self.str_replace(args),
-                "delete_file" => self.delete_file(args),
-                "multi_edit" => self.multi_edit(args),
+                "str_replace" => {
+                    // edits array routes to multi_edit handler
+                    if args.get("edits").and_then(Value::as_array).is_some() {
+                        self.multi_edit(args)
+                    } else {
+                        self.str_replace(args)
+                    }
+                }
                 "list_dir" => self.list_dir(args),
                 "grep" => self.grep(args),
                 "glob" => self.glob(args),
+                "git" => {
+                    let action = args
+                        .get("action")
+                        .and_then(Value::as_str)
+                        .unwrap_or("status");
+                    match action {
+                        "status" => git_gix::git_status(&self.project_root),
+                        "diff" => git_gix::git_diff(
+                            &self.project_root,
+                            args,
+                            self.get_budget_pressure(),
+                            self.aggregate_output_bytes
+                                .load(std::sync::atomic::Ordering::Relaxed),
+                        ),
+                        "log" => git_gix::git_log(&self.project_root, args),
+                        "show" => git_gix::git_show(
+                            &self.project_root,
+                            args,
+                            self.get_budget_pressure(),
+                            self.aggregate_output_bytes
+                                .load(std::sync::atomic::Ordering::Relaxed),
+                        ),
+                        "blame" => git_gix::git_blame(&self.project_root, args),
+                        "file_history" => git_gix::git_file_history(&self.project_root, args),
+                        "log_search" => git_gix::git_log_search(&self.project_root, args),
+                        "contributors" => git_gix::git_contributors(&self.project_root, args),
+                        "commit" => self.git_commit(args),
+                        "revert_commit" => self.git_revert_commit(args),
+                        "stash" => self.git_stash(args),
+                        "checkout_file" => self.git_checkout_file(args),
+                        "worktree" => self.git_worktree(args),
+                        _ => format!(
+                            "Error: unknown git action '{action}'. Use one of: status, diff, log, show, blame, file_history, log_search, contributors, commit, revert_commit, stash, checkout_file, worktree"
+                        ),
+                    }
+                }
                 "git_status" => git_gix::git_status(&self.project_root),
                 "git_diff" => git_gix::git_diff(
                     &self.project_root,
@@ -1205,6 +1323,17 @@ impl ToolExecutor {
                         .unwrap_or_else(|| self.project_root.to_string_lossy().to_string());
                     astra_tools::web_fetch::fetch_with_cache_scope(None, args, &cache_scope).await
                 }
+                "memory" => {
+                    let op = match args.get("action").and_then(|v| v.as_str()) {
+                        Some(a) => a,
+                        None => return "Error: missing required parameter 'action'. Use one of: store, retrieve, purge, correct, profile, search, feedback".to_string(),
+                    };
+                    let mut clean_args = args.clone();
+                    if let Some(obj) = clean_args.as_object_mut() {
+                        obj.remove("action");
+                    }
+                    self.memoria_call(op, &clean_args).await
+                }
                 "memory_retrieve" => self.memoria_call("retrieve", args).await,
                 "memory_store" => self.memoria_call("store", args).await,
                 "memory_search" => self.memoria_call("search", args).await,
@@ -1251,53 +1380,91 @@ impl ToolExecutor {
                     }).to_string()
                     }
                 }
-                "run_chain" => {
-                    match serde_json::from_value::<astra_runtime::tool_registry::ToolChain>(
-                        args.clone(),
-                    ) {
-                        Ok(chain) => {
-                            // Validate chain steps reference known tools
-                            let known: Vec<&str> = astra_runtime::tool_registry::TOOL_CATALOG
-                                .iter()
-                                .map(|t| t.name)
-                                .collect();
-                            if let Err(errors) = chain.validate(&known) {
-                                return format!("Error: Invalid chain: {}", errors.join("; "));
-                            }
-                            let input = args
-                                .get("input")
-                                .cloned()
-                                .unwrap_or_else(|| serde_json::json!({}));
-                            self.execute_chain(&chain, input).await
+                // ── Consolidated agent tool ──────────────────────────────────
+                "agent" => {
+                    let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+                    match action {
+                        "delegate" => {
+                            "Delegation request acknowledged. The delegation engine will execute \
+                             this request and provide results in the next round."
+                                .to_string()
                         }
-                        Err(e) => format!("Error: Invalid chain format: {e}"),
+                        "run_chain" => {
+                            match serde_json::from_value::<astra_runtime::tool_registry::ToolChain>(
+                                args.clone(),
+                            ) {
+                                Ok(chain) => {
+                                    let known: Vec<&str> =
+                                        astra_runtime::tool_registry::TOOL_CATALOG
+                                            .iter()
+                                            .map(|t| t.name)
+                                            .collect();
+                                    if let Err(errors) = chain.validate(&known) {
+                                        return format!(
+                                            "Error: Invalid chain: {}",
+                                            errors.join("; ")
+                                        );
+                                    }
+                                    let input = args
+                                        .get("input")
+                                        .cloned()
+                                        .unwrap_or_else(|| serde_json::json!({}));
+                                    self.execute_chain(&chain, input).await
+                                }
+                                Err(e) => format!("Error: Invalid chain format: {e}"),
+                            }
+                        }
+                        "spawn" => {
+                            agent_spawning::handle_spawn_agent_tool(
+                                args,
+                                self.spawn_context.as_ref(),
+                            )
+                            .await
+                        }
+                        "get_result" => {
+                            agent_spawning::handle_get_agent_result_tool(
+                                args,
+                                self.spawn_context.as_ref(),
+                            )
+                            .await
+                        }
+                        "send_message" => {
+                            let ctx = self
+                                .send_message_context
+                                .lock()
+                                .ok()
+                                .and_then(|g| g.clone());
+                            agent_messaging::handle_send_message_tool(args, ctx.as_ref()).await
+                        }
+                        _ => format!(
+                            "Error: unknown agent action '{action}'. Use one of: delegate, run_chain, spawn, get_result, send_message"
+                        ),
                     }
                 }
-                "ask_user" => self.ask_user(args),
+                // ── Consolidated session tool ──────────────────────────────
+                "session" => {
+                    let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+                    match action {
+                        "config" => self.adjust_config(args),
+                        "prioritize" => self.prioritize_tool(args),
+                        "deprioritize" => self.deprioritize_tool(args),
+                        "set_goal" => self.set_goal(args),
+                        "compact" => self.compress_context(args),
+                        "rollback_edits" => self.rollback_file_edits(args),
+                        "ask_user" => self.ask_user(args),
+                        "sleep" => self.sleep_tool(args).await,
+                        "tool_search" => self.tool_search(args),
+                        "" => "Missing required parameter: action. Use: config, prioritize, deprioritize, set_goal, compact, rollback_edits, ask_user, sleep, tool_search".to_string(),
+                        other => format!("Unknown session action: '{other}'"),
+                    }
+                }
                 // Task management tools
                 "task_create" => self.task_create(args).await,
                 "task_list" => self.task_list(args).await,
                 "task_get" => self.task_get(args).await,
                 "task_update" => self.task_update(args).await,
                 "task_stop" => self.task_stop(args).await,
-                "sleep" => self.sleep_tool(args).await,
-                "tool_search" => self.tool_search(args),
                 "web_search" => self.web_search(args),
-                "send_message" => {
-                    let ctx = self
-                        .send_message_context
-                        .lock()
-                        .ok()
-                        .and_then(|g| g.clone());
-                    agent_messaging::handle_send_message_tool(args, ctx.as_ref()).await
-                }
-                "spawn_agent" => {
-                    agent_spawning::handle_spawn_agent_tool(args, self.spawn_context.as_ref()).await
-                }
-                "get_agent_result" => {
-                    agent_spawning::handle_get_agent_result_tool(args, self.spawn_context.as_ref())
-                        .await
-                }
                 "share_context" => self.share_context(args),
                 "query_context" => self.query_context(args),
                 astra_runtime::turn::agentic_loop_host::DELEGATE_TOOL_NAME => {
@@ -1305,6 +1472,7 @@ impl ToolExecutor {
                 this request and provide results in the next round."
                         .to_string()
                 }
+                "introspect" => self.handle_introspect(args),
                 "diagnose" => self.diagnose(args).await,
                 "lsp" => self.lsp(args),
                 "env" => self.env_tool(args),

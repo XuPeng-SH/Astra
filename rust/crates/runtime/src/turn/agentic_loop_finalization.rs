@@ -305,7 +305,31 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
     };
     // Persist compaction effectiveness state for enriched resume guidance.
     heavy.compaction_state = Some(state.compaction_effectiveness.to_json());
-    heavy.continuity_state = serde_json::to_value(&state.continuity).ok();
+    heavy.continuity_state = match serde_json::to_value(&state.continuity) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            astra_core::agent_warn!(
+                "checkpoint",
+                "continuity_state serialize failed (NaN/non-finite float?); \
+                 checkpoint written without continuity — resume guidance degraded: {e}"
+            );
+            None
+        }
+    };
+    // Persist context pipeline state for warm-start on resume (includes emergent context).
+    if let Some(ref sess) = state.pipeline_session {
+        heavy.pipeline_state = match serde_json::to_value(sess.snapshot_full_state()) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                astra_core::agent_warn!(
+                    "checkpoint",
+                    "pipeline_state serialize failed (NaN cache ratio / bad histogram?); \
+                     resume will start cold — cache hit rate, feedback history, latches lost: {e}"
+                );
+                None
+            }
+        };
+    }
     let cp = StepCheckpoint::Heavy(Box::new(heavy));
     if let Err(e) = step_checkpoint::write_step_checkpoint(sid, ckpt_num, &cp) {
         astra_core::agent_warn!(
@@ -505,6 +529,7 @@ fn reset_per_turn_corrective_state(state: &mut AgenticLoopState) {
     state.stall.forced_parallel_batching = false;
     state.stall.forced_round_budget_phase1 = false;
     state.stall.forced_round_budget_phase2 = false;
+    state.stall.forced_completion_soft_stop = false;
     state.stall.forced_redundant_reads_corrective = false;
     state.stall.forced_cache_waste_corrective = false;
     state.stall.forced_exploration_family_corrective = false;

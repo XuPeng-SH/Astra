@@ -341,6 +341,9 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                 token: self.cancel_token.clone(),
             },
             error_recovery: Default::default(),
+            pipeline_session: Some(astra_turn_core::pipeline_session::PipelineSession::new(
+                astra_turn_core::pipeline_config::PipelineConfig::default(),
+            )),
             message: config.task.clone(),
             recent_tools: Vec::new(),
             task_profile,
@@ -362,6 +365,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             pinned_tool_schema_tokens: 0,
             max_turn_input_tokens: astra_core::RuntimeLimits::global().max_turn_input_tokens,
             budget_wrapup_injected: false,
+            compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
             skill_produced_output: false,
             max_cumulative_tokens: 0,
             thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,

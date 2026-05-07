@@ -68,6 +68,22 @@ use astra_turn_core::tool_schema_prune::prune_tool_schemas;
 const TOOL_RESULT_AUDIT_CHARS: usize = 4000;
 const ROOT_TURN_JOURNAL_HEADER: &str = "x-mo-root-turn-journal";
 
+fn self_awareness_volatile_section(text: &str) -> Option<prompts::PromptSection> {
+    (!text.is_empty()).then(|| {
+        prompts::PromptSection::dynamic(text.to_string(), prompts::PromptTokenBucket::Environment)
+            .with_trace_signals(
+                astra_turn_core::context_assembly_trace::PromptTraceSignals {
+                    context_signals:
+                        astra_turn_core::context_assembly_trace::PromptContextSignals {
+                            self_awareness: true,
+                            ..Default::default()
+                        },
+                    ..Default::default()
+                },
+            )
+    })
+}
+
 #[derive(Clone)]
 struct BridgeTraceCorrelation {
     session_turn_source: String,
@@ -639,11 +655,8 @@ fn turn_complete_event(messages: &[Value], assistant_text: &str, tool_calls: &[V
 pub use super::prompt_cache::PromptCacheConfig;
 #[cfg(test)]
 pub(crate) use super::prompt_cache::add_message_cache_breakpoint;
-#[cfg(test)]
-pub(crate) use super::prompt_cache::build_system_message;
 pub(crate) use super::prompt_cache::{
     annotate_tool_schemas_for_caching, apply_anthropic_cache_metadata,
-    build_system_message_with_dynamic_sections,
 };
 
 #[derive(Clone)]
@@ -1094,6 +1107,22 @@ impl InProcessChatTurnBridge {
             let tool_names: Vec<&str> = edge_tools.iter()
                 .filter_map(|t| t.get("function").and_then(|f| f.get("name")).and_then(Value::as_str))
                 .collect();
+            // Split `profile_desc` into two cache-aligned parts:
+            //
+            // * `profile_desc` (STABLE) — cwd + git_branch + env_section.
+            //   Derived from edge_profile only; byte-stable within a session.
+            //   Routes to RuntimeIdentity (Session scope) via the pipeline's
+            //   typed `profile_desc` field → cached behind the 2nd marker.
+            //
+            // * memoria prefetch entries (VOLATILE) — typed MemoryEntry items
+            //   produced by `prefetch_memories`. The retrieval query uses the
+            //   latest user message, so results drift turn-to-turn. They route
+            //   through the pipeline's Memory section (None scope) where rank,
+            //   dedup, and budget trimming are applied.
+            //
+            // Previously both were concatenated into one `profile_desc`
+            // string and routed to volatile, dragging ~3-4 kB of stable
+            // cwd/branch/env content out of the cached prefix every turn.
             let profile_desc = {
                 let mut parts = Vec::new();
                 if let Some(cwd) = edge_profile.get("cwd").and_then(Value::as_str) {
@@ -1102,39 +1131,11 @@ impl InProcessChatTurnBridge {
                 if let Some(branch) = edge_profile.get("git_branch").and_then(Value::as_str) {
                     parts.push(format!("git_branch: {branch}"));
                 }
-                // Inject rich environment context (OS, shell, git status, etc.)
                 let env_section = edge_profile
                     .get("environment_context")
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
-                // Prefetch memories relevant to the current user message.
-                // Injected every turn — cost is bounded by top_k and relevance
-                // (typically 1-3 matches, ~100 tokens). This ensures LLM always
-                // has user context (repo mappings, preferences) without needing
-                // an extra round-trip to call memory_retrieve itself.
-                if let (Some(mem_url), Some(mem_key)) = (
-                    edge_profile.get("memoria_url").and_then(Value::as_str),
-                    edge_profile.get("memoria_key").and_then(Value::as_str),
-                ) {
-                    let user_msg = messages
-                        .iter()
-                        .rev()
-                        .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
-                        .and_then(|m| m.get("content").and_then(Value::as_str))
-                        .unwrap_or("");
-                    let top_k = edge_profile
-                        .get("retrieval_top_k")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(5) as u32;
-                    let result = prefetch_memories(mem_url, mem_key, user_msg, &user_id, top_k).await;
-                    memory_fetch_ms = result.fetch_ms;
-                    memory_items = result.items;
-                    memory_preview = result.preview;
-                    if let Some(section) = result.section {
-                        parts.push(section);
-                    }
-                }
                 if parts.is_empty() && env_section.is_empty() {
                     String::new()
                 } else {
@@ -1145,6 +1146,33 @@ impl InProcessChatTurnBridge {
                     };
                     format!("{base}{env_section}")
                 }
+            };
+
+            // Memoria prefetch lives on its own. `section` is the
+            // "## User Memories\n..." block — the piece that actually drifts.
+            let mut memoria_prefetch_entries = Vec::new();
+            let memoria_prefetch_section = if let (Some(mem_url), Some(mem_key)) = (
+                edge_profile.get("memoria_url").and_then(Value::as_str),
+                edge_profile.get("memoria_key").and_then(Value::as_str),
+            ) {
+                let user_msg = messages
+                    .iter()
+                    .rev()
+                    .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+                    .and_then(|m| m.get("content").and_then(Value::as_str))
+                    .unwrap_or("");
+                let top_k = edge_profile
+                    .get("retrieval_top_k")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(5) as u32;
+                let result = prefetch_memories(mem_url, mem_key, user_msg, &user_id, top_k).await;
+                memory_fetch_ms = result.fetch_ms;
+                memory_items = result.items;
+                memory_preview = result.preview;
+                memoria_prefetch_entries = result.entries;
+                result.section
+            } else {
+                None
             };
             // Read active skill hints from edge_profile (injected by CLI)
             let active_skill_names: Vec<&str> = edge_profile
@@ -1348,10 +1376,39 @@ impl InProcessChatTurnBridge {
                 tool_cfg.effective_round_budget_limit(),
             );
 
+            // Split bridge-composed signals into session-stable (RuntimeIdentity
+            // scope → cached behind the Session→None marker) and turn-volatile
+            // (RuntimeVolatile scope → re-sent per turn).
+            //
+            // STABLE (change only when session state changes, if at all):
+            //   profile_desc (cwd/branch/env — Memoria split out)
+            //
+            // VOLATILE (change each turn by design):
+            //   learned_context_hint (EMA tracker — byte-level changes break prefix cache),
+            //   feedback_rules_hint (accumulates on each user correction),
+            //   skill_hint (active skill/tool selection),
+            //   self_awareness_hint (turn/token/outcome signals),
+            //   typed memory_entries (per-turn retrieval — was baked into
+            //     profile_desc, now routed through the Memory section),
+            //   implicit_feedback_hint (per-turn correction signal based on
+            //     user message content),
+            //   memoria_insights_hint (per-turn retrieval),
+            //   recent_arg_hints_hint (per-turn tool args),
+            //   session_anchor (per-turn state),
+            //   tool_round_guidance (per-turn messages count)
+            let mut stable_sections = Vec::new();
             let mut dynamic_sections = Vec::new();
             if !profile_desc.is_empty() {
-                dynamic_sections.push(prompts::PromptSection::dynamic(
+                stable_sections.push(prompts::PromptSection::dynamic(
                     profile_desc.clone(),
+                    prompts::PromptTokenBucket::Environment,
+                ));
+            }
+            if let Some(ref section) = memoria_prefetch_section
+                && memoria_prefetch_entries.is_empty()
+            {
+                dynamic_sections.push(prompts::PromptSection::dynamic(
+                    section.clone(),
                     prompts::PromptTokenBucket::Environment,
                 ));
             }
@@ -1386,6 +1443,8 @@ impl InProcessChatTurnBridge {
                 );
             }
             if !implicit_feedback_hint.is_empty() {
+                // Per-turn correction signal — depends on current user
+                // message content, so it's volatile.
                 dynamic_sections.push(
                     prompts::PromptSection::dynamic(
                         implicit_feedback_hint.clone(),
@@ -1415,20 +1474,8 @@ impl InProcessChatTurnBridge {
                     }),
                 );
             }
-            if !self_awareness_hint.is_empty() {
-                dynamic_sections.push(
-                    prompts::PromptSection::dynamic(
-                        self_awareness_hint.clone(),
-                        prompts::PromptTokenBucket::Environment,
-                    )
-                    .with_trace_signals(astra_turn_core::context_assembly_trace::PromptTraceSignals {
-                        context_signals: astra_turn_core::context_assembly_trace::PromptContextSignals {
-                            self_awareness: true,
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    }),
-                );
+            if let Some(section) = self_awareness_volatile_section(&self_awareness_hint) {
+                dynamic_sections.push(section);
             }
             if !memoria_insights_hint.is_empty() {
                 dynamic_sections.push(
@@ -1480,72 +1527,105 @@ impl InProcessChatTurnBridge {
                     }),
                 );
             }
-            // Build provider-aware system message with static/dynamic boundary.
-            // Anthropic gets multi-block content with cache_control on stable sections;
-            // OpenAI/others get two messages: stable prefix (cacheable) + dynamic per-turn.
-            let (system_msg, dynamic_msg, prompt_sections) = build_system_message_with_dynamic_sections(
+            // Build provider-aware system message via the context pipeline.
+            // Anthropic: multi-block content with `cache_control` on stable sections.
+            // OpenAI/others: two messages (stable prefix + dynamic per-turn).
+            //
+            // This is the bridge's on-ramp to the pipeline: dynamic_sections
+            // (session anchor, feedback rules, memoria insights, etc.) flow
+            // through ExternalSources.extra_dynamic_sections so the binder
+            // appends them after runtime identity — keeping them in the
+            // None-scoped post-cache segment where churn is expected.
+            // Memoria prefetch results are passed separately as typed
+            // MemoryEntry values so the Memory binder can rank/dedup/budget
+            // them instead of treating the whole recall block as one string.
+            // project_context comes from cross-session history summaries;
+            // byte-stable within a session, so routing it into the pipeline's
+            // ProjectContext section (Session scope) puts it behind the
+            // Session→None cache marker.
+            let project_context = edge_profile
+                .get("project_context")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty());
+            let pipeline_outcome = crate::turn::prompt_cache::assemble_bridge_pipeline_outcome(
                 &tool_names,
+                &edge_tools,
+                &stable_sections,
                 &dynamic_sections,
+                &memoria_prefetch_entries,
                 selection_confidence,
                 task_type,
                 &cache_cfg,
+                &session_id,
+                &model_name,
+                &provider,
+                edge_profile.get("cwd").and_then(Value::as_str),
+                edge_profile.get("git_branch").and_then(Value::as_str),
+                project_context,
             );
+            let system_msg = pipeline_outcome.primary_system;
+            let dynamic_msg = pipeline_outcome.dynamic_system;
+            let prompt_sections = pipeline_outcome.prompt_sections;
+            // Pipeline decision is the only source of truth for tier + pruning.
+            // Cache the outputs so the round-level block below uses them
+            // instead of re-deriving a tier.
+            let pipeline_tier = pipeline_outcome.tier;
+            let pipeline_tool_schemas = pipeline_outcome.tool_schemas;
+            // Debug: dump system prompt for cache analysis (env-gated).
+            // Enable with ASTRA_PIPELINE_DUMP_SYSTEM_PROMPT=1. Writes to
+            // $TMPDIR/astra-bridge-prompt-<sid>-<ts>.json so `diff` between
+            // consecutive turns reveals which sections break cache prefix.
+            if std::env::var("ASTRA_PIPELINE_DUMP_SYSTEM_PROMPT").is_ok() {
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                let sid = if session_id.is_empty() {
+                    "nosid".to_string()
+                } else {
+                    session_id.clone()
+                };
+                let dump_path = std::env::temp_dir().join(format!(
+                    "astra-bridge-prompt-{sid}-{ts}.json"
+                ));
+                let dump_content = serde_json::to_string_pretty(&system_msg)
+                    .unwrap_or_else(|_| "serialize error".into());
+                let _ = std::fs::write(&dump_path, &dump_content);
+            }
             llm_messages.push(system_msg);
+            let mut bridge_volatile_text: Option<String> = None;
             if let Some(dyn_msg) = dynamic_msg {
-                llm_messages.push(dyn_msg);
+                // For prefix-only providers the dynamic system block contains
+                // volatile per-turn content. We prepend it to the last user
+                // message (below, after compacted messages are added) so the
+                // stable prefix (system + history) is byte-identical across
+                // turns for maximum prefix cache hits.
+                // Anthropic never reaches here (dynamic_system is None).
+                debug_assert!(
+                    !crate::turn::llm_client::provider_uses_explicit_cache_control(&provider),
+                    "Anthropic/Bedrock should not produce dynamic_system — \
+                     volatile content goes via pipeline cache_control markers"
+                );
+                let dyn_text = dyn_msg
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                // Stash for prepending to last user message after history is added
+                bridge_volatile_text = Some(dyn_text);
             }
 
             // Merge tool results into messages (handle continuation turns)
             // Client sends complete message history including tool role messages,
             // so we just use messages directly.
+            //
+            // Phase 3/Convergence: both the bridge and `ServerAgenticLoopHost`
+            // now route through the shared `wire_assembly::MemoriaContext`.
+            // The summary client still constructs here (it captures the
+            // current request's auth headers + overrides) and is injected.
             let (merged_messages, _initial_tier) = {
                 let raw = messages.clone();
 
-                // Tool result compaction is handled by compact_tool_results_adaptive
-                // in agentic_loop_lifecycle.rs. No separate analytics pass here.
-
-                // Compute model budget for tier-aware compaction using cache-aware estimation.
-                // Tool schemas are cache-eligible (stable prefix), so we estimate their cost.
-                let budget = crate::prompts::budget_for_model(Some(&model_name));
-                let tool_schema_tokens: usize = edge_tools.iter()
-                    .map(|t| serde_json::to_string(t).map(|s| crate::prompts::estimate_str_tokens(&s)).unwrap_or(50))
-                    .sum();
-                // Combine system prompt (llm_messages) + conversation (raw) for estimation
-                let mut all_msgs = llm_messages.clone();
-                all_msgs.extend(raw.iter().cloned());
-                let cache_est = crate::prompts::estimate_tokens_cache_aware(&all_msgs, tool_schema_tokens);
-                let tier = crate::prompts::compaction_tier_calibrated(
-                    &budget,
-                    cache_est.total_tokens,
-                    None,
-                    0,
-                );
-                // Use effective input limit as char budget (×4 for char-to-token ratio)
-                let budget_chars = budget.effective_input_limit() * 4;
-
-                // Use Memoria-based compaction (async with HTTP client)
-                let memoria_config = crate::turn::cloud::memoria_compact::MemoriaCompactConfig::default();
-                let cwd = edge_profile.get("cwd").and_then(Value::as_str);
-                let (session_memory_file, session_memory_combine) =
-                    crate::turn::cloud::memoria_compact::resolve_session_memory_file_options(
-                        &session_id,
-                        cwd,
-                    );
-                let memoria_params = crate::turn::cloud::memoria_compact::MemoriaCompactParams {
-                    budget_chars,
-                    keep_chars: 2_000,
-                    tier,
-                    keep_recent_turns: budget.keep_recent_turns,
-                    current_tokens: cache_est.total_tokens,
-                    session_memory_file,
-                    session_memory_combine,
-                    session_facts: session_facts_shared.lock().ok().map(|f| f.clone()),
-                };
-
-                // Reuse shared Memoria client for compaction
-                let memoria_client = memoria_client_shared.clone();
-
-                // Build summary client for LLM-based compaction
                 let compact_config = crate::prompts::CompactConfig::from_env();
                 let summary_client = astra_turn_core::cloud_summary::HttpSummaryClient::new(
                     astra_turn_core::cloud_summary::LlmConnParams {
@@ -1556,68 +1636,32 @@ impl InProcessChatTurnBridge {
                         max_output_tokens: compact_config.summary_token_budget,
                     },
                 );
+                let memoria_client = memoria_client_shared.clone();
 
-                let compact_result = crate::turn::cloud::memoria_compact::compact_with_memoria(
-                    &raw,
-                    Some(&session_id),
-                    &memoria_config,
-                    &memoria_params,
-                    memoria_client.as_ref().map(|c| c as &dyn crate::turn::cloud::memoria_compact::MemoriaClient),
-                    Some(&compact_config),
-                    Some(&summary_client as &dyn astra_turn_core::cloud_summary::SummaryLlmClient),
-                )
-                .await;
+                let ctx = crate::turn::wire_assembly::MemoriaContext {
+                    session_id: &session_id,
+                    model_name: &model_name,
+                    memoria_client: memoria_client.as_ref().map(|c| {
+                        c as &dyn crate::turn::cloud::memoria_compact::MemoriaClient
+                    }),
+                    summary_client: Some(
+                        &summary_client
+                            as &dyn astra_turn_core::cloud_summary::SummaryLlmClient,
+                    ),
+                    tier: pipeline_tier,
+                    cwd: edge_profile.get("cwd").and_then(Value::as_str),
+                    session_facts: session_facts_shared.lock().ok().map(|f| f.clone()),
+                };
 
-                // ── P2: Continuation prompt after compaction ──
-                // When compaction removed messages, append a user-role nudge so the
-                // LLM resumes the task instead of asking "how can I help?"
-                // Skip if the last assistant message signals task completion.
+                let compact_result = ctx.compact(&raw, &llm_messages, &edge_tools).await;
+
                 let mut msgs = compact_result.messages;
-                if compact_result.boundary.is_some() && msgs.len() >= 2 {
-                    let last_is_user = msgs.last()
-                        .and_then(|m| m.get("role").and_then(Value::as_str))
-                        == Some("user");
-                    let last_signals_done = msgs.last()
-                        .and_then(|m| m.get("content").and_then(Value::as_str))
-                        .map(|c| {
-                            // Check only the last ~200 chars (the conclusion) to avoid
-                            // false positives from negations in earlier context.
-                            let tail = if c.len() > 200 { &c[c.floor_char_boundary(c.len() - 200)..] } else { c };
-                            let lower = tail.to_ascii_lowercase();
-                            let has_completion = lower.contains("task complete") || lower.contains("all done")
-                                || lower.contains("finished") || lower.contains("completed successfully")
-                                || lower.contains("任务完成") || lower.contains("已完成");
-                            if !has_completion { return false; }
-                            // Only check negation near the completion phrase (same tail)
-                            let has_negation = lower.contains("not yet") || lower.contains("not complete")
-                                || lower.contains("not finished") || lower.contains("haven't finished")
-                                || lower.contains("hasn't finished") || lower.contains("won't be finished")
-                                || lower.contains("don't think") || lower.contains("not sure")
-                                || lower.contains("没有完成") || lower.contains("尚未完成")
-                                || lower.contains("except") || lower.contains("but ");
-                            has_completion && !has_negation
-                        })
-                        .unwrap_or(false);
-                    if !last_is_user && !last_signals_done {
-                        // Detect if conversation is primarily CJK (Chinese/Japanese/Korean)
-                        let is_cjk = msgs.iter().rev().take(4)
-                            .filter_map(|m| m.get("content").and_then(Value::as_str))
-                            .any(|c| c.chars().take(200).filter(|ch| ('\u{4e00}'..='\u{9fff}').contains(ch)).count() > 10);
-                        let prompt = if is_cjk {
-                            "从上次中断的地方继续。不要向用户提问，直接继续当前任务。"
-                        } else {
-                            "Continue the conversation from where it left off. \
-                             Do not ask the user any further questions — \
-                             pick up the current task and keep going."
-                        };
-                        msgs.push(serde_json::json!({
-                            "role": "user",
-                            "content": prompt
-                        }));
-                    }
-                }
+                crate::turn::wire_assembly::maybe_append_continuation_prompt(
+                    &mut msgs,
+                    compact_result.boundary.is_some(),
+                );
 
-                (msgs, tier) // tier only feeds memoria_compact params
+                (msgs, pipeline_tier)
             };
 
             llm_messages.extend(merged_messages);
@@ -1627,6 +1671,27 @@ impl InProcessChatTurnBridge {
             // compat; only the most recent assistant reasoning is preserved.
             // Heavy checkpoints and persisted events retain full reasoning.
             astra_turn_core::edge_ledger::strip_stale_reasoning(&mut llm_messages, &provider, &model_name);
+
+            // Prepend volatile content to the last user message (same strategy
+            // as wire_assembly::assemble_llm_messages) so the stable prefix
+            // (system + history) stays byte-identical for prefix cache hits.
+            if let Some(vol_text) = bridge_volatile_text.take() {
+                if !vol_text.is_empty() {
+                    if let Some(last_user) = llm_messages
+                        .iter_mut()
+                        .rev()
+                        .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+                    {
+                        let existing = last_user
+                            .get("content")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        last_user["content"] = Value::String(format!(
+                            "<system-reminder>\n{vol_text}</system-reminder>\n\n{existing}"
+                        ));
+                    }
+                }
+            }
 
             // Cloud loop: every tool round waits on §5.5 ledger (`POST /tools/result`) then continues LLM.
             let merged_tool_results: Vec<Value> = tool_results.clone();
@@ -1657,30 +1722,22 @@ impl InProcessChatTurnBridge {
 
                 // Budget check removed: single LLM call per HTTP request.
 
+                // Round-level tools come from the pipeline's Optimize phase,
+                // which already ran tier-appropriate schema pruning. The
+                // per-round `filter_round_edge_tools` pass strips names in
+                // `restricted_tools` — here always empty, so the pipeline
+                // output is already the authoritative set.
                 let round_edge_tools =
                     filter_round_edge_tools(&edge_tools, &HashSet::new());
                 let round_tools_fingerprint_str =
                     serde_json::to_string(&round_edge_tools).unwrap_or_default();
-
-                let tool_schema_tokens_round: usize = round_edge_tools
-                    .iter()
-                    .map(|t| {
-                        serde_json::to_string(t)
-                            .map(|s| crate::prompts::estimate_str_tokens(&s))
-                            .unwrap_or(50)
-                    })
-                    .sum();
-                let cache_est_round = crate::prompts::estimate_tokens_cache_aware(
-                    &llm_messages,
-                    tool_schema_tokens_round,
-                );
-                let round_tier = crate::prompts::compaction_tier_calibrated(
-                    &budget,
-                    cache_est_round.total_tokens,
-                    last_measured_prompt,
-                    0, // single-call proxy: no consecutive context-window errors to track
-                );
-                let mut pruned_tools = prune_tool_schemas(&round_edge_tools, round_tier);
+                // `pipeline_tier` is the authoritative tier; the per-round
+                // tier refinement (based on `last_measured_prompt`) used to
+                // live here but produced tier drift between planner and
+                // tool-pruning paths. Phase 3 will feed last-measured back
+                // into the planner; until then rely on pipeline output.
+                let _ = last_measured_prompt; // referenced for future wiring
+                let mut pruned_tools = pipeline_tool_schemas.clone();
                 annotate_tool_schemas_for_caching(&mut pruned_tools, &cache_cfg);
 
                 let loop_started = Instant::now();
@@ -1842,24 +1899,11 @@ impl InProcessChatTurnBridge {
                                 "bridge",
                                 "context window exceeded — forcing aggressive compaction and retrying"
                             );
-                            // Re-compact with AggressivePrune tier
+                            // Emergency retry: re-route through the shared
+                            // `MemoriaContext` with tighter budget overrides so
+                            // the aggressive path and the main path share one
+                            // compaction + summary-client construction flow.
                             let budget = crate::prompts::budget_for_model(Some(&model_name));
-                            let cwd_ag = edge_profile.get("cwd").and_then(Value::as_str);
-                            let (session_memory_file, session_memory_combine) =
-                                crate::turn::cloud::memoria_compact::resolve_session_memory_file_options(
-                                    &session_id,
-                                    cwd_ag,
-                                );
-                            let aggressive_params = crate::turn::cloud::memoria_compact::MemoriaCompactParams {
-                                budget_chars: budget.effective_input_limit() * 3, // tighter budget
-                                keep_chars: 1_000, // more aggressive truncation
-                                tier: crate::prompts::CompactionTier::AggressivePrune,
-                                keep_recent_turns: 4, // keep fewer turns
-                                current_tokens: budget.effective_input_limit(), // assume we're at limit
-                                session_memory_file,
-                                session_memory_combine,
-                    session_facts: session_facts_shared.lock().ok().map(|f| f.clone()),
-                            };
                             let compact_config = crate::prompts::CompactConfig::from_env();
                             let summary_client = astra_turn_core::cloud_summary::HttpSummaryClient::new(
                                 astra_turn_core::cloud_summary::LlmConnParams {
@@ -1871,35 +1915,54 @@ impl InProcessChatTurnBridge {
                                 },
                             );
                             let memoria_client = memoria_client_owned.clone();
-                            let memoria_config = crate::turn::cloud::memoria_compact::MemoriaCompactConfig::default();
 
-                            // Get original messages (exclude leading system messages)
-                            let sys_count = llm_messages.iter()
-                                .take_while(|m| m.get("role").and_then(Value::as_str) == Some("system"))
-                                .count();
-                            let original_msgs: Vec<Value> = llm_messages.iter().skip(sys_count).cloned().collect();
-                            let compact_result = crate::turn::cloud::memoria_compact::compact_with_memoria(
-                                &original_msgs,
-                                Some(&session_id),
-                                &memoria_config,
-                                &aggressive_params,
-                                memoria_client.as_ref().map(|c| c as &dyn crate::turn::cloud::memoria_compact::MemoriaClient),
-                                Some(&compact_config),
-                                Some(&summary_client as &dyn astra_turn_core::cloud_summary::SummaryLlmClient),
-                            )
-                            .await;
+                            let aggressive_ctx = crate::turn::wire_assembly::MemoriaContext {
+                                session_id: &session_id,
+                                model_name: &model_name,
+                                memoria_client: memoria_client.as_ref().map(|c| {
+                                    c as &dyn crate::turn::cloud::memoria_compact::MemoriaClient
+                                }),
+                                summary_client: Some(
+                                    &summary_client
+                                        as &dyn astra_turn_core::cloud_summary::SummaryLlmClient,
+                                ),
+                                tier: crate::prompts::CompactionTier::AggressivePrune,
+                                cwd: edge_profile.get("cwd").and_then(Value::as_str),
+                                session_facts: session_facts_shared
+                                    .lock()
+                                    .ok()
+                                    .map(|f| f.clone()),
+                            };
+                            let overrides = crate::turn::wire_assembly::BudgetOverrides {
+                                budget_chars: Some(budget.effective_input_limit() * 3),
+                                keep_chars: Some(1_000),
+                                keep_recent_turns: Some(4),
+                                current_tokens: Some(budget.effective_input_limit()),
+                                tier: None, // ctx.tier already carries AggressivePrune
+                            };
 
-                            // Rebuild llm_messages with compacted content.
-                            // Preserve all leading system messages (stable + dynamic).
-                            let system_msgs: Vec<Value> = llm_messages
+                            // Split out the leading system prefix so Memoria
+                            // only sees user/assistant/tool history; the
+                            // system block stays untouched across retries.
+                            let sys_count = llm_messages
                                 .iter()
                                 .take_while(|m| {
                                     m.get("role").and_then(Value::as_str) == Some("system")
                                 })
-                                .cloned()
-                                .collect();
-                            llm_messages.clear();
-                            llm_messages.extend(system_msgs);
+                                .count();
+                            let (system_prefix, original_msgs) = llm_messages.split_at(sys_count);
+                            let compact_result = aggressive_ctx
+                                .compact_with_overrides(
+                                    original_msgs,
+                                    system_prefix,
+                                    &round_edge_tools,
+                                    overrides,
+                                )
+                                .await;
+
+                            // Rebuild llm_messages: unchanged system prefix +
+                            // fresh compacted tail from Memoria.
+                            llm_messages.truncate(sys_count);
                             llm_messages.extend(compact_result.messages);
 
                             // Also prune tool schemas more aggressively
@@ -3457,12 +3520,17 @@ mod tests {
         }
     }
 
-    #[allow(dead_code)]
+    // The journal-flow helpers below are only compiled when the
+    // `bridge-e2e-hooks` feature is on, because all their callers
+    // (`forward_persists_full_journal_*`, etc.) are gated on the same
+    // feature. Gating here means no `#[allow(dead_code)]` dance is
+    // needed when the feature is off.
+    #[cfg(feature = "bridge-e2e-hooks")]
     fn bridge_test_matrixone() -> MatrixOneSettings {
         MatrixOneSettings::mock()
     }
 
-    #[allow(dead_code)]
+    #[cfg(feature = "bridge-e2e-hooks")]
     fn bridge_test_encryptor() -> Arc<FernetTokenEncryptor> {
         Arc::new(
             FernetTokenEncryptor::new("cJ8pxr3t6iJmSYqe6wD7vu2rN_C3ovGUxkC5H3NXFNY=")
@@ -3470,7 +3538,7 @@ mod tests {
         )
     }
 
-    #[allow(dead_code)]
+    #[cfg(feature = "bridge-e2e-hooks")]
     fn bridge_test_headers(session_id: &str, full_llm_capture: bool) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert("x-mo-user-id", "user-bridge-journal".parse().unwrap());
@@ -3489,7 +3557,7 @@ mod tests {
         headers
     }
 
-    #[allow(dead_code)]
+    #[cfg(feature = "bridge-e2e-hooks")]
     fn read_journal_events(session_id: &str) -> Vec<Value> {
         let path = JournalWriter::new(session_id)
             .expect("journal writer")
@@ -3506,7 +3574,7 @@ mod tests {
         }
     }
 
-    #[allow(dead_code)]
+    #[cfg(feature = "bridge-e2e-hooks")]
     async fn wait_for_journal_events(session_id: &str) -> Vec<Value> {
         for _ in 0..100 {
             let events = read_journal_events(session_id);
@@ -3518,7 +3586,7 @@ mod tests {
         read_journal_events(session_id)
     }
 
-    #[allow(dead_code)]
+    #[cfg(feature = "bridge-e2e-hooks")]
     async fn collect_response_body(response: Response) -> String {
         let body = response
             .into_body()
@@ -3767,331 +3835,22 @@ mod tests {
     static CACHE_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
-    fn build_system_message_anthropic_has_cache_control() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
-        // Ensure env var doesn't interfere
-        unsafe {
-            std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
-        }
+    fn self_awareness_section_is_post_cache_volatile() {
+        let section = self_awareness_volatile_section(
+            "\n\n## Self-Awareness\nTurn: 37 | Tokens: 26899/80000",
+        )
+        .expect("section");
 
-        let (msg, _, _) = build_system_message(
-            &["bash", "read_file"],
-            "cwd: /test",
-            0.8,
-            Some("implementation"),
-            &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
+        assert_eq!(
+            section.scope,
+            prompts::CacheScope::None,
+            "self-awareness contains per-turn counters and must not enter the cached prefix"
         );
-
-        // Should be multi-block content array
-        let content = msg.get("content").expect("should have content");
-        let blocks = content
-            .as_array()
-            .expect("Anthropic content should be array");
-        assert!(blocks.len() >= 2, "should have at least 2 blocks");
-
-        // First block (Global) should NOT have cache_control (only last Global does)
-        let first = &blocks[0];
-        assert!(
-            first.get("cache_control").is_none() || first["cache_control"].is_null(),
-            "Non-last Global block should not have cache_control"
-        );
-
-        // Some block should have cache_control with scope=global (the last Global)
-        let global_cc_block = blocks.iter().find(|b| {
-            b.get("cache_control")
-                .and_then(|cc| cc.get("scope"))
-                .and_then(|s| s.as_str())
-                == Some("global")
-        });
-        assert!(
-            global_cc_block.is_some(),
-            "should have a block with scope=global cache_control"
-        );
-        let gcc = &global_cc_block.unwrap()["cache_control"];
-        assert_eq!(gcc["type"].as_str(), Some("ephemeral"));
-        assert_eq!(gcc["ttl"].as_str(), Some("1h"));
-
-        // Last block (profile/dynamic) should NOT have cache_control
-        let last = blocks.last().unwrap();
-        assert!(
-            last.get("cache_control").is_none() || last["cache_control"].is_null(),
-            "dynamic block should not have cache_control"
-        );
+        assert!(section.trace_signals.context_signals.self_awareness);
     }
 
     #[test]
-    fn build_system_message_session_scope_has_ttl_but_no_global_scope() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
-        unsafe {
-            std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
-        }
-
-        let (msg, _, _) = build_system_message(
-            &["bash", "read_file"],
-            "cwd: /test",
-            0.8,
-            Some("implementation"),
-            &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
-        );
-
-        let content = msg.get("content").expect("should have content");
-        let blocks = content.as_array().unwrap();
-
-        // With fine-grained sections, Session blocks come after Global blocks.
-        // Find a block whose text contains "Self-Model" (Session-scoped tool list).
-        let session_block = blocks.iter().find(|b| {
-            b.get("text")
-                .and_then(|t| t.as_str())
-                .is_some_and(|t| t.contains("Self-Model"))
-        });
-        if let Some(block) = session_block {
-            if let Some(cc) = block.get("cache_control") {
-                assert_eq!(cc["ttl"].as_str(), Some("1h"), "Session should have ttl=1h");
-                // Session should NOT have scope=global (it's per-session)
-                assert!(
-                    cc.get("scope").is_none() || cc["scope"].is_null(),
-                    "Session block should not have scope=global"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn build_system_message_cache_disabled_env() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
-        unsafe {
-            std::env::set_var("ASTRA_TEST_PROMPT_CACHE_DISABLED", "1");
-        }
-
-        let (msg, _, _) = build_system_message(
-            &["bash"],
-            "cwd: /test",
-            0.8,
-            None,
-            &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
-        );
-
-        let content = msg.get("content").expect("should have content");
-        let blocks = content.as_array().unwrap();
-        for block in blocks {
-            assert!(
-                block.get("cache_control").is_none() || block["cache_control"].is_null(),
-                "all blocks should lack cache_control when disabled"
-            );
-        }
-
-        unsafe {
-            std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
-        }
-    }
-
-    #[test]
-    fn build_system_message_openai_has_string_content() {
-        let (msg, dynamic, _) = build_system_message(
-            &["bash", "read_file"],
-            "cwd: /test",
-            0.8,
-            None,
-            &PromptCacheConfig::latch("openai", "gpt-4"),
-        );
-
-        // Primary should be a single string content (stable prefix)
-        let content = msg.get("content").expect("should have content");
-        assert!(content.is_string(), "OpenAI content should be string");
-
-        // Dynamic profile should be in the second message
-        let dyn_msg = dynamic.expect("should have dynamic message when profile is non-empty");
-        let dyn_content = dyn_msg
-            .get("content")
-            .expect("dynamic msg should have content");
-        assert!(
-            dyn_content.as_str().unwrap().contains("cwd: /test"),
-            "dynamic message should contain profile"
-        );
-    }
-
-    #[test]
-    fn build_system_message_feedback_rules_in_dynamic_no_cache_control() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
-        unsafe {
-            std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
-        }
-
-        // Simulate dynamic_desc with accumulated feedback rules
-        let dynamic_with_rules = "cwd: /test\n\n[Learned Feedback Rules]\n- Rule: don't use mocks | Why: prod divergence | When: integration tests\n- Rule: never force push on main";
-
-        let (msg, _, _) = build_system_message(
-            &["bash", "read_file"],
-            dynamic_with_rules,
-            0.8,
-            Some("implementation"),
-            &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
-        );
-
-        let blocks = msg["content"].as_array().expect("should be array");
-
-        // Last block should contain the feedback rules but have NO cache_control
-        let last = blocks.last().unwrap();
-        let text = last["text"].as_str().unwrap();
-        assert!(
-            text.contains("[Learned Feedback Rules]"),
-            "dynamic block should contain rules"
-        );
-        assert!(
-            text.contains("don't use mocks"),
-            "dynamic block should contain rule text"
-        );
-        assert!(
-            last.get("cache_control").is_none() || last["cache_control"].is_null(),
-            "dynamic block with feedback rules must NOT have cache_control"
-        );
-
-        // Stable blocks with cache_control should NOT contain feedback rules
-        for block in blocks
-            .iter()
-            .filter(|b| b.get("cache_control").is_some() && !b["cache_control"].is_null())
-        {
-            let block_text = block["text"].as_str().unwrap_or("");
-            assert!(
-                !block_text.contains("[Learned Feedback Rules]"),
-                "cached block must not contain feedback rules"
-            );
-        }
-    }
-
-    #[test]
-    fn build_system_message_openai_feedback_rules_in_dynamic_message() {
-        // For OpenAI: feedback rules should be in the second (dynamic) system message,
-        // not in the first (stable/cacheable) message
-        let dynamic_with_rules = "cwd: /test\n\n[Learned Feedback Rules]\n- Rule: use moerr";
-
-        let (primary, dynamic, _) = build_system_message(
-            &["bash"],
-            dynamic_with_rules,
-            0.8,
-            None,
-            &PromptCacheConfig::latch("openai", "gpt-4"),
-        );
-
-        // Primary (stable) must NOT contain feedback rules
-        let primary_text = primary["content"].as_str().unwrap();
-        assert!(
-            !primary_text.contains("[Learned Feedback Rules]"),
-            "stable prefix must not contain feedback rules"
-        );
-
-        // Dynamic message must contain them
-        let dyn_msg = dynamic.expect("should have dynamic message");
-        let dyn_text = dyn_msg["content"].as_str().unwrap();
-        assert!(
-            dyn_text.contains("[Learned Feedback Rules]"),
-            "dynamic message should contain feedback rules"
-        );
-    }
-
-    #[test]
-    fn build_system_message_openai_keeps_late_round_guidance_in_dynamic_message() {
-        let messages = vec![
-            json!({"role": "user", "content": "inspect the project"}),
-            json!({"role": "tool", "content": "Cargo.toml"}),
-            json!({"role": "tool", "content": "README.md"}),
-        ];
-        let guidance = prompts::tool_round_guidance(&messages, prompts::ROUND_BUDGET_THRESHOLD);
-
-        let (primary, dynamic, _) = build_system_message(
-            &["read_file", "list_dir"],
-            &guidance,
-            0.8,
-            Some("implementation"),
-            &PromptCacheConfig::latch("openai", "gpt-4"),
-        );
-
-        let primary_text = primary
-            .get("content")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let dynamic_text = dynamic
-            .as_ref()
-            .and_then(|msg| msg.get("content"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-
-        assert!(
-            !primary_text.contains("Synthesize Or Batch Now"),
-            "stable primary message must not contain late-round dynamic guidance"
-        );
-        // Synthesize directive is neutered; parallel feedback still works.
-        assert!(
-            !dynamic_text.contains("Synthesize Or Batch Now"),
-            "synthesize directive is neutered (circuit breaker replaces it)"
-        );
-        assert!(
-            dynamic_text.contains("2 tools executed in parallel"),
-            "dynamic message should keep batching feedback"
-        );
-    }
-
-    #[test]
-    fn build_system_message_bedrock_claude_triggers_anthropic_format() {
-        let (msg, _, _) = build_system_message(
-            &["bash"],
-            "",
-            0.8,
-            None,
-            &PromptCacheConfig::latch("bedrock", "anthropic.claude-sonnet-4-20250514-v1:0"),
-        );
-
-        let content = msg.get("content").expect("should have content");
-        assert!(
-            content.is_array(),
-            "bedrock-hosted claude should use anthropic-style structured content"
-        );
-    }
-
-    #[test]
-    fn build_system_message_openai_claude_keeps_openai_format() {
-        let (msg, dynamic, _) = build_system_message(
-            &["bash"],
-            "",
-            0.8,
-            None,
-            &PromptCacheConfig::latch("openai", "claude-sonnet-4-20250514"),
-        );
-
-        let content = msg.get("content").expect("should have content");
-        assert!(
-            content.is_string(),
-            "explicit openai provider should keep string system content even for Claude-named models"
-        );
-        assert!(
-            dynamic.is_none(),
-            "empty profile should not create dynamic message"
-        );
-    }
-
-    #[test]
-    fn build_system_message_returns_non_empty_sections() {
-        let (_, _, sections) = build_system_message(
-            &["bash", "grep"],
-            "cwd: /test\ngit_branch: main",
-            0.8,
-            None,
-            &PromptCacheConfig::latch("openai", "gpt-4"),
-        );
-        assert!(!sections.is_empty(), "should return prompt sections");
-        // Should have Global + Session scoped sections
-        let has_global = sections
-            .iter()
-            .any(|s| s.scope == crate::prompts::CacheScope::Global);
-        let has_session = sections
-            .iter()
-            .any(|s| s.scope == crate::prompts::CacheScope::Session);
-        assert!(has_global, "should have Global sections");
-        assert!(has_session, "should have Session sections");
-    }
-
-    #[test]
-    fn build_system_message_records_bridge_context_signals() {
+    fn pipeline_assembly_records_bridge_context_signals() {
         let active_skill_names = vec!["concise"];
         let learned_context_text = "matrixorigin => github";
         // memory_signal_hint removed — LLM-driven via system prompt rules
@@ -4219,13 +3978,19 @@ mod tests {
                 },
             ),
         ];
-        let (_, _, prompt_sections) = build_system_message_with_dynamic_sections(
-            &["bash", "read_file"],
-            &dynamic_sections,
-            0.8,
-            Some("implementation"),
-            &PromptCacheConfig::latch("openai", "gpt-4"),
-        );
+        let (_, _, prompt_sections) =
+            crate::turn::prompt_cache::assemble_system_message_via_pipeline(
+                &["bash", "read_file"],
+                &dynamic_sections,
+                0.8,
+                Some("implementation"),
+                &PromptCacheConfig::latch("openai", "gpt-4"),
+                "test-session",
+                "gpt-4",
+                "openai",
+                None,
+                None,
+            );
         let breakdown = prompts::build_system_prompt_trace(&prompt_sections, vec![], vec![]);
 
         assert!(breakdown.context_signals.active_output_skills);
@@ -4301,10 +4066,9 @@ mod tests {
             Some("ephemeral"),
             "last tool should have ephemeral cache_control"
         );
-        assert_eq!(
-            tools[1]["cache_control"]["ttl"].as_str(),
-            Some("1h"),
-            "last tool should have ttl=1h"
+        assert!(
+            tools[1]["cache_control"].get("ttl").is_none(),
+            "simple ephemeral marker — no ttl (Bedrock-compatible)"
         );
     }
 
@@ -4319,13 +4083,15 @@ mod tests {
     }
 
     #[test]
-    fn annotate_tool_schemas_only_last_tool() {
+    fn annotate_tool_schemas_marks_end_of_pinned_prefix() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
         unsafe {
             std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         }
 
-        // bash and read_file are pinned; github_list_prs is dynamic
+        // bash and read_file are pinned (static lib); github_list_prs is dynamic.
+        // The marker must sit on the last pinned tool so dynamic churn after
+        // it doesn't invalidate the cached prefix.
         let mut tools = vec![
             json!({"function": {"name": "bash"}}),
             json!({"function": {"name": "read_file"}}),
@@ -4336,24 +4102,26 @@ mod tests {
             &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
         );
 
-        // Only the LAST tool should have cache_control (simplified strategy)
         assert!(
             tools[0].get("cache_control").is_none(),
-            "first tool should not have cache_control"
+            "first pinned tool should not have cache_control"
         );
         assert!(
-            tools[1].get("cache_control").is_none(),
-            "middle tool should not have cache_control"
+            tools[1].get("cache_control").is_some(),
+            "last pinned tool (read_file) should have cache_control — end of static prefix"
         );
         assert!(
-            tools[2].get("cache_control").is_some(),
-            "last tool should have cache_control"
+            tools[2].get("cache_control").is_none(),
+            "dynamic tool (github_list_prs) must not carry the marker"
         );
         assert_eq!(
-            tools[2]["cache_control"]["type"].as_str(),
+            tools[1]["cache_control"]["type"].as_str(),
             Some("ephemeral")
         );
-        assert_eq!(tools[2]["cache_control"]["ttl"].as_str(), Some("1h"));
+        assert!(
+            tools[1]["cache_control"].get("ttl").is_none(),
+            "simple ephemeral marker — no ttl (Bedrock-compatible)"
+        );
     }
 
     #[test]
@@ -4648,109 +4416,6 @@ mod tests {
 
     // ── Combined cache layer tests ──────────────────────────────────────
 
-    #[test]
-    fn all_three_cache_layers_present_for_anthropic() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
-        unsafe {
-            std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
-        }
-
-        // Layer 1: System message with cache_control
-        let (sys, _, _) = build_system_message(
-            &["bash", "read_file"],
-            "cwd: /test",
-            0.8,
-            Some("implementation"),
-            &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
-        );
-        let sys_blocks = sys["content"].as_array().expect("array content");
-        let has_sys_cache = sys_blocks.iter().any(|b| b.get("cache_control").is_some());
-        assert!(
-            has_sys_cache,
-            "Layer 1: system message should have cache_control"
-        );
-
-        // Layer 2: Tool schemas with cache_control
-        let mut tools = vec![
-            json!({"function": {"name": "bash"}}),
-            json!({"function": {"name": "read_file"}}),
-        ];
-        annotate_tool_schemas_for_caching(
-            &mut tools,
-            &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
-        );
-        assert!(
-            tools.last().unwrap().get("cache_control").is_some(),
-            "Layer 2: last tool should have cache_control"
-        );
-
-        // Layer 3: Message breakpoint
-        let mut messages = vec![
-            json!({"role": "user", "content": "hello"}),
-            json!({"role": "assistant", "content": "hi"}),
-        ];
-        add_message_cache_breakpoint(
-            &mut messages,
-            &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
-        );
-        let last = messages.last().unwrap();
-        let last_arr = last["content"].as_array().expect("converted to array");
-        assert!(
-            last_arr[0].get("cache_control").is_some(),
-            "Layer 3: last message should have cache breakpoint"
-        );
-    }
-
-    #[test]
-    fn cache_disabled_strips_all_three_layers() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
-        unsafe {
-            std::env::set_var("ASTRA_TEST_PROMPT_CACHE_DISABLED", "1");
-        }
-
-        // Layer 1: system message
-        let (sys, _, _) = build_system_message(
-            &["bash"],
-            "cwd: /test",
-            0.8,
-            None,
-            &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
-        );
-        let sys_blocks = sys["content"].as_array().unwrap();
-        for block in sys_blocks {
-            assert!(
-                block.get("cache_control").is_none() || block["cache_control"].is_null(),
-                "system blocks should not have cache_control when disabled"
-            );
-        }
-
-        // Layer 2: tool schemas
-        let mut tools = vec![json!({"function": {"name": "bash"}})];
-        annotate_tool_schemas_for_caching(
-            &mut tools,
-            &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
-        );
-        assert!(
-            tools[0].get("cache_control").is_none(),
-            "tools should not have cache_control when disabled"
-        );
-
-        // Layer 3: message breakpoint
-        let mut messages = vec![json!({"role": "user", "content": "hello"})];
-        add_message_cache_breakpoint(
-            &mut messages,
-            &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
-        );
-        assert!(
-            messages[0]["content"].is_string(),
-            "messages should not be modified when cache disabled"
-        );
-
-        unsafe {
-            std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
-        }
-    }
-
     // ── Message breakpoint edge cases ──────────────────────────────────
 
     #[test]
@@ -4954,406 +4619,26 @@ mod tests {
     /// Anthropic: at most 4 cache_control breakpoints across the entire request
     /// (system prompt + tool schemas + conversation messages).
     /// System prompt should use at most 2 (last Global, last Session).
-    #[test]
-    fn anthropic_cache_breakpoints_within_limit() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
-        unsafe {
-            std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
-        }
-
-        // Worst case: many tools → many Session sections
-        let tools: Vec<&str> = vec![
-            "bash",
-            "read_file",
-            "write_file",
-            "glob",
-            "grep",
-            "git_status",
-            "git_diff",
-            "git_log",
-            "git_commit",
-            "find_definition",
-            "find_references",
-            "call_graph",
-            "rename_symbol",
-            "dead_code",
-            "extract_members",
-            "type_hierarchy",
-            "multi_edit",
-            "run_build_test",
-            "memory_store",
-            "memory_search",
-            "github_list_prs",
-            "github_get_issue",
-        ];
-        let (msg, _, _) = build_system_message(
-            &tools,
-            "profile",
-            0.8,
-            Some("code_review"),
-            &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
-        );
-
-        let blocks = msg["content"].as_array().unwrap();
-        let cc_count = blocks
-            .iter()
-            .filter(|b| b.get("cache_control").is_some_and(|cc| !cc.is_null()))
-            .count();
-        assert!(
-            cc_count <= 2,
-            "system prompt should have at most 2 cache_control breakpoints, got {cc_count}"
-        );
-    }
-
-    /// Anthropic: Global breakpoint has scope:"global", Session breakpoint does not.
-    #[test]
-    fn anthropic_scope_annotations_correct() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
-        unsafe {
-            std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
-        }
-
-        let (msg, _, _) = build_system_message(
-            &["bash", "read_file", "memory_store"],
-            "profile",
-            0.8,
-            Some("debugging"),
-            &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
-        );
-
-        let blocks = msg["content"].as_array().unwrap();
-        let cc_blocks: Vec<_> = blocks
-            .iter()
-            .filter(|b| b.get("cache_control").is_some_and(|cc| !cc.is_null()))
-            .collect();
-
-        assert_eq!(cc_blocks.len(), 2, "should have exactly 2 breakpoints");
-
-        // First breakpoint: Global (has scope:"global")
-        let first_cc = &cc_blocks[0]["cache_control"];
-        assert_eq!(first_cc["scope"].as_str(), Some("global"));
-        assert_eq!(first_cc["ttl"].as_str(), Some("1h"));
-
-        // Second breakpoint: Session (no scope field)
-        let second_cc = &cc_blocks[1]["cache_control"];
-        assert!(
-            second_cc.get("scope").is_none() || second_cc["scope"].is_null(),
-            "Session breakpoint should not have scope"
-        );
-        assert_eq!(second_cc["ttl"].as_str(), Some("1h"));
-    }
-
+    /// Anthropic: simple ephemeral breakpoint on the last Global block.
+    /// Session-scoped sections were demoted to None (tool-dependent, change per turn)
+    /// as part of the cache-stability fix, so only the Global breakpoint remains.
     /// Anthropic multi-turn: Global prefix is identical across turns with
     /// different tool sets → cross-session cache reuse.
-    #[test]
-    fn anthropic_global_prefix_stable_across_tool_sets() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
-        unsafe {
-            std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
-        }
-
-        let (msg1, _, _) = build_system_message(
-            &["bash", "read_file"],
-            "p1",
-            0.8,
-            None,
-            &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
-        );
-        let (msg2, _, _) = build_system_message(
-            &["bash", "git_diff", "memory_store"],
-            "p2",
-            0.5,
-            Some("debugging"),
-            &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
-        );
-
-        let blocks1 = msg1["content"].as_array().unwrap();
-        let blocks2 = msg2["content"].as_array().unwrap();
-
-        // Find the Global breakpoint index in each
-        let global_end_1 = blocks1
-            .iter()
-            .position(|b| {
-                b.get("cache_control")
-                    .and_then(|cc| cc.get("scope"))
-                    .and_then(|s| s.as_str())
-                    == Some("global")
-            })
-            .expect("should have global breakpoint");
-        let global_end_2 = blocks2
-            .iter()
-            .position(|b| {
-                b.get("cache_control")
-                    .and_then(|cc| cc.get("scope"))
-                    .and_then(|s| s.as_str())
-                    == Some("global")
-            })
-            .expect("should have global breakpoint");
-
-        // Same number of Global blocks
-        assert_eq!(
-            global_end_1, global_end_2,
-            "Global prefix length should be identical"
-        );
-
-        // Same content in each Global block
-        for i in 0..=global_end_1 {
-            let t1 = blocks1[i]["text"].as_str().unwrap();
-            let t2 = blocks2[i]["text"].as_str().unwrap();
-            assert_eq!(
-                t1, t2,
-                "Global block {i} should be identical across tool sets"
-            );
-        }
-    }
-
     /// Anthropic multi-turn: same tool set + same task type → Session prefix
     /// also identical (only profile/style differ).
-    #[test]
-    fn anthropic_session_prefix_stable_within_session() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
-        unsafe {
-            std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
-        }
-
-        // Simulate two turns in the same session (same tools, different profile)
-        let (msg_turn1, _, _) = build_system_message(
-            &["bash", "read_file", "git_diff"],
-            "turn1 profile",
-            0.8,
-            None,
-            &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
-        );
-        let (msg_turn2, _, _) = build_system_message(
-            &["bash", "read_file", "git_diff"],
-            "turn2 profile",
-            0.8,
-            None,
-            &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
-        );
-
-        let b1 = msg_turn1["content"].as_array().unwrap();
-        let b2 = msg_turn2["content"].as_array().unwrap();
-
-        // Find Session breakpoint (last block with cache_control but no scope:"global")
-        let session_end = |blocks: &[Value]| -> usize {
-            blocks
-                .iter()
-                .rposition(|b| b.get("cache_control").is_some_and(|cc| !cc.is_null()))
-                .unwrap()
-        };
-        let se1 = session_end(b1);
-        let se2 = session_end(b2);
-        assert_eq!(
-            se1, se2,
-            "Session prefix length should be identical across turns"
-        );
-
-        // All blocks up to and including Session breakpoint should be identical
-        for i in 0..=se1 {
-            assert_eq!(
-                b1[i]["text"].as_str(),
-                b2[i]["text"].as_str(),
-                "Block {i} should be identical across turns (only profile differs)"
-            );
-        }
-
-        // Profile blocks (after Session breakpoint) should differ
-        let last1 = b1.last().unwrap()["text"].as_str().unwrap();
-        let last2 = b2.last().unwrap()["text"].as_str().unwrap();
-        assert_ne!(last1, last2, "Profile blocks should differ between turns");
-    }
-
     /// OpenAI: stable prefix for automatic prefix caching.
     /// Static content is in the primary message (identical across turns);
     /// dynamic profile is in a separate second system message.
-    #[test]
-    fn openai_stable_prefix_across_turns() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
-
-        let (msg1, dyn1, _) = build_system_message(
-            &["bash", "read_file"],
-            "turn1 profile",
-            0.8,
-            None,
-            &PromptCacheConfig::latch("openai", "gpt-4o"),
-        );
-        let (msg2, dyn2, _) = build_system_message(
-            &["bash", "read_file"],
-            "turn2 profile",
-            0.8,
-            None,
-            &PromptCacheConfig::latch("openai", "gpt-4o"),
-        );
-
-        let s1 = msg1["content"].as_str().unwrap();
-        let s2 = msg2["content"].as_str().unwrap();
-
-        // Primary messages should be 100% identical (stable prefix)
-        assert_eq!(
-            s1, s2,
-            "OpenAI primary system messages must be identical across turns"
-        );
-
-        // Dynamic messages should carry the per-turn profile
-        let d1 = dyn1.unwrap();
-        let d2 = dyn2.unwrap();
-        assert!(
-            d1["content"].as_str().unwrap().contains("turn1"),
-            "dynamic msg1 should contain turn1 profile"
-        );
-        assert!(
-            d2["content"].as_str().unwrap().contains("turn2"),
-            "dynamic msg2 should contain turn2 profile"
-        );
-    }
-
     /// OpenAI: different tool sets share the same Global prefix.
-    #[test]
-    fn openai_global_prefix_stable_across_tool_sets() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
-
-        let (msg1, _, _) = build_system_message(
-            &["bash"],
-            "",
-            0.8,
-            None,
-            &PromptCacheConfig::latch("openai", "gpt-4o"),
-        );
-        let (msg2, _, _) = build_system_message(
-            &["bash", "git_diff", "memory_store", "find_definition"],
-            "",
-            0.8,
-            Some("code_review"),
-            &PromptCacheConfig::latch("openai", "gpt-4o"),
-        );
-
-        let s1 = msg1["content"].as_str().unwrap();
-        let s2 = msg2["content"].as_str().unwrap();
-
-        // Both should start with the same Global content (Core Rules etc.)
-        // The Global prefix ends before "## Self-Model"
-        let self_model_pos_1 = s1.find("## Self-Model").unwrap();
-        let self_model_pos_2 = s2.find("## Self-Model").unwrap();
-
-        // Everything before Self-Model should be identical
-        assert_eq!(
-            &s1[..self_model_pos_1],
-            &s2[..self_model_pos_2],
-            "Global prefix (before Self-Model) should be identical across tool sets"
-        );
-    }
-
+    ///
+    /// After the cache-stability refactor, tool-dependent sections (Self-Model,
+    /// tool-conditional guidance, task-type strategy, search strategy) are
+    /// `CacheScope::None` and therefore emitted to the *dynamic* second
+    /// system message for OpenAI. The **primary** system message should be
+    /// byte-identical across tool sets — that's the whole point of moving
+    /// them out of the cached prefix.
     /// Global sections contain no tool names — ensures cross-session cache reuse.
-    #[test]
-    fn global_sections_contain_no_tool_names() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
-        unsafe {
-            std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
-        }
-
-        let tools = vec!["bash", "read_file", "memory_store", "git_diff"];
-        let (msg, _, _) = build_system_message(
-            &tools,
-            "",
-            0.8,
-            None,
-            &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
-        );
-
-        let blocks = msg["content"].as_array().unwrap();
-        // Find the Global breakpoint
-        let global_end = blocks
-            .iter()
-            .position(|b| {
-                b.get("cache_control")
-                    .and_then(|cc| cc.get("scope"))
-                    .and_then(|s| s.as_str())
-                    == Some("global")
-            })
-            .unwrap();
-
-        // No Global block should contain any tool name
-        for (i, block) in blocks.iter().enumerate().take(global_end + 1) {
-            let text = block["text"].as_str().unwrap();
-            for tool in &tools {
-                // "bash" appears in generic text like "bash commands", skip it
-                if *tool == "bash" {
-                    continue;
-                }
-                assert!(
-                    !text.contains(&format!("{tool},")),
-                    "Global block {i} should not contain tool name '{tool}' in a tool list"
-                );
-            }
-            assert!(
-                !text.contains("Self-Model"),
-                "Global block {i} should not contain Self-Model"
-            );
-        }
-    }
-
     /// Task type change only affects Session sections, not Global.
-    #[test]
-    fn task_type_change_preserves_global_prefix() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
-        unsafe {
-            std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
-        }
-
-        let tools = vec!["bash", "read_file"];
-        let (msg_none, _, _) = build_system_message(
-            &tools,
-            "",
-            0.8,
-            None,
-            &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
-        );
-        let (msg_review, _, _) = build_system_message(
-            &tools,
-            "",
-            0.8,
-            Some("code_review"),
-            &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
-        );
-        let (msg_debug, _, _) = build_system_message(
-            &tools,
-            "",
-            0.8,
-            Some("debugging"),
-            &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
-        );
-
-        let get_global_blocks = |msg: &Value| -> Vec<String> {
-            let blocks = msg["content"].as_array().unwrap();
-            let global_end = blocks
-                .iter()
-                .position(|b| {
-                    b.get("cache_control")
-                        .and_then(|cc| cc.get("scope"))
-                        .and_then(|s| s.as_str())
-                        == Some("global")
-                })
-                .unwrap();
-            (0..=global_end)
-                .map(|i| blocks[i]["text"].as_str().unwrap().to_string())
-                .collect()
-        };
-
-        let g_none = get_global_blocks(&msg_none);
-        let g_review = get_global_blocks(&msg_review);
-        let g_debug = get_global_blocks(&msg_debug);
-
-        assert_eq!(
-            g_none, g_review,
-            "Global prefix should be identical regardless of task type"
-        );
-        assert_eq!(
-            g_review, g_debug,
-            "Global prefix should be identical regardless of task type"
-        );
-    }
-
     // -----------------------------------------------------------------------
     // Unhappy-path / edge-case tests
     // -----------------------------------------------------------------------
@@ -5791,61 +5076,6 @@ mod tests {
 
     // ── P1: L0 anchor appears in system prompt ──────────────────────────
 
-    #[test]
-    fn p1_anchor_injected_into_openai_dynamic_message() {
-        use crate::turn::cloud::session_memory_protocol::extract_anchor;
-
-        let anchor = extract_anchor("Build a distributed rate limiter using Redis", None);
-        let profile_desc = format!("cwd: /home/user/project\n\n{anchor}");
-
-        let cache_cfg = PromptCacheConfig {
-            is_anthropic: false,
-            cache_enabled: false,
-        };
-        let (_primary, dynamic, _sections) =
-            build_system_message(&["read_file", "grep"], &profile_desc, 0.9, None, &cache_cfg);
-
-        let dyn_content = dynamic
-            .expect("OpenAI should have dynamic message")
-            .get("content")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        assert!(
-            dyn_content.contains("[session-anchor]"),
-            "Dynamic message should contain anchor: {dyn_content}"
-        );
-        assert!(dyn_content.contains("rate limiter"));
-    }
-
-    #[test]
-    fn p1_anchor_injected_into_anthropic_blocks() {
-        use crate::turn::cloud::session_memory_protocol::extract_anchor;
-
-        let anchor = extract_anchor("Refactor auth module to use JWT", None);
-        let profile_desc = format!("cwd: /project\n\n{anchor}");
-
-        let cache_cfg = PromptCacheConfig {
-            is_anthropic: true,
-            cache_enabled: true,
-        };
-        let (msg, _, _) =
-            build_system_message(&["read_file"], &profile_desc, 0.9, None, &cache_cfg);
-
-        // Anthropic: single message with content blocks array
-        let blocks = msg.get("content").and_then(Value::as_array).unwrap();
-        let all_text: String = blocks
-            .iter()
-            .filter_map(|b| b.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            all_text.contains("[session-anchor]"),
-            "Anthropic blocks should contain anchor"
-        );
-        assert!(all_text.contains("JWT"));
-    }
-
     // ── P2: Continuation prompt after compaction ────────────────────────
 
     #[test]
@@ -6038,33 +5268,6 @@ mod tests {
         );
         let anchor = extract_anchor(&first_user_text.unwrap(), None);
         assert!(anchor.contains("distributed cache"));
-    }
-
-    #[test]
-    fn p1_anchor_does_not_break_cached_prefix() {
-        use crate::turn::cloud::session_memory_protocol::extract_anchor;
-
-        let cache_cfg = PromptCacheConfig {
-            is_anthropic: false,
-            cache_enabled: true,
-        };
-        let tools = &["read_file", "grep"];
-
-        // Turn 1: no anchor
-        let (primary1, _, _) = build_system_message(tools, "cwd: /project", 0.9, None, &cache_cfg);
-
-        // Turn 2: with anchor
-        let anchor = extract_anchor("Build rate limiter", None);
-        let profile_with_anchor = format!("cwd: /project\n\n{anchor}");
-        let (primary2, _, _) =
-            build_system_message(tools, &profile_with_anchor, 0.9, None, &cache_cfg);
-
-        // Stable cached primary must be identical — anchor only in dynamic
-        assert_eq!(
-            primary1.get("content").and_then(Value::as_str),
-            primary2.get("content").and_then(Value::as_str),
-            "Anchor must not change the cached primary system message"
-        );
     }
 
     #[test]

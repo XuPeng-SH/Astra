@@ -14,7 +14,50 @@ use astra_turn_core::agentic_turn_ingest::{
     agentic_turn_stream_snapshot_with_kind, ingest_agentic_turn_stream,
     map_ingest_outcome_to_iteration_control,
 };
+use astra_turn_core::compaction_types::CompactionTier;
 use astra_turn_core::interruption::{InterruptionKind, InterruptionRecord, ResumeAction};
+
+/// Lazily-initialized process-wide alert dispatcher.
+///
+/// Reads `ASTRA_ALERT_WEBHOOK_URL` (and optional `ASTRA_ALERT_WEBHOOK_MIN_SEVERITY`)
+/// once, builds a single `AlertDispatcher` with a reusable reqwest client so that
+/// webhook calls share a TCP connection pool and TLS session cache across turns.
+///
+/// Returns `None` when no webhook URL is configured — the whole alert-dispatch
+/// branch is then a single cheap `OnceLock` load.
+fn global_alert_dispatcher()
+-> Option<&'static std::sync::Arc<astra_turn_core::alert_dispatcher::AlertDispatcher>> {
+    use std::sync::OnceLock;
+    static DISPATCHER: OnceLock<
+        Option<std::sync::Arc<astra_turn_core::alert_dispatcher::AlertDispatcher>>,
+    > = OnceLock::new();
+    DISPATCHER
+        .get_or_init(|| {
+            let url = std::env::var("ASTRA_ALERT_WEBHOOK_URL").ok()?;
+            let url = url.trim().to_string();
+            if url.is_empty() {
+                return None;
+            }
+            let min_severity = std::env::var("ASTRA_ALERT_WEBHOOK_MIN_SEVERITY")
+                .ok()
+                .and_then(|s| match s.to_ascii_lowercase().as_str() {
+                    "info" => Some(astra_turn_core::trace_alert::AlertSeverity::Info),
+                    "warning" | "warn" => {
+                        Some(astra_turn_core::trace_alert::AlertSeverity::Warning)
+                    }
+                    "error" => Some(astra_turn_core::trace_alert::AlertSeverity::Error),
+                    _ => None,
+                })
+                .unwrap_or(astra_turn_core::trace_alert::AlertSeverity::Error);
+            let client =
+                std::sync::Arc::new(astra_turn_core::alert_dispatcher::ReqwestWebhookClient::new());
+            let cfg = astra_turn_core::alert_dispatcher::AlertWebhookConfig { url, min_severity };
+            Some(std::sync::Arc::new(
+                astra_turn_core::alert_dispatcher::AlertDispatcher::new(cfg, client),
+            ))
+        })
+        .as_ref()
+}
 
 /// Record an `llm_round` event for an early-exit path (no tool calls).
 fn record_early_exit_llm_round(
@@ -32,7 +75,7 @@ fn record_early_exit_llm_round(
             prompt_tokens: turn_result.accum.prompt_tokens,
             completion_tokens: turn_result.accum.completion_tokens,
             cache_read_tokens: turn_result.accum.cache_read_tokens,
-            cache_creation_tokens: 0,
+            cache_creation_tokens: turn_result.accum.cache_creation_tokens,
             tool_calls_returned: 0,
             tool_call_names: vec![],
             finish_reason: finish_reason.map(Into::into),
@@ -328,6 +371,28 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     );
                 }
             }
+            astra_turn_core::loop_circuit_breaker::BreakerAction::SoftStop => {
+                state.stall.forced_completion_soft_stop = true;
+                state.messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": completion_soft_stop_message(state.llm_rounds_completed, &state.message),
+                }));
+                tracing::info!(
+                    target: "astra::loop_guard",
+                    tier = "completion_soft_stop",
+                    round = state.llm_rounds_completed,
+                    "completion soft-stop injected"
+                );
+                if !prep.quiet {
+                    host.emit_headless_line(
+                        HeadlessStderrStyle::Yellow,
+                        format!(
+                            "↻ Task appears complete at round {}; nudging model to stop unless work remains.",
+                            state.llm_rounds_completed
+                        ),
+                    );
+                }
+            }
             astra_turn_core::loop_circuit_breaker::BreakerAction::Continue => {}
             // BreakerAction is #[non_exhaustive] — future soft-intervention
             // variants should default to a no-op so the loop continues.
@@ -336,6 +401,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     }
 
     if !state.stall.forced_round_budget_phase1
+        && !state.stall.forced_completion_soft_stop
         && let Some((family, blocked_tools)) = exploration_family_phase2_candidate(state)
     {
         state.stall.forced_exploration_family_phase2 = true;
@@ -369,6 +435,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     // phase-1 is the harder finalization push — if both would fire on the
     // same round we prefer phase-1's narrower "stop calling tools" message.
     if !state.stall.forced_round_budget_phase1
+        && !state.stall.forced_completion_soft_stop
         && !state.stall.forced_exploration_family_phase2
         && should_inject_redundant_reads_corrective(state, redundant_reads_threshold)
     {
@@ -398,6 +465,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         }
     }
     if !state.stall.forced_round_budget_phase1
+        && !state.stall.forced_completion_soft_stop
         && !state.stall.forced_exploration_family_phase2
         && !state.stall.forced_redundant_reads_corrective
         && should_inject_cache_waste_corrective(state, cache_waste_threshold)
@@ -429,6 +497,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         }
     }
     if !state.stall.forced_round_budget_phase1
+        && !state.stall.forced_completion_soft_stop
         && !state.stall.forced_exploration_family_phase2
         && !state.stall.forced_redundant_reads_corrective
         && !state.stall.forced_cache_waste_corrective
@@ -507,6 +576,11 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     state.llm_rounds_completed += 1;
     let turn_result = turn_result?;
     state.rate_limit_cooldown.record_success();
+    // Clear pipeline recovery escalation after a successful LLM call —
+    // the PTL pressure is relieved.
+    if let Some(ref mut sess) = state.pipeline_session {
+        sess.recovery.reset_on_success();
+    }
     if let Some(ref emitter) = state.messaging.progress_emitter {
         emitter.llm_call_completed(
             turn_index as u32,
@@ -566,6 +640,85 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     // can still move by-value into the control-flow mapper below.
     let ingest_is_fatal = matches!(ingest_outcome, AgenticTurnIngestOutcome::Fatal(_));
     if !ingest_is_fatal {
+        if let Some(ref mut pipeline_sess) = state.pipeline_session {
+            let feedback = astra_turn_core::context_feedback::ContextFeedback::from_usage(
+                turn_result.accum.prompt_tokens,
+                turn_result.accum.cache_read_tokens,
+                turn_result.accum.cache_creation_tokens,
+                turn_result.accum.completion_tokens,
+                false,
+            );
+            let model_id = state.skills.model_override.as_deref().unwrap_or("default");
+            pipeline_sess.record_feedback(model_id, "agentic_loop", feedback.clone(), None);
+
+            // Emit pipeline journal events for observability and cloud sync
+            if let Some(ref mut buf) = state.turn_event_buffer {
+                let turn = state.llm_rounds_completed;
+                let session_id = state.current_session_id.as_deref();
+
+                // Per-turn feedback event
+                let feedback_evt =
+                    astra_turn_core::pipeline_journal::PipelineJournalEvent::from_feedback(
+                        turn, model_id, &feedback,
+                    );
+                if let Ok(payload) = serde_json::to_value(&feedback_evt) {
+                    buf.record(
+                        astra_services::session_journal::JournalEvent::pipeline_feedback(
+                            session_id, turn, payload,
+                        ),
+                    );
+                }
+
+                // Drain and emit compaction audit events
+                for audit in pipeline_sess.drain_pending_audits() {
+                    if let Ok(payload) = serde_json::to_value(&audit) {
+                        buf.record(
+                            astra_services::session_journal::JournalEvent::pipeline_compaction_audit(
+                                session_id, turn, payload,
+                            ),
+                        );
+                    }
+                }
+
+                // Evaluate trace alerts and emit Error-severity ones
+                let alerts = astra_turn_core::trace_alert::evaluate_alerts(
+                    turn,
+                    &feedback,
+                    &pipeline_sess.stats,
+                    &pipeline_sess.recovery,
+                );
+                // Best-effort webhook dispatch: dispatcher is initialized once
+                // per process via a global OnceLock, reusing reqwest::Client's
+                // connection pool + TLS session cache across turns. Dispatch
+                // runs async so it never blocks turn execution.
+                if !alerts.is_empty() {
+                    if let Some(dispatcher) = global_alert_dispatcher() {
+                        let session_id_str = session_id.unwrap_or("unknown-session").to_string();
+                        let alerts_to_send = alerts.clone();
+                        let dispatcher = dispatcher.clone();
+                        tokio::spawn(async move {
+                            dispatcher.dispatch(&session_id_str, &alerts_to_send).await;
+                        });
+                    }
+                }
+
+                for alert in &alerts {
+                    if alert.severity >= astra_turn_core::trace_alert::AlertSeverity::Error {
+                        let alert_evt =
+                            astra_turn_core::pipeline_journal::PipelineJournalEvent::from_alert(
+                                alert,
+                            );
+                        if let Ok(payload) = serde_json::to_value(&alert_evt) {
+                            buf.record(
+                                astra_services::session_journal::JournalEvent::pipeline_alert(
+                                    session_id, turn, payload,
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+        }
         host.on_turn_completed(state);
     }
 
@@ -650,6 +803,14 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 && state.consecutive_context_window_errors
                     <= super::compaction_replay::MAX_COMPACT_RETRIES
             {
+                // Inform the pipeline session about the PTL error so its
+                // RecoveryState can escalate tier on subsequent turns and
+                // widen reserve estimates. This bridges the legacy compaction
+                // retry path with the pipeline's observability/feedback loop.
+                if let Some(ref mut sess) = state.pipeline_session {
+                    sess.recovery.record_ptl_error();
+                }
+
                 if let Some(result) = super::compaction_replay::try_compact_for_retry_tiered(
                     &mut state.messages,
                     state.last_measured_prompt_tokens,
@@ -660,6 +821,11 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     state
                         .compaction_effectiveness
                         .record_compaction(result.tokens_freed);
+                    // Feed compaction stats into pipeline for reserve estimation.
+                    if let Some(ref mut sess) = state.pipeline_session {
+                        sess.recovery.record_reactive_compact();
+                        sess.stats.record_compaction(result.tokens_freed);
+                    }
                     let summary = super::compaction_replay::compaction_summary(&result);
                     if !prep.quiet {
                         host.emit_headless_line(
@@ -1345,6 +1511,7 @@ pub(crate) fn is_execution_corrective_message(m: &serde_json::Value) -> bool {
         || is_execution_escalation(m)
         || is_parallel_batching_force(m)
         || is_round_budget_phase1(m)
+        || is_completion_soft_stop(m)
         || is_redundant_reads_corrective(m)
         || is_cache_waste_corrective(m)
         || is_exploration_family_corrective(m)
@@ -1458,6 +1625,7 @@ pub(crate) fn parallel_batching_force_message(streak: usize, original_query: &st
 // overkill of an immediate hard cap on weaker models.
 
 pub(crate) const ROUND_BUDGET_PHASE1_MARKER: &str = "## ⤴ Round Budget Reached";
+pub(crate) const COMPLETION_SOFT_STOP_MARKER: &str = "## ✓ Task Appears Complete";
 
 pub(crate) fn is_round_budget_phase1(m: &serde_json::Value) -> bool {
     if m.get("role").and_then(|r| r.as_str()) != Some("user") {
@@ -1466,6 +1634,15 @@ pub(crate) fn is_round_budget_phase1(m: &serde_json::Value) -> bool {
     m.get("content")
         .and_then(|c| c.as_str())
         .is_some_and(|s| s.starts_with(ROUND_BUDGET_PHASE1_MARKER))
+}
+
+pub(crate) fn is_completion_soft_stop(m: &serde_json::Value) -> bool {
+    if m.get("role").and_then(|r| r.as_str()) != Some("user") {
+        return false;
+    }
+    m.get("content")
+        .and_then(|c| c.as_str())
+        .is_some_and(|s| s.starts_with(COMPLETION_SOFT_STOP_MARKER))
 }
 
 /// Build a `RoundSignal` from the current loop state for the circuit breaker.
@@ -1481,6 +1658,7 @@ fn build_circuit_breaker_signal(
         return RoundSignal {
             tool_signatures,
             produced_mutation: false,
+            task_completed: false,
             tool_count,
         };
     }
@@ -1511,12 +1689,26 @@ fn build_circuit_breaker_signal(
             .take(state.max_tools_per_turn as usize)
             .any(tool_record_is_workspace_mutation)
     };
+    let task_completed = latest_round_records
+        .iter()
+        .any(|record| record.ok && record.name == "git_commit");
 
     RoundSignal {
         tool_signatures,
         produced_mutation,
+        task_completed,
         tool_count,
     }
+}
+
+pub(crate) fn completion_soft_stop_message(round_index: u32, original_query: &str) -> String {
+    format!(
+        "{COMPLETION_SOFT_STOP_MARKER}\n\
+         Runtime signal: a successful git commit indicates the requested work is likely complete after {round_index} tool round(s).\n\n\
+         Stop now and provide the final answer unless you can name concrete remaining work that is necessary for the user's request. \
+         Do not run more verification or status checks just to be extra sure; only use tools if there is specific unresolved work.\n\n\
+         Original user query: {original_query}"
+    )
 }
 
 pub(crate) fn round_budget_phase1_message(round_index: u32, original_query: &str) -> String {
@@ -1987,6 +2179,67 @@ async fn handle_token_budget<H: AgenticLoopHost>(
         return Some(TurnExecutionControl::Return(AgenticLoopOutcome::Completed));
     }
 
+    // First attempt: compact-and-continue instead of hard-stopping.
+    // Two-tier strategy:
+    //   1. Aggressive compression pipeline (clear tool results)
+    //   2. If still over: spill old messages to disk, keep reference in context
+    // Only if both fail do we inject the stop directive.
+    // Skip tier-1 mechanical compression if pre-turn LLM compact already ran,
+    // but still allow tier-2 spill-to-disk as an independent recovery path.
+    if !state.budget_wrapup_injected {
+        let budget = super::context_compression::TokenBudget {
+            max_prompt_tokens: state.max_turn_input_tokens,
+            last_measured_tokens: measured,
+            current_round_index: Some(state.current_round_index),
+        };
+        let mut total_freed = 0;
+        if state.compact_tier_applied < CompactionTier::CompactHistory {
+            let pipeline = super::context_compression::CompressionPipeline::aggressive_pipeline();
+            let outcome = pipeline.compress_if_needed(&mut state.messages, &budget);
+            total_freed = outcome.total_tokens_freed;
+        }
+
+        // Tier 2: Spill old messages to disk if compression wasn't enough.
+        // Serialize the oldest 60% of messages to a session-local file.
+        // Leave a system message referencing the file path so the agent
+        // can read_file it if needed. This is the SpillBackend pattern
+        // applied to conversation history — content isn't lost, just
+        // moved out of the live context window.
+        if measured.saturating_sub(total_freed) > state.max_turn_input_tokens {
+            if let Some(sid) = state.current_session_id.as_deref() {
+                let spill_freed = spill_old_messages_to_disk(
+                    &mut state.messages,
+                    sid,
+                    state.llm_rounds_completed,
+                );
+                total_freed += spill_freed;
+            }
+        }
+
+        if total_freed > 0 {
+            if !prep.quiet {
+                host.emit_headless_line(
+                    HeadlessStderrStyle::Yellow,
+                    format!(
+                        "♻ Context pressure {measured}/{} tokens — freed ~{} tokens (compact+spill), continuing.",
+                        state.max_turn_input_tokens, total_freed,
+                    ),
+                );
+            }
+            if let Some(ref mut sess) = state.pipeline_session {
+                sess.recovery.record_reactive_compact();
+                sess.stats.record_compaction(total_freed);
+            }
+            state
+                .compaction_effectiveness
+                .record_compaction(total_freed);
+            state.budget_wrapup_injected = true;
+            try_write_heavy_checkpoint(state);
+            return Some(TurnExecutionControl::ContinueLoop);
+        }
+    }
+
+    // Compaction didn't help (or already tried once) — inject stop directive.
     state.budget_wrapup_injected = true;
     if !prep.quiet {
         host.emit_headless_line(
@@ -2846,6 +3099,78 @@ mod tests {
     }
 
     #[test]
+    fn circuit_breaker_signal_marks_successful_git_commit_as_task_completed() {
+        let mut state = make_state();
+        state.llm_rounds_completed = 4;
+        state.stall.turn_sigs.push(
+            ["git_commit:{\"message\":\"finish\"}".to_string()]
+                .into_iter()
+                .collect(),
+        );
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "git_commit".into(),
+            ok: true,
+            round: Some(3),
+            ..Default::default()
+        });
+
+        let signal = build_circuit_breaker_signal(&state);
+
+        assert!(signal.task_completed);
+        assert!(
+            signal.produced_mutation,
+            "git_commit still counts as mutation evidence"
+        );
+    }
+
+    #[test]
+    fn circuit_breaker_signal_does_not_reuse_stale_git_commit_completion() {
+        let mut state = make_state();
+        state.llm_rounds_completed = 5;
+        state.stall.turn_sigs.push(
+            ["read_file:{\"path\":\"a.rs\"}".to_string()]
+                .into_iter()
+                .collect(),
+        );
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "git_commit".into(),
+            ok: true,
+            round: Some(3),
+            ..Default::default()
+        });
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "read_file".into(),
+            ok: true,
+            round: Some(4),
+            ..Default::default()
+        });
+
+        let signal = build_circuit_breaker_signal(&state);
+
+        assert!(
+            !signal.task_completed,
+            "only the latest completed round may emit completion"
+        );
+    }
+
+    #[test]
+    fn completion_soft_stop_message_is_ephemeral_corrective() {
+        let msg = serde_json::json!({
+            "role": "user",
+            "content": completion_soft_stop_message(7, "finish and commit the fix"),
+        });
+
+        assert!(is_completion_soft_stop(&msg));
+        assert!(is_execution_corrective_message(&msg));
+        assert!(
+            msg["content"]
+                .as_str()
+                .unwrap()
+                .contains("Stop now and provide the final answer")
+        );
+    }
+
+    #[test]
     fn circuit_breaker_signal_ignores_round_zero_records_before_any_round_completes() {
         let mut state = make_state();
         state.llm_rounds_completed = 0;
@@ -3640,4 +3965,372 @@ mod tests {
             "search-family corrective must not globally block bash"
         );
     }
+
+    #[tokio::test]
+    async fn pipeline_session_receives_feedback_on_successful_turn() {
+        use astra_turn_core::pipeline_config::PipelineConfig;
+        use astra_turn_core::pipeline_session::PipelineSession;
+
+        let mut state = make_state();
+        state.pipeline_session = Some(PipelineSession::new(PipelineConfig::default()));
+
+        let mut host = MockHost::new(vec![text_result("Hello", 1000, 200, Some(50))]);
+        let prep = TurnIterationPrep {
+            quiet: true,
+            turn_start_time: Instant::now(),
+        };
+
+        let result = execute_turn_and_ingest_phase(&mut host, &mut state, 0, prep).await;
+        assert!(result.is_ok());
+
+        let sess = state.pipeline_session.as_ref().unwrap();
+        assert_eq!(sess.turns_completed(), 1);
+        assert_eq!(sess.stats.turns_executed, 1);
+    }
+
+    #[tokio::test]
+    async fn pipeline_session_none_does_not_panic() {
+        let mut state = make_state();
+        assert!(state.pipeline_session.is_none());
+
+        let mut host = MockHost::new(vec![text_result("Hello", 500, 100, None)]);
+        let prep = TurnIterationPrep {
+            quiet: true,
+            turn_start_time: Instant::now(),
+        };
+
+        let result = execute_turn_and_ingest_phase(&mut host, &mut state, 0, prep).await;
+        assert!(result.is_ok());
+    }
+}
+
+/// Spill old messages to disk with a structural summary retained in context.
+///
+/// Strategy (SpillBackend pattern for conversation history):
+/// 1. Extract a compact structural summary from the messages being spilled
+///    (user intents, tool calls made, files touched, errors hit)
+/// 2. Serialize the full messages to a session-local file (backup)
+/// 3. Replace the spilled messages with ONE system message containing:
+///    - The structural summary (so the agent retains awareness)
+///    - The spill file path (so it can read_file for full details)
+///
+/// This is NOT just raw dump — the summary gives the agent enough context
+/// to continue working without re-reading the full history. But if it needs
+/// specifics, the full transcript is one read_file away.
+///
+/// Returns estimated tokens freed.
+// Spill policy tunables — keep ~40% of the tail, shed ~60%. Chosen to
+// meaningfully relieve pressure in a single pass while preserving enough
+// recent turns that the agent doesn't lose working context.
+const SPILL_KEEP_NUMERATOR: usize = 2;
+const SPILL_KEEP_DENOMINATOR: usize = 5;
+const SPILL_MIN_KEEP: usize = 6;
+const SPILL_MIN_TOTAL: usize = 10;
+const SPILL_MIN_SPILL: usize = 4;
+
+/// Adjust `spill_count` so the drain boundary lands on a clean role boundary.
+///
+/// Provider APIs require assistant messages with `tool_calls` / `tool_use`
+/// blocks to be followed by matching tool-result messages with the same ids.
+/// If we spill through the middle of such a pair we'll get 400s on the next
+/// provider call. This walks the boundary *backward* (spilling fewer messages)
+/// until we land in a safe spot:
+///   - the retained prefix does not start with a `tool` / `tool_result` role, and
+///   - the last spilled message is not an assistant with unanswered tool calls.
+pub(crate) fn adjust_spill_boundary_for_tool_pairs(
+    messages: &[serde_json::Value],
+    mut spill_count: usize,
+) -> usize {
+    let is_tool_role = |m: &serde_json::Value| -> bool {
+        let role = m.get("role").and_then(|r| r.as_str());
+        // OpenAI-shape: role is "tool"; Anthropic-shape: role is "tool_result".
+        if matches!(role, Some("tool") | Some("tool_result")) {
+            return true;
+        }
+        // Anthropic tool-result messages arrive as role="user" with a content
+        // array containing {type:"tool_result"} blocks.  The current-role check
+        // above misses these, which would leave an orphaned tool_use assistant
+        // message in the retained window.
+        if role == Some("user") {
+            if let Some(arr) = m.get("content").and_then(|c| c.as_array()) {
+                return arr
+                    .iter()
+                    .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result"));
+            }
+        }
+        false
+    };
+    let has_tool_calls = |m: &serde_json::Value| -> bool {
+        if m.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+            return false;
+        }
+        // OpenAI-shape: top-level `tool_calls` array.
+        if m.get("tool_calls")
+            .and_then(|t| t.as_array())
+            .map(|a| !a.is_empty())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        // Anthropic-shape: `content` is an array with `tool_use` blocks.
+        if let Some(arr) = m.get("content").and_then(|c| c.as_array()) {
+            return arr
+                .iter()
+                .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"));
+        }
+        false
+    };
+
+    // Walk backward while the boundary is unsafe. Bail if we'd spill nothing.
+    while spill_count > 0 {
+        let last_spilled = &messages[spill_count - 1];
+        let first_retained = messages.get(spill_count);
+        let retained_starts_with_tool = first_retained.map(is_tool_role).unwrap_or(false);
+        let last_is_pending_assistant = has_tool_calls(last_spilled);
+        if !retained_starts_with_tool && !last_is_pending_assistant {
+            break;
+        }
+        spill_count -= 1;
+    }
+    spill_count
+}
+
+fn spill_old_messages_to_disk(
+    messages: &mut Vec<serde_json::Value>,
+    session_id: &str,
+    round: u32,
+) -> u64 {
+    let total = messages.len();
+    if total < SPILL_MIN_TOTAL {
+        return 0;
+    }
+    let keep_count = (total * SPILL_KEEP_NUMERATOR / SPILL_KEEP_DENOMINATOR).max(SPILL_MIN_KEEP);
+    let mut spill_count = total.saturating_sub(keep_count);
+    // Snap to a safe role boundary so we never split an assistant/tool pair.
+    spill_count = adjust_spill_boundary_for_tool_pairs(messages, spill_count);
+    if spill_count < SPILL_MIN_SPILL {
+        return 0;
+    }
+
+    let to_spill: Vec<_> = messages.drain(..spill_count).collect();
+
+    // Build structural summary from the spilled messages.
+    let summary = build_spill_summary(&to_spill);
+
+    let spill_json = match serde_json::to_string_pretty(&to_spill) {
+        Ok(json) => json,
+        Err(_) => {
+            // Put messages back in their original position (prefix).
+            let mut restored = to_spill;
+            restored.append(messages);
+            *messages = restored;
+            return 0;
+        }
+    };
+    let tokens_freed = (spill_json.len() / 4) as u64;
+
+    // Write full transcript to session dir.
+    let spill_dir = astra_services::session_journal::local_sessions_dir().join(session_id);
+    let _ = std::fs::create_dir_all(&spill_dir);
+    let spill_path = spill_dir.join(format!("spill-round{round}.json"));
+    if std::fs::write(&spill_path, &spill_json).is_err() {
+        let mut restored = to_spill;
+        restored.append(messages);
+        *messages = restored;
+        return 0;
+    }
+
+    // Insert summary + reference as first message.
+    let reference_msg = serde_json::json!({
+        "role": "system",
+        "content": format!(
+            "[Context compressed — {spill_count} earlier messages spilled to disk]\n\n\
+             ## Summary of spilled context\n{summary}\n\n\
+             ## Full transcript\n\
+             Path: {path}\n\
+             Use `read_file` on this path if you need exact details from \
+             the earlier conversation.",
+            path = spill_path.display(),
+        )
+    });
+    messages.insert(0, reference_msg);
+
+    tokens_freed
+}
+
+/// Extract a structural summary from messages without LLM — pure string extraction.
+/// Captures: user requests, tools called, files modified, errors encountered.
+fn build_spill_summary(messages: &[serde_json::Value]) -> String {
+    let mut user_messages = Vec::new();
+    let mut tools_used = Vec::new();
+    let mut files_modified = Vec::new();
+    let mut errors = Vec::new();
+
+    // Synthetic/system-injected user messages that shouldn't count as "requests".
+    const SYNTHETIC_USER_PREFIXES: &[&str] = &[
+        "[attention:",
+        "[session-anchor]",
+        "[working-set:",
+        "[session-memory:",
+        "(cached",
+    ];
+    let is_synthetic_user = |s: &str| {
+        SYNTHETIC_USER_PREFIXES
+            .iter()
+            .any(|p| s.trim_start().starts_with(p))
+    };
+
+    // Extract plain text from a `content` field that may be a string or an
+    // array of content blocks (Anthropic shape).
+    let content_text = |v: &serde_json::Value| -> Option<String> {
+        if let Some(s) = v.as_str() {
+            return Some(s.to_string());
+        }
+        if let Some(arr) = v.as_array() {
+            let mut out = String::new();
+            for b in arr {
+                let ty = b.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                if ty == "text" {
+                    if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+                        if !out.is_empty() {
+                            out.push('\n');
+                        }
+                        out.push_str(t);
+                    }
+                }
+            }
+            if !out.is_empty() {
+                return Some(out);
+            }
+        }
+        None
+    };
+
+    // Record a tool invocation, extracting a `path` arg when present.
+    let mut record_tool = |name: &str, args: &serde_json::Value| {
+        let path = args.get("path").and_then(|p| p.as_str());
+        if let Some(p) = path {
+            if matches!(name, "str_replace" | "write_file" | "multi_edit") {
+                let ps = p.to_string();
+                if !files_modified.contains(&ps) {
+                    files_modified.push(ps);
+                }
+            }
+            tools_used.push(format!("{name}({p})"));
+        } else {
+            tools_used.push(name.to_string());
+        }
+    };
+
+    for msg in messages {
+        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        match role {
+            "user" => {
+                if let Some(content) = msg.get("content").and_then(content_text) {
+                    if !is_synthetic_user(&content) {
+                        let preview: String = content.chars().take(150).collect();
+                        user_messages.push(preview);
+                    }
+                }
+            }
+            "assistant" => {
+                // OpenAI-shape: top-level `tool_calls`.
+                if let Some(tool_calls) = msg.get("tool_calls").and_then(|t| t.as_array()) {
+                    for tc in tool_calls {
+                        let name = tc
+                            .get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("?");
+                        let args_str = tc
+                            .get("function")
+                            .and_then(|f| f.get("arguments"))
+                            .and_then(|a| a.as_str())
+                            .unwrap_or("");
+                        let parsed: serde_json::Value =
+                            serde_json::from_str(args_str).unwrap_or(serde_json::Value::Null);
+                        record_tool(name, &parsed);
+                    }
+                }
+                // Anthropic-shape: content array with `tool_use` blocks.
+                if let Some(arr) = msg.get("content").and_then(|c| c.as_array()) {
+                    for block in arr {
+                        if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                            let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+                            let input = block
+                                .get("input")
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null);
+                            record_tool(name, &input);
+                        }
+                    }
+                }
+                // Error mentions in assistant text — require word boundaries
+                // to avoid false positives like "no errors" or "won't fail".
+                if let Some(text) = msg.get("content").and_then(content_text) {
+                    let looks_like_error = text.contains(": error")
+                        || text.contains("Error:")
+                        || text.contains("panicked")
+                        || text.contains("traceback")
+                        || text.contains("Traceback");
+                    if looks_like_error && errors.len() < 5 {
+                        let preview: String = text.chars().take(100).collect();
+                        errors.push(preview);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut summary = String::new();
+
+    if !user_messages.is_empty() {
+        summary.push_str("**User requests:**\n");
+        for (i, msg) in user_messages.iter().take(10).enumerate() {
+            summary.push_str(&format!("{}. {}\n", i + 1, msg));
+        }
+        summary.push('\n');
+    }
+
+    if !files_modified.is_empty() {
+        summary.push_str("**Files modified:**\n");
+        for f in files_modified.iter().take(20) {
+            summary.push_str(&format!("- {f}\n"));
+        }
+        summary.push('\n');
+    }
+
+    if !tools_used.is_empty() {
+        // Deduplicate and count
+        let mut tool_counts: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for t in &tools_used {
+            *tool_counts.entry(t.as_str()).or_default() += 1;
+        }
+        let mut sorted: Vec<_> = tool_counts.into_iter().collect();
+        sorted.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+        summary.push_str(&format!("**Tools used ({} calls):**\n", tools_used.len()));
+        for (tool, count) in sorted.iter().take(15) {
+            if *count > 1 {
+                summary.push_str(&format!("- {tool} ×{count}\n"));
+            } else {
+                summary.push_str(&format!("- {tool}\n"));
+            }
+        }
+        summary.push('\n');
+    }
+
+    if !errors.is_empty() {
+        summary.push_str("**Errors encountered:**\n");
+        for e in &errors {
+            summary.push_str(&format!("- {e}\n"));
+        }
+    }
+
+    if summary.is_empty() {
+        summary.push_str("(no structured content extracted from spilled messages)");
+    }
+
+    summary
 }

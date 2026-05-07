@@ -391,25 +391,25 @@ dev-seed:
 	SQL="DROP DATABASE IF EXISTS $$DB_NAME; CREATE DATABASE $$DB_NAME;"; \
 	run_mysql_ddl() { mysql --protocol=TCP -h"$$DB_HOST" -P"$$DB_PORT" -u"$$DB_USER" -p"$$DB_PASS" "$$@" -e "$$SQL"; }; \
 	mysql_ssl_disable_arg() { \
-		if mysql --no-defaults --ssl-mode=DISABLED --version >/dev/null 2>&1; then printf '%s\n' "--ssl-mode=DISABLED"; \
-		elif mysql --no-defaults --ssl=0 --version >/dev/null 2>&1; then printf '%s\n' "--ssl=0"; \
-		elif mysql --no-defaults --skip-ssl --version >/dev/null 2>&1; then printf '%s\n' "--skip-ssl"; \
+		if mysql --no-defaults --skip-ssl --version >/dev/null 2>&1 && [ -z "$$(mysql --no-defaults --skip-ssl --version 2>&1 >/dev/null)" ]; then printf '%s\n' "--skip-ssl"; \
+		elif mysql --no-defaults --ssl=0 --version >/dev/null 2>&1 && [ -z "$$(mysql --no-defaults --ssl=0 --version 2>&1 >/dev/null)" ]; then printf '%s\n' "--ssl=0"; \
+		elif mysql --no-defaults --ssl-mode=DISABLED --version >/dev/null 2>&1 && [ -z "$$(mysql --no-defaults --ssl-mode=DISABLED --version 2>&1 >/dev/null)" ]; then printf '%s\n' "--ssl-mode=DISABLED"; \
 		fi; \
 	}; \
 	MYSQL_SSL_ARG=$$(mysql_ssl_disable_arg); \
 	run_mysql_ddl 2>/dev/null || { \
 		if [ -n "$$MYSQL_SSL_ARG" ]; then run_mysql_ddl "$$MYSQL_SSL_ARG"; else run_mysql_ddl; fi; \
 	}
-	@$(MAKE) dev-api-restart build-cli-release
+	@$(MAKE) dev-api-restart-debug build-cli-debug
 	@sleep 2
 	@echo "Registering admin (admin@mo.com)..."
-	@NO_PROXY=localhost ./rust/target/release/astra-admin register \
+	@NO_PROXY=localhost ./rust/target/debug/astra-admin register \
 		--username admin --password 11111111 --email admin@mo.com
 	@echo "Logging in as admin..."
-	@NO_PROXY=localhost ./rust/target/release/astra-admin login \
+	@NO_PROXY=localhost ./rust/target/debug/astra-admin login \
 		--username admin --password 11111111
 	@echo "Loading models from .models.yaml..."
-	@NO_PROXY=localhost ./rust/target/release/astra-admin model load .models.yaml
+	@NO_PROXY=localhost ./rust/target/debug/astra-admin model load .models.yaml
 	@echo ""
 	@echo "✅ Seed complete — admin@mo.com / 11111111"
 
@@ -617,9 +617,9 @@ test-online:
 	SQL="DROP DATABASE IF EXISTS $$TEST_DB; CREATE DATABASE $$TEST_DB;"; \
 	run_mysql_ddl() { mysql --protocol=TCP -h"$$DB_HOST" -P"$$DB_PORT" -u"$$DB_USER" -p"$$DB_PASS" "$$@" -e "$$SQL"; }; \
 	mysql_ssl_disable_arg() { \
-		if mysql --no-defaults --ssl-mode=DISABLED --version >/dev/null 2>&1; then printf '%s\n' "--ssl-mode=DISABLED"; \
-		elif mysql --no-defaults --ssl=0 --version >/dev/null 2>&1; then printf '%s\n' "--ssl=0"; \
-		elif mysql --no-defaults --skip-ssl --version >/dev/null 2>&1; then printf '%s\n' "--skip-ssl"; \
+		if mysql --no-defaults --skip-ssl --version >/dev/null 2>&1 && [ -z "$$(mysql --no-defaults --skip-ssl --version 2>&1 >/dev/null)" ]; then printf '%s\n' "--skip-ssl"; \
+		elif mysql --no-defaults --ssl=0 --version >/dev/null 2>&1 && [ -z "$$(mysql --no-defaults --ssl=0 --version 2>&1 >/dev/null)" ]; then printf '%s\n' "--ssl=0"; \
+		elif mysql --no-defaults --ssl-mode=DISABLED --version >/dev/null 2>&1 && [ -z "$$(mysql --no-defaults --ssl-mode=DISABLED --version 2>&1 >/dev/null)" ]; then printf '%s\n' "--ssl-mode=DISABLED"; \
 		fi; \
 	}; \
 	MYSQL_SSL_ARG=$$(mysql_ssl_disable_arg); \

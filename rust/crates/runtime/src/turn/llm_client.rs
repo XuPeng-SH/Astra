@@ -113,6 +113,19 @@ pub(crate) fn provider_uses_bedrock_converse(provider: &str) -> bool {
     llm_provider_protocol(provider) == LlmProviderProtocol::BedrockConverse
 }
 
+/// Single source of truth: does this provider use explicit cache_control
+/// markers (Anthropic/Bedrock) vs prefix-only caching (everyone else)?
+///
+/// Use this everywhere instead of ad-hoc `provider == "anthropic"` checks.
+/// Adding a new Anthropic-family provider here automatically propagates to
+/// all cache-splitting, annotation, and volatile-routing decisions.
+pub(crate) fn provider_uses_explicit_cache_control(provider: &str) -> bool {
+    matches!(
+        llm_provider_protocol(provider),
+        LlmProviderProtocol::AnthropicMessages | LlmProviderProtocol::BedrockConverse
+    )
+}
+
 /// Returns true only when the *provider* is known to be DashScope / Aliyun / Alibaba.
 ///
 /// We intentionally do NOT match on model name here: Qwen models are also served
@@ -802,7 +815,7 @@ fn build_bedrock_message_content(msg: &Value, include_reasoning_content: bool) -
         "assistant" => {
             let mut blocks = Vec::new();
             // Bedrock requires reasoningContent FIRST when thinking is enabled.
-            if include_reasoning_content
+            let has_reasoning = if include_reasoning_content
                 && let Some(rc) = msg.get("reasoning_content").and_then(Value::as_str)
             {
                 if !rc.is_empty() {
@@ -813,12 +826,23 @@ fn build_bedrock_message_content(msg: &Value, include_reasoning_content: bool) -
                         }
                     }
                     blocks.push(json!({"reasoningContent": {"reasoningText": reasoning_text}}));
+                    true
+                } else {
+                    false
                 }
-            }
+            } else {
+                false
+            };
             blocks.extend(build_bedrock_text_content_blocks(msg.get("content")));
             blocks.extend(build_bedrock_tool_blocks(
                 msg.get("tool_calls").and_then(Value::as_array),
             ));
+            // Bedrock rejects assistant messages where the final block is thinking/reasoning.
+            // If reasoning was emitted but no text or tool_use followed, append a minimal
+            // text block to satisfy the constraint.
+            if has_reasoning && blocks.len() == 1 {
+                blocks.push(json!({ "text": "" }));
+            }
             blocks
         }
         _ => build_bedrock_text_content_blocks(msg.get("content")),
@@ -1275,7 +1299,35 @@ pub(crate) fn build_provider_request_body(
                 body["stream_options"] = json!({"include_usage": true});
             }
             if let Some(max_out) = max_output_tokens {
-                body["max_completion_tokens"] = json!(max_out);
+                // When thinking is active, providers like DeepSeek allocate a
+                // thinking_budget that must be LESS than max_completion_tokens.
+                // If max_out is too small, the request will 400. Bump to at
+                // least thinking_budget + a headroom for the visible answer.
+                //
+                // We honor the user's configured ceiling when it already exceeds
+                // the required floor (respects deliberate budget caps) and only
+                // bump when the configured value is demonstrably too low.
+                let effective_max = if !thinking.is_off() {
+                    let required_floor: usize = match thinking {
+                        ThinkingConfig::Enabled { budget_tokens } => {
+                            (*budget_tokens as usize).saturating_add(8192)
+                        }
+                        _ => 65536,
+                    };
+                    if max_out < required_floor {
+                        tracing::debug!(
+                            user_max = max_out,
+                            bumped_to = required_floor,
+                            "max_completion_tokens bumped to fit thinking budget"
+                        );
+                        required_floor
+                    } else {
+                        max_out
+                    }
+                } else {
+                    max_out
+                };
+                body["max_completion_tokens"] = json!(effective_max);
             }
             if let Some(temp) = temperature {
                 body["temperature"] = json!(temp);
@@ -1539,17 +1591,23 @@ fn anthropic_message_from_openai(msg: &Value) -> Option<Value> {
         }
         "assistant" => {
             let mut blocks = Vec::new();
-            if let Some(rc) = msg.get("reasoning_content").and_then(Value::as_str) {
-                if !rc.is_empty() {
-                    let mut thinking = json!({"type": "thinking", "thinking": rc});
-                    if let Some(sig) = msg.get("reasoning_signature").and_then(Value::as_str) {
-                        if !sig.is_empty() {
-                            thinking["signature"] = Value::String(sig.to_string());
+            let has_thinking =
+                if let Some(rc) = msg.get("reasoning_content").and_then(Value::as_str) {
+                    if !rc.is_empty() {
+                        let mut thinking = json!({"type": "thinking", "thinking": rc});
+                        if let Some(sig) = msg.get("reasoning_signature").and_then(Value::as_str) {
+                            if !sig.is_empty() {
+                                thinking["signature"] = Value::String(sig.to_string());
+                            }
                         }
+                        blocks.push(thinking);
+                        true
+                    } else {
+                        false
                     }
-                    blocks.push(thinking);
-                }
-            }
+                } else {
+                    false
+                };
             blocks.extend(anthropic_text_blocks_from_content(msg.get("content")));
             if let Some(tool_calls) = msg.get("tool_calls").and_then(Value::as_array) {
                 blocks.extend(
@@ -1557,6 +1615,12 @@ fn anthropic_message_from_openai(msg: &Value) -> Option<Value> {
                         .iter()
                         .filter_map(openai_tool_call_to_anthropic_block),
                 );
+            }
+            // Anthropic/Bedrock reject assistant messages where the final block is `thinking`.
+            // If thinking was emitted but no text or tool_use followed, append a minimal
+            // text block to satisfy the constraint.
+            if has_thinking && blocks.len() == 1 {
+                blocks.push(json!({"type": "text", "text": ""}));
             }
             let mut out = json!({"role": "assistant", "content": blocks});
             carry_cache_annotations(msg, &mut out);
@@ -6913,6 +6977,78 @@ mod tests {
         );
     }
 
+    /// Regression: assistant message with reasoning_content but no text/tool_calls
+    /// must NOT produce a message ending with a thinking block (Bedrock 400 error).
+    #[test]
+    fn bedrock_reasoning_only_assistant_gets_trailing_text_block() {
+        let messages = vec![
+            json!({"role": "user", "content": "hello"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "reasoning_content": "I need to think about this...",
+                "reasoning_signature": "sig_test"
+            }),
+            json!({"role": "user", "content": "continue"}),
+        ];
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "us.anthropic.claude-opus-4-6-v1:0",
+            "bedrock",
+            Some(4096),
+            None,
+            true,
+            &ThinkingConfig::Enabled {
+                budget_tokens: 1024,
+            },
+        );
+        let bedrock_msgs = body["messages"].as_array().unwrap();
+        let assistant = &bedrock_msgs[1];
+        assert_eq!(assistant["role"], "assistant");
+        let content = assistant["content"].as_array().unwrap();
+        assert!(
+            content.len() >= 2,
+            "reasoning-only assistant must have at least 2 blocks, got {}",
+            content.len()
+        );
+        assert!(
+            content[0].get("reasoningContent").is_some(),
+            "first block should be reasoningContent"
+        );
+        // Final block must NOT be reasoningContent (Bedrock rejects this)
+        let last = content.last().unwrap();
+        assert!(
+            last.get("reasoningContent").is_none(),
+            "final block must not be reasoningContent, got: {last}"
+        );
+    }
+
+    /// Same regression for the Anthropic Messages path.
+    #[test]
+    fn anthropic_reasoning_only_assistant_gets_trailing_text_block() {
+        let msg = json!({
+            "role": "assistant",
+            "content": null,
+            "reasoning_content": "Let me think...",
+            "reasoning_signature": "sig_xyz"
+        });
+        let result = anthropic_message_from_openai(&msg).unwrap();
+        let blocks = result["content"].as_array().unwrap();
+        assert!(
+            blocks.len() >= 2,
+            "reasoning-only assistant must have at least 2 blocks, got {}",
+            blocks.len()
+        );
+        assert_eq!(blocks[0]["type"], "thinking");
+        // Final block must NOT be thinking
+        let last = blocks.last().unwrap();
+        assert_ne!(
+            last["type"], "thinking",
+            "final block must not be thinking, got: {last}"
+        );
+    }
+
     /// Helper for counter tests: build a body that would violate the
     /// signature contract, catching the debug_assert panic so the test can
     /// observe the counter's post-increment state.
@@ -7716,5 +7852,74 @@ mod tests {
         );
         // "required" at top level must survive
         assert_eq!(schema["required"], json!(["max_turns"]));
+    }
+
+    // --- Regression: max_completion_tokens bump respects user's ceiling ---
+    #[test]
+    fn max_completion_tokens_honors_user_when_above_floor() {
+        use astra_turn_core::thinking_config::ThinkingConfig;
+        // User sets 128K, thinking budget is 32K → floor = 40K → must keep 128K.
+        let thinking = ThinkingConfig::Enabled {
+            budget_tokens: 32_000,
+        };
+        let body = build_provider_request_body(
+            &[json!({"role": "user", "content": "hi"})],
+            &[],
+            "deepseek-chat",
+            "deepseek",
+            Some(128_000),
+            None,
+            false,
+            &thinking,
+        );
+        assert_eq!(
+            body["max_completion_tokens"].as_u64(),
+            Some(128_000),
+            "user ceiling above floor must not be bumped"
+        );
+    }
+
+    #[test]
+    fn max_completion_tokens_bumps_when_user_below_floor() {
+        use astra_turn_core::thinking_config::ThinkingConfig;
+        // User sets 8K, thinking budget is 32K → floor = 32K + 8K = 40K → bump to 40K.
+        let thinking = ThinkingConfig::Enabled {
+            budget_tokens: 32_000,
+        };
+        let body = build_provider_request_body(
+            &[json!({"role": "user", "content": "hi"})],
+            &[],
+            "deepseek-chat",
+            "deepseek",
+            Some(8_000),
+            None,
+            false,
+            &thinking,
+        );
+        assert_eq!(
+            body["max_completion_tokens"].as_u64(),
+            Some(40_192),
+            "configured max below thinking_budget+headroom must be bumped to floor"
+        );
+    }
+
+    #[test]
+    fn max_completion_tokens_unchanged_when_thinking_off() {
+        use astra_turn_core::thinking_config::ThinkingConfig;
+        let body = build_provider_request_body(
+            &[json!({"role": "user", "content": "hi"})],
+            &[],
+            "deepseek-chat",
+            "deepseek",
+            Some(4_096),
+            None,
+            false,
+            &ThinkingConfig::Off,
+        );
+        assert_eq!(
+            body["max_completion_tokens"].as_u64(),
+            Some(4_096),
+            "thinking=off must never bump user's max"
+        );
     }
 }

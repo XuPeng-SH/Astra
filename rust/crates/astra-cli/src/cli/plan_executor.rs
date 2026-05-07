@@ -1788,6 +1788,7 @@ async fn plan_executor_task(
                     runtime_continuity: None,
                     turn_index: ctx.turn,
                     evolution_service: ctx.evolution_service.clone(),
+                    pipeline_state: None,
                     pre_loaded_messages: None,
                     append_system_prompt: None,
                     #[cfg(feature = "harness")]

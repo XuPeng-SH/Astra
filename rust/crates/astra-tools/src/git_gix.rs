@@ -694,10 +694,19 @@ pub fn git_show(
         Err(e) => return e,
     };
 
-    let commit_ref = match args.get("commit").and_then(Value::as_str) {
+    let commit_ref = match args
+        .get("commit")
+        .or_else(|| args.get("ref"))
+        .and_then(Value::as_str)
+    {
         Some(c) => c,
         None => return "Error: missing 'commit' (SHA, branch, or tag)".to_string(),
     };
+
+    // Reject range syntax — git_show is for a single commit, suggest git diff
+    if commit_ref.contains("..") {
+        return "Error: git show expects a single commit reference, not a range. Use git diff for 'A..B' ranges.".to_string();
+    }
 
     // Allow valid git ref characters including reflog (@{}) and tree-object (:)
     if commit_ref.contains(|c: char| {
@@ -1179,6 +1188,26 @@ pub fn git_diff(
 
     // If a ref is given, do a tree-to-tree diff (HEAD vs ref)
     if let Some(ref_str) = git_ref {
+        // Handle "A..B" range syntax (e.g. "HEAD~8..HEAD") via CLI
+        if ref_str.contains("..") {
+            // Validate each part of the range against shell injection
+            let separator = if ref_str.contains("...") { "..." } else { ".." };
+            if let Some((base, tip)) = ref_str.split_once(separator) {
+                if let Err(e) = reject_shell_meta(base) {
+                    return format!("Error: invalid base ref in range: {e}");
+                }
+                if let Err(e) = reject_shell_meta(tip) {
+                    return format!("Error: invalid tip ref in range: {e}");
+                }
+            }
+            let mut cli_args = vec!["diff", ref_str, "--no-ext-diff", "--no-color"];
+            if let Some(p) = path_filter {
+                cli_args.push("--");
+                cli_args.push(p);
+            }
+            return diff_via_git_cli(project_root, &cli_args, limit)
+                .unwrap_or_else(|| "No changes".to_string());
+        }
         // With path filter, use CLI for tree-to-tree as well
         if let Some(p) = path_filter
             && let Some(result) = diff_via_git_cli(
@@ -2392,6 +2421,40 @@ pub fn git_stash_with_metadata(project_root: &Path, args: &Value) -> ToolExecuti
     }
 }
 
+/// Consolidated `git` tool dispatcher. Routes `args.action` to the
+/// appropriate git sub-operation. Replaces 11 separate git_* tools with
+/// a single `git { action: "...", ...params }` interface.
+pub fn git_dispatch(project_root: &Path, args: &Value) -> String {
+    let action = match args.get("action").and_then(Value::as_str) {
+        Some(a) => a,
+        None => {
+            return "Missing required parameter: action. \
+                    Use one of: status, diff, log, show, blame, \
+                    file_history, log_search, contributors, commit, \
+                    revert_commit, stash"
+                .to_string();
+        }
+    };
+    match action {
+        "status" => git_status(project_root),
+        "diff" => git_diff(project_root, args, 0.0, 0),
+        "log" => git_log(project_root, args),
+        "show" => git_show(project_root, args, 0.0, 0),
+        "blame" => git_blame(project_root, args),
+        "file_history" => git_file_history(project_root, args),
+        "log_search" => git_log_search(project_root, args),
+        "contributors" => git_contributors(project_root, args),
+        "commit" => git_commit_with_metadata(project_root, args).output,
+        "revert_commit" => git_revert_commit_with_metadata(project_root, args).output,
+        "stash" => git_stash_with_metadata(project_root, args).output,
+        other => format!(
+            "Unknown git action: '{other}'. Valid actions: status, diff, log, \
+             show, blame, file_history, log_search, contributors, commit, \
+             revert_commit, stash"
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2703,6 +2766,22 @@ mod tests {
     }
 
     #[test]
+    fn git_diff_ref_range_with_dotdot() {
+        let root = repo_root();
+        // "HEAD~2..HEAD" range syntax in ref param must not error
+        let result = git_diff(&root, &json!({"ref": "HEAD~2..HEAD"}), 0.0, 0);
+        assert!(
+            !result.starts_with("Error:"),
+            "ref with range A..B should not error: {result}"
+        );
+        // Should produce diff output or "No changes"
+        assert!(
+            result.contains("diff --git") || result.contains("No changes"),
+            "ref range should produce diff output: {result}"
+        );
+    }
+
+    #[test]
     fn git_diff_default_shows_worktree() {
         let root = repo_root();
         let result = git_diff(&root, &json!({}), 0.0, 0);
@@ -2798,6 +2877,73 @@ mod tests {
         assert!(
             result.contains("disallowed"),
             "shell meta in base_ref should be rejected: {result}"
+        );
+    }
+
+    // --- Bug #3: git_show should reject range syntax with helpful message ---
+    #[test]
+    fn git_show_rejects_range_syntax() {
+        let dir = init_temp_repo();
+        // Create a second commit so HEAD~1 exists
+        std::fs::write(dir.path().join("second.txt"), "2").unwrap();
+        run_git(dir.path(), &["add", "."]);
+        run_git(dir.path(), &["commit", "-m", "second"]);
+
+        let result = git_show(dir.path(), &json!({"ref": "HEAD~1..HEAD"}), 0.0, 0);
+        assert!(
+            result.contains("single commit") || result.contains("git diff"),
+            "Should suggest using git diff for ranges, got: {result}"
+        );
+    }
+
+    // --- Bug #5: git_diff .. branch must validate with reject_shell_meta ---
+    #[test]
+    fn git_diff_range_rejects_shell_meta() {
+        let dir = init_temp_repo();
+
+        let result = git_diff(dir.path(), &json!({"ref": "HEAD;echo pwned..HEAD"}), 0.0, 0);
+        assert!(
+            result.contains("Error") || result.contains("invalid"),
+            "Should reject shell meta in range ref, got: {result}"
+        );
+
+        let result2 = git_diff(dir.path(), &json!({"ref": "$(whoami)..HEAD"}), 0.0, 0);
+        assert!(
+            result2.contains("Error") || result2.contains("invalid"),
+            "Should reject shell meta in range ref, got: {result2}"
+        );
+    }
+
+    // Supplementary: tip contains shell meta (not just base)
+    #[test]
+    fn git_diff_range_rejects_shell_meta_in_tip() {
+        let dir = init_temp_repo();
+
+        let result = git_diff(dir.path(), &json!({"ref": "HEAD..$(whoami)"}), 0.0, 0);
+        assert!(
+            result.contains("Error") || result.contains("invalid"),
+            "Should reject shell meta in tip, got: {result}"
+        );
+
+        let result2 = git_diff(dir.path(), &json!({"ref": "HEAD..HEAD|cat"}), 0.0, 0);
+        assert!(
+            result2.contains("Error") || result2.contains("invalid"),
+            "Should reject shell meta in tip, got: {result2}"
+        );
+    }
+
+    // Supplementary: triple-dot range works
+    #[test]
+    fn git_diff_triple_dot_range_works() {
+        let dir = init_temp_repo();
+        std::fs::write(dir.path().join("b.txt"), "new content").unwrap();
+        run_git(dir.path(), &["add", "."]);
+        run_git(dir.path(), &["commit", "-m", "second commit"]);
+
+        let result = git_diff(dir.path(), &json!({"ref": "HEAD~1...HEAD"}), 0.0, 0);
+        assert!(
+            !result.contains("Error") && !result.contains("cannot resolve"),
+            "Triple-dot range should work, got: {result}"
         );
     }
 
@@ -3696,4 +3842,54 @@ mod tests {
     }
 
     // ── Git Worktree Tests ──────────────────────────────────────────────
+
+    // ── Consolidated `git` tool tests ──────────────────────────────────
+    #[test]
+    fn consolidated_git_dispatches_status() {
+        let root = repo_root();
+        let result = super::git_dispatch(&root, &json!({"action": "status"}));
+        assert!(
+            result.contains("##")
+                || result.contains("nothing to commit")
+                || result.contains("On branch"),
+            "git status action should return valid status: {result}"
+        );
+    }
+
+    #[test]
+    fn consolidated_git_dispatches_log() {
+        let root = repo_root();
+        let result = super::git_dispatch(&root, &json!({"action": "log", "n": 3}));
+        assert!(!result.is_empty(), "git log should return commits");
+    }
+
+    #[test]
+    fn consolidated_git_dispatches_diff() {
+        let root = repo_root();
+        let result = super::git_dispatch(&root, &json!({"action": "diff"}));
+        assert!(
+            !result.starts_with("Unknown git action") && !result.starts_with("Missing required"),
+            "diff must be recognized as valid action"
+        );
+    }
+
+    #[test]
+    fn consolidated_git_unknown_action_returns_error() {
+        let root = repo_root();
+        let result = super::git_dispatch(&root, &json!({"action": "nonexistent"}));
+        assert!(
+            result.contains("Unknown git action"),
+            "unknown action must produce error: {result}"
+        );
+    }
+
+    #[test]
+    fn consolidated_git_missing_action_returns_error() {
+        let root = repo_root();
+        let result = super::git_dispatch(&root, &json!({"file": "foo.rs"}));
+        assert!(
+            result.contains("Missing required parameter"),
+            "missing action must produce helpful error: {result}"
+        );
+    }
 }

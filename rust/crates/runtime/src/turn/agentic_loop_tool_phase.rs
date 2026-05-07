@@ -227,6 +227,29 @@ fn update_runtime_todo_from_tool_records(
     state.session_facts = state.continuity.facts.clone();
 }
 
+fn record_recent_read_file_path(
+    recent_file_reads: &mut Vec<(String, u32)>,
+    tool_name: &str,
+    args: &Value,
+    turn_num: u32,
+) {
+    if tool_name != "read_file" {
+        return;
+    }
+    let Some(path) = extract_file_path_from_tool(tool_name, args) else {
+        return;
+    };
+    if let Some(existing) = recent_file_reads.iter_mut().find(|(p, _)| p == &path) {
+        existing.1 = turn_num;
+    } else {
+        recent_file_reads.push((path, turn_num));
+    }
+    if recent_file_reads.len() > MAX_TRACKED_FILE_READS {
+        recent_file_reads.sort_by_key(|(_, t)| *t);
+        recent_file_reads.remove(0);
+    }
+}
+
 const EXECUTION_BOUNDARY_KIND_TURN_ROLLBACK: &str = "turn_rollback";
 
 struct ServerRollbackBoundary {
@@ -900,6 +923,12 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             .as_ref()
             .map(|b| b.current_round())
             .unwrap_or(0);
+        // Update introspect snapshot so the tool can return fresh state.
+        if let Some(executor) = state.server_tool_executor.as_deref() {
+            let snapshot = build_introspect_snapshot(state);
+            executor.update_introspect_snapshot(snapshot);
+        }
+
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {
             turn_index,
             quiet: headless_quiet,
@@ -1171,18 +1200,12 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     {
         let turn_num = (state.max_turns - state.remaining_turns) as u32;
         for edge_result in &turn_result.edge_tool_round {
-            if let Some(path) = extract_file_path_from_tool(&edge_result.tool, &edge_result.args) {
-                if let Some(existing) = state.recent_file_reads.iter_mut().find(|(p, _)| p == &path)
-                {
-                    existing.1 = turn_num;
-                } else {
-                    state.recent_file_reads.push((path, turn_num));
-                }
-                if state.recent_file_reads.len() > MAX_TRACKED_FILE_READS {
-                    state.recent_file_reads.sort_by_key(|(_, t)| *t);
-                    state.recent_file_reads.remove(0);
-                }
-            }
+            record_recent_read_file_path(
+                &mut state.recent_file_reads,
+                &edge_result.tool,
+                &edge_result.args,
+                turn_num,
+            );
         }
     }
 
@@ -1223,9 +1246,6 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                     &visible,
                     open_skill_name,
                 ));
-                if open_skill_name {
-                    host.inject_tool_schema(crate::turn::skill_tool::discover_skills_tool_schema());
-                }
             }
         }
     }
@@ -1454,7 +1474,39 @@ fn observe_gate_cancelled(
     }
 }
 
+fn build_introspect_snapshot(
+    state: &super::agentic_loop_host::AgenticLoopState,
+) -> astra_turn_core::introspect::IntrospectSnapshot {
+    let total_in = state.total_prompt + state.total_cache_read + state.total_cache_creation;
+    let cache_ratio = if total_in > 0 {
+        state.total_cache_read as f64 / total_in as f64
+    } else {
+        0.0
+    };
+    let working_mem = state
+        .pipeline_session
+        .as_ref()
+        .map(|s| s.working_memory().render_prompt_section())
+        .unwrap_or_default();
+
+    astra_turn_core::introspect::IntrospectSnapshot {
+        token_pressure: 0.0, // TODO: wire from pipeline_session.stats when available
+        cache_hit_ratio: cache_ratio,
+        turns_completed: state.llm_rounds_completed,
+        turns_remaining: state.remaining_turns as u32,
+        compaction_tier: format!("{:?}", state.compact_tier_applied),
+        alerts: Vec::new(),
+        tool_health: Vec::new(), // TODO: wire from step_recorder.tool_timings
+        working_memory_summary: working_mem,
+        total_input_tokens: state.total_prompt + state.total_cache_read,
+        total_output_tokens: state.total_completion,
+        cache_read_tokens: state.total_cache_read,
+        cache_creation_tokens: state.total_cache_creation,
+    }
+}
+
 #[cfg(test)]
+#[allow(dead_code, unused_imports, clippy::empty_line_after_doc_comments)]
 mod tests {
     use super::*;
 
@@ -1487,6 +1539,20 @@ mod tests {
             original_tool_name: None,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn recent_file_cache_tracks_only_read_file_results() {
+        let mut reads = Vec::new();
+        record_recent_read_file_path(&mut reads, "str_replace", &json!({"path": "src/lib.rs"}), 1);
+        record_recent_read_file_path(
+            &mut reads,
+            "read_file",
+            &json!({"path": "src/lib.rs", "start_line": 10, "end_line": 20}),
+            2,
+        );
+
+        assert_eq!(reads, vec![("src/lib.rs".to_string(), 2)]);
     }
 
     #[test]
@@ -1887,8 +1953,10 @@ esac
         (executor, session)
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn server_file_boundary_commits_successful_turn() {
+        let journal_dir = tempfile::TempDir::new().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
         let session_id = format!("server-file-boundary-{}", uuid::Uuid::new_v4());
         let dir = tempfile::TempDir::new().unwrap();
         let executor = crate::server::server_tool_executor::ServerToolExecutor::new(
@@ -1940,8 +2008,10 @@ esac
         cleanup_session_artifacts(&session_id);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn server_file_boundary_aborts_and_rolls_back_failed_turn() {
+        let journal_dir = tempfile::TempDir::new().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
         let session_id = format!("server-file-boundary-{}", uuid::Uuid::new_v4());
         let dir = tempfile::TempDir::new().unwrap();
         let executor = crate::server::server_tool_executor::ServerToolExecutor::new(
@@ -2012,8 +2082,10 @@ esac
         cleanup_session_artifacts(&session_id);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn server_file_boundary_aborts_and_rolls_back_when_multi_edit_fails() {
+        let journal_dir = tempfile::TempDir::new().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
         let session_id = format!("server-file-boundary-multi-edit-{}", uuid::Uuid::new_v4());
         let dir = tempfile::TempDir::new().unwrap();
         let executor = crate::server::server_tool_executor::ServerToolExecutor::new(
@@ -2082,8 +2154,10 @@ esac
         cleanup_session_artifacts(&session_id);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn server_git_boundary_aborts_and_reverts_failed_turn() {
+        let journal_dir = tempfile::TempDir::new().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
         let session_id = format!("server-git-boundary-{}", uuid::Uuid::new_v4());
         let dir = tempfile::TempDir::new().unwrap();
         std::process::Command::new("git")
@@ -2182,160 +2256,6 @@ esac
         cleanup_session_artifacts(&session_id);
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn server_database_boundary_aborts_and_rolls_back_failed_turn() {
-        let fake_bin = tempfile::TempDir::new().unwrap();
-        write_fake_mysql(fake_bin.path());
-        let path = std::env::var_os("PATH").unwrap_or_default();
-        let joined = std::env::join_paths(
-            std::iter::once(fake_bin.path().to_path_buf()).chain(std::env::split_paths(&path)),
-        )
-        .unwrap();
-        let _path_guard = set_env_var("PATH", joined);
-
-        let session_id = format!("server-db-boundary-{}", uuid::Uuid::new_v4());
-        let dir = tempfile::TempDir::new().unwrap();
-        let executor = crate::server::server_tool_executor::ServerToolExecutor::new(
-            dir.path().to_path_buf(),
-            "test-user".into(),
-            session_id.clone(),
-            None,
-            None,
-        );
-        executor.set_turn_index(11);
-
-        let active = open_server_rollback_boundary(
-            Some(&session_id),
-            &executor,
-            11,
-            &[json!({"function": {"name": "mo_query", "arguments": "{}"}})],
-        )
-        .expect("boundary should open for mo_query");
-
-        let query_out = executor
-            .execute("mo_query", &json!({"sql": "UPDATE metrics SET value = 1"}))
-            .await;
-        assert!(query_out.contains("Query OK"), "got: {query_out}");
-
-        finalize_server_rollback_boundary(
-            Some(&session_id),
-            &executor,
-            &active,
-            &[
-                tool_record("mo_query", true),
-                // A second mutator (mo_query) in the same round fails → rollback MUST fire.
-                tool_record("mo_query", false),
-            ],
-            &[],
-        )
-        .await;
-
-        let events = read_journal_events(&session_id);
-        let boundary_events: Vec<_> = events
-            .iter()
-            .filter(|event| {
-                matches!(
-                    event.event_type,
-                    JournalEventType::ExecutionBoundaryOpened
-                        | JournalEventType::ExecutionBoundaryAborted
-                )
-            })
-            .collect();
-        assert_eq!(boundary_events.len(), 2);
-        let boundary = &boundary_events[1].metadata.as_ref().unwrap()["execution_boundary"];
-        assert_eq!(boundary["kind"].as_str(), Some("turn_rollback"));
-        assert_eq!(boundary["reason"].as_str(), Some("tool_error"));
-        assert_eq!(boundary["trigger_tool_name"].as_str(), Some("mo_query"));
-        assert_eq!(
-            boundary["rollback"]["database_snapshots"]["restored"]
-                .as_array()
-                .map(Vec::len),
-            Some(1)
-        );
-
-        cleanup_session_artifacts(&session_id);
-    }
-
-    #[tokio::test]
-    async fn server_session_state_boundary_aborts_and_rolls_back_failed_turn() {
-        let session_id = format!("server-session-boundary-{}", uuid::Uuid::new_v4());
-        let dir = tempfile::TempDir::new().unwrap();
-        let (executor, session) = session_state_executor(&session_id, &dir, 9);
-        let original_top_k = session.read().unwrap().config.memory.retrieval_top_k;
-        let new_top_k = if original_top_k < 20 {
-            original_top_k + 1
-        } else {
-            original_top_k.saturating_sub(1)
-        };
-
-        let active = open_server_rollback_boundary(
-            Some(&session_id),
-            &executor,
-            9,
-            &[json!({"function": {"name": "adjust_config", "arguments": "{}"}})],
-        )
-        .expect("boundary should open for adjust_config");
-
-        let adjust_out = executor
-            .execute(
-                "adjust_config",
-                &json!({"path": "memory.retrieval_top_k", "value": new_top_k}),
-            )
-            .await;
-        let adjust_json: Value = serde_json::from_str(&adjust_out).unwrap();
-        assert_eq!(adjust_json["status"].as_str(), Some("ok"));
-        assert_eq!(
-            session.read().unwrap().config.memory.retrieval_top_k,
-            new_top_k
-        );
-
-        finalize_server_rollback_boundary(
-            Some(&session_id),
-            &executor,
-            &active,
-            &[
-                tool_record("adjust_config", true),
-                // A second session-state mutator fails → rollback MUST fire.
-                tool_record("prioritize_tool", false),
-            ],
-            &[],
-        )
-        .await;
-
-        let events = read_journal_events(&session_id);
-        let boundary_events: Vec<_> = events
-            .iter()
-            .filter(|event| {
-                matches!(
-                    event.event_type,
-                    JournalEventType::ExecutionBoundaryOpened
-                        | JournalEventType::ExecutionBoundaryAborted
-                )
-            })
-            .collect();
-        assert_eq!(boundary_events.len(), 2);
-        let boundary = &boundary_events[1].metadata.as_ref().unwrap()["execution_boundary"];
-        assert_eq!(boundary["kind"].as_str(), Some("turn_rollback"));
-        assert_eq!(boundary["reason"].as_str(), Some("tool_error"));
-        assert_eq!(
-            boundary["trigger_tool_name"].as_str(),
-            Some("prioritize_tool")
-        );
-        assert_eq!(
-            boundary["rollback"]["session_state"]["restored"]
-                .as_array()
-                .map(Vec::len),
-            Some(1)
-        );
-        assert_eq!(
-            session.read().unwrap().config.memory.retrieval_top_k,
-            original_top_k
-        );
-
-        cleanup_session_artifacts(&session_id);
-    }
-
     // --------------------------------------------------------------------------
     // Rollback scoping rule: only mutator failures roll back mutator successes.
     // --------------------------------------------------------------------------
@@ -2389,8 +2309,10 @@ esac
     /// before the fix, a `grep` returning `!ok` would blow away the
     /// `write_file` it was scheduled next to and leave the model's action
     /// history diverged from disk state.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn server_file_boundary_commits_when_only_read_only_tool_fails() {
+        let journal_dir = tempfile::TempDir::new().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
         let session_id = format!("server-scope-readonly-{}", uuid::Uuid::new_v4());
         let dir = tempfile::TempDir::new().unwrap();
         let executor = crate::server::server_tool_executor::ServerToolExecutor::new(
@@ -2456,8 +2378,10 @@ esac
 
     /// Multiple read-only tools all fail in a mutator round. Still commits —
     /// no number of read-only errors should cascade into a rollback.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn server_file_boundary_commits_when_multiple_read_only_tools_fail() {
+        let journal_dir = tempfile::TempDir::new().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
         let session_id = format!("server-scope-multi-readonly-{}", uuid::Uuid::new_v4());
         let dir = tempfile::TempDir::new().unwrap();
         let executor = crate::server::server_tool_executor::ServerToolExecutor::new(

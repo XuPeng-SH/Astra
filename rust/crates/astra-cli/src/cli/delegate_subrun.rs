@@ -416,6 +416,9 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
                 token: self.cancel_token.clone(),
             },
             error_recovery: Default::default(),
+            pipeline_session: Some(astra_turn_core::pipeline_session::PipelineSession::new(
+                astra_turn_core::pipeline_config::PipelineConfig::default(),
+            )),
             message: config.task.clone(),
             recent_tools: Vec::new(),
             task_profile,
@@ -437,6 +440,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             pinned_tool_schema_tokens: 0,
             max_turn_input_tokens: astra_core::RuntimeLimits::global().max_turn_input_tokens,
             budget_wrapup_injected: false,
+            compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
             skill_produced_output: false,
             max_cumulative_tokens: 0,
             thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
@@ -976,8 +980,8 @@ mod tests {
         assert!(names.contains(&"write_file"), "must include write_file");
         assert!(names.contains(&"read_file"), "must include read_file");
         assert!(
-            names.len() > 20,
-            "expected >20 tool schemas, got {}",
+            names.len() > 15,
+            "expected >15 tool schemas, got {}",
             names.len()
         );
     }

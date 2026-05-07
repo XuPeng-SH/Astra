@@ -573,6 +573,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tower-http",
+ "uuid",
 ]
 
 [[package]]
@@ -658,6 +659,7 @@ dependencies = [
  "dashmap",
  "dirs 6.0.0",
  "fastrand",
+ "filetime",
  "futures-util",
  "proptest",
  "regex",
