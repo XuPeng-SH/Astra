@@ -357,10 +357,24 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         thinking: thinking_config,
     });
 
-    // Inject ephemeral prefix (e.g., skill listing) at the start of messages.
+    // Route skill listing through edge_profile → bridge volatile lane, so
+    // it lands in RuntimeVolatile (post-cache-marker) rather than becoming a
+    // leading role:system message that breaks the prefix cache on
+    // prefix-only providers (DeepSeek, GLM, Qwen). The skill selector
+    // re-ranks each turn, so the content changes — it must not live in the
+    // system prefix or it invalidates the cache every turn.
     if let Some(prefix) = ctx.ephemeral_prefix {
-        if let Some(arr) = payload.get_mut("messages").and_then(Value::as_array_mut) {
-            arr.insert(0, prefix.clone());
+        if let Some(content) = prefix.get("content").and_then(serde_json::Value::as_str)
+            && !content.is_empty()
+            && let Some(root) = payload.as_object_mut()
+            && let Some(ep) = root.get_mut("edge_profile")
+            && let Some(ep_obj) = ep.as_object_mut()
+        {
+            ep_obj.insert(
+                astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_SKILL_LISTING_TEXT
+                    .to_string(),
+                json!(content),
+            );
         }
     }
     let active_skills = detect_active_system_skills_in_message(ctx.message);
@@ -755,9 +769,14 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         }
     }
     if let Some(self_model) = ctx.executor.build_self_model_snapshot() {
-        let text = self_model.to_system_prompt_section();
-        if text.len() > 30 {
-            if let Some(root) = payload.as_object_mut()
+        // Gate on signal content, not raw length. A bare `Turn: N\nTokens: …`
+        // header easily passes a length threshold but carries no actionable
+        // signal for the LLM — emitting it every turn wastes ~500 tokens
+        // (and the tokens are in the volatile lane, so they never cache).
+        if self_model.has_meaningful_self_awareness() {
+            let text = self_model.to_system_prompt_section();
+            if !text.trim().is_empty()
+                && let Some(root) = payload.as_object_mut()
                 && let Some(ep) = root.get_mut("edge_profile")
                 && let Some(ep_obj) = ep.as_object_mut()
             {

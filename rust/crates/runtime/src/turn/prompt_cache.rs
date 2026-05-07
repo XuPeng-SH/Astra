@@ -10,6 +10,8 @@ use std::sync::{Mutex, OnceLock};
 use serde_json::{Value, json};
 
 use crate::prompts;
+use astra_turn_core::microcompact::{PromptCacheProtocol, ProviderCacheStrategy};
+use astra_turn_core::pipeline_config::ProviderCachePolicy;
 
 const DEFAULT_CACHE_EDIT_PIN_KEY: &str = "__default__";
 const MAX_PINNED_CACHE_EDIT_SESSIONS: usize = 1024;
@@ -65,7 +67,9 @@ impl Default for PromptCacheConfig {
 // ── Section Cache ────────────────────────────────────────────────────────────
 // Two-level cache for static/dynamic prompt boundary:
 // - Global+Session sections are cached by (tool_names, task_type, confidence) — stable within a session
-// - Per-turn profile_desc is NOT cached (changes every turn with skills/memory/environment)
+// - Per-turn volatile content (environment_volatile, memoria recall, …) is
+//   bound into RuntimeVolatile post-cache-marker so it re-sends each turn
+//   without invalidating the cached prefix.
 
 /// Full pipeline output a bridge caller needs, in one place.
 ///
@@ -86,6 +90,21 @@ pub(crate) struct BridgePipelineOutcome {
     pub tier: astra_turn_core::compaction_types::CompactionTier,
     /// Tool schemas already pruned to `tier` by the pipeline's Optimize phase.
     pub tool_schemas: Vec<Value>,
+}
+
+/// Resolve the context-pipeline cache policy from the same provider+model
+/// classification used by [`PromptCacheConfig::latch`].
+///
+/// This matters for multiplexed providers like Bedrock: Claude models support
+/// Anthropic-style cache markers (translated to Bedrock cache points), while
+/// Nova/Titan models must remain prefix-only.
+pub(crate) fn provider_cache_policy_for(provider: &str, model_name: &str) -> ProviderCachePolicy {
+    let strategy = ProviderCacheStrategy::from_provider_and_model(Some(provider), Some(model_name));
+    if strategy.prompt_cache_protocol == PromptCacheProtocol::AnthropicCacheControl {
+        ProviderCachePolicy::anthropic()
+    } else {
+        ProviderCachePolicy::openai_compatible()
+    }
 }
 
 /// Assemble a system message via the context pipeline directly, without
@@ -186,8 +205,7 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
     use astra_turn_core::context_sources::{
         AgentContext, EdgeProfile, ExternalSources, SessionContext, TurnState,
     };
-    use astra_turn_core::microcompact::ProviderCacheStrategy;
-    use astra_turn_core::pipeline_config::{PipelineConfig, ProviderCachePolicy};
+    use astra_turn_core::pipeline_config::PipelineConfig;
     use astra_turn_core::pipeline_session::{AdaptiveTurnInput, PipelineSession};
 
     // Build ExternalSources from bridge-side signals. Tool-dependent prompt
@@ -207,22 +225,6 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
         if text.is_empty() { None } else { Some(text) }
     };
     let tool_guidance = prompts::low_confidence_tool_selection_section(confidence);
-    let mut profile_parts = Vec::new();
-    if let Some(cwd) = edge_profile_cwd {
-        profile_parts.push(format!("cwd: {cwd}"));
-    }
-    if let Some(branch) = edge_profile_git_branch {
-        profile_parts.push(format!("git_branch: {branch}"));
-    }
-    let profile_desc = if profile_parts.is_empty() {
-        None
-    } else {
-        Some(format!(
-            "\n\n# Project Profile\n{}",
-            profile_parts.join("\n")
-        ))
-    };
-
     // ASTRA_OUTPUT_STYLE is a user preference — stable within a session
     // (user doesn't toggle styles mid-session). Route to stable lane.
     let mut stable = extra_stable_sections.to_vec();
@@ -258,9 +260,7 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
         spill_dir: None,
         spill_backend: None,
 
-        profile_desc,
         effort_hint: None,
-        learned_context: None,
         system_override: None,
         plan_context: None,
         tool_guidance,
@@ -268,15 +268,18 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
         extra_dynamic_sections: volatile,
     };
 
-    let provider_policy = match provider {
-        "anthropic" | "bedrock" => ProviderCachePolicy::anthropic(),
-        _ => ProviderCachePolicy::openai_compatible(),
-    };
+    let provider_policy = provider_cache_policy_for(provider, model_id);
     let session_ctx = SessionContext {
         session_id: session_id.to_string(),
         run_id: String::new(),
         model_id: model_id.to_string(),
-        model_limit: 200_000, // generous — bridge doesn't track per-model limits here
+        // Resolve the true per-model context window via the shared
+        // `budget_for_model` table. Previously hardcoded to 200_000, which
+        // severely under-reported budget pressure on 32K/8K-window models
+        // and delayed compaction until the provider returned a
+        // context-length error.
+        model_limit: u32::try_from(crate::prompts::budget_for_model(Some(model_id)).model_limit)
+            .unwrap_or(u32::MAX),
         provider_policy: provider_policy.clone(),
         provider_strategy: ProviderCacheStrategy::default(),
         project_context: project_context.unwrap_or("").to_string(),
@@ -558,9 +561,16 @@ pub(crate) fn apply_anthropic_cache_metadata(
     //    must stay in the cache_edits list across turns) stay here
     //    because the pin map is keyed by session_id and outlives any
     //    single request.
+    //
+    // Order matters: `collect_cleared_tool_result_refs` inspects string
+    // content, but `annotate_last_message_cache_breakpoint` on a tool
+    // message with string content wraps it into a `tool_result` block
+    // (commit 5b69039a, required because Anthropic rejects message-level
+    // `cache_control` on tool messages). So collection runs first — before
+    // the breakpoint annotation rewrites content shape.
+    let new_deletes = collect_cleared_tool_result_refs(messages);
     astra_turn_core::context_serializer::annotate_last_message_cache_breakpoint(messages);
 
-    let new_deletes = collect_cleared_tool_result_refs(messages);
     let pinned_deletes = pin_and_merge_cache_edits(session_id, &new_deletes);
     astra_turn_core::context_serializer::insert_cache_edits_block(messages, &pinned_deletes);
     astra_turn_core::context_serializer::annotate_tool_result_cache_references(messages);
@@ -639,11 +649,20 @@ fn clear_anthropic_cache_edit_pins_for_tests(session_id: &str) {
     }
 }
 
+/// Process-wide mutex guarding any test that mutates env vars read by the
+/// prompt-cache pipeline (`ASTRA_TEST_PROMPT_CACHE_DISABLED`,
+/// `ASTRA_OUTPUT_STYLE`, etc.). Exposed at module scope so sibling test
+/// modules (`bridge_inprocess::tests`) share the same lock — otherwise
+/// two independent mutexes race to the same `std::env::set_var` and a
+/// panic in one poisons the other's tests. Recover from poison on lock
+/// acquire; test panics carry their own failure and should not cascade.
+#[cfg(test)]
+pub(crate) static CACHE_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
+    use super::CACHE_ENV_MUTEX;
     use super::*;
-
-    static CACHE_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Safe wrapper for `std::env::set_var` in single-threaded tests guarded by `CACHE_ENV_MUTEX`.
     fn set_test_env(key: &str, val: &str) {
@@ -767,7 +786,7 @@ mod tests {
         // schemas from a single helper call instead of re-deriving them via
         // `compaction_tier_calibrated` + `tool_schema_prune::prune_tool_schemas`
         // at two downstream sites. Lock that contract in.
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         remove_test_env("ASTRA_OUTPUT_STYLE");
         let cache_cfg = PromptCacheConfig {
             cache_enabled: false,
@@ -822,7 +841,7 @@ mod tests {
 
     #[test]
     fn bridge_pipeline_outcome_routes_memory_entries_through_pipeline() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         remove_test_env("ASTRA_OUTPUT_STYLE");
         let cache_cfg = PromptCacheConfig {
             cache_enabled: false,
@@ -868,7 +887,7 @@ mod tests {
 
     #[test]
     fn bridge_pipeline_routes_low_confidence_warning_to_dynamic_message() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         remove_test_env("ASTRA_OUTPUT_STYLE");
         let cache_cfg = PromptCacheConfig {
             cache_enabled: false,
@@ -903,21 +922,16 @@ mod tests {
             .and_then(|msg| msg.get("content"))
             .and_then(Value::as_str)
             .unwrap_or_default();
+        // `## Self-Model` was the assertion target before commit a1187f76
+        // emptied `self_model_section`; the section no longer appears at
+        // all, so only the low-confidence warning is asserted now.
         assert!(
             !primary_text.contains("Low-Confidence Tool Selection"),
             "per-turn selector confidence must not enter cached prefix: {primary_text}"
         );
         assert!(
-            !primary_text.contains("## Self-Model"),
-            "selected-tool self model must not enter cached prefix: {primary_text}"
-        );
-        assert!(
             dynamic_text.contains("Low-Confidence Tool Selection"),
             "low confidence warning should be post-cache RuntimeVolatile: {dynamic_text}"
-        );
-        assert!(
-            dynamic_text.contains("## Self-Model"),
-            "selected-tool self model should be post-cache RuntimeVolatile: {dynamic_text}"
         );
     }
 
@@ -925,7 +939,7 @@ mod tests {
 
     #[test]
     fn pipeline_assembly_anthropic_emits_multi_block_with_cache_control() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         remove_test_env("ASTRA_OUTPUT_STYLE");
         let cache_cfg = PromptCacheConfig {
             cache_enabled: true,
@@ -966,7 +980,7 @@ mod tests {
 
     #[test]
     fn pipeline_assembly_openai_splits_stable_and_dynamic() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         remove_test_env("ASTRA_OUTPUT_STYLE");
         let cache_cfg = PromptCacheConfig {
             cache_enabled: false,
@@ -1005,7 +1019,7 @@ mod tests {
     /// rules flow through `extra_dynamic_sections` into the final system prompt.
     #[test]
     fn pipeline_assembly_carries_extra_dynamic_sections_through() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         remove_test_env("ASTRA_OUTPUT_STYLE");
         let cache_cfg = PromptCacheConfig {
             cache_enabled: true,
@@ -1056,7 +1070,7 @@ mod tests {
         // produce identical system message bytes (no HashMap drift, no
         // time-based IDs, no non-determinism). Holds `CACHE_ENV_MUTEX` so
         // a concurrent test can't mutate `$ASTRA_OUTPUT_STYLE` mid-run.
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         remove_test_env("ASTRA_OUTPUT_STYLE");
         let cache_cfg = PromptCacheConfig {
             cache_enabled: true,
@@ -1092,7 +1106,7 @@ mod tests {
     /// markers from the anthropic system message. Ports the intent of the
     #[test]
     fn pipeline_assembly_cache_disabled_strips_all_markers() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         remove_test_env("ASTRA_OUTPUT_STYLE");
         let cache_cfg = PromptCacheConfig {
             cache_enabled: false,
@@ -1140,7 +1154,7 @@ mod tests {
     /// pick up the override and surface `$ASTRA_OUTPUT_STYLE` in the output.
     #[test]
     fn pipeline_assembly_applies_prompt_overrides_and_output_style() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().expect("temp home");
         let prompts_dir = home.path().join(".astra").join("prompts");
         std::fs::create_dir_all(&prompts_dir).expect("prompts dir");
@@ -1192,7 +1206,7 @@ mod tests {
     /// rather than caching stale bytes).
     #[test]
     fn pipeline_assembly_picks_up_override_file_changes() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().expect("temp home");
         let prompts_dir = home.path().join(".astra").join("prompts");
         std::fs::create_dir_all(&prompts_dir).expect("prompts dir");
@@ -1243,7 +1257,7 @@ mod tests {
     /// stable/volatile split it lives in the Session-scoped primary block.
     #[test]
     fn pipeline_assembly_picks_up_output_style_changes() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().expect("temp home");
         set_test_env("HOME", home.path().to_str().unwrap());
 
@@ -1346,7 +1360,7 @@ mod tests {
 
     #[test]
     fn latch_enables_anthropic_style_cache_for_bedrock_claude() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         remove_test_env("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         let cfg = PromptCacheConfig::latch("bedrock", "anthropic.claude-sonnet-4-20250514-v1:0");
         assert!(cfg.cache_enabled);
@@ -1355,11 +1369,37 @@ mod tests {
 
     #[test]
     fn latch_keeps_non_claude_bedrock_on_openai_style_cache() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         remove_test_env("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         let cfg = PromptCacheConfig::latch("bedrock", "us.amazon.nova-micro-v1:0");
         assert!(cfg.cache_enabled);
         assert!(!cfg.is_anthropic);
+    }
+
+    #[test]
+    fn bridge_provider_policy_keeps_non_claude_bedrock_prefix_only() {
+        let policy = provider_cache_policy_for("bedrock", "us.amazon.nova-micro-v1:0");
+
+        assert_eq!(
+            policy.protocol,
+            astra_turn_core::microcompact::PromptCacheProtocol::Prefix,
+            "non-Claude Bedrock models must not receive Anthropic cache_control markers"
+        );
+        assert_eq!(policy.max_markers, 0);
+        assert!(!policy.supports_global_scope);
+    }
+
+    #[test]
+    fn bridge_provider_policy_enables_anthropic_for_bedrock_claude() {
+        let policy =
+            provider_cache_policy_for("bedrock", "anthropic.claude-sonnet-4-20250514-v1:0");
+
+        assert_eq!(
+            policy.protocol,
+            astra_turn_core::microcompact::PromptCacheProtocol::AnthropicCacheControl
+        );
+        assert!(policy.max_markers > 0);
+        assert!(policy.supports_global_scope);
     }
 
     #[test]

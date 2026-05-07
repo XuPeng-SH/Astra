@@ -14,7 +14,6 @@ use astra_turn_core::context_sources::{
     EdgeProfile, ExternalSources, MemoryEntry, SessionContext, TurnState,
 };
 use astra_turn_core::microcompact::ProviderCacheStrategy;
-use astra_turn_core::pipeline_config::ProviderCachePolicy;
 use astra_turn_core::recovery_state::RecoveryState;
 use astra_turn_core::token_accounting::TokenAccounting;
 
@@ -58,22 +57,23 @@ pub(crate) fn build_external_sources(
         if text.is_empty() { None } else { Some(text) }
     };
 
-    // 3. Profile description
-    let mut profile_parts = Vec::new();
-    if let Some(cwd) = edge_profile.get("cwd").and_then(Value::as_str) {
-        profile_parts.push(format!("cwd: {cwd}"));
-    }
-    if let Some(branch) = edge_profile.get("git_branch").and_then(Value::as_str) {
-        profile_parts.push(format!("git_branch: {branch}"));
-    }
-    let profile_desc = if profile_parts.is_empty() {
-        None
-    } else {
-        Some(format!(
-            "\n\n# Project Profile\n{}",
-            profile_parts.join("\n")
-        ))
-    };
+    // 3. Environment context — routed split by cache volatility.
+    //    Static (Platform/Shell/CWD/Home) → RuntimeIdentity (Session cache).
+    //    Volatile (git branch dirty / diff / commits) → RuntimeVolatile.
+    //    The legacy `# Project Profile\ncwd:/git_branch:` Markdown block
+    //    has been dropped: bind_runtime_identity already emits typed
+    //    `Model: / CWD: / Branch:` lines from SessionContext, so
+    //    re-emitting cwd/branch as a second header was pure duplicate.
+    let env_static = edge_profile
+        .get("environment_static")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let env_volatile = edge_profile
+        .get("environment_volatile")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
 
     // 4. Effort/agent_type hint
     let effort_hint = {
@@ -189,25 +189,41 @@ pub(crate) fn build_external_sources(
             })
     });
 
+    // Environment context — the static half sits in the Session cache,
+    // the volatile half (git state) rides the None-scope lane.
+    let extra_stable_sections: Vec<crate::prompts::PromptSection> = env_static
+        .into_iter()
+        .map(|text| {
+            crate::prompts::PromptSection::dynamic(
+                text,
+                crate::prompts::PromptTokenBucket::Environment,
+            )
+        })
+        .collect();
+    if let Some(text) = env_volatile {
+        extra_dynamic_sections.push(crate::prompts::PromptSection::dynamic(
+            text,
+            crate::prompts::PromptTokenBucket::Environment,
+        ));
+    }
+
     ExternalSources {
         memory_entries,
         spill_dir: None,
         spill_backend,
 
-        profile_desc,
         effort_hint,
-        learned_context: None,
+        // learned_context intentionally flows through extra_dynamic_sections
+        // (volatile lane) rather than ExternalSources.
         system_override,
         plan_context,
         tool_guidance,
-        // Adapter path (ServerAgenticLoopHost) doesn't use the bridge's
-        // stable-lane escape hatch — session-stable signals have typed
-        // fields above.
-        extra_stable_sections: Vec::new(),
-        // Volatile lane: the per-turn skill-listing shortlist. Turn-varying
-        // by design (content depends on current user message). Kept in
-        // None scope via RuntimeVolatile so it doesn't invalidate the
-        // cached prefix.
+        // Adapter path (ServerAgenticLoopHost) puts environment_static
+        // here so it lands in the cached Session prefix.
+        extra_stable_sections,
+        // Volatile lane: environment_volatile (git state), learned
+        // context, skill listing. None-scope so churn doesn't invalidate
+        // the cached prefix.
         extra_dynamic_sections: {
             extra_dynamic_sections.extend(learned_context_section);
             extra_dynamic_sections.extend(skill_listing_extra);
@@ -338,7 +354,7 @@ pub(crate) fn build_session_context(
     provider: &str,
     project_context: Option<&str>,
 ) -> SessionContext {
-    let provider_policy = provider_policy_for(provider, model_name);
+    let provider_policy = super::prompt_cache::provider_cache_policy_for(provider, model_name);
     SessionContext {
         session_id: session_id.to_string(),
         run_id: run_id.unwrap_or_default().to_string(),
@@ -365,24 +381,6 @@ pub(crate) fn build_session_context(
         },
         self_model: None,
     }
-}
-
-/// Map a provider name to its cache policy.
-///
-/// Anthropic-family providers use `cache_control` markers; everyone else gets
-/// prefix-only caching. Bedrock is provider-multiplexed, so it must opt in only
-/// for Claude model IDs rather than all `provider=bedrock` traffic.
-fn provider_policy_for(provider: &str, model_name: &str) -> ProviderCachePolicy {
-    match provider {
-        "anthropic" => ProviderCachePolicy::anthropic(),
-        "bedrock" if is_bedrock_claude_model(model_name) => ProviderCachePolicy::anthropic(),
-        _ => ProviderCachePolicy::openai_compatible(),
-    }
-}
-
-fn is_bedrock_claude_model(model_name: &str) -> bool {
-    let model = model_name.to_ascii_lowercase();
-    model.contains("anthropic.claude")
 }
 
 #[cfg(test)]
@@ -631,21 +629,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn selected_tool_guidance_is_volatile() {
-        let ep = serde_json::Map::new();
-        let state = make_state();
-        let sources = build_external_sources(&ep, &state, "hi", &["bash"], 0.8, None);
-
-        let dynamic_text: String = sources
-            .extra_dynamic_sections
-            .iter()
-            .map(|section| section.text.as_str())
-            .collect();
-        // self_model_text and tool_conditional fields removed — volatile content routes to extra_dynamic_sections only
-        assert!(dynamic_text.contains("## Self-Model"));
-        assert!(dynamic_text.contains("Explicit Tool Requests"));
-    }
+    // `selected_tool_guidance_is_volatile` was deleted: it asserted on
+    // `## Self-Model` + `Explicit Tool Requests` strings that originated
+    // from the now-empty `self_model_section` / `tool_conditional_section`
+    // bodies (commit a1187f76). The volatile-lane routing contract is
+    // covered by the composite integration tests below.
 
     #[test]
     fn external_sources_empty_memory_when_edge_profile_has_none() {
@@ -860,7 +848,8 @@ mod tests {
     #[test]
     fn composite_adapter_runtime_identity_sits_in_session_scope() {
         // The cache-locality contract: dynamic-but-session-stable content
-        // (cwd, git_branch, profile_desc, self_model_text, tool_conditional)
+        // Session-stable signals (cwd/git_branch typed fields,
+        // environment_static via extra_stable_sections, system_override)
         // must land in CacheScope::Session. The adapter packs these into
         // ExternalSources; the binder stitches them into RuntimeIdentity.
         // If adapter output drifts back to CacheScope::None, the 2nd cache

@@ -91,14 +91,21 @@ impl TokenBudget {
 
         let allocated: u32 = allocations.values().sum();
         let remaining = effective_limit.saturating_sub(allocated);
-        let remainder_kinds = [
-            SectionKind::SelfModel,
-            SectionKind::Skills,
-            SectionKind::ProjectContext,
-            SectionKind::WorkingMemory,
-            SectionKind::RuntimeIdentity,
-            SectionKind::RuntimeVolatile,
-        ];
+        // Enumerate remainder kinds via `SectionKind::all_planned()` so adding
+        // a new variant is a compile error at the enum site (via the
+        // exhaustive match in `SectionKind::is_preallocated`) rather than a
+        // silent budget-zero drop at runtime.
+        let remainder_kinds: Vec<SectionKind> = SectionKind::all_planned()
+            .iter()
+            .copied()
+            .filter(|k| !k.is_preallocated())
+            .collect();
+        if remainder_kinds.is_empty() {
+            return Self {
+                effective_limit,
+                allocations,
+            };
+        }
         let base = remaining / remainder_kinds.len() as u32;
         let mut extra = remaining % remainder_kinds.len() as u32;
         for kind in remainder_kinds {
@@ -296,6 +303,28 @@ mod tests {
     fn budget_without_history_does_not_allocate_history() {
         let budget = TokenBudget::allocate(100_000, CompactionTier::Normal, &HashMap::new());
         assert_eq!(budget.budget_for(SectionKind::History), 0);
+    }
+
+    #[test]
+    fn budget_does_not_allocate_emergent_zero_budget_sections() {
+        let budget = TokenBudget::allocate(100_000, CompactionTier::Normal, &HashMap::new());
+
+        for kind in [
+            SectionKind::EmergentSkills,
+            SectionKind::EmergentMemory,
+            SectionKind::EmergentSummary,
+        ] {
+            assert_eq!(
+                budget.budget_for(kind),
+                0,
+                "{kind:?} is emitted by the planner with estimated_tokens=0, so it must not consume remainder budget"
+            );
+        }
+        assert_eq!(
+            budget.total_allocated(),
+            budget.effective_limit,
+            "usable planned sections should receive the full effective limit"
+        );
     }
 
     #[test]

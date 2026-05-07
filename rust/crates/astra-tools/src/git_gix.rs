@@ -677,6 +677,17 @@ pub fn git_log(project_root: &Path, args: &Value) -> String {
 
 // ─── git_show ───────────────────────────────────────────────────────────────
 
+/// Show a single commit.
+///
+/// Accepts `commit` (preferred) or `ref` (legacy alias). When neither is
+/// provided, defaults to `HEAD` — this is intentional UX for interactive
+/// callers ("show me the last commit"). Callers that require the caller
+/// to always pass an explicit ref must validate the args themselves
+/// *before* reaching this function; `git_show` treats missing ref as a
+/// successful request for `HEAD`, not as an error.
+///
+/// Range syntax (`A..B`) is rejected with a helpful error suggesting
+/// `git_diff` instead.
 pub fn git_show(
     project_root: &Path,
     args: &Value,
@@ -694,14 +705,11 @@ pub fn git_show(
         Err(e) => return e,
     };
 
-    let commit_ref = match args
+    let commit_ref = args
         .get("commit")
         .or_else(|| args.get("ref"))
         .and_then(Value::as_str)
-    {
-        Some(c) => c,
-        None => return "Error: missing 'commit' (SHA, branch, or tag)".to_string(),
-    };
+        .unwrap_or("HEAD");
 
     // Reject range syntax — git_show is for a single commit, suggest git diff
     if commit_ref.contains("..") {
@@ -1199,6 +1207,13 @@ pub fn git_diff(
                 if let Err(e) = reject_shell_meta(tip) {
                     return format!("Error: invalid tip ref in range: {e}");
                 }
+            } else {
+                // Defensive: contains("..") was true but split_once failed.
+                // Should be unreachable, but must not silently pass a malformed
+                // ref to the CLI (defence-in-depth for shell-injection guard).
+                return format!(
+                    "Error: malformed range ref '{ref_str}' — expected 'A..B' or 'A...B'"
+                );
             }
             let mut cli_args = vec!["diff", ref_str, "--no-ext-diff", "--no-color"];
             if let Some(p) = path_filter {
@@ -2631,10 +2646,14 @@ mod tests {
     }
 
     #[test]
-    fn git_show_missing_commit() {
+    fn git_show_missing_commit_defaults_to_head() {
         let root = repo_root();
         let result = git_show(&root, &json!({}), 0.0, 0);
-        assert!(result.contains("Error: missing"));
+        // Without explicit commit/ref, defaults to HEAD (same as `git show`)
+        assert!(
+            result.contains("commit ") || result.contains("Author:"),
+            "empty args should default to HEAD, got: {result}"
+        );
     }
 
     #[test]
@@ -3880,6 +3899,35 @@ mod tests {
         assert!(
             result.contains("Unknown git action"),
             "unknown action must produce error: {result}"
+        );
+    }
+
+    #[test]
+    fn consolidated_git_show_without_ref_defaults_to_head() {
+        // Regression: LLM calls `git(action="show")` without ref param.
+        // Before fix: "Error: missing 'commit' (SHA, branch, or tag)"
+        // After fix: shows HEAD commit (same as CLI `git show`).
+        let root = repo_root();
+        let result = super::git_dispatch(&root, &json!({"action": "show"}));
+        assert!(
+            result.contains("commit ") && result.contains("Author:"),
+            "git show without ref must default to HEAD, got: {result}"
+        );
+        // Must not START with "Error:" — commit message body may
+        // contain the word "Error" but that's not a tool failure.
+        assert!(
+            !result.starts_with("Error:"),
+            "must not return error when ref omitted, got: {result}"
+        );
+    }
+
+    #[test]
+    fn consolidated_git_show_with_ref_works() {
+        let root = repo_root();
+        let result = super::git_dispatch(&root, &json!({"action": "show", "ref": "HEAD"}));
+        assert!(
+            result.contains("commit ") && result.contains("Author:"),
+            "git show with ref=HEAD must work, got: {result}"
         );
     }
 

@@ -281,205 +281,21 @@ fn tool_error_recovery_section() -> &'static str {
      - **Unknown tool**: check get_agent_info for available tools. Do NOT invent tool names.\n"
 }
 
-/// Self-model (tool list). Session-scoped — changes when tool set changes.
-pub(crate) fn self_model_section(tool_names: &[&str]) -> String {
-    format!(
-        "\n## Self-Model\nTools: {}\n\
-         Refer to 'Runtime Identity' below for model, session, and environment details.\n",
-        tool_names.join(", ")
-    )
+/// Self-model (tool list). Removed — tool names are already visible in the
+/// tools array schema. Listing them again wastes ~200 tokens per turn.
+pub(crate) fn self_model_section(_tool_names: &[&str]) -> String {
+    String::new()
 }
 
-type MemoryPromptMode = astra_prompts::memory_types::MemoryPromptMode;
-
-fn memory_prompt_mode(tool_names: &[&str], profile_desc: &str) -> MemoryPromptMode {
-    let has_memory_store = tool_names.contains(&"memory_store");
-    let has_memory_ops = tool_names.iter().any(|name| {
-        matches!(
-            *name,
-            "memory_retrieve"
-                | "memory_search"
-                | "memory_correct"
-                | "memory_purge"
-                | "memory_profile"
-        )
-    });
-    let has_user_memories = profile_desc.contains("## User Memories");
-
-    if !has_memory_store && !has_memory_ops {
-        MemoryPromptMode::None
-    } else if has_memory_ops || has_user_memories {
-        MemoryPromptMode::Full
-    } else {
-        MemoryPromptMode::Minimal
-    }
-}
-
-/// Tool-conditional guidance (git, code nav, editing, build/test, memory, etc.).
-/// Session-scoped — depends on which tools are selected.
+/// Tool-conditional guidance. Removed — tool descriptions in the schema already
+/// contain usage guidance. This section was duplicating schema content and
+/// wasting ~1000 tokens per turn. Returns empty string.
 pub(crate) fn tool_conditional_section(
-    tool_names: &[&str],
-    profile_desc: &str,
+    _tool_names: &[&str],
+    _profile_desc: &str,
     _selection_confidence: f64,
 ) -> String {
-    let memory_mode = memory_prompt_mode(tool_names, profile_desc);
-    let has_github = tool_names.iter().any(|n| n.starts_with("github"));
-    let has_git = tool_names.iter().any(|n| n.starts_with("git_"));
-    let has_spawn_agent = tool_names.contains(&"spawn_agent");
-    let has_delegate = tool_names.contains(&"delegate");
-    let has_code_nav = tool_names.contains(&"find_definition")
-        || tool_names.contains(&"find_references")
-        || tool_names.contains(&"lsp");
-    let has_call_graph = tool_names.contains(&"call_graph");
-    let has_multi_edit = tool_names.contains(&"multi_edit");
-    let has_build_test = tool_names.contains(&"run_build_test");
-    let has_git_mutations = tool_names.contains(&"git_commit");
-    let has_git_revert = tool_names.contains(&"git_revert_commit");
-    let has_git_worktree = tool_names.contains(&"git_worktree");
-    let has_session_state_rollback = tool_names.contains(&"rollback_session_state");
-    let has_turn_rollback = tool_names.contains(&"rollback_turn_actions");
-
-    let mut s = String::new();
-
-    if tool_names.contains(&"bash") {
-        s.push_str(
-            "\n## Explicit Tool Requests\n\
-             - If the user explicitly asks to use `bash`, call the `bash` tool rather than substituting file/navigation tools. Batch safe shell steps with `&&`.\n",
-        );
-    }
-
-    if has_git || has_github {
-        s.push_str(
-            "7. Git/GitHub: use git_status, git_diff (stat_only:true ≈ `git diff --stat`), git_show, git_log, github_* for SINGLE operations.\n\
-             For COMPOUND git operations (e.g., log + diff + show in one step), prefer bash with && chaining: `git log -1 --format='%H %s' && git diff HEAD~1`.\n",
-        );
-    }
-    if has_github {
-        s.push_str(
-            "8. For GitHub data: use github_list_prs / github_list_issues / github_repo_stats directly.\n",
-        );
-    }
-    if has_spawn_agent && !has_delegate {
-        s.push_str(
-            "\n## Sub-agents\n\
-             - Use `spawn_agent` for sub-agent work.\n\
-             - Do NOT call `delegate` unless it appears in the current tool list — it is an internal, conditional tool in some runtimes.\n",
-        );
-    }
-    if has_delegate {
-        s.push_str(
-            "\n## Delegation\n\
-             Use `delegate` when the user asks for multi-agent help (e.g., \"have agents help me\", \"让多个agent帮我\", \"并行分析\"):\n\
-             - **fan_out**: Parallel execution for independent tasks (default when agents >1).\n\
-             - **sequential**: Agents run one by one, each seeing prior outputs.\n\
-             - **pipeline**: Each agent's output becomes the next's input.\n\
-             - **adversarial**: Producer + reviewer iterate until consensus.\n\
-             Available agents: 'coder' (code tasks), 'reviewer' (code review), 'writer' (docs).\n\
-             Example: delegate(task=\"analyze auth module\", agents=[\"coder\", \"reviewer\"], pattern=\"adversarial\")\n",
-        );
-    }
-    if has_code_nav {
-        s.push_str(
-            "\n## Code Navigation\n\
-             - **find_definition**: Where a symbol is defined. tree-sitter AST — more accurate than grep.\n\
-             - **find_references**: All usages of a symbol. Use `kind` (definition/import/call/usage) to filter.\n\
-             - **symbols**: File outline. Use `calls=true` to see what each function calls inline.\n\
-             Use these BEFORE grep for code symbols. They understand syntax, grep doesn't.\n",
-        );
-    }
-    if has_call_graph {
-        s.push_str(
-            "- **call_graph**: Call relationships. `callers=true` finds who calls a function. `scope='project'` searches cross-file.\n",
-        );
-    }
-    if tool_names.contains(&"rename_symbol") {
-        s.push_str(
-            "- **rename_symbol**: Rename across project. AST-validated, skips comments/strings. dry_run=true previews.\n",
-        );
-    }
-    if tool_names.contains(&"dead_code") {
-        s.push_str("- **dead_code**: Find unused symbols before cleanup.\n");
-    }
-    if tool_names.contains(&"extract_members") {
-        s.push_str(
-            "- **extract_members**: Struct/class/enum fields+methods. Point at any line inside.\n",
-        );
-    }
-    if tool_names.contains(&"type_hierarchy") {
-        s.push_str("- **type_hierarchy**: Who implements trait / what traits a type has.\n");
-    }
-    if tool_names.contains(&"lsp") {
-        s.push_str(
-            "- **lsp**: Prefer this for symbol-aware navigation, autocomplete, quick fixes, auto-imports, signature help, diagnostics, rename/code actions, code lenses, and other follow-up actions that grep cannot infer. Advanced editor-rendering operations such as document highlights/links, inlay hints, folding ranges, colors, semantic tokens, selection ranges, and linked editing are available but usually lower ROI unless the task explicitly needs IDE-style rendering details. Use `action_index` to apply a chosen code action, `item_index` to resolve or execute/apply a returned completion or code lens, and `dry_run=false` only for supported write operations. On Rust files, `code_lenses` first use native rust-analyzer Run/Debug lenses from `textDocument/codeLens`; if those come back empty, they can still fall back to rust-analyzer runnables. Rust hover can also include runnable action links on symbols like tests when the server provides them. Rust signature help can include precise parameter label offsets, Rust completions now expose richer postfix/snippet-style candidates when the server provides them, Rust diagnostics can use standard `textDocument/diagnostic` pull results when available, and Rust code actions can surface real assists such as import fixes. Both code-lens paths support `item_index` + `dry_run=false` execution.\n",
-        );
-    }
-    if has_multi_edit {
-        s.push_str(
-            "\n## Editing Strategy\n\
-             - Use **multi_edit** for multiple related changes to one file — it's atomic (all-or-nothing) and more token-efficient than sequential str_replace.\n\
-             - Use **str_replace(dry_run=true)** to preview changes before applying. Great for complex edits where you want to verify first.\n\
-             - Use **delete_file** to remove files (safe: refuses .git/, directories, paths outside project root).\n\
-             - For risky refactors: dry_run first → review diff → apply if correct.\n",
-        );
-    }
-    if has_build_test {
-        s.push_str(
-            "\n## Build & Test Loop\n\
-             - Use **run_build_test** instead of bash for build/test commands. It returns structured errors WITH source context.\n\
-             - Each error shows: 🔧 Trivial (mechanical fix), 🔨 Fixable (needs reasoning), or Complex.\n\
-             - Errors include 💡 hints — follow them for quick resolution.\n\
-             - Each error location includes surrounding code — fix directly with str_replace, no extra read_file needed.\n\
-             - ⚡ Cascading errors: when the tool says \"fix root cause FIRST\", do that — downstream errors often resolve automatically.\n\
-             - If >3 errors in the same file, fix the FIRST one — later errors are often cascading.\n\
-             - Set **auto_fix: true** for trivial fixes (unused imports/vars). The tool auto-applies high-confidence fixes and re-runs (max 3 iterations).\n\
-             - Auto-fix aborts on regression (more errors after fix) and reverts the offending changes automatically.\n\
-             - Set **report_only: true** to preview what auto-fix would do without applying — useful for checking before committing.\n\
-             - After fixing, call run_build_test again with the SAME command. The tool tracks iterations:\n\
-             - It shows ✅ Fixed, 🆕 New, ⏳ Persistent errors — use this to gauge your fix progress.\n\
-             - If you see ⚠ REGRESSION (more errors after your fix), revert the change and try a different approach.\n\
-             - Repeat until clean. Aim to fix ALL errors, not just the first one.\n",
-        );
-    }
-    if has_git_mutations || has_git_worktree {
-        s.push_str(
-            "\n## Git Workflow\n\
-             - Use **git_commit** to commit changes (stages automatically). Write clear, concise commit messages.\n\
-             - Use **git_stash** push/apply/pop to save and restore work-in-progress.\n\
-             - Use **git_checkout_file** to revert a file to its last committed state if an edit goes wrong.\n\
-             - Commit after each logical milestone — don't accumulate too many uncommitted changes.\n",
-        );
-        if has_git_revert {
-            s.push_str(
-                "             - Use **git_revert_commit** with a captured commit_sha to create a compensating revert commit when rolling back a dedicated git_commit.\n",
-            );
-        }
-        if has_git_worktree {
-            if has_turn_rollback {
-                s.push_str(
-                    "             - Use **git_worktree** for isolated parallel branch work; clean worktrees created by `enter`/`add` can participate in `rollback_turn_actions`, but explicit `remove` or `exit_action=remove` is still the destructive manual boundary once that worktree has diverged.\n",
-                );
-            }
-        }
-    }
-    if has_session_state_rollback {
-        s.push_str(
-            "\n## Session-State Rollback\n\
-             - Use **rollback_session_state** to restore bounded self-mod or task mutations from the current turn (or inspect recorded handles with `scope=list`).\n\
-",
-        );
-        if has_turn_rollback {
-            s.push_str(
-                "             - `rollback_turn_actions` now also includes recorded session-state mutations alongside file/database/git rollback journals for mixed-turn recovery.\n",
-            );
-        }
-    }
-    {
-        let memory_section = astra_prompts::memory_types::build_memory_prompt(memory_mode);
-        if !memory_section.is_empty() {
-            s.push_str(&memory_section);
-        }
-    }
-    s
+    String::new()
 }
 
 /// Per-turn advisory for tool-selector uncertainty.
@@ -1689,50 +1505,17 @@ mod tests {
         );
     }
 
-    #[test]
-    fn prompt_includes_tool_names() {
-        let p = build_main_system_prompt(&["bash", "git_diff"], "", 0.5, None);
-        assert!(p.contains("bash, git_diff"));
-    }
-
-    #[test]
-    fn prompt_includes_memory_rules_when_memory_tools_present() {
-        let p = build_main_system_prompt(&["memory_store", "memory_retrieve"], "", 0.5, None);
-        assert!(p.contains("Memory Rules"));
-        assert!(p.contains("<types>"));
-        assert!(p.contains("<name>user</name>"));
-    }
-
-    #[test]
-    fn prompt_memory_search_alias_triggers_full_mode() {
-        let p = build_main_system_prompt(&["memory_store", "memory_search"], "", 0.5, None);
-        assert!(
-            p.contains("<types>"),
-            "memory_search (server-side alias) must trigger Full mode with type taxonomy"
-        );
-    }
-
-    #[test]
-    fn prompt_memory_store_only_uses_minimal_rules() {
-        let p = build_main_system_prompt(&["memory_store"], "", 0.5, None);
-        assert!(p.contains("Memory Rules"));
-        assert!(p.contains("Do NOT ask"));
-        assert!(
-            !p.contains("<types>"),
-            "minimal mode should not include type taxonomy"
-        );
-    }
+    // Tests for `## Self-Model\nTools: ...` list, `## Memory Rules` /
+    // `<types>` taxonomy, and `GitHub data` / `memory_store` guidance
+    // were deleted: those Markdown sections were emitted by
+    // `self_model_section` / `tool_conditional_section`, which are now
+    // no-ops (commit a1187f76 — the tools array schema already carries
+    // that guidance per-tool).
 
     #[test]
     fn prompt_no_memory_rules_without_memory_tools() {
         let p = build_main_system_prompt(&["bash", "git_diff"], "", 0.5, None);
         assert!(!p.contains("Memory Rules"));
-    }
-
-    #[test]
-    fn prompt_includes_github_rules_when_github_tools_present() {
-        let p = build_main_system_prompt(&["github_list_prs", "github_list_issues"], "", 0.5, None);
-        assert!(p.contains("GitHub data"));
     }
 
     #[test]
@@ -1891,33 +1674,12 @@ mod tests {
     }
 
     #[test]
-    fn prompt_honors_explicit_bash_requests() {
-        let p = build_main_system_prompt(&["bash", "read_file", "list_dir"], "", 0.5, None);
-        assert!(p.contains("If the user explicitly asks to use `bash`"));
-        assert!(p.contains("rather than substituting file/navigation tools"));
-    }
-
-    #[test]
     fn prompt_bounds_runaway_file_exploration() {
         let p = build_main_system_prompt(&["bash", "read_file", "list_dir"], "", 0.5, None);
         assert!(p.contains("Runaway Exploration Guard"));
         assert!(p.contains("\"as many as you can\""));
         assert!(p.contains("2 directory listings and 2 file reads"));
         assert!(p.contains("busy-loop"));
-    }
-
-    #[test]
-    fn prompt_git_tool_guidance_for_compound_ops() {
-        let p = build_main_system_prompt(&["git_diff", "git_log", "bash"], "", 0.5, None);
-        assert!(p.contains("git_status, git_diff"));
-        assert!(p.contains("COMPOUND git operations"));
-    }
-
-    #[test]
-    fn prompt_prefers_spawn_agent_over_internal_delegate_when_delegate_absent() {
-        let p = build_main_system_prompt(&["spawn_agent", "bash"], "", 0.5, None);
-        assert!(p.contains("Use `spawn_agent`"));
-        assert!(p.contains("Do NOT call `delegate`"));
     }
 
     #[test]
@@ -2025,21 +1787,6 @@ mod tests {
         assert!(p.contains("CI status"));
     }
 
-    // ── Tool precedence guidance ──
-
-    #[test]
-    fn prompt_includes_tool_precedence() {
-        let p = build_main_system_prompt(&["bash"], "", 0.5, None);
-        assert!(p.contains("Tool Precedence"));
-        assert!(p.contains("File search"));
-        assert!(p.contains("Code edit"));
-        assert!(p.contains("Git"));
-        // Memory line only when memory tools present
-        assert!(!p.contains("Memory:"));
-        let p_mem = build_main_system_prompt(&["memory_store"], "", 0.5, None);
-        assert!(p_mem.contains("Memory"));
-    }
-
     #[test]
     fn prompt_includes_search_strategy_when_search_tools_present() {
         let p = build_main_system_prompt(&["glob", "grep", "read_file"], "", 0.5, None);
@@ -2053,31 +1800,6 @@ mod tests {
     fn prompt_omits_search_strategy_without_search_tools() {
         let p = build_main_system_prompt(&["bash"], "", 0.5, None);
         assert!(!p.contains("Search Strategy"));
-    }
-
-    // ── Enhanced memory rules ──
-
-    #[test]
-    fn prompt_memory_rules_include_dedup_and_negative() {
-        let p = build_main_system_prompt(&["memory_store", "memory_retrieve"], "", 0.5, None);
-        assert!(p.contains("memory_correct"));
-        assert!(p.contains("don't want"));
-        assert!(p.contains("What NOT to save"));
-    }
-
-    #[test]
-    fn prompt_user_memories_upgrade_memory_rules_to_full() {
-        let p = build_main_system_prompt(
-            &["memory_store"],
-            "\n## User Memories\nprefers Rust\n",
-            0.5,
-            None,
-        );
-        assert!(
-            p.contains("<types>"),
-            "User Memories should upgrade to full mode"
-        );
-        assert!(p.contains("memory_correct"));
     }
 
     // ── Task type count invariant ──
@@ -2109,52 +1831,11 @@ mod tests {
     }
 
     #[test]
-    fn code_nav_guidance_present_when_tools_available() {
-        let p = build_main_system_prompt(
-            &["find_definition", "find_references", "symbols"],
-            "",
-            0.5,
-            Some("implementation"),
-        );
-        assert!(
-            p.contains("Code Navigation"),
-            "should include code nav section"
-        );
-        assert!(
-            p.contains("find_definition"),
-            "should mention find_definition"
-        );
-        assert!(
-            p.contains("tree-sitter"),
-            "should mention tree-sitter advantage"
-        );
-    }
-
-    #[test]
     fn code_nav_guidance_absent_without_tools() {
         let p = build_main_system_prompt(&["bash", "read_file"], "", 0.5, Some("implementation"));
         assert!(
             !p.contains("Code Navigation"),
             "should NOT include code nav without tools"
-        );
-    }
-
-    #[test]
-    fn build_test_guidance_present_when_tool_available() {
-        let p = build_main_system_prompt(
-            &["run_build_test", "str_replace"],
-            "",
-            0.5,
-            Some("implementation"),
-        );
-        assert!(
-            p.contains("Build & Test Loop"),
-            "should include build/test section"
-        );
-        assert!(p.contains("run_build_test"), "should mention the tool");
-        assert!(
-            p.contains("structured errors"),
-            "should describe structured output"
         );
     }
 
@@ -2182,74 +1863,11 @@ mod tests {
     }
 
     #[test]
-    fn git_mutations_guidance_present_when_tools_available() {
-        let p = build_main_system_prompt(
-            &[
-                "git_commit",
-                "git_revert_commit",
-                "git_stash",
-                "git_checkout_file",
-                "git_worktree",
-            ],
-            "",
-            0.5,
-            Some("implementation"),
-        );
-        assert!(
-            p.contains("Git Workflow"),
-            "should include git workflow section"
-        );
-        assert!(p.contains("git_commit"), "should mention git_commit");
-        assert!(
-            p.contains("git_revert_commit"),
-            "should mention git_revert_commit"
-        );
-        assert!(p.contains("git_worktree"), "should mention git_worktree");
-        assert!(p.contains("git_stash"), "should mention git_stash");
-        assert!(
-            p.contains("git_checkout_file"),
-            "should mention git_checkout_file"
-        );
-    }
-
-    #[test]
     fn git_mutations_guidance_absent_without_tools() {
         let p = build_main_system_prompt(&["git_diff", "git_log"], "", 0.5, None);
         assert!(
             !p.contains("Git Workflow"),
             "should NOT include git mutations without commit tool"
-        );
-    }
-
-    #[test]
-    fn session_state_rollback_guidance_omits_turn_rollback_when_unavailable() {
-        let p = build_main_system_prompt(
-            &["rollback_session_state", "session"],
-            "",
-            0.5,
-            Some("implementation"),
-        );
-        assert!(
-            p.contains("Session-State Rollback"),
-            "should include session rollback section"
-        );
-        assert!(
-            !p.contains("rollback_turn_actions"),
-            "should not mention unavailable mixed-surface rollback tool"
-        );
-    }
-
-    #[test]
-    fn session_state_rollback_guidance_mentions_turn_rollback_when_available() {
-        let p = build_main_system_prompt(
-            &["rollback_session_state", "rollback_turn_actions", "session"],
-            "",
-            0.5,
-            Some("implementation"),
-        );
-        assert!(
-            p.contains("rollback_turn_actions"),
-            "should mention mixed-surface rollback when tool is available"
         );
     }
 
@@ -2360,10 +1978,11 @@ mod tests {
     }
 
     #[test]
-    fn sections_tool_dependent_guidance_is_none_scoped() {
-        // Tool-dependent guidance (code-nav, task-type strategies) sits in
-        // the None-scoped post-cache segment so it can vary per turn without
-        // invalidating the cached Global prefix.
+    fn sections_task_type_strategy_lands_in_none_scope() {
+        // Task-type strategy (e.g. Debugging Strategy) still routes to the
+        // None-scoped post-cache segment. `Code Navigation` guidance used
+        // to live there too but was emitted by `tool_conditional_section`,
+        // now a no-op.
         let tools = vec!["bash", "find_definition", "find_references", "git_commit"];
         let sections = build_system_prompt_sections(&tools, "", 0.8, Some("debugging"));
 
@@ -2372,10 +1991,6 @@ mod tests {
             .filter(|s| s.scope == CacheScope::None)
             .map(|s| s.text.as_str())
             .collect();
-        assert!(
-            post_cache_text.contains("Code Navigation"),
-            "code nav guidance should land in None-scoped (post-cache) segment"
-        );
         assert!(
             post_cache_text.contains("Debugging Strategy"),
             "task-type strategy should land in None-scoped (post-cache) segment"
@@ -2402,21 +2017,16 @@ mod tests {
     }
 
     #[test]
-    fn sections_to_string_contains_all_content() {
+    fn sections_to_string_contains_core_and_task_content() {
         let tools = vec!["bash", "read_file", "glob"];
         let profile = "cwd: /test\ngit_branch: main";
 
         let sections = build_system_prompt_sections(&tools, profile, 0.8, Some("implementation"));
         let result = sections_to_string(&sections);
 
-        // All key content should appear in the concatenated output
         assert!(
             result.contains(SYSTEM_PROMPT_BASE),
             "should contain identity"
-        );
-        assert!(
-            result.contains("bash, read_file, glob"),
-            "should contain tools"
         );
         assert!(result.contains("Core Rules"), "should contain core rules");
         assert!(
@@ -2498,40 +2108,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn prompt_rename_symbol_guidance_when_present() {
-        let p = build_main_system_prompt(&["rename_symbol"], "", 0.5, None);
-        assert!(p.contains("rename_symbol"));
-        assert!(p.contains("AST-validated"));
-        assert!(p.contains("dry_run=true"));
-    }
-
-    #[test]
-    fn prompt_dead_code_extract_members_type_hierarchy() {
-        let p = build_main_system_prompt(
-            &["dead_code", "extract_members", "type_hierarchy"],
-            "",
-            0.5,
-            None,
-        );
-        assert!(p.contains("dead_code"));
-        assert!(p.contains("Find unused symbols"));
-        assert!(p.contains("extract_members"));
-        assert!(p.contains("fields+methods"));
-        assert!(p.contains("type_hierarchy"));
-        assert!(p.contains("implements trait"));
-    }
-
     // ── Editing strategy (multi_edit) ────────────────────────────
-
-    #[test]
-    fn prompt_multi_edit_includes_editing_strategy() {
-        let p = build_main_system_prompt(&["multi_edit"], "", 0.5, None);
-        assert!(p.contains("Editing Strategy"));
-        assert!(p.contains("multi_edit"));
-        assert!(p.contains("atomic"));
-        assert!(p.contains("delete_file"));
-    }
 
     #[test]
     fn prompt_editing_strategy_absent_without_multi_edit() {
@@ -2568,31 +2145,6 @@ mod tests {
         );
     }
 
-    // ── git_ vs github_ tool distinction ─────────────────────────
-
-    #[test]
-    fn prompt_git_prefix_without_github_omits_github_rule() {
-        let p = build_main_system_prompt(&["git_diff", "git_log"], "", 0.5, None);
-        assert!(
-            p.contains("git_status, git_diff"),
-            "git_ prefix triggers tool preference"
-        );
-        assert!(
-            !p.contains("GitHub data"),
-            "should NOT have GitHub-specific rule without github_ tools"
-        );
-    }
-
-    #[test]
-    fn prompt_github_tools_trigger_both_rules() {
-        let p = build_main_system_prompt(&["github_list_prs"], "", 0.5, None);
-        assert!(p.contains("github_*"), "github_ triggers preference rule");
-        assert!(
-            p.contains("GitHub data"),
-            "github_ triggers GitHub-specific rule"
-        );
-    }
-
     // ── Profile desc in no-tools path ────────────────────────────
 
     #[test]
@@ -2611,53 +2163,6 @@ mod tests {
             result.is_empty(),
             "empty sections should produce empty string"
         );
-    }
-
-    // ── Code-nav guidance lives in the post-cache segment ────────────
-
-    #[test]
-    fn sections_all_code_nav_tools_appear_in_post_cache_segment() {
-        // Code-nav guidance references the active tool names, so it lives
-        // in the None-scoped post-cache segment (varies per turn with tool
-        // selection) rather than Session.
-        let tools = vec![
-            "find_definition",
-            "find_references",
-            "call_graph",
-            "rename_symbol",
-            "dead_code",
-            "extract_members",
-            "type_hierarchy",
-            "lsp",
-        ];
-        let sections = build_system_prompt_sections(&tools, "", 0.8, None);
-        let post_cache_text: String = sections
-            .iter()
-            .filter(|s| s.scope == CacheScope::None)
-            .map(|s| s.text.as_str())
-            .collect();
-        assert!(post_cache_text.contains("Code Navigation"));
-        assert!(post_cache_text.contains("call_graph"));
-        assert!(post_cache_text.contains("rename_symbol"));
-        assert!(post_cache_text.contains("dead_code"));
-        assert!(post_cache_text.contains("extract_members"));
-        assert!(post_cache_text.contains("type_hierarchy"));
-        assert!(post_cache_text.contains("lsp"));
-    }
-
-    #[test]
-    fn sections_lsp_alone_adds_code_navigation_guidance() {
-        let sections = build_system_prompt_sections(&["lsp"], "", 0.8, None);
-        let post_cache_text: String = sections
-            .iter()
-            .filter(|s| s.scope == CacheScope::None)
-            .map(|s| s.text.as_str())
-            .collect();
-        assert!(post_cache_text.contains("Code Navigation"));
-        assert!(post_cache_text.contains("item_index"));
-        assert!(post_cache_text.contains("action_index"));
-        assert!(post_cache_text.contains("quick fixes"));
-        assert!(post_cache_text.contains("autocomplete"));
     }
 
     // ── Empty-tools + empty-profile section behavior ─────────────

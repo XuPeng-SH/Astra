@@ -185,7 +185,9 @@ pub struct ExternalSources {
     /// with a lightweight `SpillReference` to free token budget.
     pub spill_backend: Option<std::sync::Arc<dyn crate::spill_backend::SpillBackend>>,
     /// Learned context from skill quality tracker / session history.
-    pub learned_context: Option<String>,
+    // NOTE: `learned_context` removed — the runtime adapter now emits it via
+    // `extra_dynamic_sections` (volatile lane) instead of a stable field.
+    // See crates/runtime/src/turn/context_pipeline_adapter.rs.
     /// Delegation system override (injected by orchestrator).
     pub system_override: Option<String>,
     /// Plan-in-progress reminder ("You are executing step 3 of 5...").
@@ -195,8 +197,6 @@ pub struct ExternalSources {
     /// Skill effort/agent_type hint ("effort: high", "agent: reviewer").
     pub effort_hint: Option<String>,
 
-    /// Project profile description (cwd, git_branch, project facts).
-    pub profile_desc: Option<String>,
     /// **Session-stable** pre-built sections — bridge-composed content
     /// that persists across turns (skill hint, accumulated feedback rules,
     /// self-awareness hint, any caller-composed static snippet).

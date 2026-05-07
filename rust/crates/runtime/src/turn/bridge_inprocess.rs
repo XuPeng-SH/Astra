@@ -1097,8 +1097,9 @@ impl InProcessChatTurnBridge {
 
             // Build LLM messages: system prompt + history + current messages + tool results
             let mut llm_messages: Vec<Value> = Vec::new();
-            // Memory is prefetched and injected into profile_desc.
-            // These track telemetry for the explain block.
+            // Memory is prefetched + routed through the typed Memory binder
+            // (extra_stable / extra_dynamic sections). Counters below track
+            // telemetry for the explain block.
             let mut memory_fetch_ms: i64 = 0;
             let mut memory_items: usize = 0;
             let mut memory_preview: Vec<String> = Vec::new();
@@ -1107,46 +1108,33 @@ impl InProcessChatTurnBridge {
             let tool_names: Vec<&str> = edge_tools.iter()
                 .filter_map(|t| t.get("function").and_then(|f| f.get("name")).and_then(Value::as_str))
                 .collect();
-            // Split `profile_desc` into two cache-aligned parts:
+            // Environment context is split by cache volatility:
             //
-            // * `profile_desc` (STABLE) — cwd + git_branch + env_section.
-            //   Derived from edge_profile only; byte-stable within a session.
-            //   Routes to RuntimeIdentity (Session scope) via the pipeline's
-            //   typed `profile_desc` field → cached behind the 2nd marker.
+            // * `environment_static`  (Platform, Shell, CWD, Home) →
+            //   stable for the session, safe inside the Session cache.
+            //   Routed through `extra_stable_sections` → binder's
+            //   `RuntimeIdentity` → behind the 2nd cache marker.
             //
-            // * memoria prefetch entries (VOLATILE) — typed MemoryEntry items
-            //   produced by `prefetch_memories`. The retrieval query uses the
-            //   latest user message, so results drift turn-to-turn. They route
-            //   through the pipeline's Memory section (None scope) where rank,
-            //   dedup, and budget trimming are applied.
+            // * `environment_volatile` (Git branch dirty state, staged /
+            //   unstaged diff stats, recent commits) → changes on every
+            //   edit/commit. Routed through `extra_dynamic_sections` →
+            //   binder's `RuntimeVolatile` (None scope, post-marker) so
+            //   it never invalidates the cached prefix.
             //
-            // Previously both were concatenated into one `profile_desc`
-            // string and routed to volatile, dragging ~3-4 kB of stable
-            // cwd/branch/env content out of the cached prefix every turn.
-            let profile_desc = {
-                let mut parts = Vec::new();
-                if let Some(cwd) = edge_profile.get("cwd").and_then(Value::as_str) {
-                    parts.push(format!("cwd: {cwd}"));
-                }
-                if let Some(branch) = edge_profile.get("git_branch").and_then(Value::as_str) {
-                    parts.push(format!("git_branch: {branch}"));
-                }
-                let env_section = edge_profile
-                    .get("environment_context")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                if parts.is_empty() && env_section.is_empty() {
-                    String::new()
-                } else {
-                    let base = if parts.is_empty() {
-                        String::new()
-                    } else {
-                        format!("\n\n# Project Profile\n{}", parts.join("\n"))
-                    };
-                    format!("{base}{env_section}")
-                }
-            };
+            // The `# Project Profile` wrapper with cwd/git_branch is
+            // dropped: `bind_runtime_identity` already emits typed
+            // `Model: / CWD: / Branch:` lines from `SessionContext`, so
+            // repeating them as a Markdown block was pure duplicate.
+            let env_static = edge_profile
+                .get("environment_static")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let env_volatile = edge_profile
+                .get("environment_volatile")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
 
             // Memoria prefetch lives on its own. `section` is the
             // "## User Memories\n..." block — the piece that actually drifts.
@@ -1236,6 +1224,18 @@ impl InProcessChatTurnBridge {
                 .map(|text| format!("\n\n{text}"))
                 .unwrap_or_default();
 
+            // ── Skill listing (injected by CLI via edge_profile) ──
+            // Previously injected as a leading role:system message (broke
+            // prefix cache on every turn because the skill selector re-ranks).
+            // Now routed through the volatile lane alongside other per-turn
+            // dynamic sections.
+            let skill_listing_hint = edge_profile
+                .get(astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_SKILL_LISTING_TEXT)
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(|text| format!("\n\n{text}"))
+                .unwrap_or_default();
+
             // Memory storage decisions are now fully LLM-driven via system
             // prompt rules. detect_store_signal keyword matching was removed.
 
@@ -1319,10 +1319,14 @@ impl InProcessChatTurnBridge {
             // Derive anchor from current conversation state. On turn 1, falls back to
             // first user message. On subsequent turns, builds a lightweight L1 from
             // messages to show current state + progress — zero network calls.
+            //
+            // Skip emission when the anchor is trivial (bootstrap shape that
+            // just echoes the current user message) — injecting it in that
+            // case duplicates the user turn for ~100 tokens of no signal.
             let session_anchor = {
                 use crate::turn::cloud::session_memory_protocol::{
                     extract_anchor, extract_anchor_from_facts, extract_message_text,
-                    build_l1_from_messages, SessionMemory,
+                    is_trivial_anchor, build_l1_from_messages, SessionMemory,
                 };
                 let first_user_text = messages
                     .iter()
@@ -1363,7 +1367,11 @@ impl InProcessChatTurnBridge {
                         };
                         extract_anchor(&first_user_text, l1.as_ref())
                     };
-                    format!("\n\n{anchor}")
+                    if is_trivial_anchor(&anchor, user_content_for_signal) {
+                        String::new()
+                    } else {
+                        format!("\n\n{anchor}")
+                    }
                 }
             };
 
@@ -1381,15 +1389,16 @@ impl InProcessChatTurnBridge {
             // (RuntimeVolatile scope → re-sent per turn).
             //
             // STABLE (change only when session state changes, if at all):
-            //   profile_desc (cwd/branch/env — Memoria split out)
+            //   environment_static (Platform/Shell/CWD/Home)
             //
             // VOLATILE (change each turn by design):
+            //   environment_volatile (git branch dirty/diff/recent commits),
             //   learned_context_hint (EMA tracker — byte-level changes break prefix cache),
             //   feedback_rules_hint (accumulates on each user correction),
             //   skill_hint (active skill/tool selection),
             //   self_awareness_hint (turn/token/outcome signals),
-            //   typed memory_entries (per-turn retrieval — was baked into
-            //     profile_desc, now routed through the Memory section),
+            //   typed memory_entries (per-turn retrieval, routed through the
+            //     Memory section),
             //   implicit_feedback_hint (per-turn correction signal based on
             //     user message content),
             //   memoria_insights_hint (per-turn retrieval),
@@ -1398,9 +1407,15 @@ impl InProcessChatTurnBridge {
             //   tool_round_guidance (per-turn messages count)
             let mut stable_sections = Vec::new();
             let mut dynamic_sections = Vec::new();
-            if !profile_desc.is_empty() {
+            if let Some(ref text) = env_static {
                 stable_sections.push(prompts::PromptSection::dynamic(
-                    profile_desc.clone(),
+                    text.clone(),
+                    prompts::PromptTokenBucket::Environment,
+                ));
+            }
+            if let Some(ref text) = env_volatile {
+                dynamic_sections.push(prompts::PromptSection::dynamic(
+                    text.clone(),
                     prompts::PromptTokenBucket::Environment,
                 ));
             }
@@ -1496,6 +1511,14 @@ impl InProcessChatTurnBridge {
                 dynamic_sections.push(
                     prompts::PromptSection::dynamic(
                         recent_arg_hints_hint.clone(),
+                        prompts::PromptTokenBucket::Environment,
+                    ),
+                );
+            }
+            if !skill_listing_hint.is_empty() {
+                dynamic_sections.push(
+                    prompts::PromptSection::dynamic(
+                        skill_listing_hint.clone(),
                         prompts::PromptTokenBucket::Environment,
                     ),
                 );
@@ -3832,7 +3855,10 @@ mod tests {
 
     // ── Static/dynamic prompt boundary tests ──
     // These tests manipulate env vars, so they must not run in parallel.
-    static CACHE_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // Share the mutex with `turn::prompt_cache::tests` — both modules hit
+    // the same env vars, so two independent locks would race and a panic
+    // in one would leave the other poisoned.
+    use crate::turn::prompt_cache::CACHE_ENV_MUTEX;
 
     #[test]
     fn self_awareness_section_is_post_cache_volatile() {
@@ -4042,7 +4068,7 @@ mod tests {
     }
     #[test]
     fn annotate_tool_schemas_for_caching_adds_cache_control() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         }
@@ -4084,7 +4110,7 @@ mod tests {
 
     #[test]
     fn annotate_tool_schemas_marks_end_of_pinned_prefix() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         }
@@ -4126,7 +4152,7 @@ mod tests {
 
     #[test]
     fn add_message_cache_breakpoint_targets_last_non_system() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let mut messages = vec![
             json!({"role": "system", "content": "sys prompt"}),
             json!({"role": "user", "content": "hello"}),
@@ -4153,7 +4179,7 @@ mod tests {
 
     #[test]
     fn add_message_cache_breakpoint_noop_for_openai() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let mut messages = vec![
             json!({"role": "system", "content": "sys"}),
             json!({"role": "user", "content": "hi"}),
@@ -4171,7 +4197,7 @@ mod tests {
 
     #[test]
     fn prompt_cache_config_latch_anthropic() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         }
@@ -4190,7 +4216,7 @@ mod tests {
 
     #[test]
     fn prompt_cache_config_latch_openai() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         }
@@ -4205,7 +4231,7 @@ mod tests {
 
     #[test]
     fn prompt_cache_config_latch_unknown_provider() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         }
@@ -4223,7 +4249,7 @@ mod tests {
 
     #[test]
     fn prompt_cache_config_env_disabled() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::set_var("ASTRA_TEST_PROMPT_CACHE_DISABLED", "1");
         }
@@ -4245,7 +4271,7 @@ mod tests {
 
     #[test]
     fn prompt_cache_config_latch_idempotent() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         }
@@ -4420,7 +4446,7 @@ mod tests {
 
     #[test]
     fn message_breakpoint_skips_system_only() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         }
@@ -4439,7 +4465,7 @@ mod tests {
 
     #[test]
     fn message_breakpoint_empty_messages_noop() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let mut messages: Vec<Value> = vec![];
         add_message_cache_breakpoint(
             &mut messages,
@@ -4450,7 +4476,7 @@ mod tests {
 
     #[test]
     fn message_breakpoint_array_content_appends_to_last_block() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         }
@@ -4482,7 +4508,7 @@ mod tests {
 
     #[test]
     fn tool_schemas_empty_list_noop() {
-        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let mut tools: Vec<Value> = vec![];
         annotate_tool_schemas_for_caching(
             &mut tools,
