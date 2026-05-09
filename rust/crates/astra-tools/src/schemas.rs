@@ -17,6 +17,9 @@ pub const DEFAULT_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "web_fetch",
     "web_search",
     "run_script",
+    "notify",
+    "ask_user",
+    "task",
 ];
 
 pub const SERVER_EXECUTOR_TOOL_NAMES: &[&str] = &[
@@ -39,6 +42,9 @@ pub const SERVER_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "web_search",
     "symbols",
     "run_script",
+    "notify",
+    "ask_user",
+    "task",
 ];
 
 fn filter_tool_schemas_by_name(allowed_names: &[&str]) -> Vec<Value> {
@@ -451,7 +457,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "memory",
-                "description": "Memory operations. Actions: store, retrieve, purge, correct, profile, search, feedback.",
+                "description": "Memory operations. Actions: store, retrieve, purge, correct, profile, search, feedback. Supports agent_type scoping for per-agent-type memory isolation.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -459,7 +465,8 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "content": {"type": "string", "description": "Content to store/correct"},
                         "query": {"type": "string", "description": "Query for retrieve/search"},
                         "memory_id": {"type": "string", "description": "ID for purge/correct/feedback"},
-                        "memory_type": {"type": "string", "description": "Type: semantic, profile, procedural, working, episodic"}
+                        "memory_type": {"type": "string", "description": "Type: semantic, profile, procedural, working, episodic"},
+                        "agent_type": {"type": "string", "description": "Scope to a specific agent type (explore, code-review, task, general-purpose). When set on store, tags the memory; on retrieve/search, filters to only that type's memories + unscoped globals."}
                     },
                     "required": ["action"]
                 }
@@ -469,11 +476,11 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "session",
-                "description": "Session lifecycle. Actions: config, prioritize, deprioritize, set_goal, compact, rollback_edits, ask_user, sleep, tool_search.",
+                "description": "Session lifecycle and introspection. Actions: config, prioritize, deprioritize, set_goal, compact, rollback_edits, ask_user, sleep, tool_search, timeline, summary, history.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "action": {"type": "string", "enum": ["config","prioritize","deprioritize","set_goal","compact","rollback_edits","ask_user","sleep","tool_search"]},
+                        "action": {"type": "string", "enum": ["config","prioritize","deprioritize","set_goal","compact","rollback_edits","ask_user","sleep","tool_search","timeline","summary","history"]},
                         "key": {"type": "string", "description": "Config key"},
                         "value": {"type": "string", "description": "Config value"},
                         "tool": {"type": "string", "description": "Tool name (prioritize/deprioritize)"},
@@ -551,6 +558,84 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "subtopic": {"type": "string", "enum": ["session","cache","recent","volatile","stall","noise","all"], "description": "Which diagnostic to run (default: session). `noise`: per-channel freshness of runtime-injected prompt signals — flags channels re-rendered unchanged for many turns."},
                         "detail": {"type": "string", "enum": ["full","summary","minimal"], "description": "Output detail level for the session topic (default: auto from budget). Ignored for other subtopics."}
                     }
+                }
+            }
+        }),
+        // ── Notify (proactive notification for gateways) ─────────────────
+        json!({
+            "type": "function",
+            "function": {
+                "name": "notify",
+                "description": "Send a notification to the user. Use for proactive updates (background task done, blocker found, unsolicited insight). Gateways route based on notification_type: 'normal' = in-chat reply, 'proactive' = push notification. CLI mode: both render as text.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "message": {"type": "string", "description": "Notification content"},
+                        "notification_type": {"type": "string", "enum": ["normal","proactive"], "description": "Routing hint for gateway. 'proactive' = push even if user isn't looking at chat."}
+                    },
+                    "required": ["message"]
+                }
+            }
+        }),
+        // ── Ask user (interactive clarification) ─────────────────────────
+        json!({
+            "type": "function",
+            "function": {
+                "name": "ask_user",
+                "description": "Ask the user a question when you need clarification or a decision. Supports multiple-choice (2-9 options, single-key select) and free-form text input. Use sparingly — only when the next step is genuinely ambiguous.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "question": {"type": "string", "description": "The question to ask"},
+                        "choices": {"type": "array", "items": {"type": "string"}, "description": "2-9 options for multiple choice. Omit for free-form input."},
+                        "default": {"type": "string", "description": "Default answer (used if user presses Enter without typing)"},
+                        "context": {"type": "string", "description": "Brief context shown above the question (dimmed)"}
+                    },
+                    "required": ["question"]
+                }
+            }
+        }),
+        // ── Task management (unified tool) ───────────────────────────────
+        json!({
+            "type": "function",
+            "function": {
+                "name": "task",
+                "description": "Track work progress for multi-step tasks. Actions: create, update, list, get, stop. Supports blocking dependencies, ownership, and arbitrary metadata.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["create","update","list","get","stop"], "description": "Operation to perform"},
+                        "title": {"type": "string", "description": "(create/update) Brief imperative title"},
+                        "description": {"type": "string", "description": "(create/update) What needs to be done"},
+                        "task_id": {"type": "string", "description": "(update/get/stop) Task ID (e.g. 'task-1')"},
+                        "new_status": {"type": "string", "enum": ["pending","in_progress","completed","failed","deleted"], "description": "(update) New status to assign. 'deleted' permanently removes the task."},
+                        "status_filter": {"type": "string", "enum": ["pending","in_progress","completed","failed","all","active"], "description": "(list) Restrict results. 'active' = pending+in_progress. Default 'all'."},
+                        "subtask_id": {"type": "string", "description": "(update) Update a specific subtask"},
+                        "active_form": {"type": "string", "description": "(create/update) Present-continuous form shown while in_progress (e.g. 'Running tests')"},
+                        "owner": {"type": "string", "description": "(create/update) Agent or user that owns this task"},
+                        "metadata": {"type": "object", "description": "(create/update) Arbitrary key-value pairs. On update: set key to null to delete it."},
+                        "add_blocks": {"type": "array", "items": {"type": "string"}, "description": "(update) Task IDs that THIS task blocks (they can't start until this completes)"},
+                        "add_blocked_by": {"type": "array", "items": {"type": "string"}, "description": "(update) Task IDs that must complete before THIS task can start"},
+                        "remove_blocks": {"type": "array", "items": {"type": "string"}, "description": "(update) Remove entries from this task's blocks list"},
+                        "remove_blocked_by": {"type": "array", "items": {"type": "string"}, "description": "(update) Remove entries from this task's blocked_by list"},
+                        "subtasks": {
+                            "type": "array",
+                            "description": "(create) Optional sub-steps",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "id": {"type": "string"},
+                                    "title": {"type": "string"},
+                                    "description": {"type": "string"},
+                                    "depends_on": {"type": "array", "items": {"type": "string"}}
+                                },
+                                "required": ["id", "title"]
+                            }
+                        },
+                        "reason": {"type": "string", "description": "(stop) Why the task is being stopped"},
+                        "error_message": {"type": "string", "description": "(update) Reason for failure"}
+                    },
+                    "required": ["action"]
                 }
             }
         }),
@@ -666,7 +751,8 @@ mod tests {
         assert!(!names.contains(&"delete_file"));
         assert!(!names.contains(&"enter_plan_mode"));
         assert!(!names.contains(&"exit_plan_mode"));
-        assert!(!names.contains(&"ask_user"));
+        // ask_user is now a first-class tool (P2 completion)
+        assert!(names.contains(&"ask_user"));
         assert!(!names.contains(&"sleep"));
     }
 

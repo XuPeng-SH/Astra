@@ -640,9 +640,6 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         // for prompt-cache reuse. No-op unless:
         //   - the `prefix_store` Arc was plumbed in (CLI startup
         //     sets this on every host when fork_prefix.enabled)
-        //   - feature flag is on (capture_parent_prefix
-        //     early-returns otherwise, preserving the
-        //     FeatureDisabled contract)
         //   - ingest populated the expected state fields
         let Some(store) = self.prefix_store.as_ref() else {
             return;

@@ -61,6 +61,10 @@ pub(crate) struct SubRunHost {
     pub(crate) all_schemas: Vec<Value>,
     pub(crate) valid_tool_names: HashSet<String>,
     pub(crate) perm_manager: PermissionManager,
+    /// Shared journal writer from the parent session. When present,
+    /// child LLM rounds are written to the parent's journal with an
+    /// `agent_id` tag so the unified timeline can interleave them.
+    pub(crate) journal: Option<std::sync::Arc<astra_services::session_journal::JournalWriter>>,
     /// Per-response completion token limit from the skill manifest.
     pub(crate) max_completion_tokens: Option<u32>,
     /// Effort level from the skill manifest.
@@ -214,10 +218,18 @@ impl AgenticLoopHost for SubRunHost {
         payload["skill_search"] =
             serde_json::to_value(&state.skills.search).unwrap_or_else(|_| json!({}));
 
-        // Attach tool schemas directly (no selector).
+        // Attach tool schemas. In fork mode, prefer the parent's frozen
+        // canonical schemas so the tool-schema hash matches the parent's
+        // cached prefix (cache key alignment). Falls back to live
+        // registry if no frozen schemas are available.
+        let schemas_to_use = self
+            .inherited_prefix
+            .as_ref()
+            .and_then(|ip| ip.frozen_tool_schemas.clone())
+            .unwrap_or_else(|| self.all_schemas.clone());
         astra_runtime::turn::agentic_prepare_payload::apply_selector_hints_then_attach_filtered_edge_tools(
             &mut payload,
-            self.all_schemas.clone(),
+            schemas_to_use,
             &mut state.restricted_tools,
             None,  // no selection report
             0.5,   // neutral confidence
@@ -346,12 +358,6 @@ impl AgenticLoopHost for SubRunHost {
     fn on_turn_completed(&mut self, state: &AgenticLoopState) {
         // PR 5.6: probe the first successful ingested turn's
         // cache_read_input_tokens against the parent-side estimate.
-        // Subsequent turns no-op. Sink may be None — runtime is
-        // harmless without telemetry. We pass the *accumulated*
-        // total_cache_read because ingest has already added the
-        // current turn's cache_read_input_tokens into it, and this
-        // is the first call after ingest, so the accumulator IS the
-        // first-turn value.
         if let Some(ref sink) = self.fork_cache_sink {
             astra_runtime::orchestration::maybe_emit_fork_cache_probe(
                 &mut self.fork_cache_probe_state,
@@ -361,6 +367,42 @@ impl AgenticLoopHost for SubRunHost {
                 astra_turn_core::fork_cache_event::ForkCacheThresholds::default(),
                 sink.as_ref(),
             );
+        }
+
+        // Unified timeline: emit the LATEST round event tagged with
+        // agent_id to the parent's journal so the timeline renderer
+        // can interleave child rounds with parent rounds.
+        //
+        // NOTE: `state.recent_rounds` is a **ring buffer** (capacity
+        // RECENT_ROUNDS_RING_CAPACITY=32) that accumulates across
+        // turns. Iterating the whole ring here would re-journal every
+        // historical round on every turn end, causing duplicate
+        // entries and inflated token accounting in the parent
+        // timeline. Only the most recent entry — the round that just
+        // completed — should be emitted.
+        if let Some(ref journal) = self.journal {
+            if let Some(round_summary) = state.recent_rounds.last() {
+                let mut buf = astra_services::session_journal::TurnEventBuffer::begin_turn(
+                    state.current_session_id.as_deref(),
+                    state.current_round_index.saturating_add(1),
+                );
+                buf.record_llm_round(astra_services::session_journal::LlmRoundRecord {
+                    duration_ms: round_summary.duration_ms,
+                    prompt_tokens: round_summary.prompt_tokens,
+                    completion_tokens: round_summary.completion_tokens,
+                    cache_read_tokens: round_summary.cache_read_tokens,
+                    cache_creation_tokens: round_summary.cache_creation_tokens,
+                    tool_calls_returned: round_summary.tool_calls_returned,
+                    tool_call_names: round_summary.tool_call_names.clone(),
+                    finish_reason: round_summary.finish_reason.clone(),
+                    source: Some("child_agent".to_string()),
+                    run_id: state.current_run_id.clone(),
+                    agent_id: Some(self.agent_id.clone()),
+                    ..Default::default()
+                });
+                let events = buf.drain();
+                let _ = journal.append_bulk_no_sync(&events);
+            }
         }
     }
 }
@@ -500,6 +542,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             inherited_prefix: None,
             fork_cache_sink: None,
             fork_cache_probe_state: astra_runtime::orchestration::ForkCacheProbeState::new(),
+            journal: None,
         };
 
         let messages = vec![
@@ -716,6 +759,7 @@ mod tests {
             inherited_prefix: None,
             fork_cache_sink: None,
             fork_cache_probe_state: astra_runtime::orchestration::ForkCacheProbeState::new(),
+            journal: None,
         };
         assert!(host.is_quiet());
     }
@@ -744,6 +788,7 @@ mod tests {
             inherited_prefix: None,
             fork_cache_sink: None,
             fork_cache_probe_state: astra_runtime::orchestration::ForkCacheProbeState::new(),
+            journal: None,
         };
         assert!(!host.is_quiet());
     }
@@ -771,6 +816,7 @@ mod tests {
             inherited_prefix: None,
             fork_cache_sink: None,
             fork_cache_probe_state: astra_runtime::orchestration::ForkCacheProbeState::new(),
+            journal: None,
         };
         let schema = json!({
             "type": "function",

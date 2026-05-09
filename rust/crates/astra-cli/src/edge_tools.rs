@@ -953,6 +953,267 @@ impl ToolExecutor {
         .to_string()
     }
 
+    // ── Timeline tool: unified multi-agent trace ───────────────────────────────
+
+    fn render_session_timeline(&self, args: &Value) -> String {
+        let session_id = match self.active_session_id() {
+            Some(s) if !s.trim().is_empty() => s,
+            _ => return "Error: no active session. Timeline requires a session.".to_string(),
+        };
+        let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(50) as usize;
+        let agent_filter = args.get("agent_id").and_then(Value::as_str);
+
+        let journal_path = std::path::PathBuf::from(
+            std::env::var("HOME")
+                .ok()
+                .or_else(|| dirs::home_dir().map(|p| p.to_string_lossy().into_owned()))
+                .unwrap_or_else(|| ".".to_string()),
+        )
+        .join(".astra")
+        .join("sessions")
+        .join(format!("{session_id}.jsonl"));
+
+        if !journal_path.exists() {
+            return format!("Error: journal not found at {}", journal_path.display());
+        }
+
+        let events: Vec<serde_json::Value> = match std::fs::read_to_string(&journal_path) {
+            Ok(content) => content
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect(),
+            Err(e) => return format!("Error reading journal: {e}"),
+        };
+
+        let mut timeline = astra_turn_core::unified_timeline::build_timeline(&events);
+
+        if let Some(filter) = agent_filter {
+            timeline.entries.retain(|e| {
+                e.agent_id.as_deref() == Some(filter)
+                    || matches!(&e.kind,
+                        astra_turn_core::unified_timeline::TimelineEntryKind::AgentSpawned { child_agent_id, .. }
+                        | astra_turn_core::unified_timeline::TimelineEntryKind::AgentCompleted { child_agent_id, .. }
+                        | astra_turn_core::unified_timeline::TimelineEntryKind::AgentFailed { child_agent_id, .. }
+                        if child_agent_id.contains(filter)
+                    )
+                    || e.agent_id.is_none() // always show parent rounds for context
+            });
+        }
+
+        astra_turn_core::unified_timeline::render_timeline(&timeline, limit)
+    }
+
+    // ── Session summary: structured overview of current session ────────────────
+
+    fn render_session_summary(&self) -> String {
+        let session_id = match self.active_session_id() {
+            Some(s) if !s.trim().is_empty() => s,
+            _ => return "Error: no active session.".to_string(),
+        };
+        let journal_path = std::path::PathBuf::from(
+            dirs::home_dir()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| ".".to_string()),
+        )
+        .join(".astra")
+        .join("sessions")
+        .join(format!("{session_id}.jsonl"));
+
+        let events: Vec<serde_json::Value> = match std::fs::read_to_string(&journal_path) {
+            Ok(content) => content
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect(),
+            Err(_) => return "Error: journal not found.".to_string(),
+        };
+
+        let mut turns = 0u32;
+        let mut total_tokens_in = 0u64;
+        let mut total_tokens_out = 0u64;
+        let mut total_rounds = 0u32;
+        let mut errors = 0u32;
+        let mut agents_spawned = 0u32;
+        let mut agents_completed = 0u32;
+        let mut current_goal = String::new();
+
+        for evt in &events {
+            let etype = evt.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            match etype {
+                "turn" => {
+                    turns += 1;
+                    if let Some(tin) = evt.get("tokens_in").and_then(|v| v.as_u64()) {
+                        total_tokens_in += tin;
+                    }
+                    if let Some(tout) = evt.get("tokens_out").and_then(|v| v.as_u64()) {
+                        total_tokens_out += tout;
+                    }
+                }
+                "llm_round" => total_rounds += 1,
+                "turn_error" => errors += 1,
+                "agent_spawned" => agents_spawned += 1,
+                "AgentTerminated" => agents_completed += 1,
+                _ => {}
+            }
+        }
+
+        // Try to get current goal from observability session
+        if let Some(obs) = self.observability_session.as_ref()
+            && let Ok(s) = obs.read()
+        {
+            if let Some(gt) = s.goal_tracker.as_ref() {
+                current_goal = gt.goal().to_string();
+            }
+        }
+
+        let mut out = String::from("## Session Summary\n");
+        out.push_str(&format!("Session: {session_id}\n"));
+        out.push_str(&format!(
+            "Turns: {turns} | LLM rounds: {total_rounds} | Errors: {errors}\n"
+        ));
+        out.push_str(&format!(
+            "Tokens: {} in + {} out = {} total\n",
+            total_tokens_in,
+            total_tokens_out,
+            total_tokens_in + total_tokens_out
+        ));
+        if agents_spawned > 0 {
+            out.push_str(&format!(
+                "Agents: {agents_spawned} spawned, {agents_completed} completed\n"
+            ));
+        }
+        if !current_goal.is_empty() {
+            out.push_str(&format!("Current goal: {current_goal}\n"));
+        }
+
+        // Task status nudge: if there are active tasks, remind the
+        // agent to update them (Claude Code parity: proactive nudge).
+        let tasks = self.task_manager.snapshot();
+        let active_tasks: Vec<_> = tasks
+            .iter()
+            .filter(|t| t.status == "pending" || t.status == "in_progress")
+            .collect();
+        if !active_tasks.is_empty() {
+            out.push_str(&format!("\nActive tasks: {}\n", active_tasks.len()));
+            for t in active_tasks.iter().take(5) {
+                let status_icon = if t.status == "in_progress" {
+                    "▶"
+                } else {
+                    "○"
+                };
+                let blocked = if !t.blocked_by.is_empty() {
+                    format!(" [blocked by: {}]", t.blocked_by.join(","))
+                } else {
+                    String::new()
+                };
+                out.push_str(&format!(
+                    "  {status_icon} {} — {}{}\n",
+                    t.id, t.title, blocked
+                ));
+            }
+            out.push_str(
+                "Hint: update task status with `task(action=\"update\", task_id=\"...\", status=\"...\")` as you make progress.\n",
+            );
+        }
+        out
+    }
+
+    // ── Session history: recall past conversation turns ──────────────────────
+
+    fn render_session_history(&self, args: &Value) -> String {
+        let session_id = match self.active_session_id() {
+            Some(s) if !s.trim().is_empty() => s,
+            _ => return "Error: no active session.".to_string(),
+        };
+        let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize;
+        let query = args.get("query").and_then(Value::as_str).unwrap_or("");
+
+        let journal_path = std::path::PathBuf::from(
+            dirs::home_dir()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| ".".to_string()),
+        )
+        .join(".astra")
+        .join("sessions")
+        .join(format!("{session_id}.jsonl"));
+
+        let events: Vec<serde_json::Value> = match std::fs::read_to_string(&journal_path) {
+            Ok(content) => content
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect(),
+            Err(_) => return "Error: journal not found.".to_string(),
+        };
+
+        // Extract turn events with user_input + assistant_output
+        let mut turns: Vec<(u32, &str, &str)> = Vec::new();
+        for evt in &events {
+            if evt.get("type").and_then(|v| v.as_str()) != Some("turn") {
+                continue;
+            }
+            let turn_num = evt.get("turn").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let user = evt.get("user_input").and_then(|v| v.as_str()).unwrap_or("");
+            let assistant = evt
+                .get("assistant_output")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !user.is_empty() || !assistant.is_empty() {
+                turns.push((turn_num, user, assistant));
+            }
+        }
+
+        // Filter by query if provided
+        let filtered: Vec<&(u32, &str, &str)> = if query.is_empty() {
+            turns.iter().collect()
+        } else {
+            let q_lower = query.to_lowercase();
+            turns
+                .iter()
+                .filter(|(_, u, a)| {
+                    u.to_lowercase().contains(&q_lower) || a.to_lowercase().contains(&q_lower)
+                })
+                .collect()
+        };
+
+        if filtered.is_empty() {
+            return if query.is_empty() {
+                "No conversation history in this session.".to_string()
+            } else {
+                format!("No turns matching '{query}' found.")
+            };
+        }
+
+        // Take last N
+        let shown: &[&(u32, &str, &str)] = if filtered.len() > limit {
+            &filtered[filtered.len() - limit..]
+        } else {
+            &filtered
+        };
+
+        let mut out = format!(
+            "## Conversation History ({} turns{})\n",
+            filtered.len(),
+            if !query.is_empty() {
+                format!(" matching '{query}'")
+            } else {
+                String::new()
+            }
+        );
+        for (turn_num, user, assistant) in shown {
+            let user_preview: String = user.chars().take(120).collect();
+            let assist_preview: String = assistant.chars().take(200).collect();
+            out.push_str(&format!("\n**T{turn_num} User**: {user_preview}"));
+            if user.len() > 120 {
+                out.push('…');
+            }
+            out.push_str(&format!("\n**T{turn_num} Assistant**: {assist_preview}"));
+            if assistant.len() > 200 {
+                out.push('…');
+            }
+            out.push('\n');
+        }
+        out
+    }
+
     // ── Env tool: environment variable management ─────────────────────────────
 
     /// Environment variable management tool — delegated to `env_tools` module.
@@ -1557,17 +1818,69 @@ impl ToolExecutor {
                         "ask_user" => self.ask_user(args),
                         "sleep" => self.sleep_tool(args).await,
                         "tool_search" => self.tool_search(args),
-                        "" => "Missing required parameter: action. Use: config, prioritize, deprioritize, set_goal, compact, rollback_edits, ask_user, sleep, tool_search".to_string(),
+                        "timeline" => self.render_session_timeline(args),
+                        "summary" => self.render_session_summary(),
+                        "history" => self.render_session_history(args),
+                        "" => "Missing required parameter: action. Use: config, prioritize, deprioritize, set_goal, compact, rollback_edits, ask_user, sleep, tool_search, timeline, summary, history".to_string(),
                         other => format!("Unknown session action: '{other}'"),
                     }
                 }
-                // Task management tools
+                // Task management (unified tool with action param)
+                "task" => {
+                    let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+                    match action {
+                        "create" => self.task_create(args).await,
+                        "list" => self.task_list(args).await,
+                        "get" => self.task_get(args).await,
+                        "update" => self.task_update(args).await,
+                        "stop" => self.task_stop(args).await,
+                        "" => "Missing required parameter: action. Use: create, update, list, get, stop".to_string(),
+                        other => format!("Unknown task action: '{other}'. Use: create, update, list, get, stop"),
+                    }
+                }
+                // Legacy separate task_* names (backward compat)
                 "task_create" => self.task_create(args).await,
                 "task_list" => self.task_list(args).await,
                 "task_get" => self.task_get(args).await,
                 "task_update" => self.task_update(args).await,
                 "task_stop" => self.task_stop(args).await,
                 "web_search" => self.web_search(args),
+                "ask_user" => self.ask_user(args),
+                "notify" => {
+                    const MAX_NOTIFY_MSG: usize = 4096;
+                    let message = args.get("message").and_then(Value::as_str).unwrap_or("");
+                    let raw_type = args
+                        .get("notification_type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("normal");
+                    // Enforce the schema enum — reject anything outside the
+                    // declared set rather than silently passing through.
+                    let notification_type = match raw_type {
+                        "normal" | "proactive" => raw_type,
+                        other => {
+                            return format!(
+                                "Error: 'notification_type' must be 'normal' or 'proactive' (got '{}')",
+                                other
+                            );
+                        }
+                    };
+                    if message.is_empty() {
+                        "Error: 'message' is required".to_string()
+                    } else if message.len() > MAX_NOTIFY_MSG {
+                        format!(
+                            "Error: 'message' exceeds {} bytes ({}). Notifications should be short.",
+                            MAX_NOTIFY_MSG,
+                            message.len()
+                        )
+                    } else {
+                        serde_json::json!({
+                            "delivered": true,
+                            "notification_type": notification_type,
+                            "message": message,
+                        })
+                        .to_string()
+                    }
+                }
                 "share_context" => self.share_context(args),
                 "query_context" => self.query_context(args),
                 astra_runtime::turn::agentic_loop_host::DELEGATE_TOOL_NAME => {
