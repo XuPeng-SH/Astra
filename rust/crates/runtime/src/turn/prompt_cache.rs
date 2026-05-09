@@ -4,18 +4,11 @@
 //! for Anthropic and stable-prefix splitting for OpenAI. Used by both the bridge proxy
 //! and `ServerAgenticLoopHost`.
 
-use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
-
 use serde_json::{Value, json};
 
 use crate::prompts;
 use astra_turn_core::microcompact::{PromptCacheProtocol, ProviderCacheStrategy};
 use astra_turn_core::pipeline_config::ProviderCachePolicy;
-
-const DEFAULT_CACHE_EDIT_PIN_KEY: &str = "__default__";
-const MAX_PINNED_CACHE_EDIT_SESSIONS: usize = 1024;
-const MAX_PINNED_CACHE_EDITS_PER_SESSION: usize = 256;
 
 // ── PromptCacheConfig ────────────────────────────────────────────────────────
 
@@ -361,17 +354,45 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
     let pruned_tool_schemas = output.optimized.tool_schemas.clone();
 
     let (primary_system, dynamic_system) = if is_anthropic {
-        // Anthropic multi-block with cache_control. serialize_provider_request
-        // already placed cache markers per the policy.
-        let mut blocks: Vec<Value> = Vec::with_capacity(output.serialized.system_blocks.len());
+        // Anthropic-protocol path: emit STABLE blocks (non-None scope)
+        // as multi-block content with cache_control markers; promote
+        // volatile (CacheScope::None) blocks into the `dynamic_system`
+        // second message so the primary system content stays byte-
+        // stable across rounds.
+        //
+        // The earlier revision kept volatile blocks inline in the
+        // system content array on the theory that the cache_control
+        // marker "isolates" them. Controlled probes against DeepSeek's
+        // `/anthropic` endpoint (see `tests/fixtures/
+        // deepseek_anthropic_cache_probe.py`) proved this leaks
+        // byte churn into DeepSeek's payload-identity check — tools
+        // (~5K tokens) never reach the 2nd-warm cache state. Bedrock
+        // is first-call-complete either way, so moving volatile out
+        // is globally safe. Session 5c5cbf78 t5_r0 diff showed
+        // system.block[3] (Self-Awareness counter) was the sole
+        // per-round delta.
+        use astra_turn_core::section_types::CacheScope;
+        let mut stable_blocks: Vec<Value> =
+            Vec::with_capacity(output.serialized.system_blocks.len());
+        let mut dynamic_text = String::new();
         for block in &output.serialized.system_blocks {
-            let mut b = json!({"type": "text", "text": block.text});
-            if let Some(ref cc) = block.cache_control {
-                b["cache_control"] = cc.clone();
+            if matches!(block.scope, CacheScope::None) {
+                dynamic_text.push_str(&block.text);
+            } else {
+                let mut b = json!({"type": "text", "text": block.text});
+                if let Some(ref cc) = block.cache_control {
+                    b["cache_control"] = cc.clone();
+                }
+                stable_blocks.push(b);
             }
-            blocks.push(b);
         }
-        (json!({"role": "system", "content": blocks}), None)
+        let primary = json!({"role": "system", "content": stable_blocks});
+        let dynamic = if dynamic_text.is_empty() {
+            None
+        } else {
+            Some(json!({"role": "system", "content": dynamic_text}))
+        };
+        (primary, dynamic)
     } else {
         // OpenAI stable+dynamic split: stable = non-None-scoped blocks joined,
         // dynamic = None-scoped joined separately.
@@ -403,11 +424,6 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
         tier,
         tool_schemas: pruned_tool_schemas,
     }
-}
-
-fn pinned_cache_edits() -> &'static Mutex<HashMap<String, Vec<String>>> {
-    static PINS: OnceLock<Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();
-    PINS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Test-only: hash a tuple of inputs for cache-key regression tests.
@@ -511,12 +527,20 @@ pub(crate) fn default_pinned_tool_names() -> std::collections::HashSet<String> {
     // agentic_loop_lifecycle.rs). These aren't in TOOL_CATALOG but are
     // structurally part of the static lib — include them so the cache
     // marker sits at the real static-prefix boundary.
+    //
+    // `web_search` is a first-class runtime tool (astra-tools crate) that
+    // ships with every session but is absent from TOOL_CATALOG. Session
+    // d0640d3d observed it as the last of 21 tools; without it in the
+    // pinned set the marker landed on `skill` (idx 19) and web_search
+    // (idx 20) fell outside the cached tool prefix, shaving ~500 tokens
+    // off every cache hit on the deepseek-anthropic path.
     for name in [
         "skill",
         "spawn_agent",
         "get_agent_result",
         "send_message",
         "introspect",
+        "web_search",
     ] {
         out.insert(name.to_string());
     }
@@ -537,116 +561,25 @@ pub(crate) fn add_message_cache_breakpoint(messages: &mut [Value], cache_cfg: &P
     astra_turn_core::context_serializer::annotate_last_message_cache_breakpoint(messages);
 }
 
-/// Add Anthropic protocol-level cache metadata for cached micro-compaction.
+/// Add Anthropic protocol-level cache metadata for cached prompts.
 ///
-/// This mirrors Claude Code's API-layer approach: request messages are annotated
-/// with `cache_reference` / `cache_edits` while the persisted local conversation
-/// remains unchanged. Existing `cache_control` placement is preserved at exactly
-/// one message-level breakpoint.
+/// Places exactly one `cache_control` breakpoint on the last conversation
+/// message. The per-request pin-map and `cache_edits` / `cache_reference`
+/// annotations that used to live here were removed after session
+/// 5c5cbf78 (2026-05-08) showed the real Anthropic `/v1/messages`
+/// endpoint rejecting the `cache_edits` content-block type with HTTP
+/// 400 ("unknown variant `cache_edits`"). Those fields were speculative
+/// — they don't appear in Anthropic's public schema — and only Bedrock
+/// Converse silently tolerated them.
 pub(crate) fn apply_anthropic_cache_metadata(
     messages: &mut [Value],
     cache_cfg: &PromptCacheConfig,
-    session_id: &str,
+    _session_id: &str,
 ) {
     if !cache_cfg.should_annotate() || messages.is_empty() {
         return;
     }
-
-    // Phase 2 decomposition:
-    //  - the *pure* wire mutations (marker placement, cache_edits block
-    //    insertion, cache_reference stamping) live in
-    //    `astra_turn_core::context_serializer` alongside the pipeline's
-    //    Serialize phase.
-    //  - the *stateful* bits (which tool_call_ids have been cleared and
-    //    must stay in the cache_edits list across turns) stay here
-    //    because the pin map is keyed by session_id and outlives any
-    //    single request.
-    //
-    // Order matters: `collect_cleared_tool_result_refs` inspects string
-    // content, but `annotate_last_message_cache_breakpoint` on a tool
-    // message with string content wraps it into a `tool_result` block
-    // (commit 5b69039a, required because Anthropic rejects message-level
-    // `cache_control` on tool messages). So collection runs first — before
-    // the breakpoint annotation rewrites content shape.
-    let new_deletes = collect_cleared_tool_result_refs(messages);
     astra_turn_core::context_serializer::annotate_last_message_cache_breakpoint(messages);
-
-    let pinned_deletes = pin_and_merge_cache_edits(session_id, &new_deletes);
-    astra_turn_core::context_serializer::insert_cache_edits_block(messages, &pinned_deletes);
-    astra_turn_core::context_serializer::annotate_tool_result_cache_references(messages);
-}
-
-fn collect_cleared_tool_result_refs(messages: &[Value]) -> Vec<String> {
-    let mut refs = Vec::new();
-    for msg in messages {
-        if msg.get("role").and_then(Value::as_str) != Some("tool") {
-            continue;
-        }
-        let Some(tool_call_id) = msg.get("tool_call_id").and_then(Value::as_str) else {
-            continue;
-        };
-        let content = msg.get("content").and_then(Value::as_str).unwrap_or("");
-        if content == crate::turn::cloud::analytics::MICRO_COMPACT_STUB
-            || astra_turn_core::microcompact::is_cleared_content(content)
-        {
-            refs.push(tool_call_id.to_string());
-        }
-    }
-    refs.sort();
-    refs.dedup();
-    refs
-}
-
-fn pin_and_merge_cache_edits(session_id: &str, new_deletes: &[String]) -> Vec<String> {
-    let key = if session_id.is_empty() {
-        DEFAULT_CACHE_EDIT_PIN_KEY
-    } else {
-        session_id
-    };
-    let Ok(mut pins) = pinned_cache_edits().lock() else {
-        return new_deletes.to_vec();
-    };
-    if !pins.contains_key(key)
-        && pins.len() >= MAX_PINNED_CACHE_EDIT_SESSIONS
-        && let Some(evict_key) = pins
-            .keys()
-            .find(|existing| existing.as_str() != key)
-            .cloned()
-    {
-        pins.remove(&evict_key);
-    }
-    let entry = pins.entry(key.to_string()).or_default();
-    for delete_ref in new_deletes {
-        if !entry.contains(delete_ref) {
-            entry.push(delete_ref.clone());
-        }
-    }
-    entry.sort();
-    entry.dedup();
-    if entry.len() > MAX_PINNED_CACHE_EDITS_PER_SESSION {
-        let excess = entry.len() - MAX_PINNED_CACHE_EDITS_PER_SESSION;
-        entry.drain(0..excess);
-    }
-    entry.clone()
-}
-
-// NOTE: `insert_cache_edits_block`, `add_tool_result_cache_references`,
-// `ensure_content_array`, and `message_has_cache_control` were moved to
-// `astra_turn_core::context_serializer` as Phase 2 of the pipeline-owned
-// wire payload refactor. Runtime keeps the session-keyed pin map in
-// `pin_and_merge_cache_edits` / `collect_cleared_tool_result_refs` and
-// calls the pure primitives from `apply_anthropic_cache_metadata` above.
-
-#[cfg(test)]
-fn clear_anthropic_cache_edit_pins_for_tests(session_id: &str) {
-    let key = if session_id.is_empty() {
-        DEFAULT_CACHE_EDIT_PIN_KEY
-    } else {
-        session_id
-    };
-    if let Ok(mut pins) = pinned_cache_edits().lock() {
-        pins.remove(key);
-    }
 }
 
 /// Process-wide mutex guarding any test that mutates env vars read by the
@@ -711,6 +644,59 @@ mod tests {
 
         let anthropic_provider = PromptCacheConfig::latch("anthropic", "gpt-4o");
         assert!(anthropic_provider.is_anthropic);
+    }
+
+    // ── pinned-tool audit: session d0640d3d tool order ───────────────────
+    //
+    // Production capture showed 21 tools in this order — all served stably
+    // by the runtime every turn — with only `skill` (idx 19) carrying
+    // cache_control. `web_search` (idx 20) fell OUT of the cached tool
+    // prefix because it wasn't in `default_pinned_tool_names()`:
+    //   [bash, read_file, write_file, str_replace, list_dir, grep, glob,
+    //    introspect, lsp, git, github, web_fetch, memory, session, mo,
+    //    agent, symbols, powershell, run_script, skill, web_search]
+    //
+    // All of these are first-class, runtime-owned tools that appear in
+    // every request. They must be pinned so the cache marker lands on the
+    // LAST one (web_search), not an interior position.
+    #[test]
+    fn default_pinned_tool_names_covers_all_first_class_runtime_tools() {
+        let pinned = super::default_pinned_tool_names();
+        // Full runtime tool catalog as observed in live session d0640d3d.
+        // Any divergence here causes a cache hole at the tool tail.
+        let expected = [
+            "bash",
+            "read_file",
+            "write_file",
+            "str_replace",
+            "list_dir",
+            "grep",
+            "glob",
+            "introspect",
+            "lsp",
+            "git",
+            "github",
+            "web_fetch",
+            "memory",
+            "session",
+            "mo",
+            "agent",
+            "symbols",
+            "powershell",
+            "run_script",
+            "skill",
+            "web_search",
+        ];
+        let missing: Vec<&str> = expected
+            .iter()
+            .copied()
+            .filter(|n| !pinned.contains(*n))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these runtime tools are NOT pinned — marker will fall short of the last \
+             tool and subsequent tools miss cache: {missing:?}",
+        );
     }
 
     #[test]
@@ -1035,7 +1021,7 @@ mod tests {
                 prompts::PromptTokenBucket::Environment,
             ),
         ];
-        let (primary, _dynamic, _) = assemble_system_message_via_pipeline(
+        let (primary, dynamic, _) = assemble_system_message_via_pipeline(
             &["bash"],
             &extra,
             0.8,
@@ -1047,20 +1033,37 @@ mod tests {
             Some("/tmp"),
             None,
         );
-        let all_text: String = primary["content"]
+        // Post-5c5cbf78 contract: volatile (CacheScope::None) sections
+        // are promoted out of the primary system content array and into
+        // the `dynamic` second message, so the primary stays byte-stable
+        // across rounds. Accept the extras from either slot — what
+        // matters for this test is that they're still routed through to
+        // the LLM payload.
+        let primary_text: String = primary["content"]
             .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|b| b.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join("\n");
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|b| b.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+        let dynamic_text = dynamic
+            .as_ref()
+            .and_then(|m| m.get("content"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let all_text = format!("{primary_text}\n{dynamic_text}");
         assert!(
             all_text.contains("Session Anchor"),
-            "extra section 1 must reach the final prompt"
+            "extra section 1 must reach the final prompt (primary or dynamic): \
+             primary={primary_text:?} dynamic={dynamic_text:?}",
         );
         assert!(
             all_text.contains("Learned Feedback Rules"),
-            "extra section 2 must reach the final prompt"
+            "extra section 2 must reach the final prompt (primary or dynamic): \
+             primary={primary_text:?} dynamic={dynamic_text:?}",
         );
     }
 
@@ -1402,9 +1405,18 @@ mod tests {
         assert!(policy.supports_global_scope);
     }
 
+    /// Real Anthropic `/v1/messages` rejects speculative cache-protocol
+    /// extensions: `cache_edits` as a content-block type, `cache_reference`
+    /// as a top-level message key. Session 5c5cbf78 (2026-05-08) hit HTTP
+    /// 400 after seven successful tool-loop rounds when enough deletes
+    /// had accumulated to materialize a `cache_edits` block.
+    ///
+    /// `apply_anthropic_cache_metadata` must emit ONLY the real Anthropic
+    /// extension (`cache_control` marker on the last pre-user message).
+    /// Any re-introduction of `cache_edits` / `cache_reference` here is a
+    /// regression back to the 5c5cbf78 failure mode.
     #[test]
-    fn anthropic_cache_metadata_inserts_deduped_cache_edits_and_references() {
-        clear_anthropic_cache_edit_pins_for_tests("session-a");
+    fn anthropic_cache_metadata_emits_only_cache_control_marker() {
         let cfg = PromptCacheConfig {
             cache_enabled: true,
             is_anthropic: true,
@@ -1424,75 +1436,39 @@ mod tests {
             json!({"role": "user", "content": "continue"}),
         ];
 
-        let original_tool_content = messages[1]["content"].clone();
         apply_anthropic_cache_metadata(&mut messages, &cfg, "session-a");
 
-        assert_eq!(
-            messages[1]["content"], original_tool_content,
-            "request annotation must not rewrite full local tool content"
-        );
-        // Both tool messages get cache_reference (they're at or before the marker).
-        assert_eq!(messages[1]["cache_reference"], "tool-1");
-        assert_eq!(messages[2]["cache_reference"], "tool-2");
-
-        // The cache_control marker is on messages[2] (last msg before the
-        // current-turn user message) — this is the "prefix boundary" that
-        // Anthropic's cache keys on.
-        let marker_msg = &messages[2];
-        assert!(
-            astra_turn_core::context_serializer::message_has_cache_control(marker_msg),
-            "cache_control marker must be on the last message before the current user turn"
-        );
-
-        // cache_edits go on the last user message (API directive, separate
-        // from the prefix marker).
-        let user_blocks = messages[3]["content"]
-            .as_array()
-            .expect("user content upgraded to blocks for cache_edits");
-        let cache_edits = user_blocks
+        // Real Anthropic extension: exactly one message carries cache_control.
+        let cc_count = messages
             .iter()
-            .find(|block| block.get("type").and_then(Value::as_str) == Some("cache_edits"))
-            .expect("cache_edits block on last user");
+            .filter(|m| astra_turn_core::context_serializer::message_has_cache_control(m))
+            .count();
         assert_eq!(
-            cache_edits["edits"],
-            json!([{ "type": "delete", "cache_reference": "tool-2" }])
+            cc_count, 1,
+            "exactly one cache_control marker expected; got {cc_count} in {messages:#?}",
         );
-    }
 
-    #[test]
-    fn anthropic_cache_edits_are_pinned_across_requests_for_session() {
-        clear_anthropic_cache_edit_pins_for_tests("session-pinned");
-        let cfg = PromptCacheConfig {
-            cache_enabled: true,
-            is_anthropic: true,
-        };
-        let mut first = vec![
-            json!({
-                "role": "tool",
-                "tool_call_id": "tool-1",
-                "content": crate::turn::cloud::analytics::MICRO_COMPACT_STUB
-            }),
-            json!({"role": "user", "content": "continue"}),
-        ];
-        apply_anthropic_cache_metadata(&mut first, &cfg, "session-pinned");
-
-        let mut second = vec![json!({"role": "user", "content": "later"})];
-        apply_anthropic_cache_metadata(&mut second, &cfg, "session-pinned");
-
-        let blocks = second[0]["content"].as_array().expect("content blocks");
-        let cache_edits = blocks
-            .iter()
-            .find(|block| block.get("type").and_then(Value::as_str) == Some("cache_edits"))
-            .expect("pinned cache_edits block");
-        assert_eq!(
-            cache_edits["edits"],
-            json!([{ "type": "delete", "cache_reference": "tool-1" }])
-        );
+        // Speculative/rejected extensions must not appear anywhere.
+        for (i, m) in messages.iter().enumerate() {
+            assert!(
+                m.get("cache_reference").is_none(),
+                "msg[{i}] must not carry cache_reference (not a real Anthropic field): {m}",
+            );
+            if let Some(blocks) = m.get("content").and_then(Value::as_array) {
+                for (j, b) in blocks.iter().enumerate() {
+                    let ty = b.get("type").and_then(Value::as_str).unwrap_or("");
+                    assert_ne!(
+                        ty, "cache_edits",
+                        "msg[{i}].content[{j}] must not be a cache_edits block \
+                         (Anthropic /v1/messages returns HTTP 400): {m}",
+                    );
+                }
+            }
+        }
     }
 
     #[test]
     fn anthropic_cache_metadata_noop_for_openai() {
-        clear_anthropic_cache_edit_pins_for_tests("session-openai");
         let cfg = PromptCacheConfig {
             cache_enabled: true,
             is_anthropic: false,

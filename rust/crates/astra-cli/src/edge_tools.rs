@@ -700,6 +700,17 @@ impl ToolExecutor {
         }
     }
 
+    /// Snapshot the currently-stashed session lessons. Used by the
+    /// injection-freshness observer (`observe_injections`) so it can
+    /// fingerprint the same slice the next SelfModel snapshot will
+    /// project into the system prompt.
+    pub fn session_lessons_snapshot(&self) -> Vec<astra_runtime::self_model::LessonHint> {
+        self.session_lessons
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
+    }
+
     /// P3.3 seam: stash the latest auto-invoke diagnosis. Pass `None` to
     /// clear a stale diagnosis once the triggering condition resolves.
     /// The next `build_self_model_snapshot` picks it up.
@@ -950,6 +961,19 @@ impl ToolExecutor {
     }
 
     fn handle_introspect(&self, args: &Value) -> String {
+        // `subtopic` routes to a specialized diagnostic. Default behavior
+        // (session health: token pressure, tool health, alerts) remains
+        // unchanged when `subtopic` is missing, empty, or "session".
+        let subtopic = args
+            .get("subtopic")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if subtopic == "cache" {
+            return self.handle_introspect_cache();
+        }
+
         let detail_arg = args
             .get("detail")
             .and_then(Value::as_str)
@@ -965,10 +989,89 @@ impl ToolExecutor {
             })
             .clone();
 
-        match snapshot {
-            Some(snap) => astra_turn_core::introspect::render_introspect(&snap, detail),
-            None => "No introspection data available yet (first turn).".to_string(),
+        // Fall back to a zero-state snapshot on the first turn (before the
+        // host has had a chance to populate one) so the model always gets
+        // structured output instead of an opaque "first turn" string.
+        let mut snap = snapshot.unwrap_or_default();
+
+        // Overlay session-scoped injection freshness. The per-turn
+        // snapshot lives on `AgenticLoopState` (not session) so the
+        // runtime leaves this empty; we fill it here from the
+        // session-scoped history maintained via `observe_injections`.
+        // Subtopic-agnostic: `render_all` and `noise` both need it.
+        if let Some(obs) = self.observability_session.as_ref()
+            && let Ok(s) = obs.read()
+        {
+            snap.injection_freshness = astra_turn_core::injection_tracking::freshness_report(
+                &s.injection_history,
+                s.turn_number,
+            );
+            snap.current_round = s.turn_number;
         }
+
+        // Task #46: three new subtopics for fine-grained runtime
+        // self-awareness. All read from `IntrospectSnapshot`, which the
+        // runtime populates every turn — no disk I/O required.
+        match subtopic.as_str() {
+            "recent" | "recent_rounds" | "rounds" => {
+                return astra_turn_core::introspect::render_recent_rounds(&snap);
+            }
+            "volatile" | "volatile_pending" | "pending" => {
+                return astra_turn_core::introspect::render_volatile_pending(&snap);
+            }
+            "stall" | "stall_state" | "loop_guard" => {
+                return astra_turn_core::introspect::render_stall_state(&snap);
+            }
+            "noise" | "injection" | "injections" | "freshness" => {
+                return astra_turn_core::introspect::render_injection_freshness(&snap);
+            }
+            "all" => {
+                return astra_turn_core::introspect::render_all(&snap);
+            }
+            _ => {}
+        }
+
+        astra_turn_core::introspect::render_introspect(&snap, detail)
+    }
+
+    /// `introspect(subtopic="cache")` — scan recent `llm_capture_*.json`
+    /// files for the current session and run the four cache-diagnosis
+    /// rules over them. Returns a markdown report.
+    ///
+    /// Requires `full_llm_capture=true` in session metadata; otherwise
+    /// the renderer explains why no data is available so the LLM knows
+    /// how to enable it. A future task (#17) adds an in-memory per-turn
+    /// ring so diagnosis also works without full capture.
+    fn handle_introspect_cache(&self) -> String {
+        use astra_turn_core::introspect::cache_diagnosis;
+        let session_id = match self.active_session_id() {
+            Some(s) if !s.trim().is_empty() => s,
+            _ => {
+                return cache_diagnosis::render_findings_markdown(&[], &[]);
+            }
+        };
+        let session_dir = std::path::PathBuf::from(
+            std::env::var("HOME")
+                .ok()
+                .or_else(|| dirs::home_dir().map(|p| p.to_string_lossy().into_owned()))
+                .unwrap_or_else(|| ".".to_string()),
+        )
+        .join(".astra")
+        .join("sessions")
+        .join(&session_id);
+        let rounds = match cache_diagnosis::load_session_captures(&session_dir) {
+            Ok(rs) => rs,
+            Err(e) => {
+                astra_core::agent_warn!(
+                    "introspect",
+                    "cache diagnosis: failed to read session dir {}: {e}",
+                    session_dir.display(),
+                );
+                Vec::new()
+            }
+        };
+        let findings = cache_diagnosis::evaluate_all(&rounds);
+        cache_diagnosis::render_findings_markdown(&rounds, &findings)
     }
 
     pub fn update_introspect_snapshot(
@@ -2012,6 +2115,90 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let executor = ToolExecutor::new(dir.path());
         (dir, executor)
+    }
+
+    // ── introspect tool: first-turn behavior (regression guard) ────────
+    //
+    // Regression: `handle_introspect` used to return the string
+    // "No introspection data available yet (first turn)." whenever the
+    // snapshot had not been populated. In the CLI edge path the snapshot
+    // is only updated *after* `turn_result?` unwraps, so the model calling
+    // `introspect` during turn 1 (or mid-turn in any later turn, before
+    // that write lands) always saw the opaque string. The fix: on `None`
+    // render a zero-state snapshot so output is always structured.
+    #[test]
+    fn introspect_returns_structured_output_on_first_turn() {
+        let executor = test_executor();
+        let out = executor.handle_introspect(&serde_json::json!({"detail": "summary"}));
+        assert!(
+            out.contains("Session Health"),
+            "expected structured output, got: {out}"
+        );
+        assert!(
+            !out.contains("first turn"),
+            "must not return opaque first-turn placeholder, got: {out}"
+        );
+    }
+
+    #[test]
+    fn introspect_minimal_first_turn_has_metrics_not_placeholder() {
+        let executor = test_executor();
+        let out = executor.handle_introspect(&serde_json::json!({"detail": "minimal"}));
+        assert!(
+            out.contains("pressure=") && out.contains("turns="),
+            "expected minimal metrics line, got: {out}"
+        );
+        assert!(!out.contains("first turn"));
+    }
+
+    #[test]
+    fn introspect_reflects_updated_snapshot() {
+        let executor = test_executor();
+        // Populate a non-trivial snapshot.
+        executor.update_introspect_snapshot(astra_turn_core::introspect::IntrospectSnapshot {
+            turns_completed: 5,
+            turns_remaining: 10,
+            total_input_tokens: 12345,
+            total_output_tokens: 678,
+            compaction_tier: "None".to_string(),
+            ..Default::default()
+        });
+        let out = executor.handle_introspect(&serde_json::json!({"detail": "summary"}));
+        assert!(out.contains("Turns: 5/15"), "got: {out}");
+        assert!(out.contains("12345in"), "got: {out}");
+    }
+
+    #[test]
+    fn introspect_subtopic_cache_routes_to_cache_diagnosis() {
+        let executor = test_executor();
+        // No session set → renderer explains the "no data" path.
+        let out = executor.handle_introspect(&serde_json::json!({"subtopic": "cache"}));
+        assert!(
+            out.contains("Cache Diagnosis"),
+            "subtopic=cache must produce the cache section, got: {out}",
+        );
+        assert!(
+            out.contains("No per-round cache snapshots"),
+            "without a session / captures, the renderer must explain why: {out}",
+        );
+    }
+
+    #[test]
+    fn introspect_subtopic_session_is_default_behavior() {
+        // Without subtopic the tool still shows Session Health unchanged.
+        let executor = test_executor();
+        let out = executor.handle_introspect(&serde_json::json!({"detail": "summary"}));
+        assert!(
+            out.contains("Session Health"),
+            "default subtopic must preserve legacy output, got: {out}",
+        );
+    }
+
+    #[test]
+    fn introspect_subtopic_cache_is_case_insensitive() {
+        let executor = test_executor();
+        let out = executor.handle_introspect(&serde_json::json!({"subtopic": "Cache"}));
+        assert!(out.contains("Cache Diagnosis"), "got: {out}");
     }
 
     #[test]

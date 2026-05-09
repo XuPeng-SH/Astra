@@ -2119,10 +2119,13 @@ impl AgenticRunLifecycleService {
 
         AgenticLoopState {
             messages: vec![user_message],
+            volatile_pending: Vec::new(),
+            recent_rounds: Vec::new(),
             tool_results: Vec::new(),
             current_session_id: Some(session_id.to_string()),
             current_run_id: Some(run_id.to_string()),
             recursion_depth: 0,
+            attention_manifest_text: None,
             final_text: String::new(),
             final_text_streamed: false,
             total_prompt: 0,
@@ -2207,6 +2210,7 @@ impl AgenticRunLifecycleService {
             pinned_tool_schema_tokens: 0,
             max_turn_input_tokens: astra_core::RuntimeLimits::global().max_turn_input_tokens,
             budget_wrapup_injected: false,
+            budget_wrapup_ignored_rounds: 0,
             compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
             skill_produced_output: false,
             max_cumulative_tokens: 0,
@@ -3885,10 +3889,13 @@ impl SubRunExecutor for ServerSubRunExecutor {
 
         let mut loop_state = AgenticLoopState {
             messages: vec![user_message],
+            volatile_pending: Vec::new(),
+            recent_rounds: Vec::new(),
             tool_results: Vec::new(),
             current_session_id: Some(config.session_id.clone()),
             current_run_id: Some(config.run_id.clone()),
             recursion_depth: 0,
+            attention_manifest_text: None,
             final_text: String::new(),
             final_text_streamed: false,
             total_prompt: 0,
@@ -3976,6 +3983,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             pinned_tool_schema_tokens: 0,
             max_turn_input_tokens: astra_core::RuntimeLimits::global().max_turn_input_tokens,
             budget_wrapup_injected: false,
+            budget_wrapup_ignored_rounds: 0,
             compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
             skill_produced_output: false,
             max_cumulative_tokens: 0,
@@ -4272,6 +4280,7 @@ mod tests {
                 turns_completed: 15,
                 remaining_turns: 0,
                 error_detail: Some("Round budget hard-limit reached".to_string()),
+                stall_signal: None,
             },
         );
 
@@ -4888,6 +4897,7 @@ mod tests {
                 turns_completed: 15,
                 remaining_turns: 0,
                 error_detail: Some("Round budget hard-limit reached".to_string()),
+                stall_signal: None,
             },
         ));
 

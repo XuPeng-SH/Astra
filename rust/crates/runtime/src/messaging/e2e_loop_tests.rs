@@ -144,10 +144,13 @@ mod tests {
     fn make_state() -> AgenticLoopState {
         AgenticLoopState {
             messages: Vec::new(),
+            volatile_pending: Vec::new(),
+            recent_rounds: Vec::new(),
             tool_results: Vec::new(),
             current_session_id: None,
             current_run_id: None,
             recursion_depth: 0,
+            attention_manifest_text: None,
             final_text: String::new(),
             final_text_streamed: false,
             total_prompt: 0,
@@ -204,6 +207,7 @@ mod tests {
             pinned_tool_schema_tokens: 0,
             max_turn_input_tokens: 0,
             budget_wrapup_injected: false,
+            budget_wrapup_ignored_rounds: 0,
             compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
             skill_produced_output: false,
             max_cumulative_tokens: 0,
@@ -355,21 +359,16 @@ mod tests {
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
 
-        // The loop should have injected a system message with the drained mailbox content.
-        let has_mailbox_msg = state.messages.iter().any(|m| {
-            m.get("role").and_then(Value::as_str) == Some("system")
-                && m.get("content")
-                    .and_then(Value::as_str)
-                    .is_some_and(|c| c.contains("📬") && c.contains("orchestrator"))
-        });
+        // Post-Task #45: drained mailbox rides the structured volatile
+        // lane (Kind::Mailbox) instead of state.messages.
+        let has_mailbox_msg = state
+            .volatile_pending
+            .iter()
+            .any(|inj| inj.content.contains("📬") && inj.content.contains("orchestrator"));
         assert!(
             has_mailbox_msg,
-            "should have system message with drained mailbox: {:?}",
-            state
-                .messages
-                .iter()
-                .filter(|m| m.get("role").and_then(Value::as_str) == Some("system"))
-                .collect::<Vec<_>>()
+            "should have mailbox injection in volatile_pending: {:?}",
+            state.volatile_pending,
         );
     }
 

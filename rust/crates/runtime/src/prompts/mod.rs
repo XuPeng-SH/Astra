@@ -22,8 +22,9 @@ pub use context::{
 pub use system::{
     AgentRuntimeContext, CacheScope, LOW_CONFIDENCE_THRESHOLD, PARALLEL_BATCHING_NUDGE_THRESHOLD,
     PromptOverrides, PromptSection, PromptTokenBucket, ROUND_BUDGET_HARD_LIMIT,
-    ROUND_BUDGET_THRESHOLD, STALL_NUDGE, SYSTEM_PROMPT_BASE, apply_overrides,
-    build_main_system_prompt, build_main_system_prompt_with_style, build_pipeline_static_sections,
+    ROUND_BUDGET_THRESHOLD, STALL_NUDGE, SYSTEM_PROMPT_BASE, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+    SystemPromptBuilder, apply_overrides, build_main_system_prompt,
+    build_main_system_prompt_with_style, build_pipeline_static_sections,
     build_system_prompt_sections, build_system_prompt_sections_with_style,
     build_system_prompt_trace, default_overrides_dir, detect_task_type, load_overrides,
     parallel_batching_nudge_directive, parallel_execution_feedback, round_budget_directive,
@@ -68,10 +69,13 @@ mod tests {
             "should include anti-fabrication rule"
         );
         assert!(
-            p.contains("check conversation history"),
+            p.contains("check history"),
             "should include history awareness"
         );
-        assert!(p.contains("Planning Protocol"), "should include protocol");
+        assert!(
+            p.contains("Plan, Batch, Execute"),
+            "should include protocol"
+        );
     }
 
     #[test]
@@ -178,7 +182,7 @@ mod tests {
     fn prompt_includes_history_awareness() {
         let p = build_main_system_prompt(&["read_file"], "", 1.0, None);
         assert!(
-            p.contains("check conversation history"),
+            p.contains("check history") || p.contains("Reuse history"),
             "should instruct checking history before calling tools"
         );
     }
@@ -225,11 +229,11 @@ mod tests {
     fn prompt_includes_discovery_before_access() {
         let p = build_main_system_prompt(&["read_file", "list_dir", "glob"], "", 1.0, None);
         assert!(
-            p.contains("Discovery Before Access"),
-            "should include discovery-first discipline section"
+            p.contains("Discover before reading"),
+            "should include discovery-first discipline guidance"
         );
         assert!(
-            p.contains("NEVER guess file paths"),
+            p.contains("Never guess"),
             "should warn against guessing paths"
         );
     }

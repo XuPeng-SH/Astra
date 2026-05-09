@@ -339,10 +339,13 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
 
         let mut state = AgenticLoopState {
             messages,
+            volatile_pending: Vec::new(),
+            recent_rounds: Vec::new(),
             tool_results: Vec::new(),
             current_session_id: Some(self.session_id.clone()),
             current_run_id: None,
             recursion_depth: child_recursion_depth,
+            attention_manifest_text: None,
             final_text: String::new(),
             final_text_streamed: false,
             total_prompt: 0,
@@ -424,6 +427,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             pinned_tool_schema_tokens: 0,
             max_turn_input_tokens: astra_core::RuntimeLimits::global().max_turn_input_tokens,
             budget_wrapup_injected: false,
+            budget_wrapup_ignored_rounds: 0,
             compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
             skill_produced_output: false,
             max_cumulative_tokens: SUBRUN_MAX_CUMULATIVE_TOKENS,

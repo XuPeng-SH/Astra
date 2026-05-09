@@ -660,6 +660,7 @@ dependencies = [
  "dirs 6.0.0",
  "fastrand",
  "filetime",
+ "fnv",
  "futures-util",
  "proptest",
  "regex",
@@ -681,6 +682,7 @@ dependencies = [
 name = "astra-turn-types"
 version = "0.1.0"
 dependencies = [
+ "astra-prompts",
  "regex",
  "serde",
  "serde_json",

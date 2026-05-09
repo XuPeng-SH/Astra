@@ -88,7 +88,7 @@ pub fn all_tool_schemas_with_env<F: Fn(&str) -> Option<String>>(env: F) -> Vec<V
                 "type": "object",
                 "properties": {
                     "command": {"type": "string", "description": "PowerShell command to run"},
-                    "timeout": {"type": "number", "description": "Timeout in seconds (default 30)"}
+                    "timeout": {"type": "number", "description": "Timeout in seconds (default 120). Pass a larger value for long-running builds/tests (e.g. 300 for cargo build, 600 for full test suites)."}
                 },
                 "required": ["command"]
             }
@@ -127,7 +127,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                     "type": "object",
                     "properties": {
                         "command": {"type": "string", "description": "Shell command to run"},
-                        "timeout": {"type": "number", "description": "Timeout in seconds (default 30)"}
+                        "timeout": {"type": "number", "description": "Timeout in seconds (default 120). Pass a larger value for long-running builds/tests (e.g. 300 for cargo build, 600 for full test suites)."}
                     },
                     "required": ["command"]
                 }
@@ -360,12 +360,71 @@ fn all_tool_schemas_core() -> Vec<Value> {
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "action": {"type": "string", "enum": ["status","diff","log","show","blame","file_history","log_search","contributors","commit","revert_commit","stash","checkout_file","worktree"], "description": "Git operation to perform"},
-                        "file": {"type": "string", "description": "File path (for blame, file_history)"},
-                        "ref": {"type": "string", "description": "Git ref — commit SHA, branch, or tag (for show, diff). Defaults to HEAD if omitted."},
-                        "n": {"type": "integer", "description": "Number of entries (for log)"},
-                        "query": {"type": "string", "description": "Search query (for log_search)"},
-                        "message": {"type": "string", "description": "Commit message (for commit)"}
+                        "action": {
+                            "type": "string",
+                            "enum": ["status","diff","log","show","blame","file_history","log_search","contributors","commit","revert_commit","stash","checkout_file","worktree"],
+                            "description": "Git operation to perform"
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "Repository-relative file or directory path. Used by: diff, log, blame, checkout_file, contributors."
+                        },
+                        "file": {
+                            "type": "string",
+                            "description": "Repository-relative file path. Used by: file_history (required)."
+                        },
+                        "ref": {
+                            "type": "string",
+                            "description": "Git ref — commit SHA, branch, or tag. Used by: diff (compares ref vs worktree), log (restrict to ref), checkout_file (required: ref to restore from). Defaults to HEAD when omitted."
+                        },
+                        "base_ref": {
+                            "type": "string",
+                            "description": "Base ref for range diffs. Used by: diff (with ref: diff base_ref..ref)."
+                        },
+                        "revision": {
+                            "type": "string",
+                            "description": "Commit-ish to inspect. Used by: show. Defaults to HEAD."
+                        },
+                        "staged": {
+                            "type": "boolean",
+                            "description": "Show staged (index vs HEAD) changes. Used by: diff. Default false."
+                        },
+                        "n": {
+                            "type": "integer",
+                            "description": "Max entries to return. Used by: log (default 10, max 100), file_history (default 10), log_search (default 200)."
+                        },
+                        "query": {
+                            "type": "string",
+                            "description": "Search query (TF-IDF over commit messages). Used by: log_search (required)."
+                        },
+                        "since": {
+                            "type": "string",
+                            "description": "Git date expression (e.g. '2.weeks.ago', '2024-01-01'). Used by: contributors."
+                        },
+                        "message": {
+                            "type": "string",
+                            "description": "Commit message. Used by: commit (required), stash (optional, with sub_action=push/save)."
+                        },
+                        "all": {
+                            "type": "boolean",
+                            "description": "Stage all tracked modifications before committing. Used by: commit. Default false."
+                        },
+                        "commit_sha": {
+                            "type": "string",
+                            "description": "Commit SHA to revert. Used by: revert_commit (required)."
+                        },
+                        "sub_action": {
+                            "type": "string",
+                            "description": "Sub-operation for multi-mode actions. Used by: stash (push/save/pop/apply/drop/list), worktree (add/list/remove)."
+                        },
+                        "index": {
+                            "type": "integer",
+                            "description": "Stash index (stash@{N}). Used by: stash with sub_action=apply/pop/drop. Default 0."
+                        },
+                        "stash_ref": {
+                            "type": "string",
+                            "description": "Exact stash selector or OID. Used by: stash with sub_action=apply. Takes precedence over index."
+                        }
                     },
                     "required": ["action"]
                 }
@@ -485,11 +544,12 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "introspect",
-                "description": "Query own runtime state: token pressure, cache hit rate, tool health, alerts, working memory. Budget-adaptive detail.",
+                "description": "Query own runtime state. Subtopics: 'session' (default — token pressure, cache hit rate, tool health, alerts, working memory); 'cache' (cache-regression diagnosis over recent LLM captures); 'recent' (last N LLM-round summaries from in-memory ring — tokens, tool calls, duration); 'volatile' (what runtime nudges / working-set / coaching are about to be injected); 'stall' (loop-guard state — nudge count, stall events, forced corrections); 'all' (session + recent + volatile + stall).",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "detail": {"type": "string", "enum": ["full","summary","minimal"], "description": "Output detail level (default: auto from budget)"}
+                        "subtopic": {"type": "string", "enum": ["session","cache","recent","volatile","stall","noise","all"], "description": "Which diagnostic to run (default: session). `noise`: per-channel freshness of runtime-injected prompt signals — flags channels re-rendered unchanged for many turns."},
+                        "detail": {"type": "string", "enum": ["full","summary","minimal"], "description": "Output detail level for the session topic (default: auto from budget). Ignored for other subtopics."}
                     }
                 }
             }
@@ -648,5 +708,83 @@ mod tests {
                 "default executor exposes `{name}` but server_executor_tool_schemas() omits it"
             );
         }
+    }
+
+    // ── Session 0e37eb46 regression: bash/powershell schema-advertised
+    //    timeout defaults must match the actual code defaults ─────────
+    //
+    // The bash schema previously advertised "default 30" while the code
+    // default is 120s. The LLM read "30" from the schema and either
+    // (a) explicitly set timeout:30 and was surprised when cargo build
+    // took 40s, or (b) expected cargo builds to finish within a 30s
+    // mental deadline. Result: session 0e37eb46 r9 timed out at 30s,
+    // model added `timeout: 180` at r11 — one round burned on a
+    // schema-doc mismatch.
+    //
+    // The schemas must not lie. Lock: bash & powershell schemas must
+    // document the ACTUAL default (120s), and the description must
+    // hint that long-running commands (cargo, make, pytest, go test)
+    // should pass a larger explicit timeout.
+
+    fn find_schema<'a>(schemas: &'a [Value], name: &str) -> Option<&'a Value> {
+        schemas.iter().find(|s| {
+            s.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+                == Some(name)
+        })
+    }
+
+    fn timeout_description(schema: &Value) -> &str {
+        schema
+            .pointer("/function/parameters/properties/timeout/description")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+    }
+
+    #[test]
+    fn bash_schema_timeout_default_matches_code_default() {
+        let schemas = all_tool_schemas_with_env(|_| None);
+        let bash = find_schema(&schemas, "bash").expect("bash schema must exist");
+        let desc = timeout_description(bash);
+        assert!(
+            desc.contains("120"),
+            "bash schema must document the REAL default timeout (120s) — got {desc:?}. \
+             Drift between schema and code burns a round per session when the LLM \
+             hits unexpected timeout (session 0e37eb46 r9)."
+        );
+        assert!(
+            !desc.contains("default 30"),
+            "bash schema must NOT advertise default=30 when the code default is 120s"
+        );
+    }
+
+    #[test]
+    fn bash_schema_hints_to_extend_timeout_for_long_commands() {
+        let schemas = all_tool_schemas_with_env(|_| None);
+        let bash = find_schema(&schemas, "bash").expect("bash schema must exist");
+        let desc = timeout_description(bash);
+        // Presence of at least ONE of these signal tokens tells the
+        // model "bump timeout for slow commands" without the schema
+        // over-prescribing which tools are slow.
+        let has_hint = ["cargo", "build", "test", "long"]
+            .iter()
+            .any(|kw| desc.to_lowercase().contains(kw));
+        assert!(
+            has_hint,
+            "bash schema should hint that cargo/test/build-style commands \
+             need a larger explicit timeout — got {desc:?}"
+        );
+    }
+
+    #[test]
+    fn powershell_schema_timeout_default_matches_code_default() {
+        let schemas = all_tool_schemas_with_env(|_| None);
+        let ps = find_schema(&schemas, "powershell").expect("powershell schema must exist");
+        let desc = timeout_description(ps);
+        assert!(
+            desc.contains("120"),
+            "powershell schema must document the REAL default (120s), got {desc:?}"
+        );
     }
 }

@@ -15,6 +15,7 @@ use astra_turn_core::agentic_turn_ingest::{
     map_ingest_outcome_to_iteration_control,
 };
 use astra_turn_core::compaction_types::CompactionTier;
+use astra_turn_core::interaction_types::TurnInteractionMode;
 use astra_turn_core::interruption::{InterruptionKind, InterruptionRecord, ResumeAction};
 
 /// Lazily-initialized process-wide alert dispatcher.
@@ -105,20 +106,25 @@ fn inject_runtime_attention_manifest(state: &mut AgenticLoopState) {
     state.continuity.sync_facts(state.session_facts.clone());
     state.session_facts = state.continuity.facts.clone();
 
-    if state.continuity.todos.has_items()
+    // Always strip any legacy attention-manifest messages from
+    // `state.messages` — older code paths (and checkpoints restored
+    // from before this refactor) may still push one into history. The
+    // attention manifest now rides the volatile system-prompt lane
+    // exclusively, so the message tail must stay clean for prefix
+    // caching.
+    astra_turn_types::continuity::strip_attention_manifest_messages(&mut state.messages);
+
+    let carries_signal = state.continuity.todos.has_items()
         || !state.continuity.facts.active_files.is_empty()
         || state.continuity.facts.error_state.total_errors > 0
         || !state.continuity.user_corrections.is_empty()
-        || state.continuity.verification.last_status.is_some()
-    {
-        astra_turn_types::continuity::append_attention_manifest_message(
-            &mut state.messages,
-            &state.continuity,
-            4_000,
-        );
+        || state.continuity.verification.last_status.is_some();
+
+    state.attention_manifest_text = if carries_signal {
+        astra_turn_types::continuity::build_attention_manifest_text(&state.continuity, 4_000)
     } else {
-        astra_turn_types::continuity::strip_attention_manifest_messages(&mut state.messages);
-    }
+        None
+    };
 }
 
 fn circuit_breaker_introspection_message(
@@ -147,6 +153,19 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
 
     inject_runtime_attention_manifest(state);
 
+    // ── Nudge suppression gate ──────────────────────────────────────────
+    // In PermissionMode::Auto the user has explicitly asked to let the
+    // model run to completion without interruption. Skip all corrective
+    // / interruption-style nudges in that case: execution escalation,
+    // parallel-batching force, circuit-breaker correction/introspect/
+    // soft-stop, exploration-family retries, redundant-reads, cache-
+    // waste. Safety-critical abort (circuit breaker) still fires — it
+    // terminates the loop, not just nudges.
+    //
+    // Observed in session 3b7ac18f: ~10 nudge injections across 15
+    // turns in Auto mode, user complaint "不停的被打断,不一气呵成".
+    let suppress_nudges = host.turn_interaction_mode().suppresses_loop_nudges();
+
     // Inject round budget guidance so the model knows to batch or synthesize.
     // Use llm_rounds_completed (actual LLM call count) not turn_index (step
     // counter inflated by progressive penalty).
@@ -170,13 +189,15 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     if !host.injects_round_guidance() {
         // Drop any stale guidance message(s) from prior rounds before this call.
         state.messages.retain(|m| !is_ephemeral_round_budget_msg(m));
-        let guidance =
-            crate::prompts::tool_round_guidance(&state.messages, state.llm_rounds_completed);
-        if !guidance.is_empty() {
-            astra_turn_core::chat_history_openai::append_openai_user_content_messages(
-                &mut state.messages,
-                &[guidance],
-            );
+        if !suppress_nudges {
+            let guidance =
+                crate::prompts::tool_round_guidance(&state.messages, state.llm_rounds_completed);
+            if !guidance.is_empty() {
+                astra_turn_core::chat_history_openai::append_openai_user_content_messages(
+                    &mut state.messages,
+                    &[guidance],
+                );
+            }
         }
     }
 
@@ -186,7 +207,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     // catches the failure mode where the loop runs out of budget in an
     // inspection spiral (see session 4178c6a7). One-shot per turn; stripped
     // by `finalize_and_render`.
-    if should_escalate_execution(state) {
+    if !suppress_nudges && should_escalate_execution(state) {
         let read_only_calls = state
             .stall
             .tool_call_records
@@ -194,10 +215,11 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             .filter(|r| !r.is_synthetic_placeholder() && r.ok)
             .count();
         state.stall.forced_execution_escalation = true;
-        state.messages.push(serde_json::json!({
-            "role": "user",
-            "content": execution_escalation_message(&state.message, read_only_calls),
-        }));
+        let msg = execution_escalation_message(&state.message, read_only_calls);
+        state.push_volatile(
+            super::agentic_loop_host::VolatileKind::ExecutionEscalation,
+            msg,
+        );
         tracing::warn!(
             target: "astra::loop_guard",
             tier = "execution_escalation",
@@ -229,13 +251,15 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     // streak of trailing single-tool rounds despite the prompt-layer nudge,
     // regardless of task type. Catches the "exploratory churn" failure mode
     // (sessions 6566d6a8, bbae8641, 6da9cf8f). One-shot per turn.
-    if should_force_parallel_batching(state, parallel_batching_force_threshold) {
+    if !suppress_nudges && should_force_parallel_batching(state, parallel_batching_force_threshold)
+    {
         let streak = crate::prompts::trailing_single_tool_round_streak(&state.messages);
         state.stall.forced_parallel_batching = true;
-        state.messages.push(serde_json::json!({
-            "role": "user",
-            "content": parallel_batching_force_message(streak, &state.message),
-        }));
+        let msg = parallel_batching_force_message(streak, &state.message);
+        state.push_volatile(
+            super::agentic_loop_host::VolatileKind::ParallelBatchingForce,
+            msg,
+        );
         tracing::warn!(
             target: "astra::loop_guard",
             tier = "parallel_batching_force",
@@ -251,6 +275,33 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 ),
             );
         }
+    } else if !suppress_nudges && should_escalate_parallel_batching(state) {
+        // Second-tier: the first force didn't stop the streak. Fire a
+        // harder corrective before the circuit breaker aborts the turn
+        // (session 8d9e5903 T11 reached streak 18 with no mid-loop
+        // escalation). One-shot per turn.
+        let streak = crate::prompts::trailing_single_tool_round_streak(&state.messages);
+        state.stall.forced_parallel_batching_escalated = true;
+        let msg = parallel_batching_escalation_message(streak);
+        state.push_volatile(
+            super::agentic_loop_host::VolatileKind::ParallelBatchingForce,
+            msg,
+        );
+        tracing::warn!(
+            target: "astra::loop_guard",
+            tier = "parallel_batching_escalation",
+            streak,
+            round = state.llm_rounds_completed,
+            "loop guard escalated"
+        );
+        if !prep.quiet {
+            host.emit_headless_line(
+                HeadlessStderrStyle::Yellow,
+                format!(
+                    "↻↻ streak still growing ({streak}); escalating parallel-batching corrective…"
+                ),
+            );
+        }
     }
 
     // ── Circuit breaker observation ──────────────────────────────────────
@@ -261,6 +312,14 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         let signal = build_circuit_breaker_signal(state);
         let action = state.stall.circuit_breaker.observe(signal);
         match action {
+            astra_turn_core::loop_circuit_breaker::BreakerAction::InjectCorrection
+                if suppress_nudges =>
+            {
+                // Auto mode: drop the correction entirely. Abort path
+                // below still fires because it represents a real budget
+                // exhaustion, not a soft nudge.
+                state.stall.circuit_breaker.correction_injected();
+            }
             astra_turn_core::loop_circuit_breaker::BreakerAction::InjectCorrection => {
                 state.stall.forced_round_budget_phase1 = true;
                 state.stall.circuit_breaker.correction_injected();
@@ -278,10 +337,8 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 for name in host.valid_tool_names() {
                     state.restricted_tools.insert(name.clone());
                 }
-                state.messages.push(serde_json::json!({
-                    "role": "user",
-                    "content": round_budget_phase1_message(state.llm_rounds_completed, &state.message),
-                }));
+                let msg = round_budget_phase1_message(state.llm_rounds_completed, &state.message);
+                state.push_volatile(super::agentic_loop_host::VolatileKind::BudgetAdvisory, msg);
                 tracing::warn!(
                     target: "astra::loop_guard",
                     tier = "circuit_breaker_correction",
@@ -337,6 +394,12 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 finalize_and_render(host, state).await;
                 return Ok(TurnExecutionControl::Return(AgenticLoopOutcome::Completed));
             }
+            astra_turn_core::loop_circuit_breaker::BreakerAction::Introspect { .. }
+                if suppress_nudges =>
+            {
+                // Auto mode: don't interject a [Self-check — round N]
+                // message; the user opted in to uninterrupted execution.
+            }
             astra_turn_core::loop_circuit_breaker::BreakerAction::Introspect {
                 consecutive_read_only,
             } => {
@@ -346,13 +409,11 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 // for structured logging / observability only.
                 state.stall.introspection_count = state.stall.introspection_count.saturating_add(1);
                 let emission_index = state.stall.introspection_count;
-                state.messages.push(serde_json::json!({
-                    "role": "user",
-                    "content": circuit_breaker_introspection_message(
-                        state.llm_rounds_completed,
-                        consecutive_read_only,
-                    ),
-                }));
+                let msg = circuit_breaker_introspection_message(
+                    state.llm_rounds_completed,
+                    consecutive_read_only,
+                );
+                state.push_volatile(super::agentic_loop_host::VolatileKind::CircuitBreaker, msg);
                 tracing::info!(
                     target: "astra::loop_guard",
                     tier = "circuit_breaker_introspect",
@@ -371,12 +432,11 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     );
                 }
             }
+            astra_turn_core::loop_circuit_breaker::BreakerAction::SoftStop if suppress_nudges => {}
             astra_turn_core::loop_circuit_breaker::BreakerAction::SoftStop => {
                 state.stall.forced_completion_soft_stop = true;
-                state.messages.push(serde_json::json!({
-                    "role": "user",
-                    "content": completion_soft_stop_message(state.llm_rounds_completed, &state.message),
-                }));
+                let msg = completion_soft_stop_message(state.llm_rounds_completed, &state.message);
+                state.push_volatile(super::agentic_loop_host::VolatileKind::CircuitBreaker, msg);
                 tracing::info!(
                     target: "astra::loop_guard",
                     tier = "completion_soft_stop",
@@ -400,15 +460,14 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         }
     }
 
-    if !state.stall.forced_round_budget_phase1
+    if !suppress_nudges
+        && !state.stall.forced_round_budget_phase1
         && !state.stall.forced_completion_soft_stop
         && let Some((family, blocked_tools)) = exploration_family_phase2_candidate(state)
     {
         state.stall.forced_exploration_family_phase2 = true;
-        state.messages.push(serde_json::json!({
-            "role": "user",
-            "content": exploration_family_phase2_message(&family, &blocked_tools, &state.message),
-        }));
+        let msg = exploration_family_phase2_message(&family, &blocked_tools, &state.message);
+        state.push_volatile(super::agentic_loop_host::VolatileKind::Corrective, msg);
         tracing::warn!(
             target: "astra::loop_guard",
             tier = "exploration_family_phase2",
@@ -434,7 +493,8 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     // rather than re-reading. Lives below round-budget phase-1 because
     // phase-1 is the harder finalization push — if both would fire on the
     // same round we prefer phase-1's narrower "stop calling tools" message.
-    if !state.stall.forced_round_budget_phase1
+    if !suppress_nudges
+        && !state.stall.forced_round_budget_phase1
         && !state.stall.forced_completion_soft_stop
         && !state.stall.forced_exploration_family_phase2
         && should_inject_redundant_reads_corrective(state, redundant_reads_threshold)
@@ -443,10 +503,8 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             &state.stall.tool_call_records,
         );
         state.stall.forced_redundant_reads_corrective = true;
-        state.messages.push(serde_json::json!({
-            "role": "user",
-            "content": redundant_reads_corrective_message(count, &state.message),
-        }));
+        let msg = redundant_reads_corrective_message(count, &state.message);
+        state.push_volatile(super::agentic_loop_host::VolatileKind::Corrective, msg);
         tracing::warn!(
             target: "astra::loop_guard",
             tier = "redundant_reads_corrective",
@@ -464,7 +522,8 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             );
         }
     }
-    if !state.stall.forced_round_budget_phase1
+    if !suppress_nudges
+        && !state.stall.forced_round_budget_phase1
         && !state.stall.forced_completion_soft_stop
         && !state.stall.forced_exploration_family_phase2
         && !state.stall.forced_redundant_reads_corrective
@@ -472,10 +531,8 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     {
         let wasteful = cache_wasteful_tools(state, cache_waste_threshold);
         state.stall.forced_cache_waste_corrective = true;
-        state.messages.push(serde_json::json!({
-            "role": "user",
-            "content": cache_waste_corrective_message(&wasteful, &state.message),
-        }));
+        let msg = cache_waste_corrective_message(&wasteful, &state.message);
+        state.push_volatile(super::agentic_loop_host::VolatileKind::Corrective, msg);
         tracing::warn!(
             target: "astra::loop_guard",
             tier = "cache_waste_corrective",
@@ -496,7 +553,8 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             );
         }
     }
-    if !state.stall.forced_round_budget_phase1
+    if !suppress_nudges
+        && !state.stall.forced_round_budget_phase1
         && !state.stall.forced_completion_soft_stop
         && !state.stall.forced_exploration_family_phase2
         && !state.stall.forced_redundant_reads_corrective
@@ -506,10 +564,9 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     {
         let restricted = apply_exploration_family_restrictions(state, &family);
         state.stall.forced_exploration_family_corrective = true;
-        state.messages.push(serde_json::json!({
-            "role": "user",
-            "content": exploration_family_corrective_message(&family, streak, &restricted, &state.message),
-        }));
+        let msg =
+            exploration_family_corrective_message(&family, streak, &restricted, &state.message);
+        state.push_volatile(super::agentic_loop_host::VolatileKind::Corrective, msg);
         tracing::warn!(
             target: "astra::loop_guard",
             tier = "exploration_family_corrective",
@@ -1592,6 +1649,42 @@ pub(crate) fn should_force_parallel_batching(
     streak >= threshold
 }
 
+/// Escalation threshold: once the first parallel-batching force has
+/// fired, if the model is still producing single-tool rounds and the
+/// streak from *the round after the force* has grown by this many
+/// rounds, fire a second, harder corrective. Chosen to avoid immediate
+/// re-fire (the model needs at least 1 round to react) while catching
+/// cases where the streak grows without bound (session 8d9e5903 T11
+/// reached 18).
+pub(crate) const PARALLEL_BATCHING_ESCALATION_STREAK: usize = 10;
+
+pub(crate) fn should_escalate_parallel_batching(state: &AgenticLoopState) -> bool {
+    // Requires that the first-tier force already fired.
+    if !state.stall.forced_parallel_batching {
+        return false;
+    }
+    // One-shot: never re-fire the escalation in the same turn.
+    if state.stall.forced_parallel_batching_escalated {
+        return false;
+    }
+    let streak = crate::prompts::trailing_single_tool_round_streak(&state.messages);
+    streak >= PARALLEL_BATCHING_ESCALATION_STREAK
+}
+
+pub(crate) fn parallel_batching_escalation_message(streak: usize) -> String {
+    format!(
+        "{PARALLEL_BATCHING_FORCE_MARKER}\n\
+         Runtime ESCALATION: the prior parallel-batching correction did not \
+         change your behavior — you are still on a streak of {streak} consecutive \
+         single-tool rounds. This is a hard loop; the turn will be aborted \
+         by the circuit breaker if it continues. \
+         Your NEXT response MUST be one of:\n\
+         - A final answer (no tool calls), OR\n\
+         - ≥2 independent tool calls in a single parallel batch.\n\
+         Do not produce another single-tool round — there is no third warning."
+    )
+}
+
 pub(crate) fn parallel_batching_force_message(streak: usize, original_query: &str) -> String {
     format!(
         "{PARALLEL_BATCHING_FORCE_MARKER}\n\
@@ -2233,6 +2326,31 @@ async fn handle_token_budget<H: AgenticLoopHost>(
             state
                 .compaction_effectiveness
                 .record_compaction(total_freed);
+            // Session 0e37eb46 regression: after compaction shreds the
+            // history, the model sees a much-shorter context and often
+            // misreads it as "I've been interrupted" → produces a
+            // progress summary instead of continuing. Inject a short
+            // directive that reframes it as "the runtime compressed
+            // your history; CONTINUE the task — do NOT summarize."
+            //
+            // Observable: stderr line above ("♻ Context pressure…")
+            // shows the compaction fired; this push_volatile adds the
+            // behavioural counter-directive to the volatile lane.
+            // Recoverable: if a future user wants the old behaviour,
+            // the volatile is singleton per turn and never persisted.
+            // Correctable: `compaction_injects_resume_directive_on_volatile_lane`
+            // test locks the contract.
+            state.push_volatile(
+                super::agentic_loop_host::VolatileKind::CompactResume,
+                "Context compacted: the runtime just compressed your older \
+                 conversation history to reduce token pressure. Your \
+                 original task and the most recent tool activity are \
+                 still above — CONTINUE the task where you left off. \
+                 Do NOT summarize progress or ask the user to restate \
+                 the goal. If the previous attempt left a failing test \
+                 or an error, FIX IT next. Treat this compaction as a \
+                 transparent runtime event, not an instruction to stop.",
+            );
             state.budget_wrapup_injected = true;
             try_write_heavy_checkpoint(state);
             return Some(TurnExecutionControl::ContinueLoop);
@@ -2250,13 +2368,13 @@ async fn handle_token_budget<H: AgenticLoopHost>(
             ),
         );
     }
-    state.messages.push(serde_json::json!({
-        "role": "system",
-        "content": "You have reached the token budget limit for this turn. \
-            Do NOT call any more tools. Summarize your progress so far and \
-            present your results to the user. If you have partial work, \
-            explain what remains to be done."
-    }));
+    state.push_volatile(
+        super::agentic_loop_host::VolatileKind::BudgetAdvisory,
+        "You have reached the token budget limit for this turn. \
+         Do NOT call any more tools. Summarize your progress so far and \
+         present your results to the user. If you have partial work, \
+         explain what remains to be done.",
+    );
     try_write_heavy_checkpoint(state);
     Some(TurnExecutionControl::ContinueLoop)
 }
@@ -2296,12 +2414,12 @@ fn should_wrap_up_for_cumulative_budget<H: AgenticLoopHost>(
             ),
         );
     }
-    state.messages.push(serde_json::json!({
-        "role": "system",
-        "content": "You have reached the cumulative token budget. \
-            Do NOT call any more tools. Summarize your progress so far and \
-            present your results to the user."
-    }));
+    state.push_volatile(
+        super::agentic_loop_host::VolatileKind::BudgetAdvisory,
+        "You have reached the cumulative token budget. \
+         Do NOT call any more tools. Summarize your progress so far and \
+         present your results to the user.",
+    );
     try_write_heavy_checkpoint(state);
     true
 }
@@ -2461,32 +2579,75 @@ mod tests {
         assert_eq!(guard.turn_timings[0].turn, 6);
     }
 
+    // ── Attention manifest lives in state.attention_manifest_text,
+    //    NOT in state.messages ────────────────────────────────────────
+    // Regression guard for the prefix-cache drift fix. Previously the
+    // manifest was pushed as a `role:user` message in history, which
+    // broke byte-prefix caching every turn because the manifest
+    // content drifts (todo status flips, active_files grows). It now
+    // rides the volatile system-prompt lane — the host reads
+    // `state.attention_manifest_text` when building the payload.
+    //
+    // Regression coverage requires both halves:
+    // 1. The text IS populated on state (so downstream can surface it)
+    // 2. `state.messages` has ZERO `[attention:v1]` entries (so prefix
+    //    cache stays stable).
+
     #[test]
-    fn runtime_attention_manifest_creates_todo_without_task_tool_call() {
+    fn runtime_attention_manifest_populates_state_not_messages() {
         let mut state = make_state();
         state.message =
             "Implement runtime continuity and validate that active todo survives compaction".into();
+        let original_msg_count = state.messages.len();
         state.messages.push(serde_json::json!({
             "role": "user",
             "content": state.message,
         }));
+        let msg_count_before_inject = state.messages.len();
 
         inject_runtime_attention_manifest(&mut state);
 
+        // 1. Continuity state carries the todo correctly.
         assert_eq!(state.continuity.todos.items.len(), 1);
         assert_eq!(state.continuity.todos.items[0].id, "runtime-goal");
-        let manifest = state
+
+        // 2. Manifest text is on state, reflects the todo.
+        let text = state
+            .attention_manifest_text
+            .as_ref()
+            .expect("manifest must be set when todos present");
+        assert!(text.starts_with("[attention:v1]\n"));
+        assert!(text.contains("current_todo: runtime-goal [pending]"));
+
+        // 3. CRITICAL: no attention-manifest message leaked into history.
+        let manifest_msgs = state
             .messages
-            .last()
-            .and_then(|message| message.get("content"))
-            .and_then(|content| content.as_str())
-            .unwrap();
-        assert!(manifest.starts_with("[attention:v1]\n"));
-        assert!(manifest.contains("current_todo: runtime-goal [pending]"));
+            .iter()
+            .filter(|m| {
+                m.get("content")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|s| s.starts_with("[attention:v1]"))
+            })
+            .count();
+        assert_eq!(
+            manifest_msgs, 0,
+            "attention manifest must NOT appear in state.messages — prefix cache depends on stable history"
+        );
+
+        // 4. messages length didn't grow from injection (only the user
+        //    message we pushed ourselves is present).
+        assert_eq!(
+            state.messages.len(),
+            msg_count_before_inject,
+            "inject_runtime_attention_manifest must not push to messages; original={original_msg_count}"
+        );
     }
 
     #[test]
-    fn runtime_attention_manifest_replaces_stale_manifest_and_keeps_active_facts() {
+    fn runtime_attention_manifest_strips_legacy_manifest_from_messages() {
+        // Older code paths / restored checkpoints may still carry a
+        // manifest message in history. The inject step must always
+        // strip it so prefix cache stays clean going forward.
         let mut state = make_state();
         state.message = "Fix the runtime continuity bug and add tests".into();
         state.messages.push(serde_json::json!({
@@ -2505,21 +2666,53 @@ mod tests {
         inject_runtime_attention_manifest(&mut state);
         inject_runtime_attention_manifest(&mut state);
 
-        let manifests: Vec<&str> = state
+        // Legacy manifest messages must be gone.
+        let manifest_msgs = state
             .messages
             .iter()
-            .filter_map(|message| message.get("content").and_then(|content| content.as_str()))
-            .filter(|content| content.starts_with("[attention:v1]"))
-            .collect();
-        assert_eq!(manifests.len(), 1);
-        assert!(manifests[0].contains(
+            .filter(|m| {
+                m.get("content")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|s| s.starts_with("[attention:v1]"))
+            })
+            .count();
+        assert_eq!(manifest_msgs, 0, "legacy manifest msg must be stripped");
+
+        // The fresh manifest on state reflects the active files, not
+        // the stale placeholder content.
+        let text = state
+            .attention_manifest_text
+            .as_ref()
+            .expect("non-trivial state must produce manifest");
+        assert!(text.contains(
             "active_files:\n- rust/crates/runtime/src/turn/agentic_loop_execution_phase.rs"
         ));
-        assert!(!manifests[0].contains("stale"));
+        assert!(!text.contains("stale"));
+    }
+
+    #[test]
+    fn runtime_attention_manifest_is_none_for_trivial_state() {
+        // Turn 1 of a plain "hi" session: no todos, no active files,
+        // no errors, no corrections, no verifications. State should
+        // report None so the volatile block emits nothing.
+        let mut state = make_state();
+        state.message = "hi".into();
+
+        inject_runtime_attention_manifest(&mut state);
+
+        assert!(
+            state.attention_manifest_text.is_none(),
+            "trivial state must not produce manifest text, got: {:?}",
+            state.attention_manifest_text
+        );
     }
 
     #[tokio::test]
-    async fn execute_turn_strips_stale_manifest_and_injects_fresh_manifest_before_host_call() {
+    async fn execute_turn_strips_legacy_manifest_and_populates_state_text() {
+        // Post-refactor: the attention manifest MUST NOT appear in
+        // messages executed against the host. Instead, the fresh
+        // manifest text is on `state.attention_manifest_text` for the
+        // host's payload builder to route into the volatile lane.
         let mut state = make_state();
         state.message = "Continue the checkpoint restore refactor and add tests".into();
         state.messages.push(serde_json::json!({
@@ -2548,16 +2741,31 @@ mod tests {
         .await
         .unwrap();
 
+        // No manifest message reached the host.
         let captured = host.executed_messages.first().expect("host was called");
-        let manifests: Vec<&str> = captured
+        let manifest_msgs = captured
             .iter()
-            .filter_map(|message| message.get("content").and_then(|content| content.as_str()))
-            .filter(|content| content.starts_with("[attention:v1]"))
-            .collect();
-        assert_eq!(manifests.len(), 1);
-        assert!(manifests[0].contains("checkpoint restore refactor"));
-        assert!(manifests[0].contains("rust/crates/astra-pipeline/src/step_restore.rs"));
-        assert!(!manifests[0].contains("stale compacted summary"));
+            .filter(|message| {
+                message
+                    .get("content")
+                    .and_then(|content| content.as_str())
+                    .is_some_and(|s| s.starts_with("[attention:v1]"))
+            })
+            .count();
+        assert_eq!(
+            manifest_msgs, 0,
+            "post-refactor: no attention manifest in history — it rides state.attention_manifest_text instead"
+        );
+
+        // The fresh manifest text is on state with the new file info,
+        // and does NOT carry the stale compacted summary wording.
+        let text = state
+            .attention_manifest_text
+            .as_ref()
+            .expect("non-trivial state must carry manifest");
+        assert!(text.contains("checkpoint restore refactor"));
+        assert!(text.contains("rust/crates/astra-pipeline/src/step_restore.rs"));
+        assert!(!text.contains("stale compacted summary"));
     }
 
     // PR 5a: the turn loop must invoke host.on_turn_completed
@@ -3532,6 +3740,85 @@ mod tests {
         ));
     }
 
+    // ── Escalation tier (P0: session 8d9e5903 regression) ──
+    //
+    // When the first-tier force has fired but the model keeps producing
+    // single-tool rounds, the runtime must escalate — one-shot is too
+    // lenient. Guards prevent infinite re-fire and prevent escalation
+    // from firing *before* the first-tier has fired.
+
+    #[test]
+    fn parallel_batching_escalation_silent_before_first_tier_fires() {
+        let mut state = make_state();
+        state.message = "explore".into();
+        for _ in 0..PARALLEL_BATCHING_ESCALATION_STREAK {
+            push_single_tool_round(&mut state);
+        }
+        // Even at high streak, escalation requires the first-tier to
+        // have fired already — otherwise the first-tier should fire
+        // instead (and does; asserted in its own tests).
+        assert!(!should_escalate_parallel_batching(&state));
+    }
+
+    #[test]
+    fn parallel_batching_escalation_fires_when_streak_persists_after_first_tier() {
+        let mut state = make_state();
+        state.message = "explore".into();
+        // Simulate: first-tier already fired some rounds back; model
+        // ignored the correction and kept streaking.
+        state.stall.forced_parallel_batching = true;
+        for _ in 0..PARALLEL_BATCHING_ESCALATION_STREAK {
+            push_single_tool_round(&mut state);
+        }
+        assert!(
+            should_escalate_parallel_batching(&state),
+            "with forced_parallel_batching=true and streak>=10, escalation must fire \
+             — session 8d9e5903 T11 reached streak 18 with no escalation because \
+             this path did not exist"
+        );
+    }
+
+    #[test]
+    fn parallel_batching_escalation_silent_below_escalation_threshold() {
+        let mut state = make_state();
+        state.message = "explore".into();
+        state.stall.forced_parallel_batching = true;
+        for _ in 0..(PARALLEL_BATCHING_ESCALATION_STREAK - 1) {
+            push_single_tool_round(&mut state);
+        }
+        assert!(!should_escalate_parallel_batching(&state));
+    }
+
+    #[test]
+    fn parallel_batching_escalation_is_one_shot_per_turn() {
+        let mut state = make_state();
+        state.message = "explore".into();
+        state.stall.forced_parallel_batching = true;
+        for _ in 0..PARALLEL_BATCHING_ESCALATION_STREAK {
+            push_single_tool_round(&mut state);
+        }
+        assert!(should_escalate_parallel_batching(&state));
+        // Once escalation has fired, a second round of single-tool does
+        // NOT re-escalate.
+        state.stall.forced_parallel_batching_escalated = true;
+        push_single_tool_round(&mut state);
+        assert!(!should_escalate_parallel_batching(&state));
+    }
+
+    #[test]
+    fn parallel_batching_escalation_message_contains_streak_and_no_third_warning() {
+        let msg = parallel_batching_escalation_message(18);
+        assert!(msg.contains("18 consecutive"));
+        assert!(
+            msg.contains("no third warning"),
+            "escalation message must make clear this is the last chance: {msg}"
+        );
+        assert!(
+            msg.contains("ESCALATION"),
+            "message must distinguish itself from the first-tier force: {msg}"
+        );
+    }
+
     #[test]
     fn parallel_batching_force_marker_recognized_by_corrective_filter() {
         let msg = serde_json::json!({
@@ -3594,6 +3881,139 @@ mod tests {
     // unit tests in `astra_turn_core::loop_circuit_breaker::tests`.
     // The circuit breaker is integration-tested via the full agentic loop
     // E2E tests.
+
+    // ── Auto-mode nudge suppression ────────────────────────────────────
+    // In PermissionMode::Auto (→ TurnInteractionMode::Auto) the user
+    // opted into uninterrupted execution. Every corrective nudge we
+    // would otherwise inject must be dropped. Regression coverage for
+    // the "不停被打断" complaint in session 3b7ac18f.
+
+    fn prep(quiet: bool) -> TurnIterationPrep {
+        TurnIterationPrep {
+            quiet,
+            turn_start_time: Instant::now(),
+        }
+    }
+
+    fn has_message_starting_with(state: &AgenticLoopState, prefix: &str) -> bool {
+        state.messages.iter().any(|m| {
+            m.get("content")
+                .and_then(|c| c.as_str())
+                .is_some_and(|s| s.starts_with(prefix))
+        })
+    }
+
+    #[tokio::test]
+    async fn auto_mode_suppresses_parallel_batching_force_injection() {
+        // Set up a state that DEFINITELY would inject the
+        // parallel-batching-force nudge in non-auto mode: long enough
+        // single-tool streak past threshold.
+        let mut state = make_state();
+        state.message = "explore the codebase".into();
+        for _ in 0..(PARALLEL_BATCHING_FORCE_STREAK_THRESHOLD + 2) {
+            push_single_tool_round(&mut state);
+        }
+
+        let mut host = MockHost::new(vec![text_result("done", 10, 5, Some(1))])
+            .with_interaction_mode(TurnInteractionMode::Auto);
+        let _ = execute_turn_and_ingest_phase(&mut host, &mut state, 0, prep(true))
+            .await
+            .unwrap();
+
+        assert!(
+            !has_message_starting_with(&state, PARALLEL_BATCHING_FORCE_MARKER),
+            "Auto mode must not inject parallel-batching-force nudge"
+        );
+        assert!(
+            !state.stall.forced_parallel_batching,
+            "Auto mode must not set forced_parallel_batching flag"
+        );
+    }
+
+    // Non-auto positive control is covered by the existing unit tests
+    // `parallel_batching_force_fires_at_streak_threshold` etc. — those
+    // test the predicate directly without the RuntimeConfig-dependent
+    // loading code path that `execute_turn_and_ingest_phase` runs. The
+    // Auto-mode suppression tests below target the new gate, which is
+    // the only behaviour that changed.
+
+    #[tokio::test]
+    async fn auto_mode_suppresses_execution_escalation_injection() {
+        // Build a state that would trigger execution escalation: many
+        // read-only successful tool calls on a mutating-sounding task.
+        let mut state = make_state();
+        state.message = "fix the broken auth middleware".into();
+        // Accumulate EXECUTION_ESCALATION_TOOL_CALL_THRESHOLD successful
+        // read-only records with no write. `ok: true` + non-synthetic is
+        // the shape `should_escalate_execution` counts.
+        for i in 0..EXECUTION_ESCALATION_TOOL_CALL_THRESHOLD {
+            state.stall.tool_call_records.push(ToolCallRecord {
+                name: "read_file".to_string(),
+                ok: true,
+                ms: 10,
+                error: None,
+                input_bytes: None,
+                output_bytes: None,
+                args_preview: Some(format!("path: src/{i}.rs")),
+                result_preview: None,
+                file_path: Some(format!("src/{i}.rs")),
+                surgically_removed: None,
+                original_tool_name: None,
+                start_offset_ms: None,
+                batch_id: None,
+                parallel: None,
+                round: None,
+                args_full: None,
+                result_full: None,
+                skill_reentry_count: None,
+                skill_locked_out: None,
+            });
+        }
+
+        let mut host = MockHost::new(vec![text_result("done", 10, 5, Some(1))])
+            .with_interaction_mode(TurnInteractionMode::Auto);
+        let _ = execute_turn_and_ingest_phase(&mut host, &mut state, 0, prep(true))
+            .await
+            .unwrap();
+
+        assert!(
+            !has_message_starting_with(&state, EXECUTION_ESCALATION_MARKER),
+            "Auto mode must not inject execution-escalation nudge"
+        );
+        assert!(!state.stall.forced_execution_escalation);
+    }
+
+    #[tokio::test]
+    async fn auto_mode_suppresses_round_budget_guidance_injection() {
+        // The prompt-side tool_round_guidance (parallel-batching soft
+        // nudge at streak=4, before the hard force at streak=5) also
+        // must stay silent in Auto.
+        let mut state = make_state();
+        state.message = "keep going".into();
+        // Below the force threshold but at/above the soft-nudge
+        // threshold (=4). This should emit a user message in non-auto.
+        for _ in 0..crate::prompts::PARALLEL_BATCHING_NUDGE_THRESHOLD {
+            push_single_tool_round(&mut state);
+        }
+
+        let mut host = MockHost::new(vec![text_result("done", 10, 5, Some(1))])
+            .with_interaction_mode(TurnInteractionMode::Auto);
+        let _ = execute_turn_and_ingest_phase(&mut host, &mut state, 0, prep(true))
+            .await
+            .unwrap();
+
+        // Neither the soft "Sequential Tool Calls Detected" nudge nor
+        // the positive "Previous round: N tools" feedback should be
+        // re-injected in Auto mode — both ride `tool_round_guidance`.
+        assert!(
+            !has_message_starting_with(&state, "## ⚠ Sequential Tool Calls Detected")
+                && !state.messages.iter().any(|m| m
+                    .get("content")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|s| s.contains("## ⚠ Sequential Tool Calls Detected"))),
+            "Auto mode must not inject round-budget/tool guidance nudges"
+        );
+    }
 
     fn push_redundant_sed_read(state: &mut AgenticLoopState, round: u32) {
         // Same file, same range, no intervening mutation — counts as one

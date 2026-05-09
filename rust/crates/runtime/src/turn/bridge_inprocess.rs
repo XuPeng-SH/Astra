@@ -68,6 +68,58 @@ use astra_turn_core::tool_schema_prune::prune_tool_schemas;
 const TOOL_RESULT_AUDIT_CHARS: usize = 4000;
 const ROOT_TURN_JOURNAL_HEADER: &str = "x-mo-root-turn-journal";
 
+/// Decide whether the bridge should run its own `prefetch_memories` call.
+///
+/// Returns `false` (= skip) when the CLI has already injected
+/// `memoria_insights_text`. Both the CLI's `memory_boost_search` +
+/// `render_digest` path and the bridge's `prefetch_memories` + `bind_memory`
+/// path hit the same Memoria backend with overlapping queries and `top_k=5`.
+/// Running both produces two differently-formatted memory sections
+/// (`## Memoria Recall` + `## User Memories`) whose contents substantially
+/// overlap — observed +~700 tok of duplicate content per turn in production
+/// sessions. The CLI digest is authoritative; when present, the bridge
+/// path is redundant.
+pub(crate) fn bridge_should_run_memoria_prefetch(edge_profile: &Map<String, Value>) -> bool {
+    let cli_has_insights = edge_profile
+        .get("memoria_insights_text")
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.is_empty());
+    !cli_has_insights
+}
+
+/// Strip volatile `dynamic_sections` when the provider can't tolerate
+/// per-round byte churn in the request prefix.
+///
+/// Strict-history providers (MiniMax-style, classified as
+/// `VolatilePlacement::CurrentUserOnly`) invalidate the whole cache
+/// entry on ANY mid-history byte change. Re-injecting volatile content
+/// (Self-Awareness, session anchor, memoria insights, feedback rules)
+/// on every round collapses their cache. `CacheCapability::should_inject_volatile_on_round`
+/// returns `false` for them on every round — including round 0 — and
+/// we must respond by dropping all volatile sections.
+///
+/// Round-0-only injection was tried and rejected: round 0's msg[1]
+/// would include `preamble + user_q` while round 1+'s msg[1] would be
+/// `user_q` only, so the byte-stable-history invariant still breaks.
+/// See `cache_placement::VolatilePlacement::CurrentUserOnly` docs and
+/// the session 986a553e regression for the full rationale.
+///
+/// Extracted as a standalone pure function so the dual-path
+/// (bridge + server) invariant can be unit-tested without spinning up
+/// the full bridge pipeline. The server path has its own equivalent
+/// in `run_turn_pipeline`; both must stay in sync.
+fn effective_volatile_sections_for_round(
+    cache_cap: astra_turn_core::cache_placement::CacheCapability,
+    round_index: u32,
+    dynamic_sections: &[prompts::PromptSection],
+) -> Vec<prompts::PromptSection> {
+    if cache_cap.should_inject_volatile_on_round(round_index) {
+        dynamic_sections.to_vec()
+    } else {
+        Vec::new()
+    }
+}
+
 fn self_awareness_volatile_section(text: &str) -> Option<prompts::PromptSection> {
     (!text.is_empty()).then(|| {
         prompts::PromptSection::dynamic(text.to_string(), prompts::PromptTokenBucket::Environment)
@@ -962,9 +1014,10 @@ impl InProcessChatTurnBridge {
             // Resolve LLM model (skipped when `test_llm_rounds` drives the turn — feature `bridge-e2e-hooks`).
             // Also capture fallback_chain for rate-limit-triggered fallback.
             let pool_ref = shared_pool.as_ref().map(SharedPool::get);
-            let (mut model_name, mut api_key, mut base_url, mut provider, fallback_chain) = if use_e2e_llm {
+            let (mut model_name, mut wire_model_name, mut api_key, mut base_url, mut provider, fallback_chain) = if use_e2e_llm {
                 (
                     "bridge-e2e-mock".to_string(),
+                    None::<String>,
                     "unused".to_string(),
                     "http://127.0.0.1:1".to_string(),
                     "openai".to_string(),
@@ -979,7 +1032,14 @@ impl InProcessChatTurnBridge {
                 )
                 .await
                 {
-                    Ok(m) => (m.model_name, m.api_key, m.base_url, m.provider, m.fallback_chain),
+                    Ok(m) => (
+                        m.model_name,
+                        m.wire_model_name,
+                        m.api_key,
+                        m.base_url,
+                        m.provider,
+                        m.fallback_chain,
+                    ),
                     Err(e) => {
                         yield render_sse_map(&build_stream_error_event(&e, "MODEL_NOT_AVAILABLE", false));
                         mark_disconnect_capture_finalized(&disconnect_capture_state);
@@ -1039,6 +1099,7 @@ impl InProcessChatTurnBridge {
                     {
                         FallbackOutcome::Resolved(fb) => {
                             model_name = fb.model_name;
+                            wire_model_name = fb.wire_model_name;
                             api_key = fb.api_key;
                             base_url = fb.base_url;
                             provider = fb.provider;
@@ -1138,8 +1199,19 @@ impl InProcessChatTurnBridge {
 
             // Memoria prefetch lives on its own. `section` is the
             // "## User Memories\n..." block — the piece that actually drifts.
+            //
+            // Skip when the CLI has already injected `memoria_insights_text`
+            // (rendered as `## Memoria Recall` via the bridge's volatile
+            // lane). Both paths query the same Memoria backend with
+            // overlapping queries + top_k=5; running both duplicates
+            // ~700 tokens of memory content per turn into two
+            // differently-formatted sections (`## Memoria Recall` +
+            // `## User Memories`). When present, the CLI digest is
+            // authoritative. See `bridge_should_run_memoria_prefetch`.
             let mut memoria_prefetch_entries = Vec::new();
-            let memoria_prefetch_section = if let (Some(mem_url), Some(mem_key)) = (
+            let memoria_prefetch_section = if !bridge_should_run_memoria_prefetch(&edge_profile) {
+                None
+            } else if let (Some(mem_url), Some(mem_key)) = (
                 edge_profile.get("memoria_url").and_then(Value::as_str),
                 edge_profile.get("memoria_key").and_then(Value::as_str),
             ) {
@@ -1326,7 +1398,7 @@ impl InProcessChatTurnBridge {
             let session_anchor = {
                 use crate::turn::cloud::session_memory_protocol::{
                     extract_anchor, extract_anchor_from_facts, extract_message_text,
-                    is_trivial_anchor, build_l1_from_messages, SessionMemory,
+                    build_l1_from_messages, SessionMemory,
                 };
                 let first_user_text = messages
                     .iter()
@@ -1367,7 +1439,7 @@ impl InProcessChatTurnBridge {
                         };
                         extract_anchor(&first_user_text, l1.as_ref())
                     };
-                    if is_trivial_anchor(&anchor, user_content_for_signal) {
+                    if anchor.is_trivial(user_content_for_signal) {
                         String::new()
                     } else {
                         format!("\n\n{anchor}")
@@ -1570,11 +1642,23 @@ impl InProcessChatTurnBridge {
                 .get("project_context")
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty());
+            // Provider-aware volatile gating — see
+            // `effective_volatile_sections_for_round` for the full rationale.
+            // CurrentUserOnly (MiniMax) drops ALL rounds, not just >0.
+            let cache_cap = astra_turn_core::cache_placement::CacheCapability::for_provider_and_model(
+                &provider,
+                &model_name,
+            );
+            let effective_dynamic_sections = effective_volatile_sections_for_round(
+                cache_cap,
+                round_index,
+                &dynamic_sections,
+            );
             let pipeline_outcome = crate::turn::prompt_cache::assemble_bridge_pipeline_outcome(
                 &tool_names,
                 &edge_tools,
                 &stable_sections,
-                &dynamic_sections,
+                &effective_dynamic_sections,
                 &memoria_prefetch_entries,
                 selection_confidence,
                 task_type,
@@ -1618,17 +1702,16 @@ impl InProcessChatTurnBridge {
             llm_messages.push(system_msg);
             let mut bridge_volatile_text: Option<String> = None;
             if let Some(dyn_msg) = dynamic_msg {
-                // For prefix-only providers the dynamic system block contains
-                // volatile per-turn content. We prepend it to the last user
-                // message (below, after compacted messages are added) so the
-                // stable prefix (system + history) is byte-identical across
-                // turns for maximum prefix cache hits.
-                // Anthropic never reaches here (dynamic_system is None).
-                debug_assert!(
-                    !crate::turn::llm_client::provider_uses_explicit_cache_control(&provider),
-                    "Anthropic/Bedrock should not produce dynamic_system — \
-                     volatile content goes via pipeline cache_control markers"
-                );
+                // Volatile per-turn content (Self-Awareness counter, session
+                // anchor, etc.) — ALL protocols now route it to the
+                // last user message prefix so the system + tools prefix stays
+                // byte-stable across rounds. Earlier the Anthropic/Bedrock
+                // paths embedded volatile in the system content array past
+                // the cache_control marker; controlled probes (session
+                // 5c5cbf78, see deepseek_anthropic_cache_probe.py) showed
+                // DeepSeek treats the byte change as a fresh payload and
+                // never reaches the 2nd-warm state where tools enter cache.
+                // Bedrock is unaffected either way.
                 let dyn_text = dyn_msg
                     .get("content")
                     .and_then(Value::as_str)
@@ -1774,20 +1857,25 @@ impl InProcessChatTurnBridge {
                 } else {
                     resolved_model.clone()
                 };
-                record_full_llm_request_event(
-                    &mut turn_event_buffer,
-                    full_llm_capture,
-                    &session_id,
-                    trace_turn,
-                    &trace_correlation,
-                    "bridge_inprocess",
-                    &request_capture_model,
-                    &provider,
-                    attempt_in_round,
-                    &llm_messages,
-                    &pruned_tools,
-                    Some(max_output_tokens),
-                );
+
+                // Capture the request AFTER all wire mutations: session-anchor
+                // append, prompt-cache metadata (cache_control marker on the
+                // last pre-user message), tool schema annotations.
+                // Historically the capture ran here,
+                // BEFORE `apply_anthropic_cache_metadata` — which meant the
+                // trace reported a pre-mutation snapshot that doesn't match
+                // what actually went out on the wire. Concretely: Anthropic
+                // request captures showed 0 `cache_control` markers on
+                // messages even though the downstream call DID have them,
+                // making "is prompt-cache working?" uninvestigable from a
+                // trace alone. See session c6e18730 analysis.
+                //
+                // The capture now happens after the e2e-round fixture branch
+                // so that both real and fixture paths record the final
+                // bytes. E2E path: mutations already applied by the fixture
+                // (no re-mutate). Real path: mutations applied here, then
+                // capture, then the real LLM call consumes `llm_messages`
+                // which STILL carries those mutations.
 
                 let e2e_round: Option<&Value> = if use_e2e_llm {
                     bridge_e2e
@@ -1797,7 +1885,39 @@ impl InProcessChatTurnBridge {
                     None
                 };
 
+                // Both branches below apply the same wire mutations and then
+                // capture the final state. Binding the capture args once here
+                // makes "E2E and real path record byte-identical traces" a
+                // structural property rather than a copy-paste invariant
+                // (reviewers previously had to diff the two call sites).
+                let capture_request = |buf: &mut Option<TurnEventBuffer>,
+                                       msgs: &[Value],
+                                       attempt: u32| {
+                    record_full_llm_request_event(
+                        buf,
+                        full_llm_capture,
+                        &session_id,
+                        trace_turn,
+                        &trace_correlation,
+                        "bridge_inprocess",
+                        &request_capture_model,
+                        &provider,
+                        attempt,
+                        msgs,
+                        &pruned_tools,
+                        Some(max_output_tokens),
+                    );
+                };
+
                 if let Some(round_val) = e2e_round {
+                    // E2E fixture path: apply cache annotations first so the
+                    // captured wire state matches the real-LLM branch below.
+                    // Otherwise fixture runs would trace pre-mutation state
+                    // even though the request shape sent to the real API
+                    // would be post-mutation. Traces from E2E tests must be
+                    // comparable to traces from real runs.
+                    apply_anthropic_cache_metadata(&mut llm_messages, &cache_cfg, &session_id);
+                    capture_request(&mut turn_event_buffer, &llm_messages, attempt_in_round);
                     #[cfg(feature = "bridge-e2e-hooks")]
                     {
                         let (t, r, tc, u_delta) =
@@ -1826,6 +1946,11 @@ impl InProcessChatTurnBridge {
                 } else {
                     // Add Anthropic protocol-level prompt-cache metadata on the request clone.
                     apply_anthropic_cache_metadata(&mut llm_messages, &cache_cfg, &session_id);
+
+                    // Capture the final post-mutation request state (see the
+                    // long note ~60 lines up for why this is here and not
+                    // before the mutations).
+                    capture_request(&mut turn_event_buffer, &llm_messages, attempt_in_round);
 
                     // Emit system prompt breakdown so CLI can record precise per-component trace.
                     let skill_injections: Vec<astra_turn_core::context_assembly_trace::SkillInjection> =
@@ -1889,6 +2014,7 @@ impl InProcessChatTurnBridge {
                             &llm_messages,
                             &pruned_tools,
                             &model_name,
+                            wire_model_name.as_deref(),
                             &api_key,
                             &base_url,
                             &provider,
@@ -2015,6 +2141,7 @@ impl InProcessChatTurnBridge {
                                 &llm_messages,
                                 &pruned_tools,
                                 &model_name,
+                                wire_model_name.as_deref(),
                                 &api_key,
                                 &base_url,
                                 &provider,
@@ -3686,6 +3813,152 @@ mod tests {
         assert_eq!(count_inprocess_persisted_events(2, 3, true), 5);
     }
 
+    // ── effective_volatile_sections_for_round ────────────────────────────
+    //
+    // Regression tests for the dual-path volatile-gating invariant.
+    // Session 986a553e was first fixed only on the server path
+    // (`run_turn_pipeline`), but `astra chat` routes through this bridge
+    // which had its own volatile-injection flow. The bridge's fix shipped
+    // afterwards, and these tests exist so the next dual-path bug gets
+    // caught at unit-test speed instead of during a cache-rate postmortem.
+    //
+    // Pairs with `server_loop_host::tests::run_turn_pipeline_minimax_skips_volatile_on_tool_loop_round`.
+
+    fn sample_volatile_sections() -> Vec<prompts::PromptSection> {
+        vec![
+            prompts::PromptSection::dynamic(
+                "Self-Awareness: Turn 3 | Tokens 4200/8000".to_string(),
+                prompts::PromptTokenBucket::Environment,
+            ),
+            prompts::PromptSection::dynamic(
+                "session anchor: pay down test flakes".to_string(),
+                prompts::PromptTokenBucket::Environment,
+            ),
+        ]
+    }
+
+    #[test]
+    fn effective_volatile_minimax_is_empty_on_every_round() {
+        // Strict-history (MiniMax) must suppress volatile on round 0, 1,
+        // 6, and any other round — round-0-only injection still makes
+        // msg[1] bytes diverge across rounds, so we suppress unconditionally.
+        let cap = astra_turn_core::cache_placement::CacheCapability::for_provider_and_model(
+            "openai",
+            "MiniMax-M2.7",
+        );
+        let dyn_sections = sample_volatile_sections();
+        for round in [0u32, 1, 2, 6, 12] {
+            let out = effective_volatile_sections_for_round(cap, round, &dyn_sections);
+            assert!(
+                out.is_empty(),
+                "MiniMax must suppress volatile on round {round}; got {} sections",
+                out.len(),
+            );
+        }
+    }
+
+    #[test]
+    fn effective_volatile_openai_keeps_sections_on_every_round() {
+        // OpenAI auto-prefix (TailSuffix): safe to inject every round
+        // since volatile lives at the tail of the last user message.
+        let cap = astra_turn_core::cache_placement::CacheCapability::for_provider_and_model(
+            "openai", "gpt-4o",
+        );
+        let dyn_sections = sample_volatile_sections();
+        for round in [0u32, 1, 5] {
+            let out = effective_volatile_sections_for_round(cap, round, &dyn_sections);
+            assert_eq!(
+                out.len(),
+                dyn_sections.len(),
+                "OpenAI TailSuffix must pass through all volatile on round {round}",
+            );
+        }
+    }
+
+    #[test]
+    fn effective_volatile_anthropic_keeps_sections_on_every_round() {
+        // Anthropic MarkerIsolated: volatile lives AFTER the last
+        // cache_control marker inside the system block, so it's safe to
+        // emit every round. The bridge still gets all sections back;
+        // the downstream pipeline is responsible for marker placement.
+        let cap = astra_turn_core::cache_placement::CacheCapability::for_provider_and_model(
+            "anthropic",
+            "claude-sonnet-4",
+        );
+        let dyn_sections = sample_volatile_sections();
+        for round in [0u32, 1, 5] {
+            let out = effective_volatile_sections_for_round(cap, round, &dyn_sections);
+            assert_eq!(
+                out.len(),
+                dyn_sections.len(),
+                "Anthropic MarkerIsolated must pass through all volatile on round {round}",
+            );
+        }
+    }
+
+    #[test]
+    fn effective_volatile_bedrock_keeps_sections_on_every_round() {
+        // Bedrock cachePoint is also MarkerIsolated — same invariant
+        // as Anthropic.
+        let cap = astra_turn_core::cache_placement::CacheCapability::for_provider_and_model(
+            "bedrock",
+            "us.anthropic.claude-sonnet-4-6",
+        );
+        let dyn_sections = sample_volatile_sections();
+        for round in [0u32, 1, 5] {
+            let out = effective_volatile_sections_for_round(cap, round, &dyn_sections);
+            assert_eq!(
+                out.len(),
+                dyn_sections.len(),
+                "Bedrock MarkerIsolated must pass through all volatile on round {round}",
+            );
+        }
+    }
+
+    /// Pin the exact model id observed in the 986a553e regression so a
+    /// future provider/model normalization change doesn't silently route
+    /// MiniMax back to TailSuffix and reopen the cache hole on the bridge
+    /// path. Mirrors the equivalent server-path regression in
+    /// `cache_placement::tests::minimax_m27_session_986a553e_routes_to_current_user_only`.
+    #[test]
+    fn effective_volatile_bridge_minimax_m27_session_986a553e_regression() {
+        let cap = astra_turn_core::cache_placement::CacheCapability::for_provider_and_model(
+            "openai",
+            "MiniMax-M2.7",
+        );
+        let dyn_sections = sample_volatile_sections();
+        // Round 0 explicitly — the subtle part of the invariant is that
+        // even round 0 must skip, because round-0-only injection still
+        // breaks history byte stability across the tool loop.
+        assert!(
+            effective_volatile_sections_for_round(cap, 0, &dyn_sections).is_empty(),
+            "bridge path must skip volatile on round 0 for MiniMax (strict-history)",
+        );
+        // And stays empty through the typical tool-loop length.
+        assert!(effective_volatile_sections_for_round(cap, 6, &dyn_sections).is_empty(),);
+    }
+
+    #[test]
+    fn effective_volatile_empty_input_produces_empty_output() {
+        // Degenerate: no dynamic sections to begin with. All providers
+        // should return empty — no work to preserve or suppress.
+        let empty: Vec<prompts::PromptSection> = Vec::new();
+        for (prov, model) in [
+            ("openai", "MiniMax-M2.7"),
+            ("openai", "gpt-4o"),
+            ("anthropic", "claude-sonnet-4"),
+            ("bedrock", "us.anthropic.claude-sonnet-4-6"),
+        ] {
+            let cap = astra_turn_core::cache_placement::CacheCapability::for_provider_and_model(
+                prov, model,
+            );
+            assert!(
+                effective_volatile_sections_for_round(cap, 0, &empty).is_empty(),
+                "empty input must yield empty output for {prov}/{model}",
+            );
+        }
+    }
+
     #[test]
     fn attach_skill_selector_metric_uses_structured_shortlist() {
         let request_messages = vec![json!({
@@ -5293,7 +5566,7 @@ mod tests {
             "Should extract text from content blocks"
         );
         let anchor = extract_anchor(&first_user_text.unwrap(), None);
-        assert!(anchor.contains("distributed cache"));
+        assert!(anchor.to_string().contains("distributed cache"));
     }
 
     #[test]
@@ -5689,7 +5962,7 @@ mod tests {
         };
 
         // Without L1 — shows "starting"
-        let anchor_no_l1 = extract_anchor("Build rate limiter", None);
+        let anchor_no_l1 = extract_anchor("Build rate limiter", None).to_string();
         assert!(anchor_no_l1.contains("starting"));
         assert!(anchor_no_l1.contains("0/0"));
 
@@ -5708,7 +5981,7 @@ mod tests {
              # Context\nT5"
         );
         let l1 = SessionMemory::parse(&l1_text).unwrap();
-        let anchor_with_l1 = extract_anchor("Build rate limiter", Some(&l1));
+        let anchor_with_l1 = extract_anchor("Build rate limiter", Some(&l1)).to_string();
 
         assert!(
             !anchor_with_l1.contains("starting"),
@@ -5848,7 +6121,7 @@ mod tests {
 
         let l1_text = build_l1_from_messages(&messages, turn_count, 0);
         let l1 = SessionMemory::parse(&l1_text).unwrap();
-        let anchor = extract_anchor("Build a rate limiter using Redis", Some(&l1));
+        let anchor = extract_anchor("Build a rate limiter using Redis", Some(&l1)).to_string();
 
         assert!(
             !anchor.contains("starting"),
@@ -6187,5 +6460,60 @@ mod tests {
                 "{context} should persist a remote llm_capture artifact for mid-stream failures"
             );
         }
+    }
+
+    // ── bridge_should_run_memoria_prefetch gate ────────────────────────
+
+    #[test]
+    fn prefetch_gate_runs_when_cli_insights_absent() {
+        let ep: Map<String, Value> = Map::new();
+        assert!(
+            bridge_should_run_memoria_prefetch(&ep),
+            "empty edge_profile = CLI didn't run memory_boost_search; bridge must fetch"
+        );
+    }
+
+    #[test]
+    fn prefetch_gate_runs_when_cli_insights_empty_string() {
+        let mut ep: Map<String, Value> = Map::new();
+        ep.insert(
+            "memoria_insights_text".to_string(),
+            Value::String(String::new()),
+        );
+        assert!(
+            bridge_should_run_memoria_prefetch(&ep),
+            "empty string insights should not count as CLI-produced content"
+        );
+    }
+
+    #[test]
+    fn prefetch_gate_skips_when_cli_insights_present() {
+        // Regression: bridge used to double-fetch Memoria even when CLI
+        // already rendered `## Memoria Recall`, producing ~700 tokens of
+        // duplicate memory content as a second `## User Memories` block.
+        let mut ep: Map<String, Value> = Map::new();
+        ep.insert(
+            "memoria_insights_text".to_string(),
+            Value::String("## Memoria Recall\n- User prefers Rust for CLI work.".to_string()),
+        );
+        assert!(
+            !bridge_should_run_memoria_prefetch(&ep),
+            "CLI-rendered digest already covers the memory retrieval — skip bridge prefetch"
+        );
+    }
+
+    #[test]
+    fn prefetch_gate_runs_when_insights_key_not_a_string() {
+        // Defensive: if edge_profile carries malformed insights (non-string),
+        // fall back to running the bridge fetch rather than silently
+        // producing an empty memory section.
+        let mut ep: Map<String, Value> = Map::new();
+        ep.insert("memoria_insights_text".to_string(), Value::Null);
+        assert!(bridge_should_run_memoria_prefetch(&ep));
+        ep.insert(
+            "memoria_insights_text".to_string(),
+            Value::Number(42.into()),
+        );
+        assert!(bridge_should_run_memoria_prefetch(&ep));
     }
 }

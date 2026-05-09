@@ -233,6 +233,9 @@ fn mock_round_partial_text(error: &astra_core::ClassifiedError) -> Option<String
 #[derive(Debug, Clone)]
 struct ResolvedTurnLlmConfig {
     model_name: String,
+    /// Upstream literal name to put in the request body's `model` field.
+    /// `None` → send `model_name`. See `ResolvedActiveLlmModel::upstream_model_name`.
+    wire_model_name: Option<String>,
     api_key: String,
     base_url: String,
     provider: String,
@@ -338,6 +341,7 @@ async fn resolve_llm_model_for_turn(
         return Ok(ResolvedTurnLlmConfig {
             model_name: normalize_request_model(preferred_model)
                 .unwrap_or_else(|| "gpt-4o-mini".to_string()),
+            wire_model_name: None,
             api_key: String::new(),
             base_url: "https://api.openai.com/v1".to_string(),
             provider: "openai".to_string(),
@@ -352,6 +356,7 @@ async fn resolve_llm_model_for_turn(
             .await?;
     Ok(ResolvedTurnLlmConfig {
         model_name: resolved.model_name,
+        wire_model_name: resolved.wire_model_name,
         api_key: resolved.api_key,
         base_url: resolved.base_url,
         provider: resolved.provider,
@@ -399,6 +404,21 @@ pub struct CapturedLlmRequest {
     /// as text; for Anthropic: the concatenated text of all blocks up to and
     /// including the last cache_control breakpoint).
     pub cacheable_prefix_sha256: String,
+    /// Indices of messages (in the captured `messages` array) that carry a
+    /// `cache_control` marker anywhere in their content. Order matches the
+    /// message order. Empty for non-Anthropic providers.
+    ///
+    /// Used by tests to assert the rolling-breakpoint invariant across
+    /// consecutive rounds: the historical marker from round N must still
+    /// be present at the same message index in round N+1 so that Anthropic
+    /// can hit the cached prefix through the message history — not just
+    /// through `system` + `tools`.
+    pub message_cache_control_indices: Vec<usize>,
+    /// For each message in `messages`, the SHA-256 hex of that message's
+    /// canonical JSON serialization (sort_keys). Tests compare slices of
+    /// this vector across rounds to prove the cacheable message prefix is
+    /// byte-stable (a prerequisite for Anthropic cache hits beyond tools).
+    pub message_sha256: Vec<String>,
 }
 
 #[cfg(feature = "bridge-e2e-hooks")]
@@ -457,6 +477,47 @@ fn cacheable_prefix_text(system_primary: &Value, is_anthropic: bool) -> String {
     }
 }
 
+/// Normalize a message to the shape Anthropic uses for cache-key
+/// derivation. Removes `cache_control` attributes everywhere (they are
+/// request-layer directives, not tokens) and upgrades `content: "text"`
+/// strings to the canonical `content: [{type:"text", text:"..."}]`
+/// array form so that the "marker placed → content promoted to array"
+/// shape flip produced by `apply_cache_control_to_message` does not
+/// spuriously break byte-level prefix comparisons in tests.
+#[cfg(feature = "bridge-e2e-hooks")]
+fn normalize_message_for_cache_hash(m: &Value) -> Value {
+    let mut out = m.clone();
+    if let Some(obj) = out.as_object_mut()
+        && let Some(content) = obj.get("content").cloned()
+        && let Some(s) = content.as_str()
+    {
+        obj.insert(
+            "content".into(),
+            serde_json::json!([{ "type": "text", "text": s }]),
+        );
+    }
+    strip_cache_control(&mut out);
+    out
+}
+
+#[cfg(feature = "bridge-e2e-hooks")]
+fn strip_cache_control(v: &mut Value) {
+    match v {
+        Value::Object(map) => {
+            map.remove("cache_control");
+            for (_, child) in map.iter_mut() {
+                strip_cache_control(child);
+            }
+        }
+        Value::Array(items) => {
+            for item in items.iter_mut() {
+                strip_cache_control(item);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[cfg(feature = "bridge-e2e-hooks")]
 fn sha256_hex(s: &str) -> String {
     use sha2::{Digest, Sha256};
@@ -508,6 +569,35 @@ fn build_captured_llm_request(
         .unwrap_or(false);
     let prefix = cacheable_prefix_text(&primary, cache_cfg.is_anthropic);
     let cacheable_prefix_sha256 = sha256_hex(&prefix);
+    let message_cache_control_indices: Vec<usize> = if cache_cfg.is_anthropic {
+        messages
+            .iter()
+            .enumerate()
+            .filter_map(|(i, m)| {
+                let at_msg = value_has_cache_control(m);
+                let in_content = m
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .is_some_and(|arr| arr.iter().any(value_has_cache_control));
+                (at_msg || in_content).then_some(i)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    // Hash each message AFTER normalizing to the shape Anthropic uses for
+    // cache-key derivation (see `normalize_message_for_cache_hash`). This
+    // lets prefix-stability tests prove "same tokens, different marker
+    // placement" is still a cache hit.
+    let message_sha256: Vec<String> = messages
+        .iter()
+        .map(|m| {
+            let normalized = normalize_message_for_cache_hash(m);
+            let canonical =
+                serde_json::to_string(&normalized).unwrap_or_else(|_| "<unserializable>".into());
+            sha256_hex(&canonical)
+        })
+        .collect();
     CapturedLlmRequest {
         turn_index,
         provider,
@@ -522,6 +612,8 @@ fn build_captured_llm_request(
         last_tool_has_cache_control,
         last_message_has_cache_control,
         cacheable_prefix_sha256,
+        message_cache_control_indices,
+        message_sha256,
     }
 }
 
@@ -1118,17 +1210,43 @@ impl ServerAgenticLoopHost {
 
         // Replicate the real-path tool + message annotations so captured
         // payloads reflect what a real provider would see. Start from the
-        // pipeline-pruned tool schemas so mock replay mirrors the real wire.
+        // pipeline-pruned tool schemas so mock replay mirrors the real
+        // wire. Route the history through the same `assemble_llm_messages`
+        // stitcher the real path uses so matrix tests see the output of
+        // volatile-preamble folding and `consolidate_mid_history_volatile_injections`.
         let mut annotated_tools = mock_pipeline.tool_schemas;
         annotate_tool_schemas_for_caching(&mut annotated_tools, &cache_cfg);
-        let mut annotated_messages = state.messages.clone();
-        apply_anthropic_cache_metadata(&mut annotated_messages, &cache_cfg, &self.session_id);
         let (provider, model) = self
             .mock_provider
             .clone()
             .unwrap_or_else(|| ("openai".to_string(), "server-loop-mock".to_string()));
+        let mock_llm_cfg = ResolvedTurnLlmConfig {
+            provider: provider.clone(),
+            model_name: model.clone(),
+            wire_model_name: None,
+            api_key: String::new(),
+            base_url: String::new(),
+            fallback_chain: Vec::new(),
+            header_overrides: HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
+        };
+        let wire_messages = self.assemble_llm_messages(
+            system_msgs.clone(),
+            volatile_preamble.clone(),
+            state.messages.clone(),
+            state,
+            &mock_llm_cfg,
+            &cache_cfg,
+        );
+        // `assemble_llm_messages` produces `[system(s), …, compacted msgs,
+        // post-compact attachments]`. For the capture's downstream
+        // assertions we want just the message portion (post the canonical
+        // system messages). Extract.
+        let sys_count = system_msgs.len();
+        let annotated_messages: Vec<Value> =
+            wire_messages.iter().skip(sys_count).cloned().collect();
         let mut capture_messages = system_msgs.clone();
-        capture_messages.extend(volatile_preamble);
         capture_messages.extend(annotated_messages.clone());
 
         // Record the captured request before tool delivery (so assertions see
@@ -1728,7 +1846,6 @@ impl ServerAgenticLoopHost {
         use crate::turn::context_pipeline_adapter::{
             build_external_sources, build_session_context, build_turn_state,
         };
-        use astra_turn_core::context_serializer::system_blocks_to_anthropic_content;
         use astra_turn_core::context_sources::AgentContext;
         use astra_turn_core::pipeline_session::AdaptiveTurnInput;
 
@@ -1868,42 +1985,130 @@ impl ServerAgenticLoopHost {
         // added there is automatically picked up here.
         let is_anthropic = crate::turn::llm_client::provider_uses_explicit_cache_control(provider);
 
-        let (system_messages, volatile_preamble) = if is_anthropic {
-            // Anthropic/Bedrock: all blocks in system message with cache_control.
-            let content = system_blocks_to_anthropic_content(&pipeline_output.serialized);
-            (
-                vec![json!({"role": "system", "content": content})],
-                Vec::new(),
-            )
-        } else {
-            // Prefix-only: split blocks by scope.
-            use astra_turn_core::section_types::CacheScope;
-            let mut stable_text = String::new();
-            let mut volatile_text = String::new();
-            for block in &pipeline_output.serialized.system_blocks {
-                if block.scope == CacheScope::None {
-                    volatile_text.push_str(&block.text);
+        // Classify the provider's cache semantics to decide volatile
+        // placement. `CacheCapability::should_inject_volatile_on_round`
+        // is the gate — for `VolatilePlacement::CurrentUserOnly`
+        // providers (MiniMax-style strict-history cache) rounds > 0
+        // MUST skip injection or the entire turn's cache collapses
+        // (see session 986a553e regression).
+        use astra_turn_core::cache_placement::{CacheCapability, VolatilePlacement};
+        let cache_cap = CacheCapability::for_provider_and_model(provider, model_name);
+        let round_within_turn = state.current_round_index;
+        let inject_volatile = cache_cap.should_inject_volatile_on_round(round_within_turn);
+
+        let (system_messages, volatile_preamble) = match cache_cap.volatile_placement {
+            VolatilePlacement::MarkerIsolated => {
+                // Anthropic-protocol providers (Anthropic, Bedrock, DeepSeek's
+                // /anthropic endpoint). Earlier design kept volatile blocks
+                // INSIDE the system content array past the last cache_control
+                // marker, on the theory that the marker "isolates" them from
+                // the cached prefix.
+                //
+                // Controlled probes against Bedrock Converse and DeepSeek's
+                // /anthropic endpoint (see
+                // `astra-turn-core/tests/fixtures/deepseek_anthropic_cache_probe.py`
+                // and session 5c5cbf78 analysis) showed this is suboptimal
+                // for DeepSeek: every round's volatile-tail byte change
+                // looks like a fresh payload and the provider's cache-
+                // write/read pipeline never reaches the 2nd-warm state
+                // where tools get cached. Production cache_read stalls at
+                // ~2432 (system-prefix-only) instead of ~10K (system +
+                // tools). Bedrock is unaffected (first-call-complete
+                // caching) but also loses nothing from moving volatile to
+                // the user message.
+                //
+                // New policy: build the system content array from STABLE
+                // blocks only; volatile (CacheScope::None) blocks get
+                // promoted to the same `volatile_preamble` path that
+                // TailSuffix/CurrentUserOnly already use. That keeps the
+                // cache-control marker on the tail of the system content
+                // and makes the full system+tools+history byte-stable
+                // across rounds.
+                use astra_turn_core::section_types::CacheScope;
+                let stable_content: Vec<Value> = pipeline_output
+                    .serialized
+                    .system_blocks
+                    .iter()
+                    .filter(|b| b.scope != CacheScope::None)
+                    .map(|block| {
+                        let mut v = json!({
+                            "type": "text",
+                            "text": block.text,
+                        });
+                        if let Some(ref cc) = block.cache_control {
+                            v["cache_control"] = cc.clone();
+                        }
+                        v
+                    })
+                    .collect();
+                let volatile_text: String = pipeline_output
+                    .serialized
+                    .system_blocks
+                    .iter()
+                    .filter(|b| b.scope == CacheScope::None)
+                    .map(|b| b.text.as_str())
+                    .collect();
+                let system_msgs = vec![json!({"role": "system", "content": stable_content})];
+                let preamble = if !inject_volatile || volatile_text.is_empty() {
+                    Vec::new()
                 } else {
-                    stable_text.push_str(&block.text);
-                }
+                    vec![
+                        json!({
+                            "role": "user",
+                            "content": format!(
+                                "<system-reminder>\n{volatile_text}</system-reminder>"
+                            ),
+                        }),
+                        json!({
+                            "role": "assistant",
+                            "content": "Understood.",
+                        }),
+                    ]
+                };
+                (system_msgs, preamble)
             }
-            let system_msgs = vec![json!({"role": "system", "content": stable_text})];
-            let preamble = if volatile_text.is_empty() {
-                Vec::new()
-            } else {
-                vec![
-                    json!({
-                        "role": "user",
-                        "content": format!("<system-reminder>\n{volatile_text}</system-reminder>"),
-                    }),
-                    json!({
-                        "role": "assistant",
-                        "content": "Understood.",
-                    }),
-                ]
-            };
-            (system_msgs, preamble)
+            VolatilePlacement::TailSuffix
+            | VolatilePlacement::CurrentUserOnly
+            | VolatilePlacement::Free => {
+                // Prefix-only paths: split blocks by scope. Stable
+                // content stays in the system message; volatile
+                // content goes into a preamble that `assemble_llm_messages`
+                // will prepend to the last user message (TailSuffix
+                // semantics) — UNLESS we're a round > 0 on a
+                // strict-history provider, in which case we drop
+                // volatile entirely to preserve byte-identical history.
+                use astra_turn_core::section_types::CacheScope;
+                let mut stable_text = String::new();
+                let mut volatile_text = String::new();
+                for block in &pipeline_output.serialized.system_blocks {
+                    if block.scope == CacheScope::None {
+                        volatile_text.push_str(&block.text);
+                    } else {
+                        stable_text.push_str(&block.text);
+                    }
+                }
+                let system_msgs = vec![json!({"role": "system", "content": stable_text})];
+                let preamble = if !inject_volatile || volatile_text.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![
+                        json!({
+                            "role": "user",
+                            "content": format!(
+                                "<system-reminder>\n{volatile_text}</system-reminder>"
+                            ),
+                        }),
+                        json!({
+                            "role": "assistant",
+                            "content": "Understood.",
+                        }),
+                    ]
+                };
+                (system_msgs, preamble)
+            }
         };
+        // Silence unused-var in the MarkerIsolated branch.
+        let _ = is_anthropic;
 
         PipelineTurnOutcome {
             system_messages,
@@ -1967,10 +2172,16 @@ impl ServerAgenticLoopHost {
         system_messages: Vec<Value>,
         volatile_preamble: Vec<Value>,
         compacted_messages: Vec<Value>,
-        state: &AgenticLoopState,
+        state: &mut AgenticLoopState,
         llm_cfg: &ResolvedTurnLlmConfig,
         cache_cfg: &PromptCacheConfig,
     ) -> Vec<Value> {
+        // Drain the structured volatile lane BEFORE we borrow `state`
+        // immutably (via `state.skills` / `state.recent_file_reads`) —
+        // the borrow checker can't interleave a mutable drain with the
+        // later immutable reads that feed `attachments`.
+        let drained = state.take_volatile_pending();
+
         // Sort skills most-recent-first (matches legacy ordering; shared
         // assembler emits them in the order we supply).
         let mut skills: Vec<_> = state.skills.invoked.values().collect();
@@ -1996,6 +2207,7 @@ impl ServerAgenticLoopHost {
         crate::turn::wire_assembly::assemble_llm_messages(
             system_messages,
             volatile_preamble,
+            drained,
             compacted_messages,
             &attachments,
             &self.session_id,
@@ -2323,6 +2535,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 &llm_messages,
                 &final_tools,
                 &llm_cfg.model_name,
+                llm_cfg.wire_model_name.as_deref(),
                 &llm_cfg.api_key,
                 &llm_cfg.base_url,
                 &llm_cfg.provider,
@@ -2720,6 +2933,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             &reflection_messages,
             &[],
             &llm_cfg.model_name,
+            llm_cfg.wire_model_name.as_deref(),
             &llm_cfg.api_key,
             &llm_cfg.base_url,
             &llm_cfg.provider,
@@ -3209,8 +3423,33 @@ fn llm_capture_error_response(error: &astra_core::ClassifiedError) -> Value {
 fn normalize_usage_to_canonical(
     raw: &serde_json::Map<String, Value>,
 ) -> serde_json::Map<String, Value> {
-    // Pass-through when already canonical: presence of either `input_tokens`
-    // or `output_tokens` means the producer already normalized.
+    // Pass-through when already canonical: presence of `cached_input_tokens`
+    // (the canonical cache key; `input_tokens`/`output_tokens` are ambiguous
+    // because Anthropic also uses those names) means the producer already
+    // normalized. Anthropic-dialect detection below takes priority when only
+    // `input_tokens`/`output_tokens` are present alongside the anthropic
+    // cache keys.
+    let looks_anthropic = raw.contains_key("cache_read_input_tokens")
+        || raw.contains_key("cache_creation_input_tokens");
+    if !looks_anthropic
+        && (raw.contains_key("cached_input_tokens") || raw.contains_key("cache_creation_tokens"))
+    {
+        return raw.clone();
+    }
+    // Anthropic dialect (Messages API, deepseek `/anthropic` endpoint, …):
+    // `input_tokens`/`output_tokens` plus separate `cache_read_input_tokens`
+    // and `cache_creation_input_tokens`. Must be checked BEFORE the generic
+    // `input_tokens` canonical fast-path above would match, otherwise the
+    // cache fields would leak through verbatim.
+    if looks_anthropic {
+        if let Some(canonical) = crate::turn::token_usage::extract_usage(
+            crate::turn::token_usage::UsageDialect::AnthropicMessages,
+            raw,
+        ) {
+            return canonical.to_json_map();
+        }
+    }
+    // Canonical fast-path for non-anthropic already-normalized shapes.
     if raw.contains_key("input_tokens") || raw.contains_key("output_tokens") {
         return raw.clone();
     }
@@ -3451,6 +3690,71 @@ mod tests {
         assert_eq!(response["usage"]["cached_input_tokens"].as_i64(), Some(2));
         assert_eq!(response["usage"]["cache_creation_tokens"].as_i64(), Some(1));
         assert_eq!(response["usage"]["output_tokens"].as_i64(), Some(4));
+    }
+
+    #[test]
+    fn llm_capture_error_response_normalizes_anthropic_usage_to_canonical() {
+        // Anthropic-dialect usage (e.g. deepseek `/anthropic` endpoint, direct
+        // Anthropic Messages API) arrives with `input_tokens`/`output_tokens`
+        // at the top level AND separate `cache_read_input_tokens` /
+        // `cache_creation_input_tokens` keys. These must be folded into the
+        // canonical `cached_input_tokens` / `cache_creation_tokens` schema so
+        // downstream cache-rate math sees the hits instead of zeros.
+        let error =
+            astra_core::ClassifiedError::new(astra_core::ErrorKind::StreamTransport, "boom")
+                .with_details_json(
+                    json!({
+                        "usage": {
+                            "input_tokens": 25,
+                            "output_tokens": 7,
+                            "cache_read_input_tokens": 4864,
+                            "cache_creation_input_tokens": 120
+                        }
+                    })
+                    .to_string(),
+                );
+        let response = llm_capture_error_response(&error);
+        assert_eq!(response["usage"]["input_tokens"].as_i64(), Some(25));
+        assert_eq!(response["usage"]["output_tokens"].as_i64(), Some(7));
+        assert_eq!(
+            response["usage"]["cached_input_tokens"].as_i64(),
+            Some(4864),
+            "anthropic `cache_read_input_tokens` must be folded into canonical `cached_input_tokens`",
+        );
+        assert_eq!(
+            response["usage"]["cache_creation_tokens"].as_i64(),
+            Some(120),
+            "anthropic `cache_creation_input_tokens` must be folded into canonical `cache_creation_tokens`",
+        );
+        assert!(
+            response["usage"].get("cache_read_input_tokens").is_none(),
+            "anthropic-dialect key must not leak through after normalization",
+        );
+    }
+
+    #[test]
+    fn llm_capture_error_response_detects_anthropic_dialect_from_cache_keys_only() {
+        // Edge case: an error artifact that only carries cache fields (no
+        // top-level input/output tokens) — still unambiguously anthropic. We
+        // must recognize the dialect from `cache_read_input_tokens` alone,
+        // otherwise the pass-through branch (triggered by presence of
+        // `input_tokens`) never fires and we silently drop the cache signal.
+        let error =
+            astra_core::ClassifiedError::new(astra_core::ErrorKind::StreamTransport, "boom")
+                .with_details_json(
+                    json!({
+                        "usage": {
+                            "cache_read_input_tokens": 2048,
+                            "cache_creation_input_tokens": 0
+                        }
+                    })
+                    .to_string(),
+                );
+        let response = llm_capture_error_response(&error);
+        assert_eq!(
+            response["usage"]["cached_input_tokens"].as_i64(),
+            Some(2048),
+        );
     }
 
     #[test]
@@ -3711,6 +4015,7 @@ mod tests {
         // list is equivalent to the real runtime path here.
         let llm_cfg = ResolvedTurnLlmConfig {
             model_name: "gpt-4".into(),
+            wire_model_name: None,
             api_key: String::new(),
             base_url: String::new(),
             provider: "openai".into(),
@@ -3723,7 +4028,7 @@ mod tests {
             vec![json!({"role": "system", "content": "system prompt text"})],
             Vec::new(),
             state.messages.clone(),
-            &state,
+            &mut state,
             &llm_cfg,
             &PromptCacheConfig::latch("openai", "gpt-4"),
         );
@@ -3786,6 +4091,155 @@ mod tests {
         // System messages are rendered from pipeline's serialized system blocks.
         assert!(!outcome.system_messages.is_empty());
         assert_eq!(outcome.system_messages[0]["role"], "system");
+    }
+
+    /// Session 986a553e observed MiniMax-M2.7 cache collapsing from
+    /// 7680 to 0 across six tool-loop rounds because volatile
+    /// content (Self-Awareness with live turn/token counters) was
+    /// being re-injected every round. The new `CacheCapability`
+    /// routing classifies MiniMax as `VolatilePlacement::CurrentUserOnly`;
+    /// `run_turn_pipeline` now consults it and emits an **empty**
+    /// `volatile_preamble` on rounds > 0 so the message history bytes
+    /// stay stable across the tool loop.
+    #[tokio::test]
+    async fn run_turn_pipeline_minimax_skips_volatile_on_tool_loop_round() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-minimax".to_string(),
+            "s-minimax".to_string(),
+        )
+        .with_edge_tools(vec![json!({
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "Shell.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        })])
+        .build();
+        let mut state = create_test_state();
+        state.current_session_id = Some("s-minimax".into());
+        state.max_turn_input_tokens = 200_000;
+        state.pipeline_session = Some(astra_turn_core::pipeline_session::PipelineSession::new(
+            astra_turn_core::pipeline_config::PipelineConfig::default(),
+        ));
+        let tools = host.edge_tools.clone();
+
+        // Updated contract: strict-history providers (MiniMax) must
+        // suppress volatile preamble on EVERY round, not just >0.
+        // Round-0-only injection still causes a byte mismatch at
+        // msg[1] vs round 1+ (round 0 has preamble+user_q, round 1
+        // has only user_q), so the whole turn's cache misses.
+        for round in [0u32, 1, 5] {
+            state.current_round_index = round;
+            let out = host.run_turn_pipeline(&mut state, &tools, "openai", "MiniMax-M2.7", "hi");
+            assert!(
+                out.volatile_preamble.is_empty(),
+                "MiniMax must suppress volatile preamble on every round \
+                 (strict-history provider). round={round} preamble={:?}",
+                out.volatile_preamble,
+            );
+        }
+    }
+
+    /// OpenAI auto-prefix cache can tolerate volatile-in-tail every
+    /// round, so preamble emission stays unchanged across rounds.
+    #[tokio::test]
+    async fn run_turn_pipeline_openai_keeps_volatile_on_all_rounds() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-openai".to_string(),
+            "s-openai".to_string(),
+        )
+        .with_edge_tools(vec![json!({
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "Shell.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        })])
+        .build();
+        let mut state = create_test_state();
+        state.current_session_id = Some("s-openai".into());
+        state.max_turn_input_tokens = 200_000;
+        state.pipeline_session = Some(astra_turn_core::pipeline_session::PipelineSession::new(
+            astra_turn_core::pipeline_config::PipelineConfig::default(),
+        ));
+        let tools = host.edge_tools.clone();
+
+        state.current_round_index = 0;
+        let r0 = host.run_turn_pipeline(&mut state, &tools, "openai", "gpt-4o", "hi");
+        state.current_round_index = 3;
+        let r3 = host.run_turn_pipeline(&mut state, &tools, "openai", "gpt-4o", "hi");
+        // Identical preamble shape on OpenAI — injection gate doesn't
+        // special-case round index.
+        assert_eq!(
+            r0.volatile_preamble.len(),
+            r3.volatile_preamble.len(),
+            "OpenAI should emit identical preamble on round 0 and 3",
+        );
+    }
+
+    /// Anthropic path (MarkerIsolated) — post-fix contract: volatile
+    /// (CacheScope::None) blocks are promoted OUT of the system content
+    /// array and into `volatile_preamble` so the system content stays
+    /// byte-stable across rounds. This unblocks tool-schema caching on
+    /// DeepSeek's `/anthropic` endpoint (see session 5c5cbf78 analysis
+    /// and `tests/fixtures/deepseek_anthropic_cache_probe.py`) and is
+    /// no-op for Bedrock (which cache-writes the full payload on the
+    /// first call regardless).
+    ///
+    /// The preamble existence on a given round depends on whether the
+    /// pipeline generated any `CacheScope::None` blocks in the first
+    /// place; here we just assert the MarkerIsolated branch no longer
+    /// leaves stable and volatile content co-mingled in the system
+    /// content array.
+    #[tokio::test]
+    async fn run_turn_pipeline_anthropic_system_content_stays_byte_stable() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-anth".to_string(),
+            "s-anth".to_string(),
+        )
+        .with_edge_tools(vec![json!({
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "Shell.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        })])
+        .build();
+        let mut state = create_test_state();
+        state.current_session_id = Some("s-anth".into());
+        state.max_turn_input_tokens = 200_000;
+        state.pipeline_session = Some(astra_turn_core::pipeline_session::PipelineSession::new(
+            astra_turn_core::pipeline_config::PipelineConfig::default(),
+        ));
+        let tools = host.edge_tools.clone();
+
+        // Capture system content on two different rounds and assert the
+        // byte-stable invariant. The old MarkerIsolated branch embedded
+        // the Turn/Tokens counter inside the system content, so
+        // `system_messages[0]["content"]` differed between round 0 and
+        // round 7. Post-fix: the counter rides in `volatile_preamble`
+        // and system content is identical.
+        state.current_round_index = 0;
+        let r0 = host.run_turn_pipeline(&mut state, &tools, "anthropic", "claude-sonnet-4", "hi");
+        state.current_round_index = 7;
+        let r7 = host.run_turn_pipeline(&mut state, &tools, "anthropic", "claude-sonnet-4", "hi");
+
+        assert_eq!(
+            r0.system_messages, r7.system_messages,
+            "system_messages must be byte-identical across rounds — any \
+             drift here reopens the session 5c5cbf78 cache regression. \
+             r0={:#?} r7={:#?}",
+            r0.system_messages, r7.system_messages,
+        );
     }
 
     #[tokio::test]
@@ -4130,10 +4584,13 @@ mod tests {
 
         AgenticLoopState {
             messages: Vec::new(),
+            volatile_pending: Vec::new(),
+            recent_rounds: Vec::new(),
             tool_results: Vec::new(),
             current_session_id: None,
             current_run_id: None,
             recursion_depth: 0,
+            attention_manifest_text: None,
             final_text: String::new(),
             final_text_streamed: false,
             total_prompt: 0,
@@ -4192,6 +4649,7 @@ mod tests {
             pinned_tool_schema_tokens: 0,
             max_turn_input_tokens: 0,
             budget_wrapup_injected: false,
+            budget_wrapup_ignored_rounds: 0,
             compact_tier_applied: CompactionTier::Normal,
             skill_produced_output: false,
             max_cumulative_tokens: 0,

@@ -1,5 +1,13 @@
 /// Agent persona / base identity.
-pub const SYSTEM_PROMPT_BASE: &str = "You are an expert software engineer. You write clean, correct code and use tools precisely to solve tasks.";
+///
+/// Persona shapes tone and default behavior before any rule fires.
+/// Keep it tight: identity + 3-4 behavioral traits. Longer personas
+/// dilute; shorter ones leave the model to improvise a voice.
+pub const SYSTEM_PROMPT_BASE: &str = "You are Astra, an expert software engineer operating as a terminal-native coding agent. You write clean, correct code and use tools precisely to solve tasks.\n\n\
+    - **Direct over deferential**: state the answer, then the reasoning. No flattery, no hedging preambles (\"Great question!\", \"I'd be happy to…\").\n\
+    - **Concise by default**: match response length to question complexity. A one-line question deserves a one-line answer.\n\
+    - **Honest about uncertainty**: if you don't know, say so and propose how to find out — never fabricate.\n\
+    - **Action-biased**: when the user asks for a change, make it. Don't ask permission for obvious next steps.";
 
 use std::fmt::Write;
 
@@ -57,6 +65,104 @@ pub const LOW_CONFIDENCE_THRESHOLD: f64 = 0.3;
 // (prompt builders) without a circular dependency.
 pub use astra_turn_core::section_types::{CacheScope, PromptSection, PromptTokenBucket};
 
+/// Marker text inserted between the **cacheable prefix** (global/session-stable
+/// sections) and the **volatile tail** (per-turn sections) in the flattened
+/// system prompt. Providers that support prefix-cache breakpoints can use this
+/// marker as an inspection anchor; it is also asserted in tests so that
+/// reordering bugs (a volatile section accidentally placed before the boundary)
+/// are caught immediately.
+///
+/// The exact string is an implementation detail; do **not** match on it from
+/// production code — use [`SystemPromptBuilder`] instead.
+pub const SYSTEM_PROMPT_DYNAMIC_BOUNDARY: &str =
+    "\n<!-- astra:system-prompt:dynamic-boundary -->\n";
+
+/// Builder that enforces the **static-before-dynamic** invariant at the API
+/// level, so callers cannot silently push a volatile section into the cached
+/// prefix (the class of regression fixed by commit `b64223c9`).
+///
+/// Usage:
+/// ```ignore
+/// let mut b = SystemPromptBuilder::new();
+/// b.push_stable(PromptSection::stable(rules, CacheScope::Global));
+/// b.push_stable(PromptSection::stable(planning, CacheScope::Global));
+/// b.push_volatile(PromptSection::dynamic(per_turn, Environment));
+/// let sections = b.finish(); // stable first, boundary marker, then volatile
+/// ```
+///
+/// `push_stable` rejects anything with `CacheScope::None`; `push_volatile`
+/// rejects anything *without* `CacheScope::None`. This makes it impossible
+/// for a caller to silently invert the order and wreck the prefix cache.
+#[derive(Debug, Default)]
+pub struct SystemPromptBuilder {
+    stable: Vec<PromptSection>,
+    volatile: Vec<PromptSection>,
+}
+
+impl SystemPromptBuilder {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append a cacheable section (scope: `Global` or `Session`).
+    ///
+    /// # Panics
+    /// Panics in debug builds if the section has `CacheScope::None`; in
+    /// release builds the section is silently demoted to the volatile tail
+    /// to avoid a cache-busting prefix at runtime.
+    pub fn push_stable(&mut self, section: PromptSection) {
+        debug_assert!(
+            section.scope != CacheScope::None,
+            "push_stable requires CacheScope::Global or ::Session; use push_volatile for dynamic content"
+        );
+        if section.scope == CacheScope::None {
+            self.volatile.push(section);
+        } else {
+            self.stable.push(section);
+        }
+    }
+
+    /// Append a volatile section (scope: `None`).
+    ///
+    /// # Panics
+    /// Panics in debug builds if the section is not `CacheScope::None`; in
+    /// release builds the section is promoted to the stable prefix so its
+    /// content still reaches the model.
+    pub fn push_volatile(&mut self, section: PromptSection) {
+        debug_assert!(
+            section.scope == CacheScope::None,
+            "push_volatile requires CacheScope::None; use push_stable for cacheable content"
+        );
+        if section.scope == CacheScope::None {
+            self.volatile.push(section);
+        } else {
+            self.stable.push(section);
+        }
+    }
+
+    /// Finalise into `[stable..., boundary_marker, volatile...]`.
+    ///
+    /// The boundary marker is emitted only when both lanes are non-empty;
+    /// an all-stable or all-volatile prompt keeps its original shape so
+    /// existing byte-level assertions in tests remain valid.
+    #[must_use]
+    pub fn finish(self) -> Vec<PromptSection> {
+        let Self {
+            mut stable,
+            mut volatile,
+        } = self;
+        if !stable.is_empty() && !volatile.is_empty() {
+            stable.push(PromptSection::dynamic(
+                SYSTEM_PROMPT_DYNAMIC_BOUNDARY.to_string(),
+                PromptTokenBucket::BasePersona,
+            ));
+        }
+        stable.append(&mut volatile);
+        stable
+    }
+}
+
 /// Build the static sections for the context pipeline.
 /// These are the Global-scope sections that never change between turns.
 /// Compile once at session start and pass to PipelineSession's TurnInput.
@@ -79,6 +185,10 @@ pub fn build_pipeline_static_sections() -> astra_turn_core::context_sources::Sta
             token_bucket: PromptTokenBucket::BasePersona,
             trace_signals: PromptTraceSignals::default(),
         },
+        safety: PromptSection::stable(
+            resolve("safety", safety_section().to_string()),
+            CacheScope::Global,
+        ),
         planning_protocol: PromptSection::stable(
             resolve("planning", planning_section().to_string()),
             CacheScope::Global,
@@ -91,15 +201,8 @@ pub fn build_pipeline_static_sections() -> astra_turn_core::context_sources::Sta
             resolve("turn_discipline", turn_discipline_section().to_string()),
             CacheScope::Global,
         ),
-        parallel_efficiency: PromptSection::stable(
-            resolve(
-                "parallel_and_efficiency",
-                format!(
-                    "{}\n{}",
-                    parallel_and_efficiency_section(),
-                    plan_execution_section()
-                ),
-            ),
+        plan_execution: PromptSection::stable(
+            resolve("plan_execution", plan_execution_section().to_string()),
             CacheScope::Global,
         ),
         output_format: PromptSection::stable(
@@ -131,48 +234,63 @@ fn core_rules_section() -> String {
          2. STOP when done. Don't continue exploring after completing the user's request.\n\
          3. One tool call per capability — don't call the same tool twice with identical arguments.\n\n\
          ## Core Rules\n\
-         1. Think step-by-step, then act. For multi-step tasks, plan BEFORE your first tool call.\n\
-         2. Live data (CI, PRs, issues, stats, memory, git) → MUST call a tool. Never answer from training data.\n\
-         3. Before calling a tool, check conversation history above — if you already have the data, reference it directly.\n\
-         4. Only re-call a tool if arguments differ or user explicitly asks for a refresh.\n\
-         5. Tool outputs in history reflect state AT CALL TIME, not now. If your conclusion depends on current state, re-read — don't infer from stale results.\n\
-         6. You are compatible with Claude Code skills (Agent Skills open standard). When you see `.claude/skills/`, `.claude/commands/`, or skill SKILL.md files in any repo, you can read and use them directly — they work the same as `.astra/skills/`.\n"
+         1. Live data (CI, PRs, issues, stats, memory, git) → MUST call a tool. Never answer from training data.\n\
+         2. Before calling a tool, check history — if the data is there, reference it. Only re-call if arguments differ or user asks for a refresh.\n\
+         3. Tool outputs in history reflect state AT CALL TIME. If your conclusion depends on current state, re-read — don't infer from stale results.\n\
+         4. You are compatible with Claude Code skills (Agent Skills open standard). `.claude/skills/`, `.claude/commands/`, and SKILL.md files work the same as `.astra/skills/`.\n"
     )
 }
 
-/// Planning protocol + context strategy. Pure static.
+/// Safety + refusal boundaries. Pure static.
+/// Consolidated from fragments previously scattered across core_rules
+/// ("NEVER fabricate"), tool_error_recovery ("auth/credential"), and
+/// ad-hoc guidance. Having a single section makes the boundary explicit
+/// to the model and easy to audit.
+fn safety_section() -> &'static str {
+    "\n## Safety & Refusal\n\
+     \n\
+     ### Refuse outright\n\
+     - **Malicious code**: malware, exploits, credential stealers, unauthorized access tooling. Refuse even if framed as \"research\" or \"just for fun.\"\n\
+     - **Secret exfiltration**: do not read, echo, or transmit credentials, private keys, `.env` values, or tokens the user didn't explicitly paste. If you encounter them incidentally (e.g. in a file you were asked to review), flag their presence without reproducing the value.\n\
+     - **Destructive ops without consent**: `rm -rf`, force-push to shared branches, DB drops, `git reset --hard` on dirty trees. Ask first, even if the user's phrasing suggests urgency.\n\
+     \n\
+     ### Refusal template\n\
+     State *what* you won't do and *why* in one sentence. Offer a safer alternative if one exists. Do not lecture, moralize, or pad with disclaimers.\n\
+     \n\
+     Good: \"I won't write a credential-stealing script. If you're testing your own auth flow, I can help you write a mock login instead.\"\n\
+     Bad: \"As an AI, I must emphasize that I cannot in good conscience… [3 paragraphs]\"\n\
+     \n\
+     ### Honesty over compliance\n\
+     - Never fabricate tool output, file contents, test results, or citations. \"I don't know\" or \"let me check\" beats a confident lie.\n\
+     - If a user asks you to claim something false (\"say the tests passed\"), refuse and explain.\n\
+     - If an instruction conflicts with these rules, the rules win. Surface the conflict to the user.\n"
+}
+
+/// Planning + batching + efficiency. Single consolidated section.
+/// Replaces the former Planning Protocol / Context Strategy / Think-Before-Act /
+/// Parallel Tool Calls / Batching / Token Efficiency / Exploration Guard / Build-Test
+/// stack (~60 lines of repetition) with a tight 18-line contract.
 fn planning_section() -> &'static str {
-    "\n## Planning Protocol\n\
-     For tasks that need 3+ tool calls, plan in a <think> block FIRST:\n\
-     <think>\n\
-     Goal: [what the user wants]\n\
-     Plan: [numbered steps — what to read/check/change/verify]\n\
-     </think>\n\
-     After each tool result, reflect: <reflect>[what I learned] [adjust plan or proceed]</reflect>\n\
-     This prevents exploration spirals.\n\n\
-     ## Context Strategy\n\
-     Before acting, identify WHAT context you need:\n\
-     1. **Plan context needs**: What files/functions/tests must I understand first?\n\
-      2. **Batch the fetch**: Call all needed reads/greps in ONE turn (parallel).\n\
-      3. **Check inventory**: If context was already fetched, use it — don't re-fetch.\n\
-      4. **Then act**: Only after understanding, make your changes.\n"
+    "\n## Plan, Batch, Execute\n\
+     1. **Plan first** (3+ tool calls): state goal + numbered steps in a <think> block, then act.\n\
+     2. **Batch independent reads** into ONE turn (≤5 parallel). Only serialize when one result feeds the next call's args.\n\
+     3. **Reuse history**: if context was already fetched this session, reference it — don't re-fetch.\n\
+     4. **Discover before reading**: use list_dir/glob to confirm paths. Never guess.\n\
+     5. **Targeted reads**: prefer line ranges + outline=true over full files. Use glob before grep.\n\
+     6. **Never batch writes**: write_file / str_replace / bash / git execute sequentially.\n\
+     7. **Build/test only AFTER your writes** — not for exploration, review, or Q&A.\n\
+     8. **Open-ended loops** (\"keep going\", \"as many as you can\"): do one useful pass, then stop.\n\
+     9. **Exploration cap**: ≤2 dir listings + ≤2 full-file reads unless user names a concrete target.\n"
 }
 
 /// Discovery + coding discipline. Pure static.
 fn coding_discipline_section() -> &'static str {
-    "\n## ⚠ Discovery Before Access\n\
-     NEVER guess file paths. Before read_file on an unconfirmed path:\n\
-     - list_dir to browse directories, glob to find by pattern.\n\
-     - Reuse paths already returned by previous tools.\n\
-     Guessing paths wastes turns. Discover first, then read.\n\n\
-     ## Coding Discipline\n\
-     - **Read before write**: understand existing patterns, naming conventions, and imports before editing.\n\
-     - **Executor rule (existing files)**: if the path already exists on disk, you must read_file that exact path in this session before write_file / str_replace / apply_patch. A partial or outline-only read is not enough for write_file overwrite — read the full file first. If the file changed on disk since your last read, read it again.\n\
-     - **Surgical edits**: change only what's needed. Don't rewrite unrelated code.\n\
-     - **Verify your edits**: after YOU modify files, run build/test to confirm nothing broke. Skip this for read-only tasks.\n\
-     - **Undo on failure**: if a change causes errors and you can't fix them, revert it.\n\
-     - **One concern per edit**: each str_replace should address one logical change.\n\
-     - **Imports and dependencies**: when adding new functionality, add required imports/deps.\n"
+    "\n## Coding Discipline\n\
+     - **Read before write**: understand existing patterns, naming, and imports before editing.\n\
+     - **Executor rule (existing files)**: the target path must be read in this session before write_file / str_replace / apply_patch. Outline-only reads are not enough for write_file overwrite. Re-read if the file changed on disk.\n\
+     - **Surgical edits**: change only what's needed. One concern per str_replace.\n\
+     - **Undo on failure**: if a change causes errors you can't fix, revert it.\n\
+     - **Imports and dependencies**: when adding functionality, add required imports/deps.\n"
 }
 
 /// Turn discipline: brief announcements, terminal summary, no externalized reasoning.
@@ -186,41 +304,6 @@ fn turn_discipline_section() -> &'static str {
      - **No externalized reasoning**: deliberation belongs in <think> blocks. Skip \"Let me think...\" / \"Hmm\" / \"Actually, wait\" — noise, not content.\n\
      - **Lead with the answer**: \"The bug is on line 42 because X\" beats \"Looking at the code, I notice line 42 might be relevant, let me investigate…\".\n\
      - **Match depth to task**: a one-line question gets a one-line answer, not a structured report.\n"
-}
-
-/// Parallel tool calls + token efficiency + build/test warning. Pure static.
-fn parallel_and_efficiency_section() -> &'static str {
-    "\n## Think-Before-Act\n\
-     Before your FIRST tool call in any task:\n\
-     1. Identify ALL the information you need.\n\
-     2. Plan which tools to call and in what order.\n\
-     3. Batch all independent calls into ONE turn.\n\
-     4. Only make sequential calls when one result determines the next call's arguments.\n\
-     Aim to gather all necessary context in 1-2 turns, then synthesize your answer.\n\n\
-     ## Parallel Tool Calls\n\
-      Call multiple independent tools in ONE turn (e.g., several reads, git_status+git_diff, glob+grep, git_log+git_show).\n\
-      Do NOT parallelize when one result determines the next call's arguments.\n\
-       **Limit**: Keep parallel tool calls to ≤5 per turn. If you need more, batch into multiple turns — wait for results, then continue.\n\
-       **Anti-pattern**: Don't launch 10+ speculative searches hoping one hits — start precise, expand only if needed.\n\
-       **Anti-pattern**: Don't call one tool, wait for results, then call the next independent tool — batch them.\n\n\
-       ## Batching read-only tool calls\n\
-       Return all independent read-only tool calls in one assistant message. Only serialize when the next call depends on the previous result.\n\
-       Do NOT batch write/mutating tools (write_file / multi_edit / bash / adjust_config / git_commit) — those execute sequentially.\n\n\
-      ## Token Efficiency\n\
-     - Prefer targeted reads (line ranges) over full-file reads.\n\
-     - Use glob to narrow candidates before grep.\n\
-     - Request only the data you need — avoid fetching entire files when a section suffices.\n\
-     - Summarize findings concisely. Show relevant code, not the whole file.\n\
-      - If you've already fetched something, reference it from history — don't re-fetch.\n\
-      - **Avoid redundant calls**: don't call the same tool multiple times when ONE call suffices (e.g., git_diff once covers all files).\n\n\
-      ## Runaway Exploration Guard\n\
-      - For open-ended loops (\"keep going\", \"as many as you can\", repeated list/read), do one useful pass, then stop and say more would be busywork/a busy-loop.\n\n\
-      - Hard cap open-ended file exploration at 2 directory listings and 2 file reads unless the user names a concrete target.\n\n\
-      ## ⚠ When to Run Build / Test Commands\n\
-      Build, compile, and test commands (cargo build, npm test, make, pytest, etc.) are EXPENSIVE.\n\
-      - **Run them ONLY to verify YOUR changes** — after you edited or created files.\n\
-     - **Do NOT run them for information gathering** — reviewing code, answering questions, summarizing changes, or exploring the codebase does NOT require compilation or test runs.\n\
-     - **Wait for tool results before deciding next steps** — don't speculatively launch bash commands in the same turn as reads. Read first, then decide if bash is needed.\n"
 }
 
 /// Plan execution guidance. Pure static.
@@ -262,23 +345,44 @@ fn output_format_section() -> &'static str {
          - **GitHub**: list → detail → CI status\n"
 }
 
-/// Tool error recovery. Pure static.
+/// Tool error recovery. Scenario-based: diagnose → fix → anti-pattern.
 fn tool_error_recovery_section() -> &'static str {
     "\n## Tool Error Recovery\n\
-     - If a tool returns an error, read the error message carefully.\n\
-     - Fix the arguments (wrong path, typo, missing param) and retry ONCE.\n\
-     - If it fails again, try an alternative tool or approach.\n\
-     - NEVER retry the same failing call more than twice.\n\
-     - If output is truncated (\"... truncated\"), work with what you have or narrow scope.\n\
-     - **Timeout** (>30s no output): try a different approach, don't keep waiting.\n\
-     - **Rate limited**: back off, don't retry the same API immediately.\n\
-     - **Permission denied**: try a different path or ask the user.\n\
-     - **Path not found**: STOP. Use glob or list_dir to discover the correct path. Do NOT retry with a slightly different guess.\n\
-     - **Network failure**: check connectivity if multiple tools fail. Report to user.\n\
-     - **Auth/credential error**: do NOT retry with same creds. Ask user to re-authenticate.\n\
-     - **DB connection error**: verify MATRIXONE_HOST/PORT config. Use `mo_query` with simple SELECT 1 to test.\n\
-     - **Empty results** (memory_retrieve returns nothing): normal for new users — don't treat as error.\n\
-     - **Unknown tool**: check get_agent_info for available tools. Do NOT invent tool names.\n"
+     \n\
+     ### Retry Budget\n\
+     Fix args and retry ONCE. If it fails twice, switch tool or ask the user. Never loop on the same failing call.\n\
+     \n\
+     ### Scenario: File not found (read_file / str_replace / write_file)\n\
+     - Symptom: `No such file or directory` / path error.\n\
+     - Diagnose: did you guess the path? Was it moved, renamed, or in a different crate?\n\
+     - Fix: `glob` with a partial pattern → confirm the real path → retry with the confirmed path.\n\
+     - Anti-pattern: retrying variations like `src/foo.rs` → `./src/foo.rs` → `crates/x/src/foo.rs` hoping one sticks.\n\
+     \n\
+     ### Scenario: str_replace old_str did not match\n\
+     - Symptom: `old_str not found` or ambiguous match.\n\
+     - Diagnose: file changed since your last read, or whitespace/indent/quotes differ from what you typed.\n\
+     - Fix: re-read the exact target lines → copy verbatim (including leading whitespace) → retry. For multiple matches, add surrounding context lines to disambiguate.\n\
+     - Anti-pattern: shortening old_str hoping for a loose match; replace_all without verifying uniqueness.\n\
+     \n\
+     ### Scenario: bash command timeout or hang (>30s no output)\n\
+     - Diagnose: interactive prompt waiting for input? Infinite loop? Slow network/build?\n\
+     - Fix: add non-interactive flags (`--yes`, `-y`, `CI=1`); narrow scope (single file vs recursive); for builds use `run_build_test` with package scope, not `cargo build` on the workspace.\n\
+     - Anti-pattern: re-running the same command with a longer timeout.\n\
+     \n\
+     ### Scenario: Truncated output (\"... truncated\")\n\
+     - Fix: narrow the query (file glob, line range, `head_limit`, specific package) and retry. Work with what you have if the visible portion answers the question.\n\
+     - Anti-pattern: re-running the identical call hoping for more.\n\
+     \n\
+     ### Scenario: Auth / credential / permission error\n\
+     - Stop. Do NOT retry with the same credentials or path.\n\
+     - Fix: ask the user to re-authenticate, or try a path you have access to.\n\
+     \n\
+     ### Non-errors (do not treat as failures)\n\
+     - `memory_retrieve` returns empty → normal for new users/topics; proceed without memory.\n\
+     - `grep` / `glob` returns zero matches → valid answer; report it, don't keep searching blindly.\n\
+     \n\
+     ### Unknown tool name\n\
+     If a tool name is rejected, it's not available in this session. Check the tools list; never invent tool names.\n"
 }
 
 /// Self-model (tool list). Removed — tool names are already visible in the
@@ -555,13 +659,10 @@ pub fn build_system_prompt_sections_with_style(
     // ── Global sections (stable across sessions) ──
     let mut sections = vec![
         PromptSection::stable(core_rules_section(), CacheScope::Global),
+        PromptSection::stable(safety_section().to_string(), CacheScope::Global),
         PromptSection::stable(planning_section().to_string(), CacheScope::Global),
         PromptSection::stable(coding_discipline_section().to_string(), CacheScope::Global),
         PromptSection::stable(turn_discipline_section().to_string(), CacheScope::Global),
-        PromptSection::stable(
-            parallel_and_efficiency_section().to_string(),
-            CacheScope::Global,
-        ),
         PromptSection::stable(plan_execution_section().to_string(), CacheScope::Global),
         PromptSection::stable(output_format_section().to_string(), CacheScope::Global),
         PromptSection::stable(
@@ -668,17 +769,17 @@ use std::path::{Path, PathBuf};
 
 /// Section name → override text mapping.
 /// Keys use snake_case matching the section builder function names:
-/// `core_rules`, `planning`, `coding_discipline`, `parallel_and_efficiency`,
+/// `core_rules`, `safety`, `planning`, `coding_discipline`, `turn_discipline`,
 /// `plan_execution`, `output_format`, `tool_error_recovery`.
 pub type PromptOverrides = HashMap<String, String>;
 
 /// Section names in order, matching the Global sections in `build_system_prompt_sections_with_style`.
 const SECTION_NAMES: &[&str] = &[
     "core_rules",
+    "safety",
     "planning",
     "coding_discipline",
     "turn_discipline",
-    "parallel_and_efficiency",
     "plan_execution",
     "output_format",
     "tool_error_recovery",
@@ -1094,12 +1195,19 @@ pub fn parallel_batching_nudge_directive(messages: &[serde_json::Value]) -> Stri
     if streak < PARALLEL_BATCHING_NUDGE_THRESHOLD {
         return String::new();
     }
+    // Compacted from a 3-bullet form (~450c) to one line (~165c). The
+    // long form explained *why* parallel is cheaper and enumerated
+    // examples — both derivable from the header and the model's
+    // existing tool-use training. What the directive has to assert is
+    // just: "you did N single-tool rounds in a row; batch the next
+    // independent calls". Rides the volatile lane once the streak
+    // threshold trips, so bytes here are per-turn waste until the
+    // model batches (which resets the streak).
     format!(
         "\n\n## ⚠ Sequential Tool Calls Detected\n\
-         Your last {streak} rounds each ran exactly ONE tool. This is the most expensive way to gather information.\n\
-         - Look at the next set of files / commands you intend to inspect.\n\
-         - If they are independent (different files, different greps, different reads), batch them ALL into the next single round in parallel.\n\
-         - Reserve sequential single-tool rounds for cases where each call genuinely depends on the previous result.\n"
+         Last {streak} rounds each ran one tool. Batch independent calls \
+         (different files, greps, reads) into a single parallel round; \
+         keep sequential rounds only when a call depends on the previous result.\n"
     )
 }
 
@@ -1123,12 +1231,31 @@ fn is_trailing_runtime_scaffolding_message(message: &serde_json::Value) -> bool 
     if role == Some("system") {
         return true;
     }
-    role == Some("user")
-        && message
-            .get("content")
-            .and_then(|content| content.as_str())
-            .is_some_and(is_attention_manifest_content)
+    if role != Some("user") {
+        return false;
+    }
+    let Some(content) = message.get("content").and_then(|c| c.as_str()) else {
+        return false;
+    };
+    // Attention manifests carry the `[attention:v1]\n...` prefix.
+    if is_attention_manifest_content(content) {
+        return true;
+    }
+    // Session 8d9e5903 regression: every outbound request ends with a
+    // role=user `<system-reminder>` wrapper produced by the volatile
+    // lane (wire_assembly / bridge_inprocess / server_loop_host). This
+    // is runtime scaffolding, not a user query, and must not break
+    // round-cadence detection — otherwise the single-tool-streak
+    // counter always returns 0 on live sessions and the
+    // parallel-batching force never fires.
+    content.starts_with(SYSTEM_REMINDER_WRAPPER_PREFIX)
 }
+
+/// Wrapper tag applied by the volatile lane to mark runtime-injected
+/// scaffolding carried on a `role=user` message (git state / self-
+/// awareness / volatile nudges). See `wire_assembly`, `bridge_inprocess`,
+/// and `server_loop_host` for producers.
+const SYSTEM_REMINDER_WRAPPER_PREFIX: &str = "<system-reminder>";
 
 /// Returns true when `content` begins with the attention-manifest prefix
 /// followed by a newline. Allocation-free — safe to call in hot loops over
@@ -1603,9 +1730,8 @@ mod tests {
     #[test]
     fn prompt_includes_planning_protocol() {
         let p = build_main_system_prompt(&["bash"], "", 0.5, None);
-        assert!(p.contains("Planning Protocol"));
+        assert!(p.contains("Plan, Batch, Execute"));
         assert!(p.contains("<think>"));
-        assert!(p.contains("<reflect>"));
     }
 
     #[test]
@@ -1615,34 +1741,29 @@ mod tests {
         assert!(p.contains("Read before write"));
         assert!(p.contains("Executor rule (existing files)"));
         assert!(p.contains("Surgical edits"));
-        assert!(p.contains("Verify your edits"));
+        assert!(p.contains("One concern per str_replace"));
     }
 
     #[test]
     fn prompt_includes_parallel_tool_calls() {
         let p = build_main_system_prompt(&["bash"], "", 0.5, None);
-        assert!(p.contains("Parallel Tool Calls"));
+        assert!(p.contains("Batch independent reads"));
         assert!(p.contains("ONE turn"));
     }
 
     #[test]
     fn prompt_includes_token_efficiency() {
         let p = build_main_system_prompt(&["bash"], "", 0.5, None);
-        assert!(p.contains("Token Efficiency"));
-        assert!(p.contains("targeted reads"));
+        assert!(p.contains("Targeted reads"));
+        assert!(p.contains("line ranges"));
     }
 
     #[test]
     fn prompt_includes_build_test_guidance() {
         let p = build_main_system_prompt(&["bash"], "", 0.5, None);
-        assert!(p.contains("When to Run Build / Test"));
         assert!(
-            p.contains("ONLY to verify YOUR changes"),
+            p.contains("Build/test only AFTER your writes"),
             "should restrict build/test to post-edit verification"
-        );
-        assert!(
-            p.contains("Do NOT run them for information gathering"),
-            "should discourage speculative build/test"
         );
     }
 
@@ -1659,27 +1780,27 @@ mod tests {
     fn prompt_includes_error_recovery() {
         let p = build_main_system_prompt(&["bash"], "", 0.5, None);
         assert!(p.contains("Tool Error Recovery"));
+        assert!(p.contains("Retry Budget"));
         assert!(p.contains("retry ONCE"));
-        assert!(p.contains("truncated"));
-        assert!(p.contains("Timeout"));
-        assert!(p.contains("Rate limited"));
-        assert!(p.contains("Permission denied"));
-        assert!(p.contains("Path not found"));
-        // New error recovery entries
-        assert!(p.contains("Network failure"));
-        assert!(p.contains("Auth/credential error"));
-        assert!(p.contains("DB connection error"));
-        assert!(p.contains("Empty results"));
-        assert!(p.contains("Unknown tool"));
+        // Scenario headers
+        assert!(p.contains("File not found"));
+        assert!(p.contains("str_replace old_str did not match"));
+        assert!(p.contains("bash command timeout"));
+        assert!(p.contains("Truncated output"));
+        assert!(p.contains("Auth / credential / permission error"));
+        assert!(p.contains("Non-errors"));
+        assert!(p.contains("Unknown tool name"));
+        // Key anti-patterns preserved
+        assert!(p.contains("Anti-pattern"));
+        assert!(p.contains("memory_retrieve"));
     }
 
     #[test]
     fn prompt_bounds_runaway_file_exploration() {
         let p = build_main_system_prompt(&["bash", "read_file", "list_dir"], "", 0.5, None);
-        assert!(p.contains("Runaway Exploration Guard"));
+        assert!(p.contains("Open-ended loops"));
         assert!(p.contains("\"as many as you can\""));
-        assert!(p.contains("2 directory listings and 2 file reads"));
-        assert!(p.contains("busy-loop"));
+        assert!(p.contains("≤2 dir listings"));
     }
 
     #[test]
@@ -1964,12 +2085,12 @@ mod tests {
             "should contain core rules"
         );
         assert!(
-            global_text.contains("Planning Protocol"),
+            global_text.contains("Plan, Batch, Execute"),
             "should contain planning"
         );
         assert!(
-            global_text.contains("Context Strategy"),
-            "should contain context strategy"
+            global_text.contains("Reuse history"),
+            "should contain context reuse rule"
         );
         assert!(
             global_text.contains("Claude Code skills"),
@@ -2270,8 +2391,8 @@ mod tests {
 
         assert_eq!(sections[0].text, "Custom core rules content");
         assert_eq!(sections[0].scope, CacheScope::Global);
-        // Other sections should be unchanged
-        assert!(sections[1].text.contains("Planning Protocol"));
+        // Other sections should be unchanged (safety is now [1], planning is [2])
+        assert!(sections[2].text.contains("Plan, Batch, Execute"));
     }
 
     #[test]
@@ -2737,6 +2858,60 @@ mod tests {
         );
     }
 
+    /// Session 8d9e5903 regression: every outbound request has a
+    /// `role=user` message with a `<system-reminder>` wrapper at the
+    /// tail (volatile-lane injection carrying Git State / self-awareness
+    /// / volatile nudges). This is runtime scaffolding, not a user
+    /// query. Before the fix, `is_trailing_runtime_scaffolding_message`
+    /// only recognized attention-manifest user content, so the streak
+    /// detector broke at the first `<system-reminder>` it saw and
+    /// returned 0 — which meant the parallel-batching force never fired
+    /// despite 18 consecutive single-tool rounds in T11. The fix
+    /// extends scaffolding detection to any user message whose content
+    /// starts with `<system-reminder>`, which is a stable runtime
+    /// marker applied by every provider path (bridge_inprocess /
+    /// server_loop_host / wire_assembly).
+    #[test]
+    fn trailing_single_tool_streak_skips_system_reminder_wrapper() {
+        let mut msgs = rounds_pattern(&[1, 1, 1, 1]);
+        // The real shape seen in session 8d9e5903 captures:
+        msgs.push(serde_json::json!({
+            "role": "user",
+            "content": "<system-reminder>\n\n\n## Git State\n- Git branch: improve_promts\n</system-reminder>"
+        }));
+        assert_eq!(
+            trailing_single_tool_round_streak(&msgs),
+            4,
+            "runtime-injected <system-reminder> at tail must be treated as scaffolding \
+             so the single-tool streak detector can see the real round cadence; \
+             otherwise parallel-batching force never fires on live Astra sessions"
+        );
+        assert!(
+            parallel_batching_nudge_directive(&msgs).contains("Sequential Tool Calls Detected"),
+            "nudge must fire despite the <system-reminder> tail"
+        );
+    }
+
+    #[test]
+    fn trailing_single_tool_streak_skips_multiple_scaffolding_tails() {
+        // Realistic Astra tail: attention manifest + system-reminder +
+        // potentially a volatile-wrapper system message stacked up.
+        let mut msgs = rounds_pattern(&[1, 1, 1, 1, 1]);
+        msgs.push(serde_json::json!({
+            "role": "system",
+            "content": "(runtime-injected nudge)"
+        }));
+        msgs.push(serde_json::json!({
+            "role": "user",
+            "content": "<system-reminder>\nTurn: 5 | Tokens: 12000\n</system-reminder>"
+        }));
+        assert_eq!(
+            trailing_single_tool_round_streak(&msgs),
+            5,
+            "multiple stacked scaffolding tails must all be peeled off"
+        );
+    }
+
     #[test]
     fn tool_round_guidance_includes_batching_nudge_and_signals_it() {
         let msgs = rounds_pattern(&[1, 1, 1, 1]);
@@ -2755,5 +2930,85 @@ mod tests {
         assert!(!signals.round_budget_warning);
         // Single-tool last round → no positive parallel_feedback either.
         assert!(!signals.parallel_feedback);
+    }
+
+    // ── SystemPromptBuilder invariants ─────────────────────────────────
+
+    #[test]
+    fn system_prompt_builder_emits_stable_then_boundary_then_volatile() {
+        let mut b = SystemPromptBuilder::new();
+        b.push_stable(PromptSection::stable("RULES", CacheScope::Global));
+        b.push_stable(PromptSection::stable("SESSION", CacheScope::Session));
+        b.push_volatile(PromptSection::dynamic(
+            "ENV",
+            PromptTokenBucket::Environment,
+        ));
+        let out = b.finish();
+
+        assert_eq!(out.len(), 4, "expected 2 stable + boundary + 1 volatile");
+        assert_eq!(out[0].text, "RULES");
+        assert_eq!(out[0].scope, CacheScope::Global);
+        assert_eq!(out[1].text, "SESSION");
+        assert_eq!(out[1].scope, CacheScope::Session);
+        // Boundary marker — scope None so it sits on the dynamic side
+        assert_eq!(out[2].text, SYSTEM_PROMPT_DYNAMIC_BOUNDARY);
+        assert_eq!(out[2].scope, CacheScope::None);
+        assert_eq!(out[3].text, "ENV");
+        assert_eq!(out[3].scope, CacheScope::None);
+
+        // Rendered text: stable prefix must come before the marker, and
+        // the marker must come before any volatile content.
+        let rendered = sections_to_string(&out);
+        let rules_pos = rendered.find("RULES").unwrap();
+        let marker_pos = rendered.find(SYSTEM_PROMPT_DYNAMIC_BOUNDARY).unwrap();
+        let env_pos = rendered.find("ENV").unwrap();
+        assert!(
+            rules_pos < marker_pos && marker_pos < env_pos,
+            "order must be stable → boundary → volatile; got rules={rules_pos} marker={marker_pos} env={env_pos}"
+        );
+    }
+
+    #[test]
+    fn system_prompt_builder_omits_boundary_when_all_stable() {
+        let mut b = SystemPromptBuilder::new();
+        b.push_stable(PromptSection::stable("RULES", CacheScope::Global));
+        let out = b.finish();
+        assert_eq!(out.len(), 1);
+        assert!(
+            !out.iter().any(|s| s.text == SYSTEM_PROMPT_DYNAMIC_BOUNDARY),
+            "no boundary marker when volatile lane is empty"
+        );
+    }
+
+    #[test]
+    fn system_prompt_builder_omits_boundary_when_all_volatile() {
+        let mut b = SystemPromptBuilder::new();
+        b.push_volatile(PromptSection::dynamic(
+            "ENV",
+            PromptTokenBucket::Environment,
+        ));
+        let out = b.finish();
+        assert_eq!(out.len(), 1);
+        assert!(
+            !out.iter().any(|s| s.text == SYSTEM_PROMPT_DYNAMIC_BOUNDARY),
+            "no boundary marker when stable lane is empty"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "push_stable requires")]
+    fn system_prompt_builder_rejects_volatile_in_stable_lane() {
+        let mut b = SystemPromptBuilder::new();
+        b.push_stable(PromptSection::dynamic(
+            "oops",
+            PromptTokenBucket::Environment,
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "push_volatile requires")]
+    fn system_prompt_builder_rejects_stable_in_volatile_lane() {
+        let mut b = SystemPromptBuilder::new();
+        b.push_volatile(PromptSection::stable("oops", CacheScope::Global));
     }
 }
