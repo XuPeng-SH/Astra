@@ -77,6 +77,8 @@ mod command_registry;
 mod command_router;
 #[path = "cli/command_usage.rs"]
 mod command_usage;
+#[path = "cli/context_dump.rs"]
+mod context_dump;
 #[path = "cli/context_references.rs"]
 mod context_references;
 

@@ -204,9 +204,47 @@ pub(crate) enum Command {
     Agent(AgentArgs),
     /// Inspect inter-agent messaging state
     Messaging(MessagingArgs),
+    /// Dump the `/context` snapshot for a persisted session
+    #[command(subcommand)]
+    Context(ContextCmd),
     /// Direct message: astra "your question here"
     #[command(external_subcommand)]
     Message(Vec<String>),
+}
+
+/// Subcommands for the standalone `astra context` group.  Mirrors
+/// the TUI's `/context` slash command but works without a running
+/// REPL — useful for forensic replay from a persisted session.
+#[derive(Subcommand, Debug)]
+pub(crate) enum ContextCmd {
+    /// Dump a session's context as JSON, or a human-readable
+    /// summary to stdout.
+    ///
+    /// Examples:
+    ///     astra context dump                # most-recent session, JSON to ~/.astra/context-dumps/
+    ///     astra context dump -s 01e363ed    # 8-char prefix (any unique prefix works)
+    ///     astra context dump --summary      # plain-text summary to stdout, no file write
+    ///     astra context dump -s abc -o snap.json
+    #[command(verbatim_doc_comment)]
+    Dump(ContextDumpArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub(crate) struct ContextDumpArgs {
+    /// Session id — any unique prefix (e.g. first 8 chars) works.
+    /// When omitted, falls back to the most recently modified
+    /// session in `~/.astra/sessions/`.
+    #[arg(short = 's', long)]
+    pub session: Option<String>,
+    /// Write a JSON dump to this path instead of the default
+    /// `~/.astra/context-dumps/<sid>-t<turn>-<ts>.json`.  Ignored
+    /// when `--summary` is set.
+    #[arg(short = 'o', long)]
+    pub output: Option<String>,
+    /// Print a human-readable summary to stdout instead of writing
+    /// a JSON file.  Useful for `| grep`, CI logs, bug reports.
+    #[arg(long)]
+    pub summary: bool,
 }
 
 /// Headless plan commands (no interactive `plan>` prompt).

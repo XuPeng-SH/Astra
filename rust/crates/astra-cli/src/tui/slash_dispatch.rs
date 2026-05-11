@@ -294,21 +294,101 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
 
         // ── Context panel (TUI-native) ──────────────────────────────
         //
-        // `/context` with no args pops a live breakdown view built from
-        // the most recent turn's `TokenBudgetTrace`. Subcommands
-        // (`breakdown`, `explain`, `cognition`) fall through to the
-        // existing rustyline-style printer via Fallback.
+        // Only two forms are supported:
+        //   `/context`            → open the TUI panel
+        //   `/context dump [path]` → write a JSON snapshot to disk
+        //
+        // Earlier iterations fell through to a rustyline-style
+        // `breakdown`/`explain`/`cognition` printer, but those just
+        // duplicate what the panel shows.  Anything else now gets
+        // a short error that points the user at the two valid forms.
         "/context" => {
-            if !args.is_empty() {
-                return SlashResult::Fallback;
+            let args_trim = args.trim();
+            if let Some(rest) = args_trim.strip_prefix("dump") {
+                return handle_context_dump(rest.trim(), ctx);
+            }
+            if !args_trim.is_empty() {
+                use crate::tui::history_cell::system::SystemCell;
+                ctx.chat_widget.commit_system(SystemCell::info(
+                    "Usage: /context          — open the context panel\n       \
+                     /context dump [path] — write a JSON snapshot",
+                ));
+                return SlashResult::Handled;
             }
             use crate::tui::bottom_pane::context_panel_view::ContextPanelView;
-            use crate::tui::context_panel::ContextBreakdown;
+            use crate::tui::context_panel::model::{ActiveSkill, SessionSummary};
+            use crate::tui::context_panel::{ContextBreakdown, ContextSnapshot};
+
+            // Collect human-readable previews the trace doesn't
+            // carry: per-turn transcript snippets (from the chat
+            // widget's history) and process-state bits for the
+            // System-prompt sub-rows (model id, cwd, git branch,
+            // user-rules path).  The panel renders these under the
+            // count rows when the user expands a section.
+            let mut snap = ContextSnapshot::default();
+            snap.model = ctx.state.model.as_deref();
+            if let Ok(cwd) = std::env::current_dir() {
+                snap.cwd = Some(display_path(&cwd));
+            }
+            snap.git_branch = detect_git_branch();
+            snap.user_rules_path = find_user_rules_path();
+
+            // Loaded system skills.  Surfaced as a Skills-section
+            // fallback when the trace is silent (common for CLI
+            // sessions where edge_profile.active_skills isn't set).
+            snap.active_skills = ctx
+                .state
+                .active_system_skills
+                .iter()
+                .map(|s| ActiveSkill {
+                    name: s.name.clone(),
+                    description: s.description.clone(),
+                })
+                .collect();
+
+            // Build the Session / Budget summary from ReplState.
+            // All fields are cheap reads — no I/O, no extra locks.
+            snap.session = Some(SessionSummary {
+                session_id: ctx.state.session_id.clone().unwrap_or_default(),
+                turn: ctx.state.turn,
+                model: ctx.state.model.clone(),
+                total_cost: ctx.state.total_session_cost,
+                max_budget: ctx.state.max_budget_limit,
+                prompt_tokens: ctx.state.total_prompt_tokens,
+                completion_tokens: ctx.state.total_completion_tokens,
+                cache_read_tokens: ctx.state.total_cache_read_tokens,
+                cache_creation_tokens: ctx.state.total_cache_creation_tokens,
+                continuation_anchor: ctx.state.continuation_anchor.clone(),
+                queued_message: ctx.state.queued_message.clone(),
+                diagnostics_context: ctx.state.diagnostics_context.clone(),
+            });
+
+            // Walk the committed history cells and pair them with
+            // the trace's turn indices.  We use the cell ordering
+            // (user/assistant pairs) as a rough proxy — the trace
+            // doesn't emit a stable cell→turn_index mapping today,
+            // so we populate by position.  Each turn contributes a
+            // one-line preview for the collapsed view plus the
+            // full body text for the drill-in view.
+            let (previews, bodies) = collect_history_text(ctx.chat_widget);
+            snap.history_previews = previews;
+            snap.history_bodies = bodies;
+
             let breakdown = match ctx.state.observability_session.as_ref() {
                 Some(session) => {
                     let guard = session.read().unwrap_or_else(|e| e.into_inner());
+                    // Pull session-level compaction history into the
+                    // snapshot so the Compaction section can show all
+                    // past events, not just the last-turn trace.
+                    snap.compressed_turns = guard.compressed_turns.clone();
                     match guard.context_traces.last() {
-                        Some(trace) => ContextBreakdown::from_trace(&trace.token_budget),
+                        // Use the full assembly trace so the panel
+                        // can render the nested tool / memory /
+                        // skill / section rows under the top-level
+                        // category bar. Old code only passed the
+                        // scalar TokenBudgetTrace which lost that
+                        // detail.
+                        Some(trace) => ContextBreakdown::from_trace_with(trace, &snap),
                         None => ContextBreakdown::empty(),
                     }
                 }
@@ -1189,6 +1269,145 @@ fn parse_slash(text: &str) -> (&str, &str) {
     }
 }
 
+/// Render a filesystem path for the `/context` Environment row.
+/// Replaces `$HOME` with `~` so absolute paths stay short.
+fn display_path(path: &std::path::Path) -> String {
+    let s = path.display().to_string();
+    if let Ok(home) = std::env::var("HOME") {
+        if let Some(rest) = s.strip_prefix(&home) {
+            return format!("~{rest}");
+        }
+    }
+    s
+}
+
+/// Detect current git branch via `gix`. Returns `None` when the cwd
+/// isn't a git repo, in detached HEAD, or on any I/O error — in any
+/// of those cases the Environment row falls back to just the cwd.
+fn detect_git_branch() -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    let repo = gix::discover(cwd).ok()?;
+    let head = repo.head().ok()?;
+    let name = head.referent_name()?;
+    Some(name.shorten().to_string())
+}
+
+/// Locate the user-rules directory under `~/.astra/rules/`, if
+/// present.  Returns the home-shortened path via `display_path`
+/// so the snapshot already reads like `~/.astra/rules`.  `None`
+/// when the directory doesn't exist.
+fn find_user_rules_path() -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let p = std::path::PathBuf::from(&home).join(".astra/rules");
+    if p.exists() {
+        return Some(display_path(&p));
+    }
+    None
+}
+
+/// Build a `turn_index → one-line preview` map from the chat
+/// widget's committed scrollback.  Turn indices come from the
+/// trace side of the API, but the trace doesn't store text — we
+/// use the cell position within each user-turn as the index.
+///
+/// The mapping is heuristic (cells don't carry a turn id) but
+/// matches the common case: each user/assistant pair is one turn.
+fn collect_history_text(
+    chat: &crate::tui::chat_widget::ChatWidget,
+) -> (
+    std::collections::HashMap<u32, String>,
+    std::collections::HashMap<u32, String>,
+) {
+    use crate::tui::history_cell::{
+        assistant::AssistantCell, reasoning::ReasoningCell, user::UserCell,
+    };
+    let mut previews: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
+    let mut bodies: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
+    // Walk history cells; each user cell advances the turn index.
+    // For both preview (one-line) and body (full text) we follow
+    // the same priority: user message wins; otherwise assistant
+    // reply for that turn; otherwise reasoning text as last resort.
+    let mut turn_idx: u32 = 0;
+    let record = |idx: u32,
+                  text: &str,
+                  previews: &mut std::collections::HashMap<u32, String>,
+                  bodies: &mut std::collections::HashMap<u32, String>,
+                  force: bool| {
+        if text.trim().is_empty() {
+            return;
+        }
+        if force || !previews.contains_key(&idx) {
+            let p = one_line_preview(text);
+            if !p.is_empty() {
+                previews.insert(idx, p);
+            }
+        }
+        if force || !bodies.contains_key(&idx) {
+            bodies.insert(idx, text.to_string());
+        }
+    };
+    for cell in chat.history() {
+        let any = cell.as_any_ref();
+        if let Some(u) = any.downcast_ref::<UserCell>() {
+            record(turn_idx, u.text(), &mut previews, &mut bodies, true);
+            turn_idx = turn_idx.saturating_add(1);
+        } else if let Some(a) = any.downcast_ref::<AssistantCell>() {
+            if turn_idx == 0 {
+                continue;
+            }
+            let slot = turn_idx.saturating_sub(1);
+            record(slot, a.source(), &mut previews, &mut bodies, false);
+        } else if let Some(r) = any.downcast_ref::<ReasoningCell>() {
+            if turn_idx == 0 {
+                continue;
+            }
+            let slot = turn_idx.saturating_sub(1);
+            record(slot, r.text(), &mut previews, &mut bodies, false);
+        }
+    }
+    (previews, bodies)
+}
+
+fn one_line_preview(text: &str) -> String {
+    text.lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(200)
+        .collect()
+}
+
+/// `/context dump [path]` — write a full JSON snapshot of the
+/// context-panel state (trace + chat history + environment) to
+/// disk for sharing or forensic replay.  When `path` is empty,
+/// writes to `~/.astra/context-dumps/<session>-<turn>-<ts>.json`.
+///
+/// Kept inline so the user sees the output path as a normal
+/// scrollback cell instead of tearing down the TUI like the
+/// fallback printer would.
+fn handle_context_dump(arg: &str, ctx: &mut DispatchContext<'_>) -> SlashResult {
+    use crate::tui::history_cell::system::SystemCell;
+    let chat_history = crate::tui::collect_chat_turns_for_dump(ctx.chat_widget);
+    let path = match crate::context_dump::write_dump_for_repl(
+        ctx.state,
+        chat_history,
+        if arg.is_empty() { None } else { Some(arg) },
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            ctx.chat_widget
+                .commit_system(SystemCell::error(format!("/context dump failed: {e}")));
+            return SlashResult::Handled;
+        }
+    };
+    ctx.chat_widget.commit_system(SystemCell::info(format!(
+        "Context snapshot written to {}",
+        path.display()
+    )));
+    SlashResult::Handled
+}
+
 #[cfg(test)]
 mod panels_tests {
     use super::build_panels_cheat_sheet_lines;
@@ -1213,6 +1432,85 @@ mod panels_tests {
         insta::assert_snapshot!(
             "panels_cheat_sheet",
             build_panels_cheat_sheet_lines().join("\n")
+        );
+    }
+}
+
+#[cfg(test)]
+mod context_history_tests {
+    use super::{collect_history_text, one_line_preview};
+    use crate::tui::chat_widget::ChatWidget;
+    use crate::tui::turn_event::{SystemLevel, TurnEvent};
+
+    #[test]
+    fn one_line_preview_skips_leading_blanks_crlf_and_truncates() {
+        assert_eq!(one_line_preview("\n\n  first line  \nsecond"), "first line");
+        assert_eq!(one_line_preview("\r\nCRLF line\r\n"), "CRLF line");
+
+        let long = "a".repeat(240);
+        let preview = one_line_preview(&long);
+        assert_eq!(preview.chars().count(), 200);
+        assert!(preview.chars().all(|ch| ch == 'a'));
+    }
+
+    #[test]
+    fn collect_history_text_ignores_assistant_without_user_anchor() {
+        let mut chat = ChatWidget::new("");
+        chat.replay(vec![
+            TurnEvent::Assistant {
+                ts: None,
+                markdown: "orphan assistant should not attach to turn zero".into(),
+            },
+            TurnEvent::Thinking {
+                ts: None,
+                text: "orphan reasoning should not attach to turn zero".into(),
+                duration_ms: None,
+            },
+        ]);
+
+        let (previews, bodies) = collect_history_text(&chat);
+
+        assert!(
+            previews.is_empty() && bodies.is_empty(),
+            "assistant/reasoning cells before the first user turn must not create a fake turn 0"
+        );
+    }
+
+    #[test]
+    fn collect_history_text_skips_system_cells_and_keeps_turn_indices_aligned() {
+        let mut chat = ChatWidget::new("");
+        chat.replay(vec![
+            TurnEvent::User {
+                ts: None,
+                text: "first user".into(),
+            },
+            TurnEvent::System {
+                ts: None,
+                level: SystemLevel::Info,
+                text: "system note should not appear in context history".into(),
+            },
+            TurnEvent::Assistant {
+                ts: None,
+                markdown: "assistant answer".into(),
+            },
+            TurnEvent::User {
+                ts: None,
+                text: "second user".into(),
+            },
+        ]);
+
+        let (previews, bodies) = collect_history_text(&chat);
+
+        assert_eq!(previews.get(&0).map(String::as_str), Some("first user"));
+        assert_eq!(bodies.get(&0).map(String::as_str), Some("first user"));
+        assert_eq!(previews.get(&1).map(String::as_str), Some("second user"));
+        assert_eq!(bodies.get(&1).map(String::as_str), Some("second user"));
+        assert!(
+            previews
+                .values()
+                .chain(bodies.values())
+                .all(|text| !text.contains("system note")),
+            "system cells should not pollute turn previews or bodies"
         );
     }
 }
