@@ -343,6 +343,22 @@ impl IngestionSender {
         }
     }
 
+    /// Build a sender whose events can be drained from the returned
+    /// receiver. Tests wire this up when they need to assert on enqueued
+    /// events instead of just ignoring them. Not intended for production
+    /// code paths — use [`IngestionSender`] obtained from
+    /// [`EventIngestionWorker::spawn`] there.
+    pub fn for_tests(capacity: usize) -> (Self, mpsc::Receiver<IngestionEvent>) {
+        let (tx, rx) = mpsc::channel(capacity);
+        (
+            Self {
+                tx,
+                overflow_count: Arc::new(AtomicU64::new(0)),
+            },
+            rx,
+        )
+    }
+
     /// Enqueue an event for async ingestion. Non-blocking; increments overflow counter if channel full.
     pub fn enqueue(&self, event: IngestionEvent) {
         if let Err(mpsc::error::TrySendError::Full(_)) = self.tx.try_send(event) {
@@ -1006,9 +1022,6 @@ mod tests {
             Some("sess-sync"),
             "default",
             "repl_startup",
-            Some(7),
-            true,
-            2,
             &keys,
             false,
         );
@@ -1017,7 +1030,6 @@ mod tests {
         assert_eq!(ingestion.session_id, "sess-sync");
         let meta = ingestion.metadata.expect("metadata");
         let cp = meta.get("cloud_pull").expect("cloud_pull blob");
-        assert_eq!(cp.get("learning_version").and_then(|v| v.as_i64()), Some(7));
         assert_eq!(
             cp.get("preference_keys_merged")
                 .and_then(|v| v.as_array())
@@ -1044,9 +1056,6 @@ mod tests {
             Some("s-empty"),
             "default",
             "post_login",
-            None,
-            false,
-            0,
             &[],
             true,
         );
@@ -1065,16 +1074,8 @@ mod tests {
     #[test]
     fn merged_metadata_cloud_pull_only_no_lineage_still_emits_object() {
         use crate::session_journal::JournalEvent;
-        let journal = JournalEvent::cloud_pull_sync_marker(
-            Some("s1"),
-            "p",
-            "post_login",
-            None,
-            false,
-            0,
-            &[],
-            true,
-        );
+        let journal =
+            JournalEvent::cloud_pull_sync_marker(Some("s1"), "p", "post_login", &[], true);
         let merged = super::merged_metadata_from_journal_event(&journal);
         let obj = merged.expect("expected metadata");
         assert!(obj.get("cloud_pull").is_some());

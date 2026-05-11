@@ -34,7 +34,6 @@ use sqlx::Row;
 
 use crate::FernetTokenEncryptor;
 use crate::MatrixOneSettings;
-use crate::evolution::service::EvolutionService;
 use crate::observability_integration::ObservabilityHub;
 use crate::turn::agentic_loop_host::{
     AgenticLoopOutcome, AgenticLoopState, CancellationState, ContextTracePersistenceContext,
@@ -48,9 +47,8 @@ use crate::{
 use astra_pipeline::step_recorder::StepRecorder;
 use astra_turn_core::contracts::{
     TurnCoreEventRecord, TurnCoreEventWriter, TurnCorePersistPlan, TurnDecisionAuditRecord,
-    TurnHookDbPersistPlan, TurnHookDbWriter, TurnLearningOutcome, TurnLearningWriter,
-    TurnObserverRequest, TurnObserverWorker, TurnSkillSelectionRecord, TurnToolEventPersistPlan,
-    TurnToolEventRecord, TurnToolEventWriter,
+    TurnHookDbPersistPlan, TurnHookDbWriter, TurnObserverRequest, TurnObserverWorker,
+    TurnSkillSelectionRecord, TurnToolEventPersistPlan, TurnToolEventRecord, TurnToolEventWriter,
 };
 
 use astra_core::{
@@ -60,7 +58,6 @@ use astra_core::{
 
 use super::run_engine::RunEngine;
 use super::server_loop_host::ServerAgenticLoopHostBuilder;
-use super::state_builder::PipelineLearningStack;
 
 const RUNTIME_CONTEXT_TRACE_AGENT_ID: &str = "astra-server";
 const LLM_TOKEN_SERVICE_TRUSTED_DOMAINS_TABLE: &str = "runtime_llm_trusted_domains";
@@ -385,6 +382,7 @@ fn build_server_skill_executor(
     session_id: &str,
     edge_connection_pool: Option<&astra_server_types::edge_connection_pool::EdgeConnectionPool>,
     cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
+    memory_extraction_service: Option<&Arc<crate::session_memory::MemoryExtractionService>>,
     #[cfg(feature = "harness")] harness_sink: Option<
         &std::sync::Arc<dyn astra_harness::SnapshotSink>,
     >,
@@ -406,6 +404,9 @@ fn build_server_skill_executor(
     .with_request_constraints(request_constraints)
     .with_skill_resolver(skill_resolver)
     .with_cancel_token(cancel_token);
+    if let Some(svc) = memory_extraction_service {
+        subrun_executor = subrun_executor.with_memory_extraction_service(Arc::clone(svc));
+    }
     if let Some(pool) = edge_connection_pool {
         subrun_executor = subrun_executor.with_edge_connection_pool(pool.clone());
     }
@@ -523,56 +524,20 @@ fn build_runtime_evaluation_service(
     }
 }
 
-fn seed_restricted_tools_from_blocked_patterns(
-    loop_state: &mut AgenticLoopState,
-    pattern_library: &astra_pipeline::pattern::PatternLibrary,
-) {
-    for name in pattern_library.blocked_tool_names() {
-        if !astra_turn_core::tool_registry_meta::is_pinned_tool(&name) {
-            loop_state.restricted_tools.insert(name);
-        }
-    }
-}
-
 async fn initialize_runtime_controllers(
     loop_state: &mut AgenticLoopState,
     user_id: &str,
     session_id: &str,
     evaluation_persistence: Option<EvaluationPersistenceContext>,
     context_trace_persistence: Option<ContextTracePersistenceContext>,
-) -> super::state_builder::PipelineLearningStack {
-    let learning_stack = super::state_builder::build_pipeline_learning_stack(Some("default"));
+) {
     let hub = Arc::new(ObservabilityHub::new());
-    hub.attach_pattern_library(learning_stack.pattern_library.clone());
     let session = hub.start_session(user_id, session_id);
-
-    // Seed restricted_tools from evolution-blocked patterns so the LLM never
-    // sees schemas for tools that cross-session learning has identified as
-    // persistently failing (deny-at-assembly).
-    if let Ok(lib) = learning_stack.pattern_library.lock() {
-        seed_restricted_tools_from_blocked_patterns(loop_state, &lib);
-    }
-
-    let evolution_service = Arc::new(
-        EvolutionService::new()
-            .with_pattern_library(learning_stack.pattern_library.clone())
-            .with_calibrator(learning_stack.calibrator.clone()),
-    );
-    if let Some(active_canary) = learning_stack.active_canary.clone()
-        && let Err(err) = evolution_service.restore_active_canary(active_canary).await
-    {
-        astra_core::agent_warn!(
-            "evolution",
-            "Failed to restore persisted active canary: {err}"
-        );
-    }
 
     loop_state.telemetry.observability_hub = Some(hub);
     loop_state.telemetry.observability_session = Some(session);
     loop_state.telemetry.evaluation_persistence = evaluation_persistence;
     loop_state.telemetry.context_trace_persistence = context_trace_persistence;
-    loop_state.evolution_service = Some(evolution_service);
-    learning_stack
 }
 
 async fn configure_runtime_controllers(
@@ -581,7 +546,7 @@ async fn configure_runtime_controllers(
     loop_state: &mut AgenticLoopState,
     user_id: &str,
     session_id: &str,
-) -> super::state_builder::PipelineLearningStack {
+) {
     let evaluation_persistence = shared_pool.map(|pool| EvaluationPersistenceContext {
         user_id: user_id.to_string(),
         evaluation_service: build_runtime_evaluation_service(matrixone, Some(pool)),
@@ -706,12 +671,8 @@ impl PostLoopPersistContext {
     ///
     /// The `loop_success` flag comes from `outcome.is_ok()` (before consuming
     /// the outcome in `finalize_run_events`).
-    async fn run(
-        &self,
-        state: &AgenticLoopState,
-        learning_stack: &PipelineLearningStack,
-        loop_success: bool,
-    ) {
+    async fn run(&self, state: &AgenticLoopState, loop_success: bool) {
+        let _ = loop_success;
         // 0. Persist CSL via CslManager.
         if let Some(ref mgr) = self.csl_manager {
             let mut mgr = mgr.lock().await;
@@ -772,15 +733,6 @@ impl PostLoopPersistContext {
                 .await;
         }
 
-        // 5. Record pipeline learning outcome (PatternLibrary / EntityGraph).
-        record_server_loop_learning_outcome(
-            learning_stack.writer.as_ref(),
-            &self.user_message,
-            state,
-            loop_success,
-        )
-        .await;
-
         // 6. Fire SessionEnd hooks.
         crate::skills::hooks::fire_session_end(
             &state.skills.session_event_hooks,
@@ -798,13 +750,6 @@ impl PostLoopPersistContext {
             &state.telemetry.promotion_events,
         )
         .await;
-
-        // 8. Save cross-session learning state.
-        let active_canary = match state.evolution_service.as_ref() {
-            Some(evolution_service) => evolution_service.export_active_canary().await,
-            None => None,
-        };
-        learning_stack.save_with_active_canary(active_canary);
     }
 }
 
@@ -812,7 +757,6 @@ fn extract_session_state_compact(
     state: &AgenticLoopState,
 ) -> astra_turn_core::conversation_log::SessionStateCompact {
     astra_turn_core::conversation_log::SessionStateCompact {
-        continuity: Some(state.continuity.clone()),
         blocked_tools: state.restricted_tools.iter().cloned().collect(),
         recent_tools: state.recent_tools.clone(),
         approval_overrides: state
@@ -1143,55 +1087,10 @@ fn truncate_for_audit(text: &str, max_chars: usize) -> String {
     }
 }
 
-/// Record a pipeline learning outcome from the server-driven loop so the
-/// PatternLibrary / EntityGraph / ProgressiveCalibrator can learn across
-/// sessions.  This mirrors what the bridge path does via
-/// `PipelineLearningWriter.record_outcome()` in `side_effects.rs`.
-///
-/// Correction detection: the server agentic loop previously hardcoded
-/// `was_corrected=false`, which left the ProgressiveCalibrator's three-axis
-/// formula `threshold = 0.70 - 0×0.15 - 0×0.10 - 0×0.10 = 0.70` frozen. This
-/// function now runs implicit-feedback detection on the user's turn against
-/// the most recent assistant message pulled from `state.messages`, matching
-/// the CLI/bridge behavior (`repl_turn.rs::record_selector_turn_outcome`,
-/// `bridge_inprocess.rs::build_turn_hook_args`).
-async fn record_server_loop_learning_outcome(
-    writer: &dyn TurnLearningWriter,
-    user_message: &str,
-    state: &AgenticLoopState,
-    success: bool,
-) {
-    let tools_used: Vec<String> = state.telemetry.all_tools_used.iter().cloned().collect();
-    let prev_assistant_text = extract_prev_assistant_text(&state.messages);
-    let signal = astra_turn_types::detect_implicit_feedback_signal(
-        user_message,
-        prev_assistant_text.as_deref(),
-    );
-    let was_corrected = matches!(signal.signal_type.as_str(), "correction" | "frustration");
-    let outcome = TurnLearningOutcome {
-        query: user_message.to_string(),
-        tools_selected: tools_used.clone(),
-        tools_used,
-        success,
-        quality: if success { 0.7 } else { 0.2 },
-        was_corrected,
-        task_type_label: None,
-        domain_hint_label: None,
-        user_feedback_score: None,
-        reward_hacking_risk: 0.0,
-        reward_hacking_flags: Vec::new(),
-        causal_support_score: if success { 0.8 } else { 0.3 },
-        causal_support_flags: Vec::new(),
-    };
-    if let Err(e) = writer.record_outcome(outcome).await {
-        astra_core::agent_error!("server-loop", "failed to record learning outcome: {e}");
-    }
-}
-
 /// Walk `messages` (chronological) and return the content of the latest
-/// assistant entry, if any. Used by implicit-feedback detection so the
-/// "user said `that's wrong` after the assistant answered `X`" pattern can
-/// score higher confidence.
+/// assistant entry, if any. Kept for tests that exercise implicit-feedback
+/// detection against assistant history.
+#[cfg_attr(not(test), allow(dead_code))]
 fn extract_prev_assistant_text(messages: &[serde_json::Value]) -> Option<String> {
     for msg in messages.iter().rev() {
         let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
@@ -1440,6 +1339,11 @@ pub struct AgenticRunLifecycleService {
     /// Harness sink registry for server-side harness observation (Phase 2A).
     #[cfg(feature = "harness")]
     harness_registry: Option<crate::server::harness_handlers::HarnessSinkRegistry>,
+    /// Shared background session-memory extraction coordinator. Cloned
+    /// into every `AgenticLoopState` the service builds, so all turns
+    /// share selector cooldown, in-flight dedup, event sink, and
+    /// broker. `None` → extraction disabled (e.g. minimal test service).
+    memory_extraction_service: Option<Arc<crate::session_memory::MemoryExtractionService>>,
 }
 
 impl AgenticRunLifecycleService {
@@ -1469,7 +1373,16 @@ impl AgenticRunLifecycleService {
             background_task_count: Arc::new(AtomicUsize::new(0)),
             #[cfg(feature = "harness")]
             harness_registry: None,
+            memory_extraction_service: None,
         }
+    }
+
+    pub fn with_memory_extraction_service(
+        mut self,
+        svc: Arc<crate::session_memory::MemoryExtractionService>,
+    ) -> Self {
+        self.memory_extraction_service = Some(svc);
+        self
     }
 
     #[cfg(feature = "harness")]
@@ -1573,13 +1486,6 @@ impl AgenticRunLifecycleService {
                 loop_state.messages = restored;
 
                 let ss = mat.session_state;
-                if let Some(c) = ss.continuity {
-                    if loop_state.continuity
-                        == astra_turn_types::continuity::ContinuityState::default()
-                    {
-                        loop_state.continuity = c;
-                    }
-                }
                 if !ss.blocked_tools.is_empty() {
                     loop_state.restricted_tools.extend(ss.blocked_tools);
                 }
@@ -1633,13 +1539,30 @@ impl AgenticRunLifecycleService {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             if self.background_task_count.load(Ordering::Acquire) == 0 {
-                return true;
+                break;
             }
             if tokio::time::Instant::now() >= deadline {
                 return false;
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
+
+        // Turn-owned background_task_count reached zero, but the
+        // session-memory extraction service has its own pending
+        // counter (see `MemoryExtractionService::wait_for_pending`).
+        // Fold it into the same shutdown deadline so we don't kill
+        // in-flight Memoria writes mid-HTTP.
+        if let Some(svc) = self.memory_extraction_service.as_ref() {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let leftover = svc.wait_for_pending(remaining).await;
+            if leftover > 0 {
+                return false;
+            }
+        }
+        true
     }
 
     /// Returns the current number of in-flight background tasks.
@@ -2070,8 +1993,6 @@ impl AgenticRunLifecycleService {
             .as_ref()
             .map(|root| crate::skills::hooks::load_all_hooks(std::path::Path::new(root)))
             .unwrap_or_default();
-        let runtime_continuity = Self::continuity_from_chat_context(&request.context);
-
         // Create harness sink early so sub-run executors can share it.
         #[cfg(feature = "harness")]
         let (harness_server_sink, harness_sink_arc): (
@@ -2110,6 +2031,7 @@ impl AgenticRunLifecycleService {
             session_id,
             self.edge_connection_pool.as_ref(),
             cancel_token,
+            self.memory_extraction_service.as_ref(),
             #[cfg(feature = "harness")]
             harness_sink_arc.as_ref(),
         );
@@ -2125,7 +2047,6 @@ impl AgenticRunLifecycleService {
             current_session_id: Some(session_id.to_string()),
             current_run_id: Some(run_id.to_string()),
             recursion_depth: 0,
-            attention_manifest_text: None,
             final_text: String::new(),
             final_text_streamed: false,
             total_prompt: 0,
@@ -2137,6 +2058,8 @@ impl AgenticRunLifecycleService {
             has_any_usage: false,
             max_turns,
             remaining_turns: max_turns,
+            turn_budget_hint_emitted_50: false,
+            turn_budget_hint_emitted_20: false,
             agentic_turn_budget,
             current_round_index: 0,
             llm_rounds_completed: 0,
@@ -2200,7 +2123,6 @@ impl AgenticRunLifecycleService {
             delegations_this_turn: 0,
             project_context: None,
             checkpoint_gate: None,
-            evolution_service: None,
             rate_limit_cooldown: Default::default(),
             data_snapshot_provider: None,
             last_composite_snapshot: None,
@@ -2221,12 +2143,11 @@ impl AgenticRunLifecycleService {
             tactical_adapter: None,
             step_signal_collector: None,
             tool_budget_override: None,
-            pending_reflection_signals: Vec::new(),
             recent_tactical_actions: Vec::new(),
             server_tool_executor: None,
             interruption: None,
             session_facts: Default::default(),
-            continuity: runtime_continuity.unwrap_or_default(),
+            memory_extraction_service: self.memory_extraction_service.clone(),
             compact_strategy: astra_turn_core::microcompact::CompactStrategy::from_provider_hint(
                 request.model.as_deref().unwrap_or(""),
             ),
@@ -2279,104 +2200,6 @@ impl AgenticRunLifecycleService {
                     crate::turn::harness_adapter::HarnessSlot::empty()
                 }
             },
-        }
-    }
-
-    fn parse_runtime_continuity_value(
-        value: &Value,
-        source: &'static str,
-    ) -> Option<astra_turn_types::continuity::ContinuityState> {
-        astra_turn_types::continuity::try_from_checkpoint_value(value)
-            .map_err(|error| {
-                tracing::warn!(
-                    error = %error,
-                    source,
-                    "dropping invalid continuity_state"
-                );
-            })
-            .ok()
-    }
-
-    fn continuity_from_chat_context(
-        context: &Option<Map<String, Value>>,
-    ) -> Option<astra_turn_types::continuity::ContinuityState> {
-        context
-            .as_ref()
-            .and_then(|ctx| ctx.get("continuity_state"))
-            .and_then(|value| Self::parse_runtime_continuity_value(value, "chat request context"))
-    }
-
-    async fn restore_continuity_from_session_checkpoint(
-        &self,
-        session_id: &str,
-    ) -> Result<
-        Option<astra_turn_types::continuity::ContinuityState>,
-        astra_pipeline::step_restore::RestoreError,
-    > {
-        match astra_pipeline::step_restore::restore_session_with_continuity_validator(
-            session_id,
-            |value| {
-                astra_turn_types::continuity::try_from_checkpoint_value(value)
-                    .map(|_| ())
-                    .map_err(|e| e.to_string())
-            },
-        ) {
-            Ok(Some(restored)) => {
-                // RestoredSession.continuity_state is now Option<ContinuityState>
-                // (parsed during restore), so no re-parse needed here.
-                if restored.continuity_state.is_some() {
-                    return Ok(restored.continuity_state);
-                }
-            }
-            Ok(None) => {}
-            Err(astra_pipeline::step_restore::RestoreError::IoError(error)) => {
-                return Err(astra_pipeline::step_restore::RestoreError::IoError(error));
-            }
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    session_id,
-                    "skipping invalid local step checkpoint during server continuity restore"
-                );
-            }
-        }
-
-        let Some(shared_pool) = self.shared_pool.as_ref() else {
-            return Ok(None);
-        };
-        match astra_services::session_restore::pull_step_checkpoint_from_cloud(
-            shared_pool.get(),
-            session_id,
-        )
-        .await
-        {
-            Ok(Some(state_json)) => {
-                match astra_services::session_restore::parse_cloud_heavy_checkpoint_state(
-                    &state_json,
-                ) {
-                    // continuity_state is already a parsed ContinuityState (Option<ContinuityState>)
-                    // after the CloudHeavyCheckpointState strong-type migration — no re-parse needed.
-                    Ok(Some(heavy)) => Ok(heavy.continuity_state),
-                    Ok(None) => Ok(None),
-                    Err(error) => {
-                        tracing::warn!(
-                            error = %error,
-                            session_id,
-                            "skipping cloud step checkpoint during server continuity restore"
-                        );
-                        Ok(None)
-                    }
-                }
-            }
-            Ok(None) => Ok(None),
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    session_id,
-                    "cloud step checkpoint unavailable during server continuity restore"
-                );
-                Ok(None)
-            }
         }
     }
 
@@ -2616,24 +2439,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         #[cfg(feature = "harness")]
         loop_state.harness.set_user_id(&user_id);
 
-        if request.session_id.is_some()
-            && loop_state.continuity == astra_turn_types::continuity::ContinuityState::default()
-        {
-            match self
-                .restore_continuity_from_session_checkpoint(&session_id)
-                .await
-            {
-                Ok(Some(restored)) => loop_state.continuity = restored,
-                Ok(None) => {}
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        session_id,
-                        "server continuity restore unavailable; continuing without checkpoint continuity"
-                    );
-                }
-            }
-        }
         loop_state.session_turn = infer_session_turn(self.shared_pool.as_ref(), &session_id).await;
 
         // ── Pipeline warm-start: restore PipelineSession from checkpoint ──
@@ -2643,19 +2448,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // session resume starts with cold pipeline state — the write side
         // (agentic_loop_finalization) persists it, but nothing was reading it
         // back until now.
-        if let Ok(Some(restored)) =
-            astra_pipeline::step_restore::restore_session_with_continuity_validator(
-                &session_id,
-                |_| Ok(()), // already validated continuity above
-            )
+        if let Ok(Some(restored)) = astra_pipeline::step_restore::restore_session(&session_id)
+            && restored.pipeline_state.is_some()
         {
-            if restored.pipeline_state.is_some() {
-                loop_state.pipeline_session =
-                    Some(astra_turn_core::pipeline_session_serde::restore_or_new(
-                        astra_turn_core::pipeline_config::PipelineConfig::default(),
-                        restored.pipeline_state.as_ref(),
-                    ));
-            }
+            loop_state.pipeline_session =
+                Some(astra_turn_core::pipeline_session_serde::restore_or_new(
+                    astra_turn_core::pipeline_config::PipelineConfig::default(),
+                    restored.pipeline_state.as_ref(),
+                ));
         }
 
         // ── CSL: Load conversation history from the log ─────────────
@@ -2672,7 +2472,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             &pause_flag,
             &llm_cancel_token,
         );
-        let learning_stack = configure_runtime_controllers(
+        configure_runtime_controllers(
             &self.matrixone,
             self.shared_pool.as_ref(),
             &mut loop_state,
@@ -2926,35 +2726,18 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             }
 
             // Best-effort post-loop persistence (core events, tool events,
-            // hook DB, observer, learning, session-end hooks, promotion events).
-            persist_ctx
-                .run(&loop_state, &learning_stack, loop_success)
-                .await;
+            // hook DB, observer, session-end hooks, promotion events).
+            persist_ctx.run(&loop_state, loop_success).await;
 
-            // Session-end governance: extract learnings, store to Memoria, purge working memory.
+            // Session-end governance: purge working memory.
             // This is create_run-specific (background runs are long-lived sessions).
             if let Some(ref memoria_client) =
                 crate::turn::cloud::memoria_compact::HttpMemoriaClient::from_env()
             {
-                use crate::turn::cloud::memoria_compact::MemoriaClient as _;
                 let sid = loop_state.current_session_id.as_deref().unwrap_or("");
                 if !sid.is_empty() {
-                    // Try to retrieve L1 narrative from Memoria for knowledge extraction
-                    let narrative = memoria_client
-                        .retrieve_ext(
-                            &format!("{} session state", crate::turn::cloud::session_memory_protocol::SESSION_MEMORY_PREFIX),
-                            Some(sid), 3, true,
-                        )
-                        .await
-                        .ok()
-                        .and_then(|mems| {
-                            mems.into_iter()
-                                .find(|m| m.content.starts_with(crate::turn::cloud::session_memory_protocol::SESSION_MEMORY_PREFIX))
-                        })
-                        .and_then(|m| crate::turn::cloud::session_memory_protocol::SessionMemory::parse(&m.content));
                     match crate::turn::cloud::session_end_governance::run_session_end_governance(
                         &loop_state.session_facts,
-                        narrative.as_ref(),
                         sid,
                         memoria_client,
                     )
@@ -2974,6 +2757,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                             tracing::warn!(session_id = %sid, error = %e, "session-end governance failed")
                         }
                     }
+                }
+            }
+            // Release per-session debounce state held by the extraction
+            // service so it doesn't accumulate an entry per session for
+            // the life of the process.
+            if let Some(svc) = loop_state.memory_extraction_service.as_ref() {
+                if let Some(sid) = loop_state.current_session_id.as_deref() {
+                    svc.forget_session(sid);
                 }
             }
         });
@@ -3050,34 +2841,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         #[cfg(feature = "harness")]
         state.harness.set_user_id(&user_id);
 
-        if request.session_id.is_some()
-            && state.continuity == astra_turn_types::continuity::ContinuityState::default()
-        {
-            match self
-                .restore_continuity_from_session_checkpoint(&session_id)
-                .await
-            {
-                Ok(Some(restored)) => state.continuity = restored,
-                Ok(None) => {}
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        session_id,
-                        "server continuity restore unavailable; continuing without checkpoint continuity"
-                    );
-                }
-            }
-        }
         state.session_turn = infer_session_turn(self.shared_pool.as_ref(), &session_id).await;
 
         // ── Pipeline warm-start from step checkpoint ────────────────
         if request.session_id.is_some() {
-            if let Ok(Some(restored)) =
-                astra_pipeline::step_restore::restore_session_with_continuity_validator(
-                    &session_id,
-                    |_| Ok(()),
-                )
-            {
+            if let Ok(Some(restored)) = astra_pipeline::step_restore::restore_session(&session_id) {
                 if restored.pipeline_state.is_some() {
                     state.pipeline_session =
                         Some(astra_turn_core::pipeline_session_serde::restore_or_new(
@@ -3143,7 +2911,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             &pause_flag,
             &llm_cancel_token,
         );
-        let learning_stack = configure_runtime_controllers(
+        configure_runtime_controllers(
             &self.matrixone,
             self.shared_pool.as_ref(),
             &mut state,
@@ -3216,8 +2984,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             let loop_success = loop_result.is_ok();
 
             // Best-effort post-loop persistence (core events, tool events,
-            // hook DB, observer, learning, session-end hooks, promotion events).
-            persist_ctx.run(&state, &learning_stack, loop_success).await;
+            // hook DB, observer, session-end hooks, promotion events).
+            persist_ctx.run(&state, loop_success).await;
 
             let (mut final_events, final_status, error_msg) =
                 Self::finalize_run_events(loop_result, host.take_emitted_events(), &state);
@@ -3724,6 +3492,7 @@ pub struct ServerSubRunExecutor {
     edge_connection_pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
     skill_service: Option<Arc<dyn SkillService>>,
     skill_resolver_cache: std::sync::OnceLock<ServerSkillResolverBundle>,
+    memory_extraction_service: Option<Arc<crate::session_memory::MemoryExtractionService>>,
 }
 
 impl ServerSubRunExecutor {
@@ -3740,11 +3509,20 @@ impl ServerSubRunExecutor {
             edge_connection_pool: None,
             skill_service: None,
             skill_resolver_cache: std::sync::OnceLock::new(),
+            memory_extraction_service: None,
         }
     }
 
     pub fn with_pool(mut self, pool: SharedPool) -> Self {
         self.shared_pool = Some(pool);
+        self
+    }
+
+    pub fn with_memory_extraction_service(
+        mut self,
+        svc: Arc<crate::session_memory::MemoryExtractionService>,
+    ) -> Self {
+        self.memory_extraction_service = Some(svc);
         self
     }
 
@@ -3895,7 +3673,6 @@ impl SubRunExecutor for ServerSubRunExecutor {
             current_session_id: Some(config.session_id.clone()),
             current_run_id: Some(config.run_id.clone()),
             recursion_depth: 0,
-            attention_manifest_text: None,
             final_text: String::new(),
             final_text_streamed: false,
             total_prompt: 0,
@@ -3907,6 +3684,8 @@ impl SubRunExecutor for ServerSubRunExecutor {
             has_any_usage: false,
             max_turns: 10,
             remaining_turns: 10,
+            turn_budget_hint_emitted_50: false,
+            turn_budget_hint_emitted_20: false,
             agentic_turn_budget:
                 astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::default()
                     .agentic_turn_budget,
@@ -3973,7 +3752,6 @@ impl SubRunExecutor for ServerSubRunExecutor {
             delegations_this_turn: 0,
             project_context: None,
             checkpoint_gate: config.checkpoint_gate.clone(),
-            evolution_service: None,
             rate_limit_cooldown: Default::default(),
             data_snapshot_provider: None,
             last_composite_snapshot: None,
@@ -3994,12 +3772,11 @@ impl SubRunExecutor for ServerSubRunExecutor {
             tactical_adapter: None,
             step_signal_collector: None,
             tool_budget_override: None,
-            pending_reflection_signals: Vec::new(),
             recent_tactical_actions: Vec::new(),
             server_tool_executor: None,
             interruption: None,
             session_facts: Default::default(),
-            continuity: Default::default(),
+            memory_extraction_service: self.memory_extraction_service.clone(),
             compact_strategy,
             approval_overrides: None,
             confidence_trend: Default::default(),
@@ -4060,7 +3837,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             loop_state.server_tool_executor = Some(std::sync::Arc::new(executor));
         }
 
-        let learning_stack = configure_runtime_controllers(
+        configure_runtime_controllers(
             &self.matrixone,
             self.shared_pool.as_ref(),
             &mut loop_state,
@@ -4101,13 +3878,6 @@ impl SubRunExecutor for ServerSubRunExecutor {
             config.agent_profile.model_override.as_deref(),
         )
         .await;
-
-        // Persist cross-session learning state.
-        let active_canary = match loop_state.evolution_service.as_ref() {
-            Some(evolution_service) => evolution_service.export_active_canary().await,
-            None => None,
-        };
-        learning_stack.save_with_active_canary(active_canary);
 
         match outcome {
             Ok(AgenticLoopOutcome::Completed) => {
@@ -4813,33 +4583,6 @@ mod tests {
     }
 
     #[test]
-    fn seed_restricted_tools_from_blocked_patterns_adds_blocked_tools() {
-        let svc = test_service();
-        let request = test_request("inspect blocked tools");
-        let mut state = svc.build_initial_state(&request, "session-1", "run-1", None, None);
-        let mut pattern_library = astra_pipeline::pattern::PatternLibrary::new();
-
-        // One success so the pattern exists, then Block adds 5 failures.
-        // Total: success=1, failure=5, rate=5/6=0.833 > 0.8 → blocked.
-        pattern_library.record_outcome(
-            &["some_custom_tool".to_string()],
-            crate::pipeline::routing::TaskType::Code,
-            None,
-            true,
-            0.8,
-            None,
-        );
-        pattern_library.apply_evolution_action(
-            "some_custom_tool",
-            astra_evolution::types::PatternAction::Block,
-        );
-
-        seed_restricted_tools_from_blocked_patterns(&mut state, &pattern_library);
-
-        assert!(state.restricted_tools.contains("some_custom_tool"));
-    }
-
-    #[test]
     fn finalize_run_events_appends_run_finished_for_failures() {
         let svc = test_service();
         let request = test_request("boom");
@@ -5432,40 +5175,6 @@ mod tests {
         assert_eq!(state.agentic_turn_budget, expected_budget);
         assert_eq!(state.message, "write a test");
         assert!(state.cancellation.token.is_none());
-    }
-
-    #[test]
-    fn build_initial_state_restores_continuity_from_request_context() {
-        let svc = test_service();
-        let mut continuity = astra_turn_types::continuity::ContinuityState::default();
-        continuity.ensure_tracked_goal("continue server-side restored work");
-        let mut req = test_request("continue");
-        let mut context = Map::new();
-        context.insert(
-            "continuity_state".to_string(),
-            serde_json::to_value(&continuity).unwrap(),
-        );
-        req.context = Some(context);
-
-        let state = svc.build_initial_state(&req, "sess-1", "run-1", None, None);
-
-        assert_eq!(state.continuity, continuity);
-    }
-
-    #[test]
-    fn build_initial_state_soft_drops_invalid_continuity_context() {
-        let svc = test_service();
-        let mut req = test_request("continue");
-        let mut context = Map::new();
-        context.insert("continuity_state".to_string(), serde_json::json!({}));
-        req.context = Some(context);
-
-        let state = svc.build_initial_state(&req, "sess-1", "run-1", None, None);
-
-        assert_eq!(
-            state.continuity,
-            astra_turn_types::continuity::ContinuityState::default()
-        );
     }
 
     #[test]
@@ -6746,7 +6455,6 @@ mod tests {
             "consecutive_ctx_errors",
             "recent_tools",
             "blocked_tools",
-            "continuity",
             "approval_overrides",
             "interruption",
         ];
@@ -6783,7 +6491,6 @@ mod tests {
             .expect("restore_csl_history must exist");
         let restore_body = &source[restore_fn..restore_fn + 3000];
         let required_fields = [
-            "continuity",
             "blocked_tools",
             "recent_tools",
             "approval_overrides",

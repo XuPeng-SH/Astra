@@ -190,12 +190,8 @@ pub(crate) struct ChatTurnParams<'a> {
         Option<std::sync::Arc<std::sync::Mutex<crate::edge_tools::SessionStateRollbackJournal>>>,
     /// Session-scoped task manager so task mutations survive across turns.
     pub(crate) task_manager: Option<std::sync::Arc<crate::edge_tools::TaskManager>>,
-    /// Runtime-owned continuity restored from a checkpoint or prior REPL turn.
-    pub(crate) runtime_continuity: Option<&'a astra_turn_types::continuity::ContinuityState>,
     /// Current REPL turn number — used to tag journal entries for undo.
     pub(crate) turn_index: u32,
-    /// Shared evolution service for multi-axis self-evolution.
-    pub(crate) evolution_service: Option<Arc<astra_runtime::evolution::service::EvolutionService>>,
     /// Pre-loaded CSL messages (from CslManager.load() in repl_turn).
     /// Restored pipeline state from a checkpoint (enables warm-start on resume).
     pub(crate) pipeline_state: Option<serde_json::Value>,
@@ -203,6 +199,11 @@ pub(crate) struct ChatTurnParams<'a> {
     pub(crate) pre_loaded_messages: Option<Vec<serde_json::Value>>,
     /// Extra context appended to the system prompt (gateway injects cron/session context here).
     pub(crate) append_system_prompt: Option<String>,
+    /// Background session-memory.md extraction coordinator. Cloned
+    /// from `ReplState::session_memory_extractor`. `None` keeps
+    /// extraction disabled (one-shot `chat -m`, plan subtasks, tests).
+    pub(crate) session_memory_extractor:
+        Option<std::sync::Arc<astra_runtime::session_memory::MemoryExtractionService>>,
     /// Shared harness snapshot sink for /inspect command.
     #[cfg(feature = "harness")]
     pub(crate) harness_sink: Option<std::sync::Arc<astra_harness::InMemorySnapshotSink>>,
@@ -311,12 +312,11 @@ impl<'a> ChatTurnParams<'a> {
             git_worktree_journal: None,
             session_state_journal: None,
             task_manager: None,
-            runtime_continuity: None,
             turn_index: 0,
-            evolution_service: None,
             pipeline_state: None,
             pre_loaded_messages: None,
             append_system_prompt: None,
+            session_memory_extractor: None,
             #[cfg(feature = "harness")]
             harness_sink: ctx.harness_sink.clone(),
             #[cfg(feature = "harness")]

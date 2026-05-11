@@ -133,7 +133,8 @@ fn all_tool_schemas_core() -> Vec<Value> {
                     "type": "object",
                     "properties": {
                         "command": {"type": "string", "description": "Shell command to run"},
-                        "timeout": {"type": "number", "description": "Timeout in seconds (default 120). Pass a larger value for long-running builds/tests (e.g. 300 for cargo build, 600 for full test suites)."}
+                        "timeout": {"type": "number", "description": "Timeout in seconds (default 120). Pass a larger value for long-running builds/tests (e.g. 300 for cargo build, 600 for full test suites)."},
+                        "force": {"type": "boolean", "description": "If true, bypass the per-session identical-command cache and execute even when the same command already succeeded."}
                     },
                     "required": ["command"]
                 }
@@ -196,7 +197,8 @@ fn all_tool_schemas_core() -> Vec<Value> {
                             }
                         },
                         "dry_run": {"type": "boolean", "description": "Preview diff without applying (default: false)"},
-                        "replace_all": {"type": "boolean", "description": "Replace ALL occurrences (default: false)"}
+                        "replace_all": {"type": "boolean", "description": "Replace ALL occurrences (default: false)"},
+                        "allow_structural_change": {"type": "boolean", "description": "Bypass structural safety checks for intentional syntax-breaking or comment-removing edits (default: false)"}
                     },
                     "required": ["path"]
                 }
@@ -534,7 +536,8 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "model": {"type": "string", "description": "Model override (spawn)"},
                         "background": {"type": "boolean", "description": "Return immediately with agent_id (spawn)"},
                         "name": {"type": "string", "description": "Addressable name (spawn)"},
-                        "max_turns": {"type": "integer", "description": "Max turns (spawn)"},
+                        "max_turns": {"type": "integer", "description": "Max turns (spawn). Explicit value wins over `complexity`."},
+                        "complexity": {"type": "string", "enum": ["light","normal","deep"], "description": "Task-complexity hint scaling the default budget when `max_turns` is absent. `light`≈10 turns, `normal`=agent default, `deep`=2× default. Use `deep` for review/refactor/multi-file tasks that routinely exhaust the default."},
                         "isolated": {"type": "boolean", "description": "Use isolated worktree (spawn)"},
                         "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Tool allowlist (spawn)"},
                         "agent_id": {"type": "string", "description": "Agent ID (get_result)"},

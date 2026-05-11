@@ -133,19 +133,12 @@ async fn finalize_root_mailbox(
 }
 
 fn extend_restricted_with_blocked_tools(
-    restricted: &mut HashSet<String>,
-    observability_hub: Option<&Arc<astra_runtime::observability_integration::ObservabilityHub>>,
+    _restricted: &mut HashSet<String>,
+    _observability_hub: Option<&Arc<astra_runtime::observability_integration::ObservabilityHub>>,
 ) {
-    if let Some(hub) = observability_hub
-        && let Some(pattern_library) = hub.pattern_library()
-        && let Ok(lib) = pattern_library.lock()
-    {
-        for name in lib.blocked_tool_names() {
-            if !astra_turn_core::tool_registry_meta::is_pinned_tool(&name) {
-                restricted.insert(name);
-            }
-        }
-    }
+    // Pattern-library / evolution-driven tool blocking was removed along with
+    // the self-evolution subsystem. The function is retained as a no-op so
+    // callers don't need signature changes; add future block sources here.
 }
 
 pub(crate) async fn stream_chat_sse(
@@ -153,6 +146,16 @@ pub(crate) async fn stream_chat_sse(
 ) -> Result<StreamResult, crate::TurnFailure> {
     let start = Instant::now();
     let root_agent_id = p.root_agent_id.unwrap_or("main");
+
+    // UX bridge: subscribe to the session-memory broker for this turn
+    // and forward qualifying events to the CLI stream as `StatusLine`
+    // so long-running LLM extraction gets a subtle visual cue. Runs
+    // for the duration of the turn; dropped when `_session_memory_ux`
+    // goes out of scope.
+    let _session_memory_ux = crate::chat_stream::session_memory_ux::SessionMemoryUxBridge::spawn(
+        p.session_memory_extractor.as_ref(),
+        p.stream_event_tx.clone(),
+    );
     // Stable run_id for this turn — shared by:
     //   1. state.current_run_id (so on_turn_completed captures the
     //      parent prefix keyed on this id)
@@ -572,7 +575,6 @@ pub(crate) async fn stream_chat_sse(
         current_session_id,
         current_run_id: Some(parent_turn_run_id.clone()),
         recursion_depth: 0,
-        attention_manifest_text: None,
         final_text: String::new(),
         final_text_streamed: false,
         total_prompt: 0,
@@ -584,6 +586,8 @@ pub(crate) async fn stream_chat_sse(
         has_any_usage: false,
         max_turns,
         remaining_turns: max_turns,
+        turn_budget_hint_emitted_50: false,
+        turn_budget_hint_emitted_20: false,
         agentic_turn_budget: task_profile.agentic_turn_budget,
         current_round_index: 0,
         llm_rounds_completed: 0,
@@ -719,7 +723,6 @@ pub(crate) async fn stream_chat_sse(
         delegations_this_turn: 0,
         project_context,
         checkpoint_gate: None,
-        evolution_service: p.evolution_service.clone(),
         rate_limit_cooldown: Default::default(),
         data_snapshot_provider: None,
         last_composite_snapshot: None,
@@ -740,12 +743,11 @@ pub(crate) async fn stream_chat_sse(
         tactical_adapter: None,
         step_signal_collector: None,
         tool_budget_override: None,
-        pending_reflection_signals: Vec::new(),
         recent_tactical_actions: Vec::new(),
         server_tool_executor: None,
         interruption: None,
         session_facts: Default::default(),
-        continuity: p.runtime_continuity.cloned().unwrap_or_default(),
+        memory_extraction_service: p.session_memory_extractor.clone(),
         compact_strategy: astra_turn_core::microcompact::CompactStrategy::from_provider_and_model(
             p.provider, p.model,
         ),
@@ -879,7 +881,6 @@ pub(crate) async fn stream_chat_sse(
         step_recorder: &state.step_recorder,
         turn_guard: &state.turn_guard,
         last_heavy_checkpoint: state.stall.last_heavy_checkpoint,
-        runtime_continuity: state.continuity,
         ttft_ms: state.telemetry.first_ttft_ms,
         context_ms: state.telemetry.first_context_assembly_ms,
         selector_strategy: state.telemetry.first_selector_strategy,
@@ -937,14 +938,11 @@ mod tests {
     use super::circuit_breaker_config_from_tool_selection;
     use super::detect_turn_hook_sets;
     use super::extend_restricted_with_blocked_tools;
-    use astra_pipeline::pattern::PatternLibrary;
-    use astra_runtime::evolution::types::PatternAction;
     use astra_runtime::observability_integration::ObservabilityHub;
     use astra_turn_core::chat_turn_heuristics::infer_task_execution_profile;
-    use astra_turn_core::routing_engine::TaskType;
     use std::collections::HashSet;
     use std::path::Path;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use tempfile::tempdir;
 
     #[test]
@@ -1119,25 +1117,13 @@ hooks:
 
     #[test]
     fn blocked_patterns_do_not_restrict_pinned_tools() {
-        // All tools are pinned after consolidation, so pattern-library
-        // blocks have no effect on tool restrictions. Only non-pinned
-        // (dynamic) tools can be blocked.
-        let pattern_library = Arc::new(Mutex::new(PatternLibrary::new()));
-        {
-            let mut lib = pattern_library.lock().unwrap();
-            let tools = vec!["grep".to_string()];
-            lib.record_outcome(&tools, TaskType::Code, None, true, 0.8, None);
-            lib.apply_evolution_action("grep", PatternAction::Block);
-        }
-
+        // After the pattern-library subsystem was removed, the blocked-tools
+        // set is always empty — verify `extend_restricted_with_blocked_tools`
+        // is a safe no-op on an ObservabilityHub without any evolution inputs.
         let hub = Arc::new(ObservabilityHub::new());
-        hub.attach_pattern_library(pattern_library);
-
         let mut restricted = HashSet::new();
         extend_restricted_with_blocked_tools(&mut restricted, Some(&hub));
-
-        // grep is pinned → not restricted even when blocked
-        assert!(!restricted.contains("grep"));
+        assert!(restricted.is_empty());
     }
 
     // ── G3: spawn_agent visibility gate ──

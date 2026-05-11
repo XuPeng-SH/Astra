@@ -362,28 +362,6 @@ async fn execute_repl_bridge_command(
     maybe_load_project_instructions(&mut state);
 
     let (_selector, pipeline_modules) = create_tool_selector(api, profile);
-    state.pattern_library = Some(pipeline_modules.pattern_library.clone());
-    state.entity_graph = Some(pipeline_modules.entity_graph.clone());
-    state.calibrator = Some(pipeline_modules.calibrator.clone());
-
-    // Initialize evolution service with pattern library for drift detection.
-    {
-        let mut evo = astra_runtime::evolution::service::EvolutionService::new()
-            .with_pattern_library(pipeline_modules.pattern_library.clone())
-            .with_calibrator(pipeline_modules.calibrator.clone());
-        if let Some(skills_dir) = astra_skills::loader::skill_search_paths()
-            .into_iter()
-            .next()
-        {
-            evo = evo.with_evolution_store(std::sync::Arc::new(
-                astra_runtime::evolution::store::EvolutionStore::new(skills_dir),
-            ));
-        }
-        state.evolution_service = Some(std::sync::Arc::new(evo));
-    }
-    if let Some(hub) = &state.observability_hub {
-        hub.attach_pattern_library(pipeline_modules.pattern_library.clone());
-    }
     state.unified_skill_registry = pipeline_modules.unified_skill_registry.clone();
     state.mcp_manager = pipeline_modules.mcp_manager.clone();
 
@@ -3120,7 +3098,6 @@ mod exit_code_tests {
             step_recorder_summary: None,
             tool_health_export: vec![],
             last_heavy_checkpoint: None,
-            runtime_continuity: Default::default(),
             ttft_ms: None,
             context_ms: None,
             selector_strategy: None,
@@ -3409,7 +3386,6 @@ mod final_json_output_tests {
             step_recorder_summary: None,
             tool_health_export: vec![],
             last_heavy_checkpoint: None,
-            runtime_continuity: Default::default(),
             ttft_ms: None,
             context_ms: None,
             selector_strategy: None,

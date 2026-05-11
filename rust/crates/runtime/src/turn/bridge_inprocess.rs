@@ -718,8 +718,6 @@ pub struct InProcessChatTurnBridge {
     /// Shared DB pool — avoids creating a new connection per turn.
     /// When `None`, falls back to ephemeral single-connection pool.
     pub shared_pool: Option<SharedPool>,
-    /// Pipeline learning writer — auto-updates EntityGraph/PatternLibrary/Calibrator.
-    pub turn_learning_writer: Option<Arc<dyn crate::TurnLearningWriter>>,
     /// Same `Arc` as [`crate::AppState::edge_callback_ledger`] — bridge takes tool callbacks here.
     pub edge_callback_ledger: Arc<tokio::sync::Mutex<HashMap<String, Value>>>,
     /// Session-scoped structured feedback store — accumulates correction rules
@@ -741,7 +739,6 @@ impl InProcessChatTurnBridge {
             matrixone,
             encryptor,
             shared_pool: None,
-            turn_learning_writer: None,
             edge_callback_ledger: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             feedback_store: Arc::new(astra_pipeline::feedback_store::FeedbackStore::new()),
             memoria_client: crate::turn::cloud::memoria_compact::HttpMemoriaClient::from_env(),
@@ -752,11 +749,6 @@ impl InProcessChatTurnBridge {
 
     pub fn with_pool(mut self, pool: SharedPool) -> Self {
         self.shared_pool = Some(pool);
-        self
-    }
-
-    pub fn with_learning_writer(mut self, writer: Arc<dyn crate::TurnLearningWriter>) -> Self {
-        self.turn_learning_writer = Some(writer);
         self
     }
 
@@ -892,7 +884,6 @@ impl InProcessChatTurnBridge {
         };
         let root_runtime_owns_turn_journal =
             bridge_root_turn_journal_owned(headers, &payload, bridge_e2e_authorized);
-        let turn_learning_writer = self.turn_learning_writer.clone();
         let _edge_callback_ledger = self.edge_callback_ledger.clone();
 
         #[cfg(feature = "bridge-e2e-hooks")]
@@ -1258,16 +1249,6 @@ impl InProcessChatTurnBridge {
                 .and_then(|m| m.get("content").and_then(Value::as_str))
                 .unwrap_or("");
 
-            let learned_context_text = edge_profile
-                .get("learned_context_hint")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .unwrap_or_default();
-            let learned_context_hint = if learned_context_text.is_empty() {
-                String::new()
-            } else {
-                format!("\n\n## Learned Runtime Context\n{learned_context_text}")
-            };
             let task_type = edge_profile
                 .get("selection_task_type")
                 .and_then(Value::as_str)
@@ -1387,66 +1368,6 @@ impl InProcessChatTurnBridge {
             // ── Memoria client (shared across P1 anchor + compaction + P3 write) ──
             let memoria_client_shared = memoria_client_owned.clone();
 
-            // ── P1: L0 session anchor — inject original task into dynamic system prompt ──
-            // Derive anchor from current conversation state. On turn 1, falls back to
-            // first user message. On subsequent turns, builds a lightweight L1 from
-            // messages to show current state + progress — zero network calls.
-            //
-            // Skip emission when the anchor is trivial (bootstrap shape that
-            // just echoes the current user message) — injecting it in that
-            // case duplicates the user turn for ~100 tokens of no signal.
-            let session_anchor = {
-                use crate::turn::cloud::session_memory_protocol::{
-                    extract_anchor, extract_anchor_from_facts, extract_message_text,
-                    build_l1_from_messages, SessionMemory,
-                };
-                let first_user_text = messages
-                    .iter()
-                    .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
-                    .and_then(|m| extract_message_text(m))
-                    .unwrap_or_default();
-
-                if first_user_text.is_empty() {
-                    String::new()
-                } else {
-                    // Prefer facts-based anchor (ground truth) when available
-                    let facts_opt = session_facts_shared.lock().ok();
-                    let has_facts = facts_opt.as_ref().map(|f| f.turn > 0).unwrap_or(false);
-
-                    let anchor = if has_facts {
-                        let facts = facts_opt.unwrap();
-                        // Try to get narrative for task spec (optional enrichment)
-                        let turn_count = messages.iter()
-                            .filter(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
-                            .count();
-                        let l1 = if turn_count > 0 {
-                            let l1_text = build_l1_from_messages(&messages, turn_count, 0);
-                            SessionMemory::parse(&l1_text).filter(|l| l.validate().is_ok())
-                        } else {
-                            None
-                        };
-                        extract_anchor_from_facts(&first_user_text, &facts, l1.as_ref())
-                    } else {
-                        // First turn or lock failed — use legacy anchor
-                        let turn_count = messages.iter()
-                            .filter(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
-                            .count();
-                        let l1 = if turn_count > 0 {
-                            let l1_text = build_l1_from_messages(&messages, turn_count, 0);
-                            SessionMemory::parse(&l1_text).filter(|l| l.validate().is_ok())
-                        } else {
-                            None
-                        };
-                        extract_anchor(&first_user_text, l1.as_ref())
-                    };
-                    if anchor.is_trivial(user_content_for_signal) {
-                        String::new()
-                    } else {
-                        format!("\n\n{anchor}")
-                    }
-                }
-            };
-
             // ── Round budget directive: encourage synthesis after several rounds ──
             let tool_cfg = astra_config::runtime_config::RuntimeConfig::load().tool_selection;
             let (tool_round_guidance, guidance_signals) = prompts::tool_round_guidance_trace_with(
@@ -1465,7 +1386,6 @@ impl InProcessChatTurnBridge {
             //
             // VOLATILE (change each turn by design):
             //   environment_volatile (git branch dirty/diff/recent commits),
-            //   learned_context_hint (EMA tracker — byte-level changes break prefix cache),
             //   feedback_rules_hint (accumulates on each user correction),
             //   skill_hint (active skill/tool selection),
             //   self_awareness_hint (turn/token/outcome signals),
@@ -1475,7 +1395,6 @@ impl InProcessChatTurnBridge {
             //     user message content),
             //   memoria_insights_hint (per-turn retrieval),
             //   recent_arg_hints_hint (per-turn tool args),
-            //   session_anchor (per-turn state),
             //   tool_round_guidance (per-turn messages count)
             let mut stable_sections = Vec::new();
             let mut dynamic_sections = Vec::new();
@@ -1508,21 +1427,6 @@ impl InProcessChatTurnBridge {
                     .with_trace_signals(astra_turn_core::context_assembly_trace::PromptTraceSignals {
                         context_signals: astra_turn_core::context_assembly_trace::PromptContextSignals {
                             active_output_skills: true,
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    }),
-                );
-            }
-            if !learned_context_hint.is_empty() {
-                dynamic_sections.push(
-                    prompts::PromptSection::dynamic(
-                        learned_context_hint.clone(),
-                        prompts::PromptTokenBucket::UserPreferences,
-                    )
-                    .with_trace_signals(astra_turn_core::context_assembly_trace::PromptTraceSignals {
-                        context_signals: astra_turn_core::context_assembly_trace::PromptContextSignals {
-                            learned_runtime_context: true,
                             ..Default::default()
                         },
                         ..Default::default()
@@ -1593,21 +1497,6 @@ impl InProcessChatTurnBridge {
                         skill_listing_hint.clone(),
                         prompts::PromptTokenBucket::Environment,
                     ),
-                );
-            }
-            if !session_anchor.is_empty() {
-                dynamic_sections.push(
-                    prompts::PromptSection::dynamic(
-                        session_anchor.clone(),
-                        prompts::PromptTokenBucket::Environment,
-                    )
-                    .with_trace_signals(astra_turn_core::context_assembly_trace::PromptTraceSignals {
-                        context_signals: astra_turn_core::context_assembly_trace::PromptContextSignals {
-                            session_anchor: true,
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    }),
                 );
             }
             if !tool_round_guidance.is_empty() {
@@ -1755,8 +1644,9 @@ impl InProcessChatTurnBridge {
                             as &dyn astra_turn_core::cloud_summary::SummaryLlmClient,
                     ),
                     tier: pipeline_tier,
-                    cwd: edge_profile.get("cwd").and_then(Value::as_str),
                     session_facts: session_facts_shared.lock().ok().map(|f| f.clone()),
+                    turn_number: 0,
+                    observatory: None,
                 };
 
                 let compact_result = ctx.compact(&raw, &llm_messages, &edge_tools).await;
@@ -1989,6 +1879,35 @@ impl InProcessChatTurnBridge {
                         skill_injections,
                         memory_injections,
                     );
+                    // Emit per-turn injection-channel texts so the CLI's
+                    // observability layer can fingerprint every live
+                    // channel (wip-5). Bridge echoes the CLI-owned
+                    // channels (self_awareness / memoria_insights /
+                    // recent_arg_hints / skill_listing) for symmetry so
+                    // the single post-turn `observe_bridge_injections`
+                    // call has one canonical source. Bridge-generated
+                    // channels (feedback_rules / implicit_feedback /
+                    // memoria_prefetch / tool_round_guidance / volatile)
+                    // are only visible here.
+                    let volatile_joined = env_volatile.as_deref().unwrap_or("").to_string();
+                    let memoria_prefetch_str = memoria_prefetch_section.as_deref().unwrap_or("");
+                    yield render_sse(&json!({
+                        "type": "injection_freshness",
+                        "texts": {
+                            "self_awareness": self_awareness_hint,
+                            "memoria_insights": memoria_insights_hint,
+                            "recent_arg_hints": recent_arg_hints_hint,
+                            "skill_listing": skill_listing_hint,
+                            // CLI owns lessons — bridge leaves empty so the
+                            // CLI post-turn merge can supply the live value.
+                            "lessons": "",
+                            "memoria_prefetch": memoria_prefetch_str,
+                            "feedback_rules": feedback_rules_hint,
+                            "implicit_feedback": implicit_feedback_hint,
+                            "tool_round_guidance": tool_round_guidance,
+                            "volatile": volatile_joined,
+                        }
+                    }));
                     yield render_sse(&json!({
                         "type": "context_meta",
                         "system_prompt_tokens": breakdown.total_tokens,
@@ -2076,11 +1995,12 @@ impl InProcessChatTurnBridge {
                                         as &dyn astra_turn_core::cloud_summary::SummaryLlmClient,
                                 ),
                                 tier: crate::prompts::CompactionTier::AggressivePrune,
-                                cwd: edge_profile.get("cwd").and_then(Value::as_str),
                                 session_facts: session_facts_shared
                                     .lock()
                                     .ok()
                                     .map(|f| f.clone()),
+                                turn_number: 0,
+                                observatory: None,
                             };
                             let overrides = crate::turn::wire_assembly::BudgetOverrides {
                                 budget_chars: Some(budget.effective_input_limit() * 3),
@@ -3198,8 +3118,6 @@ impl InProcessChatTurnBridge {
                     &all_round_tool_calls,
                     skill_selector_shortlist.as_ref(),
                 );
-                // Propagate correction signal and routing metadata so pipeline
-                // learning can update ProgressiveCalibrator with actual data.
                 if is_correction_turn {
                     hook_payload.insert(
                         "is_correction".to_string(),
@@ -3221,7 +3139,6 @@ impl InProcessChatTurnBridge {
                     turn_reflection_state_store.clone(),
                     turn_reflection_lesson_writer.clone(),
                     turn_observer_worker.clone(),
-                    turn_learning_writer.clone(),
                 );
             }
 
@@ -3443,21 +3360,11 @@ impl InProcessChatTurnBridge {
                     );
                 }
 
-                let l1_content = crate::turn::cloud::session_memory_protocol::build_l1_from_messages(
-                    &messages, cloud_loop_turns as usize,
-                    usage.get("input_tokens").and_then(Value::as_u64).unwrap_or(0) as usize,
-                );
-                let l1_sid = session_id.clone();
-                let l1_client = memoria_client_shared.clone();
-                tokio::spawn(async move {
-                    let Some(client) = l1_client else { return; };
-                    match crate::turn::cloud::session_memory_protocol::persist_l1(
-                        &client, &l1_content, &l1_sid,
-                    ).await {
-                        Ok(id) => tracing::debug!(session_id = %l1_sid, memory_id = %id, "L1 session memory persisted"),
-                        Err(e) => tracing::warn!(session_id = %l1_sid, error = %e, "L1 session memory persist failed"),
-                    }
-                });
+                // L1 session-memory persistence now lives in
+                // `crate::session_memory::MemoryExtractionService`
+                // (driven from the turn finalization path). The bridge
+                // no longer owns a duplicate write — single ownership,
+                // single event stream.
             }
 
             // turn_complete
@@ -4152,14 +4059,12 @@ mod tests {
     #[test]
     fn pipeline_assembly_records_bridge_context_signals() {
         let active_skill_names = vec!["concise"];
-        let learned_context_text = "matrixorigin => github";
         // memory_signal_hint removed — LLM-driven via system prompt rules
         let implicit_feedback_hint =
             "\n\n## Implicit Feedback\nThe user is correcting the previous attempt.";
         let feedback_rules_hint = "\n\n[Learned Feedback Rules]\n- Rule: do not use mocks";
         let self_awareness_hint =
             "\n\n## Self-Awareness\nCurrent task: review runtime prompt assembly.";
-        let session_anchor = "\n\n## Session Anchor\nOriginal task: optimize prompt tracing.";
         let dynamic_sections = vec![
             prompts::PromptSection::dynamic(
                 "\n\n# Project Profile\ncwd: /test".to_string(),
@@ -4174,20 +4079,6 @@ mod tests {
                     context_signals:
                         astra_turn_core::context_assembly_trace::PromptContextSignals {
                             active_output_skills: !active_skill_names.is_empty(),
-                            ..Default::default()
-                        },
-                    ..Default::default()
-                },
-            ),
-            prompts::PromptSection::dynamic(
-                "learned context payload".to_string(),
-                prompts::PromptTokenBucket::UserPreferences,
-            )
-            .with_trace_signals(
-                astra_turn_core::context_assembly_trace::PromptTraceSignals {
-                    context_signals:
-                        astra_turn_core::context_assembly_trace::PromptContextSignals {
-                            learned_runtime_context: !learned_context_text.is_empty(),
                             ..Default::default()
                         },
                     ..Default::default()
@@ -4250,20 +4141,6 @@ mod tests {
                 },
             ),
             prompts::PromptSection::dynamic(
-                "session anchor payload".to_string(),
-                prompts::PromptTokenBucket::Environment,
-            )
-            .with_trace_signals(
-                astra_turn_core::context_assembly_trace::PromptTraceSignals {
-                    context_signals:
-                        astra_turn_core::context_assembly_trace::PromptContextSignals {
-                            session_anchor: !session_anchor.is_empty(),
-                            ..Default::default()
-                        },
-                    ..Default::default()
-                },
-            ),
-            prompts::PromptSection::dynamic(
                 "\n\n## Memoria Recall\n- Stored: prefer Rust for CLI work.".to_string(),
                 prompts::PromptTokenBucket::Environment,
             )
@@ -4294,7 +4171,6 @@ mod tests {
         let breakdown = prompts::build_system_prompt_trace(&prompt_sections, vec![], vec![]);
 
         assert!(breakdown.context_signals.active_output_skills);
-        assert!(breakdown.context_signals.learned_runtime_context);
         assert!(
             !breakdown.context_signals.memory_signal_detected,
             "memory signal detection removed — LLM-driven"
@@ -4302,7 +4178,6 @@ mod tests {
         assert!(breakdown.context_signals.self_awareness);
         assert!(breakdown.context_signals.implicit_feedback);
         assert!(breakdown.context_signals.learned_feedback_rules);
-        assert!(breakdown.context_signals.session_anchor);
         assert!(breakdown.context_signals.memoria_insights);
         assert!(!breakdown.context_signals.system_prompt_override);
         assert!(!breakdown.context_signals.effort_hint);
@@ -5400,10 +5275,9 @@ mod tests {
             tier: crate::prompts::CompactionTier::AggressivePrune,
             keep_recent_turns: 2,
             current_tokens: 80000,
-            session_memory_file: None,
-            session_memory_combine:
-                crate::turn::cloud::memoria_compact::SessionMemoryFileCombine::None,
             session_facts: None,
+            turn_number: 0,
+            observatory: None,
         };
 
         let result = tokio::runtime::Runtime::new()
@@ -5454,10 +5328,9 @@ mod tests {
             tier: crate::prompts::CompactionTier::CompactHistory,
             keep_recent_turns: 2,
             current_tokens: 500,
-            session_memory_file: None,
-            session_memory_combine:
-                crate::turn::cloud::memoria_compact::SessionMemoryFileCombine::None,
             session_facts: None,
+            turn_number: 0,
+            observatory: None,
         };
 
         let result = tokio::runtime::Runtime::new()
@@ -5495,10 +5368,9 @@ mod tests {
             tier: crate::prompts::CompactionTier::AggressivePrune,
             keep_recent_turns: 2,
             current_tokens: 80000,
-            session_memory_file: None,
-            session_memory_combine:
-                crate::turn::cloud::memoria_compact::SessionMemoryFileCombine::None,
             session_facts: None,
+            turn_number: 0,
+            observatory: None,
         };
 
         let result = tokio::runtime::Runtime::new()
@@ -5533,41 +5405,6 @@ mod tests {
                 "Consecutive user messages found: [{r0}] then [{r1}]"
             );
         }
-    }
-
-    #[test]
-    fn p1_anchor_handles_anthropic_content_blocks_in_user_message() {
-        use crate::turn::cloud::session_memory_protocol::extract_anchor;
-
-        // Simulate Anthropic-style content blocks in user message
-        let messages = vec![
-            json!({"role": "system", "content": "sys"}),
-            json!({"role": "user", "content": [
-                {"type": "text", "text": "Build a distributed cache with LRU eviction"}
-            ]}),
-        ];
-
-        let first_user_text = messages
-            .iter()
-            .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
-            .and_then(|m| {
-                m.get("content").and_then(|c| {
-                    c.as_str().map(String::from).or_else(|| {
-                        c.as_array().and_then(|blocks| {
-                            blocks.iter().find_map(|b| {
-                                b.get("text").and_then(Value::as_str).map(String::from)
-                            })
-                        })
-                    })
-                })
-            });
-
-        assert!(
-            first_user_text.is_some(),
-            "Should extract text from content blocks"
-        );
-        let anchor = extract_anchor(&first_user_text.unwrap(), None);
-        assert!(anchor.to_string().contains("distributed cache"));
     }
 
     #[test]
@@ -5954,50 +5791,6 @@ mod tests {
         );
     }
 
-    // ── Fix #1: anchor evolves with L1 ──────────────────────────────────
-
-    #[test]
-    fn p1_anchor_evolves_when_l1_available() {
-        use crate::turn::cloud::session_memory_protocol::{
-            SESSION_MEMORY_PREFIX, SessionMemory, extract_anchor,
-        };
-
-        // Without L1 — shows "starting"
-        let anchor_no_l1 = extract_anchor("Build rate limiter", None).to_string();
-        assert!(anchor_no_l1.contains("starting"));
-        assert!(anchor_no_l1.contains("0/0"));
-
-        // With L1 — shows current state and progress
-        let l1_text = format!(
-            "{SESSION_MEMORY_PREFIX}\n\
-             # Session Title\nRate Limiter\n\
-             # Task Specification\nBuild a distributed rate limiter.\n\
-             # Current State\nRedis integration complete, testing.\n\
-             # Key Files\nsrc/main.rs\n\
-             # Progress\n✅ Setup\n✅ Redis\n🔄 Testing\n⏳ Deploy\n\
-             # Errors & Corrections\nNone\n\
-             # Decisions\n- Use Redis\n\
-             # User Messages\nBuild rate limiter\n\
-             # Worklog\nT1\n\
-             # Context\nT5"
-        );
-        let l1 = SessionMemory::parse(&l1_text).unwrap();
-        let anchor_with_l1 = extract_anchor("Build rate limiter", Some(&l1)).to_string();
-
-        assert!(
-            !anchor_with_l1.contains("starting"),
-            "should not say 'starting' when L1 available"
-        );
-        assert!(
-            anchor_with_l1.contains("Redis integration"),
-            "should show current state from L1"
-        );
-        assert!(
-            anchor_with_l1.contains("2/4"),
-            "should show progress from L1"
-        );
-    }
-
     // ── Fix #4: P2 skips continuation when task is done ─────────────────
 
     /// Helper matching the actual P2 completion detection logic in the turn loop.
@@ -6091,44 +5884,6 @@ mod tests {
     fn p2_true_positive_cant_believe_completed() {
         // "can't" in a non-negating context should NOT suppress completion detection
         assert!(signals_done("I can't believe we completed successfully!"));
-    }
-
-    // ── P1 latency fix: anchor from local messages, no network ──────────
-
-    #[test]
-    fn p1_anchor_evolves_from_local_messages_no_network() {
-        use crate::turn::cloud::session_memory_protocol::{
-            SessionMemory, build_l1_from_messages, extract_anchor,
-        };
-
-        // Multi-turn conversation — anchor should show progress, not "starting"
-        let messages = vec![
-            json!({"role": "system", "content": "sys"}),
-            json!({"role": "user", "content": "Build a rate limiter using Redis"}),
-            json!({"role": "assistant", "content": "Starting implementation.", "tool_calls": [
-                {"id": "c1", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\": \"src/main.rs\"}"}}
-            ]}),
-            json!({"role": "tool", "content": "fn main() {}", "tool_call_id": "c1"}),
-            json!({"role": "assistant", "content": "Done with step 1."}),
-            json!({"role": "user", "content": "Now add Redis connection"}),
-            json!({"role": "assistant", "content": "Added Redis."}),
-        ];
-
-        let turn_count = messages
-            .iter()
-            .filter(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
-            .count();
-        assert_eq!(turn_count, 3);
-
-        let l1_text = build_l1_from_messages(&messages, turn_count, 0);
-        let l1 = SessionMemory::parse(&l1_text).unwrap();
-        let anchor = extract_anchor("Build a rate limiter using Redis", Some(&l1)).to_string();
-
-        assert!(
-            !anchor.contains("starting"),
-            "multi-turn anchor should not say 'starting'"
-        );
-        assert!(anchor.contains("Turn 3"), "should reflect current turn");
     }
 
     // ── Fix #11: CJK detection for bilingual continuation prompt ────────
