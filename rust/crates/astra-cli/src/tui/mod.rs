@@ -6,6 +6,7 @@ mod tests;
 mod app_event;
 mod approval;
 mod bottom_pane;
+mod config_edit_router;
 mod context_panel;
 // Core (post-refactor): HistoryCell trait + TurnEvent schema +
 // single ChatWidget router + on-disk JSONL transcript. See
@@ -840,6 +841,86 @@ pub(crate) async fn run_tui_repl(
                                                 chat_widget.commit_system(history_cell::system::SystemCell::error(format!("Register failed: {e}")));
                                             }
                                         }
+                                        bottom_pane.sync_popups();
+                                        frame_requester.schedule_frame();
+                                        continue;
+                                    }
+                                    // /config edit completion. Token format:
+                                    //   __config_edit__\n<action>\n<toml-body>
+                                    // Actions: save_user | save_project | discard | cancel.
+                                    // save_* writes the TOML to the target scope
+                                    // AND refreshes the process-wide overlay so
+                                    // the new values take effect for the next turn.
+                                    if let Some(rest) = name.strip_prefix("__config_edit__\n") {
+                                        let mut parts = rest.splitn(2, '\n');
+                                        let action = parts.next().unwrap_or("").to_string();
+                                        let toml_body = parts.next().unwrap_or("").to_string();
+                                        let result = crate::tui::config_edit_router::finalize(
+                                            &action,
+                                            &toml_body,
+                                        );
+                                        let msg = match result {
+                                            Ok(outcome) => {
+                                                // If the save produced a new version id,
+                                                // emit a ConfigChange journal event
+                                                // recording the transition and update
+                                                // ReplState so subsequent HeavyCheckpoints
+                                                // carry the new pointer.
+                                                if let Some(save) = outcome.save.as_ref() {
+                                                    let prev = state.config_version_id.clone();
+                                                    if let (Some(ref j), Some(ref sid)) = (
+                                                        state.journal.as_ref(),
+                                                        state.session_id.as_ref(),
+                                                    ) {
+                                                        let ev = astra_services::session_journal::JournalEvent::config_version_change(
+                                                            Some(sid.as_str()),
+                                                            state.turn,
+                                                            prev.as_deref(),
+                                                            &save.new_version_id,
+                                                            save.source,
+                                                        );
+                                                        let _ = j.append(&ev);
+                                                    }
+                                                    state.config_version_id =
+                                                        Some(save.new_version_id.clone());
+
+                                                    // Step 4b: cloud push. Best-effort
+                                                    // — if matrix_runtime is None (no
+                                                    // cloud configured) or the
+                                                    // ingestion worker is gone, we
+                                                    // degrade to local-only. The
+                                                    // version will sync next time the
+                                                    // CLI runs with cloud available,
+                                                    // via the same content-addressed
+                                                    // id.
+                                                    if let Some(ref mc) =
+                                                        state.matrix_runtime
+                                                    {
+                                                        let user_id = state
+                                                            .ingestion_user_id
+                                                            .clone()
+                                                            .unwrap_or_else(|| {
+                                                                "anonymous".to_string()
+                                                            });
+                                                        let row = astra_services::config_version_cloud::ConfigVersionRow {
+                                                            version_id: save.new_version_id.clone(),
+                                                            user_id,
+                                                            toml_body: save.toml_body.clone(),
+                                                            created_at_ms: chrono::Utc::now().timestamp_millis(),
+                                                            first_seen_session: state.session_id.clone(),
+                                                        };
+                                                        mc.enqueue_config_version_push(&row);
+                                                    }
+                                                }
+                                                history_cell::system::SystemCell::response(
+                                                    outcome.message,
+                                                )
+                                            }
+                                            Err(e) => history_cell::system::SystemCell::error(e),
+                                        };
+                                        chat_widget.commit_system(msg);
+                                        let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+                                        flush_chat_widget(&mut guard, &mut chat_widget, w);
                                         bottom_pane.sync_popups();
                                         frame_requester.schedule_frame();
                                         continue;

@@ -201,6 +201,7 @@ dependencies = [
  "tokio-stream",
  "tokio-tungstenite 0.26.2",
  "tokio-util",
+ "toml 1.1.2+spec-1.1.0",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
@@ -226,9 +227,14 @@ name = "astra-config"
 version = "0.1.0"
 dependencies = [
  "astra-core",
+ "chrono",
  "dirs 6.0.0",
+ "fs2",
  "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
  "toml 1.1.2+spec-1.1.0",
 ]
 
@@ -469,6 +475,7 @@ dependencies = [
 name = "astra-services"
 version = "0.1.0"
 dependencies = [
+ "astra-config",
  "astra-core",
  "astra-logging",
  "astra-turn-types",

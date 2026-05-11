@@ -106,6 +106,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             if !args.is_empty() {
                 // /model <name> — set directly
                 ctx.state.model = Some(args.to_string());
+                crate::slash_config::set_active_model_for_display(Some(args.to_string()));
                 ctx.bottom_pane.footer.model = Some(args.to_string());
                 ctx.show_response(format!("Set model to {args}"));
                 return SlashResult::Handled;
@@ -315,6 +316,26 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             };
             ctx.bottom_pane
                 .push_view(Box::new(ContextPanelView::new(breakdown)));
+            SlashResult::Handled
+        }
+
+        // ── /config (TUI-native, matches the reference CLI) ──────────
+        //
+        // `/config` with no args opens the interactive panel directly —
+        // this is the user's primary entry point, same as the reference
+        // implementation's `/config` (aliased `/settings`).
+        //
+        // `/config edit` is kept as an alias for muscle memory / docs.
+        //
+        // Subcommands that only print static text (`show`, `paths`,
+        // `diff`, `sources`, `export`) fall back to the line-mode
+        // printer via `with_restored`. Those briefly tear down the TUI
+        // which is acceptable for a print-and-done flow.
+        "/config" if args.trim().is_empty() || args.trim() == "edit" => {
+            use crate::tui::bottom_pane::config_edit_view::ConfigEditView;
+            let cfg = astra_config::runtime_config::RuntimeConfig::load();
+            ctx.bottom_pane
+                .push_view(Box::new(ConfigEditView::new(cfg)));
             SlashResult::Handled
         }
 
@@ -696,6 +717,11 @@ pub(crate) fn build_panels_cheat_sheet_lines() -> Vec<String> {
             "↑↓ navigate · q / Esc close",
         ),
         (
+            "/config",
+            "interactive panel — search, pick, and edit runtime config",
+            "↑↓ navigate · Enter edit · type to search · Esc save/close",
+        ),
+        (
             "/help",
             "list every slash command grouped by category",
             "↑↓ browse · Esc close",
@@ -854,6 +880,7 @@ pub(crate) fn handle_view_result(
 
     // Model name → apply
     state.model = Some(name.to_string());
+    crate::slash_config::set_active_model_for_display(Some(name.to_string()));
     bottom_pane.footer.model = Some(name.to_string());
     chat_widget.commit_system(SystemCell::response(format!("Set model to {name}")));
 }

@@ -76,6 +76,18 @@ pub(crate) struct Cli {
     /// Load MCP server config from JSON file(s) or inline JSON strings
     #[arg(long = "mcp-config", num_args = 1..)]
     pub mcp_config: Vec<String>,
+    /// Overlay runtime settings from a JSON string or file path.
+    ///
+    /// Partial overlay: the JSON needs to mention only the fields you
+    /// want to change; everything else keeps the value from config file
+    /// + env + defaults. Inline vs. file is decided by a leading `{`.
+    ///
+    /// Examples:
+    ///   astra -p 'fix tests' --model sonnet-4-6 \
+    ///     --settings '{"token_budget":{"max_turn_input_tokens":500000}}'
+    ///   astra --settings overrides.json
+    #[arg(long = "settings", value_name = "JSON-OR-PATH")]
+    pub settings: Option<String>,
     /// Use a specific session ID (must be a valid UUID)
     #[arg(long = "session-id")]
     pub session_id: Option<String>,
@@ -1105,6 +1117,55 @@ pub(crate) enum ConfigCmd {
     Set(ConfigSetArgs),
     /// Show the resolved workflow-guard policy for a model
     ShowPolicy(ConfigShowPolicyArgs),
+    /// Inspect the content-addressed history of saved configs.
+    #[command(subcommand)]
+    Version(ConfigVersionCmd),
+}
+
+/// `astra config version ...` — browse, diff, and inspect saved config
+/// versions. Every `/config` save and every session startup writes an
+/// entry to the version store (`~/.astra/config/versions/`); these
+/// commands are the read-side of that store.
+#[derive(Subcommand, Debug)]
+pub(crate) enum ConfigVersionCmd {
+    /// List versions newest-first.
+    List(ConfigVersionListArgs),
+    /// Print the TOML body of a specific version.
+    Show(ConfigVersionShowArgs),
+    /// Show field-level diff between two versions.
+    Diff(ConfigVersionDiffArgs),
+    /// Print the id of the config the current process would run under.
+    Current,
+    /// Pull cloud-mirrored versions into the local store.
+    Pull(ConfigVersionPullArgs),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ConfigVersionPullArgs {
+    /// Maximum number of versions to pull (default: 500).
+    #[arg(long, default_value_t = 500)]
+    pub limit: i64,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ConfigVersionListArgs {
+    /// Maximum number of rows to render (default: all).
+    #[arg(long)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ConfigVersionShowArgs {
+    /// Version id (full or a unique prefix, e.g. `cfg_a7b2`).
+    pub id: String,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ConfigVersionDiffArgs {
+    /// First version id (or unique prefix).
+    pub a: String,
+    /// Second version id (or unique prefix).
+    pub b: String,
 }
 
 #[derive(Args, Debug)]

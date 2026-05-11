@@ -1209,6 +1209,21 @@ pub struct ContextWindowConfig {
     /// Tokens reserved for error recovery retries.
     #[serde(default = "default_error_recovery_reserve")]
     pub error_recovery_reserve: u32,
+
+    /// Enables the "at 85% usage, lower `max_turn_input_tokens` by ~10%"
+    /// path in `agentic_adaptive_tuning`. Default: OFF.
+    ///
+    /// Why off by default: the logic is a self-defeating shrink spiral. At
+    /// high pressure it LOWERS the ceiling the next turn must fit under,
+    /// which raises the probability of another high-pressure event, which
+    /// lowers the ceiling again. Session 0e37eb46 hit 36968 tokens via this
+    /// path and the model gave up with a progress summary. The compaction
+    /// pipeline is the right tool for pressure; the budget should stay put.
+    ///
+    /// Leave reachable via config for environments that explicitly want
+    /// quota-style protection over per-turn headroom.
+    #[serde(default)]
+    pub adaptive_budget_reduction: bool,
 }
 
 fn default_compression_threshold_min() -> f64 {
@@ -1233,6 +1248,7 @@ impl Default for ContextWindowConfig {
             compression_threshold_max: default_compression_threshold_max(),
             remaining_turn_factor: default_remaining_turn_factor(),
             error_recovery_reserve: default_error_recovery_reserve(),
+            adaptive_budget_reduction: false,
         }
     }
 }
@@ -1281,6 +1297,38 @@ fn merge_if_non_default<T: PartialEq>(slot: &mut T, incoming: T, default: T) {
     }
 }
 
+// ─── CLI `--settings` overlay ────────────────────────────────────────────────
+
+/// Process-wide overlay installed by the CLI front door from `--settings`.
+/// `RuntimeConfig::load()` reads this after env overrides and merges it with
+/// non-default-wins semantics, so a `--settings` override beats both env and
+/// on-disk config for one invocation. `None` = no overlay, normal load.
+///
+/// Stored as the already-parsed `RuntimeConfig` rather than raw JSON so the
+/// CLI boundary is the only place that can fail on malformed input — every
+/// `load()` call thereafter is infallible.
+static CLI_OVERLAY: std::sync::OnceLock<std::sync::RwLock<Option<RuntimeConfig>>> =
+    std::sync::OnceLock::new();
+
+fn cli_overlay_cell() -> &'static std::sync::RwLock<Option<RuntimeConfig>> {
+    CLI_OVERLAY.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+/// Install a process-wide config overlay. Subsequent `RuntimeConfig::load()`
+/// calls merge `overlay` on top of the resolved config. Pass `None` to clear.
+///
+/// Intended for CLI `--settings`: call once at startup after arg parsing.
+/// Safe to call multiple times; the last call wins.
+pub fn set_cli_overlay(overlay: Option<RuntimeConfig>) {
+    if let Ok(mut slot) = cli_overlay_cell().write() {
+        *slot = overlay;
+    }
+}
+
+fn cli_overlay_snapshot() -> Option<RuntimeConfig> {
+    cli_overlay_cell().read().ok().and_then(|s| s.clone())
+}
+
 // ─── Configuration Loading ───────────────────────────────────────────────────
 
 impl RuntimeConfig {
@@ -1291,6 +1339,7 @@ impl RuntimeConfig {
     /// 2. ~/.astra/config/runtime.toml
     /// 3. .astra/config/runtime.toml
     /// 4. Environment variables
+    /// 5. CLI `--settings` overlay (see [`set_cli_overlay`])
     pub fn load() -> Self {
         let mut config = Self::default();
 
@@ -1315,6 +1364,13 @@ impl RuntimeConfig {
         // Environment overrides
         config.apply_env_overrides();
 
+        // CLI --settings overlay (process-wide, highest precedence).
+        // Applied after env so an operator who wants to undo an env-set
+        // knob for one invocation can do so without unsetting the env.
+        if let Some(overlay) = cli_overlay_snapshot() {
+            config = config.merge(overlay);
+        }
+
         // Apply strategy presets
         if config.compression.strategy != CompressionStrategy::Custom {
             let strategy = config.compression.strategy.clone();
@@ -1322,6 +1378,26 @@ impl RuntimeConfig {
         }
 
         config
+    }
+
+    /// Load the resolved config and simultaneously record it in a
+    /// content-addressed version store. Returns `(config, version_id)`.
+    ///
+    /// This is the "front door" every session should walk through at
+    /// startup. The returned id is the single small value that flows
+    /// into checkpoints, journals, and (later) cloud mirrors as the
+    /// canonical reference to "what config this session ran under".
+    ///
+    /// The store is taken by reference so callers can choose between
+    /// the default `~/.astra/config/versions/` `LocalFileStore` and a
+    /// tempdir store (tests, ephemeral CLI modes).
+    pub fn load_with_version(
+        store: &dyn crate::config_versions::ConfigVersionStore,
+        meta: crate::config_versions::PutMetadata,
+    ) -> Result<(Self, crate::config_versions::VersionId), crate::config_versions::StoreError> {
+        let config = Self::load();
+        let id = store.put(&config, meta)?;
+        Ok((config, id))
     }
 
     /// Merge another config into this one (other takes precedence).
@@ -1723,6 +1799,7 @@ impl RuntimeConfig {
             compression_threshold_max,
             remaining_turn_factor,
             error_recovery_reserve,
+            adaptive_budget_reduction,
         } = context_window;
         merge_if_non_default(&mut self.context_window.adaptive, adaptive, default_true());
         merge_if_non_default(
@@ -1749,6 +1826,11 @@ impl RuntimeConfig {
             &mut self.context_window.error_recovery_reserve,
             error_recovery_reserve,
             default_error_recovery_reserve(),
+        );
+        merge_if_non_default(
+            &mut self.context_window.adaptive_budget_reduction,
+            adaptive_budget_reduction,
+            false,
         );
 
         // ── Adaptive Tuning ──
@@ -2066,6 +2148,7 @@ mod tests {
                 compression_threshold_max: 0.98,
                 remaining_turn_factor: 0.5,
                 error_recovery_reserve: 12000,
+                adaptive_budget_reduction: true,
             },
             adaptive_tuning: AdaptiveTuningConfig {
                 scenario_cooldown_turns: 10,
