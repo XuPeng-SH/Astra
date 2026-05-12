@@ -971,6 +971,241 @@ pub(crate) async fn run_tui_repl(
                                         frame_requester.schedule_frame();
                                         continue;
                                     }
+                                    // `/model` picker accepted a model name.
+                                    // If the model advertises a thinking
+                                    // capability, push the second-level
+                                    // thinking-mode picker; otherwise commit
+                                    // the base name as-is.
+                                    if let Some(base_model) =
+                                        name.strip_prefix(slash_dispatch::MODEL_PICK_SENTINEL)
+                                    {
+                                        let base_model = base_model.to_string();
+                                        let token = crate::repl_runtime::current_access_token(profile);
+                                        let raw = crate::slash_router::fetch_model_list_raw(
+                                            api,
+                                            token.as_deref(),
+                                        )
+                                        .await
+                                        .unwrap_or_default();
+                                        let entry = crate::slash_router::find_model_entry_by_name(
+                                            &raw,
+                                            &base_model,
+                                        );
+                                        let thinking_cap = entry
+                                            .and_then(crate::slash_router::entry_thinking_capability);
+                                        let provider =
+                                            entry.and_then(crate::slash_router::entry_provider);
+                                        let opts = astra_turn_core::thinking_config::thinking_options_with_capability(
+                                            &base_model,
+                                            provider,
+                                            thinking_cap,
+                                        );
+                                        if opts.is_empty() {
+                                            // Model doesn't think — commit
+                                            // the base name directly.
+                                            state.model = Some(base_model.clone());
+                                            crate::slash_config::set_active_model_for_display(
+                                                Some(base_model.clone()),
+                                            );
+                                            bottom_pane.footer.model = Some(base_model.clone());
+                                            chat_widget.commit_system(
+                                                history_cell::system::SystemCell::response(
+                                                    format!("Set model to {base_model}"),
+                                                ),
+                                            );
+                                        } else {
+                                            use crate::tui::bottom_pane::list_selection_view::{
+                                                ListSelectionView, SelectionItem,
+                                            };
+                                            let items: Vec<SelectionItem> = opts
+                                                .iter()
+                                                .map(|o| SelectionItem {
+                                                    name: o.label.to_string(),
+                                                    description: None,
+                                                    is_current: o.is_default,
+                                                })
+                                                .collect();
+                                            let prefix = format!(
+                                                "{}{}\n",
+                                                slash_dispatch::MODEL_THINKING_SENTINEL,
+                                                base_model,
+                                            );
+                                            let view = ListSelectionView::new(
+                                                items,
+                                                Some(format!(
+                                                    "Select thinking mode for {base_model}:",
+                                                )),
+                                            )
+                                            .with_result_prefix(prefix);
+                                            bottom_pane.push_view(Box::new(view));
+                                        }
+                                        let w = guard
+                                            .terminal
+                                            .size()
+                                            .map(|s| s.width)
+                                            .unwrap_or(80);
+                                        flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                        bottom_pane.sync_popups();
+                                        frame_requester.schedule_frame();
+                                        continue;
+                                    }
+
+                                    // `/model` thinking-mode picker accepted a
+                                    // label. Compose the final model id with
+                                    // the appropriate suffix and commit.
+                                    if let Some(rest) =
+                                        name.strip_prefix(slash_dispatch::MODEL_THINKING_SENTINEL)
+                                    {
+                                        let mut parts = rest.splitn(2, '\n');
+                                        let base_model =
+                                            parts.next().unwrap_or("").to_string();
+                                        let label = parts.next().unwrap_or("").to_string();
+                                        let token = crate::repl_runtime::current_access_token(profile);
+                                        let raw = crate::slash_router::fetch_model_list_raw(
+                                            api,
+                                            token.as_deref(),
+                                        )
+                                        .await
+                                        .unwrap_or_default();
+                                        let entry = crate::slash_router::find_model_entry_by_name(
+                                            &raw,
+                                            &base_model,
+                                        );
+                                        let provider =
+                                            entry.and_then(crate::slash_router::entry_provider);
+                                        let thinking_cap = entry
+                                            .and_then(crate::slash_router::entry_thinking_capability);
+                                        let opts = astra_turn_core::thinking_config::thinking_options_with_capability(
+                                            &base_model,
+                                            provider,
+                                            thinking_cap,
+                                        );
+                                        let suffix_opt = opts
+                                            .iter()
+                                            .find(|o| o.label == label)
+                                            .map(|o| astra_turn_core::thinking_config::thinking_suffix_for(&o.config));
+                                        let suffix = match suffix_opt {
+                                            Some(s) => s,
+                                            None => {
+                                                // Model catalog shifted between the
+                                                // picker's two `fetch_model_list_raw`
+                                                // calls (or the server returned fewer
+                                                // thinking options) — the chosen label
+                                                // no longer maps to a suffix.  Warn
+                                                // instead of silently committing the
+                                                // bare model name, which would leave
+                                                // the user on a different thinking mode
+                                                // than they selected.
+                                                chat_widget.commit_system(
+                                                    history_cell::system::SystemCell::error(format!(
+                                                        "Thinking mode `{label}` is no longer available for {base_model}; model unchanged. Re-open the picker with `/model`."
+                                                    )),
+                                                );
+                                                let w = guard
+                                                    .terminal
+                                                    .size()
+                                                    .map(|s| s.width)
+                                                    .unwrap_or(80);
+                                                flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                                bottom_pane.sync_popups();
+                                                frame_requester.schedule_frame();
+                                                continue;
+                                            }
+                                        };
+                                        let composed = format!("{base_model}{suffix}");
+                                        state.model = Some(composed.clone());
+                                        crate::slash_config::set_active_model_for_display(
+                                            Some(composed.clone()),
+                                        );
+                                        bottom_pane.footer.model = Some(composed.clone());
+                                        chat_widget.commit_system(
+                                            history_cell::system::SystemCell::response(format!(
+                                                "Set model to {composed}"
+                                            )),
+                                        );
+                                        let w = guard
+                                            .terminal
+                                            .size()
+                                            .map(|s| s.width)
+                                            .unwrap_or(80);
+                                        flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                        bottom_pane.sync_popups();
+                                        frame_requester.schedule_frame();
+                                        continue;
+                                    }
+
+                                    // `/session fork` picker → hand off to
+                                    // the line-mode `/session fork <parent>`
+                                    // pipeline. Calling `fork_local_session`
+                                    // inline here used to leave ReplState in
+                                    // a half-done state (session_id /
+                                    // journal / CSL all still pointed at the
+                                    // parent); the fallback path is the same
+                                    // code the line-mode handler runs
+                                    // through, so it does the full restore.
+                                    if let Some(parent_sid) = name.strip_prefix(slash_dispatch::FORK_PICK_SENTINEL) {
+                                        let slash_text = format!("/session fork {parent_sid}");
+                                        let slash_result = guard
+                                            .with_restored(|| async {
+                                                let tok = crate::repl_runtime::current_access_token(
+                                                    profile,
+                                                );
+                                                crate::slash_router::handle_slash_command(
+                                                    &slash_text,
+                                                    api,
+                                                    profile,
+                                                    &mut state,
+                                                    tok.as_deref(),
+                                                    &*startup.selector,
+                                                )
+                                                .await
+                                            })
+                                            .await;
+                                        match slash_result {
+                                            Ok(Ok(true)) => {
+                                                break 'main Ok(());
+                                            }
+                                            Ok(Ok(false)) => {}
+                                            Ok(Err(e)) => {
+                                                chat_widget.commit_system(
+                                                    history_cell::system::SystemCell::error(e),
+                                                );
+                                            }
+                                            Err(e) => {
+                                                chat_widget.commit_system(
+                                                    history_cell::system::SystemCell::error(
+                                                        format!("Terminal restore failed: {e}"),
+                                                    ),
+                                                );
+                                            }
+                                        }
+                                        // Post-fork: the line handler may have
+                                        // swapped `state.session_id`; refresh
+                                        // the footer + ChatWidget replay so
+                                        // the user lands on the child session.
+                                        bottom_pane.footer.session_id = state
+                                            .session_id
+                                            .as_ref()
+                                            .map(|s| s[..8.min(s.len())].to_string());
+                                        let w = guard
+                                            .terminal
+                                            .size()
+                                            .map(|s| s.width)
+                                            .unwrap_or(80);
+                                        if let Some(ref new_sid) = state.session_id
+                                            && !new_sid.is_empty()
+                                        {
+                                            chat_widget = replay_session_into_widget(
+                                                &mut guard,
+                                                new_sid,
+                                                w,
+                                            );
+                                        }
+                                        flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                        bottom_pane.sync_popups();
+                                        frame_requester.schedule_frame();
+                                        continue;
+                                    }
                                     // Session picker result → run the async
                                     // `/resume <id>` pipeline via the usual
                                     // slash fallback path. This is the same
@@ -1393,6 +1628,11 @@ fn handle_app_event(
             // tool cell in its own event handler.
             status_indicator
                 .set_state(status_indicator::IndicatorState::Thinking { started_at: now });
+        }
+        TuiAppEvent::ToolOutput { .. } => {
+            // Progress ticks are handled by the ChatWidget path
+            // (updates active ToolCell counters). No bottom-pane or
+            // indicator state change.
         }
         TuiAppEvent::StatusLine(_) => {}
         TuiAppEvent::TurnComplete | TuiAppEvent::TurnError(_) => {

@@ -105,21 +105,12 @@ fn truncate_to_first_sentence(desc: &str) -> &str {
 
 fn strip_optional_params(func: &mut Value) {
     if let Some(params) = func.get_mut("parameters").and_then(Value::as_object_mut) {
-        let required: Vec<String> = params
-            .get("required")
-            .and_then(Value::as_array)
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(Value::as_str)
-                    .map(String::from)
-                    .collect()
-            })
-            .unwrap_or_default();
+        let required = collect_required_union(params);
 
         if let Some(props) = params.get_mut("properties").and_then(Value::as_object_mut) {
             let keys_to_remove: Vec<String> = props
                 .keys()
-                .filter(|k| !required.contains(k))
+                .filter(|k| !required.contains(k.as_str()))
                 .cloned()
                 .collect();
             for key in keys_to_remove {
@@ -127,6 +118,52 @@ fn strip_optional_params(func: &mut Value) {
             }
         }
     }
+}
+
+/// Collect every field name that's required by *any* action of the
+/// schema — top-level `required` plus every field name listed in the
+/// `x-astra-per-action-required` vendor-prefixed extension map
+/// (shape: `{"action_name": ["field1", "field2"], ...}`).
+///
+/// Background: we originally encoded per-action required fields via
+/// JSON-Schema `allOf + if/then/required`, but Anthropic/Bedrock
+/// reject those keywords at the top level of `input_schema` (HTTP
+/// 400: "input_schema does not support oneOf, allOf, or anyOf at
+/// the top level"). The vendor-prefixed extension (`x-...`) is
+/// ignored by providers but honoured here so `AggressivePrune`
+/// doesn't strip per-action required properties when the LLM is
+/// under context pressure.
+///
+/// Note: the extension key is deliberately a single constant
+/// (`PER_ACTION_REQUIRED_KEY`) to keep this logic and its mirror
+/// in `runtime::tool_selector::collect_schema_required_union` in
+/// lockstep — any rename must update both call sites.
+pub const PER_ACTION_REQUIRED_KEY: &str = "x-astra-per-action-required";
+
+pub fn collect_required_union(params: &serde_json::Map<String, Value>) -> HashSet<String> {
+    let mut union: HashSet<String> = HashSet::new();
+    if let Some(arr) = params.get("required").and_then(Value::as_array) {
+        for v in arr {
+            if let Some(s) = v.as_str() {
+                union.insert(s.to_string());
+            }
+        }
+    }
+    if let Some(map) = params
+        .get(PER_ACTION_REQUIRED_KEY)
+        .and_then(Value::as_object)
+    {
+        for (_action, fields) in map {
+            if let Some(arr) = fields.as_array() {
+                for v in arr {
+                    if let Some(s) = v.as_str() {
+                        union.insert(s.to_string());
+                    }
+                }
+            }
+        }
+    }
+    union
 }
 
 fn strip_property_descriptions(func: &mut Value) {
@@ -402,6 +439,61 @@ mod tests {
             result[0]["function"]["parameters"]["properties"]
                 .get("command")
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn prune_aggressive_keeps_per_action_required_fields() {
+        // Regression: consolidated tools express per-action required
+        // via the `x-astra-per-action-required` vendor extension
+        // (moved from `allOf` because Bedrock HTTP 400s on top-level
+        // allOf/oneOf/anyOf). If AggressivePrune only looked at
+        // top-level `required`, the LLM would lose the ability to
+        // call `agent spawn` (description/prompt stripped), `git
+        // commit` (message stripped), etc. under context pressure.
+        let tool = json!({
+            "type": "function",
+            "function": {
+                "name": "agent",
+                "description": "Consolidated multi-agent tool.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["spawn","delegate"]},
+                        "description": {"type": "string"},
+                        "prompt": {"type": "string"},
+                        "task": {"type": "string"},
+                        "background": {"type": "boolean"}
+                    },
+                    "required": ["action"],
+                    "x-astra-per-action-required": {
+                        "spawn": ["description", "prompt"],
+                        "delegate": ["task"]
+                    }
+                }
+            }
+        });
+        let result = prune_tool_schemas(&[tool], CompactionTier::AggressivePrune);
+        let props = &result[0]["function"]["parameters"]["properties"];
+        // Union of every per-action required list must survive
+        // pruning even though they aren't in top-level `required`.
+        assert!(
+            props.get("description").is_some(),
+            "description must survive"
+        );
+        assert!(props.get("prompt").is_some(), "prompt must survive");
+        assert!(
+            props.get("task").is_some(),
+            "task (delegate required) must survive"
+        );
+        assert!(
+            props.get("action").is_some(),
+            "action (top-level required) must survive"
+        );
+        // Pure optional stays stripped.
+        assert!(
+            props.get("background").is_none(),
+            "purely-optional props still get pruned"
         );
     }
 

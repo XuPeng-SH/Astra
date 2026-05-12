@@ -444,6 +444,15 @@ pub struct ToolExecutor {
     /// more aggressively.
     /// Per-turn aggregate budget is 200K.
     aggregate_output_bytes: std::sync::atomic::AtomicUsize,
+    /// Optional progress sink for the *currently running* bash
+    /// invocation. `stream_render::execute_tool` installs a fresh
+    /// sink before dispatching bash and clears it on completion,
+    /// so the sink pointer is alive only for the duration of a
+    /// single in-flight call. Read by `shell_ops`/`edge_tools::shell`
+    /// wait loops to record byte/line counters; polled by a
+    /// `StreamEvent::ToolOutput` ticker.
+    pub(crate) bash_progress_sink:
+        std::sync::RwLock<Option<std::sync::Arc<crate::chat_stream::ToolProgressSink>>>,
     /// After a `.rs` file is written under a Rust workspace, set so the next
     /// `/chat` turn with `tool_results` can run passive `cargo check` and inject diagnostics.
     passive_cargo_pending: AtomicBool,
@@ -567,6 +576,7 @@ impl ToolExecutor {
             memoria_notified_down: std::sync::atomic::AtomicBool::new(false),
             file_state: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             aggregate_output_bytes: std::sync::atomic::AtomicUsize::new(0),
+            bash_progress_sink: std::sync::RwLock::new(None),
             passive_cargo_pending: AtomicBool::new(false),
             passive_tsc_pending: AtomicBool::new(false),
             passive_lsp: passive_lsp::PassiveLspManager::new(),
@@ -672,6 +682,29 @@ impl ToolExecutor {
     pub fn with_active_session_id(self, session_id: impl Into<String>) -> Self {
         self.set_active_session_id(session_id);
         self
+    }
+
+    /// Install a progress sink for the next/currently-running bash
+    /// invocation. Passing `None` clears the sink. Kept as a
+    /// pointer rather than passed on every call so `shell.rs` can
+    /// reach it from the sync wait loop without threading a new arg
+    /// through half the shell module.
+    pub fn set_bash_progress_sink(
+        &self,
+        sink: Option<std::sync::Arc<crate::chat_stream::ToolProgressSink>>,
+    ) {
+        if let Ok(mut slot) = self.bash_progress_sink.write() {
+            *slot = sink;
+        }
+    }
+
+    /// Non-blocking read of the active bash progress sink. Used by
+    /// `shell.rs`'s read-with-timeout loop to bump counters; returns
+    /// `None` when no sink is installed (non-TUI callers, tests).
+    pub(crate) fn current_bash_progress_sink(
+        &self,
+    ) -> Option<std::sync::Arc<crate::chat_stream::ToolProgressSink>> {
+        self.bash_progress_sink.read().ok().and_then(|g| g.clone())
     }
 
     pub fn set_active_session_id(&self, session_id: impl Into<String>) {
@@ -1670,6 +1703,16 @@ impl ToolExecutor {
             outcome.output = output;
             return outcome;
         }
+        // Consolidated `mo` tool (action=query|snapshot|branch).
+        // Only `query` has a metadata path — snapshot/branch fall
+        // through to `execute()` which dispatches without metadata.
+        if name == "mo" && args.get("action").and_then(Value::as_str) == Some("query") {
+            let mut outcome = self.mo_query_with_metadata(args);
+            let output = self.finalize_tool_output(outcome.output, name);
+            self.record_output_size(output.len());
+            outcome.output = output;
+            return outcome;
+        }
         if name == "git" {
             let action = args
                 .get("action")
@@ -1843,6 +1886,26 @@ impl ToolExecutor {
                 "mo_query" => self.mo_query(args),
                 "mo_snapshot" => self.mo_snapshot(args),
                 "mo_branch" => self.mo_branch(args),
+                // Consolidated `mo` tool (matches the schema in
+                // astra-tools/schemas.rs). Routes by `action` to the
+                // existing legacy handlers. Without this arm, calls
+                // to `mo` fall to DefaultToolExecutor which doesn't
+                // know about it either — the tool was effectively
+                // dead-wired. Per-action required fields (sql for
+                // query, sub_action for snapshot/branch) are
+                // enforced by the schema's `allOf` block.
+                "mo" => {
+                    let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+                    match action {
+                        "query" => self.mo_query(args),
+                        "snapshot" => self.mo_snapshot(args),
+                        "branch" => self.mo_branch(args),
+                        "" => "Error: missing required parameter 'action'. Use one of: query, snapshot, branch".to_string(),
+                        other => format!(
+                            "Error: unknown mo action '{other}'. Use one of: query, snapshot, branch"
+                        ),
+                    }
+                }
                 "github_list_prs" => self.github_list_prs(args).await,
                 "github_get_pr" => self.github_get_pr(args).await,
                 "github_ci_status" => self.github_ci_status(args).await,

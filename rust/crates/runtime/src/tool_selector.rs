@@ -877,17 +877,15 @@ pub fn prune_schema(mut schema: Value, level: PruneLevel) -> Value {
 
     // Prune parameter descriptions
     if let Some(params) = func.get_mut("parameters") {
-        // Extract required names first (before mutable borrow of properties)
+        // Extract required names first (before mutable borrow of properties).
+        // Include every field required by *any* branch of a consolidated
+        // tool's `allOf` / `if-then-required` chain, not just the top-level
+        // `required`. Otherwise AggressivePrune would strip per-action
+        // required fields (e.g. `agent.spawn` needs `description`+`prompt`
+        // only when `action=="spawn"`), leaving the LLM unable to call the
+        // branch under context pressure.
         let required_names: std::collections::HashSet<String> = if level == PruneLevel::Aggressive {
-            params
-                .get("required")
-                .and_then(|r| r.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default()
+            collect_schema_required_union(params)
         } else {
             std::collections::HashSet::new()
         };
@@ -910,6 +908,27 @@ pub fn prune_schema(mut schema: Value, level: PruneLevel) -> Value {
     }
 
     schema
+}
+
+/// Collect every field name that's required by *any* action of the
+/// schema — top-level `required` plus every field listed under
+/// `x-astra-per-action-required` (shape: `{action: [fields]}`).
+/// Used by AggressivePrune so consolidated tools don't lose their
+/// per-action required properties when the aggressive tier strips
+/// "optional" properties.
+///
+/// See [`astra_turn_core::tool_schema_prune::collect_required_union`]
+/// for the full rationale — Anthropic/Bedrock reject top-level
+/// `allOf` in `input_schema`, so per-action required lives in a
+/// vendor-prefixed extension instead.
+fn collect_schema_required_union(params: &Value) -> std::collections::HashSet<String> {
+    // Prefer the shared helper from `astra_turn_core` so the two
+    // code paths stay byte-compatible — this is the runtime-side
+    // mirror of `tool_schema_prune::collect_required_union`.
+    match params.as_object() {
+        Some(obj) => astra_turn_core::tool_schema_prune::collect_required_union(obj),
+        None => std::collections::HashSet::new(),
+    }
 }
 
 /// Truncate a string at a word boundary, safely handling multi-byte UTF-8.
