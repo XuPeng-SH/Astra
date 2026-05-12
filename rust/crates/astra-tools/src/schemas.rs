@@ -37,6 +37,7 @@ pub const SERVER_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "mo",
     "agent",
     "introspect",
+    "tool_search",
     "lsp",
     "web_fetch",
     "web_search",
@@ -364,7 +365,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "git",
-                "description": "Git operations. Per-action required fields: commit→message, revert_commit→commit_sha, file_history→file, log_search→query, stash→sub_action, checkout_file→path+ref. Other actions have no extra required fields.",
+                "description": "Git operations. Actions: status, diff, log, show, blame, file_history, log_search, contributors, commit, revert_commit, stash, checkout_file, worktree.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -460,10 +461,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "pr_number": {"type": "integer", "description": "PR number. REQUIRED when action=get_pr or action=ci_status."},
                         "issue_number": {"type": "integer", "description": "Issue number. REQUIRED when action=get_issue."},
                         "title": {"type": "string", "description": "Issue title. REQUIRED when action=create_issue."},
-                        "body": {"type": "string", "description": "Issue body (create_issue)."},
-                        "labels": {"type": "array", "items": {"type": "string"}, "description": "Issue labels (create_issue)."},
-                        "state": {"type": "string", "enum": ["open","closed","all"], "description": "PR/issue state filter (list_prs, list_issues)."},
-                        "detail": {"type": "string", "enum": ["minimal","normal","full"], "description": "Response verbosity. Default normal."}
+                        "body": {"type": "string", "description": "Issue body (create_issue)."}
                     },
                     "required": ["action"],
                     "x-astra-per-action-required": {
@@ -479,29 +477,95 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "memory",
-                "description": "Memory operations. Per-action required fields: store→content; retrieve/search→query; correct→new_content+reason (plus `memory_id` OR `query` to target); feedback→memory_id+signal. `purge` needs either `memory_id` or `topic` (not schema-enforced — document level).",
+                "description": "Cognitive memory operations. Actions (model-facing verbs): \
+                    `remember` (persist a fact for future turns/sessions), \
+                    `recall` (retrieve relevant memories by query — combines keyword + vector + temporal + confidence), \
+                    `expand` (drill into one memory by id to get overview/detail + linked related memories), \
+                    `forget` (soft-delete by id), \
+                    `update` (correct or enrich an existing memory), \
+                    `focus` (session-scoped attention boost: subsequent `recall` weights the given topic/tag higher for ttl_secs), \
+                    `reflect` (cross-memory pattern synthesis; consolidates recent memories into higher-level scenes), \
+                    `profile` (return the user profile summary), \
+                    `feedback` (signal that a recalled memory was useful/irrelevant/outdated/wrong — shapes future recall ranking). \
+                    Supports `agent_type` scoping for per-agent-type memory isolation. \
+                    Visibility: `visibility=\"private\"` (default) keeps the memory to your account; \
+                    `visibility=\"team\"` tags it for team sharing (requires `team_id`), and on recall \
+                    the union includes the current user's team-tagged memories.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "action": {"type": "string", "enum": ["store","retrieve","purge","correct","profile","search","feedback"], "description": "Memory operation"},
-                        "content": {"type": "string", "description": "Content. REQUIRED when action=store."},
-                        "query": {"type": "string", "description": "Semantic query. REQUIRED when action=retrieve or action=search. Also used by correct to select target without a memory_id."},
-                        "memory_id": {"type": "string", "description": "Memory identifier. REQUIRED when action=feedback. Used by purge/correct to target a specific memory."},
-                        "new_content": {"type": "string", "description": "Replacement content. REQUIRED when action=correct."},
-                        "reason": {"type": "string", "description": "Human-readable reason. REQUIRED when action=correct."},
-                        "signal": {"type": "string", "enum": ["useful","irrelevant","outdated","wrong"], "description": "Feedback signal. REQUIRED when action=feedback."},
-                        "topic": {"type": "string", "description": "Keyword for bulk purge. Provide `memory_id` OR `topic` when action=purge."},
-                        "memory_type": {"type": "string", "enum": ["semantic","profile","procedural","working","episodic","tool_result"], "description": "Type: semantic (default), profile, procedural, working, episodic, tool_result"},
-                        "session_id": {"type": "string", "description": "Optional session-scoped retrieval boost or store tag."},
-                        "top_k": {"type": "integer", "description": "Retrieve/search result cap (default 5 for retrieve, 10 for search)."},
-                        "agent_type": {"type": "string", "description": "Scope to a specific agent type (explore, code-review, task, general-purpose). When set on store, tags the memory; on retrieve/search, filters to only that type's memories + unscoped globals."}
+                        "action": {
+                            "type": "string",
+                            "enum": ["remember","recall","expand","forget","update","focus","reflect","profile","feedback"],
+                            "description": "Cognitive memory verb."
+                        },
+                        "content": {"type": "string", "description": "remember: the fact to store. update: replacement content."},
+                        "query": {"type": "string", "description": "recall: the natural-language query. update: also accepted as a selector when memory_id is unknown."},
+                        "memory_id": {"type": "string", "description": "expand / forget / update / feedback: target memory id."},
+                        "memory_type": {
+                            "type": "string",
+                            "enum": ["semantic","profile","procedural","working","episodic"],
+                            "description": "remember: memory category. Defaults to `semantic`."
+                        },
+                        "top_k": {"type": "integer", "description": "recall: max number of memories (default 10)."},
+                        "min_confidence": {"type": "number", "description": "recall: filter out memories below this confidence (0.0-1.0)."},
+                        "scope": {
+                            "type": "string",
+                            "enum": ["all","session"],
+                            "description": "recall: `session` restricts to current session; `all` includes cross-session (default `all`)."
+                        },
+                        "view": {
+                            "type": "string",
+                            "enum": ["compact","overview","full"],
+                            "description": "recall: response detail level. `compact` (default) returns abstracts; `overview` adds summaries; `full` adds linked memories."
+                        },
+                        "importance": {"type": "number", "description": "remember / update: importance score (0.0-1.0)."},
+                        "trust_tier": {"type": "string", "description": "remember / update: provenance trust tier."},
+                        "tags": {"type": "array", "items": {"type": "string"}, "description": "remember: tags to attach."},
+                        "tags_add": {"type": "array", "items": {"type": "string"}, "description": "update: tags to append."},
+                        "tags_remove": {"type": "array", "items": {"type": "string"}, "description": "update: tags to detach."},
+                        "visibility": {
+                            "type": "string",
+                            "enum": ["private","team"],
+                            "description": "remember: who else should see this memory. `private` (default) — only you on this account. `team` — shared with other agents that belong to the same team (`team_id` required). recall: when set to `team`, the retrieval union includes team-tagged memories in addition to your private ones."
+                        },
+                        "team_id": {
+                            "type": "string",
+                            "description": "remember with visibility=team: the team to tag (encoded as `astra:team:<id>` in the memory's tag set). recall with visibility=team: union with the given team's shared pool. Omit to fall back to the executor's default team from session context."
+                        },
+                        "reason": {"type": "string", "description": "forget / update: REQUIRED — non-empty explanation for the audit trail (why this memory is being changed). feedback: optional."},
+                        "level": {
+                            "type": "string",
+                            "enum": ["abstract","overview","detail","linked"],
+                            "description": "expand: how deep to unfold (`abstract` < `overview` < `detail` < `linked`)."
+                        },
+                        "focus_type": {
+                            "type": "string",
+                            "enum": ["topic","tag","memory_id","session"],
+                            "description": "focus: what kind of attention to boost."
+                        },
+                        "focus_value": {"type": "string", "description": "focus: the topic / tag / id / session to boost."},
+                        "boost": {"type": "number", "description": "focus: multiplier applied to matching memories (default 1.5)."},
+                        "ttl_secs": {"type": "integer", "description": "focus: how long the boost lasts (default 3600s)."},
+                        "signal": {
+                            "type": "string",
+                            "enum": ["useful","irrelevant","outdated","wrong"],
+                            "description": "feedback: quality signal for the recalled memory."
+                        },
+                        "context": {"type": "string", "description": "feedback: optional free-form context on why the signal was given."},
+                        "agent_type": {
+                            "type": "string",
+                            "enum": ["explore","code-review","task","general-purpose"],
+                            "description": "remember / recall: scope to a specific agent type. On remember it tags; on recall it filters to that type + unscoped globals."
+                        }
                     },
                     "required": ["action"],
                     "x-astra-per-action-required": {
-                        "store": ["content"],
-                        "retrieve": ["query"],
-                        "search": ["query"],
-                        "correct": ["new_content", "reason"],
+                        "remember": ["content"],
+                        "recall": ["query"],
+                        "expand": ["memory_id"],
+                        "forget": ["reason"],
+                        "update": ["reason"],
                         "feedback": ["memory_id", "signal"]
                     }
                 }
@@ -511,34 +575,31 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "session",
-                "description": "Session lifecycle and introspection. Per-action required fields: config→path+value; prioritize/deprioritize→tool; ask_user→question; tool_search→query. Other actions (compact, rollback_edits, sleep, timeline, summary, history) have no extra required fields.",
+                "description": "Session lifecycle. Per-action required fields: config→path+value; prioritize/deprioritize→tool; ask_user→question. Other actions (compact, rollback_edits, sleep, set_goal, timeline, summary, history) have no extra required fields.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "action": {"type": "string", "enum": ["config","prioritize","deprioritize","set_goal","compact","rollback_edits","ask_user","sleep","tool_search","timeline","summary","history"]},
-                        "path": {"type": "string", "description": "Dot-separated config path (e.g. 'compression.compression_threshold'). REQUIRED when action=config. Also used as file path when action=rollback_edits and scope=file."},
-                        "value": {"description": "Config value (any JSON scalar matching the path's type). REQUIRED when action=config."},
-                        "force": {"type": "boolean", "description": "Override per-turn mutation ceiling / drift cap (config)."},
-                        "tool": {"type": "string", "description": "Tool name. REQUIRED when action=prioritize or action=deprioritize."},
-                        "goal": {"type": "string", "description": "Goal text (set_goal)."},
-                        "scope": {"type": "string", "enum": ["current_turn","turn","file","list"], "description": "Rollback scope (rollback_edits)."},
-                        "turn_index": {"type": "integer", "description": "Turn index (rollback_edits scope=turn)."},
-                        "question": {"type": "string", "description": "Question to ask. REQUIRED when action=ask_user."},
-                        "choices": {"type": "array", "items": {"type": "string"}, "description": "2-9 options for multiple choice (ask_user)."},
-                        "default": {"type": "string", "description": "Default answer used if user presses Enter (ask_user)."},
-                        "context": {"type": "string", "description": "Brief context shown above the question (ask_user)."},
-                        "duration_ms": {"type": "integer", "description": "Sleep ms, max 300000 (sleep)."},
-                        "reason": {"type": "string", "description": "Reason for sleep."},
-                        "query": {"type": "string", "description": "Query string. REQUIRED when action=tool_search."},
-                        "max_results": {"type": "integer", "description": "Max results (tool_search, default 5)."}
+                        "action": {"type": "string", "enum": ["config","prioritize","deprioritize","set_goal","compact","rollback_edits","ask_user","sleep","timeline","summary","history"]},
+                        "key": {"type": "string", "description": "Config key"},
+                        "value": {"type": "string", "description": "Config value"},
+                        "tool": {"type": "string", "description": "Tool name (prioritize/deprioritize)"},
+                        "goal": {"type": "string", "description": "Goal text"},
+                        "scope": {"type": "string", "enum": ["current_turn","turn","file","list"], "description": "Rollback scope"},
+                        "path": {"type": "string", "description": "File path (rollback scope=file)"},
+                        "turn_index": {"type": "integer", "description": "Turn index (rollback scope=turn)"},
+                        "question": {"type": "string", "description": "Question (ask_user)"},
+                        "choices": {"type": "array", "items": {"type": "string"}, "description": "Choices 2-9 (ask_user)"},
+                        "default": {"type": "string", "description": "Default answer (ask_user)"},
+                        "context": {"type": "string", "description": "Brief context (ask_user)"},
+                        "duration_ms": {"type": "integer", "description": "Sleep ms, max 300000"},
+                        "reason": {"type": "string", "description": "Reason (sleep)"}
                     },
                     "required": ["action"],
                     "x-astra-per-action-required": {
                         "config": ["path", "value"],
                         "prioritize": ["tool"],
                         "deprioritize": ["tool"],
-                        "ask_user": ["question"],
-                        "tool_search": ["query"]
+                        "ask_user": ["question"]
                     }
                 }
             }
@@ -547,15 +608,13 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "mo",
-                "description": "MatrixOne database operations. Per-action required fields: query→sql; snapshot/branch→sub_action (create/list/drop/restore). For sub_action=create/drop/restore on snapshot, `name` is required.",
+                "description": "MatrixOne database operations. Actions: query, snapshot, branch.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "action": {"type": "string", "enum": ["query","snapshot","branch"], "description": "MO operation"},
-                        "sql": {"type": "string", "description": "SQL to execute. REQUIRED when action=query."},
-                        "sub_action": {"type": "string", "enum": ["create","list","drop","delete","restore"], "description": "Snapshot/branch sub-operation. REQUIRED when action=snapshot or action=branch."},
-                        "name": {"type": "string", "description": "Snapshot/branch name (alphanumeric/_/-, max 64 chars). Required for snapshot create/drop/restore; branch create auto-derives from git branch when omitted."},
-                        "database": {"type": "string", "description": "Target database name (snapshot scope). Defaults to current."}
+                        "sql": {"type": "string", "description": "SQL to execute (for query)"},
+                        "name": {"type": "string", "description": "Snapshot/branch name"}
                     },
                     "required": ["action"],
                     "x-astra-per-action-required": {
@@ -570,26 +629,26 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "agent",
-                "description": "Multi-agent operations. Per-action required fields: spawn requires `description`+`prompt`; delegate requires `task`; run_chain requires `steps`; get_result requires `agent_id`; send_message requires `to`+`message`.",
+                "description": "Multi-agent operations. Actions: delegate, run_chain, spawn, get_result, send_message.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "action": {"type": "string", "enum": ["delegate","run_chain","spawn","get_result","send_message"]},
-                        "task": {"type": "string", "description": "Task description. REQUIRED when action=delegate."},
-                        "steps": {"type": "array", "description": "Chain steps. REQUIRED when action=run_chain."},
-                        "description": {"type": "string", "description": "Short (3-5 word) task description. REQUIRED when action=spawn."},
-                        "prompt": {"type": "string", "description": "Detailed task prompt. REQUIRED when action=spawn."},
-                        "agent_type": {"type": "string", "enum": ["explore","code-review","task","general-purpose"], "description": "Agent type (spawn). Default: general-purpose."},
-                        "model": {"type": "string", "description": "Model override (spawn)."},
-                        "background": {"type": "boolean", "description": "Return immediately with agent_id; you MUST call action=get_result later (spawn)."},
-                        "name": {"type": "string", "description": "Addressable name for send_message routing (spawn)."},
+                        "task": {"type": "string", "description": "Task description (delegate)"},
+                        "steps": {"type": "array", "description": "Chain steps (run_chain)"},
+                        "description": {"type": "string", "description": "Short task description (spawn)"},
+                        "prompt": {"type": "string", "description": "Detailed prompt (spawn)"},
+                        "agent_type": {"type": "string", "enum": ["explore","code-review","task","general-purpose"]},
+                        "model": {"type": "string", "description": "Model override (spawn)"},
+                        "background": {"type": "boolean", "description": "Return immediately with agent_id (spawn)"},
+                        "name": {"type": "string", "description": "Addressable name (spawn)"},
                         "max_turns": {"type": "integer", "description": "Max turns (spawn). Explicit value wins over `complexity`."},
                         "complexity": {"type": "string", "enum": ["light","normal","deep"], "description": "Task-complexity hint scaling the default budget when `max_turns` is absent. `light`≈10 turns, `normal`=agent default, `deep`=2× default. Use `deep` for review/refactor/multi-file tasks that routinely exhaust the default."},
-                        "isolated": {"type": "boolean", "description": "Use isolated worktree (spawn)."},
-                        "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Tool allowlist override (spawn)."},
-                        "agent_id": {"type": "string", "description": "Agent ID. REQUIRED when action=get_result."},
-                        "to": {"type": "string", "description": "Recipient agent_id or '*'. REQUIRED when action=send_message."},
-                        "message": {"description": "Message content. REQUIRED when action=send_message."},
+                        "isolated": {"type": "boolean", "description": "Use isolated worktree (spawn)"},
+                        "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Tool allowlist (spawn)"},
+                        "agent_id": {"type": "string", "description": "Agent ID (get_result)"},
+                        "to": {"type": "string", "description": "Recipient agent_id or '*' (send_message)"},
+                        "message": {"description": "Message content (send_message)"},
                         "message_type": {"type": "string", "enum": ["text","question","answer","instruction","progress","result","shutdown_request","shutdown_response"]},
                         "priority": {"type": "string", "enum": ["low","normal","high"]}
                     },
@@ -615,6 +674,35 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "subtopic": {"type": "string", "enum": ["session","cache","recent","volatile","stall","noise","all"], "description": "Which diagnostic to run (default: session). `noise`: per-channel freshness of runtime-injected prompt signals — flags channels re-rendered unchanged for many turns."},
                         "detail": {"type": "string", "enum": ["full","summary","minimal"], "description": "Output detail level for the session topic (default: auto from budget). Ignored for other subtopics."}
                     }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "tool_search",
+                "description":
+                    "Search and activate deferred tools. Pass `query` to find tools by \
+                     keyword, OR pass `query=\"select:NAME\"` (or `select:NAME1,NAME2`) to \
+                     retrieve the full schema for one or more deferred tools listed in \
+                     `<deferred_tools>`. After calling with `select:`, you may invoke the \
+                     selected tool(s) directly on the next turn — runtime accepts calls \
+                     for any dispatchable name, not just names currently in `tools[]`.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description":
+                                "Keyword query, or `select:NAME` / `select:NAME1,NAME2` for \
+                                 direct activation."
+                        },
+                        "max_results": {
+                            "type": "integer",
+                            "description": "Maximum results for keyword mode (default 5, max 20)."
+                        }
+                    },
+                    "required": ["query"]
                 }
             }
         }),
@@ -657,14 +745,14 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "task",
-                "description": "Track work progress for multi-step tasks. Per-action required fields: create→title; update/get/stop→task_id.",
+                "description": "Track work progress for multi-step tasks. Actions: create, update, list, get, stop. Supports blocking dependencies, ownership, and arbitrary metadata.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "action": {"type": "string", "enum": ["create","update","list","get","stop"], "description": "Operation to perform"},
-                        "title": {"type": "string", "description": "Brief imperative title. REQUIRED when action=create."},
+                        "title": {"type": "string", "description": "(create/update) Brief imperative title"},
                         "description": {"type": "string", "description": "(create/update) What needs to be done"},
-                        "task_id": {"type": "string", "description": "Task ID (e.g. 'task-1'). REQUIRED when action=update, get, or stop."},
+                        "task_id": {"type": "string", "description": "(update/get/stop) Task ID (e.g. 'task-1')"},
                         "new_status": {"type": "string", "enum": ["pending","in_progress","completed","failed","deleted"], "description": "(update) New status to assign. 'deleted' permanently removes the task."},
                         "status_filter": {"type": "string", "enum": ["pending","in_progress","completed","failed","all","active"], "description": "(list) Restrict results. 'active' = pending+in_progress. Default 'all'."},
                         "subtask_id": {"type": "string", "description": "(update) Update a specific subtask"},

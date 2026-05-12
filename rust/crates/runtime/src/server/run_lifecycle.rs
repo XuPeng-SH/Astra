@@ -72,6 +72,139 @@ type ServerSkillResolverBundle = (
 /// Build skill registry + resolver for server-side agentic loops.
 ///
 /// Returns `(registry_for_activation, resolver)` using runtime providers
+/// Post-loop session-memory cleanup shared by `create_run` and
+/// `stream_chat`. Runs session-end governance (purge working memory +
+/// persist episodic overview + Memoria reflect) when the per-session
+/// debounce window allows, and always clears the bridge seen-ledger +
+/// extraction-service debounce so long-lived servers don't accumulate
+/// per-session state.
+///
+/// Best-effort: every step logs and continues on failure. Safe to call
+/// with an empty `session_id` (no-op).
+async fn post_loop_memory_cleanup(
+    session_id: &str,
+    session_facts: &astra_turn_types::session_facts::SessionFacts,
+    extraction_service: Option<&Arc<crate::session_memory::MemoryExtractionService>>,
+) {
+    if session_id.is_empty() {
+        return;
+    }
+    // ── Governance, debounced ──
+    //
+    // Session IDs are sticky across many terminal runs (user reopens a
+    // session or the TUI issues follow-up turns). Running governance
+    // per run would write one episode per turn and hammer reflect.
+    // The debouncer allows one governance per session per window.
+    let mut episode_was_written = false;
+    if let Some(ref memoria_client) =
+        crate::turn::cloud::memoria_compact::HttpMemoriaClient::from_env()
+    {
+        let debouncer = crate::turn::session_end_debounce::global();
+        if matches!(
+            debouncer.should_run(session_id),
+            crate::turn::session_end_debounce::DebounceDecision::Run
+        ) {
+            match crate::turn::cloud::session_end_governance::run_session_end_governance(
+                session_facts,
+                session_id,
+                memoria_client,
+            )
+            .await
+            {
+                Ok(report) => {
+                    episode_was_written = report.episode_chars > 0;
+                    if episode_was_written
+                        || report.working_purged > 0
+                        || report.reflect_candidates > 0
+                        || report.scenes_stored > 0
+                    {
+                        tracing::info!(
+                            session_id = %session_id,
+                            learnings = report.learnings_stored,
+                            purged = report.working_purged,
+                            episode_chars = report.episode_chars,
+                            reflect_candidates = report.reflect_candidates,
+                            reflect_synthesized = report.reflect_synthesized,
+                            scenes_stored = report.scenes_stored,
+                            "session-end governance complete"
+                        );
+                    }
+                    debouncer.record(session_id);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        error = %e,
+                        "session-end governance failed"
+                    );
+                }
+            }
+        } else {
+            tracing::debug!(
+                session_id = %session_id,
+                "session-end governance skipped by debounce"
+            );
+        }
+
+        // ── Close the recall → outcome feedback loop ──────────────
+        //
+        // Every LLM-driven `memory(action=recall)` pushed its returned
+        // memory_ids onto the process-global recall ledger. Drain them
+        // here and route a feedback signal to Memoria. Conservative
+        // heuristic:
+        //   • episode was written (session did substantive work)
+        //       → signal `useful` — the recall was at least surfaced
+        //         into a productive session
+        //   • trivial session (no episode)
+        //       → drop without scoring — not enough evidence
+        //
+        // A richer attribution (per-tool-call outcome mapping) needs
+        // the tool dispatch layer to report success/failure per recall,
+        // which is a bigger refactor. The episode-level heuristic is
+        // the smallest step that closes the loop in production.
+        let snapshots = astra_tools::memoria::MemoriaClient::drain_recalls(session_id, None);
+        if !snapshots.is_empty() && episode_was_written {
+            use crate::turn::cloud::memoria_compact::MemoriaClient as ServerMemoriaClient;
+            for snap in &snapshots {
+                for id in &snap.memory_ids {
+                    let ctx = format!("session-end: turn {} productive session", snap.turn);
+                    if let Err(e) =
+                        ServerMemoriaClient::feedback(memoria_client, id, "useful", Some(&ctx))
+                            .await
+                    {
+                        tracing::debug!(memory_id = %id, error = %e, "feedback push failed");
+                    }
+                }
+            }
+            tracing::info!(
+                session_id = %session_id,
+                snapshots = snapshots.len(),
+                "closed recall → useful feedback loop"
+            );
+        } else if !snapshots.is_empty() {
+            tracing::debug!(
+                session_id = %session_id,
+                snapshots = snapshots.len(),
+                "session trivial; dropped recall snapshots without scoring"
+            );
+        }
+    }
+    // ── Always: clear canonical memory process state for this session ──
+    //
+    // A single process-global set in `astra_tools::memoria` holds both
+    // the bridge-side content-dedup keys and the tool-side
+    // memory_id dedup entries. The shared reset also ensures focus hints
+    // and the recall ledger are clean even if
+    // governance didn't run (e.g. no memoria client configured, or drain
+    // was conditional on an episode being written).
+    astra_tools::memoria::MemoriaClient::reset_session_process_state(session_id);
+
+    // ── Always: release extraction service's per-session debounce ──
+    if let Some(svc) = extraction_service {
+        svc.forget_session(session_id);
+    }
+}
+
 /// (Local + Bundled + optional Database provider).
 fn build_server_skill_resolver(
     skill_service: Option<Arc<dyn SkillService>>,
@@ -2729,44 +2862,16 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             // hook DB, observer, session-end hooks, promotion events).
             persist_ctx.run(&loop_state, loop_success).await;
 
-            // Session-end governance: purge working memory.
-            // This is create_run-specific (background runs are long-lived sessions).
-            if let Some(ref memoria_client) =
-                crate::turn::cloud::memoria_compact::HttpMemoriaClient::from_env()
-            {
-                let sid = loop_state.current_session_id.as_deref().unwrap_or("");
-                if !sid.is_empty() {
-                    match crate::turn::cloud::session_end_governance::run_session_end_governance(
-                        &loop_state.session_facts,
-                        sid,
-                        memoria_client,
-                    )
-                    .await
-                    {
-                        Ok(report) => {
-                            if report.learnings_stored > 0 {
-                                tracing::info!(
-                                    session_id = %sid,
-                                    learnings = report.learnings_stored,
-                                    purged = report.working_purged,
-                                    "session-end governance complete"
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(session_id = %sid, error = %e, "session-end governance failed")
-                        }
-                    }
-                }
-            }
-            // Release per-session debounce state held by the extraction
-            // service so it doesn't accumulate an entry per session for
-            // the life of the process.
-            if let Some(svc) = loop_state.memory_extraction_service.as_ref() {
-                if let Some(sid) = loop_state.current_session_id.as_deref() {
-                    svc.forget_session(sid);
-                }
-            }
+            // Post-loop memory cleanup — shared with the streaming path
+            // (see `stream_chat`). Runs governance once per session
+            // debounce window, clears bridge seen-ledger, and forgets
+            // extraction debounce.
+            post_loop_memory_cleanup(
+                loop_state.current_session_id.as_deref().unwrap_or(""),
+                &loop_state.session_facts,
+                loop_state.memory_extraction_service.as_ref(),
+            )
+            .await;
         });
 
         Ok(ChatRunRecord {
@@ -3105,6 +3210,16 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
             // Drop event_tx — signals end-of-stream to the HTTP handler.
             drop(event_tx);
+
+            // Post-loop memory cleanup — identical to `create_run`. Runs
+            // AFTER event_tx drops so the client sees turn_complete
+            // promptly and doesn't wait on governance RTT.
+            post_loop_memory_cleanup(
+                state.current_session_id.as_deref().unwrap_or(""),
+                &state.session_facts,
+                state.memory_extraction_service.as_ref(),
+            )
+            .await;
         });
 
         Ok(ChatStreamRecord {

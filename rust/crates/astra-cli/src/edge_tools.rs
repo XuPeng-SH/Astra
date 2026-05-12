@@ -544,6 +544,11 @@ pub struct ToolExecutor {
     self_mod_mutation_counter: std::sync::Mutex<(u32, u32)>,
     /// Shared tool executor for delegating unknown tools to astra-tools.
     default_executor: astra_tools::executor::DefaultToolExecutor,
+    /// Plugin-registered tool schemas (e.g. MCP servers). Joined with the
+    /// static catalog when `tool_search(select:X)` runs, so deferred
+    /// activation can reach plugin tools. Populated by the REPL after
+    /// `PluginRegistry::register` loads the user's skill manifests.
+    plugin_schemas: std::sync::RwLock<Vec<Value>>,
 }
 
 impl ToolExecutor {
@@ -568,6 +573,7 @@ impl ToolExecutor {
             )
             .build()
             .unwrap_or_else(|_| Client::new()),
+            plugin_schemas: std::sync::RwLock::new(Vec::new()),
             sandbox_policy: std::sync::RwLock::new(Some(sandbox)),
             preferred_repos: std::sync::Mutex::new(preferred_repos),
             budget_pressure: std::sync::Mutex::new(0.0),
@@ -634,6 +640,27 @@ impl ToolExecutor {
     pub fn with_spawn_context(mut self, ctx: agent_spawning::SpawnAgentContext) -> Self {
         self.spawn_context = Some(ctx);
         self
+    }
+
+    /// Install plugin-registered schemas so `tool_search(select:NAME)`
+    /// can resolve MCP / skill-backed tools. Called once at REPL start
+    /// after `PluginRegistry::register` loads manifests.
+    ///
+    /// Poison handling: recovers via `into_inner()` so a prior panic
+    /// doesn't permanently disable plugin lookup. Logs a warning so
+    /// operators notice the underlying panic. Silent-drop (the previous
+    /// `if let Ok` form) would leave deferred activation broken with
+    /// zero observability — the exact class of footgun that motivated
+    /// this rewrite's other fixes.
+    pub fn set_plugin_schemas(&self, schemas: Vec<Value>) {
+        let mut guard = self.plugin_schemas.write().unwrap_or_else(|poisoned| {
+            tracing::warn!(
+                "CLI plugin_schemas RwLock was poisoned; recovering inner. \
+                 A prior panic held the write lock — investigate that panic first."
+            );
+            poisoned.into_inner()
+        });
+        *guard = schemas;
     }
 
     /// Set the shared context cache for cross-agent knowledge sharing.
@@ -783,6 +810,27 @@ impl ToolExecutor {
 
     pub(crate) fn active_session_id(&self) -> Option<String> {
         self.active_session_id.lock().ok().and_then(|g| g.clone())
+    }
+
+    fn memory_args_with_context(&self, args: &Value) -> Value {
+        let mut clean_args = args.clone();
+        if let Some(obj) = clean_args.as_object_mut() {
+            obj.remove("action");
+            // Inject the active session id so focus hints and session-scoped
+            // recalls work. CLI does not own a user_id — leave it to the
+            // cloud proxy / Memoria server to fill in via the bearer token.
+            if let Some(sid) = self.active_session_id().filter(|sid| !sid.is_empty()) {
+                obj.insert("session_id".to_string(), serde_json::Value::String(sid));
+            }
+            let turn = self
+                .journal_turn_index
+                .load(std::sync::atomic::Ordering::Acquire);
+            obj.insert(
+                "turn".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(turn)),
+            );
+        }
+        clean_args
     }
 
     /// P3.1 seam: stash cross-session lessons loaded at session bootstrap.
@@ -1788,6 +1836,12 @@ impl ToolExecutor {
                 "bash" => self.bash(args),
                 #[cfg(windows)]
                 "powershell" => self.powershell(args),
+                // Activation primitive for the deferred tool layer.
+                // MUST use the CLI-side full catalog (`all_tool_schemas()`)
+                // so `select:NAME` can reach every cataloged tool — not
+                // just the 14 in `default_executor_tool_schemas()` that
+                // the fallback `default_executor.execute()` would hit.
+                "tool_search" => self.tool_search(args),
                 "read_file" => self.read_file(args),
                 "write_file" => {
                     // delete=true routes to delete_file handler
@@ -1925,20 +1979,12 @@ impl ToolExecutor {
                 "memory" => {
                     let op = match args.get("action").and_then(|v| v.as_str()) {
                         Some(a) => a,
-                        None => return "Error: missing required parameter 'action'. Use one of: store, retrieve, purge, correct, profile, search, feedback".to_string(),
+                        None => return "Error: missing required parameter `action`. \
+                             Use one of: remember, recall, expand, forget, update, focus, reflect, profile, feedback".to_string(),
                     };
-                    let mut clean_args = args.clone();
-                    if let Some(obj) = clean_args.as_object_mut() {
-                        obj.remove("action");
-                    }
+                    let clean_args = self.memory_args_with_context(args);
                     self.memoria_call(op, &clean_args).await
                 }
-                "memory_retrieve" => self.memoria_call("retrieve", args).await,
-                "memory_store" => self.memoria_call("store", args).await,
-                "memory_search" => self.memoria_call("search", args).await,
-                "memory_purge" => self.memoria_call("purge", args).await,
-                "memory_correct" => self.memoria_call("correct", args).await,
-                "memory_profile" => self.memoria_call("profile", args).await,
                 "adjust_config" => self.adjust_config(args),
                 "prioritize_tool" => self.prioritize_tool(args),
                 "deprioritize_tool" => self.deprioritize_tool(args),
@@ -2050,11 +2096,10 @@ impl ToolExecutor {
                         "rollback_edits" => self.rollback_file_edits(args),
                         "ask_user" => self.ask_user(args),
                         "sleep" => self.sleep_tool(args).await,
-                        "tool_search" => self.tool_search(args),
                         "timeline" => self.render_session_timeline(args),
                         "summary" => self.render_session_summary(),
                         "history" => self.render_session_history(args),
-                        "" => "Missing required parameter: action. Use: config, prioritize, deprioritize, compact, rollback_edits, ask_user, sleep, tool_search, timeline, summary, history".to_string(),
+                        "" => "Missing required parameter: action. Use: config, prioritize, deprioritize, compact, rollback_edits, ask_user, sleep, timeline, summary, history".to_string(),
                         other => format!("Unknown session action: '{other}'"),
                     }
                 }
@@ -2139,6 +2184,31 @@ impl ToolExecutor {
         };
         // Normalize empty output, then apply global safety net
         let output = self.finalize_tool_output(output, name);
+        if name != "memory"
+            && !output.starts_with("Error")
+            && let Some(session_id) = self.active_session_id().filter(|sid| !sid.is_empty())
+        {
+            let client = astra_tools::memoria::MemoriaClient::new(
+                self.cloud_base.clone(),
+                self.cloud_token(),
+            );
+            let ctx = format!("cli-tool:{name}");
+            tokio::spawn(async move {
+                let report = client
+                    .feedback_pending_recalls(&session_id, "useful", &ctx)
+                    .await;
+                if report.attempted > 0 {
+                    tracing::debug!(
+                        session_id = %session_id,
+                        context = %ctx,
+                        attempted = report.attempted,
+                        succeeded = report.succeeded,
+                        failed = report.failed,
+                        "closed recall feedback after successful cli tool"
+                    );
+                }
+            });
+        }
         self.record_output_size(output.len());
         output
     }
@@ -2629,6 +2699,155 @@ mod tests {
         (dir, executor)
     }
 
+    // ── tool_search dispatch: CLI must route to the full catalog ───────
+    //
+    // Before this fix: `execute()` had no `"tool_search"` arm, so
+    // `default_executor.execute("tool_search")` was called. That uses
+    // `default_executor_tool_schemas()` — a 14-tool subset without
+    // github, memory, session, agent, lsp, symbols. CLI users hitting
+    // `tool_search(select:github)` got `missing:["github"]` and the
+    // entire deferred-activation flow was dead on CLI.
+
+    #[tokio::test]
+    async fn tool_search_select_github_returns_schema_on_cli_path() {
+        let executor = test_executor();
+        let out = executor
+            .execute(
+                "tool_search",
+                &serde_json::json!({"query": "select:github"}),
+            )
+            .await;
+        let parsed: serde_json::Value =
+            serde_json::from_str(&out).expect("tool_search must return valid JSON");
+        let missing = parsed["missing"].as_array().expect("missing field");
+        assert!(
+            missing.is_empty(),
+            "CLI tool_search(select:github) must resolve, not return missing; got: {out}"
+        );
+        let matches = parsed["matches"].as_array().expect("matches field");
+        assert_eq!(matches.len(), 1, "exactly one match; got: {out}");
+        assert_eq!(matches[0]["name"].as_str(), Some("github"));
+        assert!(
+            matches[0].get("parameters").is_some(),
+            "must include full parameters for activation"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_search_select_memory_returns_schema_on_cli_path() {
+        // memory is in DEFAULT_PINNED but deferred activation must still
+        // return its schema on demand. Tests that the CLI dispatch pool
+        // covers all pinned catalog tools.
+        let executor = test_executor();
+        let out = executor
+            .execute(
+                "tool_search",
+                &serde_json::json!({"query": "select:memory"}),
+            )
+            .await;
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(parsed["missing"].as_array().unwrap().is_empty());
+        assert_eq!(parsed["matches"][0]["name"].as_str(), Some("memory"));
+    }
+
+    #[tokio::test]
+    async fn tool_search_select_finds_plugin_schema_once_installed() {
+        // MCP / skill-backed plugins are installed via `set_plugin_schemas`
+        // at REPL startup. After install, `tool_search(select:mcp__X)`
+        // must resolve — that's the whole deferred activation contract
+        // for plugin tools.
+        let executor = test_executor();
+        let plugin = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__weather",
+                "description": "Get weather for a city.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"]
+                }
+            }
+        });
+        executor.set_plugin_schemas(vec![plugin]);
+
+        let out = executor
+            .execute(
+                "tool_search",
+                &serde_json::json!({"query": "select:mcp__weather"}),
+            )
+            .await;
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(
+            parsed["missing"].as_array().unwrap().is_empty(),
+            "plugin must resolve after set_plugin_schemas; got: {out}"
+        );
+        assert_eq!(parsed["matches"][0]["name"].as_str(), Some("mcp__weather"));
+        assert!(parsed["matches"][0].get("parameters").is_some());
+    }
+
+    /// Poison recovery: if a prior panic poisoned the plugin_schemas
+    /// RwLock, tool_search must STILL function rather than silently
+    /// drop the plugin pool. Silent drop would leave deferred
+    /// activation broken with zero observability.
+    #[tokio::test]
+    async fn tool_search_recovers_from_poisoned_plugin_schemas_lock() {
+        let executor = test_executor();
+        let plugin = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__calc",
+                "description": "Evaluate expressions.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        });
+        executor.set_plugin_schemas(vec![plugin]);
+
+        // Simulate a prior panic-poisoned write lock.
+        let arc = std::sync::Arc::new(&executor.plugin_schemas);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = arc.write().unwrap();
+            panic!("simulated panic under write lock");
+        }));
+        assert!(
+            executor.plugin_schemas.read().is_err() || executor.plugin_schemas.write().is_err(),
+            "lock should be poisoned for the test to be meaningful"
+        );
+
+        // Now the select must still resolve the plugin via recovery.
+        let out = executor
+            .execute(
+                "tool_search",
+                &serde_json::json!({"query": "select:mcp__calc"}),
+            )
+            .await;
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(
+            parsed["missing"].as_array().unwrap().is_empty(),
+            "poisoned lock must not silently drop plugins; got: {out}"
+        );
+        assert_eq!(parsed["matches"][0]["name"].as_str(), Some("mcp__calc"));
+    }
+
+    #[tokio::test]
+    async fn tool_search_select_web_fetch_returns_schema_on_cli_path() {
+        // web_fetch is DEFERRED (not in DEFAULT_PINNED). The whole point
+        // of this test is to exercise the deferred activation flow.
+        let executor = test_executor();
+        let out = executor
+            .execute(
+                "tool_search",
+                &serde_json::json!({"query": "select:web_fetch"}),
+            )
+            .await;
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(
+            parsed["missing"].as_array().unwrap().is_empty(),
+            "select:web_fetch must resolve on CLI; got: {out}"
+        );
+        assert_eq!(parsed["matches"][0]["name"].as_str(), Some("web_fetch"));
+    }
+
     // ── introspect tool: first-turn behavior (regression guard) ────────
     //
     // Regression: `handle_introspect` used to return the string
@@ -2720,6 +2939,23 @@ mod tests {
 
         executor.set_cloud_token("new-token");
         assert_eq!(executor.cloud_token().as_deref(), Some("new-token"));
+    }
+
+    #[test]
+    fn memory_args_include_session_and_current_turn() {
+        let executor = test_executor().with_active_session_id("mem-session");
+        executor
+            .journal_turn_index
+            .store(9, std::sync::atomic::Ordering::Release);
+
+        let args = executor.memory_args_with_context(&serde_json::json!({
+            "action": "recall",
+            "query": "memory loop",
+        }));
+
+        assert!(args.get("action").is_none());
+        assert_eq!(args["session_id"].as_str(), Some("mem-session"));
+        assert_eq!(args["turn"].as_u64(), Some(9));
     }
 
     // ── File-journal persistence wiring (regression guard) ──────────────

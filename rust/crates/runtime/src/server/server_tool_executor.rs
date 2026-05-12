@@ -985,6 +985,11 @@ pub struct ServerToolExecutor {
     /// plan-mode state write through this so the next turn's system prompt
     /// reflects current state instead of the loop-start snapshot.
     plan_resume_hint_handle: Option<Arc<std::sync::RwLock<Option<String>>>>,
+    /// Plugin-registered tool schemas (e.g. MCP servers). Joined with the
+    /// server-side allowlist when `tool_search(select:NAME)` runs so
+    /// deferred activation reaches plugin tools. Populated by the server
+    /// loop host once MCP servers have been refreshed.
+    plugin_schemas: Arc<std::sync::RwLock<Vec<Value>>>,
 }
 
 /// Snapshot used by the plan-mode write guard and the system-prompt
@@ -1062,7 +1067,26 @@ impl ServerToolExecutor {
             plan_repo: None,
             plan_mode_cache: Arc::new(tokio::sync::RwLock::new(PlanModeSnapshot::default())),
             plan_resume_hint_handle: None,
+            plugin_schemas: Arc::new(std::sync::RwLock::new(Vec::new())),
         }
+    }
+
+    /// Install plugin-registered schemas (MCP, etc.) so
+    /// `tool_search(select:NAME)` can resolve them for deferred activation.
+    /// Called by the server loop host after MCP manager refresh.
+    ///
+    /// Poison handling: recovers via `into_inner()` so a prior panic
+    /// doesn't permanently disable plugin lookup server-side. Logs a
+    /// warning so operators can trace the underlying panic.
+    pub fn set_plugin_schemas(&self, schemas: Vec<Value>) {
+        let mut guard = self.plugin_schemas.write().unwrap_or_else(|poisoned| {
+            tracing::warn!(
+                "server plugin_schemas RwLock was poisoned; recovering inner. \
+                 A prior panic held the write lock — investigate that panic first."
+            );
+            poisoned.into_inner()
+        });
+        *guard = schemas;
     }
 
     /// Inject the plan repository so plan-mode tools and the write-tool guard
@@ -1238,17 +1262,11 @@ impl ServerToolExecutor {
             "memory" => {
                 let op = match args.get("action").and_then(|v| v.as_str()) {
                     Some(a) => a,
-                    None => return tool_result_from_output("Error: missing required parameter 'action'. Use: store, retrieve, purge, correct, profile, search, feedback".to_string()),
+                    None => return tool_result_from_output(
+                        "Error: missing required parameter `action`. \
+                         Use one of: remember, recall, expand, forget, update, focus, reflect, profile, feedback".to_string()),
                 };
-                let mut isolated_args = args.clone();
-                if let Some(obj) = isolated_args.as_object_mut() {
-                    obj.remove("action"); // Memoria API doesn't expect this field
-                    obj.insert(
-                        "session_id".to_string(),
-                        Value::String(self.user_id.clone()),
-                    );
-                    obj.insert("user_id".to_string(), Value::String(self.user_id.clone()));
-                }
+                let isolated_args = self.memory_args_with_context(args);
                 let output = self.memoria_client.call(op, &isolated_args).await;
                 if output.starts_with("Error") {
                     astra_tools::ToolResult::error(output)
@@ -1256,25 +1274,23 @@ impl ServerToolExecutor {
                     astra_tools::ToolResult::text(output)
                 }
             }
-            // Legacy aliases
-            "memory_retrieve" | "memory_store" | "memory_search" | "memory_purge"
-            | "memory_correct" | "memory_profile" => {
-                let op = name.strip_prefix("memory_").unwrap_or(name);
-                let mut isolated_args = args.clone();
-                if let Some(obj) = isolated_args.as_object_mut() {
-                    obj.remove("action"); // defensive: strip if present
-                    obj.insert(
-                        "session_id".to_string(),
-                        Value::String(self.user_id.clone()),
-                    );
-                    obj.insert("user_id".to_string(), Value::String(self.user_id.clone()));
-                }
-                let output = self.memoria_client.call(op, &isolated_args).await;
-                if output.starts_with("Error") {
-                    astra_tools::ToolResult::error(output)
-                } else {
-                    astra_tools::ToolResult::text(output)
-                }
+            // ── Tool search (first-class activation primitive) ─────────
+            //
+            // Lets the LLM look up schemas for deferred tools listed in
+            // `<deferred_tools>` via `tool_search(query="select:NAME")`.
+            // Schema pool = static server allowlist + plugin schemas
+            // installed via `set_plugin_schemas`. Without the union,
+            // MCP/skill-backed tools would never resolve.
+            "tool_search" => {
+                let mut pool = astra_tools::schemas::server_executor_tool_schemas();
+                // Poison recovery: recover inner so deferred activation
+                // survives a prior panic. See set_plugin_schemas doc.
+                let guard = self.plugin_schemas.read().unwrap_or_else(|poisoned| {
+                    tracing::warn!("server plugin_schemas RwLock poisoned on read; recovering.");
+                    poisoned.into_inner()
+                });
+                pool.extend(guard.iter().cloned());
+                tool_result_from_output(astra_tools::tool_search::tool_search(&pool, args))
             }
             // ── Web search (standalone function) ───────────────────────
             "web_search" => {
@@ -1328,11 +1344,7 @@ impl ServerToolExecutor {
                     "rollback_edits" => tool_result_from_output(self.rollback_file_edits(args)),
                     "ask_user" => self.server_ask_user(args).await,
                     "sleep" => self.default_executor.execute("sleep", args).await,
-                    "tool_search" => tool_result_from_output(astra_tools::tool_search::tool_search(
-                        &astra_tools::schemas::server_executor_tool_schemas(),
-                        args,
-                    )),
-                    "" => tool_result_from_output("Missing required parameter: action. Use: config, prioritize, deprioritize, compact, enter_plan, exit_plan, rollback_edits, ask_user, sleep, tool_search".to_string()),
+                    "" => tool_result_from_output("Missing required parameter: action. Use: config, prioritize, deprioritize, compact, enter_plan, exit_plan, rollback_edits, ask_user, sleep".to_string()),
                     other => tool_result_from_output(format!("Unknown session action: '{other}'")),
                 }
             }
@@ -1478,6 +1490,30 @@ impl ServerToolExecutor {
             .fetch_add(result.output.len(), Ordering::Relaxed);
         result.output = astra_tools::maybe_persist_large_output(result.output, agg, name);
 
+        if name != "memory" && !result.is_error {
+            let session_id = self.session_id.clone();
+            let ctx = format!("server-tool:{name}");
+            let client = astra_tools::memoria::MemoriaClient::new(
+                self.memoria_client.cloud_base.clone(),
+                self.memoria_client.cloud_token.clone(),
+            );
+            tokio::spawn(async move {
+                let report = client
+                    .feedback_pending_recalls(&session_id, "useful", &ctx)
+                    .await;
+                if report.attempted > 0 {
+                    tracing::debug!(
+                        session_id = %session_id,
+                        context = %ctx,
+                        attempted = report.attempted,
+                        succeeded = report.succeeded,
+                        failed = report.failed,
+                        "closed recall feedback after successful tool"
+                    );
+                }
+            });
+        }
+
         // ── Progress: tool completed ─────────────────────────────────
         if let Some(cb) = &self.progress_callback {
             cb.tool_completed(&call_id, &result.output, !result.is_error)
@@ -1532,6 +1568,25 @@ impl ServerToolExecutor {
     /// Set the current turn index for journal entries.
     pub fn set_turn_index(&self, idx: u32) {
         self.journal_turn_index.store(idx, Ordering::Relaxed);
+    }
+
+    fn memory_args_with_context(&self, args: &Value) -> Value {
+        let mut isolated_args = args.clone();
+        if let Some(obj) = isolated_args.as_object_mut() {
+            obj.remove("action"); // the verb is routed via `op`, not sent to Memoria
+            obj.insert(
+                "session_id".to_string(),
+                Value::String(self.session_id.clone()),
+            );
+            obj.insert("user_id".to_string(), Value::String(self.user_id.clone()));
+            obj.insert(
+                "turn".to_string(),
+                Value::Number(serde_json::Number::from(
+                    self.journal_turn_index.load(Ordering::Relaxed),
+                )),
+            );
+        }
+        isolated_args
     }
 
     /// Reset aggregate output counter at the start of a new turn.
@@ -3837,6 +3892,56 @@ esac
     // ── Path traversal security ────────────────────────────────────────
 
     #[tokio::test]
+    async fn server_tool_search_finds_catalog_tool() {
+        let (exec, _dir) = test_executor();
+        let result = exec
+            .execute_with_metadata("tool_search", &json!({"query": "select:github"}))
+            .await;
+        assert!(
+            !result.is_error,
+            "tool_search must succeed for select:github"
+        );
+        let parsed: Value = serde_json::from_str(&result.output).unwrap();
+        assert!(
+            parsed["missing"].as_array().unwrap().is_empty(),
+            "select:github must resolve on server path; got: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn server_tool_search_resolves_plugin_after_install() {
+        let (exec, _dir) = test_executor();
+        let plugin = json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__calculator",
+                "description": "Evaluate arithmetic expression.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"expr": {"type": "string"}},
+                    "required": ["expr"]
+                }
+            }
+        });
+        exec.set_plugin_schemas(vec![plugin]);
+
+        let result = exec
+            .execute_with_metadata("tool_search", &json!({"query": "select:mcp__calculator"}))
+            .await;
+        let parsed: Value = serde_json::from_str(&result.output).unwrap();
+        assert!(
+            parsed["missing"].as_array().unwrap().is_empty(),
+            "plugin must resolve after set_plugin_schemas on server path; got: {}",
+            result.output
+        );
+        assert_eq!(
+            parsed["matches"][0]["name"].as_str(),
+            Some("mcp__calculator")
+        );
+    }
+
+    #[tokio::test]
     async fn ask_user_returns_structured_response_from_gate() {
         let (mut exec, _dir) = test_executor();
         exec.set_ask_user_gate(Arc::new(StaticAskUserGate {
@@ -4714,10 +4819,26 @@ esac
         // We can't actually call Memoria, but we can verify the execute path
         // doesn't panic and returns a reasonable error (no MEMORIA_BASE_URL set).
         let result = exec
-            .execute("memory_store", &json!({"content": "test"}))
+            .execute("memory", &json!({"action": "remember", "content": "test"}))
             .await;
         // Should attempt the call (may fail due to no server, but shouldn't crash)
         assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn memory_tool_args_include_session_user_and_turn() {
+        let (exec, _dir) = test_executor();
+        exec.set_turn_index(12);
+
+        let args = exec.memory_args_with_context(&json!({
+            "action": "recall",
+            "query": "closed loop",
+        }));
+
+        assert!(args.get("action").is_none());
+        assert_eq!(args["session_id"].as_str(), Some(exec.session_id.as_str()));
+        assert_eq!(args["user_id"].as_str(), Some(exec.user_id.as_str()));
+        assert_eq!(args["turn"].as_u64(), Some(12));
     }
 
     #[tokio::test]

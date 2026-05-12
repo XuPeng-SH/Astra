@@ -35,6 +35,7 @@ pub mod loop_dispatcher;
 pub mod memory_prefetch;
 pub mod permission_gate;
 pub mod prompt_cache;
+pub mod session_end_debounce;
 /// Re-exported from astra-turn-types
 pub mod result_quality {
     pub use astra_turn_types::{ResultQuality, classify_result, quality_feedback};

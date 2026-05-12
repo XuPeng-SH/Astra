@@ -212,21 +212,232 @@ pub trait MemoriaClient: Send + Sync {
     async fn delete(&self, _memory_id: &str) -> Result<(), String> {
         Ok(())
     }
+
+    // ── Cognitive verbs (Phase 3) ────────────────────────────────────
+    //
+    // These mirror the v2 `memory(action=…)` LLM surface but on the
+    // runtime side so orchestration code (session-end, turn-start,
+    // auto-focus, feedback loop) can call them without routing through
+    // the tool dispatcher. The default impls return benign no-ops so
+    // mock clients in tests don't need to care about v2 verbs they
+    // haven't opted in to.
+
+    /// Persist an episodic session summary. `overview` is the condensed
+    /// (~300-500 char) post-session narrative.
+    async fn store_episode(&self, _session_id: &str, _overview: &str) -> Result<String, String> {
+        Ok(String::new())
+    }
+
+    /// Persist a reflect scene candidate as a cross-session `semantic`
+    /// memory tagged `astra:scene` so next-session prewarm picks it up.
+    /// Default: no-op. Real clients emit a POST /v1/memories.
+    async fn store_scene(
+        &self,
+        _session_id: &str,
+        _signal: &str,
+        _summary: &str,
+    ) -> Result<String, String> {
+        Ok(String::new())
+    }
+
+    /// Trigger Memoria's cross-memory reflection for the given session.
+    /// The backend respects a cooldown (≥1h v1 default); callers that
+    /// want to bypass it should pass `force=true`.
+    async fn reflect_session(
+        &self,
+        _session_id: &str,
+        _force: bool,
+    ) -> Result<ReflectSummary, String> {
+        Ok(ReflectSummary::default())
+    }
+
+    /// Persist a focus hint client-side (session-scoped, TTL-bounded).
+    /// Subsequent `recall`s consult the store and add `boost_*` fields
+    /// to the request body. Memoria v1 ignores them; v2 will honor.
+    async fn focus(
+        &self,
+        _session_id: &str,
+        _focus_type: &str,
+        _value: &str,
+        _boost: Option<f64>,
+        _ttl_secs: Option<i64>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Record an explicit quality signal (useful / irrelevant /
+    /// outdated / wrong) on a previously-recalled memory. Shapes the
+    /// ranking of that memory in future recalls.
+    async fn feedback(
+        &self,
+        _memory_id: &str,
+        _signal: &str,
+        _context: Option<&str>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// Summary returned by [`MemoriaClient::reflect_session`].
+#[derive(Debug, Clone, Default)]
+pub struct ReflectSummary {
+    /// Whether the backend actually synthesized new scene nodes (v2
+    /// reflect returns true); v1 always reports `false` here but
+    /// still triggers graph consolidation.
+    pub synthesized: bool,
+    /// Number of scene / cluster candidates produced.
+    pub candidates: u64,
+    /// Candidate scene summaries the client can forward-feed (store as
+    /// `astra:scene`-tagged memories for next-session prewarm). Empty
+    /// when the backend ran in `internal` mode (LLM synthesis already
+    /// stored scenes server-side) or when no clusters were found.
+    pub candidate_payloads: Vec<ReflectCandidate>,
+    /// Raw v1 response body for diagnostics (first 200 chars).
+    pub diagnostics: String,
+}
+
+/// A single cluster-level scene candidate returned by Memoria's reflect
+/// endpoint in `mode=candidates`. Contents are compact enough to bake
+/// into one `astra:scene` memory so the next session's prewarm picks
+/// it up via the episode + scene query.
+#[derive(Debug, Clone, Default)]
+pub struct ReflectCandidate {
+    /// Signal / label the backend attached to the cluster.
+    pub signal: String,
+    /// Importance score (arbitrary units, backend-defined).
+    pub importance: f64,
+    /// Compact summary of the cluster's contributing memories, joined
+    /// by newlines. Suitable for direct inclusion in a stored memory's
+    /// `content` field.
+    pub summary: String,
+}
+
+/// Parse `{"candidates": [...]}` from Memoria's reflect response into
+/// the strongly-typed list. Each entry in the backend's payload has
+/// `{signal, importance, memories: [{memory_id, content}]}`; we flatten
+/// `memories[*].content` into a single newline-joined `summary` so it
+/// slots directly into one Memoria memory's `content`.
+///
+/// Pure — tested in isolation.
+pub fn parse_reflect_candidates(data: &Value) -> Vec<ReflectCandidate> {
+    let Some(arr) = data.get("candidates").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for entry in arr {
+        let signal = entry
+            .get("signal")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let importance = entry
+            .get("importance")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let memories = entry
+            .get("memories")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut lines = Vec::with_capacity(memories.len());
+        for m in memories {
+            if let Some(c) = m.get("content").and_then(Value::as_str) {
+                let t = c.trim();
+                if !t.is_empty() {
+                    lines.push(format!("- {t}"));
+                }
+            }
+        }
+        let summary = lines.join("\n");
+        if summary.is_empty() && signal.is_empty() {
+            continue;
+        }
+        out.push(ReflectCandidate {
+            signal,
+            importance,
+            summary,
+        });
+    }
+    out
 }
 
 /// A memory record from Memoria.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Carries the freshness-critical fields (`observed_at`, `updated_at`,
+/// `trust_tier`) so the caller can render an LLM-visible staleness
+/// caveat without a second round-trip. See [`MemoriaMemory::freshness_suffix`]
+/// for the canonical formatter.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MemoriaMemory {
     pub memory_id: String,
     pub content: String,
     pub memory_type: String,
     #[serde(default)]
     pub retrieval_score: Option<f64>,
+    /// RFC3339 timestamp of when the memory was first observed (i.e.
+    /// the fact was stated). Decay half-life is measured from this.
+    #[serde(default)]
+    pub observed_at: Option<String>,
+    /// RFC3339 timestamp of the most recent update (e.g. via `update`).
+    #[serde(default)]
+    pub updated_at: Option<String>,
+    /// Trust tier string (`T1`-`T4`) — drives default half-life.
+    #[serde(default)]
+    pub trust_tier: Option<String>,
+    /// Session id tag, if the memory was scoped to one at write time.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+impl MemoriaMemory {
+    /// Days elapsed since `observed_at` (or `updated_at` as fallback).
+    /// `None` when neither timestamp is available.
+    pub fn age_days(&self) -> Option<i64> {
+        let ts = self.observed_at.as_deref().or(self.updated_at.as_deref())?;
+        let dt = chrono::DateTime::parse_from_rfc3339(ts).ok()?;
+        let age = chrono::Utc::now() - dt.with_timezone(&chrono::Utc);
+        Some(age.num_days().max(0))
+    }
+
+    /// Human-readable age label (`today`, `yesterday`, `3 days ago`).
+    /// Returns `None` when timestamp info is missing.
+    pub fn age_label(&self) -> Option<String> {
+        match self.age_days()? {
+            0 => Some("today".into()),
+            1 => Some("yesterday".into()),
+            n => Some(format!("{n} days ago")),
+        }
+    }
+
+    /// Append-friendly freshness marker for compact memory renderings.
+    ///
+    /// Routes through [`astra_turn_types::freshness_suffix_for`] so the
+    /// runtime-side and types-side renderings stay byte-for-byte
+    /// identical. Bucketed (`(this week)` / `(within the month)` /
+    /// `(stale — verify first)`) rather than exact-day to keep prompt
+    /// cache stable across midnight UTC; see the helper's rustdoc.
+    pub fn freshness_suffix(&self) -> String {
+        let Some(days) = self.age_days() else {
+            return String::new();
+        };
+        astra_turn_types::freshness_suffix_for(days, self.trust_tier.as_deref())
+    }
 }
 
 // ---------------------------------------------------------------------------
 // HTTP Client Implementation
 // ---------------------------------------------------------------------------
+
+/// A single active focus hint: boost a topic / tag / memory_id for a
+/// finite window. Shared backing for `HttpMemoriaClient::focus` and
+/// consulted during `retrieve_ext` so the recall payload picks it up.
+#[derive(Debug, Clone)]
+struct RuntimeFocusHint {
+    focus_type: String,
+    value: String,
+    boost: f64,
+    expires_at: std::time::Instant,
+}
 
 /// HTTP-based Memoria client.
 #[derive(Clone)]
@@ -234,6 +445,11 @@ pub struct HttpMemoriaClient {
     base_url: String,
     api_key: String,
     http: reqwest::Client,
+    /// Session-scoped focus store (runtime side). Mirrors the tool-side
+    /// store in `astra_tools::memoria` so orchestration and LLM-driven
+    /// focus hints are unified at retrieval time.
+    focus_store:
+        std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, Vec<RuntimeFocusHint>>>>,
 }
 
 impl HttpMemoriaClient {
@@ -247,6 +463,9 @@ impl HttpMemoriaClient {
                 .timeout(std::time::Duration::from_secs(60))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
+            focus_store: std::sync::Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
         }
     }
 
@@ -254,6 +473,28 @@ impl HttpMemoriaClient {
     pub fn from_env() -> Option<Self> {
         let mem = astra_core::MemoriaSettings::from_env();
         Some(Self::new(mem.base_url, mem.master_key?))
+    }
+
+    /// Read back active focus hints for a session (side-effect:
+    /// evicts expired entries). Public so test code can introspect.
+    pub fn active_focus_hints(&self, session_id: &str) -> Vec<(String, String, f64)> {
+        let now = std::time::Instant::now();
+        let key = if session_id.is_empty() {
+            "_global"
+        } else {
+            session_id
+        };
+        let Ok(mut store) = self.focus_store.write() else {
+            return Vec::new();
+        };
+        let Some(bucket) = store.get_mut(key) else {
+            return Vec::new();
+        };
+        bucket.retain(|h| h.expires_at > now);
+        bucket
+            .iter()
+            .map(|h| (h.focus_type.clone(), h.value.clone(), h.boost))
+            .collect()
     }
 }
 
@@ -315,7 +556,34 @@ impl MemoriaClient for HttpMemoriaClient {
         if let Some(sid) = session_id {
             body["session_id"] = json!(sid);
             if filter_session {
-                body["filter_session"] = json!(true);
+                // Map to v1's session_scope primitive instead of the
+                // legacy `filter_session` flag (Memoria never honored it).
+                body["session_scope"] = json!("only");
+            }
+        }
+
+        // Attach active focus hints (client-side, session-scoped TTL).
+        // Memoria v1 currently ignores `boost_*`; v2 will honor.
+        let hints = self.active_focus_hints(session_id.unwrap_or(""));
+        if !hints.is_empty() {
+            let (mut topics, mut tags, mut mids) = (Vec::new(), Vec::new(), Vec::new());
+            for (ty, val, boost) in hints {
+                let entry = json!({"value": val, "boost": boost});
+                match ty.as_str() {
+                    "topic" => topics.push(entry),
+                    "tag" => tags.push(entry),
+                    "memory_id" => mids.push(entry),
+                    _ => {}
+                }
+            }
+            if !topics.is_empty() {
+                body["boost_topics"] = Value::Array(topics);
+            }
+            if !tags.is_empty() {
+                body["boost_tags"] = Value::Array(tags);
+            }
+            if !mids.is_empty() {
+                body["boost_memory_ids"] = Value::Array(mids);
             }
         }
 
@@ -384,14 +652,21 @@ impl MemoriaClient for HttpMemoriaClient {
     }
 
     /// Purge working memories for a session.
-    /// NOTE: Currently uses topic-based purge which does fulltext search on content.
-    /// This does NOT reliably match UUID-style session IDs (ngram tokenizer issue).
-    /// TODO: switch to session_id-based purge once Memoria supports it
-    ///       (https://github.com/matrixorigin/Memoria/issues/182)
+    ///
+    /// Uses Memoria's `session_id` + `memory_types=["working"]` selector,
+    /// which is an exact filter on the session column — reliable even
+    /// for UUID-style session IDs. The prior implementation used
+    /// `topic="session:<uuid>"` which resolved via fulltext ngram
+    /// tokenization; UUID tokens never matched, so `purge_working` was
+    /// silently a no-op on every real session.
     async fn purge_working(&self, session_id: &str) -> Result<u64, String> {
+        if session_id.is_empty() {
+            return Err("purge_working requires non-empty session_id".into());
+        }
         let url = format!("{}/v1/memories/purge", self.base_url.trim_end_matches('/'));
         let body = json!({
-            "topic": format!("session:{}", session_id),
+            "session_id": session_id,
+            "memory_types": ["working"],
             "reason": "session compaction cleanup",
         });
 
@@ -413,8 +688,12 @@ impl MemoriaClient for HttpMemoriaClient {
             .await
             .map_err(|e| format!("Memoria purge parse failed: {e}"))?;
 
+        // Memoria returns `{ "purged": N, ... }` (see `PurgeResponse`);
+        // prior v1 also emitted `deleted_count` for topic-mode. Accept
+        // either so this works against both shapes.
         Ok(data
-            .get("deleted_count")
+            .get("purged")
+            .or_else(|| data.get("deleted_count"))
             .and_then(Value::as_u64)
             .unwrap_or(0))
     }
@@ -436,6 +715,224 @@ impl MemoriaClient for HttpMemoriaClient {
             .map_err(|e| format!("Memoria delete failed: {e}"))?;
         if !resp.status().is_success() {
             return Err(format!("Memoria delete HTTP {}", resp.status()));
+        }
+        Ok(())
+    }
+
+    /// Persist an episodic session summary via v1 `/v1/memories` with
+    /// `memory_type=episodic`. The session_id is mandatory — episodes
+    /// without a session_id would never be cleaned up.
+    async fn store_episode(&self, session_id: &str, overview: &str) -> Result<String, String> {
+        if session_id.is_empty() {
+            return Err("store_episode requires non-empty session_id".into());
+        }
+        if overview.trim().is_empty() {
+            return Err("store_episode: empty overview".into());
+        }
+        let url = format!("{}/v1/memories", self.base_url.trim_end_matches('/'));
+        let body = json!({
+            "content": overview,
+            "memory_type": "episodic",
+            "session_id": session_id,
+            "trust_tier": "T3",
+            "source": {"agent": "session_end_orchestrator"},
+            "tags": ["astra:episode"],
+        });
+        let resp = self
+            .http
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("Memoria store_episode failed: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("Memoria store_episode HTTP {}", resp.status()));
+        }
+        let data: Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("Memoria store_episode parse failed: {e}"))?;
+        Ok(data
+            .get("memory_id")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .unwrap_or_default())
+    }
+
+    /// Persist a reflect scene candidate as a `semantic` memory tagged
+    /// `astra:scene`. Forward-feeds reflection output into the next
+    /// session's prewarm via the `astra:scene` tag — see
+    /// `session_end_governance` for the call site.
+    async fn store_scene(
+        &self,
+        session_id: &str,
+        signal: &str,
+        summary: &str,
+    ) -> Result<String, String> {
+        if summary.trim().is_empty() {
+            return Err("store_scene: empty summary".into());
+        }
+        let url = format!("{}/v1/memories", self.base_url.trim_end_matches('/'));
+        let content = if signal.trim().is_empty() {
+            format!("[scene] {summary}")
+        } else {
+            format!("[scene:{}] {summary}", signal.trim())
+        };
+        let mut body = json!({
+            "content": content,
+            "memory_type": "semantic",
+            "trust_tier": "T4",
+            "source": {"agent": "session_end_reflect"},
+            "tags": ["astra:scene"],
+        });
+        if !session_id.is_empty() {
+            body["session_id"] = json!(session_id);
+        }
+        let resp = self
+            .http
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("Memoria store_scene failed: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("Memoria store_scene HTTP {}", resp.status()));
+        }
+        let data: Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("Memoria store_scene parse failed: {e}"))?;
+        Ok(data
+            .get("memory_id")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .unwrap_or_default())
+    }
+
+    async fn reflect_session(
+        &self,
+        session_id: &str,
+        force: bool,
+    ) -> Result<ReflectSummary, String> {
+        let url = format!("{}/v1/reflect", self.base_url.trim_end_matches('/'));
+        // Use `candidates` mode so we always get the raw cluster list
+        // back. Memoria's `internal` mode synthesizes scenes server-side
+        // via its own LLM, but that requires LLM_API_KEY on the server —
+        // in the common case the backend is LLM-less. `candidates` works
+        // regardless and lets the client forward-feed the clusters as
+        // `astra:scene`-tagged memories so next-session prewarm sees them.
+        let mut body = json!({"force": force, "mode": "candidates"});
+        if !session_id.is_empty() {
+            body["session_id"] = json!(session_id);
+        }
+        let resp = self
+            .http
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("Memoria reflect failed: {e}"))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(format!(
+                "Memoria reflect HTTP {status}: {}",
+                text.chars().take(120).collect::<String>()
+            ));
+        }
+        let data: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        let candidate_payloads = parse_reflect_candidates(&data);
+        let candidate_count = candidate_payloads.len() as u64;
+        Ok(ReflectSummary {
+            synthesized: data
+                .get("synthesized")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            candidates: candidate_count.max(
+                data.get("scenes_created")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+            ),
+            candidate_payloads,
+            diagnostics: text.chars().take(200).collect(),
+        })
+    }
+
+    async fn focus(
+        &self,
+        session_id: &str,
+        focus_type: &str,
+        value: &str,
+        boost: Option<f64>,
+        ttl_secs: Option<i64>,
+    ) -> Result<(), String> {
+        if !matches!(focus_type, "topic" | "tag" | "memory_id" | "session") {
+            return Err(format!(
+                "invalid focus_type {focus_type:?}; expected topic/tag/memory_id/session"
+            ));
+        }
+        let value = value.trim();
+        if value.is_empty() {
+            return Err("focus: empty value".into());
+        }
+        let boost = boost.unwrap_or(1.5);
+        let ttl = ttl_secs.unwrap_or(3600).max(1) as u64;
+        let expires_at = std::time::Instant::now() + std::time::Duration::from_secs(ttl);
+        let key = if session_id.is_empty() {
+            "_global".to_string()
+        } else {
+            session_id.to_string()
+        };
+        let Ok(mut store) = self.focus_store.write() else {
+            return Err("focus store poisoned".into());
+        };
+        let bucket = store.entry(key).or_default();
+        bucket.retain(|h| !(h.focus_type == focus_type && h.value == value));
+        bucket.push(RuntimeFocusHint {
+            focus_type: focus_type.to_string(),
+            value: value.to_string(),
+            boost,
+            expires_at,
+        });
+        Ok(())
+    }
+
+    async fn feedback(
+        &self,
+        memory_id: &str,
+        signal: &str,
+        context: Option<&str>,
+    ) -> Result<(), String> {
+        if memory_id.is_empty() {
+            return Err("feedback: empty memory_id".into());
+        }
+        if !matches!(signal, "useful" | "irrelevant" | "outdated" | "wrong") {
+            return Err(format!("invalid feedback signal {signal:?}"));
+        }
+        use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+        let encoded = utf8_percent_encode(memory_id, NON_ALPHANUMERIC).to_string();
+        let url = format!(
+            "{}/v1/memories/{}/feedback",
+            self.base_url.trim_end_matches('/'),
+            encoded
+        );
+        let mut body = json!({"signal": signal});
+        if let Some(ctx) = context {
+            body["context"] = json!(ctx);
+        }
+        let resp = self
+            .http
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("Memoria feedback failed: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("Memoria feedback HTTP {}", resp.status()));
         }
         Ok(())
     }
@@ -1216,6 +1713,7 @@ mod tests {
             content: "User prefers Rust".to_string(),
             memory_type: "working".to_string(),
             retrieval_score: Some(0.9),
+            ..Default::default()
         }];
         let ctx = build_memory_context(&memories, 1000);
         assert!(ctx.contains("User prefers Rust"));
@@ -1230,12 +1728,14 @@ mod tests {
                 content: "A".repeat(100),
                 memory_type: "working".to_string(),
                 retrieval_score: None,
+                ..Default::default()
             },
             MemoriaMemory {
                 memory_id: "m2".to_string(),
                 content: "B".repeat(100),
                 memory_type: "working".to_string(),
                 retrieval_score: None,
+                ..Default::default()
             },
         ];
         // With very small token limit, should only include first
@@ -1324,6 +1824,7 @@ mod tests {
             content: "Working on auth module".to_string(),
             memory_type: "working".to_string(),
             retrieval_score: Some(0.8),
+            ..Default::default()
         }]);
         let params = MemoriaCompactParams {
             budget_chars: 10000,
@@ -1424,6 +1925,7 @@ mod tests {
             content: "Working on auth module".to_string(),
             memory_type: "working".to_string(),
             retrieval_score: Some(0.8),
+            ..Default::default()
         }]);
         let params = MemoriaCompactParams {
             budget_chars: 10000,
@@ -2006,6 +2508,7 @@ mod tests {
             content: "Working on auth module".to_string(),
             memory_type: "working".to_string(),
             retrieval_score: Some(0.8),
+            ..Default::default()
         }]);
         let params = MemoriaCompactParams {
             budget_chars: 10000,
@@ -2162,6 +2665,7 @@ mod tests {
             content: "Working on auth module".to_string(),
             memory_type: "working".to_string(),
             retrieval_score: Some(0.8),
+            ..Default::default()
         }]);
         let params = MemoriaCompactParams {
             budget_chars: 10000,
@@ -2202,6 +2706,170 @@ mod tests {
             "should not store semantic entries when disabled, got {}",
             semantic_entries.len()
         );
+    }
+
+    /// P3 regression: `purge_working` must send `session_id` +
+    /// `memory_types=["working"]` to Memoria's v1 purge endpoint, NOT a
+    /// topic-based fulltext query. Verified by running a one-shot TCP
+    /// mock that captures the request body and echoes a response.
+    #[tokio::test]
+    async fn purge_working_sends_session_id_selector_not_topic() {
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = Arc::new(std::sync::Mutex::new(String::new()));
+        let captured_cl = captured.clone();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            // Read until we see \r\n\r\n then the declared Content-Length.
+            loop {
+                let n = sock.read(&mut tmp).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if let Some(idx) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = std::str::from_utf8(&buf[..idx]).unwrap_or("");
+                    let cl: usize = headers
+                        .lines()
+                        .find_map(|l| {
+                            l.strip_prefix("content-length: ")
+                                .or_else(|| l.strip_prefix("Content-Length: "))
+                        })
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(0);
+                    let body_so_far = buf.len() - idx - 4;
+                    if body_so_far >= cl {
+                        break;
+                    }
+                }
+            }
+            let full = String::from_utf8_lossy(&buf).to_string();
+            let body_start = full.find("\r\n\r\n").map(|i| i + 4).unwrap_or(full.len());
+            *captured_cl.lock().unwrap() = full[body_start..].to_string();
+            let payload = b"{\"purged\": 3}";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                payload.len()
+            );
+            let _ = sock.write_all(response.as_bytes()).await;
+            let _ = sock.write_all(payload).await;
+            let _ = sock.shutdown().await;
+        });
+
+        let client = HttpMemoriaClient::new(format!("http://{addr}"), "test-key".to_string());
+        let purged = client
+            .purge_working("8ae95566-f123-4abc-9def-0123456789ab")
+            .await
+            .expect("purge ok");
+        assert_eq!(purged, 3, "must parse `purged` from response");
+        server.await.unwrap();
+
+        let body = captured.lock().unwrap().clone();
+        let json: serde_json::Value = serde_json::from_str(&body)
+            .unwrap_or_else(|e| panic!("body parse fail: {e}, body=<{body}>"));
+        assert_eq!(
+            json.get("session_id").and_then(Value::as_str),
+            Some("8ae95566-f123-4abc-9def-0123456789ab"),
+            "session_id must be forwarded exactly"
+        );
+        let types = json
+            .get("memory_types")
+            .and_then(Value::as_array)
+            .expect("memory_types array");
+        assert_eq!(types.len(), 1);
+        assert_eq!(types[0].as_str(), Some("working"));
+        assert!(
+            json.get("topic").is_none(),
+            "must NOT send topic-based selector (ngram doesn't match UUIDs)"
+        );
+    }
+
+    #[tokio::test]
+    async fn purge_working_rejects_empty_session_id() {
+        let client = HttpMemoriaClient::new("http://127.0.0.1:1".into(), "key".into());
+        let err = client.purge_working("").await.unwrap_err();
+        assert!(
+            err.contains("non-empty"),
+            "expected validation error: {err}"
+        );
+    }
+
+    // ── P7: parse_reflect_candidates ──────────────────────────────────
+
+    #[test]
+    fn parse_reflect_candidates_returns_empty_when_no_field() {
+        let data = serde_json::json!({"scenes_created": 0});
+        assert!(parse_reflect_candidates(&data).is_empty());
+    }
+
+    #[test]
+    fn parse_reflect_candidates_flattens_memories_into_summary() {
+        let data = serde_json::json!({
+            "candidates": [
+                {
+                    "signal": "auth-redirect",
+                    "importance": 0.9,
+                    "memories": [
+                        {"memory_id": "m1", "content": "fixed OAuth callback"},
+                        {"memory_id": "m2", "content": "added state param"},
+                    ]
+                },
+                {
+                    "signal": "test-flake",
+                    "importance": 0.4,
+                    "memories": [
+                        {"memory_id": "m3", "content": "integration suite timeout"},
+                    ]
+                }
+            ]
+        });
+        let parsed = parse_reflect_candidates(&data);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].signal, "auth-redirect");
+        assert!((parsed[0].importance - 0.9).abs() < 1e-6);
+        assert_eq!(
+            parsed[0].summary,
+            "- fixed OAuth callback\n- added state param"
+        );
+        assert_eq!(parsed[1].signal, "test-flake");
+        assert_eq!(parsed[1].summary, "- integration suite timeout");
+    }
+
+    #[test]
+    fn parse_reflect_candidates_skips_empty_entries() {
+        let data = serde_json::json!({
+            "candidates": [
+                {"signal": "", "memories": []},
+                {"signal": "useful", "memories": [{"content": "x"}]},
+            ]
+        });
+        let parsed = parse_reflect_candidates(&data);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].signal, "useful");
+    }
+
+    #[test]
+    fn parse_reflect_candidates_trims_and_skips_empty_content() {
+        let data = serde_json::json!({
+            "candidates": [
+                {
+                    "signal": "x",
+                    "memories": [
+                        {"content": "   "},
+                        {"content": "real body"},
+                        {"content": ""},
+                    ]
+                }
+            ]
+        });
+        let parsed = parse_reflect_candidates(&data);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].summary, "- real body");
     }
 
     /// audit-A3: HttpMemoriaClient must have connect_timeout and timeout so a

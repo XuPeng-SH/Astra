@@ -339,20 +339,24 @@ fn memory_schema_requires_content_query_new_content_signal() {
     let schemas = all_tool_schemas();
     let mem = tool_schema(&schemas, "memory");
     assert_eq!(
-        conditional_required_for(mem, "store"),
+        conditional_required_for(mem, "remember"),
         vec!["content".to_string()]
     );
     assert_eq!(
-        conditional_required_for(mem, "retrieve"),
+        conditional_required_for(mem, "recall"),
         vec!["query".to_string()]
     );
     assert_eq!(
-        conditional_required_for(mem, "search"),
-        vec!["query".to_string()]
+        conditional_required_for(mem, "expand"),
+        vec!["memory_id".to_string()]
     );
     assert_eq!(
-        conditional_required_for(mem, "correct"),
-        vec!["new_content".to_string(), "reason".to_string()]
+        conditional_required_for(mem, "forget"),
+        vec!["reason".to_string()]
+    );
+    assert_eq!(
+        conditional_required_for(mem, "update"),
+        vec!["reason".to_string()]
     );
     assert_eq!(
         conditional_required_for(mem, "feedback"),
@@ -379,10 +383,6 @@ fn session_schema_requires_path_value_tool_question_query() {
     assert_eq!(
         conditional_required_for(sess, "ask_user"),
         vec!["question".to_string()]
-    );
-    assert_eq!(
-        conditional_required_for(sess, "tool_search"),
-        vec!["query".to_string()]
     );
 }
 

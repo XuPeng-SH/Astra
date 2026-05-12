@@ -236,6 +236,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "toml 1.1.2+spec-1.1.0",
+ "tracing",
 ]
 
 [[package]]
@@ -583,6 +584,7 @@ dependencies = [
  "astra-core",
  "astra-prompts",
  "astra-sandbox",
+ "astra-turn-types",
  "async-trait",
  "base64",
  "chrono",
