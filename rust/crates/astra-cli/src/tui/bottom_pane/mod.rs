@@ -337,6 +337,30 @@ impl BottomPane {
         id
     }
 
+    /// Issue #326 P3: enqueue with the full metadata bundle. Used
+    /// by the stream-render gate when it has source_agent / risk
+    /// tags / Will-save preview / host context to attach.
+    pub fn enqueue_approval_with_metadata(
+        &mut self,
+        tool: String,
+        header: String,
+        detail: Option<String>,
+        reason: String,
+        response_tx: oneshot::Sender<ApprovalResponse>,
+        metadata: crate::tui::approval::queue::ApprovalMetadata,
+    ) -> u64 {
+        let id = self.approval_queue.push_with_metadata(
+            tool,
+            header,
+            detail,
+            reason,
+            response_tx,
+            metadata,
+        );
+        self.footer.pending_approvals = self.approval_queue.len();
+        id
+    }
+
     /// Snapshot of pending approvals (safe to pass to rendering code).
     pub fn approval_views(&self) -> Vec<ApprovalView> {
         self.approval_queue.views()
@@ -405,16 +429,33 @@ impl BottomPane {
         let action = self.approval_queue.focused_button_action()?;
         match action {
             ButtonAction::Respond(resp) => {
-                let id = self.respond_focused_approval(resp)?;
+                let id = self.respond_focused_approval(resp.clone())?;
                 Some(ApprovalActivation::Single { id, response: resp })
             }
             ButtonAction::RespondAll(resp) => {
-                let n = self.approval_queue.respond_all(resp);
+                let n = self.approval_queue.respond_focused_group(resp.clone());
                 self.footer.pending_approvals = self.approval_queue.len();
                 Some(ApprovalActivation::Batch {
                     count: n,
                     response: resp,
                 })
+            }
+            ButtonAction::SelectScope(scope) => {
+                self.approval_queue.select_scope_for_focused(scope);
+                None
+            }
+            ButtonAction::SelectMatch(target) => {
+                let response = self.approval_queue.response_for_match_target(target)?;
+                let id = self.respond_focused_approval(response.clone())?;
+                Some(ApprovalActivation::Single { id, response })
+            }
+            ButtonAction::EditCustomPrefix => {
+                self.approval_queue.enter_custom_prefix_for_focused();
+                None
+            }
+            ButtonAction::BackToScopes => {
+                self.approval_queue.back_to_scope_for_focused();
+                None
             }
         }
     }
@@ -474,6 +515,36 @@ impl BottomPane {
             true,
         );
         cell.buttons = buttons;
+        // Issue #326 P3: forward the view's metadata so the
+        // approval card renders the source-agent / host /
+        // risk-tag / will-save lines populated by
+        // enqueue_approval_with_metadata.
+        if let Some(agent) = view.source_agent {
+            cell = cell.with_source_agent(agent);
+        }
+        if let Some(host) = view.host {
+            cell = cell.with_host(host);
+        }
+        if !view.risk_tag_labels.is_empty() {
+            cell = cell.with_risk_tag_labels(view.risk_tag_labels);
+        }
+        if let Some(preview) = view.will_save_preview {
+            cell = cell.with_will_save_preview(preview);
+        }
+        if let Some(hint) = view.selection_hint {
+            cell = cell.with_selection_hint(hint);
+        }
+        if let Some(input) = view.custom_match_input {
+            cell = cell.with_custom_match_input(input);
+        }
+        if let Some(source) = view.custom_match_source {
+            cell = cell.with_custom_match_source(source);
+        }
+        cell = cell.with_scope_context(
+            view.workspace_untrusted,
+            view.is_compound_command,
+            view.has_dynamic_eval,
+        );
         Some(cell)
     }
 
@@ -570,8 +641,29 @@ impl BottomPane {
             }
             return Some(BottomPaneAction::Quit);
         }
-        // Ctrl+D: empty composer → quit; otherwise consumed.
+        // Ctrl+D: route by context.
+        //
+        // Issue #326 P3 / R2 Major 6: plan v3 §P3 wants Reject to be
+        // an explicit gesture — the "Esc rejects" shortcut from
+        // earlier UI iterations was hostile when an approval popped
+        // up while the user was mid-typing in the composer, because
+        // pressing Esc to dismiss a popup would silently reject
+        // the approval too.
+        //
+        // Routing:
+        // 1. Pending approval + composer empty → Reject focused.
+        //    The composer-empty guard means user typing "do this"
+        //    pressing the wrong key never accidentally rejects;
+        //    Ctrl+D is intentional.
+        // 2. Otherwise composer empty (no approval) → quit.
+        // 3. Composer not empty → consumed (no-op).
         if key.code == KeyCode::Char('d') && ctrl {
+            if self.has_pending_approvals() && self.composer.is_empty() {
+                if let Some(id) = self.reject_focused_approval() {
+                    return Some(BottomPaneAction::ApprovalResolved { id });
+                }
+                return Some(BottomPaneAction::Consumed);
+            }
             if self.composer.is_empty() && self.view_stack.is_empty() {
                 return Some(BottomPaneAction::Quit);
             }
@@ -590,6 +682,32 @@ impl BottomPane {
             return None;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if self.approval_queue.focused_custom_prefix_active() {
+            return match key.code {
+                KeyCode::Enter => {
+                    if let Some(response) = self.approval_queue.submit_custom_prefix_for_focused() {
+                        if let Some(id) = self.respond_focused_approval(response) {
+                            return Some(BottomPaneAction::ApprovalResolved { id });
+                        }
+                    }
+                    Some(BottomPaneAction::Consumed)
+                }
+                KeyCode::Esc => {
+                    self.approval_queue.cancel_custom_prefix_for_focused();
+                    Some(BottomPaneAction::Consumed)
+                }
+                KeyCode::Backspace => {
+                    self.approval_queue.pop_custom_prefix_char();
+                    Some(BottomPaneAction::Consumed)
+                }
+                KeyCode::Char(ch) if !ctrl => {
+                    self.approval_queue.push_custom_prefix_char(ch);
+                    Some(BottomPaneAction::Consumed)
+                }
+                _ => None,
+            };
+        }
+
         // Ctrl+Enter → quick accept regardless of button focus.
         if key.code == KeyCode::Enter && ctrl {
             if let Some(id) = self.respond_focused_approval(ApprovalResponse::AllowOnce) {
@@ -986,7 +1104,7 @@ fn render_hint_bar(hint: &str, area: Rect, buf: &mut Buffer) {
 
 /// Summary of what happened when the user activates a button on the
 /// focused approval cell.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ApprovalActivation {
     /// Resolved a single entry via its button.
     Single { id: u64, response: ApprovalResponse },

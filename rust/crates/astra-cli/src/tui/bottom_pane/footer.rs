@@ -53,7 +53,6 @@ impl Footer {
         match self.permission_mode.as_deref() {
             Some("auto") => PermissionMode::Auto,
             Some("deny") => PermissionMode::Deny,
-            Some("bypass") => PermissionMode::Bypass,
             _ => PermissionMode::Ask,
         }
     }

@@ -13,7 +13,6 @@ fn items() -> Vec<SlashItem> {
         SlashItem::simple("/resume", "resume a session"),
         SlashItem::simple("/review", "review changes"),
         SlashItem::simple("/allow", "allow tool"),
-        SlashItem::simple("/yolo", "bypass prompts"),
     ]
 }
 
@@ -58,10 +57,9 @@ fn empty_filter_shows_all_items_in_registered_order() {
             "/resume",
             "/review",
             "/allow",
-            "/yolo",
         ]
     );
-    assert_eq!(menu.len(), 8);
+    assert_eq!(menu.len(), 7);
     assert!(!menu.is_empty());
 }
 
@@ -135,7 +133,7 @@ fn filter_accepts_empty_slash() {
     let mut menu = SlashMenu::new(items());
     menu.set_filter("/");
     // With only '/' typed, show everything.
-    assert_eq!(menu.len(), 8);
+    assert_eq!(menu.len(), 7);
     assert_eq!(menu.selected_item().map(|i| i.name), Some("/help"));
 }
 

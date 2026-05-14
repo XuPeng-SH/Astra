@@ -27,6 +27,33 @@ pub fn command_hint_from_args(args: &Value) -> Option<&str> {
     args.get("command").and_then(Value::as_str)
 }
 
+/// Extract the persistent allow-rule prefix from a shell command.
+///
+/// We stop at the first flag, the first shell metacharacter, or after at most
+/// three tokens. That keeps "Always allow" precise enough for subcommands
+/// without baking user data or flags into the rule.
+#[must_use]
+pub fn normalized_argv_prefix(cmd: &str) -> String {
+    const MAX_PREFIX_TOKENS: usize = 3;
+    const SHELL_METACHARS: &[&str] = &["|", ";", "&&", "||", ">", "<", ">>", "<<", "&"];
+
+    let mut tokens = Vec::new();
+    for raw in cmd.split_whitespace() {
+        if SHELL_METACHARS.contains(&raw) {
+            break;
+        }
+        if raw.starts_with('-') {
+            break;
+        }
+        tokens.push(raw);
+        if tokens.len() >= MAX_PREFIX_TOKENS {
+            break;
+        }
+    }
+
+    tokens.join(" ")
+}
+
 /// Raw hint used for **permission rule matching** — `starts_with`
 /// checks against deny/allow rule patterns depend on this being the
 /// naked `command` / `path` value, not a formatted preview.
@@ -122,6 +149,18 @@ mod tests {
     // label lives in `permission_prompt_display_label` — separating
     // the two avoids silently bypassing deny rules when the display
     // format changes.
+
+    #[test]
+    fn normalized_argv_prefix_stops_at_flags_and_shell_meta() {
+        assert_eq!(normalized_argv_prefix("cargo test --release"), "cargo test");
+        assert_eq!(
+            normalized_argv_prefix("npm run deploy:prod -- --foo"),
+            "npm run deploy:prod"
+        );
+        assert_eq!(normalized_argv_prefix("git commit -m 'fix'"), "git commit");
+        assert_eq!(normalized_argv_prefix("bash -c 'rm -rf tmp'"), "bash");
+        assert_eq!(normalized_argv_prefix("echo hi > out.txt"), "echo hi");
+    }
 
     #[test]
     fn permission_detail_execute_prefers_command_over_path() {

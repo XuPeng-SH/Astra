@@ -116,7 +116,11 @@ pub mod xml_tool_call_fallback;
 
 // Phase 15: turn leaf modules + cloud session modules
 pub mod action_compensation;
+pub mod approval_base_digest;
+pub mod approval_batch_group;
 pub mod approval_fingerprint;
+pub mod approval_request_key;
+pub mod approval_sink;
 pub mod chat_turn_sse_dispatch;
 pub mod cloud_approval_policy;
 pub mod cloud_attachments;
@@ -128,6 +132,16 @@ pub mod counter;
 pub mod delegation_tree;
 pub mod headless_tool_journal;
 pub mod orchestration_types;
+pub mod permission_audit;
+pub mod permission_compound_command;
+pub mod permission_cwd_root;
+pub mod permission_engine;
+pub mod permission_match_target;
+pub mod permission_path_glob;
+pub mod permission_redact;
+pub mod permission_rule_grammar;
+pub mod permission_scope;
+pub mod permission_script_preview;
 pub mod permission_sync;
 pub mod permission_types;
 pub mod persist;

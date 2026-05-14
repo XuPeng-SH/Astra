@@ -4,7 +4,7 @@ mod testing;
 mod tests;
 
 mod app_event;
-mod approval;
+pub(crate) mod approval;
 pub(crate) mod background_tasks;
 mod board_pin;
 mod bottom_pane;

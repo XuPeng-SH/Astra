@@ -1727,7 +1727,7 @@ async fn e2e_joint_5_s14_8k_window_four_devices_and_lease_expiry() {
     // process-wide broadcast channel. When other concurrent tests
     // also leak stale leases, our `rx` sees their events too — so we
     // can't take the first event blindly. Drain the channel until we
-    // find the one keyed to *our* session_id (or time out).
+    // find the one keyed to *our* session_id and device_id (or time out).
     let event = {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         loop {
@@ -1736,10 +1736,12 @@ async fn e2e_joint_5_s14_8k_window_four_devices_and_lease_expiry() {
                 .await
                 .expect("S14 device lease SSE parity event must be published")
                 .expect("S14 device lease event receiver must be open");
-            if ev.get("session_id").and_then(Value::as_str) == Some(session_id.as_str()) {
+            if ev.get("session_id").and_then(Value::as_str) == Some(session_id.as_str())
+                && ev.get("device_id").and_then(Value::as_str) == Some("device-2")
+            {
                 break ev;
             }
-            // Foreign session — keep draining until we hit ours.
+            // Foreign session/device — keep draining until we hit ours.
         }
     };
     assert!(

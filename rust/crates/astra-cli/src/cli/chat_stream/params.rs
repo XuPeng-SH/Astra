@@ -140,7 +140,13 @@ pub fn new_tool_use_id() -> String {
 }
 
 /// User's response to an approval prompt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Issue #326 P0 / R2 Minor 4: `AutoRunSession` was removed because
+/// its semantics ("flip the whole session into Auto mode") clashed
+/// with P3's per-fingerprint `AllowScope::RestOfSession`. Global mode
+/// changes now go through the status line / `/mode auto` slash
+/// command; this enum stays focused on per-call decisions.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApprovalResponse {
     /// Allow this one invocation.
     AllowOnce,
@@ -148,29 +154,89 @@ pub enum ApprovalResponse {
     Deny,
     /// Always allow this tool pattern (persistent rule).
     AlwaysAllow,
-    /// Switch to auto-run mode for the rest of the session.
-    AutoRunSession,
+    /// Always allow with an explicit user-selected scope from the
+    /// TUI scope picker.
+    AlwaysAllowScoped(astra_turn_core::permission_scope::AllowScope),
+    /// Always allow with both dimensions selected by the user:
+    /// lifetime/sink scope and match target.
+    AlwaysAllowScopedTarget {
+        scope: astra_turn_core::permission_scope::AllowScope,
+        match_target: astra_turn_core::permission_match_target::AllowMatchTarget,
+    },
     /// Skip this tool (deny without recording).
     Skip,
 }
 
 impl ApprovalResponse {
-    pub fn is_approved(self) -> bool {
+    pub fn is_approved(&self) -> bool {
         matches!(
             self,
-            Self::AllowOnce | Self::AlwaysAllow | Self::AutoRunSession
+            Self::AllowOnce
+                | Self::AlwaysAllow
+                | Self::AlwaysAllowScoped(_)
+                | Self::AlwaysAllowScopedTarget { .. }
         )
+    }
+
+    pub fn always_scope(
+        &self,
+        default_scope: astra_turn_core::permission_scope::AllowScope,
+    ) -> Option<astra_turn_core::permission_scope::AllowScope> {
+        match self {
+            Self::AlwaysAllow => Some(default_scope),
+            Self::AlwaysAllowScoped(scope) => Some(*scope),
+            Self::AlwaysAllowScopedTarget { scope, .. } => Some(*scope),
+            _ => None,
+        }
+    }
+
+    pub fn match_target(
+        &self,
+    ) -> Option<&astra_turn_core::permission_match_target::AllowMatchTarget> {
+        match self {
+            Self::AlwaysAllowScopedTarget { match_target, .. } => Some(match_target),
+            _ => None,
+        }
     }
 }
 
 /// Approval request sent from the SSE stream host to the plan executor / REPL
 /// when a tool requires interactive approval (bypass-immune check).
+///
+/// Issue #326 P3: optional `metadata` carries the source-agent /
+/// host / risk-tag / will-save-preview / base-digest fields the
+/// TUI uses to populate the approval card. Senders that compute
+/// these fields attach them; senders that don't leave the field
+/// `None` and the TUI falls back to the bare card.
 pub struct ApprovalRequest {
     pub tool: String,
     pub header: String,
     pub detail: Option<String>,
     pub reason: String,
     pub response_tx: tokio::sync::oneshot::Sender<ApprovalResponse>,
+    /// Optional enriched metadata. Stored as `Option<Box<…>>` so
+    /// the empty case stays cheap on the message channel.
+    pub metadata: Option<Box<crate::tui::approval::queue::ApprovalMetadata>>,
+}
+
+impl ApprovalRequest {
+    /// Convenience for senders that don't carry metadata.
+    pub fn bare(
+        tool: String,
+        header: String,
+        detail: Option<String>,
+        reason: String,
+        response_tx: tokio::sync::oneshot::Sender<ApprovalResponse>,
+    ) -> Self {
+        Self {
+            tool,
+            header,
+            detail,
+            reason,
+            response_tx,
+            metadata: None,
+        }
+    }
 }
 
 pub type ApprovalRequestTx = mpsc::UnboundedSender<ApprovalRequest>;

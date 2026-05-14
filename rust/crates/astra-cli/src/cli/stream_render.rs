@@ -85,6 +85,323 @@ use super::effects::{
     ThinkingSpinnerKind, ToolRegionState, ToolStdoutLineAnim, thinking_viewport_rows,
 };
 
+fn approval_stale_revalidation_target(tool: &str, args: &Value) -> Option<PathBuf> {
+    if !matches!(tool, "write_file" | "str_replace" | "edit_file") {
+        return None;
+    }
+    args.get("path").and_then(|v| v.as_str()).map(PathBuf::from)
+}
+
+fn describe_stale_check(check: &astra_turn_core::approval_base_digest::StaleCheck) -> String {
+    use astra_turn_core::approval_base_digest::StaleCheck;
+    match check {
+        StaleCheck::Fresh | StaleCheck::StillAbsent => "unchanged".to_string(),
+        StaleCheck::Stale { previous, current } => format!(
+            "changed from {} to {}",
+            previous.short_display(),
+            current.short_display()
+        ),
+        StaleCheck::FileGone { previous } => format!(
+            "was removed after approval (previous {})",
+            previous.short_display()
+        ),
+        StaleCheck::AppearedSinceEnqueue { current } => {
+            format!("appeared after approval with {}", current.short_display())
+        }
+    }
+}
+
+fn approval_stale_revalidation_error(
+    tool: &str,
+    path: &Path,
+    previous: Option<astra_turn_core::approval_base_digest::BaseDigest>,
+) -> Option<String> {
+    match astra_turn_core::approval_base_digest::stale_check(path, previous) {
+        Ok(check) if check.is_fresh() => None,
+        Ok(check) => Some(format!(
+            "Approval expired for {tool} on {}: file {}. Please review and approve the new file state.",
+            path.display(),
+            describe_stale_check(&check)
+        )),
+        Err(e) => Some(format!(
+            "Approval revalidation failed for {tool} on {}: {e}",
+            path.display()
+        )),
+    }
+}
+
+fn approval_batch_group_key(
+    tool: &str,
+    args: &Value,
+    risk_tags: &[astra_turn_core::permission_engine::RiskTag],
+) -> astra_turn_core::approval_batch_group::ApprovalBatchGroupKey {
+    let side_effect_label =
+        match astra_turn_core::cloud_approval_policy::cloud_gated_tool_kind_with_args(
+            tool,
+            Some(args),
+        ) {
+            Some(astra_turn_core::cloud_approval_policy::CloudGatedToolKind::Execute) => "Execute",
+            Some(astra_turn_core::cloud_approval_policy::CloudGatedToolKind::Write) => "Write",
+            _ => "Other",
+        };
+    astra_turn_core::approval_batch_group::ApprovalBatchGroupKey::new(
+        tool.to_string(),
+        side_effect_label,
+        risk_tags.iter().map(|tag| format!("{tag:?}")),
+        uuid::Uuid::nil(),
+    )
+}
+
+fn push_risk_tag(
+    tags: &mut Vec<astra_turn_core::permission_engine::RiskTag>,
+    tag: astra_turn_core::permission_engine::RiskTag,
+) {
+    if !tags.contains(&tag) {
+        tags.push(tag);
+    }
+}
+
+fn approval_args_from_cloud_detail(tool: &str, detail: Option<&str>) -> Value {
+    match (
+        astra_turn_core::cloud_approval_policy::cloud_gated_tool_kind(tool),
+        detail,
+    ) {
+        (Some(astra_turn_core::cloud_approval_policy::CloudGatedToolKind::Execute), Some(cmd)) => {
+            serde_json::json!({ "command": cmd })
+        }
+        (Some(astra_turn_core::cloud_approval_policy::CloudGatedToolKind::Write), Some(path)) => {
+            serde_json::json!({ "path": path })
+        }
+        _ => Value::Null,
+    }
+}
+
+fn approval_scope_context_for_tool(
+    tool: &str,
+    args: &Value,
+    source_agent_present: bool,
+    workspace_untrusted: bool,
+) -> astra_turn_core::permission_scope::ScopeAvailabilityContext {
+    use astra_turn_core::permission_engine::RiskTag;
+
+    let mut ctx = astra_turn_core::permission_scope::ScopeAvailabilityContext {
+        source_agent_present,
+        workspace_untrusted,
+        ..Default::default()
+    };
+
+    let base_tag = match astra_turn_core::cloud_approval_policy::cloud_gated_tool_kind_with_args(
+        tool,
+        Some(args),
+    ) {
+        Some(astra_turn_core::cloud_approval_policy::CloudGatedToolKind::Execute) => {
+            RiskTag::BashExecute
+        }
+        Some(astra_turn_core::cloud_approval_policy::CloudGatedToolKind::Write) => {
+            RiskTag::WritesOutsidePackage
+        }
+        _ => RiskTag::BashExecute,
+    };
+    push_risk_tag(&mut ctx.risk_tags, base_tag);
+
+    if let Some(path) = args.get("path").and_then(|v| v.as_str())
+        && astra_turn_core::permission_redact::matches_sensitive_path(path)
+    {
+        push_risk_tag(&mut ctx.risk_tags, RiskTag::WritesSensitiveFile);
+    }
+
+    if tool == "bash"
+        && let Some(cmd) = args.get("command").and_then(|v| v.as_str())
+    {
+        let parsed = astra_turn_core::permission_compound_command::tokenize_compound_command(cmd);
+        ctx.is_compound_command = parsed.steps.len() > 1;
+        ctx.has_dynamic_eval = parsed.has_dynamic_eval;
+
+        if !astra_runtime::tool_sandbox::validate_git_command(cmd).is_empty() {
+            push_risk_tag(&mut ctx.risk_tags, RiskTag::GitDestructive);
+        }
+    }
+
+    // Issue #326 P5 / R2 Major 5: MCP tools without a registered
+    // ToolCapabilityMetadata default to MCPUnknownCapability. The
+    // server-annotation lookup (slash_mcp's ToolAnnotations →
+    // ApprovalMetadata) can clear this once it is wired.
+    if tool.starts_with("mcp_") {
+        ctx.mcp_unknown_capability = true;
+        push_risk_tag(&mut ctx.risk_tags, RiskTag::MCPUnknownCapability);
+    }
+
+    ctx
+}
+
+fn approval_default_always_scope(
+    ctx: &astra_turn_core::permission_scope::ScopeAvailabilityContext,
+) -> astra_turn_core::permission_scope::AllowScope {
+    use astra_turn_core::permission_scope::{AllowScope, permitted_scopes};
+
+    let scopes = permitted_scopes(ctx);
+    let is_available = |target| {
+        scopes
+            .iter()
+            .any(|entry| entry.scope == target && entry.available)
+    };
+
+    if is_available(AllowScope::Project) {
+        return AllowScope::Project;
+    }
+    if is_available(AllowScope::RestOfSession) {
+        return AllowScope::RestOfSession;
+    }
+    if is_available(AllowScope::RestOfTurn) {
+        return AllowScope::RestOfTurn;
+    }
+
+    AllowScope::OnceThisCall
+}
+
+fn audit_scope_for_always(
+    scope: astra_turn_core::permission_scope::AllowScope,
+) -> astra_turn_core::permission_audit::AllowScope {
+    match scope {
+        astra_turn_core::permission_scope::AllowScope::OnceThisCall => {
+            astra_turn_core::permission_audit::AllowScope::OnceThisCall
+        }
+        astra_turn_core::permission_scope::AllowScope::RestOfTurn => {
+            astra_turn_core::permission_audit::AllowScope::RestOfTurn
+        }
+        astra_turn_core::permission_scope::AllowScope::RestOfSession => {
+            astra_turn_core::permission_audit::AllowScope::RestOfSession
+        }
+        astra_turn_core::permission_scope::AllowScope::Project => {
+            astra_turn_core::permission_audit::AllowScope::Project
+        }
+        astra_turn_core::permission_scope::AllowScope::User => {
+            astra_turn_core::permission_audit::AllowScope::User
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ApprovalMemoryAction {
+    None,
+    RecordAllowTurn,
+    RecordAllowSession,
+    RecordDenySession,
+    PersistProjectRule,
+    PersistUserRule,
+}
+
+fn approval_memory_action(
+    response: &super::chat_stream::ApprovalResponse,
+    always_scope: astra_turn_core::permission_scope::AllowScope,
+    stale_revalidation_passed: bool,
+) -> ApprovalMemoryAction {
+    use super::chat_stream::ApprovalResponse;
+    use astra_turn_core::permission_scope::AllowScope;
+
+    if response.is_approved() && !stale_revalidation_passed {
+        return ApprovalMemoryAction::RecordDenySession;
+    }
+
+    match response {
+        ApprovalResponse::AllowOnce => ApprovalMemoryAction::None,
+        ApprovalResponse::AlwaysAllow
+        | ApprovalResponse::AlwaysAllowScoped(_)
+        | ApprovalResponse::AlwaysAllowScopedTarget { .. } => {
+            let selected_scope = response.always_scope(always_scope).unwrap_or(always_scope);
+            match selected_scope {
+                AllowScope::Project => ApprovalMemoryAction::PersistProjectRule,
+                AllowScope::RestOfSession => ApprovalMemoryAction::RecordAllowSession,
+                AllowScope::RestOfTurn => ApprovalMemoryAction::RecordAllowTurn,
+                AllowScope::OnceThisCall => ApprovalMemoryAction::None,
+                AllowScope::User => ApprovalMemoryAction::PersistUserRule,
+            }
+        }
+        ApprovalResponse::Skip | ApprovalResponse::Deny => ApprovalMemoryAction::None,
+    }
+}
+
+fn persist_scoped_allow_rule(
+    pm: &mut crate::permission_manager::PermissionManager,
+    target: astra_turn_core::permission_audit::PersistTarget,
+    tool: &str,
+    args: &Value,
+    match_target: Option<&astra_turn_core::permission_match_target::AllowMatchTarget>,
+    save_warning_tx: Option<&super::chat_stream::StreamEventTx>,
+) {
+    let default_target = astra_turn_core::permission_match_target::default_match_target(tool, args);
+    let match_target = match_target.unwrap_or(&default_target);
+    pm.record_approval_with_match_target(tool, args, match_target, true);
+    let rule = crate::permission_manager::PermissionManager::make_allow_rule_with_match_target(
+        tool,
+        args,
+        match_target,
+    );
+    match target {
+        astra_turn_core::permission_audit::PersistTarget::Project => pm.add_allow_rule(&rule),
+        astra_turn_core::permission_audit::PersistTarget::User => pm.add_user_allow_rule(&rule),
+    }
+    if let Some(err) = pm.take_last_save_error() {
+        let target_label = match target {
+            astra_turn_core::permission_audit::PersistTarget::Project => ".kiro/permissions.json",
+            astra_turn_core::permission_audit::PersistTarget::User => "~/.astra/permissions.json",
+        };
+        astra_core::agent_warn!(
+            "permission",
+            "Always allow for {tool} is session-only; failed to save rule {rule} to {target_label}: {err}"
+        );
+        if let Some(tx) = save_warning_tx {
+            let _ = tx.send(super::chat_stream::StreamEvent::StatusLine(format!(
+                "Failed to save permission rule {rule} to {target_label}: {err}"
+            )));
+        }
+    }
+}
+
+fn apply_approval_memory_action(
+    pm: &mut crate::permission_manager::PermissionManager,
+    action: ApprovalMemoryAction,
+    tool: &str,
+    args: &Value,
+    match_target: Option<&astra_turn_core::permission_match_target::AllowMatchTarget>,
+    save_warning_tx: Option<&super::chat_stream::StreamEventTx>,
+) {
+    let default_target = astra_turn_core::permission_match_target::default_match_target(tool, args);
+    let match_target = match_target.unwrap_or(&default_target);
+    match action {
+        ApprovalMemoryAction::None => {}
+        ApprovalMemoryAction::RecordAllowTurn => {
+            pm.record_turn_approval_with_match_target(tool, args, match_target, true);
+        }
+        ApprovalMemoryAction::RecordAllowSession => {
+            pm.record_approval_with_match_target(tool, args, match_target, true);
+        }
+        ApprovalMemoryAction::RecordDenySession => {
+            pm.record_approval(tool, Some(args), false);
+        }
+        ApprovalMemoryAction::PersistProjectRule => {
+            persist_scoped_allow_rule(
+                pm,
+                astra_turn_core::permission_audit::PersistTarget::Project,
+                tool,
+                args,
+                Some(match_target),
+                save_warning_tx,
+            );
+        }
+        ApprovalMemoryAction::PersistUserRule => {
+            persist_scoped_allow_rule(
+                pm,
+                astra_turn_core::permission_audit::PersistTarget::User,
+                tool,
+                args,
+                Some(match_target),
+                save_warning_tx,
+            );
+        }
+    }
+}
+
 pub use astra_turn_core::chat_turn_sse_dispatch::ChatTurnEdgePending;
 
 // Re-export effects types for callers
@@ -1108,6 +1425,15 @@ impl<'a> CliSseStreamHost<'a> {
         let _ = writer.append(&event);
     }
 
+    fn sync_permission_manager_session_id(&mut self) {
+        let Some(session_id) = self.executor.active_session_id() else {
+            return;
+        };
+        if let Some(pm) = self.perm_manager.as_mut() {
+            pm.set_active_session_id(&session_id);
+        }
+    }
+
     fn emit_execution_boundary_opened(
         &self,
         turn_index: u32,
@@ -1746,6 +2072,125 @@ impl CliSseStreamHost<'_> {
         }
         out
     }
+
+    async fn resolve_cloud_approval_via_tui(
+        &mut self,
+        tool: &str,
+        detail: Option<&str>,
+        display_label: Option<&str>,
+        approval_kind: astra_thin_client::ApprovalKind,
+    ) -> astra_thin_client::ApprovalDecision {
+        use super::chat_stream::ApprovalResponse;
+        use astra_thin_client::ApprovalDecision;
+
+        if let Some(decision) = self.perm_manager.as_mut().and_then(|pm| {
+            pm.preflight_cloud_approval_decision(
+                tool,
+                detail,
+                approval_kind,
+                self.render_policy.is_silent(),
+            )
+        }) {
+            return decision;
+        }
+
+        let Some(tx) = &self.approval_request_tx else {
+            astra_core::agent_warn!(
+                "permission",
+                "Auto-denied cloud approval for {tool}: no TUI approval sink installed"
+            );
+            return ApprovalDecision::Deny;
+        };
+
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+        let header = format!("Cloud approval required: {tool}");
+        let reason = if matches!(approval_kind, astra_thin_client::ApprovalKind::Explicit) {
+            "This tool call requires explicit approval before it can run.".to_string()
+        } else {
+            "Cloud approval required before this tool can run.".to_string()
+        };
+        if tx
+            .send(super::chat_stream::ApprovalRequest::bare(
+                tool.to_string(),
+                header,
+                display_label.or(detail).map(ToString::to_string),
+                reason,
+                resp_tx,
+            ))
+            .is_err()
+        {
+            astra_core::agent_warn!(
+                "permission",
+                "Auto-denied cloud approval for {tool}: TUI approval sink is closed"
+            );
+            return ApprovalDecision::Deny;
+        }
+
+        let response = if let Some(token) = self.cancel_token {
+            tokio::select! {
+                biased;
+                _ = token.cancelled() => ApprovalResponse::Deny,
+                r = resp_rx => r.unwrap_or(ApprovalResponse::Deny),
+            }
+        } else {
+            resp_rx.await.unwrap_or(ApprovalResponse::Deny)
+        };
+
+        let explicit = matches!(approval_kind, astra_thin_client::ApprovalKind::Explicit);
+        let approval_args = approval_args_from_cloud_detail(tool, detail);
+        let always_scope = approval_default_always_scope(&approval_scope_context_for_tool(
+            tool,
+            &approval_args,
+            false,
+            false,
+        ));
+        match response {
+            ApprovalResponse::AllowOnce => ApprovalDecision::Allow,
+            // The current TUI button row has one Always button.
+            // Explicit cloud approvals are confirm-once by contract,
+            // so treat Always as AllowOnce until the P3 scope picker
+            // can disable persistent scopes for this prompt kind.
+            ApprovalResponse::AlwaysAllow
+            | ApprovalResponse::AlwaysAllowScoped(_)
+            | ApprovalResponse::AlwaysAllowScopedTarget { .. }
+                if explicit =>
+            {
+                ApprovalDecision::Allow
+            }
+            ApprovalResponse::AlwaysAllow
+            | ApprovalResponse::AlwaysAllowScoped(_)
+            | ApprovalResponse::AlwaysAllowScopedTarget { .. } => {
+                let action = approval_memory_action(&response, always_scope, true);
+                let save_warning_tx = self.stream_event_tx.clone();
+                if let Some(pm) = self.perm_manager.as_mut() {
+                    apply_approval_memory_action(
+                        pm,
+                        action,
+                        tool,
+                        &approval_args,
+                        response.match_target(),
+                        save_warning_tx.as_ref(),
+                    );
+                }
+                match action {
+                    ApprovalMemoryAction::RecordAllowTurn => ApprovalDecision::Allow,
+                    ApprovalMemoryAction::RecordAllowSession
+                    | ApprovalMemoryAction::PersistProjectRule
+                    | ApprovalMemoryAction::PersistUserRule => ApprovalDecision::AllowSession,
+                    ApprovalMemoryAction::None | ApprovalMemoryAction::RecordDenySession => {
+                        ApprovalDecision::Allow
+                    }
+                }
+            }
+            ApprovalResponse::Skip => {
+                if let Some(pm) = self.perm_manager.as_mut() {
+                    pm.record_approval(tool, Some(&approval_args), false);
+                }
+                ApprovalDecision::Deny
+            }
+            ApprovalResponse::Deny => ApprovalDecision::Deny,
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -1776,6 +2221,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
     fn on_session_id(&mut self, session_id: &str) {
         if self.executor.active_session_id().as_deref() != Some(session_id) {
             self.executor.set_active_session_id(session_id.to_string());
+        }
+        if let Some(pm) = self.perm_manager.as_mut() {
+            pm.set_active_session_id(session_id);
         }
     }
 
@@ -1882,6 +2330,8 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         tool: &str,
         args: &serde_json::Value,
     ) -> EdgeToolExecResult {
+        self.sync_permission_manager_session_id();
+
         // Forward tool-started event to observer channel
         let tool_description = self.render.format_tool_description(tool, args);
         if self.stream_event_tx.is_some() || self.stream_event_sink.is_some() {
@@ -2043,12 +2493,191 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 if let Some(tx) = &self.approval_request_tx {
                     use super::chat_stream::ApprovalResponse;
                     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+                    // Issue #326 P3: compute the metadata bundle so
+                    // the TUI card can render the will-save preview,
+                    // risk badge, and (if applicable) compound-
+                    // command split. Senders without this context
+                    // would call ApprovalRequest::bare instead.
+                    let mut metadata = crate::tui::approval::queue::ApprovalMetadata::default();
+
+                    // Issue #326 P4 / R2 Critical 1: compute the
+                    // ApprovalRequestKey from the live request so
+                    // the queue can dedup any subsequent in-flight
+                    // request that resolves to byte-identical
+                    // (tool, cwd, args). The user only sees one
+                    // prompt; their answer broadcasts to all
+                    // waiting senders.
+                    let request_key =
+                        astra_turn_core::approval_request_key::ApprovalRequestKey::new(
+                            t.clone(),
+                            std::env::current_dir().unwrap_or_default(),
+                            args,
+                            None,
+                            uuid::Uuid::nil(),
+                        );
+                    metadata.request_key = Some(request_key);
+
+                    // Issue #326 P3/P5: one shared host-side
+                    // classifier feeds the risk badges, batch-group
+                    // safety gate, will-save visibility, and the
+                    // actual Always storage action.
+                    let workspace_untrusted = self
+                        .perm_manager
+                        .as_ref()
+                        .is_some_and(|pm| !pm.project_allow_rules_active());
+                    let scope_ctx = approval_scope_context_for_tool(
+                        &t,
+                        args,
+                        metadata.source_agent.is_some(),
+                        workspace_untrusted,
+                    );
+                    metadata.risk_tags = scope_ctx.risk_tags.clone();
+                    metadata.workspace_untrusted = scope_ctx.workspace_untrusted;
+                    metadata.is_compound_command = scope_ctx.is_compound_command;
+                    metadata.has_dynamic_eval = scope_ctx.has_dynamic_eval;
+                    let always_scope = approval_default_always_scope(&scope_ctx);
+                    metadata.custom_match_source =
+                        astra_turn_core::permission_match_target::custom_prefix_source(&t, args);
+
+                    // Will-save: what would Always persist? We use
+                    // the same make_allow_rule the post-resolve
+                    // path uses, so the user sees an exact preview
+                    // of what permissions.json will gain. Only show
+                    // it when the actual default Always scope is
+                    // Project; session-only / call-only approvals
+                    // must not advertise an on-disk write.
+                    if always_scope == astra_turn_core::permission_scope::AllowScope::Project {
+                        let will_save =
+                            crate::permission_manager::PermissionManager::make_allow_rule(&t, args);
+                        // Issue #326 P5 / scenario #28: include
+                        // the package root in the will-save
+                        // preview so the user knows the rule will
+                        // be scoped to (say) `packages/web`, not
+                        // promoted globally. nearest_package_root
+                        // walks up from the cwd looking for a
+                        // package marker (Cargo.toml, package.json,
+                        // pyproject.toml, …); None means
+                        // "workspace root" — we use a literal
+                        // marker so the user sees something.
+                        let cwd = std::env::current_dir().unwrap_or_default();
+                        let scope_label =
+                            astra_turn_core::permission_cwd_root::nearest_package_root(&cwd, None)
+                                .as_deref()
+                                .map(|p| {
+                                    cwd.strip_prefix(p)
+                                        .ok()
+                                        .map(|rel| {
+                                            if rel.as_os_str().is_empty() {
+                                                p.file_name()
+                                                    .map(|n| n.to_string_lossy().into_owned())
+                                                    .unwrap_or_else(|| {
+                                                        p.to_string_lossy().into_owned()
+                                                    })
+                                            } else {
+                                                p.file_name()
+                                                    .map(|n| n.to_string_lossy().into_owned())
+                                                    .unwrap_or_else(|| {
+                                                        p.to_string_lossy().into_owned()
+                                                    })
+                                            }
+                                        })
+                                        .unwrap_or_else(|| p.to_string_lossy().into_owned())
+                                });
+                        let will_save_with_scope = if let Some(label) = scope_label {
+                            format!("{will_save}  (scope: {label}/)")
+                        } else {
+                            will_save
+                        };
+                        metadata.will_save_preview = Some(will_save_with_scope);
+                    }
+                    metadata.batch_group_key =
+                        Some(approval_batch_group_key(&t, args, &metadata.risk_tags));
+
+                    // Issue #326 P5 / scenario #11: when bash is
+                    // about to run a local script, attach a
+                    // preview of the body so the user can read
+                    // the actual code before approving. We only
+                    // detect simple invocations
+                    // (`bash foo.sh`, `./foo.sh`); compound
+                    // commands and shell idioms are handled by
+                    // the compound-command tokenizer above.
+                    if t == "bash" {
+                        if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
+                            if let Some(script_path) =
+                                astra_turn_core::permission_script_preview::looks_like_local_script(
+                                    cmd,
+                                )
+                            {
+                                let cwd = std::env::current_dir()
+                                    .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                                if let Ok(preview) =
+                                    astra_turn_core::permission_script_preview::build_script_preview(
+                                        &script_path,
+                                        &cwd,
+                                    )
+                                {
+                                    if preview.has_destructive_hit
+                                        && !metadata.risk_tags.contains(
+                                            &astra_turn_core::permission_engine::RiskTag::BashExecute,
+                                        )
+                                    {
+                                        // Already pushed above
+                                        // for bash; this branch
+                                        // exists for symmetry
+                                        // when the body has a
+                                        // destructive hit but
+                                        // the cmd_kind didn't
+                                        // mark Execute.
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Issue #326 P5f / R2 Major 3: for file-mutating
+                    // tools, snapshot the target file's SHA-256
+                    // here (host-side, NOT from LLM args). The
+                    // executor's pre-execution stale-check in
+                    // ApprovalQueue::focused_stale_check compares
+                    // this against a fresh read; mismatch =
+                    // re-prompt with new diff. Skipping here
+                    // means no stale revalidation, which is
+                    // safe-fail — the user just doesn't get the
+                    // protection for this tool.
+                    if matches!(t.as_str(), "write_file" | "str_replace" | "edit_file") {
+                        if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
+                            let path_buf = std::path::Path::new(path);
+                            match astra_turn_core::approval_base_digest::compute_file_digest(
+                                path_buf,
+                            ) {
+                                Ok(Some(digest)) => {
+                                    metadata.base_digest = Some(digest);
+                                }
+                                Ok(None) => {
+                                    // Brand-new write to a path
+                                    // that doesn't exist yet —
+                                    // base_digest stays None so
+                                    // the StaleCheck routes
+                                    // through StillAbsent.
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "stream_render: failed to compute base_digest for \
+                                         {tool}={path:?}: {e} — approval will lack stale revalidation",
+                                        tool = t,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    let stale_revalidation = approval_stale_revalidation_target(&t, args)
+                        .map(|path| (path, metadata.base_digest.clone()));
                     let _ = tx.send(super::chat_stream::ApprovalRequest {
                         tool: t.clone(),
                         header,
                         detail,
                         reason,
                         response_tx: resp_tx,
+                        metadata: Some(Box::new(metadata)),
                     });
                     let response = if let Some(token) = self.cancel_token {
                         tokio::select! {
@@ -2059,27 +2688,98 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     } else {
                         resp_rx.await.unwrap_or(ApprovalResponse::Deny)
                     };
-                    if let Some(pm) = self.perm_manager.as_mut() {
-                        match response {
-                            ApprovalResponse::AllowOnce => {
-                                pm.record_approval(&t, Some(args), true);
+                    let mut stale_revalidation_passed = true;
+                    if response.is_approved() {
+                        if let Some((path, previous)) = stale_revalidation.as_ref() {
+                            if let Some(error) =
+                                approval_stale_revalidation_error(&t, path, previous.clone())
+                            {
+                                stale_revalidation_passed = false;
+                                denied_output = Some(error);
                             }
-                            ApprovalResponse::AlwaysAllow => {
-                                pm.record_approval(&t, Some(args), true);
-                                let rule =
-                                    crate::permission_manager::PermissionManager::make_allow_rule(
-                                        &t, args,
-                                    );
-                                pm.add_allow_rule(&rule);
-                            }
-                            ApprovalResponse::AutoRunSession => {
-                                pm.record_approval(&t, Some(args), true);
-                                pm.set_mode(crate::permission_manager::PermissionMode::Auto);
-                            }
-                            ApprovalResponse::Skip | ApprovalResponse::Deny => {}
                         }
                     }
-                    response.is_approved()
+                    let save_warning_tx = self.stream_event_tx.clone();
+                    if let Some(pm) = self.perm_manager.as_mut() {
+                        apply_approval_memory_action(
+                            pm,
+                            approval_memory_action(
+                                &response,
+                                always_scope,
+                                stale_revalidation_passed,
+                            ),
+                            &t,
+                            args,
+                            response.match_target(),
+                            save_warning_tx.as_ref(),
+                        );
+                    }
+                    // Issue #326 P6 / R2 Major 4: emit
+                    // ApprovalResolvedEvent so audit can see
+                    // what the user picked. correlation_id ties
+                    // this back to the PermissionEvaluatedEvent
+                    // that produced the prompt (the engine
+                    // wiring populates that side; today we use
+                    // a tool+timestamp scheme).
+                    {
+                        let timestamp_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+                        let correlation_id = format!("approval-{}-{}", timestamp_ms, t);
+                        let cwd = std::env::current_dir().unwrap_or_default();
+                        let request_key =
+                            astra_turn_core::approval_request_key::ApprovalRequestKey::new(
+                                t.clone(),
+                                cwd,
+                                args,
+                                None,
+                                uuid::Uuid::nil(),
+                            );
+                        let core_response = match response {
+                            ApprovalResponse::AllowOnce => {
+                                astra_turn_core::approval_sink::ApprovalResponse::AllowOnce
+                            }
+                            ApprovalResponse::AlwaysAllow => {
+                                astra_turn_core::approval_sink::ApprovalResponse::AlwaysAllow
+                            }
+                            ApprovalResponse::AlwaysAllowScoped(_) => {
+                                astra_turn_core::approval_sink::ApprovalResponse::AlwaysAllow
+                            }
+                            ApprovalResponse::AlwaysAllowScopedTarget { .. } => {
+                                astra_turn_core::approval_sink::ApprovalResponse::AlwaysAllow
+                            }
+                            ApprovalResponse::Deny => {
+                                astra_turn_core::approval_sink::ApprovalResponse::Deny
+                            }
+                            ApprovalResponse::Skip => {
+                                astra_turn_core::approval_sink::ApprovalResponse::Skip
+                            }
+                        };
+                        let scope = response
+                            .always_scope(always_scope)
+                            .map(audit_scope_for_always);
+                        let match_target = response.match_target().cloned().or_else(|| {
+                            response.always_scope(always_scope).map(|_| {
+                                astra_turn_core::permission_match_target::default_match_target(
+                                    &t, args,
+                                )
+                            })
+                        });
+                        astra_turn_core::permission_audit::record_resolved_for_session(
+                            self.executor.active_session_id().as_deref(),
+                            astra_turn_core::permission_audit::ApprovalResolvedEvent {
+                                timestamp_ms,
+                                correlation_id,
+                                request_key,
+                                response: core_response,
+                                scope,
+                                match_target,
+                                stale_revalidation_passed,
+                            },
+                        );
+                    }
+                    response.is_approved() && stale_revalidation_passed
                 } else if self.render_policy.is_silent() {
                     astra_core::agent_warn!(
                         "permission",
@@ -2090,67 +2790,25 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     }
                     false
                 } else {
-                    self.render.stop_tool_stderr_running();
-                    self.render.stop_tool_stdout_anim();
-                    use crossterm::style::Stylize;
-                    eprintln!("  {}", format!("⚠  {header}").yellow());
-                    if let Some(d) = &detail {
-                        eprintln!("{}", d.as_str().dim());
-                    }
-                    if !reason.is_empty() {
-                        eprintln!("  {}", reason.dim());
-                    }
-                    let ch = tokio::task::spawn_blocking(|| {
-                        crate::permission_manager::PermissionManager::prompt_approval(
-                            crate::permission_manager::ApprovalPromptKind::LocalStandard,
-                        )
-                    })
-                    .await
-                    .unwrap_or('n');
-                    let approved = matches!(ch, 'y' | 'a' | '!');
+                    // Issue #326 P0 (tui-only) / #331: with the
+                    // REPL deleted upstream, TUI is the sole
+                    // interactive mode and it always installs an
+                    // `approval_request_tx`. Reaching this branch
+                    // means: no approval channel AND not silent —
+                    // a configuration mismatch, not a user
+                    // workflow. Fail closed with an actionable
+                    // reason so the LLM sees a Deny instead of
+                    // hanging on a stdin readline that the user
+                    // can't see.
+                    astra_core::agent_warn!(
+                        "permission",
+                        "Auto-denied {t}: no approval sink installed (no TUI, not silent). \
+                         Pass --mode auto or attach to a TUI session. reason={reason}"
+                    );
                     if let Some(pm) = self.perm_manager.as_mut() {
-                        if approved {
-                            pm.record_approval(&t, Some(args), true);
-                        }
-                        if ch == '!' {
-                            let was_auto = matches!(
-                                pm.mode(),
-                                crate::permission_manager::PermissionMode::Auto
-                            );
-                            pm.set_mode(crate::permission_manager::PermissionMode::Auto);
-                            if !was_auto {
-                                // Banner only on actual transition Prompt/Deny → Auto.
-                                // Repeat '!' while already in Auto is a no-op — avoid
-                                // the double-banner the user saw in session c6e18730.
-                                eprintln!(
-                                    "  {}",
-                                    "  ⚡ Auto-run enabled for this session. Use /allow prompt to restore."
-                                        .yellow()
-                                );
-                            }
-                        }
-                        if ch == 'a' {
-                            let rule =
-                                crate::permission_manager::PermissionManager::make_allow_rule(
-                                    &t, args,
-                                );
-                            pm.add_allow_rule(&rule);
-                            let scope = if pm.has_project_root() {
-                                "project"
-                            } else {
-                                "session"
-                            };
-                            eprintln!(
-                                "  {}",
-                                format!("  ✓ {rule}: always allowed ({scope})").dim()
-                            );
-                        }
-                        if ch == 's' {
-                            pm.record_approval(&t, Some(args), false);
-                            eprintln!("  {}", format!("  ✗ {t}: skipped for session").dim());
-                        }
+                        pm.record_approval(&t, Some(args), false);
                     }
-                    approved
+                    false
                 }
             }
         };
@@ -2261,13 +2919,13 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                     // prompts; header/detail/reason otherwise
                                     // come straight from the permission manager
                                     // so we don't echo the same text thrice.
-                                    let _ = tx.send(super::chat_stream::ApprovalRequest {
-                                        tool: sandbox_tool_key.clone(),
-                                        header: format!("🔒 {header}"),
+                                    let _ = tx.send(super::chat_stream::ApprovalRequest::bare(
+                                        sandbox_tool_key.clone(),
+                                        format!("🔒 {header}"),
                                         detail,
                                         reason,
-                                        response_tx: resp_tx,
-                                    });
+                                        resp_tx,
+                                    ));
                                     let response = if let Some(token) = self.cancel_token {
                                         tokio::select! {
                                             biased;
@@ -2277,23 +2935,65 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                     } else {
                                         resp_rx.await.unwrap_or(ApprovalResponse::Deny)
                                     };
-                                    if let ApprovalResponse::AlwaysAllow = response {
-                                        // Persistent: writes a tool-level allow
-                                        // rule to settings for future sessions.
-                                        let rule = crate::permission_manager::PermissionManager::make_allow_rule(&sandbox_tool_key, args);
-                                        pm.add_allow_rule(&rule);
-                                        // Session-scoped trust for the
-                                        // specific path subtree, so later
-                                        // requests under the same directory
-                                        // (from any tool) skip the prompt.
-                                        pm.trust_sandbox_root_from_reason(sandbox_msg);
+                                    let selected_scope = response.always_scope(
+                                        astra_turn_core::permission_scope::AllowScope::Project,
+                                    );
+                                    match selected_scope {
+                                        Some(astra_turn_core::permission_scope::AllowScope::Project) => {
+                                            // Persistent: writes a tool-level allow
+                                            // rule to settings for future sessions.
+                                            let rule = crate::permission_manager::PermissionManager::make_allow_rule(&sandbox_tool_key, &guard_args);
+                                            pm.add_allow_rule(&rule);
+                                            if let Some(err) = pm.take_last_save_error() {
+                                                astra_core::agent_warn!(
+                                                    "permission",
+                                                    "Always allow for {sandbox_tool_key} is session-only; failed to save rule {rule}: {err}"
+                                                );
+                                                if let Some(tx) = &self.stream_event_tx {
+                                                    let _ = tx.send(super::chat_stream::StreamEvent::StatusLine(
+                                                        format!("Failed to save permission rule {rule}: {err}"),
+                                                    ));
+                                                }
+                                            }
+                                            pm.trust_sandbox_root_from_reason(sandbox_msg);
+                                        }
+                                        Some(
+                                            astra_turn_core::permission_scope::AllowScope::RestOfSession,
+                                        ) => {
+                                            pm.trust_sandbox_root_from_reason(sandbox_msg);
+                                        }
+                                        Some(
+                                            astra_turn_core::permission_scope::AllowScope::User,
+                                        ) => {
+                                            let rule = crate::permission_manager::PermissionManager::make_allow_rule(&sandbox_tool_key, &guard_args);
+                                            pm.add_user_allow_rule(&rule);
+                                            if let Some(err) = pm.take_last_save_error() {
+                                                astra_core::agent_warn!(
+                                                    "permission",
+                                                    "Always allow for {sandbox_tool_key} is session-only; failed to save user rule {rule}: {err}"
+                                                );
+                                                if let Some(tx) = &self.stream_event_tx {
+                                                    let _ = tx.send(super::chat_stream::StreamEvent::StatusLine(
+                                                        format!("Failed to save user permission rule {rule}: {err}"),
+                                                    ));
+                                                }
+                                            }
+                                            pm.trust_sandbox_root_from_reason(sandbox_msg);
+                                        }
+                                        Some(
+                                            astra_turn_core::permission_scope::AllowScope::OnceThisCall
+                                            | astra_turn_core::permission_scope::AllowScope::RestOfTurn,
+                                        )
+                                        | None => {}
                                     }
-                                    if response == ApprovalResponse::AutoRunSession {
-                                        pm.set_mode(
-                                            crate::permission_manager::PermissionMode::Auto,
-                                        );
-                                    }
-                                    if response.is_approved() {
+                                    if matches!(
+                                        selected_scope,
+                                        Some(
+                                            astra_turn_core::permission_scope::AllowScope::Project
+                                                | astra_turn_core::permission_scope::AllowScope::RestOfSession
+                                                | astra_turn_core::permission_scope::AllowScope::User
+                                        )
+                                    ) {
                                         pm.record_approval(&sandbox_tool_key, Some(args), true);
                                     }
                                     response.is_approved()
@@ -2306,58 +3006,19 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                     pm.record_approval(&sandbox_tool_key, Some(args), false);
                                     false
                                 } else {
-                                    // Interactive mode: prompt directly
-                                    self.render.stop_tool_stderr_running();
-                                    self.render.stop_tool_stdout_anim();
-                                    use crossterm::style::Stylize;
-                                    eprintln!("  {}", format!("🔒 {sandbox_msg}").yellow());
-                                    if let Some(d) = &detail {
-                                        eprintln!("{}", d.as_str().dim());
-                                    }
-                                    if !reason.is_empty() {
-                                        eprintln!("  {}", reason.dim());
-                                    }
-                                    let ch = tokio::task::spawn_blocking(
-                                        || {
-                                            crate::permission_manager::PermissionManager::prompt_approval(
-                                                crate::permission_manager::ApprovalPromptKind::LocalStandard,
-                                            )
-                                        },
-                                    )
-                                    .await
-                                    .unwrap_or('n');
-                                    let grant = matches!(ch, 'y' | 'a' | '!');
-                                    if grant {
-                                        pm.record_approval(&sandbox_tool_key, Some(args), true);
-                                    }
-                                    if ch == 'a' {
-                                        let rule = crate::permission_manager::PermissionManager::make_allow_rule(&sandbox_tool_key, args);
-                                        pm.add_allow_rule(&rule);
-                                        pm.trust_sandbox_root_from_reason(sandbox_msg);
-                                    }
-                                    if ch == '!' {
-                                        let was_auto = matches!(
-                                            pm.mode(),
-                                            crate::permission_manager::PermissionMode::Auto
-                                        );
-                                        pm.set_mode(
-                                            crate::permission_manager::PermissionMode::Auto,
-                                        );
-                                        if !was_auto {
-                                            // Transition-only banner. Repeat '!'
-                                            // while already in Auto is a no-op.
-                                            use crossterm::style::Stylize;
-                                            eprintln!(
-                                                "  {}",
-                                                "  ⚡ Auto-run enabled for this session. Use /allow prompt to restore."
-                                                .yellow()
-                                            );
-                                        }
-                                    }
-                                    if ch == 's' {
-                                        pm.record_approval(&sandbox_tool_key, Some(args), false);
-                                    }
-                                    grant
+                                    // Issue #326 P0 (tui-only) / #331:
+                                    // legacy interactive stdin path is dead
+                                    // code now that the REPL is gone. With
+                                    // no approval channel and not silent =
+                                    // configuration mismatch, fail closed.
+                                    astra_core::agent_warn!(
+                                        "permission",
+                                        "Auto-denied sandbox expansion {sandbox_tool_key}: \
+                                         no approval sink installed (no TUI, not silent). \
+                                         Pass --mode auto or attach to a TUI session. reason={reason}"
+                                    );
+                                    pm.record_approval(&sandbox_tool_key, Some(args), false);
+                                    false
                                 }
                             }
                         };
@@ -2532,18 +3193,11 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         self.render.stop_tool_stderr_running();
         self.render.stop_tool_stdout_anim();
         self.render.stop_thinking();
-        let decision = match &mut self.perm_manager {
-            Some(pm) => {
-                pm.resolve_cloud_approval_async(
-                    tool,
-                    detail,
-                    display_label,
-                    approval_kind,
-                    self.render_policy.is_silent(),
-                )
+        let decision = if self.perm_manager.is_some() {
+            self.resolve_cloud_approval_via_tui(tool, detail, display_label, approval_kind)
                 .await
-            }
-            None => astra_thin_client::ApprovalDecision::Deny,
+        } else {
+            astra_thin_client::ApprovalDecision::Deny
         };
         let decision_str = match &decision {
             astra_thin_client::ApprovalDecision::Allow
@@ -2584,23 +3238,22 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         self.render.stop_tool_stdout_anim();
         self.render.stop_thinking();
 
-        let decisions = match &mut self.perm_manager {
-            Some(pm) => {
-                let items = requests
-                    .iter()
-                    .map(|request| {
-                        (
-                            request.tool.as_str(),
-                            request.detail.as_deref(),
-                            request.display_label.as_deref(),
-                            request.approval_kind,
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                pm.resolve_cloud_approval_batch_async(&items, self.render_policy.is_silent())
-                    .await
+        let decisions = if self.perm_manager.is_some() {
+            let mut decisions = Vec::with_capacity(requests.len());
+            for request in requests {
+                decisions.push(
+                    self.resolve_cloud_approval_via_tui(
+                        request.tool.as_str(),
+                        request.detail.as_deref(),
+                        request.display_label.as_deref(),
+                        request.approval_kind,
+                    )
+                    .await,
+                );
             }
-            None => vec![astra_thin_client::ApprovalDecision::Deny; requests.len()],
+            decisions
+        } else {
+            vec![astra_thin_client::ApprovalDecision::Deny; requests.len()]
         };
 
         let mut results = Vec::with_capacity(requests.len());
@@ -2642,6 +3295,8 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         &mut self,
         requests: Vec<ToolBatchRequest>,
     ) -> Vec<EdgeToolExecResult> {
+        self.sync_permission_manager_session_id();
+
         let n = requests.len();
 
         // Set batch progress for multi-tool turns.
@@ -3005,10 +3660,21 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         // `3b7ac18f` where `cat ~/claudecode/*` was blocked 4 times in
         // auto mode with no approval path.
         //
-        // Interactive / Prompt mode intentionally stays on the
-        // sequential path — the parallel batch is only used when the
-        // cloud has already pre-approved every request in it, so there
-        // is no UI to invoke here anyway.
+        // For NeedApproval and Deny we now route to the same approval
+        // sink as the sequential path (issue #326 P0 #1 fix). Previously
+        // both were silently `continue`d, which meant Prompt-mode users
+        // never got asked about parallel sandbox-denied tools and Deny
+        // rules fired by parallel retries were invisible. This restores
+        // the contract that **no decision is silently dropped**:
+        //   - Allow       → expand sandbox + retry
+        //   - Deny(reason)→ surface the reason in the SANDBOX_DENIED
+        //                   output so the LLM/user can see it
+        //   - NeedApproval→ ask the TUI sink synchronously; on
+        //                   approval, expand + retry; on rejection,
+        //                   surface the reason
+        //
+        // Interactive / Prompt mode now reaches this branch too because
+        // we no longer assume the parallel batch was pre-approved.
         let mut outputs = outputs;
         for pos in 0..outputs.len() {
             if !crate::sandbox_retry::is_sandbox_denied(&outputs[pos].0.output) {
@@ -3027,10 +3693,91 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 &sandbox_tool_key,
                 &guard_args,
             );
-            let approved = matches!(
-                decision,
-                crate::permission_manager::PermissionDecision::Allow
-            );
+            let approved = match decision {
+                crate::permission_manager::PermissionDecision::Allow => true,
+                crate::permission_manager::PermissionDecision::Deny(reason) => {
+                    // Surface the deny reason so the LLM and user can
+                    // see why the sandbox refused to widen, instead of
+                    // silently continuing with the original
+                    // SANDBOX_DENIED output.
+                    let prefix = "SANDBOX_DENIED: ";
+                    let suffix = format!(" (sandbox_expand:{tool} denied: {reason})");
+                    if !outputs[pos].0.output.contains(&suffix) {
+                        if outputs[pos].0.output.starts_with(prefix) {
+                            outputs[pos].0.output.push_str(&suffix);
+                        } else {
+                            outputs[pos].0.output =
+                                format!("{prefix}{}{suffix}", outputs[pos].0.output);
+                        }
+                    }
+                    false
+                }
+                crate::permission_manager::PermissionDecision::NeedApproval {
+                    tool: approval_tool,
+                    header,
+                    detail,
+                    reason,
+                } => {
+                    use super::chat_stream::ApprovalResponse;
+                    if let Some(tx) = &self.approval_request_tx {
+                        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+                        let _ = tx.send(super::chat_stream::ApprovalRequest::bare(
+                            approval_tool.clone(),
+                            header,
+                            detail,
+                            reason,
+                            resp_tx,
+                        ));
+                        let response = if let Some(token) = self.cancel_token {
+                            tokio::select! {
+                                biased;
+                                _ = token.cancelled() => ApprovalResponse::Deny,
+                                r = resp_rx => r.unwrap_or(ApprovalResponse::Deny),
+                            }
+                        } else {
+                            resp_rx.await.unwrap_or(ApprovalResponse::Deny)
+                        };
+                        if let Some(pm) = self.perm_manager.as_mut() {
+                            if response.is_approved() {
+                                let workspace_untrusted = !pm.project_allow_rules_active();
+                                let always_scope = approval_default_always_scope(
+                                    &approval_scope_context_for_tool(
+                                        &approval_tool,
+                                        &guard_args,
+                                        false,
+                                        workspace_untrusted,
+                                    ),
+                                );
+                                let save_warning_tx = self.stream_event_tx.clone();
+                                apply_approval_memory_action(
+                                    pm,
+                                    approval_memory_action(&response, always_scope, true),
+                                    &approval_tool,
+                                    &guard_args,
+                                    response.match_target(),
+                                    save_warning_tx.as_ref(),
+                                );
+                            } else {
+                                pm.record_approval(&approval_tool, Some(&guard_args), false);
+                            }
+                        }
+                        response.is_approved()
+                    } else {
+                        // No approval sink (headless / sub-run): fail
+                        // closed. The contract is enforced upstream by
+                        // forcing PermissionMode::Auto for headless
+                        // entries; reaching this branch with no sink
+                        // means a misconfiguration. Surface a clear
+                        // reason in the SANDBOX_DENIED output.
+                        let suffix = " (approval required for sandbox_expand but no TUI; \
+                                       pass --mode auto or add allow rule)";
+                        if !outputs[pos].0.output.contains(suffix) {
+                            outputs[pos].0.output.push_str(suffix);
+                        }
+                        false
+                    }
+                }
+            };
             if !approved {
                 continue;
             }
@@ -5726,6 +6473,382 @@ mod tests {
         apply_edge_auth_failure_result(&mut accum, false);
 
         assert_eq!(accum.error_message.as_deref(), Some("Cancelled by user"));
+    }
+
+    #[test]
+    fn approval_stale_revalidation_allows_unchanged_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, b"baseline").unwrap();
+        let previous = astra_turn_core::approval_base_digest::compute_file_digest(&path).unwrap();
+
+        let error = approval_stale_revalidation_error("str_replace", &path, previous);
+
+        assert!(error.is_none(), "unchanged file should pass revalidation");
+    }
+
+    #[test]
+    fn approval_stale_revalidation_blocks_modified_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, b"baseline").unwrap();
+        let previous = astra_turn_core::approval_base_digest::compute_file_digest(&path).unwrap();
+        std::fs::write(&path, b"changed").unwrap();
+
+        let error = approval_stale_revalidation_error("str_replace", &path, previous).unwrap();
+
+        assert!(error.contains("Approval expired for str_replace"));
+        assert!(error.contains("changed from"));
+    }
+
+    #[test]
+    fn approval_stale_revalidation_blocks_file_appearing_after_prompt() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("new.txt");
+        let previous = astra_turn_core::approval_base_digest::compute_file_digest(&path).unwrap();
+        assert!(previous.is_none());
+        std::fs::write(&path, b"created elsewhere").unwrap();
+
+        let error = approval_stale_revalidation_error("write_file", &path, previous).unwrap();
+
+        assert!(error.contains("appeared after approval"));
+    }
+
+    #[test]
+    fn approval_batch_group_key_carries_risk_tags_for_accept_all_gate() {
+        use astra_turn_core::permission_engine::RiskTag;
+
+        let safe = approval_batch_group_key(
+            "read_file",
+            &serde_json::json!({"path": "src/lib.rs"}),
+            &[RiskTag::BashExecute],
+        );
+        assert!(safe.allows_accept_all());
+
+        let dangerous = approval_batch_group_key(
+            "write_file",
+            &serde_json::json!({"path": ".env"}),
+            &[RiskTag::WritesSensitiveFile],
+        );
+        assert!(
+            !dangerous.allows_accept_all(),
+            "production group key must carry tags used by the queue's Accept-all guard"
+        );
+    }
+
+    #[test]
+    fn approval_default_always_scope_prefers_project_for_benign_request() {
+        let ctx = astra_turn_core::permission_scope::ScopeAvailabilityContext::default();
+
+        assert_eq!(
+            approval_default_always_scope(&ctx),
+            astra_turn_core::permission_scope::AllowScope::Project
+        );
+    }
+
+    #[test]
+    fn approval_default_always_scope_uses_session_for_non_persistent_risks() {
+        use astra_turn_core::permission_engine::RiskTag;
+        use astra_turn_core::permission_scope::{AllowScope, ScopeAvailabilityContext};
+
+        let sensitive = ScopeAvailabilityContext {
+            risk_tags: vec![RiskTag::WritesSensitiveFile],
+            ..Default::default()
+        };
+        assert_eq!(
+            approval_default_always_scope(&sensitive),
+            AllowScope::RestOfSession
+        );
+
+        let mcp_unknown = ScopeAvailabilityContext {
+            risk_tags: vec![RiskTag::MCPUnknownCapability],
+            mcp_unknown_capability: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            approval_default_always_scope(&mcp_unknown),
+            AllowScope::RestOfSession
+        );
+
+        let sub_agent = ScopeAvailabilityContext {
+            source_agent_present: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            approval_default_always_scope(&sub_agent),
+            AllowScope::RestOfSession
+        );
+    }
+
+    #[test]
+    fn approval_scope_context_tags_git_safety_as_non_persistent_risk() {
+        use astra_turn_core::permission_engine::RiskTag;
+        use astra_turn_core::permission_scope::AllowScope;
+
+        let ctx = approval_scope_context_for_tool(
+            "bash",
+            &serde_json::json!({"command": "git push --force origin main"}),
+            false,
+            false,
+        );
+
+        assert!(ctx.risk_tags.contains(&RiskTag::GitDestructive));
+        assert_eq!(
+            approval_default_always_scope(&ctx),
+            AllowScope::RestOfSession
+        );
+    }
+
+    #[test]
+    fn approval_default_always_scope_uses_turn_for_unsound_rule_shapes() {
+        use astra_turn_core::permission_scope::{AllowScope, ScopeAvailabilityContext};
+
+        let compound = ScopeAvailabilityContext {
+            is_compound_command: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            approval_default_always_scope(&compound),
+            AllowScope::RestOfTurn
+        );
+
+        let dynamic_eval = ScopeAvailabilityContext {
+            has_dynamic_eval: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            approval_default_always_scope(&dynamic_eval),
+            AllowScope::RestOfTurn
+        );
+    }
+
+    #[test]
+    fn approval_memory_action_does_not_remember_allow_once() {
+        use super::chat_stream::ApprovalResponse;
+        use astra_turn_core::permission_scope::AllowScope;
+
+        assert_eq!(
+            approval_memory_action(&ApprovalResponse::AllowOnce, AllowScope::Project, true),
+            ApprovalMemoryAction::None
+        );
+    }
+
+    #[test]
+    fn approval_memory_action_maps_always_scope_to_storage_effect() {
+        use super::chat_stream::ApprovalResponse;
+        use astra_turn_core::permission_scope::AllowScope;
+
+        assert_eq!(
+            approval_memory_action(&ApprovalResponse::AlwaysAllow, AllowScope::Project, true),
+            ApprovalMemoryAction::PersistProjectRule
+        );
+        assert_eq!(
+            approval_memory_action(&ApprovalResponse::AlwaysAllow, AllowScope::User, true),
+            ApprovalMemoryAction::PersistUserRule
+        );
+        assert_eq!(
+            approval_memory_action(&ApprovalResponse::AlwaysAllow, AllowScope::RestOfTurn, true),
+            ApprovalMemoryAction::RecordAllowTurn
+        );
+        assert_eq!(
+            approval_memory_action(
+                &ApprovalResponse::AlwaysAllow,
+                AllowScope::RestOfSession,
+                true
+            ),
+            ApprovalMemoryAction::RecordAllowSession
+        );
+        assert_eq!(
+            approval_memory_action(
+                &ApprovalResponse::AlwaysAllow,
+                AllowScope::OnceThisCall,
+                true
+            ),
+            ApprovalMemoryAction::None
+        );
+        assert_eq!(
+            approval_memory_action(&ApprovalResponse::AlwaysAllow, AllowScope::Project, false),
+            ApprovalMemoryAction::RecordDenySession
+        );
+    }
+
+    #[tokio::test]
+    async fn cloud_approval_uses_tui_sink_in_prompt_mode() {
+        let server = MockServer::start().await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+        let temp = tempdir().expect("tempdir");
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
+        let mut tool_cache = EdgeToolCache::new(8);
+        let mut pm = crate::permission_manager::PermissionManager::with_project(false, temp.path());
+        let (approval_tx, mut approval_rx) =
+            tokio::sync::mpsc::unbounded_channel::<super::chat_stream::ApprovalRequest>();
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor,
+                render_policy: RenderPolicy::Stream,
+                perm_manager: Some(&mut pm),
+                cancel_token: None,
+                stream_event_tx: None,
+                stream_event_sink: None,
+                approval_request_tx: Some(approval_tx),
+                skill_resolver: None,
+                skill_continuation: false,
+                turn_rollback_on_failure: false,
+                tool_cache: &mut tool_cache,
+                observability_hub: None,
+            },
+            80,
+            false,
+        );
+
+        let decision_fut = host.resolve_cloud_approval_via_tui(
+            "write_file",
+            Some("src/main.rs"),
+            None,
+            astra_thin_client::ApprovalKind::Standard,
+        );
+        let responder = async {
+            let request = approval_rx.recv().await.expect("approval request");
+            assert_eq!(request.tool, "write_file");
+            assert!(request.header.contains("Cloud approval required"));
+            request
+                .response_tx
+                .send(super::chat_stream::ApprovalResponse::AllowOnce)
+                .expect("send response");
+        };
+
+        let (decision, ()) = tokio::join!(decision_fut, responder);
+
+        assert_eq!(decision, astra_thin_client::ApprovalDecision::Allow);
+    }
+
+    #[tokio::test]
+    async fn cloud_approval_always_persists_benign_project_scope() {
+        let server = MockServer::start().await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+        let temp = tempdir().expect("tempdir");
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
+        let mut tool_cache = EdgeToolCache::new(8);
+        let mut pm = crate::permission_manager::PermissionManager::with_project(false, temp.path());
+        let (approval_tx, mut approval_rx) =
+            tokio::sync::mpsc::unbounded_channel::<super::chat_stream::ApprovalRequest>();
+
+        let decision = {
+            let mut host = CliSseStreamHost::from_edge_ctx(
+                EdgeSseContext {
+                    api: &api,
+                    token: "tok",
+                    executor_id: "edge-test",
+                    executor,
+                    render_policy: RenderPolicy::Stream,
+                    perm_manager: Some(&mut pm),
+                    cancel_token: None,
+                    stream_event_tx: None,
+                    stream_event_sink: None,
+                    approval_request_tx: Some(approval_tx),
+                    skill_resolver: None,
+                    skill_continuation: false,
+                    turn_rollback_on_failure: false,
+                    tool_cache: &mut tool_cache,
+                    observability_hub: None,
+                },
+                80,
+                false,
+            );
+            let decision_fut = host.resolve_cloud_approval_via_tui(
+                "write_file",
+                Some("src/main.rs"),
+                None,
+                astra_thin_client::ApprovalKind::Standard,
+            );
+            let responder = async {
+                let request = approval_rx.recv().await.expect("approval request");
+                request
+                    .response_tx
+                    .send(super::chat_stream::ApprovalResponse::AlwaysAllow)
+                    .expect("send response");
+            };
+            let (decision, ()) = tokio::join!(decision_fut, responder);
+            decision
+        };
+
+        assert_eq!(decision, astra_thin_client::ApprovalDecision::AllowSession);
+
+        let args = serde_json::json!({"path": "src/main.rs"});
+        let mut reloaded =
+            crate::permission_manager::PermissionManager::with_project(false, temp.path());
+        assert!(matches!(
+            reloaded.check_nonblocking("write_file", &args),
+            crate::permission_manager::PermissionDecision::Allow
+        ));
+    }
+
+    #[tokio::test]
+    async fn cloud_approval_always_sensitive_write_is_session_only() {
+        let server = MockServer::start().await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+        let temp = tempdir().expect("tempdir");
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
+        let mut tool_cache = EdgeToolCache::new(8);
+        let mut pm = crate::permission_manager::PermissionManager::with_project(false, temp.path());
+        let (approval_tx, mut approval_rx) =
+            tokio::sync::mpsc::unbounded_channel::<super::chat_stream::ApprovalRequest>();
+
+        let decision = {
+            let mut host = CliSseStreamHost::from_edge_ctx(
+                EdgeSseContext {
+                    api: &api,
+                    token: "tok",
+                    executor_id: "edge-test",
+                    executor,
+                    render_policy: RenderPolicy::Stream,
+                    perm_manager: Some(&mut pm),
+                    cancel_token: None,
+                    stream_event_tx: None,
+                    stream_event_sink: None,
+                    approval_request_tx: Some(approval_tx),
+                    skill_resolver: None,
+                    skill_continuation: false,
+                    turn_rollback_on_failure: false,
+                    tool_cache: &mut tool_cache,
+                    observability_hub: None,
+                },
+                80,
+                false,
+            );
+            let decision_fut = host.resolve_cloud_approval_via_tui(
+                "write_file",
+                Some(".env"),
+                None,
+                astra_thin_client::ApprovalKind::Standard,
+            );
+            let responder = async {
+                let request = approval_rx.recv().await.expect("approval request");
+                request
+                    .response_tx
+                    .send(super::chat_stream::ApprovalResponse::AlwaysAllow)
+                    .expect("send response");
+            };
+            let (decision, ()) = tokio::join!(decision_fut, responder);
+            decision
+        };
+
+        assert_eq!(decision, astra_thin_client::ApprovalDecision::AllowSession);
+
+        let args = serde_json::json!({"path": ".env"});
+        assert!(matches!(
+            pm.check_nonblocking("write_file", &args),
+            crate::permission_manager::PermissionDecision::Allow
+        ));
+        let mut reloaded =
+            crate::permission_manager::PermissionManager::with_project(false, temp.path());
+        assert!(matches!(
+            reloaded.check_nonblocking("write_file", &args),
+            crate::permission_manager::PermissionDecision::NeedApproval { .. }
+        ));
     }
 
     #[test]

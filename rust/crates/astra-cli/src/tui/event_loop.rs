@@ -1066,13 +1066,24 @@ pub(crate) async fn run_tui_repl(
                                                     // approval card is rendered by BottomPane above the
                                                     // composer so arrow-key focus is visible. Resolve
                                                     // events flush a compact audit line to scrollback.
-                                                    let _id = bottom_pane.enqueue_approval(
-                                                        req.tool,
-                                                        req.header,
-                                                        req.detail,
-                                                        req.reason,
-                                                        req.response_tx,
-                                                    );
+                                                    let _id = if let Some(metadata) = req.metadata {
+                                                        bottom_pane.enqueue_approval_with_metadata(
+                                                            req.tool,
+                                                            req.header,
+                                                            req.detail,
+                                                            req.reason,
+                                                            req.response_tx,
+                                                            *metadata,
+                                                        )
+                                                    } else {
+                                                        bottom_pane.enqueue_approval(
+                                                            req.tool,
+                                                            req.header,
+                                                            req.detail,
+                                                            req.reason,
+                                                            req.response_tx,
+                                                        )
+                                                    };
                                                     frame_requester.schedule_frame();
                                                     {
                                     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
