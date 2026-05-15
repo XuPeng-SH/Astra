@@ -206,6 +206,10 @@ impl AgentRunRegistry {
             .collect()
     }
 
+    fn bound_tool_use_ids(&self) -> Vec<String> {
+        self.tool_use_to_key.keys().cloned().collect()
+    }
+
     /// Ensure a row exists for `id` and bind `tool_use_id` to it so
     /// follow-up events can find the same row.
     fn ensure_running_for_tool_use(
@@ -394,6 +398,12 @@ pub(crate) struct ChatWidget {
     /// Logical agent ids that ended via cancellation. TaskCell has only
     /// Completed/Failed, so keep this alongside the cell for row status.
     cancelled_task_ids: std::collections::HashSet<String>,
+    /// Agent ids cleared at a turn boundary. Late terminal events for
+    /// these prior-turn agents must not resurrect rows in the next turn.
+    cleared_agent_run_ids: std::collections::HashSet<String>,
+    /// Control tool ids cleared at a turn boundary. Used to detect
+    /// late `AgentControlCompleted` arrivals after the row was dropped.
+    cleared_agent_tool_use_ids: std::collections::HashSet<String>,
 }
 
 impl ChatWidget {
@@ -410,6 +420,8 @@ impl ChatWidget {
             in_flight_task_ids: Vec::new(),
             cancelling_task_ids: std::collections::HashSet::new(),
             cancelled_task_ids: std::collections::HashSet::new(),
+            cleared_agent_run_ids: std::collections::HashSet::new(),
+            cleared_agent_tool_use_ids: std::collections::HashSet::new(),
         }
     }
 
@@ -624,6 +636,17 @@ impl ChatWidget {
                 append_agent_live_output(tc, "\nCancelling…\n");
             }
         }
+        // Once we've fanned out cancels for these ids, drop them from
+        // the in-flight set so a follow-up Ctrl+C is a no-op (count=0,
+        // no banner). Pre-fix the same ids stayed visible to the next
+        // press; the task service rejected re-cancels and the user
+        // saw "Cancelled 1 background task." printed once per press
+        // until they all settled. Cancelling badges (the cancelling
+        // map above) keep the strip showing "Cancelling…" until the
+        // worker's terminal event prunes the rest.
+        let to_drop: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
+        self.in_flight_task_ids
+            .retain(|id| !to_drop.contains(id.as_str()));
     }
 
     /// Commit a single-line banner into scrollback confirming how
@@ -848,6 +871,15 @@ impl ChatWidget {
         // of the new turn would force-fail them as if they belonged.
         self.commit_active();
         self.drain_all_live_tasks();
+        // Drop agent_runs registry entries from the prior turn. The
+        // strip's terminal rows (✓/✗) and stuck-Live rows from a
+        // dropped server stream are turn-scoped UI; carrying them
+        // forward grows the strip unboundedly ("12 parallel agents"
+        // shown for a single new spawn). Drilldown for prior-turn
+        // agents still works via the legacy history-fallback path in
+        // `agents_drilldown_rows` (TaskCells are committed to history
+        // before this point).
+        self.clear_turn_scoped_agent_state();
         let cell = UserCell::new(text);
         self.commit_cell(Box::new(cell));
     }
@@ -868,6 +900,25 @@ impl ChatWidget {
         debug_assert!(self.live_tasks.is_empty());
         self.in_flight_task_ids.clear();
         self.cancelling_task_ids.clear();
+    }
+
+    fn forget_cleared_agent_markers(&mut self, agent_keys: &[&str], tool_use_id: Option<&str>) {
+        for key in agent_keys {
+            if !key.is_empty() {
+                self.cleared_agent_run_ids.remove(*key);
+            }
+        }
+        if let Some(tool_use_id) = tool_use_id {
+            self.cleared_agent_tool_use_ids.remove(tool_use_id);
+        }
+    }
+
+    fn clear_turn_scoped_agent_state(&mut self) {
+        self.cleared_agent_run_ids.extend(self.agent_runs.ids());
+        self.cleared_agent_tool_use_ids
+            .extend(self.agent_runs.bound_tool_use_ids());
+        self.agent_runs = AgentRunRegistry::default();
+        self.cancelled_task_ids.clear();
     }
 
     fn on_answer_delta(&mut self, delta: &str) {
@@ -1078,6 +1129,7 @@ impl ChatWidget {
         // ToolStarted whose agent_id binding has already been promoted
         // to a real id can't clobber the canonical row.
         let provisional = provisional_agent_key(&tool_use_id);
+        self.forget_cleared_agent_markers(&[&key, &provisional], Some(&tool_use_id));
         if let Some(existing) = self
             .agent_runs
             .key_for_tool_use(&tool_use_id)
@@ -1117,6 +1169,16 @@ impl ChatWidget {
             provisional.clone()
         };
         let key = agent_id.clone().unwrap_or(fallback_key);
+        let late_after_turn_boundary = !self.agent_runs.contains_key(&key)
+            && !self.agent_runs.contains_key(&provisional)
+            && self.agent_runs.key_for_tool_use(&tool_use_id).is_none()
+            && (self.cleared_agent_run_ids.contains(&key)
+                || self.cleared_agent_run_ids.contains(&provisional)
+                || self.cleared_agent_tool_use_ids.contains(&tool_use_id));
+        if late_after_turn_boundary {
+            return;
+        }
+        self.forget_cleared_agent_markers(&[&key, &provisional], Some(&tool_use_id));
         if key != provisional && self.agent_runs.contains_key(&provisional) {
             if self.cancelled_task_ids.remove(&provisional) {
                 self.cancelled_task_ids.insert(key.clone());
@@ -1232,6 +1294,13 @@ impl ChatWidget {
 
     fn on_agent_live_event(&mut self, event: astra_turn_core::agent_live_event::AgentLiveEvent) {
         use astra_turn_core::agent_live_event::AgentLiveEventKind;
+
+        if !self.agent_runs.contains_key(&event.agent_id)
+            && self.cleared_agent_run_ids.contains(&event.agent_id)
+        {
+            return;
+        }
+        self.forget_cleared_agent_markers(&[event.agent_id.as_str()], None);
 
         let is_terminal_event = matches!(event.kind, AgentLiveEventKind::AgentTerminated { .. });
         if !is_terminal_event
@@ -1525,6 +1594,7 @@ impl ChatWidget {
         // sequence (shared with on_user_submit).
         self.commit_active();
         self.drain_all_live_tasks();
+        self.clear_turn_scoped_agent_state();
 
         let summary = TurnSummaryCell {
             elapsed_ms: stats.elapsed_ms,
@@ -2253,6 +2323,44 @@ mod tests {
     }
 
     #[test]
+    fn turn_complete_clears_agent_runs_and_cancelled_ids() {
+        let mut w = fresh();
+        w.handle_event(AppEvent::Wire(WireEvent::AgentControlStarted {
+            action: "spawn".into(),
+            label: "reviewer-A".into(),
+            tool_use_id: "spawn-tu-1".into(),
+            agent_id: Some("reviewer-A@abc".into()),
+        }));
+        w.handle_event(AppEvent::Wire(WireEvent::AgentControlCompleted {
+            action: "spawn".into(),
+            label: "reviewer-A".into(),
+            status: "success".into(),
+            duration_ms: 10,
+            output: Some(r#"{"status":"cancelled","agent_id":"reviewer-A@abc"}"#.into()),
+            tool_use_id: "spawn-tu-1".into(),
+            agent_id: Some("reviewer-A@abc".into()),
+        }));
+        assert_eq!(w.agent_run_ids(), vec!["reviewer-A@abc".to_string()]);
+        assert!(
+            w.cancelled_task_ids.contains("reviewer-A@abc"),
+            "terminal cancelled agent should be tracked before the turn boundary"
+        );
+
+        w.handle_event(AppEvent::Wire(WireEvent::TurnComplete(Box::default())));
+
+        assert!(
+            w.agent_run_ids().is_empty(),
+            "turn complete must clear prior-turn agent strip rows: {:?}",
+            w.agent_run_ids()
+        );
+        assert!(
+            w.cancelled_task_ids.is_empty(),
+            "turn complete must clear prior-turn cancelled ids: {:?}",
+            w.cancelled_task_ids
+        );
+    }
+
+    #[test]
     fn duplicate_agent_tool_started_does_not_double_register() {
         // Replay path: a ToolStarted fired twice for the same id
         // must not inflate the cancel list (otherwise Ctrl+C
@@ -2261,6 +2369,37 @@ mod tests {
         w.handle_event(AppEvent::Wire(task_started("tu_1", "first")));
         w.handle_event(AppEvent::Wire(task_started("tu_1", "first")));
         assert_eq!(w.in_flight_task_ids(), &["tu_1".to_string()]);
+    }
+
+    /// CRITICAL: a single Ctrl+C must take ALL live ids out of the
+    /// in-flight set so a follow-up press doesn't re-target the same
+    /// tasks. Pre-fix users saw "Cancelled 1 background task." print
+    /// six times for one Ctrl+C burst — every press kept finding the
+    /// same ids and the durable task service rejected the
+    /// already-cancelled ones, so only one new acked-success per
+    /// press counted.
+    #[test]
+    fn mark_agent_controls_cancelling_drains_in_flight() {
+        let mut w = fresh();
+        w.handle_event(AppEvent::Wire(task_started("tu_1", "first")));
+        w.handle_event(AppEvent::Wire(task_started("tu_2", "second")));
+        w.handle_event(AppEvent::Wire(task_started("tu_3", "third")));
+        assert_eq!(w.in_flight_task_ids().len(), 3);
+
+        let ids = w.in_flight_task_ids().to_vec();
+        w.mark_agent_controls_cancelling(&ids);
+
+        assert!(
+            w.in_flight_task_ids().is_empty(),
+            "after marking cancelling, those ids must NOT appear in the \
+             in-flight set or a follow-up Ctrl+C would re-cancel them; got {:?}",
+            w.in_flight_task_ids()
+        );
+        // Cancelling state itself is preserved so the strip can show
+        // a "Cancelling…" badge until the worker acks.
+        assert!(w.cancelling_task_ids.contains("tu_1"));
+        assert!(w.cancelling_task_ids.contains("tu_2"));
+        assert!(w.cancelling_task_ids.contains("tu_3"));
     }
 
     // ── Cancel banner after Ctrl+C fan-out ───────────────────────
@@ -2878,6 +3017,92 @@ mod tests {
         );
     }
 
+    /// CRITICAL regression: `agent_runs` (the registry that powers
+    /// the multi-agent strip + Ctrl+G drilldown) must drop terminal
+    /// rows from the previous turn when a new user turn begins.
+    /// Otherwise the strip carries stale "✓"/"✗" rows forward — the
+    /// reported bug had turn 1's six completed agents still showing
+    /// alongside turn 2's six, totalling "12 parallel agents".
+    /// Live rows belonging to the prior turn are NOT preserved
+    /// either: `drain_all_live_tasks` already finalises them and
+    /// they get committed to history (where Ctrl+G can still find
+    /// them via `task_cell_anywhere` history fallback).
+    #[test]
+    fn user_submit_clears_terminal_agent_runs_from_prior_turn() {
+        let mut w = fresh();
+        // Turn 1: spawn two agents, both finish.
+        w.handle_event(AppEvent::Wire(WireEvent::AgentControlStarted {
+            action: "spawn".into(),
+            label: "reviewer-A".into(),
+            tool_use_id: "spawn-tu-1".into(),
+            agent_id: Some("reviewer-A@abc".into()),
+        }));
+        w.handle_event(AppEvent::Wire(WireEvent::AgentControlCompleted {
+            action: "spawn".into(),
+            label: "reviewer-A".into(),
+            status: "success".into(),
+            duration_ms: 10,
+            output: Some(r#"{"status":"completed","agent_id":"reviewer-A@abc"}"#.into()),
+            tool_use_id: "spawn-tu-1".into(),
+            agent_id: Some("reviewer-A@abc".into()),
+        }));
+        w.handle_event(AppEvent::Wire(WireEvent::AgentControlStarted {
+            action: "spawn".into(),
+            label: "reviewer-B".into(),
+            tool_use_id: "spawn-tu-2".into(),
+            agent_id: Some("reviewer-B@def".into()),
+        }));
+        w.handle_event(AppEvent::Wire(WireEvent::AgentControlCompleted {
+            action: "spawn".into(),
+            label: "reviewer-B".into(),
+            status: "failed".into(),
+            duration_ms: 5,
+            output: Some(r#"{"status":"failed","agent_id":"reviewer-B@def"}"#.into()),
+            tool_use_id: "spawn-tu-2".into(),
+            agent_id: Some("reviewer-B@def".into()),
+        }));
+        assert_eq!(
+            w.agent_run_ids().len(),
+            2,
+            "both completed agents present at end of prior turn"
+        );
+
+        // Turn 2 starts. The registry must drop both terminal entries.
+        w.handle_event(AppEvent::User(UserEvent::Submit("next".into())));
+        assert_eq!(
+            w.agent_run_ids().len(),
+            0,
+            "terminal agent_runs from prior turn must be cleared on user submit, got: {:?}",
+            w.agent_run_ids()
+        );
+    }
+
+    /// Live agents from a prior turn (abnormal turn end, e.g. server
+    /// stream drop with no TurnComplete) must also be removed from
+    /// `agent_runs` on user submit. They get finalised and committed
+    /// to history by `drain_all_live_tasks`, so the user can still
+    /// drill into them via Ctrl+G's history-fallback path.
+    #[test]
+    fn user_submit_clears_live_agent_runs_from_prior_turn() {
+        let mut w = fresh();
+        w.handle_event(AppEvent::Wire(WireEvent::AgentControlStarted {
+            action: "spawn".into(),
+            label: "stuck-agent".into(),
+            tool_use_id: "spawn-tu-x".into(),
+            agent_id: Some("stuck@id".into()),
+        }));
+        // No AgentControlCompleted — the stream dropped.
+        assert_eq!(w.agent_run_ids().len(), 1, "agent is live");
+
+        w.handle_event(AppEvent::User(UserEvent::Submit("next".into())));
+        assert_eq!(
+            w.agent_run_ids().len(),
+            0,
+            "live agent_runs from a dropped prior turn must also be cleared, got: {:?}",
+            w.agent_run_ids()
+        );
+    }
+
     /// HIGH regression: a duplicate `ToolStarted` for an existing
     /// live task should update the description (in case the model
     /// emits the started event with extra detail on retry/replay),
@@ -2961,6 +3186,81 @@ mod tests {
         assert_eq!(
             history_len_after_late_event, history_len_after_turn_complete,
             "late ToolCompleted must NOT add a new cell to history"
+        );
+    }
+
+    #[test]
+    fn late_agent_control_completed_after_turn_complete_is_noop() {
+        let mut w = fresh();
+        w.handle_event(AppEvent::Wire(WireEvent::AgentControlStarted {
+            action: "spawn".into(),
+            label: "reviewer-A".into(),
+            tool_use_id: "spawn-tu-late".into(),
+            agent_id: Some("reviewer-A@late".into()),
+        }));
+        w.handle_event(AppEvent::Wire(WireEvent::TurnComplete(Box::default())));
+        assert!(
+            w.agent_run_ids().is_empty(),
+            "turn boundary should clear the prior-turn agent row first"
+        );
+
+        w.handle_event(AppEvent::Wire(WireEvent::AgentControlCompleted {
+            action: "spawn".into(),
+            label: "reviewer-A".into(),
+            status: "success".into(),
+            duration_ms: 10,
+            output: Some(r#"{"status":"cancelled","agent_id":"reviewer-A@late"}"#.into()),
+            tool_use_id: "spawn-tu-late".into(),
+            agent_id: Some("reviewer-A@late".into()),
+        }));
+
+        assert!(
+            w.agent_run_ids().is_empty(),
+            "late AgentControlCompleted must not resurrect a cleared prior-turn row: {:?}",
+            w.agent_run_ids()
+        );
+        assert!(
+            w.cancelled_task_ids.is_empty(),
+            "late AgentControlCompleted must not restore cancelled state from the prior turn: {:?}",
+            w.cancelled_task_ids
+        );
+    }
+
+    #[test]
+    fn late_agent_terminated_after_turn_complete_is_noop() {
+        use astra_turn_core::agent_live_event::{
+            AgentLiveEvent, AgentLiveEventKind, AgentLiveTermination,
+        };
+
+        let mut w = fresh();
+        w.handle_event(AppEvent::Wire(WireEvent::AgentLive(AgentLiveEvent {
+            agent_id: "reviewer@late-term".into(),
+            kind: AgentLiveEventKind::OutputDelta("running".into()),
+        })));
+        w.handle_event(AppEvent::Wire(WireEvent::TurnComplete(Box::default())));
+        assert!(
+            w.agent_run_ids().is_empty(),
+            "turn boundary should clear the prior-turn live row first"
+        );
+
+        w.handle_event(AppEvent::Wire(WireEvent::AgentLive(AgentLiveEvent {
+            agent_id: "reviewer@late-term".into(),
+            kind: AgentLiveEventKind::AgentTerminated {
+                termination: AgentLiveTermination::Cancelled,
+                duration_ms: 20,
+                reason: Some("late termination".into()),
+            },
+        })));
+
+        assert!(
+            w.agent_run_ids().is_empty(),
+            "late AgentTerminated must not resurrect a cleared prior-turn row: {:?}",
+            w.agent_run_ids()
+        );
+        assert!(
+            w.cancelled_task_ids.is_empty(),
+            "late AgentTerminated must not restore cancelled state from the prior turn: {:?}",
+            w.cancelled_task_ids
         );
     }
 

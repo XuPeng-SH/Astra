@@ -152,6 +152,18 @@ pub fn build_skill_listing_section(
     build_skill_listing_section_with_budget(skills, None)
 }
 
+/// Build skill listing using the per-model context window for budget sizing.
+///
+/// Resolves the model's context window via [`budget_for_model`] so the listing
+/// scales with provider capacity (32K → ~1.3KB, 200K → 8KB, 1M → 40KB).
+pub fn build_skill_listing_section_for_model(
+    skills: &[astra_skills::traits::SkillToolInfo],
+    model: Option<&str>,
+) -> Option<PromptSection> {
+    let context_window = u32::try_from(crate::prompts::budget_for_model(model).model_limit).ok();
+    build_skill_listing_section_with_budget(skills, context_window)
+}
+
 /// Build skill listing with explicit context window size for budget calculation.
 pub fn build_skill_listing_section_with_budget(
     skills: &[astra_skills::traits::SkillToolInfo],
@@ -270,6 +282,11 @@ fn flatten_whitespace(s: &str) -> String {
 /// Combine description + when_to_use into a single line, capped at entry limit.
 /// Inputs are flattened (multi-line scalars → single line) so user-authored
 /// SKILL.md text cannot inject newlines into the rendered XML.
+///
+/// The cap is enforced on the **post-escape** length so XML-escaping (`<` → `&lt;`,
+/// 4× growth) cannot blow past the budget. We truncate char-by-char, accumulating
+/// the escaped byte cost, so a description with many `<>&` characters degrades
+/// gracefully instead of bursting the budget.
 fn format_skill_description(description: &str, when_to_use: Option<&str>) -> String {
     let desc = flatten_whitespace(description);
     let wtu = when_to_use.map(flatten_whitespace).unwrap_or_default();
@@ -287,51 +304,128 @@ fn format_skill_description(description: &str, when_to_use: Option<&str>) -> Str
         (false, true) => desc,
         (true, true) => String::new(),
     };
-    if combined.len() <= SKILL_LISTING_MAX_ENTRY_CHARS {
-        combined
-    } else {
-        let mut truncated = String::with_capacity(SKILL_LISTING_MAX_ENTRY_CHARS + 3);
-        let mut used = 0usize;
-        for ch in combined.chars() {
-            let ch_len = ch.len_utf8();
-            if used + ch_len > SKILL_LISTING_MAX_ENTRY_CHARS {
-                break;
-            }
-            truncated.push(ch);
-            used += ch_len;
-        }
-        truncated.push('\u{2026}');
-        truncated
+
+    // Compute post-escape length without allocating; if it fits, return as-is.
+    let escaped_len: usize = combined
+        .chars()
+        .map(|c| match c {
+            '<' | '>' => 4, // &lt; / &gt;
+            '&' => 5,       // &amp;
+            c => c.len_utf8(),
+        })
+        .sum();
+    if escaped_len <= SKILL_LISTING_MAX_ENTRY_CHARS {
+        return combined;
     }
+
+    // Truncate by escaped-byte budget so the rendered XML respects the cap.
+    // Reserve room for the trailing ellipsis (`…` = 3 bytes UTF-8, no escape).
+    const ELLIPSIS_COST: usize = 3;
+    let body_budget = SKILL_LISTING_MAX_ENTRY_CHARS.saturating_sub(ELLIPSIS_COST);
+    let mut truncated = String::with_capacity(SKILL_LISTING_MAX_ENTRY_CHARS);
+    let mut used = 0usize;
+    for ch in combined.chars() {
+        let ch_cost = match ch {
+            '<' | '>' => 4,
+            '&' => 5,
+            c => c.len_utf8(),
+        };
+        if used + ch_cost > body_budget {
+            break;
+        }
+        truncated.push(ch);
+        used += ch_cost;
+    }
+    truncated.push('\u{2026}');
+    truncated
 }
+
+/// Budget: deferred tool listing occupies at most 2% of context window.
+/// `BUDGET_NUM/BUDGET_DEN = 1/12 ≈ 4 chars/token × 2%`.
+const DEFERRED_TOOLS_BUDGET_NUM: u64 = 1;
+const DEFERRED_TOOLS_BUDGET_DEN: u64 = 12;
+const DEFERRED_TOOLS_DEFAULT_CHAR_BUDGET: usize = 16_000;
 
 #[allow(dead_code)]
 pub fn build_deferred_tools_section(
     surface: &crate::tool_registry::surface::ToolSurface,
+) -> Option<PromptSection> {
+    build_deferred_tools_section_with_budget(surface, None)
+}
+
+/// Build deferred tools listing with explicit budget from context window size.
+pub fn build_deferred_tools_section_with_budget(
+    surface: &crate::tool_registry::surface::ToolSurface,
+    context_window_tokens: Option<u32>,
 ) -> Option<PromptSection> {
     let entries = surface.deferred();
     if entries.is_empty() {
         return None;
     }
 
-    let mut body = String::with_capacity(entries.len() * 80 + 256);
+    let char_budget = context_window_tokens
+        .map(|t| (u64::from(t) * DEFERRED_TOOLS_BUDGET_NUM / DEFERRED_TOOLS_BUDGET_DEN) as usize)
+        .unwrap_or(DEFERRED_TOOLS_DEFAULT_CHAR_BUDGET);
+
+    const TOOL_OPEN: &str = "  <tool>\n    <name>";
+    const NAME_TO_DESC: &str = "</name>\n    <description>";
+    const DESC_CLOSE: &str = "</description>\n  </tool>\n";
+    const NAME_CLOSE: &str = "</name>\n  </tool>\n";
+    let name_only_wrap = TOOL_OPEN.len() + NAME_CLOSE.len();
+    let full_wrap = TOOL_OPEN.len() + NAME_TO_DESC.len() + DESC_CLOSE.len();
+
+    let mut body = String::with_capacity(char_budget + 1024);
     body.push_str("<deferred_tools>\n");
+
+    let mut listing_chars = 0usize;
+    let mut has_degraded = false;
+
+    // entries are already sorted alphabetically by ToolSurface::build()
     for entry in entries {
-        body.push_str("  <tool>\n    <name>");
-        body.push_str(&xml_escape_text(&entry.name));
-        body.push_str("</name>\n    <description>");
-        body.push_str(&xml_escape_text(&entry.short_desc));
-        body.push_str("</description>\n  </tool>\n");
+        let escaped_name = xml_escape_text(&entry.name);
+        let name_only_len = name_only_wrap + escaped_name.len();
+
+        if listing_chars + name_only_len > char_budget {
+            has_degraded = true;
+            break;
+        }
+
+        let escaped_desc = xml_escape_text(&entry.short_desc);
+        let full_len = full_wrap + escaped_name.len() + escaped_desc.len();
+
+        if listing_chars + full_len <= char_budget {
+            body.push_str(TOOL_OPEN);
+            body.push_str(&escaped_name);
+            body.push_str(NAME_TO_DESC);
+            body.push_str(&escaped_desc);
+            body.push_str(DESC_CLOSE);
+            listing_chars += full_len;
+        } else {
+            body.push_str(TOOL_OPEN);
+            body.push_str(&escaped_name);
+            body.push_str(NAME_CLOSE);
+            listing_chars += name_only_len;
+            has_degraded = true;
+        }
     }
     body.push_str("</deferred_tools>\n\n");
+
+    if has_degraded {
+        body.push_str(
+            "Some tools above are listed by name only or omitted. \
+             Call `tool_search` to search the full catalog.\n\n",
+        );
+    }
+
     body.push_str(
-        "If a tool in `<deferred_tools>` fits your next step, call \
-         `tool_search(query=\"select:NAME\")` first — the tool_result will contain the \
-         full schema so you can invoke it on the next turn. Never guess at a tool that is \
-         not in `tools[]` without doing this. If you are about to say a needed tool is \
-         unavailable, first call `tool_search`; for dotted legacy names such as \
-         `agent.spawn`, select the consolidated tool name (`tool_search(query=\"select:agent\")`) \
-         and then use its `action` field.",
+        "Tools in `<deferred_tools>` are CALLABLE directly — invoke them \
+         by name even though they are not in `tools[]`. The runtime accepts \
+         calls to any deferred tool listed above. Use `tool_search(query=\"select:NAME\")` \
+         only when you need the full parameter schema first (e.g. for an unfamiliar tool). \
+         For dotted legacy names like `agent.spawn`, use the consolidated tool name \
+         (`agent`) and pass the action via its `action` field. \
+         Never call a tool whose name does NOT appear in `tools[]` or `<deferred_tools>` — \
+         use `tool_search` with a keyword query to discover what exists.",
     );
 
     Some(PromptSection::stable(body, CacheScope::Session))
@@ -3450,6 +3544,327 @@ mod tests {
         assert!(
             section.text.matches("<name>").count() < skills.len(),
             "when budget is tiny, some skills should be omitted entirely so the full listing stays within budget"
+        );
+    }
+
+    // ── Deferred tools budget ────────────────────────────────────────────
+
+    fn make_deferred_surface(n: usize) -> crate::tool_registry::surface::ToolSurface {
+        let schemas: Vec<serde_json::Value> = (0..n)
+            .map(|i| {
+                serde_json::json!({
+                    "function": {
+                        "name": format!("tool_{i:03}"),
+                        "description": format!("Description for tool number {i} with some extra text to fill space"),
+                        "parameters": {"type": "object"}
+                    }
+                })
+            })
+            .collect();
+        // Build with empty pinned list so all go to deferred
+        crate::tool_registry::surface::ToolSurface::build(
+            schemas,
+            &astra_config::ToolSurfaceConfig {
+                pinned_tools: vec![],
+            },
+            &[],
+        )
+    }
+
+    #[test]
+    fn deferred_section_all_entries_fit_within_large_budget() {
+        let surface = make_deferred_surface(10);
+        let section = build_deferred_tools_section_with_budget(&surface, Some(200_000)).unwrap();
+        // All 10 tools should have descriptions
+        assert_eq!(section.text.matches("<name>").count(), 10);
+        assert_eq!(section.text.matches("<description>").count(), 10);
+        assert!(!section.text.contains("listed by name only or omitted"));
+    }
+
+    #[test]
+    fn deferred_section_truncates_at_budget() {
+        let surface = make_deferred_surface(200);
+        // With tiny context window, budget = 1000/12 ≈ 83 chars — barely fits 1 entry
+        let section = build_deferred_tools_section_with_budget(&surface, Some(1_000)).unwrap();
+        let included_count = section.text.matches("<name>").count();
+        assert!(
+            included_count < 200,
+            "should not fit all 200, got {included_count}"
+        );
+        assert!(included_count > 0, "should include at least one tool");
+    }
+
+    #[test]
+    fn deferred_section_degrades_to_name_only_before_omitting() {
+        let surface = make_deferred_surface(100);
+        // Moderate budget — some full, some name-only
+        let section = build_deferred_tools_section_with_budget(&surface, Some(5_000)).unwrap();
+        let name_count = section.text.matches("<name>").count();
+        let desc_count = section.text.matches("<description>").count();
+        let name_only = name_count - desc_count;
+        assert!(
+            name_only > 0 || name_count < 100,
+            "overflow should produce name-only entries or omit some"
+        );
+    }
+
+    #[test]
+    fn deferred_section_shows_tool_search_hint_on_overflow() {
+        let surface = make_deferred_surface(200);
+        let section = build_deferred_tools_section_with_budget(&surface, Some(5_000)).unwrap();
+        assert!(
+            section.text.contains("listed by name only or omitted"),
+            "overflow must show the tool_search hint"
+        );
+    }
+
+    #[test]
+    fn deferred_section_is_session_scoped() {
+        let surface = make_deferred_surface(5);
+        let section = build_deferred_tools_section_with_budget(&surface, Some(200_000)).unwrap();
+        assert_eq!(section.scope, CacheScope::Session);
+    }
+
+    #[test]
+    fn deferred_section_preserves_alphabetical_order() {
+        let surface = make_deferred_surface(20);
+        let section = build_deferred_tools_section_with_budget(&surface, Some(200_000)).unwrap();
+        let names: Vec<&str> = section
+            .text
+            .split("<name>")
+            .skip(1)
+            .filter_map(|s| s.split("</name>").next())
+            .collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted, "entries must be alphabetical");
+    }
+
+    // ── Cache stability & token efficiency contracts ─────────────────────
+
+    #[test]
+    fn deferred_section_byte_stable_across_repeated_builds() {
+        // Prompt cache invariant: same input → same bytes. If the deferred
+        // listing were non-deterministic (HashMap iteration, random sort),
+        // the cache would bust every turn.
+        let surface = make_deferred_surface(30);
+        let a = build_deferred_tools_section_with_budget(&surface, Some(200_000))
+            .unwrap()
+            .text;
+        let b = build_deferred_tools_section_with_budget(&surface, Some(200_000))
+            .unwrap()
+            .text;
+        assert_eq!(a, b, "deferred section must be byte-stable across builds");
+    }
+
+    #[test]
+    fn skill_listing_byte_stable_across_repeated_builds() {
+        let skills: Vec<_> = (0..15)
+            .map(|i| astra_skills::traits::SkillToolInfo {
+                name: format!("skill-{i:02}"),
+                description: format!("Does thing {i}"),
+                when_to_use: Some(format!("When user wants {i}")),
+                ..Default::default()
+            })
+            .collect();
+        let a = build_skill_listing_section_with_budget(&skills, Some(200_000))
+            .unwrap()
+            .text;
+        let b = build_skill_listing_section_with_budget(&skills, Some(200_000))
+            .unwrap()
+            .text;
+        assert_eq!(a, b, "skill listing must be byte-stable across builds");
+    }
+
+    #[test]
+    fn deferred_section_token_budget_math_per_provider_context_window() {
+        // Verify that smaller context windows produce fewer entries.
+        // Budget is applied to the entry portion only (not the XML wrapper/instructions).
+        let surface = make_deferred_surface(200);
+
+        // 200K (Anthropic Claude) — should fit many entries
+        let s200k = build_deferred_tools_section_with_budget(&surface, Some(200_000)).unwrap();
+        let count_200k = s200k.text.matches("<name>").count();
+
+        // 128K (OpenAI GPT-4o) — fewer entries
+        let s128k = build_deferred_tools_section_with_budget(&surface, Some(128_000)).unwrap();
+        let count_128k = s128k.text.matches("<name>").count();
+
+        // 32K (small model) — much fewer entries
+        let s32k = build_deferred_tools_section_with_budget(&surface, Some(32_000)).unwrap();
+        let count_32k = s32k.text.matches("<name>").count();
+
+        assert!(
+            count_32k < count_128k && count_128k <= count_200k,
+            "larger context window must fit more tools: 32K={count_32k}, 128K={count_128k}, 200K={count_200k}"
+        );
+        // 32K budget = 2666 chars — at ~80 chars/entry, fits ~33 entries max
+        assert!(
+            count_32k < 50,
+            "32K context should fit well under 50 tools, got {count_32k}"
+        );
+    }
+
+    #[test]
+    fn skill_listing_token_budget_math_per_provider_context_window() {
+        let skills: Vec<_> = (0..100)
+            .map(|i| astra_skills::traits::SkillToolInfo {
+                name: format!("skill-{i:03}"),
+                description: format!("Does thing {i} with extra words for length"),
+                when_to_use: Some(format!("When user wants to do {i} operations")),
+                ..Default::default()
+            })
+            .collect();
+
+        // 200K → budget = 200_000/25 = 8_000 chars
+        let s200k = build_skill_listing_section_with_budget(&skills, Some(200_000)).unwrap();
+        let count_200k = s200k.text.matches("<name>").count();
+
+        // 32K → budget = 32_000/25 = 1_280 chars
+        let s32k = build_skill_listing_section_with_budget(&skills, Some(32_000)).unwrap();
+        let count_32k = s32k.text.matches("<name>").count();
+
+        assert!(
+            count_32k < count_200k,
+            "smaller window must fit fewer skills: 32K={count_32k}, 200K={count_200k}"
+        );
+        // 32K budget is very tight — verify degradation hint
+        assert!(
+            s32k.text.contains("discover_skills"),
+            "tight budget must emit discover_skills hint"
+        );
+    }
+
+    #[test]
+    fn combined_discovery_token_overhead_within_5_percent() {
+        // Total token overhead of both listings combined should not exceed
+        // 5% of context window for a realistic catalog (20 deferred + 10 skills).
+        let surface = make_deferred_surface(20);
+        let skills: Vec<_> = (0..10)
+            .map(|i| astra_skills::traits::SkillToolInfo {
+                name: format!("skill-{i}"),
+                description: format!("Skill description for {i}"),
+                when_to_use: Some(format!("When user wants {i}")),
+                ..Default::default()
+            })
+            .collect();
+
+        let context_window: u32 = 200_000;
+        let deferred = build_deferred_tools_section_with_budget(&surface, Some(context_window))
+            .unwrap()
+            .text;
+        let skill_listing = build_skill_listing_section_with_budget(&skills, Some(context_window))
+            .unwrap()
+            .text;
+
+        let total_chars = deferred.len() + skill_listing.len();
+        // ~4 chars per token, so total_tokens ≈ total_chars / 4
+        let approx_tokens = total_chars / 4;
+        let five_percent = context_window as usize * 5 / 100;
+        assert!(
+            approx_tokens <= five_percent,
+            "combined discovery overhead {approx_tokens} tokens > 5% ({five_percent} tokens) \
+             of context window — discovery listings are too expensive"
+        );
+    }
+
+    #[test]
+    fn deferred_section_tool_search_activation_always_mentioned() {
+        // Regardless of size, the instruction to use tool_search must appear.
+        // Without it, the model would see tool names but not know how to activate them.
+        let small = make_deferred_surface(3);
+        let section = build_deferred_tools_section_with_budget(&small, Some(200_000)).unwrap();
+        assert!(
+            section.text.contains("tool_search"),
+            "must always mention tool_search for activation"
+        );
+
+        let large = make_deferred_surface(200);
+        let section = build_deferred_tools_section_with_budget(&large, Some(5_000)).unwrap();
+        assert!(
+            section.text.contains("tool_search"),
+            "overflow case must also mention tool_search"
+        );
+    }
+
+    #[test]
+    fn deferred_section_advertises_direct_invocation() {
+        // The validator admits deferred tool calls directly (without first
+        // calling tool_search) — see headless_tool_pipeline::tests::
+        // validator_admits_deferred_catalog_tool_via_extras. The prompt must
+        // tell the model this explicitly so it doesn't waste a round on
+        // unnecessary tool_search calls.
+        let surface = make_deferred_surface(5);
+        let section = build_deferred_tools_section_with_budget(&surface, Some(200_000)).unwrap();
+        let text = &section.text;
+        assert!(
+            text.contains("CALLABLE directly")
+                || text.contains("invoke them by name")
+                || text.contains("invoke them\n         by name"),
+            "prompt must tell the model deferred tools are directly callable: {text}"
+        );
+        assert!(
+            !text.contains("first") || text.contains("only when"),
+            "prompt must not require tool_search as a mandatory first step"
+        );
+    }
+
+    #[test]
+    fn format_skill_description_xml_escape_cannot_burst_entry_cap() {
+        // Regression: previously, format_skill_description() truncated to
+        // SKILL_LISTING_MAX_ENTRY_CHARS BEFORE xml_escape_text(), so a desc
+        // full of `<>&` could expand past the cap (4× growth per char).
+        // Fix: cap is now applied to the post-escape byte cost.
+        let mean_desc = "<".repeat(SKILL_LISTING_MAX_ENTRY_CHARS); // 1024 chars of '<' → 4096 escaped
+        let result = format_skill_description(&mean_desc, None);
+        let escaped = result
+            .chars()
+            .map(|c| match c {
+                '<' | '>' => 4,
+                '&' => 5,
+                c => c.len_utf8(),
+            })
+            .sum::<usize>();
+        assert!(
+            escaped <= SKILL_LISTING_MAX_ENTRY_CHARS,
+            "escaped length {} must respect cap {}; raw input was {} chars of '<'",
+            escaped,
+            SKILL_LISTING_MAX_ENTRY_CHARS,
+            mean_desc.len()
+        );
+    }
+
+    #[test]
+    fn build_skill_listing_section_for_model_sizes_per_provider() {
+        // Production must call build_skill_listing_section_for_model so the
+        // budget scales with the provider's actual context window. Verify
+        // claude (200K) and gpt-3.5 (16K) produce different listings.
+        let skills: Vec<_> = (0..50)
+            .map(|i| astra_skills::traits::SkillToolInfo {
+                name: format!("skill-{i:02}"),
+                description: format!("Description {i} with extra words to fill space"),
+                ..Default::default()
+            })
+            .collect();
+        let claude =
+            build_skill_listing_section_for_model(&skills, Some("claude-sonnet-4")).unwrap();
+        let small = build_skill_listing_section_for_model(&skills, Some("gpt-3.5-turbo")).unwrap();
+        assert!(
+            claude.text.matches("<name>").count() > small.text.matches("<name>").count(),
+            "200K context must list more skills than 16K context"
+        );
+    }
+
+    #[test]
+    fn deferred_block_text_for_model_sizes_per_provider() {
+        let surface = make_deferred_surface(60);
+        let claude = surface
+            .deferred_block_text(Some("claude-sonnet-4"))
+            .unwrap();
+        let small = surface.deferred_block_text(Some("gpt-3.5-turbo")).unwrap();
+        assert!(
+            claude.matches("<name>").count() > small.matches("<name>").count(),
+            "200K context window must list more deferred tools than 16K"
         );
     }
 

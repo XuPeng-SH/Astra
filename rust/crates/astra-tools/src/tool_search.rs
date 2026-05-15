@@ -6,6 +6,28 @@
 
 use serde_json::{Value, json};
 
+use crate::relevance_score::Scoreable;
+
+struct ToolSchemaAdapter<'a>(&'a Value);
+
+impl Scoreable for ToolSchemaAdapter<'_> {
+    fn score_name(&self) -> &str {
+        self.0
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+    }
+
+    fn score_description(&self) -> &str {
+        self.0
+            .get("function")
+            .and_then(|f| f.get("description"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+    }
+}
+
 /// Search available tool schemas by keyword or exact name.
 ///
 /// The `schemas` parameter should be a slice of tool schema JSON values,
@@ -16,8 +38,14 @@ use serde_json::{Value, json};
 /// - Otherwise — keyword search with scoring
 pub fn tool_search(schemas: &[Value], args: &Value) -> String {
     let query = match args.get("query").and_then(Value::as_str) {
-        Some(q) if !q.is_empty() => q.trim(),
-        _ => return "Error: 'query' is required".to_string(),
+        Some(q) => {
+            let trimmed = q.trim();
+            if trimmed.is_empty() {
+                return "Error: 'query' is required".to_string();
+            }
+            trimmed
+        }
+        None => return "Error: 'query' is required".to_string(),
     };
 
     let max_results = args
@@ -90,73 +118,14 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
         .to_string();
     }
 
-    // Keyword search mode
-    let query_lower = query.to_lowercase();
-    let query_terms: Vec<&str> = query_lower.split_whitespace().collect();
+    // Keyword search mode — delegates scoring to shared utility.
+    let adapters: Vec<ToolSchemaAdapter> = schemas.iter().map(ToolSchemaAdapter).collect();
+    let ranked = crate::relevance_score::rank_by_relevance(&adapters, query, max_results);
 
-    let mut scored: Vec<(usize, &Value)> = schemas
-        .iter()
-        .filter_map(|tool| {
-            let func = tool.get("function")?;
-            let name = func.get("name")?.as_str()?;
-            let desc = func
-                .get("description")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-
-            let name_lower = name.to_lowercase();
-            let desc_lower = desc.to_lowercase();
-
-            let mut score = 0usize;
-
-            for term in &query_terms {
-                // Exact name match (high weight)
-                if name_lower == *term {
-                    score += 20;
-                } else if name_lower.contains(term) {
-                    score += 10;
-                }
-
-                // Split camelCase/snake_case for part matching
-                let name_parts: Vec<String> = name
-                    .replace('_', " ")
-                    .chars()
-                    .fold(String::new(), |mut acc, c| {
-                        if c.is_uppercase() && !acc.is_empty() {
-                            acc.push(' ');
-                        }
-                        acc.push(c);
-                        acc
-                    })
-                    .to_lowercase()
-                    .split_whitespace()
-                    .map(String::from)
-                    .collect();
-
-                for part in &name_parts {
-                    if part == *term {
-                        score += 8;
-                    } else if part.contains(term) {
-                        score += 4;
-                    }
-                }
-
-                // Description match (lower weight)
-                if desc_lower.contains(term) {
-                    score += 2;
-                }
-            }
-
-            if score > 0 { Some((score, tool)) } else { None }
-        })
-        .collect();
-
-    scored.sort_by_key(|b| std::cmp::Reverse(b.0));
-
-    let matches: Vec<Value> = scored
+    let matches: Vec<Value> = ranked
         .into_iter()
-        .take(max_results)
-        .map(|(score, tool)| {
+        .map(|(idx, score)| {
+            let tool = &schemas[idx];
             let func = tool.get("function").unwrap_or(tool);
             let name = func.get("name").and_then(Value::as_str).unwrap_or("");
             let desc = func
@@ -272,6 +241,22 @@ mod tests {
         let schemas = sample_schemas();
         let result = tool_search(&schemas, &json!({"query": ""}));
         assert!(result.contains("Error"));
+    }
+
+    #[test]
+    fn whitespace_only_query_returns_error() {
+        // Previously: `!q.is_empty()` passed for "   ", then q.trim() handed
+        // an empty string to the keyword scorer, which returned an empty
+        // matches array — not an error. The contract is "missing query =
+        // error", so whitespace-only must take the same error path.
+        let schemas = sample_schemas();
+        for q in ["   ", "\t", "\n\n", " \t \n "] {
+            let result = tool_search(&schemas, &json!({"query": q}));
+            assert!(
+                result.contains("Error"),
+                "whitespace-only query {q:?} must error, got: {result}"
+            );
+        }
     }
 
     // ── select: mode must return FULL schema (parameters included) ────────

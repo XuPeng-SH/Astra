@@ -264,6 +264,7 @@ pub(crate) async fn stream_chat_sse(
             let spawn_ctx = edge_tools::agent_spawning::SpawnAgentContext {
                 run_id: parent_turn_run_id.clone(),
                 agent_id: root_agent_id.to_string(),
+                current_model: p.model.map(str::to_string),
                 recursion_depth: 0,
                 working_dir: project_root.clone(),
                 spawner: spawner.clone(),
@@ -852,6 +853,7 @@ pub(crate) async fn stream_chat_sse(
                 tool_calls_count,
                 tool_health_export: state.turn_guard.health.export_merged(p.tool_health_entries),
                 session_id: state.current_session_id.clone(),
+                run_id: state.current_run_id.clone(),
                 last_heavy_checkpoint: state.stall.last_heavy_checkpoint.take(),
                 partial_text: std::mem::take(&mut state.final_text),
             },

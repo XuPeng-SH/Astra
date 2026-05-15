@@ -36,6 +36,9 @@ pub struct SpawnAgentContext {
     pub run_id: String,
     /// Current agent's ID
     pub agent_id: String,
+    /// Current active model for the parent turn. Used as the default
+    /// child model when the tool call omits an explicit override.
+    pub current_model: Option<String>,
     /// Current nested agent/sub-run depth of the agent.
     pub recursion_depth: u8,
     /// Working directory
@@ -57,7 +60,7 @@ pub struct SpawnAgentContext {
 /// This is called by the tool executor when the LLM invokes spawn_agent.
 pub async fn handle_spawn_agent_tool(args: &Value, ctx: Option<&SpawnAgentContext>) -> String {
     // Parse input
-    let input: SpawnAgentInput = match normalize_spawn_agent_args(args)
+    let mut input: SpawnAgentInput = match normalize_spawn_agent_args(args)
         .and_then(|patched_args| serde_json::from_value(patched_args).map_err(|e| e.to_string()))
     {
         Ok(i) => i,
@@ -81,6 +84,9 @@ pub async fn handle_spawn_agent_tool(args: &Value, ctx: Option<&SpawnAgentContex
             .to_string();
         }
     };
+    if input.model.is_none() {
+        input.model = ctx.current_model.clone();
+    }
 
     // Build spawn context
     let mut inherited_permissions = ctx.inherited_permissions.clone();
@@ -137,6 +143,22 @@ fn normalize_spawn_agent_args(args: &Value) -> Result<Value, String> {
     let obj = patched_args
         .as_object_mut()
         .ok_or_else(|| "spawn input must be a JSON object".to_string())?;
+
+    if obj.contains_key("agents") {
+        return Err("unsupported `agents` payload for agent.spawn: each \
+             `agent(action='spawn', ...)` call launches exactly one child. \
+             To fan out N sub-agents in parallel, emit N separate `agent` \
+             tool calls in a single assistant message, each with \
+             `action='spawn'` and `run_in_background: true`."
+            .to_string());
+    }
+
+    if obj.contains_key("task") {
+        return Err("unsupported deprecated `task` field for agent.spawn. \
+             Use top-level `prompt` for the full child task brief and \
+             `description` for the short UI summary."
+            .to_string());
+    }
 
     let description = non_empty_string(obj.get("description")).map(str::to_string);
     let prompt = non_empty_string(obj.get("prompt")).map(str::to_string);
@@ -324,6 +346,13 @@ pub fn get_spawn_agent_schema() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astra_runtime::orchestration::{
+        DynamicAgentSpawner, SpawnAgentExecutor, SpawnRunConfig, SpawnRunResult,
+    };
+    use astra_runtime::server::delegation_engine::DelegationTracker;
+    use astra_turn_core::permission_types::InheritedPermissions;
+    use std::path::PathBuf;
+    use std::sync::Arc;
 
     #[test]
     fn test_schema_structure() {
@@ -373,12 +402,56 @@ mod tests {
     }
 
     #[test]
+    fn spawn_arg_normalization_rejects_legacy_task_field() {
+        let err = normalize_spawn_agent_args(&json!({
+            "description": "Audit auth flow",
+            "task": "Read src/auth and report token refresh bugs."
+        }))
+        .expect_err("deprecated task field must be rejected");
+        assert!(
+            err.contains("deprecated `task` field") && err.contains("prompt"),
+            "migration error must tell callers to move to prompt. Got: {err}"
+        );
+    }
+
+    #[test]
+    fn spawn_arg_normalization_rejects_task_even_when_prompt_is_present() {
+        let err = normalize_spawn_agent_args(&json!({
+            "description": "Audit auth flow",
+            "prompt": "Use the new prompt field.",
+            "task": "Do not use this deprecated alias."
+        }))
+        .expect_err("deprecated task field must stay forbidden even when prompt exists");
+        assert!(
+            err.contains("deprecated `task` field"),
+            "mixed prompt/task payloads must still hard-fail. Got: {err}"
+        );
+    }
+
+    #[test]
     fn spawn_arg_normalization_never_fabricates_placeholder_prompt() {
         let err = normalize_spawn_agent_args(&json!({ "name": "reviewer-only" }))
             .expect_err("name alone is not enough to spawn a meaningful agent");
         assert!(
             err.contains("prompt") || err.contains("description"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn spawn_arg_normalization_rejects_agents_batch_payload_with_redirect() {
+        let err = normalize_spawn_agent_args(&json!({
+            "action": "spawn",
+            "agents": [
+                {"description": "Review one", "prompt": "p1"},
+                {"description": "Review two", "prompt": "p2"}
+            ]
+        }))
+        .expect_err("batch payloads must be rejected with an actionable redirect");
+        assert!(err.contains("agents"), "{err}");
+        assert!(
+            err.contains("single assistant message") || err.contains("separate"),
+            "error must explain the supported fan-out shape. Got: {err}"
         );
     }
 
@@ -391,6 +464,109 @@ mod tests {
         let result = handle_spawn_agent_tool(&args, None).await;
         assert!(result.contains("not available"));
         assert!(result.contains("\"status\":\"failed\""), "{result}");
+    }
+
+    struct CapturingModelExecutor {
+        captured_model: std::sync::Mutex<Option<String>>,
+    }
+
+    impl CapturingModelExecutor {
+        fn new() -> Self {
+            Self {
+                captured_model: std::sync::Mutex::new(None),
+            }
+        }
+
+        fn take_captured_model(&self) -> Option<String> {
+            self.captured_model.lock().unwrap().take()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SpawnAgentExecutor for CapturingModelExecutor {
+        async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
+            *self.captured_model.lock().unwrap() = Some(config.model.clone());
+            Ok(SpawnRunResult {
+                agent_id: config.agent_id,
+                run_id: config.run_id,
+                status: "completed".into(),
+                finish_reason: "normal".into(),
+                output: Some("ok".into()),
+                error: None,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                tool_calls: 0,
+                permission_summary: None,
+                permission_requests: 0,
+                permission_requests_approved: 0,
+                tools_blocked: 0,
+            })
+        }
+    }
+
+    fn test_spawner(executor: Arc<dyn SpawnAgentExecutor>) -> Arc<DynamicAgentSpawner> {
+        let transport = Arc::new(astra_messaging::InProcessTransport::new());
+        let tracker = Arc::new(DelegationTracker::new());
+        let router = Arc::new(astra_messaging::AgentMailboxRouter::new(transport, tracker));
+        Arc::new(DynamicAgentSpawner::new(router).with_executor(executor))
+    }
+
+    fn test_spawn_context(
+        spawner: Arc<DynamicAgentSpawner>,
+        current_model: Option<&str>,
+    ) -> SpawnAgentContext {
+        SpawnAgentContext {
+            run_id: "run-parent".into(),
+            agent_id: "root-agent".into(),
+            current_model: current_model.map(str::to_string),
+            recursion_depth: 0,
+            working_dir: PathBuf::from("."),
+            spawner,
+            inherited_permissions: InheritedPermissions::auto_approve(),
+            active_skills: Vec::new(),
+            live_event_sink: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_spawn_agent_tool_inherits_parent_model_when_omitted() {
+        let executor = Arc::new(CapturingModelExecutor::new());
+        let spawner = test_spawner(executor.clone());
+        let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
+        let args = json!({
+            "description": "Code quality review",
+            "prompt": "Review the latest commit",
+            "agent_type": "general-purpose"
+        });
+
+        let result = handle_spawn_agent_tool(&args, Some(&ctx)).await;
+
+        assert!(result.contains("\"status\":\"completed\""), "{result}");
+        assert_eq!(
+            executor.take_captured_model().as_deref(),
+            Some("MiniMax-M2.7")
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_spawn_agent_tool_preserves_explicit_model_override() {
+        let executor = Arc::new(CapturingModelExecutor::new());
+        let spawner = test_spawner(executor.clone());
+        let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
+        let args = json!({
+            "description": "Code quality review",
+            "prompt": "Review the latest commit",
+            "agent_type": "general-purpose",
+            "model": "claude-sonnet-4.6"
+        });
+
+        let result = handle_spawn_agent_tool(&args, Some(&ctx)).await;
+
+        assert!(result.contains("\"status\":\"completed\""), "{result}");
+        assert_eq!(
+            executor.take_captured_model().as_deref(),
+            Some("claude-sonnet-4.6")
+        );
     }
 
     #[tokio::test]
