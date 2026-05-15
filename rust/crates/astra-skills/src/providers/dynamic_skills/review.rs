@@ -10,11 +10,7 @@ allowed_tools:
   - bash
   - read_file
   - write_file
-triggers:
-  - review
-  - simplify
-  - "clean up code"
-when_to_use: "When the user wants their recent code changes reviewed for unnecessary complexity, readability issues, or refactoring opportunities"
+when_to_use: "User wants recently changed code reviewed for reuse, quality, or efficiency — typically before commit or after a feature lands"
 category: code-review
 tags:
   - review

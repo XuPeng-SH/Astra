@@ -10,13 +10,7 @@ allowed_tools:
   - read_file
   - write_file
   - delegate
-triggers:
-  - debug
-  - diagnose
-  - troubleshoot
-  - "why does this fail"
-  - broken
-when_to_use: "When the user reports a specific bug, test failure, or unexpected behavior that needs systematic diagnosis — not for general questions about error handling"
+when_to_use: "User reports something is broken: a failing test, a crash, a bug, output that doesn't match expectations. Not for hypothetical 'how should I handle errors' design questions"
 category: diagnostics
 arguments:
   - name: ISSUE
