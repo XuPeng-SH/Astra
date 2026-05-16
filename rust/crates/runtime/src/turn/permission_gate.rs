@@ -189,6 +189,14 @@ fn is_read_only_in_plan_mode(tool_name: &str) -> bool {
             | "grep"
             | "glob"
             | "list_dir"
+            | "git_status"
+            | "git_diff"
+            | "git_log"
+            | "git_file_history"
+            | "git_contributors"
+            | "git_log_search"
+            | "git_show"
+            | "git_blame"
             | "symbols"
             | "introspect"
             | "lsp"
@@ -248,6 +256,7 @@ mod tests {
     use crate::orchestration::permission_sync::{
         InheritedPermissions, PermissionMode, PermissionResponseMessaging, PermissionRule,
     };
+    use astra_turn_core::permission_types::RuleMatchContext;
     use std::collections::HashSet;
 
     fn is_allowed(result: &PermissionCheckResult) -> bool {
@@ -731,7 +740,9 @@ mod tests {
                     let correlation_id = msg.correlation_id.clone().unwrap();
                     let response =
                         crate::orchestration::permission_sync::PermissionResponse::approve()
-                            .with_update(PermissionUpdate::allow(PermissionRule::parse("bash")));
+                            .with_update(PermissionUpdate::allow(PermissionRule::parse(
+                                "Bash(touch:*)",
+                            )));
                     router_clone
                         .send(response.to_message(
                             &parent_addr_clone,
@@ -764,10 +775,11 @@ mod tests {
         }
 
         let ctx_guard = ctx.read().await;
-        assert!(ctx_guard.is_allowed(
+        let rule_ctx = RuleMatchContext::from_tool_args(
             "bash",
-            Some(r#"{"command":"touch astra-permission-gate-test"}"#)
-        ));
+            &serde_json::json!({"command":"touch astra-permission-gate-test"}),
+        );
+        assert!(ctx_guard.is_allowed_with_context("bash", &rule_ctx));
         let telemetry = ctx_guard.telemetry();
         assert_eq!(telemetry.permission_requests, 1);
         assert_eq!(telemetry.permission_requests_approved, 1);
@@ -861,7 +873,21 @@ mod tests {
         };
         let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
 
-        for tool in &["read_file", "grep", "glob", "list_dir", "symbols"] {
+        for tool in &[
+            "read_file",
+            "grep",
+            "glob",
+            "list_dir",
+            "git_status",
+            "git_diff",
+            "git_log",
+            "git_file_history",
+            "git_contributors",
+            "git_log_search",
+            "git_show",
+            "git_blame",
+            "symbols",
+        ] {
             let result = check_tool_permission_in_plan_mode(
                 tool,
                 None,
