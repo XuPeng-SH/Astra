@@ -238,8 +238,18 @@ pub(crate) async fn stream_chat_sse(
         } else {
             ex
         };
+        let ex = if let Some(ref tx) = p.task_notify_tx {
+            ex.with_task_notify_tx(tx.clone())
+        } else {
+            ex
+        };
         let ex = if let Some(ref cmds) = p.bg_task_commands {
             ex.with_bg_task_commands(cmds.clone())
+        } else {
+            ex
+        };
+        let ex = if let Some(ref slot) = p.bash_detach_slot {
+            ex.with_bash_detach_slot(slot.clone())
         } else {
             ex
         };
@@ -293,6 +303,9 @@ pub(crate) async fn stream_chat_sse(
     // cache keeps its copy for the next turn's render / eventual clear.
     if let Some(diag) = p.latest_skill_diagnosis {
         executor.set_latest_skill_diagnosis(Some(diag.clone()));
+    }
+    if let Some(feedback) = p.latest_turn_quality_feedback {
+        executor.set_latest_turn_quality_feedback(Some(feedback.clone()));
     }
     let root_send_message_context = p.agent_spawner.as_ref().map(|spawner| {
         edge_tools::agent_messaging::SendMessageRuntimeContext {

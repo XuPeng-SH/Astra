@@ -22,31 +22,80 @@ pub(crate) fn local_task_service() -> std::sync::Arc<dyn astra_services::TaskSer
     std::sync::Arc::new(astra_services::LocalTaskService::new(tasks_dir))
 }
 
-pub(crate) async fn resolve_task_service() -> std::sync::Arc<dyn astra_services::TaskService> {
-    if std::env::var("MATRIXONE_HOST").is_ok() {
-        let settings = astra_core::MatrixOneSettings::from_env();
-        let catalog =
-            std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
-        let _ = astra_services::storage::ensure_core_schema(&settings, &catalog).await;
-        if let Some(pool) = cloud_sync::try_connect_matrixone().await {
-            return std::sync::Arc::new(astra_services::MatrixOneTaskService::new(pool));
-        }
+/// Resolve a `TaskService` impl for this CLI invocation.
+///
+/// Edge-cloud contract: the CLI never connects to MatrixOne
+/// directly. When `cloud_base` is configured (via env or the
+/// authenticated session), we return [`crate::http_task_service::HttpTaskService`]
+/// which proxies trait calls through `POST /tasks:rpc`. Otherwise
+/// we fall back to the local on-disk store so offline / one-shot
+/// CLI and headless tests stay functional.
+///
+/// `profile` is forwarded to the access-token lookup so the same
+/// cloud session can be used for both the SSE stream and task RPC.
+pub(crate) async fn resolve_task_service(
+    profile: Option<&str>,
+) -> std::sync::Arc<dyn astra_services::TaskService> {
+    if let Some(cloud_base) = resolve_cloud_base() {
+        let token = current_access_token(profile);
+        return std::sync::Arc::new(crate::http_task_service::HttpTaskService::new(
+            cloud_base, token,
+        ));
     }
     local_task_service()
 }
 
-/// Task store for the Tier 1 session scratchpad (`session_todos`). MO-backed
-/// when a pool is configured so edge/cloud see the same rows; in-memory
-/// fallback for offline CLI.
-pub(crate) async fn resolve_task_store() -> std::sync::Arc<dyn astra_tools::task_mgmt::TaskStore> {
-    if std::env::var("MATRIXONE_HOST").is_ok()
-        && let Some(pool) = cloud_sync::try_connect_matrixone().await
-    {
-        return std::sync::Arc::new(astra_tools::task_mgmt_matrixone::MatrixOneTaskStore::new(
-            pool,
-        ));
+/// Resolve the astra server base URL. Returns `None` when no server
+/// is configured (offline mode).
+fn resolve_cloud_base() -> Option<String> {
+    std::env::var("ASTRA_API_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim_end_matches('/').to_string())
+}
+
+/// Task store for the Tier 1 session scratchpad (`session_todos`).
+///
+/// When cloud is configured, returns an [`crate::session_todo_client::HttpTaskStore`]
+/// that polls the server's `GET /sessions/{sid}/todos` endpoint and
+/// receives broadcast notifications from `route_task_action` after
+/// every successful mutation. The observer sees tasks within one poll
+/// cycle (~50ms after the dirty flag fires).
+///
+/// Offline / headless falls back to the in-memory store (no server).
+///
+/// Returns `(store, Option<notify_tx>)`. Callers wire `notify_tx`
+/// into the tool executor so `route_task_action` can signal the
+/// observer after each cloud write.
+///
+/// `cloud_base` selection: prefers the explicit caller-supplied URL
+/// (typically `ThinClient::api_origin()` — the same source the tool
+/// executor uses), falling back to the `ASTRA_API_URL` env var so
+/// scripted callers without a thin client still hit the right server.
+/// Never reads the env var when an explicit base is provided — having
+/// two sources of truth was the root cause of the "TUI dashboard
+/// never appears" bug: the executor used `api_origin()` while the
+/// task store used the env var, so the in-memory store handed to
+/// the observer never saw the cloud writes.
+pub(crate) async fn resolve_task_store(
+    profile: Option<&str>,
+    cloud_base_override: Option<&str>,
+) -> (
+    std::sync::Arc<dyn astra_tools::task_mgmt::TaskStore>,
+    Option<tokio::sync::broadcast::Sender<String>>,
+) {
+    let cloud_base = cloud_base_override
+        .map(|s| s.trim_end_matches('/').to_string())
+        .or_else(resolve_cloud_base);
+    if let Some(cloud_base) = cloud_base {
+        let token = current_access_token(profile);
+        let (store, notify_tx) = crate::session_todo_client::HttpTaskStore::new(cloud_base, token);
+        return (store, Some(notify_tx));
     }
-    std::sync::Arc::new(astra_tools::task_mgmt::InMemoryTaskStore::new())
+    (
+        std::sync::Arc::new(astra_tools::task_mgmt::InMemoryTaskStore::new()),
+        None,
+    )
 }
 
 pub(crate) fn install_task_service(
@@ -79,35 +128,35 @@ pub(crate) fn rebind_task_session(state: &SessionState, session_id: &str) {
     state.task_manager.rebind(session_id);
 }
 
-pub(crate) async fn resolve_matrixone_task_runtime() -> Result<
+/// Resolve the durable cloud task runtime (TaskService + lease).
+///
+/// Edge-cloud contract: no direct MO connection from the CLI. Both
+/// services proxy through their REST surfaces:
+/// - TaskService → `POST /tasks:rpc`
+/// - TaskLeaseService → `/tasks/{id}/lease/*`
+///
+/// `profile` is forwarded to the access-token resolver so a logged-in
+/// CLI invocation gets bearer auth.
+pub(crate) async fn resolve_matrixone_task_runtime(
+    profile: Option<&str>,
+) -> Result<
     (
         std::sync::Arc<dyn astra_services::TaskService>,
         std::sync::Arc<dyn astra_services::TaskLeaseService>,
     ),
     String,
 > {
-    if std::env::var("MATRIXONE_HOST").is_err() {
-        return Err(
-            "MatrixOne task runtime is not configured; set MATRIXONE_HOST and related MatrixOne env vars"
-                .to_string(),
-        );
-    }
-    let settings = astra_core::MatrixOneSettings::from_env();
-    let catalog =
-        std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
-    astra_services::storage::ensure_core_schema(&settings, &catalog)
-        .await
-        .map_err(|e| format!("initialize MatrixOne task schema: {e}"))?;
-    let pool = cloud_sync::try_connect_matrixone()
-        .await
-        .ok_or_else(|| "connect MatrixOne task runtime".to_string())?;
-    let task_service: std::sync::Arc<dyn astra_services::TaskService> =
-        std::sync::Arc::new(astra_services::MatrixOneTaskService::new(pool.clone()));
-    let lease_service: std::sync::Arc<dyn astra_services::TaskLeaseService> =
-        std::sync::Arc::new(astra_services::DatabaseTaskLeaseService::new(
-            pool,
-            std::sync::Arc::new(astra_services::TaskLeaseHoldCache::default()),
-        ));
+    let cloud_base = resolve_cloud_base().ok_or_else(|| {
+        "Cloud task runtime requires ASTRA_API_URL; CLI does not connect to MatrixOne directly"
+            .to_string()
+    })?;
+    let token = current_access_token(profile);
+    let task_service: std::sync::Arc<dyn astra_services::TaskService> = std::sync::Arc::new(
+        crate::http_task_service::HttpTaskService::new(cloud_base.clone(), token.clone()),
+    );
+    let lease_service: std::sync::Arc<dyn astra_services::TaskLeaseService> = std::sync::Arc::new(
+        crate::http_task_service::HttpTaskLeaseService::new(cloud_base, token),
+    );
     Ok((task_service, lease_service))
 }
 
@@ -139,12 +188,15 @@ fn create_pipeline_modules_inner(
     // (server HOME skills + database skills visible to this user). That keeps
     // CLI and Web aligned for shared server capabilities without pretending
     // that project-local CLI skills are available to Web sessions.
-    let remote_catalog = current_access_token(profile).map(|_| {
-        let profile_owned = profile.map(str::to_string);
-        let token_provider: astra_runtime::capabilities::TokenProvider =
-            std::sync::Arc::new(move || current_access_token(profile_owned.as_deref()));
-        astra_runtime::capabilities::RemoteSkillCatalogProvider::new(api.clone(), token_provider)
-    });
+    // Always install the remote catalog provider. It reads tokens at
+    // call time, so sessions can recover after env-token expiry/login
+    // without requiring a full CLI restart to rebuild pipeline modules.
+    let profile_owned = profile.map(str::to_string);
+    let token_provider: astra_runtime::capabilities::TokenProvider =
+        std::sync::Arc::new(move || current_access_token(profile_owned.as_deref()));
+    let remote_catalog = Some(
+        astra_runtime::capabilities::RemoteSkillCatalogProvider::new(api.clone(), token_provider),
+    );
     let unified_skill_registry =
         astra_runtime::capabilities::build_cli_local_skill_registry(remote_catalog);
     let handle = tokio::runtime::Handle::current();
@@ -654,14 +706,13 @@ pub(crate) fn maybe_restore_pending_plan_mode(line: &str, state: &mut SessionSta
         || state.executing_plan.is_some()
         || state.plan_handle.is_some()
         || state.pending_plan_resume_digest.is_none()
-        || !line.contains("@resume-plan")
+        || !astra_runtime::plan::plan_resume::message_signals_resume(line)
     {
         return false;
     }
 
     let path = astra_runtime::plan_decompose::PlanModeState::state_path();
     if !path.exists() {
-        state.pending_plan_resume_digest = None;
         return false;
     }
 
@@ -695,7 +746,6 @@ pub(crate) fn maybe_restore_pending_plan_mode(line: &str, state: &mut SessionSta
         }
         Err(err) => {
             eprintln!("  ⚠ failed to restore saved plan mode: {err}");
-            state.pending_plan_resume_digest = None;
             false
         }
     }
@@ -1652,6 +1702,65 @@ mod tests {
         assert_eq!(
             state.plan_mode.as_ref().map(|ps| ps.goal.as_str()),
             Some("Ship plan resume")
+        );
+    }
+
+    #[test]
+    fn maybe_restore_pending_plan_mode_accepts_plain_continue_signal() {
+        let (_tmp, _g) = isolated_sessions_dir();
+        let _creds_guard = isolate_credentials();
+        let home = tempdir().unwrap();
+        let _home_guard = EnvGuard::set("HOME", home.path().to_str().unwrap());
+        std::fs::create_dir_all(home.path().join(".astra")).unwrap();
+
+        let mut plan_state = astra_runtime::plan_decompose::PlanModeState::new(
+            "Resume without explicit tag".to_string(),
+            Default::default(),
+        );
+        plan_state
+            .plan
+            .subtasks
+            .push(astra_services::task_orchestrator::SubtaskPlan {
+                id: "t1".into(),
+                title: "Continue current subtask".into(),
+                status: astra_services::task_orchestrator::TaskStatus::InProgress,
+                ..Default::default()
+            });
+        plan_state
+            .save_to_file(&astra_runtime::plan_decompose::PlanModeState::state_path())
+            .unwrap();
+
+        let mut state = SessionState {
+            pending_plan_resume_digest: Some(
+                "[plan-resume] goal=\"Resume without explicit tag\"".into(),
+            ),
+            ..SessionState::default()
+        };
+        assert!(maybe_restore_pending_plan_mode("continue", &mut state));
+        assert!(state.pending_plan_resume_digest.is_none());
+        assert_eq!(
+            state.plan_mode.as_ref().map(|ps| ps.goal.as_str()),
+            Some("Resume without explicit tag")
+        );
+    }
+
+    #[test]
+    fn maybe_restore_pending_plan_mode_missing_file_keeps_digest_for_fallback() {
+        let (_tmp, _g) = isolated_sessions_dir();
+        let _creds_guard = isolate_credentials();
+        let home = tempdir().unwrap();
+        let _home_guard = EnvGuard::set("HOME", home.path().to_str().unwrap());
+        std::fs::create_dir_all(home.path().join(".astra")).unwrap();
+
+        let mut state = SessionState {
+            pending_plan_resume_digest: Some("[plan-resume] goal=\"Lost local file\"".into()),
+            ..SessionState::default()
+        };
+
+        assert!(!maybe_restore_pending_plan_mode("continue", &mut state));
+        assert_eq!(
+            state.pending_plan_resume_digest.as_deref(),
+            Some("[plan-resume] goal=\"Lost local file\"")
         );
     }
 

@@ -94,6 +94,11 @@ pub(crate) struct ViewportFrame {
     /// Pre-rendered task board. `None` when the board should not
     /// draw (collapsed, hidden by idle timer, empty, etc.).
     pub task_board: Option<Vec<Line<'static>>>,
+    /// The resolved board visibility state after evaluating the
+    /// snapshot. Callers MUST write this back to their local
+    /// `board_expanded` so that in-turn draws self-correct when
+    /// tasks appear mid-turn (rather than waiting for the outer tick).
+    pub resolved_board_expanded: bool,
 }
 
 pub(crate) fn active_viewport(
@@ -101,6 +106,7 @@ pub(crate) fn active_viewport(
     status: &status_indicator::StatusIndicator,
     board: Option<&TaskBoardObserver>,
     board_expanded: bool,
+    board_user_pin: Option<bool>,
     width: u16,
     rows: u16,
 ) -> ViewportFrame {
@@ -113,11 +119,11 @@ pub(crate) fn active_viewport(
     // sub-agents run shows both).
     //
     // Visibility rule: show the strip while ANY agent is still live
-    // (running). Once all agents are terminal (completed OR failed),
-    // linger for `STRIP_LINGER` so the user can glance at the final
-    // state, then dismiss. Failed entries no longer pin the strip
-    // permanently — they participate in the same linger window.
-    // Beyond linger the user can still drill in via Ctrl+G.
+    // (running). Completed-only strips linger for `STRIP_LINGER` so
+    // the user can glance at the final state, then dismiss. Failed
+    // entries stay visible until a new turn state replaces them, so
+    // failures are not silently missed after a short linger timeout.
+    // Users can still drill in via Ctrl+G.
     const STRIP_LINGER: std::time::Duration = std::time::Duration::from_secs(5);
     let _ = inner_w; // retained for future per-row layout decisions
     let agent_ids = chat_widget.agent_run_ids();
@@ -145,6 +151,7 @@ pub(crate) fn active_viewport(
             .collect();
 
         let any_live = cells.iter().any(|entry| entry.live);
+        let any_failed = cells.iter().any(|entry| entry.failed);
         let any_recently_terminal = !any_live
             && agent_ids.iter().any(|id| {
                 chat_widget.agent_run_cell(id).is_some_and(|tc| {
@@ -152,7 +159,7 @@ pub(crate) fn active_viewport(
                         .is_some_and(|completed_at| completed_at.elapsed() < STRIP_LINGER)
                 })
             });
-        if any_live || any_recently_terminal {
+        if any_live || any_failed || any_recently_terminal {
             Some(cells)
         } else {
             None
@@ -171,12 +178,48 @@ pub(crate) fn active_viewport(
             Some((lines, live, freeze_phase))
         }
     });
-    let snap = board.map(|b| b.snapshot()).unwrap_or_default();
-    // In multi-session mode the standard `snap.tasks` is empty by
-    // design (observer populates `multi_snapshot` instead). Pick
-    // the right render path so the expanded board honors whichever
-    // view mode the user toggled via Ctrl+Shift+T.
-    let task_board = if board_expanded && !snap.hidden {
+    // Pump the observer before reading its snapshot. Without this,
+    // mid-turn `task.create` / `task.update` calls land in
+    // `session_todos` but never propagate into the snapshot until
+    // the outer-tick branch fires `maybe_refresh()` — which can
+    // be 30+ seconds for a long agentic loop. The observer's own
+    // dirty/window gating makes per-frame calls cheap (no fetch
+    // unless something actually changed).
+    if let Some(b) = board {
+        b.maybe_refresh();
+    }
+    // `snap_for_render` drops completed tasks older than
+    // `COMPLETED_TASK_TTL` (~30s) so a long agentic run doesn't pile
+    // up dozens of ✔ rows above the spinner. The footer chip /
+    // header counts still pull from `counts()` (full truth) — only
+    // row rendering cares about the TTL filter.
+    let snap = board.map(|b| b.snapshot_for_render()).unwrap_or_default();
+
+    // Resolve board visibility from the FRESH snapshot every frame.
+    // This is the critical fix: previously, resolve_board_visibility
+    // only ran in the outer-tick, so in-turn draws always saw the
+    // stale `board_expanded = false` from turn start. Now every draw
+    // self-corrects — if task.create lands mid-turn, the board opens
+    // on the very next frame (≤50ms).
+    let has_tasks = !snap.tasks.is_empty();
+    let (resolved_expanded, _reset_pin) = super::board_pin::resolve_board_visibility(
+        board_expanded,
+        board_user_pin,
+        has_tasks,
+        snap.hidden,
+    );
+
+    // Three-mode board:
+    //   - hidden                       → render nothing
+    //   - !expanded, has tasks         → one-line collapsed summary
+    //   - expanded                     → full panel (single or multi-session)
+    //
+    // Earlier flow tied "no board" to "render Next: hint into the
+    // active region". With bottom-anchor + always-on collapsed
+    // summary, the hint is now redundant — the summary IS the hint.
+    let task_board = if snap.hidden {
+        None
+    } else if resolved_expanded {
         let mode = board
             .map(|b| b.view_mode())
             .unwrap_or(super::task_board_observer::ViewMode::SingleSession);
@@ -208,13 +251,15 @@ pub(crate) fn active_viewport(
                 }
             }
         }
+    } else if !snap.tasks.is_empty() {
+        task_list::render_collapsed_summary(&snap.tasks, width).map(|line| vec![line])
     } else {
         None
     };
     let status_line = status.render();
-    // Hint fallback still runs — but ONLY when we have no board to
-    // render (collapsed or empty). When the board IS visible, the
-    // hint is redundant noise.
+    // Hint suppressed once the collapsed summary covers the same
+    // ground (current/next + status icon). Only fall back to the
+    // hint when we genuinely have no board slot to fill.
     let next_hint = if task_board.is_none() && !snap.hidden {
         task_list::render_next_hint(&snap.tasks, width)
     } else {
@@ -225,6 +270,7 @@ pub(crate) fn active_viewport(
         active,
         multi_agent: multi_agent_active,
         task_board,
+        resolved_board_expanded: resolved_expanded,
     }
 }
 
@@ -411,25 +457,46 @@ pub(crate) fn do_draw(
     let bp_item = RenderableItem::Owned(Box::new(bp_renderable) as Box<dyn Renderable>);
 
     let mut flex = FlexRenderable::new();
-    // Task board FIRST so it sits above the active cell — claude-code
-    // stacks its live-panels-as-static on top of the streaming region.
-    // Flex weight 0 = "take only what you need"; the board has a
-    // deterministic row count so weight 0 is correct, stream content
-    // gets the remainder.
+    // Layout (top → bottom):
+    //   active cell + scrollback   (weight=1, soaks remaining space)
+    //   multi-agent strip          (weight=0, only if any sub-agents are live)
+    //   separator                  (weight=0)  ← visual break above board
+    //   task board                 (weight=0, pinned just above composer)
+    //   blank spacer               (weight=0)  ← only when board renders
+    //   bottom pane / composer     (weight=0)
+    //
+    // Earlier iterations stacked the board ABOVE the active cell to
+    // mirror claude-code's "static panels on top". That broke down for
+    // long agentic turns: streaming text kept pushing the board further
+    // from the composer until it was off-screen entirely. Bottom-anchor
+    // keeps the board adjacent to the composer — the user's eye only
+    // moves between two adjacent regions (composer ↔ board).
+    //
+    // The blank spacer between board and composer prevents the
+    // collapsed summary from clinging to the input prompt — without
+    // it the eye reads `⠋ N tasks ...› Ask astra ...` as one cramped
+    // strip. Only inserted when the board actually renders so an
+    // empty-task session doesn't waste a row.
+    flex.push(1, ac_renderable);
+    if let Some(item) = multi_agent_renderable {
+        flex.push(0, item);
+    }
+    flex.push(0, sep_renderable);
+    let board_rendered = task_board_lines
+        .as_ref()
+        .is_some_and(|lines| !lines.is_empty());
     if let Some(lines) = task_board_lines
         && !lines.is_empty()
     {
         let para = Paragraph::new(ratatui::text::Text::from(lines));
         flex.push(0, RenderableItem::Owned(Box::new(para)));
     }
-    // Multi-agent strip BETWEEN task board and active cell. So the
-    // user sees: board (Tier 1 todos) → parallel agents (Tier 2 sub
-    // -agents) → active cell (assistant streaming) → composer.
-    if let Some(item) = multi_agent_renderable {
-        flex.push(0, item);
+    if board_rendered {
+        let spacer = Paragraph::new(ratatui::text::Text::from(vec![Line::from(
+            ratatui::text::Span::raw(""),
+        )]));
+        flex.push(0, RenderableItem::Owned(Box::new(spacer)));
     }
-    flex.push(1, ac_renderable);
-    flex.push(0, sep_renderable);
     flex.push(0, bp_item);
 
     let total_h = flex.desired_height(width);
@@ -746,6 +813,7 @@ mod task_board_draw_tests {
             &status_indicator::StatusIndicator::new(),
             Some(&obs),
             true,
+            None,
             80,
             10,
         );
@@ -810,6 +878,7 @@ mod task_board_draw_tests {
             &status_indicator::StatusIndicator::new(),
             Some(&obs),
             true,
+            None,
             80,
             40,
         );
@@ -852,6 +921,7 @@ mod task_board_draw_tests {
             &status_indicator::StatusIndicator::new(),
             None,
             false,
+            None,
             80,
             24,
         );

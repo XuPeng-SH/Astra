@@ -95,6 +95,10 @@ pub(crate) struct SessionState {
         std::sync::Arc<std::sync::Mutex<crate::edge_tools::SessionStateRollbackJournal>>,
     /// Session-scoped task manager so task mutations survive across turns.
     pub task_manager: std::sync::Arc<crate::edge_tools::TaskManager>,
+    /// Broadcast sender for the HttpTaskStore. Fired after each
+    /// successful `route_task_action` so the observer refetches.
+    /// `None` when offline (in-memory store has its own notifications).
+    pub task_notify_tx: Option<tokio::sync::broadcast::Sender<String>>,
     /// Sticky task/thread summary used to anchor ultra-short follow-ups like
     /// "继续" even after history compaction prunes earlier turns.
     pub continuation_anchor: Option<String>,
@@ -109,6 +113,15 @@ pub(crate) struct SessionState {
     pub pending_followup_suggestion: Option<crate::followup_suggestion::FollowupSuggestion>,
     pub explain: ExplainMode,
     pub verbose_mode: bool,
+    /// User preference: enable background memory-extraction agent.
+    /// Synced via `pref_keys::AUTO_MEMORY_ENABLED`.
+    pub auto_memory_enabled: bool,
+    /// User preference: send desktop notifications when turns complete.
+    /// Synced via `pref_keys::NOTIFICATIONS_ENABLED`.
+    pub notifications_enabled: bool,
+    /// User preference: minimum elapsed seconds before a notification fires.
+    /// Synced via `pref_keys::NOTIFICATION_THRESHOLD_SECS`.
+    pub notification_threshold_secs: u64,
     pub history: Vec<(String, String)>, // (user_msg, assistant_msg)
     pub total_prompt_tokens: u64,
     pub total_completion_tokens: u64,
@@ -316,6 +329,11 @@ pub(crate) struct SessionState {
     /// Cleared when no diagnosis is produced.
     pub latest_skill_diagnosis: Option<astra_skills::auto_invoke::SkillDiagnosis>,
 
+    /// P3/P4: evaluator-derived feedback from the previous turn. Passed to
+    /// the next turn's ToolExecutor so the prompt can correct tool behavior
+    /// such as sequential read churn, repeated calls, and stalls.
+    pub latest_turn_quality_feedback: Option<astra_runtime::self_model::TurnQualityFeedback>,
+
     /// R1: tracks active diagnosis postconditions across turns. When a
     /// diagnosis fires, its success_criteria are registered here. On each
     /// subsequent turn, evaluate_turn checks whether the criteria are met.
@@ -383,6 +401,12 @@ pub(crate) struct SessionState {
     /// Shared command queue for background task operations.
     /// The tool executor pushes spawn/kill/output commands; the TUI drains them.
     pub bg_task_commands: std::sync::Arc<std::sync::Mutex<Vec<crate::edge_tools::BgTaskCommand>>>,
+    /// Shared detach slot for bash Ctrl+B promotion. Always present
+    /// (cheap to construct); when the TUI is attached it's wired
+    /// into the executor's ToolContext so each bash invocation can
+    /// observe the signal. Headless paths still see it but never
+    /// fire the signal so behaviour is unchanged.
+    pub bash_detach_slot: astra_tools::detach::DetachShellSlot,
 
     // ── Harness (observation + verification layer) ──
     #[cfg(feature = "harness")]
@@ -423,12 +447,16 @@ impl Default for SessionState {
                 crate::edge_tools::SessionStateRollbackJournal::default(),
             )),
             task_manager: std::sync::Arc::new(crate::edge_tools::TaskManager::in_memory()),
+            task_notify_tx: None,
             continuation_anchor: None,
             diagnostics_context: None,
             queued_message: None,
             pending_followup_suggestion: None,
             explain: ExplainMode::Off,
             verbose_mode: true,
+            auto_memory_enabled: true,
+            notifications_enabled: true,
+            notification_threshold_secs: 10,
             history: Vec::new(),
             total_prompt_tokens: 0,
             total_completion_tokens: 0,
@@ -523,6 +551,7 @@ impl Default for SessionState {
             session_memory_extractor: None,
             auto_invoke_handler: None,
             latest_skill_diagnosis: None,
+            latest_turn_quality_feedback: None,
             diagnosis_outcome_tracker:
                 astra_runtime::auto_invoke_handler::DiagnosisOutcomeTracker::new(),
             diagnosis_criteria_met: 0,
@@ -554,6 +583,7 @@ impl Default for SessionState {
             turns_since_task_use: 0,
             turns_since_task_reminder: 0,
             bg_task_commands: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            bash_detach_slot: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             #[cfg(feature = "harness")]
             harness_sink: astra_harness::InMemorySnapshotSink::arc(),
             #[cfg(feature = "harness")]

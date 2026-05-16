@@ -233,11 +233,17 @@ pub(super) async fn handle_chat_input_with_ui(
 
     ui.blank_line();
 
+    let restored_plan_mode = session_runtime::maybe_restore_pending_plan_mode(&line, state);
+
     // Consume one-shot resume guidance before building the effective line.
     let resume_guidance = state.resume_guidance.take();
     // P3.3 — pending plan-resume digest. Kept until the user sends an
     // explicit resume-like line, then consumed once.
-    let plan_resume_digest = consume_plan_resume_if_matches(state, &line);
+    let plan_resume_digest = if restored_plan_mode {
+        plan_resume_digest_from_active_plan_mode(state)
+    } else {
+        consume_plan_resume_if_matches(state, &line)
+    };
     let mut effective_line = build_effective_line(&line, state, ui);
     state.diagnostics_context = None; // consumed after injection
 
@@ -434,6 +440,13 @@ pub(super) fn consume_plan_resume_if_matches(
     astra_runtime::plan::plan_resume::message_signals_resume(line)
         .then(|| state.pending_plan_resume_digest.take())
         .flatten()
+}
+
+fn plan_resume_digest_from_active_plan_mode(state: &SessionState) -> Option<String> {
+    state
+        .plan_mode
+        .as_ref()
+        .and_then(astra_runtime::plan::plan_resume_digest)
 }
 
 fn apply_resume_context(
@@ -981,9 +994,9 @@ async fn run_chat_turn(
     // can reason about "what am I supposed to be doing right now"
     // without having to poll the task tool. Empty / all-completed
     // boards return None so we save cache budget on the common case.
-    let task_summary_block = {
+    let execution_state_block = {
         let tasks = state.task_manager.snapshot().await;
-        crate::task_summary::format_summary(&tasks)
+        crate::execution_state_summary::format_for_session_state(state, &tasks)
     };
 
     // Snapshot tui_cancel_token before the stream future locks `state` so the
@@ -1011,6 +1024,7 @@ async fn run_chat_turn(
             tool_health_entries: &state.tool_health_entries,
             session_lessons: &state.session_lessons,
             latest_skill_diagnosis: state.latest_skill_diagnosis.as_ref(),
+            latest_turn_quality_feedback: state.latest_turn_quality_feedback.as_ref(),
             unified_skill_registry: &state.unified_skill_registry,
             plan_only_chat: state.chat_plan_only && state.current_plan_subtask_id.is_none(),
             is_plan_subtask: state.current_plan_subtask_id.is_some(),
@@ -1039,11 +1053,13 @@ async fn run_chat_turn(
             git_worktree_journal: Some(state.git_worktree_journal.clone()),
             session_state_journal: Some(state.session_state_journal.clone()),
             task_manager: Some(state.task_manager.clone()),
+            task_notify_tx: state.task_notify_tx.clone(),
             bg_task_commands: Some(state.bg_task_commands.clone()),
+            bash_detach_slot: Some(state.bash_detach_slot.clone()),
             turn_index: state.turn,
             pipeline_state: None,
             pre_loaded_messages: None,
-            append_system_prompt: task_summary_block,
+            append_system_prompt: execution_state_block,
             session_memory_extractor: state.session_memory_extractor.clone(),
             #[cfg(feature = "harness")]
             harness_sink: Some(state.harness_sink.clone()),
@@ -1738,6 +1754,93 @@ pub(super) fn analyze_chat_turn_learning(
     TurnLearningSnapshot { routing, eval }
 }
 
+fn turn_quality_feedback_from_eval(
+    turn: u32,
+    eval: &astra_runtime::pipeline::evaluation::TurnEvaluation,
+) -> Option<astra_runtime::self_model::TurnQualityFeedback> {
+    use astra_runtime::pipeline::evaluation::EvalSignal;
+    use std::collections::BTreeSet;
+
+    let mut findings = Vec::new();
+    let mut repeated_tools = BTreeSet::new();
+    let mut saw_batching_issue = false;
+    let mut saw_stall_issue = false;
+
+    for signal in &eval.signals {
+        match signal {
+            EvalSignal::SequentialReadChurn(streak) => {
+                saw_batching_issue = true;
+                findings.push(format!(
+                    "Detected {streak} consecutive single-tool rounds; independent reads/searches should be batched in one round."
+                ));
+            }
+            EvalSignal::RepeatToolCall(tool) => {
+                repeated_tools.insert(tool.clone());
+            }
+            EvalSignal::StallDetected => {
+                saw_stall_issue = true;
+                findings.push(
+                    "TurnGuard detected a stall/divergence; stop broad exploration and take a concrete next action."
+                        .to_string(),
+                );
+            }
+            EvalSignal::VerdictWarning => {
+                saw_stall_issue = true;
+                findings.push(
+                    "TurnGuard emitted a warning-or-higher verdict; follow that warning instead of continuing the same pattern."
+                        .to_string(),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    if !repeated_tools.is_empty() {
+        let rendered = repeated_tools
+            .iter()
+            .take(4)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        findings.push(format!(
+            "Repeated tool calls detected for {rendered}; inspect prior results before retrying the same tool/arguments."
+        ));
+    }
+
+    if findings.is_empty() {
+        return None;
+    }
+
+    let recommended_action = match (
+        saw_batching_issue,
+        !repeated_tools.is_empty(),
+        saw_stall_issue,
+    ) {
+        (true, true, true) => {
+            "Batch independent reads/searches, reuse previous tool output before repeating calls, then choose one concrete recovery action."
+        }
+        (true, true, false) => {
+            "Batch independent reads/searches in one round and reuse previous output before repeating a tool call."
+        }
+        (true, false, _) => {
+            "Before the next tool round, group independent reads/searches into a parallel batch."
+        }
+        (false, true, _) => {
+            "Before retrying a tool, compare against prior output and change arguments only when new evidence requires it."
+        }
+        (false, false, true) => {
+            "Summarize current evidence, stop broad exploration, and take one concrete next action."
+        }
+        (false, false, false) => unreachable!("findings would be empty without a tracked issue"),
+    };
+
+    Some(astra_runtime::self_model::TurnQualityFeedback {
+        turn,
+        findings,
+        recommended_action: recommended_action.to_string(),
+    })
+}
+
 // record_selector_turn_outcome removed — tool selector no longer exists.
 
 /// Test-only sync variant of `apply_turn_success`. Production code paths must
@@ -1803,6 +1906,9 @@ async fn apply_turn_success_async(
                 .and_then(|rid| store.get_prefix(rid))
         });
 
+    state
+        .memory_extractor
+        .set_enabled(state.auto_memory_enabled);
     let outcome =
         state
             .memory_extractor
@@ -1842,7 +1948,10 @@ async fn apply_turn_success_async(
 
     // ── Desktop notification (fire-and-forget) ──────────────────────────
     let elapsed = turn_start.elapsed();
-    let notif_config = super::notifications::NotificationConfig::from_env();
+    let notif_config = super::notifications::NotificationConfig {
+        enabled: state.notifications_enabled,
+        min_duration_secs: state.notification_threshold_secs,
+    };
     if notif_config.enabled && notif_config.exceeds_threshold(elapsed) {
         tokio::spawn(async move {
             super::notifications::notify_completion(
@@ -1941,6 +2050,8 @@ fn apply_turn_success_sync(
     }
 
     let learning_snap = analyze_chat_turn_learning(line, state.turn, &state.recent_tools, &result);
+    state.latest_turn_quality_feedback =
+        turn_quality_feedback_from_eval(state.turn, &learning_snap.eval);
     let mut result = result;
     let routing_domain = learning_snap
         .routing
@@ -4139,6 +4250,36 @@ mod tests {
     }
 
     #[test]
+    fn restored_plan_mode_provides_resume_digest_for_effective_line() {
+        let mut plan = plan_decompose::PlanModeState::new(
+            "Fix auth".into(),
+            plan_decompose::ProjectContext::default(),
+        );
+        plan.plan
+            .subtasks
+            .push(astra_services::task_orchestrator::SubtaskPlan {
+                id: "t1".into(),
+                title: "Patch token validation".into(),
+                status: astra_services::task_orchestrator::TaskStatus::InProgress,
+                ..Default::default()
+            });
+        let state = SessionState {
+            plan_mode: Some(plan),
+            ..SessionState::default()
+        };
+
+        let digest = plan_resume_digest_from_active_plan_mode(&state).expect("digest");
+        let effective = apply_resume_context("continue".to_string(), None, Some(digest));
+
+        assert!(effective.starts_with("@resume-plan\n[plan-resume]"));
+        assert!(effective.contains("goal=\"Fix auth\""), "{effective}");
+        assert!(
+            effective.contains("in_progress=\"Patch token validation\""),
+            "{effective}"
+        );
+    }
+
+    #[test]
     fn build_effective_line_skill_dev_reads_from_disk() {
         let tmp = tempfile::tempdir().unwrap();
         let skill_dir = tmp.path().join("test-skill");
@@ -4647,6 +4788,69 @@ mod tests {
             "llm-round churn must revoke all_tools_healthy: {:?}",
             learning.eval.signals
         );
+    }
+
+    #[test]
+    fn turn_quality_feedback_mentions_batching_repeats_and_stalls() {
+        use astra_runtime::pipeline::evaluation::{
+            EvalSignal, EvaluationThresholds, TurnEvaluation,
+        };
+
+        let eval = TurnEvaluation {
+            success: false,
+            quality: 0.2,
+            confidence: 0.8,
+            signals: vec![
+                EvalSignal::SequentialReadChurn(13),
+                EvalSignal::RepeatToolCall("bash".to_string()),
+                EvalSignal::RepeatToolCall("read_file".to_string()),
+                EvalSignal::StallDetected,
+                EvalSignal::VerdictWarning,
+            ],
+            thresholds: EvaluationThresholds::default(),
+        };
+
+        let feedback = turn_quality_feedback_from_eval(9, &eval).expect("feedback");
+        assert_eq!(feedback.turn, 9);
+        assert!(
+            feedback
+                .findings
+                .iter()
+                .any(|f| f.contains("13 consecutive single-tool rounds")),
+            "{feedback:?}"
+        );
+        assert!(
+            feedback
+                .findings
+                .iter()
+                .any(|f| f.contains("bash") && f.contains("read_file")),
+            "{feedback:?}"
+        );
+        assert!(
+            feedback.recommended_action.contains("Batch independent"),
+            "{feedback:?}"
+        );
+    }
+
+    #[test]
+    fn turn_quality_feedback_ignores_untracked_or_empty_signals() {
+        use astra_runtime::pipeline::evaluation::{
+            EvalSignal, EvaluationThresholds, TurnEvaluation,
+        };
+
+        let eval = TurnEvaluation {
+            success: true,
+            quality: 0.8,
+            confidence: 0.7,
+            signals: vec![
+                EvalSignal::ToolErrorRate(0.0),
+                EvalSignal::AllToolsHealthy,
+                EvalSignal::EmptyToolOutput,
+            ],
+            thresholds: EvaluationThresholds::default(),
+        };
+
+        assert!(turn_quality_feedback_from_eval(3, &eval).is_none());
     }
 
     #[test]

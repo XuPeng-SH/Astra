@@ -20,6 +20,7 @@ pub const DEFAULT_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "notify",
     "ask_user",
     "task",
+    "agent_job",
 ];
 
 pub const SERVER_EXECUTOR_TOOL_NAMES: &[&str] = &[
@@ -47,6 +48,9 @@ pub const SERVER_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "notify",
     "ask_user",
     "task",
+    "agent_job",
+    "enter_plan_mode",
+    "exit_plan_mode",
 ];
 
 /// RPC tools exposed inside server-side `run_script`.
@@ -636,11 +640,11 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "session",
-                "description": "Session lifecycle and introspection. Actions: config, prioritize, deprioritize, set_goal, compact, enter_plan, exit_plan, rollback_edits, ask_user, sleep, timeline, summary, history_page, history_search, history_around. Use the history_* actions when the user refers to older turns in this same chat and the visible context is insufficient.",
+                "description": "Session lifecycle and introspection. Actions: config, prioritize, deprioritize, set_goal, compact, rollback_edits, ask_user, sleep, timeline, summary, history_page, history_search, history_around. For plan mode use the dedicated `enter_plan_mode` / `exit_plan_mode` tools — they're not session sub-actions any more. Use the history_* actions when the user refers to older turns in this same chat and the visible context is insufficient.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "action": {"type": "string", "enum": ["config","prioritize","deprioritize","set_goal","compact","enter_plan","exit_plan","rollback_edits","ask_user","sleep","timeline","summary","history_page","history_search","history_around"]},
+                        "action": {"type": "string", "enum": ["config","prioritize","deprioritize","set_goal","compact","rollback_edits","ask_user","sleep","timeline","summary","history_page","history_search","history_around"]},
                         "key": {"type": "string", "description": "Config key"},
                         "value": {"type": "string", "description": "Config value"},
                         "tool": {"type": "string", "description": "Tool name (prioritize/deprioritize)"},
@@ -751,7 +755,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "introspect",
-                "description": "Query own runtime state. Subtopics: 'session' (default — token pressure, cache hit rate, tool health, alerts, working memory); 'cache' (cache-regression diagnosis over recent LLM captures); 'recent' (last N LLM-round summaries from in-memory ring — tokens, tool calls, duration); 'volatile' (what runtime nudges / working-set / coaching are about to be injected); 'stall' (loop-guard state — nudge count, stall events, forced corrections); 'all' (session + recent + volatile + stall).",
+                "description": "Query own runtime state. Subtopics: 'session' (default — token pressure, cache hit rate, tool health, alerts, working memory, and host-provided plan/task/session lifecycle context such as restore/resume state and last lifecycle event when available); 'cache' (cache-regression diagnosis over recent LLM captures); 'recent' (last N LLM-round summaries from in-memory ring — tokens, tool calls, duration); 'volatile' (what runtime nudges / working-set / coaching are about to be injected); 'stall' (loop-guard state — nudge count, stall events, forced corrections); 'all' (session + recent + volatile + stall).",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -840,29 +844,35 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "task",
-                "description": "Use this tool to create and manage a structured task list for your current coding session. This helps you track progress, organize complex tasks, and demonstrate thoroughness to the user. It also helps the user understand the progress of the task and overall progress of their requests.\n\
+                "description": "Durable session task list. Use this tool proactively to track progress for multi-step coding work and surface it to the user via the task board.\n\
         \n\
-        Actions: create, update, list, get, stop, background_shell, background_agent, output, kill. Supports subtasks, blocking dependencies (add_blocks / add_blocked_by), ownership, and arbitrary metadata.\n\
+        Actions: create, update, list, get, stop. Supports subtasks, blocking dependencies, ownership, metadata.\n\
+        \n\
+        For background processes (long-running shell jobs, durable sub-agents) use `agent_job` instead — `task` is the checklist, not the runner.\n\
         \n\
         ## When to Use This Tool\n\
-        Use this tool proactively in these scenarios:\n\
+        Use `task` when progress tracking will make the work clearer to the user:\n\
+        - Complex multi-step coding work with 3 or more distinct outcomes, files, phases, or deliverables.\n\
+        - Plan-mode execution, where approved plan items should become visible progress.\n\
+        - Work delegated to sub-agents or background jobs that still needs user-visible ownership and completion state.\n\
+        - New requirements discovered while implementing, where the task board should show the expanded scope.\n\
         \n\
-        1. Complex multi-step tasks - When a task requires 3 or more distinct steps or actions\n\
-        2. Non-trivial and complex tasks - Tasks that require careful planning or multiple operations\n\
-        3. User explicitly requests todo list - When the user directly asks you to use the todo list\n\
-        4. User provides multiple tasks - When users provide a list of things to be done (numbered or comma-separated)\n\
-        5. After receiving new instructions - Immediately capture user requirements as tasks\n\
-        6. When you start working on a task - Mark it as `in_progress` BEFORE beginning work. Ideally you should only have ONE task as `in_progress` at a time\n\
-        7. After completing a task - Mark it as `completed` and add any new follow-up tasks discovered during implementation\n\
+        When you decide tracking is useful, your FIRST action this turn MUST be:\n\
+        1. Create one task per meaningful outcome or phase. Use subtasks for ordered internal steps.\n\
+        2. Mark the first actionable task as `in_progress` BEFORE beginning work.\n\
+        3. THEN start the actual work.\n\
         \n\
         ## When NOT to Use This Tool\n\
-        Skip using this tool when:\n\
-        1. There is only a single, straightforward task\n\
-        2. The task is trivial and tracking it provides no organizational benefit\n\
-        3. The task can be completed in less than 3 trivial steps\n\
-        4. The task is purely conversational or informational\n\
+        Skip task tracking when it would add noise rather than clarity:\n\
+        - Single edit / single command / single answer.\n\
+        - Pure information request (\"what does X do?\").\n\
+        - Triviality (\"add a comment\", \"fix this typo\").\n\
         \n\
-        NOTE: if there is only one trivial task to do, just do it directly — do not call this tool.\n\
+        ## ONGOING OBLIGATIONS while tasks exist:\n\
+        - Exactly ONE task as `in_progress` at any moment. Flip the current one to `completed` BEFORE flipping the next one to `in_progress`.\n\
+        - Mark `completed` IMMEDIATELY after finishing — do not batch closures.\n\
+        - Discovered new work mid-flight? Create a new task rather than expanding an existing one.\n\
+        - Failed? Mark `failed` with `error_message` so the user sees what blocked it; don't silently abandon.\n\
         \n\
         ## Examples of When to Use the Task Tool\n\
         \n\
@@ -890,7 +900,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
         User: I need to implement these features for my e-commerce site: user registration, product catalog, shopping cart, and checkout flow.\n\
         Assistant: *Creates four parent tasks, one per feature, each with subtasks for db model + API + frontend.* Let's start with user registration.\n\
         \n\
-        <reasoning>The user gave a comma-separated list of four large features — exactly the 'multiple tasks' trigger. Subtasks encode the sub-steps each feature needs.</reasoning>\n\
+        <reasoning>The user asked for four large features. Separate parent tasks make the scope and progress visible; subtasks encode the implementation steps each feature needs.</reasoning>\n\
         </example>\n\
         \n\
         ## Examples of When NOT to Use the Task Tool\n\
@@ -924,26 +934,26 @@ fn all_tool_schemas_core() -> Vec<Value> {
         - `add_blocked_by [taskA, taskB]` → this task won't be next-actionable until A and B are done.\n\
         - `metadata`: free-form; later `update` with `{key: null}` deletes a specific key.\n\
         \n\
-        ## Background Execution\n\
-        - `background_shell`: run a shell command in the background while continuing to chat. Returns a task_id. Use for builds, tests, servers, long scripts.\n\
-        - `background_agent`: spawn a durable sub-agent through the structured agent spawner. Use `get_agent_result` with the returned agent_id to collect output.\n\
-        - `output`: read stdout/stderr from a background shell task. With `block: true` (default), waits up to `timeout_ms` for completion.\n\
-        - `kill`: terminate a background task immediately.\n\
-        - You will receive `<background_task_notification>` XML when background tasks complete, fail, or stall.\n\
-        - If a task stalls (no output for 45s + looks like an interactive prompt), kill it and re-run with non-interactive flags.\n\
+        ## Cross-Session Awareness\n\
+        - `list_user` returns the user's open tasks across ALL their sessions, not just the current one. Each row includes `session_started_at` (when that session began) and `session_title` (optional) so you can tell the user which session each task comes from (e.g. \"the session from 2 days ago\"). Useful when the user references prior work (\"what was I doing yesterday?\") or before creating new tasks to avoid duplicating work from another session.\n\
+        - `adopt` brings a task from another session of the same user into the current session: `task(action='adopt', source_session_id='<sid>', task_id='<tid>')`. The original is marked migrated; a fresh task with new id is created locally with metadata `{forked_from: '<sid>:<tid>'}`.\n\
         \n\
         ## Tips\n\
         - Call `list` with `status_filter: 'active'` before creating new tasks to avoid dupes.\n\
+        - Call `list_user` if the user mentions resuming work from a prior conversation.\n\
         - Auto-completion: completing the last remaining subtask auto-completes the parent (only if parent is still active).\n\
         - Cascade: completing a parent cascades to pending/in_progress subtasks but preserves failed/cancelled.\n\
         - Rollback: task state is journaled per-turn; a /rollback undoes the most recent mutation batch.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "action": {"type": "string", "enum": ["create","update","list","get","stop","background_shell","background_agent","output","kill"], "description": "Operation to perform"},
+                        "action": {"type": "string", "enum": ["create","update","list","get","stop","list_user","adopt","archive"], "description": "Operation to perform"},
+                        "source_session_id": {"type": "string", "description": "(adopt) The session id holding the task you want to bring into the current session."},
+                        "older_than_days": {"type": "integer", "description": "(archive bulk mode) Mark completed tasks older than N days as archived. Default 30. Ignored when `task_id` is provided — single-task archive bypasses the age check."},
+                        "user_status": {"type": "string", "enum": ["active","completed","failed","all"], "description": "(list_user) Filter for cross-session list. Default 'active'."},
                         "title": {"type": "string", "description": "(create/update) Brief imperative title"},
                         "description": {"type": "string", "description": "(create/update) What needs to be done"},
-                        "task_id": {"type": "string", "description": "(update/get/stop) Task ID (e.g. 'task-1')"},
+                        "task_id": {"type": "string", "description": "(update/get/stop/adopt/archive) Task ID (e.g. 'task-1'). For `archive`, providing this archives just that one row regardless of age."},
                         "new_status": {"type": "string", "enum": ["pending","in_progress","completed","failed","cancelled","deleted"], "description": "(update) New status to assign. 'deleted' permanently removes the task."},
                         "status": {"type": "string", "enum": ["pending","in_progress","completed","failed","cancelled","deleted"], "description": "(update, legacy alias for new_status) New status to assign."},
                         "status_filter": {"type": "string", "enum": ["pending","in_progress","completed","failed","all","active"], "description": "(list) Restrict results. 'active' = pending+in_progress. Default 'all'."},
@@ -970,25 +980,186 @@ fn all_tool_schemas_core() -> Vec<Value> {
                             }
                         },
                         "reason": {"type": "string", "description": "(stop) Why the task is being stopped"},
-                        "error_message": {"type": "string", "description": "(update) Reason for failure"},
-                        "command": {"type": "string", "description": "(background_shell) Shell command to run in background"},
-                        "prompt": {"type": "string", "description": "(background_agent) Instruction for the background agent"},
-                        "agent_type": {"type": "string", "enum": ["explore","code-review","task","general-purpose"], "description": "(background_agent) Agent type. Default general-purpose."},
-                        "model": {"type": "string", "description": "(background_agent) Model override for the background agent"},
-                        "block": {"type": "boolean", "description": "(output) Wait for task to complete before returning. Default true."},
-                        "timeout_ms": {"type": "integer", "description": "(output) Max ms to wait when block=true. Default 30000, max 300000."}
+                        "error_message": {"type": "string", "description": "(update) Reason for failure"}
                     },
                     "required": ["action"],
                     "x-astra-per-action-required": {
                         "create": ["title"],
                         "update": ["task_id"],
                         "get": ["task_id"],
-                        "stop": ["task_id"],
-                        "background_shell": ["command"],
-                        "background_agent": ["prompt"],
+                        "stop": ["task_id"]
+                    }
+                }
+            }
+        }),
+        // ── agent_job ───────────────────────────────────────────────
+        // Background execution surface. Owns shell processes and
+        // durable sub-agent runs that the model wants to fire-and-
+        // poll. Split out of `task` in 2026-05 so the model has one
+        // tool for the session checklist and a different tool for
+        // long-running work — see `task_schema_does_not_advertise_
+        // background_actions`. Inspiration: codex `spawn_agents_on_csv`
+        // + `report_agent_job_result`; claudecode `Bash(run_in_background)`
+        // + `Agent(run_in_background)`.
+        json!({
+            "type": "function",
+            "function": {
+                "name": "agent_job",
+                "description": "Run shell commands or spawn durable sub-agents in the background while continuing to chat. Use this when work is long-running, can run independently, or you need to do other things in parallel.\n\
+        \n\
+        Actions: shell, agent, output, kill.\n\
+        \n\
+        ## When to Use This Tool\n\
+        - **Long-running shell** (builds, test suites, servers, scripts > ~10s): use `shell` instead of blocking `bash` — keeps the conversation responsive.\n\
+        - **Durable sub-agent fan-out**: use `agent` to spawn an agent that should survive until it produces a result. The job ID returned is durable across CLI restart.\n\
+        - **Need output later**: pair `shell` / `agent` with a follow-up `output` call. With `block: true` (default), `output` waits up to `timeout_ms` for completion.\n\
+        - **Cancel a stuck job**: `kill` terminates immediately.\n\
+        \n\
+        ## When NOT to Use This Tool\n\
+        - Quick commands (< 5s): use `bash` directly — the round-trip overhead isn't worth it.\n\
+        - Synchronous sub-agent that you need the answer from before continuing: use `agent.spawn` + `agent.get_result` — that path is integrated with the parallel-spawn coalescing window.\n\
+        - In-session todos/checklist tracking: use `task` (create/update/list/get/stop). `agent_job` is for processes, not progress markers.\n\
+        \n\
+        ## Notifications\n\
+        You will receive `<background_task_notification>` XML when background jobs complete, fail, or stall (no output for ~45s + interactive-prompt pattern). When you see one, decide whether to read its output, acknowledge it, or `kill` and retry with non-interactive flags.\n\
+        \n\
+        ## Examples\n\
+        \n\
+        <example>\n\
+        User: kick off the full test suite, I'll keep working.\n\
+        Assistant: *Calls agent_job(action='shell', command='cargo test --workspace')* — returns task_id `bg-shell-3`. *Continues with other work; later calls agent_job(action='output', task_id='bg-shell-3') to read the results.*\n\
+        </example>\n\
+        \n\
+        <example>\n\
+        User: have an explorer agent map every TODO across the codebase while we keep coding.\n\
+        Assistant: *Calls agent_job(action='agent', prompt='Find every TODO/FIXME...', agent_type='explore')* — fires it in the background.\n\
+        </example>",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["shell", "agent", "output", "kill"],
+                            "description": "Operation to perform"
+                        },
+                        "command": {
+                            "type": "string",
+                            "description": "(shell) Shell command to run in the background"
+                        },
+                        "prompt": {
+                            "type": "string",
+                            "description": "(agent) Instruction for the background sub-agent"
+                        },
+                        "agent_type": {
+                            "type": "string",
+                            "enum": ["explore", "code-review", "task", "general-purpose"],
+                            "description": "(agent) Agent type. Default general-purpose."
+                        },
+                        "model": {
+                            "type": "string",
+                            "description": "(agent) Model override for the background agent"
+                        },
+                        "task_id": {
+                            "type": "string",
+                            "description": "(output/kill) The background job ID returned by shell/agent"
+                        },
+                        "block": {
+                            "type": "boolean",
+                            "description": "(output) Wait for the job to complete before returning. Default true."
+                        },
+                        "timeout_ms": {
+                            "type": "integer",
+                            "description": "(output) Max ms to wait when block=true. Default 30000, max 300000."
+                        }
+                    },
+                    "required": ["action"],
+                    "x-astra-per-action-required": {
+                        "shell": ["command"],
+                        "agent": ["prompt"],
                         "output": ["task_id"],
                         "kill": ["task_id"]
                     }
+                }
+            }
+        }),
+        // ── enter_plan_mode ─────────────────────────────────────────
+        // Top-level sentinel tool that flips the session into plan
+        // mode. Promoted from the buried `session.enter_plan` action
+        // in 2026-05 because the model rarely picked the sub-action
+        // — claudecode's dedicated `EnterPlanMode` tool is the
+        // reference. While in plan mode, write tools (str_replace,
+        // write_file, bash, git commit, …) are denied at the
+        // permission gate; read tools stay available for codebase
+        // exploration. Exit via `exit_plan_mode` — that's the only
+        // unlock path.
+        json!({
+            "type": "function",
+            "function": {
+                "name": "enter_plan_mode",
+                "description": "Enter plan mode for non-trivial work that needs design before code. While in plan mode you can ONLY read the codebase (read_file, grep, glob, list_dir, symbols, web_fetch). Edits, shell commands, and git mutations are blocked at the permission gate — author the plan, then call `exit_plan_mode` with the markdown for user approval.\n\
+        \n\
+        ## When to Use This Tool\n\
+        Use plan mode when user alignment before edits materially reduces risk:\n\
+        - Multiple reasonable implementation approaches exist and the choice affects architecture, data flow, permissions, public API, or persistence.\n\
+        - Requirements are unclear enough that exploration should precede a concrete implementation proposal.\n\
+        - The work is high-impact or hard to unwind, such as schema changes, auth/security behavior, cross-cutting refactors, or large migrations.\n\
+        - The user explicitly wants a plan, design review, or approval before implementation.\n\
+        \n\
+        When you enter plan mode:\n\
+        1. Edits are blocked by design.\n\
+        2. Explore with read tools and identify existing patterns to follow.\n\
+        3. Consider trade-offs, choose an approach, and write a concrete plan.\n\
+        4. Call `exit_plan_mode(plan='<markdown>', approved=true)` to surface the plan for user approval. Approval unlocks edits and seeds executable plan items.\n\
+        \n\
+        ## When NOT to Use This Tool\n\
+        Do not enter plan mode when normal execution is clearer:\n\
+        - Single-line / few-line fixes (typos, obvious bugs).\n\
+        - User gave specific step-by-step instructions — just do them.\n\
+        - Pure research / read-only exploration with no implementation step (use `agent` with explore type instead).\n\
+        - The work is < 3 files and the approach is obvious.\n\
+        \n\
+        Important: `exit_plan_mode` is the ONLY way to leave plan mode. Do not use `ask_user` to ask \"is the plan ready?\" — `exit_plan_mode` itself surfaces the plan for approval.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "goal": {
+                            "type": "string",
+                            "description": "Optional one-line goal label that surfaces in the TUI plan-mode banner. Defaults to a placeholder if omitted."
+                        }
+                    },
+                    "required": []
+                }
+            }
+        }),
+        // ── exit_plan_mode ──────────────────────────────────────────
+        // Companion to enter_plan_mode. Surfaces the proposed plan to
+        // the user for approval, lifts the write-tool guard on
+        // success, and (server-side) seeds the approved plan items
+        // into `session_plan_todos` so the next turn can execute
+        // step-by-step.
+        json!({
+            "type": "function",
+            "function": {
+                "name": "exit_plan_mode",
+                "description": "Present the plan for user approval and exit plan mode. The `plan` argument is a markdown string (numbered list, nested bullets ok) that the user reads and either approves or rejects. On approval, write tools unlock and the items seed `session_plan_todos`. On rejection (`approved=false`), the plan stays open for another authoring pass.\n\
+        \n\
+        ## Important\n\
+        - Do NOT call this tool to ask 'is the plan ready?' — that's exactly what THIS tool does. It inherently requests approval.\n\
+        - Pass the FULL plan as a single markdown string in `plan`. The user sees this verbatim.\n\
+        - Only call this when the plan is concrete and unambiguous. If you have unresolved decisions, use `ask_user` first.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "plan": {
+                            "type": "string",
+                            "description": "The plan markdown to present for approval. Numbered list of steps; nested bullets ok. The user reads this verbatim."
+                        },
+                        "approved": {
+                            "type": "boolean",
+                            "description": "True (default) to commit the plan and unlock writes. False to keep planning."
+                        }
+                    },
+                    "required": ["plan"]
                 }
             }
         }),
@@ -1117,8 +1288,10 @@ mod tests {
              trigger turn-0 decomposition. Got: {desc}"
         );
         assert!(
-            desc.contains("3 or more distinct steps") || desc.contains("3+ distinct"),
-            "task description must name the explicit '3+ steps' threshold so the model has \
+            desc.contains("3 or more distinct steps")
+                || desc.contains("3 or more distinct outcomes")
+                || desc.contains("3+ distinct"),
+            "task description must name the explicit '3+ outcomes/steps' threshold so the model has \
              a hard trigger, not a fuzzy heuristic"
         );
         assert!(
@@ -1136,6 +1309,56 @@ mod tests {
                 || desc.contains("one in_progress at a time"),
             "task description must enforce single-active to prevent the model from \
              flipping every task to in_progress at once"
+        );
+    }
+
+    #[test]
+    fn plan_and_task_schemas_use_semantic_guidance_not_lexical_triggers() {
+        let schemas = all_tool_schemas_with_env(|_| None);
+        let task = find_schema(&schemas, "task").expect("task schema must exist");
+        let enter =
+            find_schema(&schemas, "enter_plan_mode").expect("enter_plan_mode schema must exist");
+        let task_desc = task["function"]["description"].as_str().unwrap();
+        let plan_desc = enter["function"]["description"].as_str().unwrap();
+
+        for desc in [task_desc, plan_desc] {
+            assert!(
+                desc.contains("## When to Use") && desc.contains("## When NOT to Use"),
+                "tool UX guidance should be semantic and example-driven, not an activation-rule matcher: {desc}"
+            );
+            assert!(
+                !desc.contains("ACTIVATION RULE"),
+                "tool schema must not expose matcher-style activation rules: {desc}"
+            );
+            assert!(
+                !desc.contains("conjunctions like"),
+                "task schema must not teach lexical trigger matching: {desc}"
+            );
+            assert!(
+                !desc.contains("\"what's the best way to\"") && !desc.contains("\"redesign\""),
+                "plan schema must not encode phrase-list triggers: {desc}"
+            );
+        }
+    }
+
+    #[test]
+    fn introspect_schema_mentions_lifecycle_and_resume_state() {
+        let schemas = all_tool_schemas_with_env(|_| None);
+        let introspect = find_schema(&schemas, "introspect").expect("introspect schema must exist");
+        let desc = introspect["function"]["description"]
+            .as_str()
+            .expect("introspect description must be a string");
+        assert!(
+            desc.contains("plan/task/session lifecycle context"),
+            "introspect should advertise lifecycle visibility: {desc}"
+        );
+        assert!(
+            desc.contains("restore/resume state"),
+            "introspect should advertise resume visibility: {desc}"
+        );
+        assert!(
+            desc.contains("last lifecycle event"),
+            "introspect should advertise causal last-event visibility: {desc}"
         );
     }
 

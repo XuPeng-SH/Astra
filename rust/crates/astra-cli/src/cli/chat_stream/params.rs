@@ -273,6 +273,11 @@ pub(crate) struct ChatTurnParams<'a> {
     /// noticed X" in the self-awareness section. `None` → no diagnosis
     /// pending; the ToolExecutor state is untouched.
     pub(crate) latest_skill_diagnosis: Option<&'a astra_skills::auto_invoke::SkillDiagnosis>,
+    /// Evaluator-derived feedback from the previous turn. This is injected
+    /// alongside self-awareness on the next turn and cleared by the caller
+    /// once a healthy turn completes.
+    pub(crate) latest_turn_quality_feedback:
+        Option<&'a astra_runtime::self_model::TurnQualityFeedback>,
     /// Unified skill registry (single source of truth for all skill resolution).
     pub(crate) unified_skill_registry:
         &'a std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
@@ -357,10 +362,16 @@ pub(crate) struct ChatTurnParams<'a> {
         Option<std::sync::Arc<std::sync::Mutex<crate::edge_tools::SessionStateRollbackJournal>>>,
     /// Session-scoped task manager so task mutations survive across turns.
     pub(crate) task_manager: Option<std::sync::Arc<crate::edge_tools::TaskManager>>,
+    /// Broadcast sender for the HttpTaskStore observer notification.
+    pub(crate) task_notify_tx: Option<tokio::sync::broadcast::Sender<String>>,
     /// Shared command queue for the TUI's BackgroundTaskRegistry.
     /// When present, tool executor pushes spawn/kill/output commands here.
     pub(crate) bg_task_commands:
         Option<std::sync::Arc<std::sync::Mutex<Vec<crate::edge_tools::BgTaskCommand>>>>,
+    /// Detach slot for bash Ctrl+B promotion. When present, the
+    /// executor pulls a fresh handle from this slot per tool call;
+    /// the TUI refills between calls.
+    pub(crate) bash_detach_slot: Option<astra_tools::detach::DetachShellSlot>,
     /// Current REPL turn number — used to tag journal entries for undo.
     pub(crate) turn_index: u32,
     /// Pre-loaded CSL messages (from CslManager.load() in chat_turn).
@@ -418,9 +429,15 @@ pub(crate) struct BasicCliChatContext<'a> {
     /// Session-scoped task manager used by one-shot/headless paths that still
     /// need the model-visible task board.
     pub task_manager: Option<std::sync::Arc<crate::edge_tools::TaskManager>>,
+    /// Broadcast sender for the HttpTaskStore observer notification.
+    pub task_notify_tx: Option<tokio::sync::broadcast::Sender<String>>,
     /// Shared command queue for the TUI's BackgroundTaskRegistry.
     pub bg_task_commands:
         Option<std::sync::Arc<std::sync::Mutex<Vec<crate::edge_tools::BgTaskCommand>>>>,
+    /// Shared detach slot for bash Ctrl+B promotion. The TUI refills
+    /// this between tool calls; the bash runner takes from it on
+    /// entry. `None` for headless paths.
+    pub bash_detach_slot: Option<astra_tools::detach::DetachShellSlot>,
     /// Optional channel for forwarding stream events (used by --stream-events).
     pub stream_event_tx: Option<StreamEventTx>,
     /// Shared harness snapshot sink for /inspect command (non-REPL one-shot paths).
@@ -462,6 +479,7 @@ impl<'a> ChatTurnParams<'a> {
             tool_health_entries: &[],
             session_lessons: &[],
             latest_skill_diagnosis: None,
+            latest_turn_quality_feedback: None,
             unified_skill_registry: ctx.unified_skill_registry,
             plan_only_chat: false,
             is_plan_subtask: false,
@@ -490,7 +508,9 @@ impl<'a> ChatTurnParams<'a> {
             git_worktree_journal: None,
             session_state_journal: None,
             task_manager: ctx.task_manager.clone(),
+            task_notify_tx: ctx.task_notify_tx.clone(),
             bg_task_commands: ctx.bg_task_commands.clone(),
+            bash_detach_slot: ctx.bash_detach_slot.clone(),
             turn_index: 0,
             pipeline_state: None,
             pre_loaded_messages: None,

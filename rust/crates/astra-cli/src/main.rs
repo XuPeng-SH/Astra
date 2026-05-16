@@ -87,10 +87,14 @@ mod durable_bridge;
 mod edge_lifecycle;
 #[path = "cli/effects/mod.rs"]
 mod effects;
+#[path = "cli/execution_state_summary.rs"]
+mod execution_state_summary;
 #[path = "cli/file_history.rs"]
 mod file_history;
 #[path = "cli/followup_suggestion.rs"]
 mod followup_suggestion;
+#[path = "cli/http_task_service.rs"]
+mod http_task_service;
 #[path = "cli/idle_agent_messages.rs"]
 mod idle_agent_messages;
 #[path = "cli/journal_diff.rs"]
@@ -107,16 +111,18 @@ mod mock_llm;
 mod notifications;
 #[path = "cli/permission_manager.rs"]
 mod permission_manager;
-#[path = "cli/plan_auto_suggest.rs"]
-mod plan_auto_suggest;
 #[path = "cli/plan_executor.rs"]
 mod plan_executor;
 #[path = "cli/plan_interaction.rs"]
 mod plan_interaction;
+#[path = "cli/plan_mode_client.rs"]
+mod plan_mode_client;
 #[path = "cli/plan_monitor.rs"]
 mod plan_monitor;
 #[path = "cli/plan_runtime.rs"]
 mod plan_runtime;
+#[path = "cli/preferences_client.rs"]
+mod preferences_client;
 #[path = "cli/project_instructions.rs"]
 mod project_instructions;
 mod sandbox_retry;
@@ -132,6 +138,8 @@ mod session_runtime;
 mod session_startup;
 #[path = "cli/session_state.rs"]
 mod session_state;
+#[path = "cli/session_todo_client.rs"]
+mod session_todo_client;
 #[path = "cli/skill_subrun.rs"]
 mod skill_subrun;
 #[path = "cli/slash_account.rs"]
@@ -654,7 +662,7 @@ mod tests {
     use axum::{Router, routing::get, routing::post};
     use cloud_sync::{
         ASTRA_JOURNAL_CLOUD_EMPTY_ACK, CloudPullResult, cloud_pull_warrants_sync_marker,
-        should_append_cloud_pull_journal, try_connect_matrixone,
+        should_append_cloud_pull_journal,
     };
     use project_instructions::discover_instructions_from_paths;
 
@@ -1698,16 +1706,19 @@ total_tokens_out: 500
     // inside an existing runtime). We unset MATRIXONE_HOST so they take
     // the graceful-fallback path.
 
+    /// Without `ASTRA_API_URL`, the cloud-pull path returns
+    /// `cloud_reachable: false` instead of attempting any HTTP.
+    /// Verifies graceful offline degradation.
     #[tokio::test]
-    async fn try_connect_matrixone_returns_none_without_env_vars() {
+    async fn try_cloud_pull_returns_unreachable_without_cloud_base() {
         // Safety: test-only, single-threaded tokio runtime
         unsafe {
-            std::env::remove_var("MATRIXONE_HOST");
+            std::env::remove_var("ASTRA_API_URL");
         }
-        let pool = try_connect_matrixone().await;
+        let result = cloud_sync::try_cloud_pull("default").await;
         assert!(
-            pool.is_none(),
-            "Without MATRIXONE_HOST, pool should be None"
+            !result.cloud_reachable,
+            "Without ASTRA_API_URL, cloud should be unreachable"
         );
     }
 
@@ -2440,6 +2451,19 @@ total_tokens_out: 500
                 assert_eq!(args.permission_mode.as_deref(), Some("auto"));
             }
             _ => panic!("expected Chat command"),
+        }
+    }
+
+    #[test]
+    fn cli_chat_permission_mode_legacy_aliases() {
+        for mode in ["yolo", "bypass-safety", "bypass_safety"] {
+            let cli = Cli::try_parse_from(["astra", "chat", "--permission-mode", mode]).unwrap();
+            match cli.command {
+                Some(Command::Chat(ref args)) => {
+                    assert_eq!(args.permission_mode.as_deref(), Some(mode));
+                }
+                _ => panic!("expected Chat command"),
+            }
         }
     }
 

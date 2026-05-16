@@ -520,7 +520,9 @@ async fn execute_headless_task_body(
     };
     // Headless single-shot path: use the MO-backed task store when available
     // so session_todos is authoritative here the same way it is in the REPL.
-    let task_store = crate::session_runtime::resolve_task_store().await;
+    let task_store = crate::session_runtime::resolve_task_store(profile, Some(&api.api_origin()))
+        .await
+        .0;
     let task_manager = std::sync::Arc::new(crate::edge_tools::TaskManager::new(
         session_id
             .clone()
@@ -543,7 +545,9 @@ async fn execute_headless_task_body(
         agent_spawner: Some(spawner),
         root_agent_id: Some(&root_agent_id),
         task_manager: Some(task_manager),
+        task_notify_tx: None,
         bg_task_commands: None,
+        bash_detach_slot: None,
         stream_event_tx,
         #[cfg(feature = "harness")]
         harness_sink: Some(astra_harness::InMemorySnapshotSink::arc()),
@@ -742,7 +746,7 @@ async fn execute_headless_task_run(
     };
     let user_id = "local";
     let task_session_id = session_id.as_deref().unwrap_or("no-session");
-    let svc = session_runtime::resolve_task_service().await;
+    let svc = session_runtime::resolve_task_service(profile).await;
     let task_id = svc
         .create_task(
             user_id,
@@ -785,7 +789,11 @@ async fn execute_task_queue(args: TaskQueueArgs) -> Result<ExitCode, String> {
     if prompt.trim().is_empty() {
         return Err("task prompt cannot be empty".to_string());
     }
-    let (svc, _) = session_runtime::resolve_matrixone_task_runtime().await?;
+    // execute_task_queue is a CLI subcommand without profile in
+    // scope — token comes from env via current_access_token(None).
+    // Per-user CLI sessions use `astra task worker` which threads
+    // profile through.
+    let (svc, _) = session_runtime::resolve_matrixone_task_runtime(None).await?;
     let session_id = std::env::var("ASTRA_CLI_SESSION_ID").unwrap_or_else(|_| "cloud-queue".into());
     let task_id = svc
         .create_task(
@@ -850,7 +858,7 @@ async fn execute_task_worker_once(
 ) -> Result<WorkerOutcome, String> {
     use astra_services::{LeaseClaimResult, TaskStatus};
 
-    let (svc, lease_svc) = session_runtime::resolve_matrixone_task_runtime().await?;
+    let (svc, lease_svc) = session_runtime::resolve_matrixone_task_runtime(profile).await?;
     let user_id = "local";
     let agent_id = args.agent_id.clone().unwrap_or_else(default_task_agent_id);
     let edge_id = std::env::var("ASTRA_EDGE_ID").unwrap_or_else(|_| agent_id.clone());
@@ -1455,7 +1463,10 @@ async fn execute_task_result(args: TaskResultArgs) -> Result<ExitCode, String> {
         return Err("provide a task id or title fragment".to_string());
     }
 
-    let svc = session_runtime::resolve_task_service().await;
+    // No profile in this CLI subcommand context; HttpTaskService
+    // falls back to env-only token resolution which is fine for
+    // one-shot `astra task result <query>` invocations.
+    let svc = session_runtime::resolve_task_service(None).await;
     let task_id = super::slash_task::find_task_by_query(&*svc, "local", &query)
         .await?
         .ok_or_else(|| format!("no task matching '{query}'"))?;
@@ -1611,10 +1622,12 @@ async fn execute_repl_bridge_command(
     if let Ok(name) = std::env::var("ASTRA_CLI_SESSION_NAME") {
         state.session_name = Some(name);
     }
-    let task_service = session_runtime::resolve_task_service().await;
+    let task_service = session_runtime::resolve_task_service(profile).await;
     session_runtime::install_task_service(&mut state, task_service);
-    let task_store = session_runtime::resolve_task_store().await;
+    let (task_store, task_notify_tx) =
+        session_runtime::resolve_task_store(profile, Some(&api.api_origin())).await;
     session_runtime::install_task_store(&mut state, task_store);
+    state.task_notify_tx = task_notify_tx;
     maybe_load_project_instructions(&mut state);
 
     let pipeline_modules = create_pipeline_modules(api, profile);
@@ -1833,7 +1846,9 @@ pub(super) async fn execute_cli_command(
                 agent_spawner: None,
                 root_agent_id: None,
                 task_manager: None,
+                task_notify_tx: None,
                 bg_task_commands: None,
+                bash_detach_slot: None,
                 stream_event_tx: None,
                 #[cfg(feature = "harness")]
                 harness_sink: Some(astra_harness::InMemorySnapshotSink::arc()),
@@ -2370,7 +2385,12 @@ pub(super) async fn execute_cli_command(
             // to `session_todos`. Without this the tool runs against a
             // throwaway in-memory manager and the Tier 1 board is invisible
             // across edge/cloud boundaries.
-            let chat_task_store = super::session_runtime::resolve_task_store().await;
+            let (chat_task_store, _chat_task_notify_tx) =
+                super::session_runtime::resolve_task_store(
+                    profile.as_deref(),
+                    Some(&api.api_origin()),
+                )
+                .await;
             let chat_task_manager = std::sync::Arc::new(crate::edge_tools::TaskManager::new(
                 session_id
                     .clone()
@@ -2392,7 +2412,9 @@ pub(super) async fn execute_cli_command(
                 agent_spawner: Some(one_shot_spawner),
                 root_agent_id: Some(&root_agent_id),
                 task_manager: Some(chat_task_manager),
+                task_notify_tx: None,
                 bg_task_commands: None,
+                bash_detach_slot: None,
                 stream_event_tx,
                 #[cfg(feature = "harness")]
                 harness_sink: Some(harness_sink.clone()),
@@ -3159,7 +3181,9 @@ pub(super) async fn run_print_mode(
     // path handles them. Without this, single-shot runs silently drop to
     // in-memory scratchpad and the Tier 1 board is invisible across turns
     // that reuse the same `session_id`.
-    let task_store = crate::session_runtime::resolve_task_store().await;
+    let task_store = crate::session_runtime::resolve_task_store(profile, Some(&api.api_origin()))
+        .await
+        .0;
     let print_task_manager = std::sync::Arc::new(crate::edge_tools::TaskManager::new(
         session_id
             .clone()
@@ -3182,7 +3206,9 @@ pub(super) async fn run_print_mode(
         agent_spawner: None,
         root_agent_id: None,
         task_manager: Some(print_task_manager),
+        task_notify_tx: None,
         bg_task_commands: None,
+        bash_detach_slot: None,
         stream_event_tx: None,
         #[cfg(feature = "harness")]
         harness_sink: Some(astra_harness::InMemorySnapshotSink::arc()),
