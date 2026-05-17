@@ -16,7 +16,7 @@
 //!   "description": "Search codebase for auth",
 //!   "prompt": "Find all authentication-related code in the project",
 //!   "agent_type": "explore",
-//!   "background": true
+//!   "run_in_background": true
 //! }
 //! ```
 
@@ -90,7 +90,7 @@ pub async fn handle_spawn_agent_tool(args: &Value, ctx: Option<&SpawnAgentContex
 
     // Build spawn context
     let mut inherited_permissions = ctx.inherited_permissions.clone();
-    inherited_permissions.is_background = input.background;
+    inherited_permissions.is_background = input.run_in_background;
     let spawn_ctx = SpawnContext {
         parent_run_id: ctx.run_id.clone(),
         parent_agent_id: ctx.agent_id.clone(),
@@ -183,7 +183,7 @@ fn normalize_spawn_agent_args(args: &Value) -> Result<Value, String> {
 
 /// Handle get_agent_result tool call — retrieves a background child's result.
 ///
-/// When a parent spawns a child with `background: true`, the child runs
+/// When a parent spawns a child with `run_in_background: true`, the child runs
 /// asynchronously and the parent receives only a "launched" status. This
 /// tool lets the parent poll for the child's result once it completes.
 pub async fn handle_get_agent_result_tool(args: &Value, ctx: Option<&SpawnAgentContext>) -> String {
@@ -216,23 +216,15 @@ pub async fn handle_get_agent_result_tool(args: &Value, ctx: Option<&SpawnAgentC
     // returns as soon as the child finishes (or times out).
     let timeout = std::time::Duration::from_secs(120);
     match ctx.spawner.wait_for_agent(agent_id, timeout).await {
-        Some(AgentStatus::Completed {
-            result,
-            finish_reason,
-        }) => render_completed_agent_result(agent_id, &result, finish_reason.as_deref()),
-        Some(AgentStatus::Failed {
-            error,
-            finish_reason,
-        }) => {
-            let reason = finish_reason.as_deref().unwrap_or("failed");
-            json!({
-                "status": "failed",
-                "agent_id": agent_id,
-                "error": error,
-                "finish_reason": reason,
-            })
-            .to_string()
+        Some(AgentStatus::Completed { result }) => {
+            render_completed_agent_result(agent_id, &result, None)
         }
+        Some(AgentStatus::Failed { error }) => json!({
+            "status": "failed",
+            "agent_id": agent_id,
+            "error": error,
+        })
+        .to_string(),
         Some(status) => json!({
             "status": "unknown",
             "agent_id": agent_id,
@@ -318,7 +310,7 @@ pub fn get_agent_result_schema() -> Value {
         "type": "function",
         "function": {
             "name": "get_agent_result",
-            "description": "Retrieve the result of a background-spawned agent. Call this after spawn_agent with background:true to get the child's output once it finishes.",
+            "description": "Retrieve the result of a background-spawned agent. Call this after spawn_agent with run_in_background:true to get the child's output once it finishes.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -632,13 +624,9 @@ mod tests {
         // still want the decision to be clear.
         for terminal in [
             AgentStatus::Cancelled,
-            AgentStatus::Failed {
-                error: "x".into(),
-                finish_reason: None,
-            },
+            AgentStatus::Failed { error: "x".into() },
             AgentStatus::Completed {
                 result: "done".into(),
-                finish_reason: None,
             },
         ] {
             let out = render_wait_timeout_outcome("ag", Some(&terminal), Duration::from_secs(30));

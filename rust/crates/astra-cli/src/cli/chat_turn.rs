@@ -233,17 +233,17 @@ pub(super) async fn handle_chat_input_with_ui(
 
     ui.blank_line();
 
-    let restored_plan_mode = session_runtime::maybe_restore_pending_plan_mode(&line, state);
+    if crate::plan_lifecycle::looks_like_pending_local_plan_entry(state)
+        && let Err(error) =
+            crate::plan_lifecycle::enter_remote_plan_mode(ctx.api, ctx.profile, token, state, &line)
+                .await
+    {
+        ui.show_error(&error);
+        return Ok(());
+    }
 
     // Consume one-shot resume guidance before building the effective line.
     let resume_guidance = state.resume_guidance.take();
-    // P3.3 — pending plan-resume digest. Kept until the user sends an
-    // explicit resume-like line, then consumed once.
-    let plan_resume_digest = if restored_plan_mode {
-        plan_resume_digest_from_active_plan_mode(state)
-    } else {
-        consume_plan_resume_if_matches(state, &line)
-    };
     let mut effective_line = build_effective_line(&line, state, ui);
     state.diagnostics_context = None; // consumed after injection
 
@@ -294,19 +294,29 @@ pub(super) async fn handle_chat_input_with_ui(
         effective_line = format!("{nudge}\n\n{effective_line}");
         state.turns_since_task_reminder = 0;
     }
-    effective_line = apply_resume_context(effective_line, resume_guidance, plan_resume_digest);
+    effective_line = apply_resume_context(effective_line, resume_guidance);
     let turn_start = Instant::now();
 
     let session_id = state.session_id.clone();
     match run_chat_turn(state, &ctx, token, &effective_line, session_id.as_deref()).await {
         TurnAttempt::Interrupted(result) => {
-            apply_user_cancelled_turn(state, ctx.profile, &line, *result, turn_start, ui).await;
+            apply_user_cancelled_turn(state, ctx.api, ctx.profile, &line, *result, turn_start, ui)
+                .await;
             return Ok(());
         }
         TurnAttempt::Completed(result) => match *result {
             Ok(result) => {
                 state.last_turn_interrupted = false;
-                apply_turn_success_async(state, ctx.profile, &line, result, turn_start).await;
+                apply_turn_success_async(
+                    state,
+                    ctx.api,
+                    ctx.profile,
+                    &line,
+                    result,
+                    turn_start,
+                    ui,
+                )
+                .await;
                 return Ok(());
             }
             Err(failure) => {
@@ -328,6 +338,7 @@ pub(super) async fn handle_chat_input_with_ui(
                         TurnAttempt::Interrupted(result) => {
                             apply_user_cancelled_turn(
                                 state,
+                                ctx.api,
                                 ctx.profile,
                                 &line,
                                 *result,
@@ -341,10 +352,12 @@ pub(super) async fn handle_chat_input_with_ui(
                             Ok(result) => {
                                 apply_turn_success_async(
                                     state,
+                                    ctx.api,
                                     ctx.profile,
                                     &line,
                                     result,
                                     turn_start,
+                                    ui,
                                 )
                                 .await;
                                 return Ok(());
@@ -386,6 +399,7 @@ pub(super) async fn handle_chat_input_with_ui(
                                 TurnAttempt::Interrupted(result) => {
                                     apply_user_cancelled_turn(
                                         state,
+                                        ctx.api,
                                         ctx.profile,
                                         &line,
                                         *result,
@@ -399,10 +413,12 @@ pub(super) async fn handle_chat_input_with_ui(
                                     Ok(result) => {
                                         apply_turn_success_async(
                                             state,
+                                            ctx.api,
                                             ctx.profile,
                                             &line,
                                             result,
                                             turn_start,
+                                            ui,
                                         )
                                         .await;
                                         return Ok(());
@@ -433,32 +449,9 @@ pub(super) async fn handle_chat_input_with_ui(
     Ok(())
 }
 
-pub(super) fn consume_plan_resume_if_matches(
-    state: &mut SessionState,
-    line: &str,
-) -> Option<String> {
-    astra_runtime::plan::plan_resume::message_signals_resume(line)
-        .then(|| state.pending_plan_resume_digest.take())
-        .flatten()
-}
-
-fn plan_resume_digest_from_active_plan_mode(state: &SessionState) -> Option<String> {
-    state
-        .plan_mode
-        .as_ref()
-        .and_then(astra_runtime::plan::plan_resume_digest)
-}
-
-fn apply_resume_context(
-    mut effective_line: String,
-    resume_guidance: Option<String>,
-    plan_resume_digest: Option<String>,
-) -> String {
+fn apply_resume_context(mut effective_line: String, resume_guidance: Option<String>) -> String {
     if let Some(guidance) = resume_guidance {
         effective_line = format!("{guidance}\n\n{effective_line}");
-    }
-    if let Some(digest) = plan_resume_digest {
-        effective_line = format!("@resume-plan\n{digest}\n\n{effective_line}");
     }
     effective_line
 }
@@ -1026,7 +1019,6 @@ async fn run_chat_turn(
             latest_skill_diagnosis: state.latest_skill_diagnosis.as_ref(),
             latest_turn_quality_feedback: state.latest_turn_quality_feedback.as_ref(),
             unified_skill_registry: &state.unified_skill_registry,
-            plan_only_chat: state.chat_plan_only && state.current_plan_subtask_id.is_none(),
             is_plan_subtask: state.current_plan_subtask_id.is_some(),
             plan_subtask_id: state.current_plan_subtask_id.as_deref(),
             delegation_engine: state.delegation_engine.clone(),
@@ -1036,6 +1028,7 @@ async fn run_chat_turn(
             agent_live_event_sink: state.tui_agent_live_event_sink.clone(),
             approval_request_tx: state.tui_approval_request_tx.clone(),
             ask_user_request_tx: state.tui_ask_user_request_tx.clone(),
+            plan_review_request_tx: state.tui_plan_review_request_tx.clone(),
             mcp_manager: Some(state.mcp_manager.clone()),
             skill_search: &state.skill_search,
             skill_quality_tracker: &mut state.skill_quality_tracker,
@@ -1862,10 +1855,12 @@ fn apply_turn_success(
 
 async fn apply_turn_success_async(
     state: &mut SessionState,
+    api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     line: &str,
     mut result: StreamResult,
     turn_start: Instant,
+    ui: &mut dyn crate::ui_adapter::ReplUiAdapter,
 ) {
     let final_messages = std::mem::take(&mut result.final_messages);
     let csl_checkpoint_fields = extract_csl_fields_from_result(&result);
@@ -1886,6 +1881,17 @@ async fn apply_turn_success_async(
         {
             astra_core::agent_warn!("csl", "persist failed: {e}");
         }
+    }
+    if state.plan_mode_active()
+        && let Some(token) = super::session_runtime::current_access_token(profile)
+        && let Err(error) =
+            crate::plan_lifecycle::sync_remote_plan_mode_state(api, &token, state).await
+    {
+        state.plan_mode_sync_error = Some(error.clone());
+        ui.show_warning(&format!(
+            "  Plan mirror sync failed; local plan may be stale. Send another planning turn after the server recovers, or use /plan to exit and re-enter before `go`. ({error})"
+        ));
+        astra_core::agent_warn!("plan", "failed to sync mirrored plan mode state: {error}");
     }
     check_skill_improvement_async(state).await;
 
@@ -3016,6 +3022,7 @@ where
 /// post-cancel cleanup, not here.
 async fn apply_user_cancelled_turn(
     state: &mut SessionState,
+    api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     line: &str,
     result: Result<StreamResult, crate::TurnFailure>,
@@ -3032,7 +3039,16 @@ async fn apply_user_cancelled_turn(
     state.last_turn_interrupted = true;
     match result {
         Ok(stream_result) => {
-            apply_turn_success_async(state, profile, line, stream_result, turn_start).await;
+            apply_turn_success_async(
+                state,
+                api,
+                profile,
+                line,
+                stream_result,
+                turn_start,
+                &mut SilentUi,
+            )
+            .await;
             // Re-assert the flag in case anything downstream cleared it.
             state.last_turn_interrupted = true;
         }
@@ -3573,6 +3589,8 @@ mod tests {
     use super::*;
     use astra_pipeline::step_checkpoint::read_composite_snapshot_index;
     use astra_pipeline::step_protocol::StepCheckpoint;
+    use wiremock::matchers::{header, method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn isolated_sessions_dir() -> (tempfile::TempDir, session_journal::JournalDirGuard) {
         let tmp = tempfile::tempdir().unwrap();
@@ -3596,6 +3614,43 @@ mod tests {
             panic!("poison observability lock");
         }));
         session
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.previous.as_deref() {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct CollectingUi {
+        warnings: Vec<String>,
+    }
+
+    impl crate::ui_adapter::ReplUiAdapter for CollectingUi {
+        fn show_error(&mut self, _msg: &str) {}
+        fn show_warning(&mut self, msg: &str) {
+            self.warnings.push(msg.to_string());
+        }
+        fn show_info(&mut self, _msg: &str) {}
+        fn show_status(&mut self, _msg: &str) {}
+        fn blank_line(&mut self) {}
     }
 
     #[test]
@@ -4233,70 +4288,13 @@ mod tests {
     }
 
     #[test]
-    fn consume_plan_resume_if_matches_requires_resume_signal() {
-        let mut state = SessionState {
-            pending_plan_resume_digest: Some("[plan-resume] goal=\"Fix auth\"".to_string()),
-            ..SessionState::default()
-        };
-
-        assert!(consume_plan_resume_if_matches(&mut state, "tell me a joke").is_none());
-        assert_eq!(
-            state.pending_plan_resume_digest.as_deref(),
-            Some("[plan-resume] goal=\"Fix auth\"")
-        );
-    }
-
-    #[test]
-    fn consume_plan_resume_if_matches_consumes_digest_on_explicit_tag() {
-        let mut state = SessionState {
-            pending_plan_resume_digest: Some("[plan-resume] goal=\"Fix auth\"".to_string()),
-            ..SessionState::default()
-        };
-
-        let digest = consume_plan_resume_if_matches(&mut state, "please @resume-plan");
-        assert_eq!(digest.as_deref(), Some("[plan-resume] goal=\"Fix auth\""));
-        assert!(state.pending_plan_resume_digest.is_none());
-    }
-
-    #[test]
-    fn apply_resume_context_injects_implicit_resume_tag_and_digest() {
+    fn apply_resume_context_prepends_resume_guidance() {
         let effective = apply_resume_context(
             "continue".to_string(),
-            None,
-            Some("[plan-resume] goal=\"Fix auth\"".to_string()),
+            Some("Resume the interrupted turn before answering.".to_string()),
         );
-        assert!(effective.starts_with("@resume-plan\n[plan-resume]"));
+        assert!(effective.starts_with("Resume the interrupted turn before answering."));
         assert!(effective.ends_with("\n\ncontinue"));
-    }
-
-    #[test]
-    fn restored_plan_mode_provides_resume_digest_for_effective_line() {
-        let mut plan = plan_decompose::PlanModeState::new(
-            "Fix auth".into(),
-            plan_decompose::ProjectContext::default(),
-        );
-        plan.plan
-            .subtasks
-            .push(astra_services::task_orchestrator::SubtaskPlan {
-                id: "t1".into(),
-                title: "Patch token validation".into(),
-                status: astra_services::task_orchestrator::TaskStatus::InProgress,
-                ..Default::default()
-            });
-        let state = SessionState {
-            plan_mode: Some(plan),
-            ..SessionState::default()
-        };
-
-        let digest = plan_resume_digest_from_active_plan_mode(&state).expect("digest");
-        let effective = apply_resume_context("continue".to_string(), None, Some(digest));
-
-        assert!(effective.starts_with("@resume-plan\n[plan-resume]"));
-        assert!(effective.contains("goal=\"Fix auth\""), "{effective}");
-        assert!(
-            effective.contains("in_progress=\"Patch token validation\""),
-            "{effective}"
-        );
     }
 
     #[test]
@@ -4897,6 +4895,71 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn apply_turn_success_async_warns_and_marks_plan_mirror_stale_when_sync_fails() {
+        let (_tmp, _g) = isolated_sessions_dir();
+        let _env = EnvVarGuard::set("ASTRA_ACCESS_TOKEN", "token");
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/plans"))
+            .and(header("authorization", "Bearer token"))
+            .and(query_param("session_id", "sess-1"))
+            .and(query_param("phase", "planning"))
+            .and(query_param("limit", "1"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "detail": "boom"
+            })))
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let mut state = SessionState::default();
+        state.session_id = Some("sess-1".to_string());
+        // Cloud plan-mode entry: both signals are set — perm_manager
+        // gates the sync, mirror holds the goal text.
+        state
+            .perm_manager
+            .set_mode(crate::permission_manager::PermissionMode::Plan);
+        state.cloud_plan_mirror = Some(astra_runtime::plan::PlanModeState::new(
+            "Ship auth".to_string(),
+        ));
+        let result = stub_stream_result("Updated the plan.");
+        let mut ui = CollectingUi::default();
+
+        apply_turn_success_async(
+            &mut state,
+            &api,
+            None,
+            "continue",
+            result,
+            Instant::now(),
+            &mut ui,
+        )
+        .await;
+
+        let error = state
+            .plan_mode_sync_error
+            .as_deref()
+            .expect("sync failure should be recorded");
+        assert!(error.contains("500"), "got: {error}");
+        assert_eq!(
+            state
+                .cloud_plan_mirror
+                .as_ref()
+                .map(|plan| plan.goal.as_str()),
+            Some("Ship auth"),
+            "sync failure should preserve the last known mirror until recovery"
+        );
+        assert!(
+            ui.warnings
+                .iter()
+                .any(|msg| msg.contains("Plan mirror sync failed")),
+            "user should see an actionable warning when plan sync fails: {:?}",
+            ui.warnings
+        );
+    }
+
     #[test]
     fn report_turn_failure_persists_filtered_partial_metrics() {
         let (_tmp, _g) = isolated_sessions_dir();
@@ -4988,9 +5051,11 @@ mod tests {
                 ..Default::default()
             },
         };
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
 
         apply_user_cancelled_turn(
             &mut state,
+            &api,
             None,
             "explain LoopDispatcher",
             Err(failure),
@@ -5069,9 +5134,11 @@ mod tests {
         }));
 
         let initial_turn = state.turn;
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
 
         apply_user_cancelled_turn(
             &mut state,
+            &api,
             None,
             "explain LoopDispatcher",
             Ok(stream_result),
@@ -5126,9 +5193,11 @@ mod tests {
             error: "stream cancelled before first token".into(),
             partial: crate::PartialTurnData::default(),
         };
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
 
         apply_user_cancelled_turn(
             &mut state,
+            &api,
             None,
             "what's in run_lifecycle.rs",
             Err(failure),
@@ -5405,12 +5474,15 @@ mod tests {
         let (_tmp, _g) = isolated_sessions_dir();
 
         let mut state = SessionState {
-            plan_mode: Some(plan_decompose::PlanModeState::new(
-                "goal".to_string(),
-                plan_decompose::ProjectContext::default(),
-            )),
+            cloud_plan_mirror: Some(astra_runtime::plan::PlanModeState::new("goal".to_string())),
             ..Default::default()
         };
+        // Plan-mode follow-up suppression now keys off perm_manager
+        // (single source of truth, invariant I6) instead of the
+        // mirror's presence.
+        state
+            .perm_manager
+            .set_mode(crate::permission_manager::PermissionMode::Plan);
         let result = stub_stream_result("Plan updated.");
 
         apply_turn_success(&mut state, None, "continue", result, Instant::now());

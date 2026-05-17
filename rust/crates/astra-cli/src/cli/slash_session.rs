@@ -4552,7 +4552,7 @@ fn reset_state_for_session_restore(state: &mut SessionState) {
     state.total_completion_tokens = 0;
     state.total_cache_read_tokens = 0;
     state.total_cache_creation_tokens = 0;
-    state.plan_mode = None;
+    state.cloud_plan_mirror = None;
     state.executing_plan = None;
     state.plan_execution_config = None;
     state.executing_plan_goal = None;
@@ -5092,7 +5092,7 @@ async fn apply_restored_session(
         }
         eprintln!(
             "    {}",
-            "Say continue / resume / next / go to pick up; correct … / rewind N to adjust; slash lines keep the plan; any other line abandons it."
+            "Paused plan restored. Inspect or edit it with slash commands; use correct … / rewind N to adjust; any other line abandons it."
                 .dim()
         );
     }

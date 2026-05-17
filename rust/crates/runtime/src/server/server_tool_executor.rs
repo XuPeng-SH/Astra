@@ -689,7 +689,7 @@ fn render_session_history_rows(
 }
 
 /// Tools that mutate the world outside the session. Blocked while plan mode
-/// is active (`PlanPhase` = PlanOnlyChat|Planning|Refining) to mirror Claude
+/// is active (`PlanPhase` = Planning|Refining) to mirror Claude
 /// Code's `prepareContextForPlanMode` behaviour: the model must call
 /// ExitPlanMode before writing anything.
 ///
@@ -1820,13 +1820,7 @@ impl ServerToolExecutor {
                 }
             }
             "list_dir" => self.default_executor.execute("list_dir", args).await,
-            // ── Top-level plan-mode tools (Phase 2) ────────────────────
-            // Promoted from `session.enter_plan` / `session.exit_plan` to
-            // dedicated tools matching claudecode's `EnterPlanMode` /
-            // `ExitPlanMode`. The buried sub-actions never got picked,
-            // wasting the plan-authoring discipline. The schema-side
-            // entries are gone (see schemas.rs); the dispatch here also
-            // redirects stale calls so the model self-corrects.
+            // ── Top-level plan-mode tools ───────────────────────────────
             "enter_plan_mode" => {
                 astra_tools::ToolResult::text(self.tool_enter_plan_mode(args).await)
             }
@@ -1839,19 +1833,6 @@ impl ServerToolExecutor {
                     "prioritize" => tool_result_from_output(self.prioritize_tool(args)),
                     "deprioritize" => tool_result_from_output(self.deprioritize_tool(args)),
                     "compact" => tool_result_from_output(self.compress_context(args)),
-                    // Phase 2 split: plan-mode actions promoted to top-level
-                    // tools. Stale callers get a redirect Error so the model
-                    // self-corrects instead of silently no-op'ing.
-                    "enter_plan" => astra_tools::ToolResult::text(format!(
-                        "Error: `session(action='enter_plan')` was promoted to the \
-                         top-level `enter_plan_mode` tool in the Phase 2 plan-mode split. \
-                         Call `enter_plan_mode` directly. The buried sub-action no longer exists."
-                    )),
-                    "exit_plan" => astra_tools::ToolResult::text(format!(
-                        "Error: `session(action='exit_plan')` was promoted to the \
-                         top-level `exit_plan_mode` tool in the Phase 2 plan-mode split. \
-                         Call `exit_plan_mode` directly with the plan markdown."
-                    )),
                     "rollback_edits" => tool_result_from_output(self.rollback_file_edits(args)),
                     "ask_user" => self.server_ask_user(args).await,
                     "sleep" => self.default_executor.execute("sleep", args).await,
@@ -3889,7 +3870,7 @@ impl ServerToolExecutor {
                 // counts as authoring.
                 let authoring =
                     !has_subtasks || (!any_in_progress && !items_done && !progress_complete);
-                let hint = astra_plan::plan_resume_system_prompt_section(&state);
+                let hint = astra_plan::plan_resume_prompt_hint(&state);
                 (authoring, hint)
             }
             Err(_) => (false, None),
@@ -3956,11 +3937,8 @@ impl ServerToolExecutor {
                 (s, Some(v))
             }
             Err(astra_plan::PlanLoadError::NotFound(_)) => {
-                let mut s = astra_plan::PlanModeState::new_with_owner(
-                    goal.clone(),
-                    astra_plan::ProjectContext::default(),
-                    self.user_id.clone(),
-                );
+                let mut s =
+                    astra_plan::PlanModeState::new_with_owner(goal.clone(), self.user_id.clone());
                 s.session_hint = Some(self.session_id.clone());
                 (s, None)
             }
@@ -5932,6 +5910,18 @@ esac
     }
 
     #[tokio::test]
+    async fn session_enter_plan_legacy_action_is_unknown() {
+        let (exec, _dir) = test_executor();
+        let result = exec
+            .execute("session", &json!({"action": "enter_plan"}))
+            .await;
+        assert!(
+            result.contains("Unknown session action: 'enter_plan'"),
+            "{result}"
+        );
+    }
+
+    #[tokio::test]
     async fn symbols_extracts_rust_symbols() {
         let (exec, dir) = test_executor();
         std::fs::write(
@@ -6317,7 +6307,7 @@ esac
         let active = Arc::new(AtomicU32::new(0));
         let load = Arc::new(AtomicU32::new(0));
         let inner: Arc<dyn astra_plan::PlanRepository> =
-            Arc::new(astra_plan::LocalCachePlanRepository::new());
+            Arc::new(astra_plan::InMemoryPlanRepository::new());
         let wrapper = Arc::new(QueryCountingPlanRepo {
             inner,
             active_calls: active.clone(),
@@ -6359,7 +6349,7 @@ esac
         // in the system prompt for the rest of the run. The executor now
         // shares the slot and pushes updates through on enter/exit.
         let inner: Arc<dyn astra_plan::PlanRepository> =
-            Arc::new(astra_plan::LocalCachePlanRepository::new());
+            Arc::new(astra_plan::InMemoryPlanRepository::new());
         let (mut exec, _dir) = test_executor();
         exec.set_plan_repository(inner);
 
@@ -6394,7 +6384,7 @@ esac
         let active = Arc::new(AtomicU32::new(0));
         let load = Arc::new(AtomicU32::new(0));
         let inner: Arc<dyn astra_plan::PlanRepository> =
-            Arc::new(astra_plan::LocalCachePlanRepository::new());
+            Arc::new(astra_plan::InMemoryPlanRepository::new());
         let wrapper = Arc::new(QueryCountingPlanRepo {
             inner,
             active_calls: active.clone(),
@@ -6551,11 +6541,8 @@ esac
         let repo = Arc::new(InMemoryPlanRepo::new());
 
         // Seed a plan in authoring state (has subtasks, all pending, none done).
-        let mut state = astra_plan::PlanModeState::new_with_owner(
-            "test plan".into(),
-            astra_plan::ProjectContext::default(),
-            "test-user".into(),
-        );
+        let mut state =
+            astra_plan::PlanModeState::new_with_owner("test plan".into(), "test-user".into());
         state
             .plan
             .subtasks
@@ -6631,11 +6618,8 @@ esac
         let repo = Arc::new(InMemoryPlanRepo::new());
 
         // Plan with 3 subtasks — typical "split into steps" output.
-        let mut state = astra_plan::PlanModeState::new_with_owner(
-            "ship feature X".into(),
-            astra_plan::ProjectContext::default(),
-            "alice".into(),
-        );
+        let mut state =
+            astra_plan::PlanModeState::new_with_owner("ship feature X".into(), "alice".into());
         for (i, title) in ["wire schema", "implement handler", "write tests"]
             .iter()
             .enumerate()
@@ -6711,7 +6695,6 @@ esac
         let repo = Arc::new(InMemoryPlanRepo::new());
         let mut state = astra_plan::PlanModeState::new_with_owner(
             "ship user-visible plan".into(),
-            astra_plan::ProjectContext::default(),
             "alice".into(),
         );
         for (i, title) in [
@@ -6790,7 +6773,6 @@ esac
         let repo = Arc::new(InMemoryPlanRepo::new());
         let mut state = astra_plan::PlanModeState::new_with_owner(
             "ship user-visible plan".into(),
-            astra_plan::ProjectContext::default(),
             "alice".into(),
         );
         state
@@ -6869,7 +6851,6 @@ esac
         let repo = Arc::new(InMemoryPlanRepo::new());
         let mut state = astra_plan::PlanModeState::new_with_owner(
             "ship user-visible plan".into(),
-            astra_plan::ProjectContext::default(),
             "alice".into(),
         );
         state
@@ -6950,7 +6931,6 @@ esac
         let repo = Arc::new(InMemoryPlanRepo::new());
         let mut state = astra_plan::PlanModeState::new_with_owner(
             "ship user-visible plan".into(),
-            astra_plan::ProjectContext::default(),
             "alice".into(),
         );
         state
@@ -7065,11 +7045,8 @@ esac
     #[tokio::test]
     async fn exit_plan_mode_rejected_does_not_seed_todos() {
         let repo = Arc::new(InMemoryPlanRepo::new());
-        let mut state = astra_plan::PlanModeState::new_with_owner(
-            "still drafting".into(),
-            astra_plan::ProjectContext::default(),
-            "alice".into(),
-        );
+        let mut state =
+            astra_plan::PlanModeState::new_with_owner("still drafting".into(), "alice".into());
         state
             .plan
             .subtasks
@@ -7112,11 +7089,8 @@ esac
     #[tokio::test]
     async fn exit_plan_mode_with_empty_plan_seeds_nothing() {
         let repo = Arc::new(InMemoryPlanRepo::new());
-        let mut state = astra_plan::PlanModeState::new_with_owner(
-            "empty plan".into(),
-            astra_plan::ProjectContext::default(),
-            "alice".into(),
-        );
+        let mut state =
+            astra_plan::PlanModeState::new_with_owner("empty plan".into(), "alice".into());
         repo.save("plan-empty-test", &mut state, None)
             .await
             .unwrap();
@@ -7308,11 +7282,8 @@ esac
     #[tokio::test]
     async fn exit_plan_mode_rejected_keeps_write_guard_blocking() {
         let repo = Arc::new(InMemoryPlanRepo::new());
-        let mut state = astra_plan::PlanModeState::new_with_owner(
-            "draft plan".into(),
-            astra_plan::ProjectContext::default(),
-            "alice".into(),
-        );
+        let mut state =
+            astra_plan::PlanModeState::new_with_owner("draft plan".into(), "alice".into());
         state
             .plan
             .subtasks
@@ -7354,11 +7325,8 @@ esac
     #[tokio::test]
     async fn exit_plan_mode_seed_failure_is_non_fatal_and_unlocks_writes() {
         let repo = Arc::new(InMemoryPlanRepo::new());
-        let mut state = astra_plan::PlanModeState::new_with_owner(
-            "seed failure plan".into(),
-            astra_plan::ProjectContext::default(),
-            "alice".into(),
-        );
+        let mut state =
+            astra_plan::PlanModeState::new_with_owner("seed failure plan".into(), "alice".into());
         state
             .plan
             .subtasks

@@ -9,7 +9,7 @@ use crate::mcp_client;
 use crate::plan_executor;
 use crate::prompts;
 use crate::slash_team;
-use astra_runtime::plan_decompose;
+use astra_runtime::plan;
 use astra_runtime::tool_registry;
 use astra_services::session_journal;
 use astra_turn_core::conversation_log::manager::CslManager;
@@ -172,14 +172,27 @@ pub(crate) struct SessionState {
     /// cumulative per-tool selection/quality counters.
     pub tool_quality_tracker:
         Option<std::sync::Arc<std::sync::Mutex<tool_registry::ToolQualityTracker>>>,
-    /// Plan-only chat (`/plan on`): normal REPL turns omit edge tools; model plans without executing.
-    pub chat_plan_only: bool,
-    /// Plan Mode state — when Some, REPL is in interactive plan editing mode.
-    pub plan_mode: Option<plan_decompose::PlanModeState>,
+    /// Local mirror of the cloud `plans` row when plan mode was
+    /// entered through the cloud workflow (`/plan "goal"` or the
+    /// `enter_plan_mode` tool against an authenticated cloud
+    /// session). `None` for the Shift+Tab / offline path — those
+    /// runs hold no plan goal text and rely entirely on
+    /// `perm_manager.mode() == Plan`.
+    ///
+    /// Step 4 invariant I6: this field is **not** the source of
+    /// truth for "am I in plan mode". Use `state.plan_mode_active()`
+    /// (which reads `perm_manager`) for that. The mirror only
+    /// supplies the goal/plan-text consumers need (status line,
+    /// `execution_state_summary`, plan-monitor UI).
+    pub cloud_plan_mirror: Option<plan::PlanModeState>,
+    /// Last remote mirror-sync failure for the active cloud plan.
+    /// When set, the mirror in `cloud_plan_mirror` may be stale and
+    /// callers that want fresh data should re-sync before reading.
+    pub plan_mode_sync_error: Option<String>,
     /// Plan being auto-executed — subtasks sent sequentially through chat.
     pub executing_plan: Option<astra_services::task_orchestrator::TaskPlan>,
-    /// Configuration for current plan execution (step-by-step, auto-execute, etc.).
-    pub plan_execution_config: Option<plan_decompose::PlanExecutionConfig>,
+    /// Configuration for current plan execution.
+    pub plan_execution_config: Option<plan::PlanExecutionConfig>,
     /// Goal text for the executing plan (for summary generation).
     pub executing_plan_goal: Option<String>,
     /// Cloud `plan_id` this execution is mirroring to, for posting
@@ -205,11 +218,9 @@ pub(crate) struct SessionState {
     pub skill_improvement_tracker: astra_skills::improvement::ImprovementTracker,
     /// Skills pinned by the user — always included in budget (never truncated).
     pub pinned_skills: std::collections::HashSet<String>,
-    /// Skills surfaced by `discover_skills` during this REPL session.
+    /// Skills surfaced by `discover_skills` during this CLI session.
     pub discovered_skills: std::collections::HashSet<String>,
     pub mcp_manager: std::sync::Arc<tokio::sync::RwLock<mcp_client::McpClientManager>>,
-    /// Skill classification cache for LLM-based skill detection.
-    #[allow(dead_code)]
     /// Active durable-task contract for plan execution verification.
     pub durable_task_state: Option<durable_bridge::DurableTaskState>,
     /// Last delivery report — kept after plan completion so `/report` works post-plan.
@@ -273,16 +284,6 @@ pub(crate) struct SessionState {
     /// Resume guidance message from a previously interrupted checkpoint.
     /// One-shot: consumed and cleared after the first turn that uses it.
     pub resume_guidance: Option<String>,
-
-    /// Pre-computed plan-resume digest (P3.3).
-    ///
-    /// Populated at REPL startup when a `plan_state.json` is detected.
-    ///
-    /// Kept pending until the user sends a resume-like message (for example
-    /// `continue`, `继续`, `resume`, or `@resume-plan`). At that point the
-    /// digest is consumed and injected into the next model turn, or cleared if
-    /// plan-mode restoration takes over first.
-    pub pending_plan_resume_digest: Option<String>,
 
     /// Turns where history compaction occurred (for drift detection).
     pub drift_compressed_turns: Vec<u32>,
@@ -366,10 +367,6 @@ pub(crate) struct SessionState {
     /// User profile manager for preferences and scenario detection.
     pub user_profile_manager: std::sync::Arc<astra_config::user_profile::UserProfileManager>,
 
-    // ── Auto-Tuning (M6) ──
-    /// Auto-tuning engine for adaptive learning.
-    pub auto_tuning_engine: std::sync::Arc<astra_learning::auto_tuning::AutoTuningEngine>,
-
     // ── Conversation State Log (CSL) ──
     /// Unified CSL manager for persisting/restoring conversation state.
     /// Created lazily when session_id is first known.
@@ -391,6 +388,12 @@ pub(crate) struct SessionState {
     pub tui_approval_request_tx: Option<crate::chat_stream::ApprovalRequestTx>,
     /// When set, ask_user requests are rendered by the native TUI overlay.
     pub tui_ask_user_request_tx: Option<crate::chat_stream::AskUserRequestTx>,
+    /// When set, `exit_plan_mode` surfaces its 4-way plan-review
+    /// overlay through the native TUI instead of headless / inquire
+    /// prompts. Independent of `tui_ask_user_request_tx` because the
+    /// plan-review overlay renders a markdown body, not the
+    /// question/option layout `ask_user` expects.
+    pub tui_plan_review_request_tx: Option<crate::chat_stream::PlanReviewRequestTx>,
 
     /// Notifications from background tasks (completed/failed/stalled)
     /// queued for injection into the model's next turn context.
@@ -495,8 +498,8 @@ impl Default for SessionState {
             tool_health_entries: Vec::new(),
             synced_tool_health_entries: Vec::new(),
             tool_quality_tracker: None,
-            chat_plan_only: false,
-            plan_mode: None,
+            cloud_plan_mirror: None,
+            plan_mode_sync_error: None,
             executing_plan: None,
             plan_execution_config: None,
             executing_plan_goal: None,
@@ -541,7 +544,6 @@ impl Default for SessionState {
             pending_idle_agent_messages: Vec::new(),
             redo_stack: Vec::new(),
             resume_guidance: None,
-            pending_plan_resume_digest: None,
             drift_compressed_turns: Vec::new(),
             drift_user_corrections: Vec::new(),
             drift_original_query: None,
@@ -567,14 +569,6 @@ impl Default for SessionState {
                     std::sync::Arc::new(astra_config::user_profile::UserProfileStore::new());
                 std::sync::Arc::new(astra_config::user_profile::UserProfileManager::new(store))
             },
-            auto_tuning_engine: {
-                let engine = astra_learning::auto_tuning::AutoTuningEngine::new();
-                // Add default evolution rules
-                for rule in astra_learning::auto_tuning::default_rules() {
-                    engine.add_rule(rule);
-                }
-                std::sync::Arc::new(engine)
-            },
             csl_manager: None,
             tui_render_policy: None,
             tui_stream_event_tx: None,
@@ -582,6 +576,7 @@ impl Default for SessionState {
             tui_cancel_token: None,
             tui_approval_request_tx: None,
             tui_ask_user_request_tx: None,
+            tui_plan_review_request_tx: None,
             pending_bg_notifications: Vec::new(),
             turns_since_task_use: 0,
             turns_since_task_reminder: 0,
@@ -613,6 +608,7 @@ impl SessionState {
     pub fn clear_session_id(&mut self) {
         self.task_manager.rebind("");
         self.session_id = None;
+        self.plan_mode_sync_error = None;
     }
 
     /// Unregister and drop the root mailbox so a subsequent turn can
@@ -628,5 +624,55 @@ impl SessionState {
                 );
             }
         }
+    }
+
+    /// Single source of truth for "is the CLI session currently in
+    /// plan mode?".
+    ///
+    /// Step 4 invariant I6/I7: callers must not peek at
+    /// `cloud_plan_mirror.is_some()` to decide plan-mode state —
+    /// that field is the cloud row mirror, present only when entry
+    /// went through the cloud workflow. The Shift+Tab / offline
+    /// path leaves the mirror as `None` while still being in plan
+    /// mode. The permission manager is the only authoritative
+    /// signal; UI / nudge / status-line consumers must call this
+    /// helper.
+    pub fn plan_mode_active(&self) -> bool {
+        self.perm_manager.mode() == crate::permission_manager::PermissionMode::Plan
+    }
+}
+
+#[cfg(test)]
+mod plan_mode_invariant_tests {
+    use super::*;
+
+    /// Invariant I7: TUI / nudge / status-line consumers can ask
+    /// `state.plan_mode_active()` and always get a fresh truth
+    /// derived from `perm_manager.mode()`. No cached field is
+    /// allowed to drift.
+    #[test]
+    fn plan_mode_active_tracks_perm_manager_only() {
+        let mut state = SessionState::default();
+        // Default is `Prompt`, not Plan.
+        assert!(
+            !state.plan_mode_active(),
+            "fresh session must not report plan_mode_active"
+        );
+
+        state
+            .perm_manager
+            .set_mode(crate::permission_manager::PermissionMode::Plan);
+        assert!(
+            state.plan_mode_active(),
+            "switching perm_manager to Plan must immediately surface as plan_mode_active"
+        );
+
+        state
+            .perm_manager
+            .set_mode(crate::permission_manager::PermissionMode::Auto);
+        assert!(
+            !state.plan_mode_active(),
+            "switching back must clear plan_mode_active without any other state change"
+        );
     }
 }
