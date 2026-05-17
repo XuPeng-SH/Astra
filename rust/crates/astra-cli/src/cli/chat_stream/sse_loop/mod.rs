@@ -144,6 +144,7 @@ pub(crate) async fn stream_chat_sse(
     mut p: ChatTurnParams<'_>,
 ) -> Result<StreamResult, crate::TurnFailure> {
     let start = Instant::now();
+    p.model = normalize_turn_model(p.model);
     let root_agent_id = p.root_agent_id.unwrap_or("main");
     p.perm_manager.clear_turn_overrides();
 
@@ -344,10 +345,12 @@ pub(crate) async fn stream_chat_sse(
     } else {
         Vec::new()
     };
+    let cli_capabilities = edge_tools::cli_default_capabilities(p.agent_spawner.is_some());
     let all_schemas: (Vec<Value>, Vec<Value>) = (
         astra_runtime::capabilities::cli_local_tool_schemas(
             edge_tools::local_tool_schemas(),
             mcp_schemas.clone(),
+            &cli_capabilities,
         ),
         mcp_schemas,
     );
@@ -499,6 +502,7 @@ pub(crate) async fn stream_chat_sse(
         file_context,
         perm_manager: p.perm_manager,
         valid_tool_names,
+        capabilities: cli_capabilities,
         pending_clear_lines: 0,
         is_plan_subtask: p.is_plan_subtask,
         plan_subtask_id: p.plan_subtask_id,
@@ -924,6 +928,10 @@ pub(crate) async fn stream_chat_sse(
     Ok(result)
 }
 
+fn normalize_turn_model(model: Option<&str>) -> Option<&str> {
+    astra_core::model_override::normalize_model_override(model)
+}
+
 fn load_turn_messages(
     pre_loaded_messages: Option<Vec<serde_json::Value>>,
     history: &[(String, String)],
@@ -958,6 +966,7 @@ mod tests {
     use super::circuit_breaker_config_from_tool_selection;
     use super::detect_turn_hook_sets;
     use super::extend_restricted_with_blocked_tools;
+    use super::normalize_turn_model;
     use astra_runtime::observability_integration::ObservabilityHub;
     use astra_turn_core::chat_turn_heuristics::infer_task_execution_profile;
     use std::collections::HashSet;
@@ -978,6 +987,16 @@ mod tests {
         assert_eq!(cfg.max_introspect_emissions, 3);
         assert_eq!(cfg.half_open_patience, 2);
         assert_eq!(cfg.absolute_max_rounds, 200);
+    }
+
+    #[test]
+    fn turn_model_normalization_drops_symbolic_default_override() {
+        assert_eq!(normalize_turn_model(None), None);
+        assert_eq!(normalize_turn_model(Some(" default ")), None);
+        assert_eq!(
+            normalize_turn_model(Some("MiniMax-M2.7")),
+            Some("MiniMax-M2.7")
+        );
     }
 
     #[test]

@@ -215,20 +215,11 @@ pub(super) async fn handle_chat_input_with_ui(
         }
     };
 
-    if state.session_id.is_none()
-        && let Some(session_id) = state.pending_recovery.clone()
-    {
-        if is_low_information_followup(&line) {
-            if let Err(e) =
-                slash_session::restore_session_into_state(&session_id, ctx.profile, ctx.api, state)
-                    .await
-            {
-                ui.show_error(&format!("  {} {e}", theme::icon_err()));
-                return Ok(());
-            }
-        } else {
-            state.pending_recovery = None;
-        }
+    if state.session_id.is_none() && state.pending_recovery.is_some() {
+        // Resume must be explicit (`/resume`, `--resume`, or `--continue`).
+        // A short first prompt like "继续" is valid new-session input and must
+        // not silently attach to the last crashed/interrupted session.
+        state.pending_recovery = None;
     }
 
     ui.blank_line();
@@ -1553,11 +1544,7 @@ fn commit_turn_journal_workspace_and_sidecars(
                 let config = ws.plan_config_json.clone();
                 let rounds = ws.plan_execution_rounds;
                 let git_branch = ws.git_branch.clone();
-                let model = if ws.model.is_empty() {
-                    None
-                } else {
-                    Some(ws.model.clone())
-                };
+                let model = ws.model.clone();
                 mc.spawn_session_sync_task(async move {
                     if let Err(e) = svc
                         .push_session_state(
@@ -2869,10 +2856,11 @@ fn initialize_journal(state: &mut SessionState, session_id: &str) {
     }
     // Preserve the workspace model for existing sessions so `/session` can report
     // what the session originally started as even if the live model changes later.
-    if let Some(model) = state.model.as_deref()
-        && (ws.model.is_empty() || (!workspace_existed && ws.model != model))
+    if let Some(model) =
+        astra_core::model_override::normalize_model_override(state.model.as_deref())
+        && (ws.model.is_none() || (!workspace_existed && ws.model.as_deref() != Some(model)))
     {
-        ws.model = model.to_string();
+        ws.model = Some(model.to_string());
         dirty = true;
     }
     if dirty {
@@ -4029,7 +4017,7 @@ mod tests {
         initialize_journal(&mut state, sid);
 
         let persisted = astra_services::session_workspace::read_workspace(sid).unwrap();
-        assert_eq!(persisted.model, "old-model");
+        assert_eq!(persisted.model.as_deref(), Some("old-model"));
         assert_eq!(persisted.turn_count, 7);
         assert_eq!(
             persisted
@@ -4253,7 +4241,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_recovery_restore_is_gated_to_low_information_followups() {
+    fn pending_recovery_never_restores_from_ordinary_chat_input() {
         let source = include_str!("chat_turn.rs");
         let start = source
             .find("pub(super) async fn handle_chat_input_with_ui")
@@ -4264,10 +4252,10 @@ mod tests {
             .expect("pre-turn gate should reach the blank-line boundary");
         let pre_turn_gate = &body[..gate_end];
         assert!(
-            pre_turn_gate.contains("restore_session_into_state(&session_id")
-                && pre_turn_gate.contains("is_low_information_followup(&line)")
+            !pre_turn_gate.contains("restore_session_into_state(")
+                && !pre_turn_gate.contains("is_low_information_followup(&line)")
                 && pre_turn_gate.contains("state.pending_recovery = None;"),
-            "interactive chat should only restore pending recovery for low-information resume/repair follow-ups"
+            "ordinary chat input must not auto-restore pending recovery; resume is explicit only"
         );
     }
 
