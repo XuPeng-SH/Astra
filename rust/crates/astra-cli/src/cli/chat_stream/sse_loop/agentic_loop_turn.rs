@@ -530,6 +530,14 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             ctx.all_schemas,
         );
     }
+    if ctx.plan_mode_active {
+        astra_turn_core::tool_schema_prune::inject_required_tool_names(
+            &mut turn_schemas,
+            &mut selection_report,
+            astra_turn_core::tool_schema_prune::PLAN_MODE_REQUIRED_TOOLS,
+            ctx.all_schemas,
+        );
+    }
 
     // Plan-mode tool restrictions are owned by the host
     // (`CliAgenticLoopHost::execute_turn`) using the same
@@ -580,7 +588,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
 
     apply_selector_hints_then_attach_filtered_edge_tools(
         &mut payload,
-        tool_surface.pinned_schemas(),
+        turn_schemas,
         ctx.restricted_tools,
         ctx.telem.first_selection_report.as_ref(),
         selection_confidence,
@@ -1508,6 +1516,149 @@ P5 still has a thread leak on timeout; terminate the child before returning.\n\n
         assert!(report.tools_selected.contains(&"grep".into()));
         assert!(report.tools_selected.contains(&"glob".into()));
         assert_eq!(turn_schemas.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn prepare_chat_turn_payload_includes_plan_mode_escape_hatches() {
+        use crate::edge_tools::ToolExecutor;
+        use astra_pipeline::step_recorder::StepRecorder;
+        use astra_runtime::{
+            tool_registry::ToolRegistry,
+            turn::chat_turn_explain_wire::{AgenticChatExplainFlags, AgenticExplainUiMode},
+        };
+        use astra_turn_core::{interaction_types::TurnInteractionPolicy, turn_guard::TurnGuard};
+        use std::{collections::HashSet, sync::Arc, time::Instant};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let all_schemas = vec![
+            schema("read_file"),
+            schema("write_file"),
+            schema("enter_plan_mode"),
+            schema("exit_plan_mode"),
+        ];
+        let registry = ToolRegistry::new(all_schemas.clone()).with_budget(100);
+        let executor = Arc::new(ToolExecutor::new(temp_dir.path()));
+        let messages = vec![json!({"role": "user", "content": "inspect the repo state"})];
+        let tool_results = Vec::new();
+        let history: Vec<(String, String)> = Vec::new();
+        let recent_tools: Vec<String> = Vec::new();
+        let file_context: Vec<String> = Vec::new();
+        let mut restricted_tools = HashSet::new();
+        let mut step_recorder = StepRecorder::new("session-1", "task-1");
+        let turn_guard = TurnGuard::default();
+        let skill_search = astra_core::SkillSearchSettings::default();
+        let mut turn_policy = TurnInteractionPolicy::default();
+        let mut first_memoria_ms = None;
+        let mut first_selection_report = None;
+        let mut first_budget_pressure = 0.0;
+        let mut first_context_assembly_ms = None;
+        let mut all_selected_skills = Vec::new();
+
+        let payload = super::prepare_chat_turn_payload(super::PrepareChatTurnRequest {
+            messages: &messages,
+            ephemeral_prefix: None,
+            current_session_id: Some("session-1"),
+            model: None,
+            explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
+            project_root: temp_dir.path(),
+            message: "inspect the repo state",
+            history: &history,
+            recent_tools: &recent_tools,
+            executor,
+            registry: &registry,
+            tool_results: &tool_results,
+            all_schemas: &all_schemas,
+            turn_guard: &turn_guard,
+            restricted_tools: &mut restricted_tools,
+            step_recorder: &mut step_recorder,
+            file_context: &file_context,
+            assembly_start: Instant::now(),
+            telem: super::PrepareTurnTelemetry {
+                first_memoria_ms: &mut first_memoria_ms,
+                first_selection_report: &mut first_selection_report,
+                first_budget_pressure: &mut first_budget_pressure,
+                first_context_assembly_ms: &mut first_context_assembly_ms,
+                all_selected_skills: &mut all_selected_skills,
+                initial_skill_selector_shortlist: None,
+                trace_collector: None,
+            },
+            skill_search: &skill_search,
+            is_plan_subtask: false,
+            plan_subtask_id: None,
+            timing_phases: false,
+            prep_ui_phase: None,
+            skill_effort: None,
+            skill_agent_type: None,
+            tool_budget_override: None,
+            interaction_mode: TurnInteractionMode::NonInteractive,
+            turn_policy: &mut turn_policy,
+            skill_allowed_tools: None,
+            previous_confidence_fallback: None,
+            round_index: 0,
+            session_turn: 1,
+            turn_chain_id: None,
+            user_query_event_id: None,
+            denial_pressure: (0, 0),
+            recent_rejections: Vec::new(),
+            observability_hub: None,
+            append_system_prompt: None,
+            plan_mode_active: true,
+        })
+        .await;
+
+        let edge_tool_names: Vec<&str> = payload["edge_tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|schema| schema["function"]["name"].as_str())
+            .collect();
+        assert!(edge_tool_names.contains(&"enter_plan_mode"));
+        assert!(edge_tool_names.contains(&"exit_plan_mode"));
+        assert_eq!(
+            edge_tool_names
+                .iter()
+                .filter(|name| **name == "enter_plan_mode")
+                .count(),
+            1
+        );
+        assert_eq!(
+            edge_tool_names
+                .iter()
+                .filter(|name| **name == "exit_plan_mode")
+                .count(),
+            1
+        );
+
+        let report = first_selection_report.expect("selection report recorded");
+        assert!(report.tools_selected.contains(&"enter_plan_mode".into()));
+        assert!(report.tools_selected.contains(&"exit_plan_mode".into()));
+        assert_eq!(
+            report
+                .tools_selected
+                .iter()
+                .filter(|name| name.as_str() == "enter_plan_mode")
+                .count(),
+            1
+        );
+        assert_eq!(
+            report
+                .tools_selected
+                .iter()
+                .filter(|name| name.as_str() == "exit_plan_mode")
+                .count(),
+            1
+        );
+        assert_eq!(report.selected_count as usize, report.tools_selected.len());
+        assert!(
+            turn_policy
+                .visible_tool_names
+                .contains(&"enter_plan_mode".into())
+        );
+        assert!(
+            turn_policy
+                .visible_tool_names
+                .contains(&"exit_plan_mode".into())
+        );
     }
 }
 
