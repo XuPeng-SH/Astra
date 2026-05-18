@@ -37,6 +37,7 @@ pub async fn build_server_state(
             settings.memoria.base_url.clone(),
             settings.memoria.master_key.clone(),
         );
+    let state = install_skillify_harness_service(state, &settings, &shared_pool, &shared_encryptor);
 
     let wiring = runtime::build_runtime_wiring(
         &settings,
@@ -64,6 +65,26 @@ pub async fn build_server_state(
 
     bridge::spawn_runtime_sweepers(shared_pool.clone());
     Ok(state.with_matrix_cloud_runtime(Some(matrix_rt)))
+}
+
+fn install_skillify_harness_service(
+    state: AppState,
+    settings: &AppSettings,
+    shared_pool: &SharedPool,
+    shared_encryptor: &Arc<FernetTokenEncryptor>,
+) -> AppState {
+    let skillify_agent_executor = Arc::new(
+        super::skillify_agent_executor::RuntimeSkillifyAgentExecutor::new(
+            settings.matrixone.clone(),
+            Arc::clone(shared_encryptor),
+            state.admin.config_service.clone(),
+            shared_pool.clone(),
+        ),
+    );
+    state.with_harness_service(Arc::new(
+        DatabaseHarnessService::new(shared_pool.clone())
+            .with_skillify_agent_executor(skillify_agent_executor),
+    ))
 }
 
 #[cfg(test)]

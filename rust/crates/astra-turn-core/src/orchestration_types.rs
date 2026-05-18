@@ -6,13 +6,29 @@
 use std::time::SystemTime;
 
 /// Current status of a spawned agent.
+///
+/// `Completed` is reused for every terminal state where progress
+/// was preserved, including budget-exhaustion early-exit paths that
+/// the loop reports as resumable interruptions. Callers that need to
+/// distinguish task completion from interruption should read
+/// `finish_reason`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentStatus {
     Initializing,
-    Running { activity: String },
+    Running {
+        activity: String,
+    },
     Idle,
-    Completed { result: String },
-    Failed { error: String },
+    Completed {
+        result: String,
+        #[allow(dead_code)]
+        finish_reason: Option<String>,
+    },
+    Failed {
+        error: String,
+        #[allow(dead_code)]
+        finish_reason: Option<String>,
+    },
     Cancelled,
 }
 

@@ -41,6 +41,7 @@ mod meta_handlers;
 mod plan_handlers;
 mod platform_handlers;
 mod preferences_handlers;
+mod product_harness_handlers;
 mod reflect_handlers;
 mod request_trace;
 mod resource_handlers;
@@ -55,6 +56,8 @@ mod session_handlers;
 mod session_quota;
 mod session_todo_handlers;
 pub mod session_todo_sweeper;
+mod session_trace;
+mod skillify_agent_executor;
 mod state_builder;
 mod task_handlers;
 mod team_handlers;
@@ -156,7 +159,6 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
         &astra_config::runtime_config::RuntimeConfig::load(),
     );
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
     let settings = AppSettings::from_env()?;
     let state = state_builder::build_server_state(settings).await?;
 
@@ -170,6 +172,8 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
             "HTTP proxy set; local callers should set NO_PROXY=127.0.0.1,localhost or use --noproxy"
         );
     }
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
 
     // Cancellation token wired into background sweepers; cancelled after axum
     // serve returns so we can drain them deterministically before tearing down

@@ -110,13 +110,17 @@ impl AgentTreeState {
                     } => {
                         record.info.status = AgentStatus::Completed {
                             result: result_summary,
+                            finish_reason: None,
                         };
                         record.info.metrics.tool_calls = total_tool_calls;
                         record.info.metrics.prompt_tokens = total_tokens.0;
                         record.info.metrics.completion_tokens = total_tokens.1;
                     }
                     ProgressEventType::Failed { error } => {
-                        record.info.status = AgentStatus::Failed { error };
+                        record.info.status = AgentStatus::Failed {
+                            error,
+                            finish_reason: None,
+                        };
                     }
                     ProgressEventType::Cancelled { .. } => {
                         record.info.status = AgentStatus::Cancelled;
@@ -245,6 +249,7 @@ fn aggregate_info(
                 {
                     aggregated.status = AgentStatus::Failed {
                         error: format!("child agent {} failed", child_info.agent_id),
+                        finish_reason: None,
                     };
                 }
             }

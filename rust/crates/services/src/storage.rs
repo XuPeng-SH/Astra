@@ -384,6 +384,93 @@ async fn add_index_if_missing(
     Ok(())
 }
 
+fn sql_decode_error(message: impl Into<String>) -> sqlx::Error {
+    sqlx::Error::Decode(Box::new(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        message.into(),
+    )))
+}
+
+fn json_value_type(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+fn promote_legacy_fallback_model_quirks(raw: &str) -> Result<Option<String>, String> {
+    let mut value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| format!("parse quirks JSON: {e}"))?;
+    let Some(object) = value.as_object_mut() else {
+        return Ok(None);
+    };
+    let Some(legacy_value) = object.remove("fallback_model") else {
+        return Ok(None);
+    };
+
+    let fallback_model = match legacy_value {
+        serde_json::Value::String(model) => model.trim().to_string(),
+        serde_json::Value::Null => String::new(),
+        other => {
+            return Err(format!(
+                "legacy fallback_model must be a string, got {}",
+                json_value_type(&other)
+            ));
+        }
+    };
+
+    if !fallback_model.is_empty() && !object.contains_key("fallback_chain") {
+        object.insert(
+            "fallback_chain".to_string(),
+            serde_json::Value::Array(vec![serde_json::Value::String(fallback_model)]),
+        );
+    }
+
+    serde_json::to_string(&value)
+        .map(Some)
+        .map_err(|e| format!("serialize migrated quirks JSON: {e}"))
+}
+
+async fn migrate_model_fallback_chain(pool: &Pool<MySql>) -> Result<u64, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let rows = query(
+        "SELECT model_id, CAST(quirks AS CHAR) AS quirks_json \
+         FROM infra_llm_models \
+         WHERE quirks IS NOT NULL",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+
+    let mut migrated = 0;
+    for row in rows {
+        let model_id: String = row.try_get("model_id")?;
+        let quirks_json: String = row.try_get("quirks_json")?;
+        let Some(updated_quirks) =
+            promote_legacy_fallback_model_quirks(&quirks_json).map_err(|e| {
+                sql_decode_error(format!(
+                    "fallback_model to fallback_chain migration failed for model_id={model_id}: {e}"
+                ))
+            })?
+        else {
+            continue;
+        };
+
+        let result = query("UPDATE infra_llm_models SET quirks = ? WHERE model_id = ?")
+            .bind(updated_quirks)
+            .bind(&model_id)
+            .execute(&mut *tx)
+            .await?;
+        migrated += result.rows_affected();
+    }
+
+    tx.commit().await?;
+    Ok(migrated)
+}
+
 pub async fn ensure_core_schema(
     settings: &MatrixOneSettings,
     bootstrap_catalog: &str,
@@ -538,6 +625,14 @@ pub async fn ensure_core_schema(
             content LONGTEXT NULL,
             parent_event_id VARCHAR(64) NULL,
             causal_chain_id VARCHAR(64) NULL,
+            run_id VARCHAR(64) NULL,
+            parent_run_id VARCHAR(64) NULL,
+            turn_id VARCHAR(64) NULL,
+            turn_seq BIGINT NULL,
+            round_index BIGINT NULL,
+            tool_call_id VARCHAR(128) NULL,
+            parent_agent_id VARCHAR(128) NULL,
+            trace_kind VARCHAR(64) NULL,
             token_usage JSON NULL,
             llm_model_used VARCHAR(128) NULL,
             llm_params JSON NULL,
@@ -560,11 +655,73 @@ pub async fn ensure_core_schema(
             INDEX idx_agent_events_causal_chain_id (causal_chain_id),
             INDEX idx_agent_events_skill_created (skill_name, created_at),
             INDEX idx_agent_events_created_at (created_at),
-            INDEX idx_agent_events_tool_name (meta_tool_name)
+            INDEX idx_agent_events_tool_name (meta_tool_name),
+            INDEX idx_agent_events_trace (session_id, turn_id, created_at),
+            INDEX idx_agent_events_run (session_id, run_id, created_at),
+            INDEX idx_agent_events_parent_run (session_id, parent_run_id, created_at),
+            INDEX idx_agent_events_tool_call (session_id, tool_call_id)
         )",
     )
     .execute(&pool)
     .await?;
+
+    for (column, ddl) in [
+        (
+            "run_id",
+            "ALTER TABLE agent_events ADD COLUMN run_id VARCHAR(64) NULL",
+        ),
+        (
+            "parent_run_id",
+            "ALTER TABLE agent_events ADD COLUMN parent_run_id VARCHAR(64) NULL",
+        ),
+        (
+            "turn_id",
+            "ALTER TABLE agent_events ADD COLUMN turn_id VARCHAR(64) NULL",
+        ),
+        (
+            "turn_seq",
+            "ALTER TABLE agent_events ADD COLUMN turn_seq BIGINT NULL",
+        ),
+        (
+            "round_index",
+            "ALTER TABLE agent_events ADD COLUMN round_index BIGINT NULL",
+        ),
+        (
+            "tool_call_id",
+            "ALTER TABLE agent_events ADD COLUMN tool_call_id VARCHAR(128) NULL",
+        ),
+        (
+            "parent_agent_id",
+            "ALTER TABLE agent_events ADD COLUMN parent_agent_id VARCHAR(128) NULL",
+        ),
+        (
+            "trace_kind",
+            "ALTER TABLE agent_events ADD COLUMN trace_kind VARCHAR(64) NULL",
+        ),
+    ] {
+        add_column_if_missing(&pool, &settings.database, "agent_events", column, ddl).await?;
+    }
+
+    for (index, ddl) in [
+        (
+            "idx_agent_events_trace",
+            "ALTER TABLE agent_events ADD INDEX idx_agent_events_trace (session_id, turn_id, created_at)",
+        ),
+        (
+            "idx_agent_events_run",
+            "ALTER TABLE agent_events ADD INDEX idx_agent_events_run (session_id, run_id, created_at)",
+        ),
+        (
+            "idx_agent_events_parent_run",
+            "ALTER TABLE agent_events ADD INDEX idx_agent_events_parent_run (session_id, parent_run_id, created_at)",
+        ),
+        (
+            "idx_agent_events_tool_call",
+            "ALTER TABLE agent_events ADD INDEX idx_agent_events_tool_call (session_id, tool_call_id)",
+        ),
+    ] {
+        add_index_if_missing(&pool, &settings.database, "agent_events", index, ddl).await?;
+    }
 
     // ── Durable web-agent run state (Phase 1 / G15 + G19) ────────────────
     query(
@@ -654,6 +811,51 @@ pub async fn ensure_core_schema(
             INDEX idx_agent_run_events_session_created (session_id, created_at),
             INDEX idx_agent_run_events_user_created (user_id, created_at),
             INDEX idx_agent_run_events_event_id (event_id)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS run_checkpoints (
+            checkpoint_id VARCHAR(64) PRIMARY KEY,
+            run_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(64) NOT NULL,
+            session_id VARCHAR(64) NOT NULL,
+            node_seq BIGINT NOT NULL DEFAULT 0,
+            checkpoint_kind VARCHAR(32) NOT NULL,
+            checkpoint_version VARCHAR(32) NOT NULL,
+            idempotency_key VARCHAR(191) NOT NULL,
+            checkpoint_json LONGTEXT NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            UNIQUE KEY uniq_run_checkpoint_idem (run_id, checkpoint_kind, idempotency_key),
+            INDEX idx_run_checkpoints_run_created (run_id, created_at),
+            INDEX idx_run_checkpoints_session_kind_created (session_id, checkpoint_kind, created_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS run_display_projections (
+            run_id VARCHAR(64) PRIMARY KEY,
+            user_id VARCHAR(64) NOT NULL,
+            session_id VARCHAR(64) NOT NULL,
+            status VARCHAR(32) NOT NULL,
+            waiting_for VARCHAR(64) NULL,
+            error_message TEXT NULL,
+            projection_event_idx BIGINT NOT NULL DEFAULT -1,
+            latest_event_type VARCHAR(64) NULL,
+            latest_checkpoint_id VARCHAR(64) NULL,
+            latest_checkpoint_kind VARCHAR(32) NULL,
+            latest_checkpoint_version VARCHAR(32) NULL,
+            total_prompt_tokens BIGINT NOT NULL DEFAULT 0,
+            total_completion_tokens BIGINT NOT NULL DEFAULT 0,
+            total_tool_calls BIGINT NOT NULL DEFAULT 0,
+            projection_hash VARCHAR(64) NOT NULL,
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_run_display_projections_session_updated (session_id, updated_at),
+            INDEX idx_run_display_projections_user_updated (user_id, updated_at)
         )",
     )
     .execute(&pool)
@@ -801,6 +1003,84 @@ pub async fn ensure_core_schema(
         128,
         "ALTER TABLE session_transcript_items MODIFY COLUMN content_hash VARCHAR(128) NOT NULL",
     )
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS transcript_pages (
+            session_id VARCHAR(64) NOT NULL,
+            page_seq BIGINT NOT NULL,
+            start_item_seq BIGINT NOT NULL,
+            end_item_seq BIGINT NOT NULL,
+            item_count INT NOT NULL,
+            page_hash VARCHAR(128) NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (session_id, page_seq),
+            INDEX idx_transcript_pages_session_end (session_id, end_item_seq),
+            INDEX idx_transcript_pages_session_updated (session_id, updated_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS prompt_request_records (
+            request_id VARCHAR(64) PRIMARY KEY,
+            session_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(64) NOT NULL,
+            run_id VARCHAR(64) NULL,
+            turn BIGINT NOT NULL,
+            round BIGINT NOT NULL,
+            attempt BIGINT NOT NULL,
+            source VARCHAR(64) NOT NULL,
+            model VARCHAR(128) NOT NULL,
+            provider VARCHAR(64) NOT NULL,
+            max_output_tokens BIGINT NULL,
+            message_count BIGINT NOT NULL,
+            tool_count BIGINT NOT NULL,
+            previous_request_id VARCHAR(64) NULL,
+            request_hash VARCHAR(64) NOT NULL,
+            summary_json LONGTEXT NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            UNIQUE KEY uq_prompt_request_attempt (session_id, turn, round, source, attempt),
+            INDEX idx_prompt_requests_session_created (session_id, created_at),
+            INDEX idx_prompt_requests_run_created (run_id, created_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS prompt_chunks (
+            chunk_id VARCHAR(80) PRIMARY KEY,
+            chunk_hash VARCHAR(64) NOT NULL,
+            chunk_kind VARCHAR(32) NOT NULL,
+            payload_json LONGTEXT NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            UNIQUE KEY uq_prompt_chunk_hash (chunk_hash)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS prompt_deltas (
+            delta_id VARCHAR(64) PRIMARY KEY,
+            request_id VARCHAR(64) NOT NULL,
+            delta_seq INT NOT NULL,
+            logical_key VARCHAR(191) NOT NULL,
+            chunk_kind VARCHAR(32) NOT NULL,
+            position INT NOT NULL,
+            op VARCHAR(16) NOT NULL,
+            chunk_id VARCHAR(80) NULL,
+            chunk_hash VARCHAR(64) NULL,
+            previous_chunk_hash VARCHAR(64) NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            UNIQUE KEY uq_prompt_delta_request_seq (request_id, delta_seq),
+            INDEX idx_prompt_deltas_request_position (request_id, position, delta_seq)
+        )",
+    )
+    .execute(&pool)
     .await?;
 
     query(
@@ -1361,6 +1641,293 @@ pub async fn ensure_core_schema(
     .execute(&pool)
     .await?;
 
+    // Product harness workflow state. This is separate from the diagnostic
+    // `harness_snapshots` table above: these rows are the durable product model
+    // for reusable user workflows such as Skillify.
+    query(
+        "CREATE TABLE IF NOT EXISTS harness_runs (
+            harness_run_id VARCHAR(128) PRIMARY KEY,
+            harness_id VARCHAR(128) NOT NULL,
+            version_id VARCHAR(128) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(128) NULL,
+            workflow_run_id VARCHAR(128) NULL,
+            agent_run_id VARCHAR(128) NULL,
+            parent_agent_run_id VARCHAR(128) NULL,
+            status VARCHAR(64) NOT NULL,
+            input_json LONGTEXT NOT NULL,
+            output_json LONGTEXT NOT NULL,
+            error TEXT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_harness_runs_user_status_updated (user_id, status, updated_at),
+            INDEX idx_harness_runs_harness_user (harness_id, user_id, updated_at),
+            INDEX idx_harness_runs_session (session_id, updated_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS harness_sources (
+            source_id VARCHAR(128) PRIMARY KEY,
+            harness_run_id VARCHAR(128) NOT NULL,
+            source_type VARCHAR(64) NOT NULL,
+            source_ref VARCHAR(255) NOT NULL,
+            snapshot_ref VARCHAR(255) NULL,
+            content_hash VARCHAR(128) NULL,
+            metadata_json LONGTEXT NOT NULL,
+            status VARCHAR(64) NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_harness_sources_run (harness_run_id, source_type, status)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS harness_items (
+            item_id VARCHAR(128) PRIMARY KEY,
+            harness_run_id VARCHAR(128) NOT NULL,
+            parent_item_id VARCHAR(128) NULL,
+            item_type VARCHAR(64) NOT NULL,
+            locator_json LONGTEXT NOT NULL,
+            input_json LONGTEXT NOT NULL,
+            proposed_output_json LONGTEXT NOT NULL,
+            final_output_json LONGTEXT NOT NULL,
+            status VARCHAR(64) NOT NULL,
+            confidence DOUBLE NULL,
+            assigned_to VARCHAR(128) NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_harness_items_run_status (harness_run_id, status, updated_at),
+            INDEX idx_harness_items_assigned (assigned_to, status, updated_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS harness_skill_drafts (
+            skill_draft_id VARCHAR(128) PRIMARY KEY,
+            harness_run_id VARCHAR(128) NOT NULL,
+            candidate_name VARCHAR(128) NOT NULL,
+            description TEXT NOT NULL,
+            target_scope VARCHAR(32) NOT NULL,
+            publish_visibility VARCHAR(32) NOT NULL,
+            content_markdown LONGTEXT NOT NULL,
+            source_summary_json LONGTEXT NOT NULL,
+            status VARCHAR(64) NOT NULL,
+            confidence DOUBLE NULL,
+            created_by_node_id VARCHAR(128) NULL,
+            revision BIGINT NOT NULL DEFAULT 1,
+            published_version_id VARCHAR(128) NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_harness_skill_drafts_run_status (harness_run_id, status, updated_at),
+            INDEX idx_harness_skill_drafts_run_revision (harness_run_id, revision)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS harness_skill_rules (
+            skill_rule_id VARCHAR(128) PRIMARY KEY,
+            skill_draft_id VARCHAR(128) NOT NULL,
+            harness_run_id VARCHAR(128) NOT NULL,
+            rule_type VARCHAR(64) NOT NULL,
+            statement TEXT NOT NULL,
+            rationale TEXT NOT NULL,
+            status VARCHAR(64) NOT NULL,
+            confidence DOUBLE NULL,
+            source_count BIGINT NOT NULL DEFAULT 0,
+            created_by_node_id VARCHAR(128) NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_harness_skill_rules_draft_status (skill_draft_id, status, updated_at),
+            INDEX idx_harness_skill_rules_run_status (harness_run_id, status, updated_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS harness_citations (
+            citation_id VARCHAR(128) PRIMARY KEY,
+            harness_run_id VARCHAR(128) NOT NULL,
+            item_id VARCHAR(128) NOT NULL,
+            skill_draft_id VARCHAR(128) NULL,
+            skill_rule_id VARCHAR(128) NULL,
+            source_id VARCHAR(128) NULL,
+            source_locator_json LONGTEXT NOT NULL,
+            artifact_id VARCHAR(128) NULL,
+            quote_hash VARCHAR(128) NULL,
+            evidence_text_preview TEXT NULL,
+            relevance_score DOUBLE NULL,
+            created_by_node_id VARCHAR(128) NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_harness_citations_item (item_id, created_at),
+            INDEX idx_harness_citations_skill_rule (skill_rule_id, created_at),
+            INDEX idx_harness_citations_run (harness_run_id, created_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS harness_decisions (
+            decision_id VARCHAR(128) PRIMARY KEY,
+            harness_run_id VARCHAR(128) NOT NULL,
+            target_type VARCHAR(64) NULL,
+            item_id VARCHAR(128) NOT NULL,
+            skill_draft_id VARCHAR(128) NULL,
+            skill_rule_id VARCHAR(128) NULL,
+            reviewer_user_id VARCHAR(128) NOT NULL,
+            decision VARCHAR(64) NOT NULL,
+            before_json LONGTEXT NOT NULL,
+            after_json LONGTEXT NOT NULL,
+            reason TEXT NULL,
+            idempotency_key VARCHAR(255) NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            UNIQUE KEY uq_harness_decision_idempotency (harness_run_id, idempotency_key),
+            INDEX idx_harness_decisions_item (item_id, created_at),
+            INDEX idx_harness_decisions_skill_draft (skill_draft_id, created_at),
+            INDEX idx_harness_decisions_skill_rule (skill_rule_id, created_at),
+            INDEX idx_harness_decisions_reviewer (reviewer_user_id, created_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    for (table, column, ddl) in [
+        (
+            "harness_citations",
+            "skill_draft_id",
+            "ALTER TABLE harness_citations ADD COLUMN skill_draft_id VARCHAR(128) NULL",
+        ),
+        (
+            "harness_citations",
+            "skill_rule_id",
+            "ALTER TABLE harness_citations ADD COLUMN skill_rule_id VARCHAR(128) NULL",
+        ),
+        (
+            "harness_decisions",
+            "target_type",
+            "ALTER TABLE harness_decisions ADD COLUMN target_type VARCHAR(64) NULL",
+        ),
+        (
+            "harness_decisions",
+            "skill_draft_id",
+            "ALTER TABLE harness_decisions ADD COLUMN skill_draft_id VARCHAR(128) NULL",
+        ),
+        (
+            "harness_decisions",
+            "skill_rule_id",
+            "ALTER TABLE harness_decisions ADD COLUMN skill_rule_id VARCHAR(128) NULL",
+        ),
+    ] {
+        add_column_if_missing(&pool, &settings.database, table, column, ddl).await?;
+    }
+    for (table, index, ddl) in [
+        (
+            "harness_citations",
+            "idx_harness_citations_skill_rule",
+            "ALTER TABLE harness_citations ADD INDEX idx_harness_citations_skill_rule (skill_rule_id, created_at)",
+        ),
+        (
+            "harness_decisions",
+            "idx_harness_decisions_skill_draft",
+            "ALTER TABLE harness_decisions ADD INDEX idx_harness_decisions_skill_draft (skill_draft_id, created_at)",
+        ),
+        (
+            "harness_decisions",
+            "idx_harness_decisions_skill_rule",
+            "ALTER TABLE harness_decisions ADD INDEX idx_harness_decisions_skill_rule (skill_rule_id, created_at)",
+        ),
+    ] {
+        add_index_if_missing(&pool, &settings.database, table, index, ddl).await?;
+    }
+
+    query(
+        "CREATE TABLE IF NOT EXISTS harness_artifacts (
+            harness_artifact_id VARCHAR(128) PRIMARY KEY,
+            harness_run_id VARCHAR(128) NOT NULL,
+            artifact_id VARCHAR(128) NULL,
+            artifact_kind VARCHAR(64) NOT NULL,
+            status VARCHAR(64) NOT NULL,
+            metadata_json LONGTEXT NOT NULL,
+            created_by_node_id VARCHAR(128) NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_harness_artifacts_run_kind (harness_run_id, artifact_kind, created_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS harness_agent_roles (
+            agent_role_id VARCHAR(128) PRIMARY KEY,
+            version_id VARCHAR(128) NOT NULL,
+            role_name VARCHAR(128) NOT NULL,
+            purpose TEXT NULL,
+            input_schema_json LONGTEXT NOT NULL,
+            output_schema_json LONGTEXT NOT NULL,
+            tool_scope_json LONGTEXT NOT NULL,
+            source_scope_json LONGTEXT NOT NULL,
+            assertion_policy_json LONGTEXT NOT NULL,
+            max_parallelism INT NOT NULL DEFAULT 1,
+            timeout_ms BIGINT NULL,
+            model_policy_json LONGTEXT NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_harness_agent_roles_version (version_id, role_name)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS harness_subagent_runs (
+            subagent_run_id VARCHAR(128) PRIMARY KEY,
+            harness_run_id VARCHAR(128) NOT NULL,
+            node_id VARCHAR(128) NOT NULL,
+            item_id VARCHAR(128) NULL,
+            agent_role_id VARCHAR(128) NOT NULL,
+            parent_agent_run_id VARCHAR(128) NULL,
+            child_agent_run_id VARCHAR(128) NOT NULL,
+            status VARCHAR(64) NOT NULL,
+            input_ref VARCHAR(255) NULL,
+            output_ref VARCHAR(255) NULL,
+            failure_reason TEXT NULL,
+            started_at DATETIME(6) NULL,
+            completed_at DATETIME(6) NULL,
+            INDEX idx_harness_subagents_run (harness_run_id, node_id, status),
+            INDEX idx_harness_subagents_child_run (child_agent_run_id)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS harness_blackboard_entries (
+            blackboard_entry_id VARCHAR(128) PRIMARY KEY,
+            harness_run_id VARCHAR(128) NOT NULL,
+            item_id VARCHAR(128) NULL,
+            created_by_node_id VARCHAR(128) NULL,
+            created_by_agent_role_id VARCHAR(128) NULL,
+            entry_kind VARCHAR(64) NOT NULL,
+            payload_json LONGTEXT NOT NULL,
+            citation_ids LONGTEXT NOT NULL,
+            confidence DOUBLE NULL,
+            status VARCHAR(64) NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_harness_blackboard_run_item (harness_run_id, item_id, entry_kind, status),
+            INDEX idx_harness_blackboard_role (created_by_agent_role_id, created_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
     // Context / decisions / evaluation essentials used by turn persistence
     query(
         "CREATE TABLE IF NOT EXISTS ctx_snapshots (
@@ -1489,22 +2056,15 @@ pub async fn ensure_core_schema(
         add_column_if_missing(&pool, &settings.database, "infra_llm_models", column, ddl).await?;
     }
 
-    // Migration: promote legacy quirks.fallback_model (string) → quirks.fallback_chain (array).
-    // Runs once — rows with the old key get it moved; rows already migrated are unaffected.
-    if let Err(e) = query(
-        "UPDATE infra_llm_models
-            SET quirks = JSON_REPLACE(
-                JSON_REMOVE(quirks, '$.fallback_model'),
-                '$.fallback_chain',
-                JSON_ARRAY(JSON_EXTRACT(quirks, '$.fallback_model'))
-            )
-          WHERE JSON_EXTRACT(quirks, '$.fallback_model') IS NOT NULL
-            AND JSON_EXTRACT(quirks, '$.fallback_chain') IS NULL",
-    )
-    .execute(&pool)
-    .await
-    {
-        tracing::warn!("fallback_model→fallback_chain migration skip: {e}");
+    // Migration: promote legacy quirks.fallback_model into quirks.fallback_chain.
+    // Keep this in Rust instead of SQL JSON functions because MatrixOne does not
+    // support the full MySQL JSON mutation surface.
+    let migrated_model_rows = migrate_model_fallback_chain(&pool).await?;
+    if migrated_model_rows > 0 {
+        tracing::info!(
+            rows = migrated_model_rows,
+            "migrated legacy model fallback_chain config"
+        );
     }
 
     // Server-wide admin config KV store. Holds settings that the admin explicitly manages
@@ -2904,6 +3464,14 @@ async fn run_migrations(pool: &sqlx::Pool<MySql>) -> Result<(), sqlx::Error> {
     )
     .await?;
 
+    run_migration(
+        pool,
+        14,
+        "add DB traceability columns and indexes to agent_events",
+        "SELECT 1",
+    )
+    .await?;
+
     Ok(())
 }
 
@@ -3225,4 +3793,58 @@ pub async fn cleanup_expired_data(
     });
 
     results
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn migrate(raw: &str) -> serde_json::Value {
+        let updated = promote_legacy_fallback_model_quirks(raw)
+            .expect("migration should parse")
+            .expect("migration should update");
+        serde_json::from_str(&updated).expect("updated quirks should be valid JSON")
+    }
+
+    #[test]
+    fn fallback_model_migration_creates_fallback_chain() {
+        let value = migrate(r#"{"fallback_model":"model-b","no_system_message":true}"#);
+
+        assert_eq!(value.get("fallback_model"), None);
+        assert_eq!(
+            value.get("fallback_chain"),
+            Some(&serde_json::json!(["model-b"]))
+        );
+        assert_eq!(
+            value.get("no_system_message"),
+            Some(&serde_json::Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn fallback_model_migration_preserves_existing_fallback_chain() {
+        let value = migrate(r#"{"fallback_model":"model-b","fallback_chain":["model-c"]}"#);
+
+        assert_eq!(value.get("fallback_model"), None);
+        assert_eq!(
+            value.get("fallback_chain"),
+            Some(&serde_json::json!(["model-c"]))
+        );
+    }
+
+    #[test]
+    fn fallback_model_migration_ignores_rows_without_legacy_key() {
+        let updated = promote_legacy_fallback_model_quirks(r#"{"fallback_chain":["model-c"]}"#)
+            .expect("migration should parse");
+
+        assert!(updated.is_none());
+    }
+
+    #[test]
+    fn fallback_model_migration_rejects_non_string_legacy_key() {
+        let error = promote_legacy_fallback_model_quirks(r#"{"fallback_model":["model-b"]}"#)
+            .expect_err("non-string legacy fallback_model should fail");
+
+        assert!(error.contains("must be a string"));
+    }
 }

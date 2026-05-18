@@ -155,6 +155,14 @@ pub use astra_services::{
         DatabaseEventService, EventCreateRequestData, EventListFilter, EventListRecord,
         EventRecord, EventService, UnconfiguredEventService,
     },
+    harness::{
+        DatabaseHarnessService, HarnessCitationRecord, HarnessDecisionRequest, HarnessItemRecord,
+        HarnessNodeCatalogRecord, HarnessRunRecord, HarnessService, HarnessSkillDraftRecord,
+        HarnessSkillRuleRecord, HarnessTemplateRecord, SkillifyAgentCitation, SkillifyAgentDraft,
+        SkillifyAgentExecutor, SkillifyAgentOutput, SkillifyAgentRequest, SkillifyAgentRule,
+        SkillifyDraftRecord, SkillifyDraftRequest, SkillifyPublishRecord, SkillifyPublishRequest,
+        SkillifyRunRequest, SkillifySourceFile, SkillifySourcePacket, UnconfiguredHarnessService,
+    },
     jobs::{
         InMemoryJobService, JobRecord, JobService, JobSubmitRequestData, UnconfiguredJobService,
     },
@@ -259,8 +267,8 @@ pub use astra_turn_core::contracts::{
 };
 
 pub use turn::services::{
-    DatabaseTurnAuxiliaryEventWriter, DatabaseTurnCoreEventWriter, DatabaseTurnHookDbWriter,
-    DatabaseTurnSessionActivityWriter, DatabaseTurnToolEventWriter,
+    DatabaseTraceEventWriter, DatabaseTurnAuxiliaryEventWriter, DatabaseTurnCoreEventWriter,
+    DatabaseTurnHookDbWriter, DatabaseTurnSessionActivityWriter, DatabaseTurnToolEventWriter,
 };
 
 pub use astra_turn_core::{
