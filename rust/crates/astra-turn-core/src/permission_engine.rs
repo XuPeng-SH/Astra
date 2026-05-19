@@ -480,7 +480,7 @@ pub fn evaluate_permission(
             .unwrap_or_default();
         if !git_violations.is_empty() {
             let reasons: Vec<String> = git_violations.iter().map(ToString::to_string).collect();
-            let all_soft = git_violations.iter().all(is_soft_violation);
+            let has_hard_violation = git_violations.iter().any(|v| !is_soft_violation(v));
             if ctx.mode() == PermissionMode::Deny {
                 let decision = HardDecision::Deny {
                     reason: "Git safety violation (deny mode)".to_string(),
@@ -501,7 +501,7 @@ pub fn evaluate_permission(
                     risk_tags,
                 );
             }
-            if all_soft && ctx.mode() == PermissionMode::Auto {
+            if ctx.mode() == PermissionMode::Auto && !has_hard_violation {
                 let decision = HardDecision::Allow;
                 push_matched(
                     &mut trace,
@@ -549,6 +549,20 @@ pub fn evaluate_permission(
                 risk_tags,
             );
         }
+        if ctx.mode() == PermissionMode::Auto {
+            let reason = "Targets a sensitive file path and requires manual approval".to_string();
+            let decision = HardDecision::NeedExternal {
+                prompt: approval_prompt(tool_name, args, reason.clone(), risk_tags.clone()),
+            };
+            push_matched(&mut trace, EvaluationStep::SensitivePath, &decision, &path);
+            return envelope(
+                decision,
+                DecisionSource::SensitivePath { path },
+                trace,
+                will_save,
+                risk_tags,
+            );
+        }
         let reason = "Targets a sensitive file path and requires manual approval".to_string();
         let decision = HardDecision::NeedExternal {
             prompt: approval_prompt(tool_name, args, reason.clone(), risk_tags.clone()),
@@ -569,6 +583,24 @@ pub fn evaluate_permission(
     );
 
     if let Some(reason) = execute_hard_deny_reason(tool_name, args) {
+        if ctx.mode() == PermissionMode::Deny {
+            let decision = HardDecision::Deny {
+                reason: "Command hard-denied (deny mode)".to_string(),
+            };
+            push_matched(
+                &mut trace,
+                EvaluationStep::ExecuteHardDeny,
+                &decision,
+                &reason,
+            );
+            return envelope(
+                decision,
+                DecisionSource::ExecuteHardDeny { reason },
+                trace,
+                will_save,
+                risk_tags,
+            );
+        }
         let decision = HardDecision::Deny {
             reason: reason.clone(),
         };
@@ -859,18 +891,20 @@ pub fn evaluate_permission(
                 )
             }
             PermissionMode::Auto => {
-                let decision = if ctx.inherited.is_tool_allowed_by_allowlist(tool_name) {
-                    HardDecision::Allow
-                } else {
+                let decision = if ctx.inherited.allowed_tools.is_some()
+                    && !ctx.inherited.is_tool_allowed_by_allowlist(tool_name)
+                {
                     HardDecision::Deny {
                         reason: format!("Tool '{tool_name}' not in allowed tools list"),
                     }
+                } else {
+                    HardDecision::Allow
                 };
                 push_matched(
                     &mut trace,
                     EvaluationStep::ExplicitApproval,
                     &decision,
-                    "explicit approval relaxed by mode",
+                    "explicit approval auto-allowed by mode",
                 );
                 envelope(
                     decision,
@@ -965,18 +999,19 @@ pub fn evaluate_permission(
 
     let mode = ctx.mode();
     let (decision, mode_label) = match mode {
-        PermissionMode::Auto => {
-            if !ctx.inherited.is_tool_allowed_by_allowlist(tool_name) {
+        PermissionMode::Auto if ctx.inherited.allowed_tools.is_some() => {
+            if ctx.inherited.is_tool_allowed_by_allowlist(tool_name) {
+                (HardDecision::Allow, "agent policy allowlist".to_string())
+            } else {
                 (
                     HardDecision::Deny {
                         reason: format!("Tool '{tool_name}' not in allowed tools list"),
                     },
-                    mode.to_string(),
+                    "agent policy allowlist".to_string(),
                 )
-            } else {
-                (HardDecision::Allow, mode.to_string())
             }
         }
+        PermissionMode::Auto => (HardDecision::Allow, mode.to_string()),
         PermissionMode::Plan => (
             HardDecision::Deny {
                 reason: format!("Tool '{tool_name}' denied by permission mode"),
@@ -1476,7 +1511,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_mode_allowlist_blocks_unlisted_tool_after_read_short_circuit() {
+    fn auto_mode_allowlist_blocks_unlisted_tool() {
         let ctx = crate::permission_types::PermissionSyncContext::new(
             crate::permission_types::InheritedPermissions {
                 mode: crate::permission_types::PermissionMode::Auto,
@@ -1490,6 +1525,15 @@ mod tests {
             "unexpected decision from {:?}: {:?}",
             envelope.source,
             envelope.trace
+        );
+        assert!(
+            matches!(
+                envelope.source,
+                DecisionSource::Mode { ref mode }
+                    if mode == "agent policy allowlist"
+            ) || matches!(envelope.source, DecisionSource::ExplicitApprovalGate { .. }),
+            "unexpected source for auto allowlist denial: {:?}",
+            envelope.source
         );
     }
 
@@ -1701,7 +1745,7 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_sensitive_path_needs_external_even_in_auto_mode() {
+    fn evaluate_sensitive_path_requests_external_approval_in_auto_mode() {
         let ctx = crate::permission_types::PermissionSyncContext::root(
             crate::permission_types::PermissionMode::Auto,
         );
@@ -1717,6 +1761,23 @@ mod tests {
         assert!(matches!(
             envelope.source,
             DecisionSource::SensitivePath { .. }
+        ));
+    }
+
+    #[test]
+    fn evaluate_execute_hard_deny_stays_denied_in_auto_mode() {
+        let ctx = crate::permission_types::PermissionSyncContext::root(
+            crate::permission_types::PermissionMode::Auto,
+        );
+        let envelope = evaluate_permission(
+            "bash",
+            &serde_json::json!({"command": "shred /dev/sda"}),
+            &ctx,
+        );
+        assert!(matches!(envelope.decision, HardDecision::Deny { .. }));
+        assert!(matches!(
+            envelope.source,
+            DecisionSource::ExecuteHardDeny { .. }
         ));
     }
 

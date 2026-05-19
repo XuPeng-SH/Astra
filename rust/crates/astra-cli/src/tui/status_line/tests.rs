@@ -38,8 +38,8 @@ fn turn_active_replaces_hints_with_interrupt_prompt() {
     };
     let plain = StatusLine::from_context(&c).plain();
     assert!(
-        plain.contains("interrupt"),
-        "active turn should mention Ctrl+C interrupt; got {plain:?}"
+        !plain.contains("Ctrl+C interrupt"),
+        "active turn should NOT show Ctrl+C interrupt; got {plain:?}"
     );
     assert!(
         !plain.contains("Ctrl+O transcript"),
@@ -48,7 +48,7 @@ fn turn_active_replaces_hints_with_interrupt_prompt() {
 }
 
 #[test]
-fn active_turn_without_objective_renders_interrupt_once() {
+fn active_turn_without_objective_renders_no_interrupt() {
     let c = StatusContext {
         turn_active: true,
         ..ctx()
@@ -56,8 +56,8 @@ fn active_turn_without_objective_renders_interrupt_once() {
     let plain = StatusLine::from_context(&c).plain();
     assert_eq!(
         plain.matches("Ctrl+C interrupt").count(),
-        1,
-        "fallback interrupt hint must not render twice; got {plain:?}"
+        0,
+        "interrupt hint must not render in status line; got {plain:?}"
     );
 }
 
@@ -79,8 +79,8 @@ fn active_turn_surfaces_objective_and_elapsed() {
         "elapsed time should render; got {plain:?}"
     );
     assert!(
-        plain.contains("Ctrl+C interrupt"),
-        "interrupt hint should remain visible; got {plain:?}"
+        !plain.contains("Ctrl+C interrupt"),
+        "interrupt hint should NOT appear in status line; got {plain:?}"
     );
 }
 

@@ -11,14 +11,7 @@ use crate::chat_stream::ApprovalResponse;
 fn primary_row_has_simple_ux_buttons_in_expected_order() {
     let row = ButtonRow::primary();
     let labels: Vec<&str> = row.buttons().iter().map(|b| b.label).collect();
-    assert_eq!(
-        labels,
-        vec![
-            "Allow once",
-            "Always allow this command pattern in workspace",
-            "Reject"
-        ]
-    );
+    assert_eq!(labels, vec!["Allow once", "Always allow", "Reject"]);
 }
 
 #[test]
@@ -45,10 +38,7 @@ fn right_arrow_advances_focus() {
     let mut row = ButtonRow::primary();
     row.move_right();
     assert_eq!(row.focus(), 1);
-    assert_eq!(
-        row.focused().unwrap().label,
-        "Always allow this command pattern in workspace"
-    );
+    assert_eq!(row.focused().unwrap().label, "Always allow");
 }
 
 #[test]
