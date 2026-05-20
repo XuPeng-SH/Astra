@@ -15,6 +15,14 @@ use std::time::Instant;
 use astra_turn_core::context_sources::MemoryEntry as ContextMemoryEntry;
 use astra_turn_types::RankableMemory;
 
+// Keep these prompt-facing labels centralized so future wording changes stay
+// synchronized between rendering and tests. The learnings label intentionally
+// includes the source session id; the cross-session label stays generic to keep
+// repeated prompt decorations short.
+const LEARNINGS_SOURCE_LABEL_PREFIX: &str = "[learnings from session ";
+const LEARNINGS_SOURCE_LABEL_SUFFIX: &str = "]";
+const CROSS_SESSION_SOURCE_LABEL: &str = "[cross-session memory]";
+
 /// Result of a memory prefetch operation.
 #[derive(Debug, Default)]
 pub struct MemoryPrefetchResult {
@@ -85,7 +93,23 @@ pub async fn prefetch_memories(
     // will be filtered downstream by `is_memory_worthy`.
     let merged: Vec<String> = merged_records
         .iter()
-        .map(|m| compact_view_of(&m.content))
+        .map(|m| {
+            let compact = compact_view_of(&m.content);
+            match source_label(&m.memory_type, m.session_id.as_deref()) {
+                Some(label) => {
+                    tracing::debug!(
+                        target: "astra::memory::prefetch",
+                        memory_id = %m.memory_id,
+                        memory_type = %m.memory_type,
+                        session_id = m.session_id.as_deref().unwrap_or(""),
+                        source_label = %label,
+                        "prefetch_memories: applied source label"
+                    );
+                    format!("{label} {compact}")
+                }
+                None => compact,
+            }
+        })
         .collect();
     let fetch_ms = started.elapsed().as_millis() as i64;
     let preview = merged.iter().take(3).map(|l| l.to_string()).collect();
@@ -832,6 +856,21 @@ fn parse_rankable(value: serde_json::Value) -> Option<RankableMemory> {
         updated_at,
         session_id,
     })
+}
+
+/// Returns a human-readable source label for a prefetched memory entry.
+/// `"procedural"` memories originated from the agent's own learnings;
+/// all other typed memories are cross-session knowledge.
+/// Returns `None` when there is no session_id to attribute.
+pub(crate) fn source_label(memory_type: &str, session_id: Option<&str>) -> Option<String> {
+    let sid = session_id.filter(|s| !s.is_empty())?;
+    match memory_type {
+        "procedural" => Some(format!(
+            "{LEARNINGS_SOURCE_LABEL_PREFIX}{sid}{LEARNINGS_SOURCE_LABEL_SUFFIX}"
+        )),
+        t if !t.is_empty() => Some(CROSS_SESSION_SOURCE_LABEL.to_string()),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -1821,5 +1860,34 @@ mod tests {
             elapsed < std::time::Duration::from_secs(30),
             "should time out well before 30s, took {elapsed:?}"
         );
+    }
+
+    // ── Task 4: prefetch source labels ───────────────────────────────────
+
+    #[test]
+    fn source_label_procedural_with_session_id_is_learnings() {
+        let label = source_label("procedural", Some("abc123"));
+        assert_eq!(label, Some("[learnings from session abc123]".to_string()));
+    }
+
+    #[test]
+    fn source_label_semantic_with_session_id_is_cross_session() {
+        let label = source_label("semantic", Some("abc"));
+        assert_eq!(label, Some("[cross-session memory]".to_string()));
+    }
+
+    #[test]
+    fn source_label_no_session_id_returns_none() {
+        assert!(source_label("semantic", None).is_none());
+    }
+
+    #[test]
+    fn source_label_empty_memory_type_returns_none() {
+        assert!(source_label("", None).is_none());
+    }
+
+    #[test]
+    fn source_label_empty_session_id_returns_none() {
+        assert!(source_label("procedural", Some("")).is_none());
     }
 }

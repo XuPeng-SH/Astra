@@ -105,6 +105,15 @@ pub const SESSION_MEMORY_TEMPLATE: &str = "\
 ## Session Title
 <!-- One-line description of the session goal -->
 
+## Active Goals
+<!-- Current goals explicitly stated by the user or assistant. Do NOT invent goals. -->
+
+## Pending Todos
+<!-- Tasks planned but NOT yet completed. Must not overlap with Completed. -->
+
+## Completed
+<!-- Tasks that have been finished this session. Cross-check: remove from Pending Todos. -->
+
 ## Current State
 <!-- What is happening right now -->
 
@@ -140,7 +149,10 @@ pub fn build_extraction_prompt(current_memory: &str, recent_messages: &[Value]) 
          - Only update content below each section's comment line.\n\
          - Keep each section under 200 words.\n\
          - Be factual and concise.\n\
-         - Output the complete updated document.";
+         - Output the complete updated document.\n\
+         - Active Goals: only record goals explicitly stated by the user or assistant. Do NOT invent or infer goals.\n\
+         - Pending Todos: list tasks planned but NOT yet completed.\n\
+         - Completed: list tasks finished this session. Cross-check: if an item appears in Completed it MUST NOT appear in Pending Todos.";
     let user = format!(
         "## Current session memory:\n\n{current_memory}\n\n\
          ## Recent conversation:\n\n{recent_text}\n\n\
@@ -624,5 +636,48 @@ mod tests {
         assert!(should_extract(&state, 12_000, 0, &config));
         assert!(should_extract(&state, 12_000, 0, &config));
         assert!(should_extract(&state, 18_000, 5, &config));
+    }
+
+    // ── Phase 3: goal/todo/completed tracking ────────────────────────────
+
+    #[test]
+    fn session_memory_template_has_goals_todos_completed_sections() {
+        assert!(
+            SESSION_MEMORY_TEMPLATE.contains("## Active Goals"),
+            "template missing ## Active Goals"
+        );
+        assert!(
+            SESSION_MEMORY_TEMPLATE.contains("## Pending Todos"),
+            "template missing ## Pending Todos"
+        );
+        assert!(
+            SESSION_MEMORY_TEMPLATE.contains("## Completed"),
+            "template missing ## Completed"
+        );
+    }
+
+    #[test]
+    fn build_extraction_prompt_instructs_no_completed_in_todos() {
+        let msgs = vec![json!({"role": "user", "content": "fix auth"})];
+        let result = build_extraction_prompt("", &msgs);
+        let system = result[0]["content"].as_str().unwrap();
+        assert!(
+            system.contains("Completed")
+                && (system.contains("Pending Todos") || system.contains("todo")),
+            "system prompt must cross-reference Completed vs Pending Todos, got: {system}"
+        );
+    }
+
+    #[test]
+    fn build_extraction_prompt_instructs_no_hallucinated_goals() {
+        let msgs = vec![json!({"role": "user", "content": "hi"})];
+        let result = build_extraction_prompt("", &msgs);
+        let system = result[0]["content"].as_str().unwrap();
+        assert!(
+            system.to_lowercase().contains("only")
+                || system.to_lowercase().contains("explicit")
+                || system.to_lowercase().contains("do not invent"),
+            "system prompt must warn against inventing goals, got: {system}"
+        );
     }
 }
