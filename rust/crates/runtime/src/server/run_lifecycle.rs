@@ -3349,11 +3349,9 @@ impl AgenticRunLifecycleService {
         });
 
         let task_profile = infer_task_execution_profile(&request.message);
-        let runtime_turn_ceiling = if is_plan_subtask_from_chat_context(&request.context) {
-            astra_core::RuntimeLimits::global().effective_plan_subtask_turns()
-        } else {
-            astra_core::RuntimeLimits::global().max_turns
-        };
+        let runtime_turn_ceiling = astra_config::runtime_config::RuntimeConfig::cached()
+            .runtime_limits
+            .resolve_turn_ceiling(is_plan_subtask_from_chat_context(&request.context));
         let requested_budget = request.execution_budget.as_ref().map(|budget| {
             astra_turn_core::chat_turn_heuristics::AgenticTurnBudgetOverride {
                 initial_turns: budget.initial_turns.map(|value| value as usize),
@@ -3459,6 +3457,7 @@ impl AgenticRunLifecycleService {
             has_any_usage: false,
             max_turns,
             remaining_turns: max_turns,
+            turn_budget_hint_emitted_90: false,
             turn_budget_hint_emitted_50: false,
             turn_budget_hint_emitted_20: false,
             agentic_turn_budget,
@@ -5707,6 +5706,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             has_any_usage: false,
             max_turns: 10,
             remaining_turns: 10,
+            turn_budget_hint_emitted_90: false,
             turn_budget_hint_emitted_50: false,
             turn_budget_hint_emitted_20: false,
             agentic_turn_budget:

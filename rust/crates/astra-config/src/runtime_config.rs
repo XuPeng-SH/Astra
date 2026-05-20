@@ -81,6 +81,61 @@ pub struct RuntimeConfig {
     /// system-reminder listing. See [`ToolSurfaceConfig`].
     #[serde(default)]
     pub tool_surface: ToolSurfaceConfig,
+
+    /// Per-turn agentic-loop budget (max tool calls per user message).
+    ///
+    /// Mirrors the env-driven [`astra_core::RuntimeLimits`] knobs but
+    /// lives in `runtime.toml` so operators can edit them via the
+    /// `/config` panel without exporting environment variables.
+    /// `RuntimeLimits` env values still apply when this section is left
+    /// at defaults (the CLI prefers config values > 0 over env).
+    #[serde(default)]
+    pub runtime_limits: RuntimeLimitsConfig,
+}
+
+// ─── Runtime Limits Configuration ────────────────────────────────────────────
+
+/// Per-turn agentic-loop budget knobs editable via `/config`.
+///
+/// Defaults of 0 mean "fall through to [`astra_core::RuntimeLimits`]"
+/// (which itself defaults to 150/0). Setting a positive value here
+/// overrides the env-driven default for the CLI without requiring a
+/// process restart with new `ASTRA_*` exports.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct RuntimeLimitsConfig {
+    /// Max tool calls per user message (regular chat turn).
+    /// 0 = inherit from `RuntimeLimits::max_turns` (env / built-in 150).
+    #[serde(default)]
+    pub max_turns: u32,
+
+    /// Max tool calls per plan subtask. 0 = fall back to `max_turns`.
+    #[serde(default)]
+    pub plan_subtask_max_turns: u32,
+}
+
+impl RuntimeLimitsConfig {
+    /// Resolve the effective per-turn tool-call ceiling.
+    ///
+    /// Config values > 0 override the env-driven [`astra_core::RuntimeLimits`]
+    /// singleton. A plan subtask first consults `plan_subtask_max_turns`,
+    /// then falls back to `max_turns`, then finally to the env/built-in
+    /// `effective_plan_subtask_turns()` behavior.
+    pub fn resolve_turn_ceiling(&self, is_plan_subtask: bool) -> usize {
+        let env_limits = astra_core::RuntimeLimits::global();
+        if is_plan_subtask {
+            if self.plan_subtask_max_turns > 0 {
+                self.plan_subtask_max_turns as usize
+            } else if self.max_turns > 0 {
+                self.max_turns as usize
+            } else {
+                env_limits.effective_plan_subtask_turns()
+            }
+        } else if self.max_turns > 0 {
+            self.max_turns as usize
+        } else {
+            env_limits.max_turns
+        }
+    }
 }
 
 // ─── Fork-Prefix Configuration ───────────────────────────────────────────────
@@ -240,6 +295,7 @@ impl Default for RuntimeConfig {
             safety: SafetyConfig::default(),
             fork_prefix: ForkPrefixConfig::default(),
             tool_surface: ToolSurfaceConfig::default(),
+            runtime_limits: RuntimeLimitsConfig::default(),
         }
     }
 }
@@ -1505,6 +1561,7 @@ impl RuntimeConfig {
             safety,
             fork_prefix,
             tool_surface,
+            runtime_limits,
         } = other;
 
         merge_if_non_default(&mut self.version, version, default_config_version());
@@ -1977,6 +2034,17 @@ impl RuntimeConfig {
             self.tool_surface = tool_surface;
         }
 
+        let RuntimeLimitsConfig {
+            max_turns,
+            plan_subtask_max_turns,
+        } = runtime_limits;
+        merge_if_non_default(&mut self.runtime_limits.max_turns, max_turns, 0);
+        merge_if_non_default(
+            &mut self.runtime_limits.plan_subtask_max_turns,
+            plan_subtask_max_turns,
+            0,
+        );
+
         self
     }
 
@@ -2268,6 +2336,10 @@ mod tests {
             safety: SafetyConfig::default(),
             fork_prefix: ForkPrefixConfig::default(),
             tool_surface: ToolSurfaceConfig::default(),
+            runtime_limits: RuntimeLimitsConfig {
+                max_turns: 250,
+                plan_subtask_max_turns: 175,
+            },
         });
 
         assert_eq!(merged.version, "2.0");
@@ -2337,6 +2409,53 @@ mod tests {
         let cfg = ToolSelectionConfig::default();
         assert_eq!(cfg.effective_round_budget_warning(), 200);
         assert_eq!(cfg.effective_round_budget_limit(), 200);
+    }
+
+    #[test]
+    fn runtime_turn_ceiling_config_overrides_env() {
+        let cfg = RuntimeLimitsConfig {
+            max_turns: 8,
+            plan_subtask_max_turns: 0,
+        };
+        assert_eq!(cfg.resolve_turn_ceiling(false), 8);
+    }
+
+    #[test]
+    fn runtime_turn_ceiling_falls_back_to_env_when_zero() {
+        let env_max = astra_core::RuntimeLimits::global().max_turns;
+        let cfg = RuntimeLimitsConfig {
+            max_turns: 0,
+            plan_subtask_max_turns: 0,
+        };
+        assert_eq!(cfg.resolve_turn_ceiling(false), env_max);
+    }
+
+    #[test]
+    fn runtime_turn_ceiling_plan_subtask_config_wins() {
+        let cfg = RuntimeLimitsConfig {
+            max_turns: 100,
+            plan_subtask_max_turns: 20,
+        };
+        assert_eq!(cfg.resolve_turn_ceiling(true), 20);
+    }
+
+    #[test]
+    fn runtime_turn_ceiling_plan_subtask_falls_back_to_config_max() {
+        let cfg = RuntimeLimitsConfig {
+            max_turns: 30,
+            plan_subtask_max_turns: 0,
+        };
+        assert_eq!(cfg.resolve_turn_ceiling(true), 30);
+    }
+
+    #[test]
+    fn runtime_turn_ceiling_plan_subtask_falls_back_to_env() {
+        let env_effective = astra_core::RuntimeLimits::global().effective_plan_subtask_turns();
+        let cfg = RuntimeLimitsConfig {
+            max_turns: 0,
+            plan_subtask_max_turns: 0,
+        };
+        assert_eq!(cfg.resolve_turn_ceiling(true), env_effective);
     }
 
     #[test]

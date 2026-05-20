@@ -115,6 +115,36 @@ fn looks_like_quick_answer_query(message: &str) -> bool {
     has_question_mark || has_english_interrogative || has_chinese_interrogative
 }
 
+fn looks_like_low_info_continuation(message: &str) -> bool {
+    use astra_turn_core::chat_turn_heuristics::{
+        starts_with_chinese_continuation_prefix, trim_trailing_punctuation,
+    };
+    let trimmed = trim_trailing_punctuation(message);
+    if trimmed.is_empty() || trimmed.chars().count() > 32 {
+        return false;
+    }
+
+    let lower = trimmed.to_lowercase();
+    if [
+        "continue",
+        "go on",
+        "go ahead",
+        "resume",
+        "next",
+        "what else",
+        "anything else",
+        "what next",
+        "next step",
+    ]
+    .iter()
+    .any(|phrase| lower == *phrase || lower.starts_with(&format!("{phrase} ")))
+    {
+        return true;
+    }
+
+    starts_with_chinese_continuation_prefix(trimmed)
+}
+
 fn looks_like_debug_query(message: &str) -> bool {
     let lower = message.to_lowercase();
     [
@@ -136,6 +166,7 @@ fn fallback_scenario_from_routing(
     if !task_profile.mutates_workspace
         && !looks_like_code_review_query(message)
         && !looks_like_debug_query(message)
+        && !looks_like_low_info_continuation(message)
         && looks_like_quick_answer_query(message)
     {
         return Some(astra_config::user_profile::Scenario::QuickAnswer);
@@ -1094,7 +1125,7 @@ fn write_session_journal_event(
 
 #[cfg(test)]
 mod tests {
-    use super::fallback_scenario_from_routing;
+    use super::{fallback_scenario_from_routing, looks_like_low_info_continuation};
     use crate::pipeline::routing::TaskType;
     use astra_config::user_profile::Scenario;
     use astra_turn_core::chat_turn_heuristics::infer_task_execution_profile;
@@ -1167,6 +1198,24 @@ mod tests {
             fallback_scenario_from_routing(q, task_profile, TaskType::Code),
             Some(Scenario::QuickAnswer)
         );
+    }
+
+    #[test]
+    fn generic_followup_question_does_not_route_to_quick_answer() {
+        let q = "还有什么？";
+        let task_profile = infer_task_execution_profile(q);
+        let res = fallback_scenario_from_routing(q, task_profile, TaskType::Code);
+        assert_ne!(res, Some(Scenario::QuickAnswer));
+    }
+
+    #[test]
+    fn continuation_query_detector_handles_expanded_short_phrases() {
+        assert!(looks_like_low_info_continuation("go on"));
+        assert!(looks_like_low_info_continuation("接着"));
+        assert!(looks_like_low_info_continuation("补一下"));
+        assert!(!looks_like_low_info_continuation(
+            "go on and explain the whole runtime pipeline in detail"
+        ));
     }
 
     #[test]

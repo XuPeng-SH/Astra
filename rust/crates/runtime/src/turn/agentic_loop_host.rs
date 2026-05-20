@@ -844,6 +844,7 @@ pub struct AgenticLoopState {
     /// lands so the newly-extended budget gets the hint sequence
     /// at the new threshold crossings. See
     /// `maybe_emit_turn_budget_self_pacing_hint`.
+    pub turn_budget_hint_emitted_90: bool,
     pub turn_budget_hint_emitted_50: bool,
     pub turn_budget_hint_emitted_20: bool,
     pub agentic_turn_budget: astra_turn_core::chat_turn_heuristics::AgenticTurnBudget,
@@ -1796,6 +1797,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         has_any_usage: false,
         max_turns: 10,
         remaining_turns: 10,
+        turn_budget_hint_emitted_90: false,
         turn_budget_hint_emitted_50: false,
         turn_budget_hint_emitted_20: false,
         agentic_turn_budget: TaskExecutionProfile::default().agentic_turn_budget,
@@ -2151,6 +2153,7 @@ pub(crate) mod tests {
             has_any_usage: false,
             max_turns: 10,
             remaining_turns: 10,
+            turn_budget_hint_emitted_90: false,
             turn_budget_hint_emitted_50: false,
             turn_budget_hint_emitted_20: false,
             agentic_turn_budget: TaskExecutionProfile::default().agentic_turn_budget,

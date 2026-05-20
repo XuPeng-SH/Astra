@@ -1,6 +1,5 @@
 use super::*;
 use crate::chat_turn::is_auth_error;
-use crate::cli_utils::{fetch_session_trace_state, update_session_trace_state};
 use crate::permission_manager::PermissionMode;
 use astra_thin_client::paths;
 use clap::CommandFactory;
@@ -2667,56 +2666,6 @@ pub(super) async fn execute_cli_command(
                 args.artifact_kind,
                 session_id,
                 output_path.display()
-            );
-            Ok(ExitCode::Success)
-        }
-
-        Some(Command::Session(SessionCmd::Trace(SessionTraceCmd::Status(args)))) => {
-            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
-            let session_id =
-                resolve_remote_session_id(api, profile.as_deref(), args.session_id.as_deref())
-                    .await?;
-            let trace_state = fetch_session_trace_state(api, Some(&token), &session_id).await?;
-            print_json_or_raw(
-                &serde_json::json!({
-                    "session_id": trace_state.session_id,
-                    "full_llm_capture": trace_state.enabled,
-                })
-                .to_string(),
-            );
-            Ok(ExitCode::Success)
-        }
-
-        Some(Command::Session(SessionCmd::Trace(SessionTraceCmd::On(args)))) => {
-            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
-            let session_id =
-                resolve_remote_session_id(api, profile.as_deref(), args.session_id.as_deref())
-                    .await?;
-            let trace_state =
-                update_session_trace_state(api, Some(&token), &session_id, true).await?;
-            print_json_or_raw(
-                &serde_json::json!({
-                    "session_id": trace_state.session_id,
-                    "full_llm_capture": trace_state.enabled,
-                })
-                .to_string(),
-            );
-            Ok(ExitCode::Success)
-        }
-
-        Some(Command::Session(SessionCmd::Trace(SessionTraceCmd::Off(args)))) => {
-            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
-            let session_id =
-                resolve_remote_session_id(api, profile.as_deref(), args.session_id.as_deref())
-                    .await?;
-            let trace_state =
-                update_session_trace_state(api, Some(&token), &session_id, false).await?;
-            print_json_or_raw(
-                &serde_json::json!({
-                    "session_id": trace_state.session_id,
-                    "full_llm_capture": trace_state.enabled,
-                })
-                .to_string(),
             );
             Ok(ExitCode::Success)
         }

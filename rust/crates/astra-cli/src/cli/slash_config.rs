@@ -235,8 +235,7 @@ fn show_config() {
     );
     println!(
         "{}",
-        "    Global default for full request/response capture; /session trace still overrides per session."
-            .dim()
+        "    Global default for full request/response capture.".dim()
     );
     println!(
         "  capture_explanations: {}",

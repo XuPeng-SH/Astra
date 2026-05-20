@@ -285,6 +285,7 @@ mod tests {
             has_any_usage: false,
             max_turns: 3,
             remaining_turns: 3,
+            turn_budget_hint_emitted_90: false,
             turn_budget_hint_emitted_50: false,
             turn_budget_hint_emitted_20: false,
             agentic_turn_budget: TaskExecutionProfile::default().agentic_turn_budget,

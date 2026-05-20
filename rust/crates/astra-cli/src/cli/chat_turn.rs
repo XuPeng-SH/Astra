@@ -3,6 +3,7 @@ use std::time::Instant;
 use astra_services::session_workspace::ContextTraceSignal;
 #[cfg(test)]
 use astra_services::session_workspace::{ContextTraceBudgetSignal, ContextTraceToolSelection};
+use astra_text_utils::str_preview::truncate_str;
 use astra_tools::task_mgmt::SessionTask;
 
 use super::*;
@@ -521,11 +522,17 @@ pub(super) fn build_effective_line(
         .as_deref()
         .filter(|_| is_low_information_followup(line))
     {
+        let task_board_reanchor = if anchor.contains("Active task board:") {
+            "If the active thread already has a task board, reconcile it before proceeding: create any missing tasks implied by the approved plan, set the current task to in_progress before doing the work, and update statuses as tasks complete.\n"
+        } else {
+            ""
+        };
         effective_line = format!(
             "[Active task attachment]\n\
 Resume the active task/thread below unless the user explicitly changes topic.\n\
 Treat brief follow-ups as actions on this active thread, not as brand-new unrelated tasks.\n\
 If the follow-up asks to fix / patch / test / continue, apply that action to this active thread.\n\
+{task_board_reanchor}\
 {anchor}\n\n[User follow-up]\n{effective_line}"
         );
     }
@@ -534,13 +541,17 @@ If the follow-up asks to fix / patch / test / continue, apply that action to thi
 }
 
 pub(super) fn is_short_continuation_prompt(line: &str) -> bool {
-    let trimmed = line.trim();
+    use astra_turn_core::chat_turn_heuristics::{
+        starts_with_chinese_continuation_prefix, trim_trailing_punctuation,
+    };
+    let trimmed = trim_trailing_punctuation(line);
     if trimmed.is_empty() || trimmed.chars().count() > 16 {
         return false;
     }
 
-    matches!(
-        trimmed.to_ascii_lowercase().as_str(),
+    let lower = trimmed.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
         "continue"
             | "continue."
             | "continue!"
@@ -560,22 +571,18 @@ pub(super) fn is_short_continuation_prompt(line: &str) -> bool {
             | "proceed"
             | "next"
             | "keep going"
-    ) || matches!(
+    ) {
+        return true;
+    }
+
+    if matches!(
         trimmed,
         "继续" | "继续。" | "继续！" | "好的" | "好" | "可以" | "是的" | "对" | "行" | "嗯"
-    )
-}
-
-fn truncate_chars(text: &str, max_chars: usize) -> String {
-    let mut out = String::new();
-    for (idx, ch) in text.chars().enumerate() {
-        if idx >= max_chars {
-            out.push('…');
-            break;
-        }
-        out.push(ch);
+    ) {
+        return true;
     }
-    out
+
+    starts_with_chinese_continuation_prefix(trimmed)
 }
 
 fn contains_any_token(haystack: &str, tokens: &[&str]) -> bool {
@@ -809,7 +816,7 @@ fn summarize_assistant_for_anchor(full_text: &str) -> Option<String> {
         if lines.len() >= 3 || total_chars >= 420 {
             break;
         }
-        let clipped = truncate_chars(line, 160);
+        let clipped = truncate_str(line, 160);
         total_chars += clipped.chars().count();
         lines.push(clipped);
     }
@@ -845,7 +852,7 @@ fn summarize_anchor_artifacts(result: &StreamResult) -> Vec<String> {
             lines.push(format!(
                 "Artifact: {} → {}",
                 call.name,
-                truncate_chars(preview.trim(), 120)
+                truncate_str(preview.trim(), 120)
             ));
         }
     }
@@ -883,7 +890,7 @@ fn summarize_event_anchor_artifacts(event: Option<&session_journal::JournalEvent
                 lines.push(format!(
                     "Artifact: {} → {}",
                     call.name,
-                    truncate_chars(preview.trim(), 120)
+                    truncate_str(preview.trim(), 120)
                 ));
             }
         }
@@ -916,7 +923,7 @@ fn active_task_anchor_section(active_tasks: &[SessionTask]) -> Option<String> {
             "- [{}] {}: {}{}",
             task.status,
             task.id,
-            truncate_chars(&task.title, 120),
+            truncate_str(&task.title, 120),
             blocked
         ));
     }
@@ -951,7 +958,7 @@ fn build_continuation_anchor_with_active_tasks(
         return state.continuation_anchor.clone();
     }
 
-    let user_summary = truncate_chars(user_line, 220);
+    let user_summary = truncate_str(user_line, 220);
     let mut sections = vec![format!("Latest user task: {user_summary}")];
     if let Some(task_section) = active_task_anchor_section(active_tasks) {
         sections.push(task_section);
@@ -996,7 +1003,7 @@ fn rebuild_continuation_anchor_from_state_with_active_tasks(
         return;
     }
 
-    let user_summary = truncate_chars(user_line, 220);
+    let user_summary = truncate_str(user_line, 220);
     let mut sections = vec![format!("Latest user task: {user_summary}")];
     if let Some(task_section) = active_task_anchor_section(active_tasks) {
         sections.push(task_section);
@@ -4154,10 +4161,19 @@ mod tests {
     }
 
     #[test]
+    fn short_continuation_prompt_detects_colloquial_followups() {
+        assert!(is_short_continuation_prompt("继续啊"));
+        assert!(is_short_continuation_prompt("继续完成所有的啊"));
+        assert!(is_short_continuation_prompt("接着啊"));
+        assert!(is_short_continuation_prompt("还有什么？"));
+    }
+
+    #[test]
     fn low_information_followup_detects_repair_prompts() {
         assert!(is_low_information_followup("修复?"));
         assert!(is_low_information_followup("fix this"));
         assert!(is_low_information_followup("test it"));
+        assert!(is_low_information_followup("还有什么？"));
         assert!(!is_low_information_followup("修一下输入法问题"));
         assert!(!is_low_information_followup(
             "implement request batching in runtime selector"
@@ -4180,6 +4196,24 @@ mod tests {
         assert!(effective.contains("review commit aa1f419b"));
         assert!(effective.contains("fix / patch / test / continue"));
         assert!(effective.contains("[User follow-up]\n修复?"));
+    }
+
+    #[test]
+    fn build_effective_line_reanchors_generic_followup_to_task_board() {
+        let state = SessionState {
+            continuation_anchor: Some(
+                "Latest user task: improve session memory flow\nActive task board:\n- [in_progress] task-1: Phase 1: /memory show — TDD"
+                    .to_string(),
+            ),
+            ..SessionState::default()
+        };
+
+        let effective =
+            build_effective_line("还有什么？", &state, &mut crate::ui_adapter::LineUiAdapter);
+        assert!(effective.contains("[Active task attachment]"));
+        assert!(effective.contains("reconcile it before proceeding"));
+        assert!(effective.contains("Active task board:"));
+        assert!(effective.contains("[User follow-up]\n还有什么？"));
     }
 
     #[test]

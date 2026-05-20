@@ -2,7 +2,8 @@
 //!
 //! Routes:
 //! - `POST /plans` — create a plan (server-side decomposition)
-//! - `GET /plans` — list plans (optional `?session_id=…` and `?phase=…` filters)
+//! - `GET /plans` — list plans (optional `?session_id=…`, `?phase=…`, and
+//!   `?active_session_only=true` filters)
 //! - `GET /plans/{plan_id}` — get plan details
 //! - `PUT /plans/{plan_id}` — edit a plan
 //! - `POST /plans/{plan_id}/execute` — start plan execution
@@ -195,6 +196,8 @@ pub(super) struct ListPlansQuery {
     pub phase: Option<String>,
     #[serde(default)]
     pub limit: Option<i32>,
+    #[serde(default)]
+    pub active_session_only: bool,
 }
 
 #[derive(Deserialize, Default)]
@@ -283,6 +286,8 @@ pub(super) struct PlanStatusResponse {
 #[derive(Serialize)]
 pub(super) struct PlanListResponse {
     pub plans: Vec<PlanSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -355,6 +360,16 @@ fn check_version(
         }
     }
     Ok(())
+}
+
+fn plan_summary_from_state(plan_id: String, plan_state: &PlanModeState) -> PlanSummary {
+    PlanSummary {
+        plan_id,
+        goal: plan_state.goal.clone(),
+        progress_pct: plan_state.plan.progress_pct(),
+        subtask_count: plan_state.plan.subtasks.len(),
+        status: infer_phase_name(plan_state).to_string(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -560,19 +575,71 @@ pub(super) async fn list_plans_handler(
     axum::extract::Query(q): axum::extract::Query<ListPlansQuery>,
 ) -> Result<Json<PlanListResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
+    if q.active_session_only && q.session_id.is_none() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "active_session_only requires session_id",
+        ));
+    }
+
+    if q.active_session_only {
+        let session_id = q
+            .session_id
+            .as_deref()
+            .expect("checked above: active_session_only requires session_id");
+        let Some(active_plan_id) = state
+            .plan_repo
+            .active_plan_for_session(session_id)
+            .await
+            .map_err(map_plan_load_err)?
+        else {
+            return Ok(Json(PlanListResponse {
+                plans: Vec::new(),
+                warning: None,
+            }));
+        };
+        let plan_state = match state
+            .plan_repo
+            .load_owned(&active_plan_id, &user.user_id)
+            .await
+        {
+            Ok(state) => state,
+            Err(PlanLoadError::NotFound(_)) => {
+                return Ok(Json(PlanListResponse {
+                    plans: Vec::new(),
+                    warning: None,
+                }));
+            }
+            Err(err) => return Err(map_plan_load_err(err)),
+        };
+        let summary = plan_summary_from_state(active_plan_id, &plan_state);
+        if let Some(phase) = q.phase.as_deref()
+            && summary.status != phase
+        {
+            return Ok(Json(PlanListResponse {
+                plans: Vec::new(),
+                warning: Some(format!(
+                    "active plan is in \"{}\" phase, not \"{phase}\"",
+                    summary.status,
+                )),
+            }));
+        }
+        return Ok(Json(PlanListResponse {
+            plans: vec![summary],
+            warning: None,
+        }));
+    }
 
     let filter = PlanListFilter {
         session_id: q.session_id.as_deref(),
         phase: q.phase.as_deref(),
         limit: q.limit,
     };
-    let saved = state
+    let plans = state
         .plan_repo
         .list_for_user(&user.user_id, filter)
         .await
-        .map_err(map_plan_load_err)?;
-
-    let plans = saved
+        .map_err(map_plan_load_err)?
         .into_iter()
         .map(|p| PlanSummary {
             plan_id: p.name,
@@ -583,7 +650,10 @@ pub(super) async fn list_plans_handler(
         })
         .collect();
 
-    Ok(Json(PlanListResponse { plans }))
+    Ok(Json(PlanListResponse {
+        plans,
+        warning: None,
+    }))
 }
 
 /// `GET /plans/{plan_id}` — get plan details.
@@ -783,8 +853,8 @@ pub(super) async fn execute_plan_handler(
 }
 
 /// `POST /plans/{plan_id}/exit-plan-mode` — web-agent counterpart of the
-/// `ExitPlanMode` tool. Approving flips the phase hint to `refining` so the
-/// next turn's tool-gate re-enables writes; rejecting keeps planning active.
+/// `ExitPlanMode` tool. Approving clears the active-plan pin so the next turn's
+/// tool-gate re-enables writes; rejecting keeps planning active.
 pub(super) async fn exit_plan_mode_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -858,7 +928,11 @@ pub(super) async fn exit_plan_mode_handler(
         ),
     );
 
-    let phase_name = if req.approved { "refining" } else { "planning" };
+    let phase_name = if req.approved {
+        infer_phase_name(&plan_state)
+    } else {
+        "planning"
+    };
     let capabilities = capabilities_for_phase_name(phase_name);
 
     Ok(Json(PlanResponse {
@@ -1501,6 +1575,28 @@ mod tests {
         assert_eq!(infer_phase_name(&state), "completed");
     }
 
+    #[test]
+    fn plan_summary_from_state_uses_inferred_phase() {
+        let mut state = PlanModeState::new("active".into());
+        state.plan = task_plan(vec![subtask("s1", "Step 1", TaskStatus::Pending)]);
+
+        let summary = plan_summary_from_state("plan-active".into(), &state);
+        assert_eq!(summary.plan_id, "plan-active");
+        assert_eq!(summary.goal, "active");
+        assert_eq!(summary.subtask_count, 1);
+        assert_eq!(summary.status, "refining");
+    }
+
+    #[test]
+    fn plan_summary_from_state_tracks_completion_progress() {
+        let mut state = PlanModeState::new("done".into());
+        state.plan = task_plan(vec![subtask("s1", "Step 1", TaskStatus::Completed)]);
+
+        let summary = plan_summary_from_state("plan-done".into(), &state);
+        assert_eq!(summary.progress_pct, 100);
+        assert_eq!(summary.status, "completed");
+    }
+
     // ── error mapping tests ──────────────────────────────────────────────
 
     #[test]
@@ -1635,5 +1731,23 @@ mod tests {
         assert_eq!(plan.subtasks[0].status, TaskStatus::Completed);
         assert_eq!(plan.subtasks[1].status, TaskStatus::Pending);
         assert_eq!(plan.subtasks[2].status, TaskStatus::Pending);
+    }
+
+    /// active_session_only + phase filter：当 active plan 的 phase 不匹配时，
+    /// 返回空列表 + warning 提示调用方是 phase 不匹配而非没有 active plan。
+    #[test]
+    fn active_session_only_phase_filter_returns_warning_when_mismatch() {
+        let empty_but_warn = PlanListResponse {
+            plans: vec![],
+            warning: Some("active plan is in \"refining\" phase, not \"planning\"".into()),
+        };
+        assert_eq!(empty_but_warn.plans.len(), 0);
+        assert!(empty_but_warn.warning.is_some());
+        assert!(
+            empty_but_warn
+                .warning
+                .unwrap()
+                .contains("active plan is in")
+        );
     }
 }

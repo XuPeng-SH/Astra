@@ -301,6 +301,27 @@ pub fn build_settings_catalog(config: &RuntimeConfig) -> Vec<SettingItem> {
             kind: SettingKind::Bool,
             value: Value::from(config.telemetry.persist_to_journal),
         },
+        // ── Runtime limits (per-turn agentic budget) ──
+        SettingItem {
+            id: "runtime_limits.max_turns".to_string(),
+            label: "Max tool calls per user message (0 = inherit env / built-in 150)".to_string(),
+            kind: SettingKind::Number {
+                min: 0.0,
+                max: 2000.0,
+                allow_fraction: false,
+            },
+            value: Value::from(config.runtime_limits.max_turns),
+        },
+        SettingItem {
+            id: "runtime_limits.plan_subtask_max_turns".to_string(),
+            label: "Max tool calls per plan subtask (0 = fall back to max_turns)".to_string(),
+            kind: SettingKind::Number {
+                min: 0.0,
+                max: 2000.0,
+                allow_fraction: false,
+            },
+            value: Value::from(config.runtime_limits.plan_subtask_max_turns),
+        },
     ]
 }
 
@@ -466,6 +487,16 @@ pub fn apply_edit(
         }
         "telemetry.persist_to_journal" => {
             config.telemetry.persist_to_journal = as_bool(&new_value, id)?;
+        }
+        "runtime_limits.max_turns" => {
+            let n = as_u32(&new_value, id)?;
+            ensure_range(n as f64, 0.0, 2000.0, id)?;
+            config.runtime_limits.max_turns = n;
+        }
+        "runtime_limits.plan_subtask_max_turns" => {
+            let n = as_u32(&new_value, id)?;
+            ensure_range(n as f64, 0.0, 2000.0, id)?;
+            config.runtime_limits.plan_subtask_max_turns = n;
         }
         unknown => return Err(OverlayError::UnknownPath(unknown.to_string())),
     }

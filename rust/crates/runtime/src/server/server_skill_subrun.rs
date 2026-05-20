@@ -375,6 +375,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             has_any_usage: false,
             max_turns: SUBRUN_MAX_TURNS,
             remaining_turns: SUBRUN_MAX_TURNS,
+            turn_budget_hint_emitted_90: false,
             turn_budget_hint_emitted_50: false,
             turn_budget_hint_emitted_20: false,
             agentic_turn_budget: task_profile.agentic_turn_budget,
