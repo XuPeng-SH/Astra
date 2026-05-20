@@ -1066,6 +1066,10 @@ fn print_turn_trace(ev: &session_journal::JournalEvent, journal_seq: Option<u32>
     eprintln!();
 }
 
+/// Retention: fallback handler for `/info` / `/whoami` — called from slash_router.rs.
+/// In TUI mode this is shadowed by the native info panel.
+/// Kept for headless / non-interactive execution paths.
+#[allow(dead_code)]
 pub(super) async fn handle_info_command(
     cmd: &str,
     arg: &str,
@@ -1897,7 +1901,7 @@ pub(super) async fn handle_info_command(
             eprintln!("{}", "  astra version 0.1.0 (Rust)".bold());
         }
 
-        "/whoami" => {
+        "/info" | "/whoami" => {
             print_whoami(state);
         }
 

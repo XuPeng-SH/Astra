@@ -72,6 +72,21 @@ impl CommandGroup {
     }
 }
 
+/// How a slash command is handled inside the TUI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TuiHandler {
+    /// Opens a native TUI panel (e.g. /context → ContextPanel).
+    Panel,
+    /// Opens a TUI selector or picker (e.g. /model → model picker).
+    Selector,
+    /// Sent as chat input to the LLM (original REPL behavior).
+    ChatForward,
+    /// Handled inline in the dispatch function (e.g. /exit, /help).
+    Inline,
+    /// Tears down the TUI, runs the legacy slash handler, then restores the TUI.
+    Fallback,
+}
+
 /// Metadata for a single slash command.
 #[derive(Debug, Clone, Copy)]
 pub struct CommandMeta {
@@ -87,6 +102,10 @@ pub struct CommandMeta {
     pub subcommands: &'static [(&'static str, &'static str)],
     /// Argument hint shown inline (e.g., "<name>").
     pub arg_hint: Option<&'static str>,
+    /// How this command is handled inside the TUI.
+    pub tui_handler: TuiHandler,
+    /// Usage examples for the help display (without leading `/`).
+    pub usage_examples: &'static [&'static str],
 }
 
 impl CommandMeta {
@@ -99,6 +118,8 @@ impl CommandMeta {
             is_alias: false,
             subcommands: &[],
             arg_hint: None,
+            tui_handler: TuiHandler::ChatForward,
+            usage_examples: &[],
         }
     }
 
@@ -122,6 +143,18 @@ impl CommandMeta {
         self.arg_hint = Some(hint);
         self
     }
+
+    /// Set how this command is handled inside the TUI.
+    pub const fn with_tui_handler(mut self, handler: TuiHandler) -> Self {
+        self.tui_handler = handler;
+        self
+    }
+
+    /// Add usage examples for help display.
+    pub const fn with_usage_examples(mut self, examples: &'static [&'static str]) -> Self {
+        self.usage_examples = examples;
+        self
+    }
 }
 
 // ── Subcommand completion arrays ────────────────────────────────────────────
@@ -139,6 +172,8 @@ const STATS_SUBCOMMANDS: &[(&str, &str)] = &[
     ("learn", "Learning insights: patterns, drift, exploration"),
     ("tools", "Tool performance: calls, timing, success rate"),
 ];
+
+const HEALTH_SUBCOMMANDS: &[(&str, &str)] = &[("detail", "Per-tool breakdown")];
 
 const SYNC_SUBCOMMANDS: &[(&str, &str)] = &[
     ("log", "Server-owned sync log hint"),
@@ -213,6 +248,17 @@ const MEMORY_SUBCOMMANDS: &[(&str, &str)] = &[
     ("search", "Search memories (needs query)"),
 ];
 
+const PROFILE_SUBCOMMANDS: &[(&str, &str)] = &[
+    ("show", "Show the current user profile"),
+    ("edit", "Edit a preference"),
+    ("scenario", "Show the detected working scenario"),
+    ("stats", "Show profile usage stats"),
+    ("tools", "Show tool preferences"),
+    ("experiments", "Show enrolled experiments"),
+    ("reset", "Reset profile preferences"),
+    ("help", "Show profile help"),
+];
+
 // Subcommands surfaced by the `/session ` popup.  Kept tight so
 // completion shows only the high-value entry points; rarer
 // diagnostic forms (cleanup / drift / errors / trace / verify /
@@ -245,7 +291,7 @@ const ALLOW_SUBCOMMANDS: &[(&str, &str)] = &[
     ("auto", "Auto-approve all tool use"),
     ("plan", "Read-only investigation mode; mutations are denied"),
     (
-        "accept_edits",
+        "accept-edits",
         "Auto-approve workspace-local file edits while still prompting for shell and external writes",
     ),
     ("deny", "Deny all tool use"),
@@ -316,29 +362,35 @@ pub static COMMANDS: &[CommandMeta] = &[
         "Show available commands; /help keys for shortcuts",
         CommandGroup::Core,
     )
-    .with_subcommands(HELP_SUBCOMMANDS),
+    .with_subcommands(HELP_SUBCOMMANDS)
+    .with_tui_handler(TuiHandler::Inline),
     CommandMeta::new(
         "/model",
         "Open the model picker, show current model, or switch",
         CommandGroup::Core,
     )
     .with_subcommands(MODEL_SUBCOMMANDS)
-    .with_arg_hint("[info | list | clear | <name>]"),
-    CommandMeta::new("/clear", "Start a new session", CommandGroup::Core),
+    .with_arg_hint("[info | list | clear | <name>]")
+    .with_tui_handler(TuiHandler::Selector),
+    CommandMeta::new("/clear", "Start a new session", CommandGroup::Core)
+        .with_tui_handler(TuiHandler::Fallback),
     CommandMeta::new("/undo", "Undo last turn(s): /undo [N]", CommandGroup::Core)
-        .with_arg_hint("[N]"),
+        .with_arg_hint("[N]")
+        .with_tui_handler(TuiHandler::Fallback),
     CommandMeta::new(
         "/redo",
         "Redo undone turn(s): /redo [N]",
         CommandGroup::Core,
     )
-    .with_arg_hint("[N]"),
+    .with_arg_hint("[N]")
+    .with_tui_handler(TuiHandler::Fallback),
     CommandMeta::new(
         "/checkpoint",
         "Manual save: /checkpoint [label] — JSON + session md + journal",
         CommandGroup::Core,
     )
-    .with_arg_hint("[label]"),
+    .with_arg_hint("[label]")
+    .with_tui_handler(TuiHandler::Fallback),
     CommandMeta::new(
         "/history",
         "Conversation turns; /history grep <q> filters in-memory",
@@ -354,29 +406,35 @@ pub static COMMANDS: &[CommandMeta] = &[
         "Resume a session: /resume [session_id]",
         CommandGroup::Core,
     )
-    .with_arg_hint("[session_id]"),
+    .with_arg_hint("[session_id]")
+    .with_tui_handler(TuiHandler::Panel),
     CommandMeta::new(
         "/timeline",
         "Browse this session's turn-by-turn journal timeline",
         CommandGroup::Core,
-    ),
+    )
+    .with_tui_handler(TuiHandler::Panel),
     CommandMeta::new(
         "/table",
         "Run a SQL query and render the result as a navigable table",
         CommandGroup::Core,
     )
-    .with_arg_hint("<sql>"),
+    .with_arg_hint("<sql>")
+    .with_tui_handler(TuiHandler::Panel),
     CommandMeta::new(
         "/worktrees",
         "List git worktrees for this repo with per-worktree session counts",
         CommandGroup::Core,
-    ),
+    )
+    .with_tui_handler(TuiHandler::Panel),
     CommandMeta::new(
         "/panels",
         "Cheat sheet of all TUI-native panels",
         CommandGroup::Core,
-    ),
-    CommandMeta::new("/exit", "Exit astra", CommandGroup::Core),
+    )
+    .with_tui_handler(TuiHandler::Inline),
+    CommandMeta::new("/exit", "Exit astra", CommandGroup::Core)
+        .with_tui_handler(TuiHandler::Inline),
     CommandMeta::new("/quit", "Exit astra (alias for /exit)", CommandGroup::Core).alias(),
     // ── Workspace ─────────────────────────────────────────────────────────
     CommandMeta::new(
@@ -384,21 +442,24 @@ pub static COMMANDS: &[CommandMeta] = &[
         "Workspace ripgrep: <pattern> | files <glob> | review <pattern>",
         CommandGroup::Workspace,
     )
-    .with_arg_hint("<pattern>"),
+    .with_arg_hint("<pattern>")
+    .with_tui_handler(TuiHandler::Fallback),
     CommandMeta::new(
         "/diff",
         "Colored git diff (staged, stat, show <rev>, …)",
         CommandGroup::Workspace,
     )
     .with_subcommands(DIFF_SUBCOMMANDS)
-    .with_arg_hint("[staged|unstaged|stat|show <rev>]"),
+    .with_arg_hint("[staged|unstaged|stat|show <rev>]")
+    .with_tui_handler(TuiHandler::Fallback),
     CommandMeta::new(
         "/review",
         "LLM review of git changes: /review [latest|<rev>|working]",
         CommandGroup::Workspace,
     )
     .with_subcommands(REVIEW_SUBCOMMANDS)
-    .with_arg_hint("[latest|<rev>|working]"),
+    .with_arg_hint("[latest|<rev>|working]")
+    .with_tui_handler(TuiHandler::Fallback),
     // ── Session & plan ───────────────────────────────────────────────────
     CommandMeta::new(
         "/session",
@@ -407,6 +468,7 @@ pub static COMMANDS: &[CommandMeta] = &[
     )
     .with_subcommands(SESSION_SUBCOMMANDS)
     .with_arg_hint("[list | history | fork | analyze | export]"),
+    // session sub-commands — aliases, no TUI handler needed
     CommandMeta::new(
         "/session history",
         "Session journal-style history",
@@ -447,12 +509,14 @@ pub static COMMANDS: &[CommandMeta] = &[
         "Enter plan mode; optionally start with a description",
         CommandGroup::SessionPlan,
     )
-    .with_arg_hint("[description]"),
+    .with_arg_hint("[description]")
+    .with_tui_handler(TuiHandler::Inline),
     CommandMeta::new(
         "/report",
         "Last delivery report (/report save = JSON)",
         CommandGroup::SessionPlan,
-    ),
+    )
+    .with_tui_handler(TuiHandler::Fallback),
     // ── Memory & tasks ────────────────────────────────────────────────────
     CommandMeta::new(
         "/memory",
@@ -467,13 +531,15 @@ pub static COMMANDS: &[CommandMeta] = &[
         CommandGroup::MemoryTasks,
     )
     .with_subcommands(TASK_SUBCOMMANDS)
-    .with_arg_hint("[list|add <title>|done <id>|status <id>|run <prompt>|result <id>]"),
+    .with_arg_hint("[list|add <title>|done <id>|status <id>|run <prompt>|result <id>]")
+    .with_tui_handler(TuiHandler::Fallback),
     // ── Observability ─────────────────────────────────────────────────────
     CommandMeta::new(
         "/explain",
         "Cycle explain: off → on (API) → verbose (+stderr)",
         CommandGroup::Observability,
-    ),
+    )
+    .with_tui_handler(TuiHandler::Fallback),
     CommandMeta::new(
         "/verbose",
         "(removed — use /stats)",
@@ -486,12 +552,14 @@ pub static COMMANDS: &[CommandMeta] = &[
         CommandGroup::Observability,
     )
     .with_subcommands(COMPACT_SUBCOMMANDS)
-    .with_arg_hint("[quick|no-memoria|summary-only]"),
+    .with_arg_hint("[quick|no-memoria|summary-only]")
+    .with_tui_handler(TuiHandler::Fallback),
     CommandMeta::new(
         "/reflect",
         "Reflect on session (modes: skill_failure, performance, …)",
         CommandGroup::Observability,
-    ),
+    )
+    .with_tui_handler(TuiHandler::Fallback),
     CommandMeta::new(
         "/turn",
         "(removed — use /timeline, Enter to drill into a turn)",
@@ -500,33 +568,37 @@ pub static COMMANDS: &[CommandMeta] = &[
     .alias(),
     CommandMeta::new(
         "/debug",
-        "Interactive session inspector (messages, tools, injections)",
+        "Developer-oriented session debugger: messages, tools, injections",
         CommandGroup::Observability,
-    ),
+    )
+    .with_tui_handler(TuiHandler::Fallback),
     CommandMeta::new(
         "/inspect",
-        "Harness: /inspect [budget|tools|context|json|diff|history|trace|forensics|export]",
+        "Harness snapshots and exports: budget, tools, context, diff, trace, …",
         CommandGroup::Observability,
     )
     .with_arg_hint("[budget|tools|context|json|diff|history N|trace|forensics|export path]"),
     CommandMeta::new(
         "/stats",
-        "Session analytics: /stats [history|tools|cost|health|learn]",
+        "Session analytics: overview, history, tools, cost, health, learning",
         CommandGroup::Observability,
     )
     .with_subcommands(STATS_SUBCOMMANDS)
-    .with_arg_hint("[cost|health|history|learn|tools]"),
+    .with_arg_hint("[cost|health|history|learn|tools]")
+    .with_tui_handler(TuiHandler::Selector),
     CommandMeta::new(
         "/lsp",
         "LSP backend status: /lsp [status]",
         CommandGroup::Observability,
     )
-    .with_arg_hint("[status]"),
+    .with_arg_hint("[status]")
+    .with_tui_handler(TuiHandler::Fallback),
     CommandMeta::new(
         "/telemetry",
-        "Session telemetry: turns, drift, decisions, profile",
+        "Deep observability traces: turns, drift, decisions, profile, context",
         CommandGroup::Observability,
-    ),
+    )
+    .with_tui_handler(TuiHandler::Fallback),
     CommandMeta::new(
         "/tuning",
         "(removed — evolution subsystem deleted)",
@@ -535,37 +607,58 @@ pub static COMMANDS: &[CommandMeta] = &[
     .alias(),
     CommandMeta::new(
         "/config",
-        "Runtime config: show|paths|sources|diff|export [path]",
+        "Runtime config: panel for edit; show|paths|sources|diff|export stay text-first",
         CommandGroup::Observability,
     )
     .with_subcommands(CONFIG_SUBCOMMANDS)
-    .with_arg_hint("[show|paths|sources|diff|export [path]]"),
+    .with_arg_hint("[edit|show|paths|sources|diff|export [path]]")
+    .with_tui_handler(TuiHandler::Panel),
     CommandMeta::new(
         "/sync",
         "Cloud sync status (server-owned)",
         CommandGroup::Observability,
     )
     .with_subcommands(SYNC_SUBCOMMANDS)
-    .with_arg_hint("[log|push|pull]"),
+    .with_arg_hint("[log|push|pull]")
+    .with_tui_handler(TuiHandler::Fallback),
     CommandMeta::new(
         "/context",
         "Open the context panel (TUI) or dump a snapshot to disk",
         CommandGroup::Observability,
     )
     .with_subcommands(&[("dump", "Write a JSON snapshot of the live context to disk")])
-    .with_arg_hint("[dump [path]]"),
+    .with_arg_hint("[dump [path]]")
+    .with_tui_handler(TuiHandler::Panel),
     CommandMeta::new(
         "/rewind",
         "Rewind conversation to an earlier turn",
         CommandGroup::Observability,
     )
-    .with_arg_hint("<turn>"),
+    .with_arg_hint("<turn>")
+    .with_tui_handler(TuiHandler::Fallback),
     CommandMeta::new("/version", "Version info", CommandGroup::Observability),
     CommandMeta::new(
-        "/whoami",
-        "Agent self-awareness: identity, session, skills, pending proposals",
+        "/info",
+        "System info at a glance: version, session, model, permissions, skills",
         CommandGroup::Observability,
-    ),
+    )
+    .with_tui_handler(TuiHandler::Panel),
+    CommandMeta::new(
+        "/whoami",
+        "Alias for /info",
+        CommandGroup::Observability,
+    )
+    .alias()
+    .with_tui_handler(TuiHandler::Panel),
+    CommandMeta::new(
+        "/health",
+        "Alias for /stats health",
+        CommandGroup::Observability,
+    )
+    .alias()
+    .with_subcommands(HEALTH_SUBCOMMANDS)
+    .with_arg_hint("[detail]")
+    .with_tui_handler(TuiHandler::Fallback),
     CommandMeta::new(
         "/experiment",
         "(removed — use /profile experiments)",
@@ -579,7 +672,8 @@ pub static COMMANDS: &[CommandMeta] = &[
         CommandGroup::Skills,
     )
     .with_subcommands(SKILL_SUBCOMMANDS)
-    .with_arg_hint("[browse|list|info|install|publish|search|new|test|dev|feedback|…]"),
+    .with_arg_hint("[browse|list|info|install|publish|search|new|test|dev|feedback|…]")
+    .with_tui_handler(TuiHandler::Selector),
     // ── MCP ───────────────────────────────────────────────────────────────
     CommandMeta::new(
         "/mcp",
@@ -587,7 +681,8 @@ pub static COMMANDS: &[CommandMeta] = &[
         CommandGroup::Mcp,
     )
     .with_subcommands(MCP_SUBCOMMANDS)
-    .with_arg_hint("[status|servers|prompts|resources|add|remove|ping|…]"),
+    .with_arg_hint("[status|servers|prompts|resources|add|remove|ping|…]")
+    .with_tui_handler(TuiHandler::Fallback),
     // ── Team & account ───────────────────────────────────────────────────
     CommandMeta::new(
         "/team",
@@ -595,45 +690,61 @@ pub static COMMANDS: &[CommandMeta] = &[
         CommandGroup::TeamAccount,
     )
     .with_subcommands(TEAM_SUBCOMMANDS)
-    .with_arg_hint("[list|info|create|add-member|context|run|…]"),
+    .with_arg_hint("[list|info|create|add-member|context|run|…]")
+    .with_tui_handler(TuiHandler::Fallback),
     CommandMeta::new(
         "/agent",
         "Spawned agents: list, status, stop, logs",
         CommandGroup::TeamAccount,
     )
     .with_subcommands(AGENT_SUBCOMMANDS)
-    .with_arg_hint("[list|status|stop|logs|help]"),
+    .with_arg_hint("[list|status|stop|logs|help]")
+    .with_tui_handler(TuiHandler::Fallback),
     CommandMeta::new(
         "/messaging",
         "Inter-agent messaging: metrics, dlq, status",
         CommandGroup::TeamAccount,
     )
     .with_subcommands(MESSAGING_SUBCOMMANDS)
-    .with_arg_hint("[metrics|dlq|status|help]"),
+    .with_arg_hint("[metrics|dlq|status|help]")
+    .with_tui_handler(TuiHandler::Fallback),
     CommandMeta::new(
         "/login",
         "Authenticate with the API",
         CommandGroup::TeamAccount,
-    ),
+    )
+    .with_tui_handler(TuiHandler::Panel),
     CommandMeta::new(
         "/register",
         "Register a new account",
         CommandGroup::TeamAccount,
-    ),
-    CommandMeta::new("/logout", "Logout from the API", CommandGroup::TeamAccount),
+    )
+    .with_tui_handler(TuiHandler::Panel),
+    CommandMeta::new("/logout", "Logout from the API", CommandGroup::TeamAccount)
+        .with_tui_handler(TuiHandler::Fallback),
+    CommandMeta::new(
+        "/profile",
+        "Profile preferences: show, edit, scenario, stats, tools, experiments, reset",
+        CommandGroup::TeamAccount,
+    )
+    .with_subcommands(PROFILE_SUBCOMMANDS)
+    .with_arg_hint("[show|edit <key> <value>|scenario|stats|tools|experiments|reset]")
+    .with_tui_handler(TuiHandler::Fallback),
     CommandMeta::new(
         "/memory-setup",
         "Guided Memoria configuration",
         CommandGroup::TeamAccount,
-    ),
+    )
+    .with_tui_handler(TuiHandler::Fallback),
     // ── System ────────────────────────────────────────────────────────────
     CommandMeta::new(
         "/allow",
-        "Permission mode: /allow [auto|plan|accept_edits|prompt|deny|all|rules|trust|untrust|trace]",
+        "Permission mode: /allow [auto|plan|accept-edits|prompt|deny|all|rules|trust|untrust|trace]",
         CommandGroup::System,
     )
     .with_subcommands(ALLOW_SUBCOMMANDS)
-    .with_arg_hint("[auto|accept_edits|plan|prompt|deny|all|rules]"),
+    .with_arg_hint("[auto|accept-edits|plan|prompt|deny|all|rules]")
+    .with_tui_handler(TuiHandler::Inline),
     CommandMeta::new(
         "/instructions",
         "Project instructions: /instructions [show|reload|off]",
@@ -646,14 +757,16 @@ pub static COMMANDS: &[CommandMeta] = &[
         "Binary, API, auth, environment checks",
         CommandGroup::System,
     )
-    .with_arg_hint("— run all checks"),
+    .with_arg_hint("— run all checks")
+    .with_tui_handler(TuiHandler::Fallback),
     // Note: /lsp is in Observability group, not duplicated here
     CommandMeta::new(
         "/bug",
         "Generate bug report: /bug [copy|save]",
         CommandGroup::System,
     )
-    .with_arg_hint("[copy|save]"),
+    .with_arg_hint("[copy|save]")
+    .with_tui_handler(TuiHandler::Fallback),
 ];
 
 // ── Query functions ─────────────────────────────────────────────────────────
@@ -679,6 +792,13 @@ pub fn resolve_command(input: &str) -> Result<&'static str, Vec<&'static str>> {
     } else {
         Err(matches)
     }
+}
+
+/// Resolve a command input to its full metadata, including TUI handler info.
+/// Returns `None` when the command can't be resolved.
+pub fn resolve_command_meta(input: &str) -> Option<&'static CommandMeta> {
+    let name = resolve_command(input).ok()?;
+    COMMANDS.iter().find(|m| m.name == name)
 }
 
 /// Suggest commands similar to the input (for typo correction / fuzzy matching).
@@ -927,15 +1047,15 @@ mod tests {
             .iter()
             .find(|meta| meta.name == "/allow")
             .expect("/allow command");
-        assert!(allow.description.contains("accept_edits"));
+        assert!(allow.description.contains("accept-edits"));
         assert!(allow.description.contains("plan"));
         assert_eq!(
             allow.arg_hint,
-            Some("[auto|accept_edits|plan|prompt|deny|all|rules]")
+            Some("[auto|accept-edits|plan|prompt|deny|all|rules]")
         );
 
         let subs = subcommand_completions("/allow").expect("/allow subcommands");
-        assert!(subs.iter().any(|(tok, _)| *tok == "accept_edits"));
+        assert!(subs.iter().any(|(tok, _)| *tok == "accept-edits"));
         assert!(subs.iter().any(|(tok, _)| *tok == "plan"));
     }
 
@@ -1018,5 +1138,118 @@ mod tests {
         });
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, "/quit");
+    }
+
+    // ── resolve_command_meta / TuiHandler routing tests ──────────────────
+
+    #[test]
+    fn resolve_command_meta_returns_tui_handler_panel() {
+        // /context is explicitly marked as Panel
+        let meta = resolve_command_meta("/context").expect("should resolve /context");
+        assert_eq!(meta.tui_handler, TuiHandler::Panel);
+    }
+
+    #[test]
+    fn resolve_command_meta_returns_tui_handler_selector() {
+        // /model is explicitly marked as Selector
+        let meta = resolve_command_meta("/model").expect("should resolve /model");
+        assert_eq!(meta.tui_handler, TuiHandler::Selector);
+    }
+
+    #[test]
+    fn resolve_command_meta_returns_tui_handler_fallback() {
+        // /clear is explicitly marked as Fallback
+        let meta = resolve_command_meta("/clear").expect("should resolve /clear");
+        assert_eq!(meta.tui_handler, TuiHandler::Fallback);
+    }
+
+    #[test]
+    fn resolve_command_meta_returns_tui_handler_inline() {
+        // /help is explicitly marked as Inline
+        let meta = resolve_command_meta("/help").expect("should resolve /help");
+        assert_eq!(meta.tui_handler, TuiHandler::Inline);
+    }
+
+    #[test]
+    fn resolve_command_meta_uses_fallback_for_non_native_commands() {
+        let meta = resolve_command_meta("/mcp").expect("should resolve /mcp");
+        assert_eq!(meta.tui_handler, TuiHandler::Fallback);
+    }
+
+    #[test]
+    fn resolve_command_meta_returns_none_for_unknown_command() {
+        assert!(resolve_command_meta("/nonexistent_cmd_xyz").is_none());
+    }
+
+    #[test]
+    fn resolve_command_meta_prefix_match_also_resolves_handler() {
+        // /reg prefixes to /register which is marked as Panel
+        let meta = resolve_command_meta("/reg").expect("should resolve /reg → /register");
+        assert_eq!(meta.name, "/register");
+        assert_eq!(meta.tui_handler, TuiHandler::Panel);
+    }
+
+    #[test]
+    fn info_and_aliases_are_discoverable() {
+        let info = resolve_command_meta("/info").expect("should resolve /info");
+        assert_eq!(info.tui_handler, TuiHandler::Panel);
+
+        let whoami = resolve_command_meta("/whoami").expect("should resolve /whoami");
+        assert!(whoami.is_alias, "/whoami should be treated as an alias");
+
+        let health = resolve_command_meta("/health").expect("should resolve /health");
+        assert!(health.is_alias, "/health should be treated as an alias");
+    }
+
+    #[test]
+    fn fallback_commands_do_not_drop_into_chat_forward() {
+        for cmd in [
+            "/checkpoint",
+            "/grep",
+            "/diff",
+            "/review",
+            "/report",
+            "/task",
+            "/debug",
+            "/lsp",
+            "/telemetry",
+            "/health",
+            "/sync",
+            "/rewind",
+            "/mcp",
+            "/team",
+            "/agent",
+            "/messaging",
+            "/logout",
+            "/profile",
+            "/memory-setup",
+            "/diagnostics",
+            "/bug",
+        ] {
+            let meta = resolve_command_meta(cmd).unwrap_or_else(|| panic!("missing {cmd}"));
+            assert_eq!(
+                meta.tui_handler,
+                TuiHandler::Fallback,
+                "{cmd} should preserve slash execution instead of forwarding to chat"
+            );
+        }
+    }
+
+    #[test]
+    fn all_handled_commands_have_explicit_handler_or_default_chat_forward() {
+        // Sanity check: every command has a tui_handler set (ChatForward is the default)
+        for cmd in COMMANDS {
+            if cmd.is_alias {
+                continue;
+            }
+            // All handlers are valid variants
+            match cmd.tui_handler {
+                TuiHandler::Panel
+                | TuiHandler::Selector
+                | TuiHandler::Inline
+                | TuiHandler::Fallback
+                | TuiHandler::ChatForward => {}
+            }
+        }
     }
 }

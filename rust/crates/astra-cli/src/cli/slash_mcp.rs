@@ -7,6 +7,10 @@ fn eprint_server_not_found(name: &str) {
     eprintln!("  {}", "Use /mcp servers to see connected servers".dim());
 }
 
+/// Retention: fallback handler for `/mcp` — called from slash_router.rs.
+/// In TUI mode this is shadowed by TuiHandler::Selector (McpView).
+/// Kept for headless / non-interactive execution paths.
+#[allow(dead_code)]
 pub(super) async fn handle_mcp_command(arg: &str, state: &mut SessionState) -> Result<(), String> {
     let sub = arg.trim();
 

@@ -1,4 +1,4 @@
-//! Slash command routing for the REPL.
+//! Slash command fallback routing for the interactive session.
 
 use std::io::IsTerminal;
 
@@ -330,7 +330,7 @@ pub(crate) async fn handle_slash_command(
         }
 
         "/history" | "/grep" | "/review" | "/copy" | "/diagnostics" | "/lsp" | "/context"
-        | "/version" | "/whoami" | "/rewind" | "/report" => {
+        | "/version" | "/info" | "/whoami" | "/rewind" | "/report" => {
             handle_info_command(cmd, arg, api, state, profile, token).await?;
         }
 
@@ -391,7 +391,7 @@ pub(crate) async fn handle_slash_command(
                     eprintln!(
                         "  {} Permission mode → {}",
                         theme::icon_info(),
-                        next.to_string().magenta()
+                        crate::command_router::permission_mode_display_label(next).magenta()
                     );
                 }
                 "all" => {
@@ -415,7 +415,10 @@ pub(crate) async fn handle_slash_command(
                     eprintln!(
                         "  {} Permission mode → {} (workspace-local edits auto-approved)",
                         theme::icon_info(),
-                        "accept_edits".magenta()
+                        crate::command_router::permission_mode_display_label(
+                            PermissionMode::AcceptEdits
+                        )
+                        .magenta()
                     );
                 }
                 "rules" | "status" => {
@@ -470,12 +473,12 @@ pub(crate) async fn handle_slash_command(
                         eprintln!(
                             "  {} Permission mode → {}",
                             theme::icon_info(),
-                            mode.to_string().magenta()
+                            crate::command_router::permission_mode_display_label(mode).magenta()
                         );
                     }
                     Err(_) => {
                         eprintln!(
-                            "  {} Unknown mode '{}'. Use: auto, plan, accept_edits, prompt, deny, all, rules, trust, untrust, trace",
+                            "  {} Unknown mode '{}'. Use: auto, plan, accept-edits, prompt, deny, all, rules, trust, untrust, trace",
                             theme::icon_warn(),
                             arg
                         );

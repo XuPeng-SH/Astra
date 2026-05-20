@@ -1,6 +1,5 @@
 ---
 source: crates/astra-cli/src/tui/slash_dispatch.rs
-assertion_line: 1211
 expression: "build_panels_cheat_sheet_lines().join(\"\\n\")"
 ---
   /resume
@@ -23,9 +22,37 @@ expression: "build_panels_cheat_sheet_lines().join(\"\\n\")"
       list git worktrees with per-worktree session counts
       ↑↓ navigate · q / Esc close
 
-  /config
-      interactive panel — search, pick, and edit runtime config
-      ↑↓ navigate · Enter edit · type to search · Esc save/close
+  /config [edit|show|paths|sources|diff|export]
+      edit opens the panel; show/paths/sources/diff/export stay text-first
+      panel: ↑↓ navigate · Enter edit/set · type to search · Esc save/close
+
+  /model
+      fuzzy-search model picker; switch or inspect current model
+      type to filter · Enter select · Esc close
+
+  /skill
+      browse, search, install, and manage skills
+      type to filter · Enter select · Esc close
+
+  /memory [list|search <q>|inspect <id>]
+      browse, search, and inspect episodic and semantic memories
+      ↑↓ navigate · Enter select · Esc close
+
+  /session
+      list, fork, history, analyze, or export sessions
+      ↑↓ navigate · Enter select · Esc close
+
+  /stats
+      view token cost, tool usage, and session statistics
+      Enter / q / Esc close
+
+  /inspect
+      session introspection: budget, tools, history, traces
+      type subcommand · Esc close
+
+  /info
+      system info at a glance — version, model, session, skills
+      ↑↓ scroll · Esc close
 
   /help
       list every slash command grouped by category

@@ -13,14 +13,24 @@
 //! ```
 //!
 //! Key features:
-//! * **Selected row** gets a cursor-gutter (`▌`), tinted background, and
-//!   bold accent-coloured name.
+//! * **Group headers**: items are grouped by category (Core, Session & Plan, Observability, …)
+//!   with dim `── Group Name ──` dividers when the filtered set spans multiple groups.
 //! * **Matched characters** (from the filter token) render in the
 //!   accent colour with UNDERLINE so the user can see why the row ranked.
 //! * **Scroll hints**: `↑ N more` / `↓ N more` above/below the window
 //!   when the list overflows.
 //! * **Aliases**: shown inline as a dim `(h)` badge right of the name.
 //! * **Responsive**: at <18 cols descriptions drop and only names render.
+//!
+//! Group-aware anatomy:
+//! ```text
+//!     ── Core ──
+//!   ▌ /help        show this help screen
+//!     /clear       clear screen
+//!     ── Session & Plan ──
+//!     /resume      resume a session
+//!     ↓ 2 more
+//! ```
 
 #![allow(dead_code)]
 
@@ -31,6 +41,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 
 use super::SlashMenu;
+use crate::command_registry::CommandGroup;
 
 /// Maximum number of **data rows** shown at once. Does not include the
 /// scroll-indicator rows (↑ N more / ↓ N more).
@@ -129,12 +140,46 @@ pub(crate) fn render(menu: &SlashMenu, area: Rect, buf: &mut Buffer) {
         lines.push(scroll_hint(format!("↑ {} more", window_start), theme));
     }
 
-    // ── Visible data rows ───────────────────────────────────────
+    // ── Visible data rows (with group headers) ─────────────────
     let highlights = menu.match_indices();
+    let prev_group_idx = matches
+        .get(window_start.saturating_sub(1))
+        .and_then(|it| it.group);
+    let mut cur_group: Option<CommandGroup> = prev_group_idx;
+
     for (idx, item) in matches[window_start..window_end].iter().enumerate() {
         let absolute = window_start + idx;
         let is_selected = absolute == selected;
         let hi = highlights.get(absolute).cloned().unwrap_or_default();
+
+        // Insert group header when group changes.
+        let item_group = item.group;
+        if item_group != cur_group {
+            cur_group = item_group;
+            if let Some(g) = item_group {
+                let label = group_display_name(g);
+                // Ensure the gutter column is included.
+                let mut group_spans: Vec<Span<'static>> = Vec::with_capacity(3);
+                group_spans.push(Span::raw("  "));
+                group_spans.push(Span::styled(
+                    format!("── {label} ──"),
+                    Style::default()
+                        .fg(theme.accent_dim())
+                        .add_modifier(Modifier::ITALIC)
+                        .add_modifier(Modifier::DIM),
+                ));
+                // Add the rest as separator.
+                group_spans.push(Span::styled(
+                    "─".repeat(
+                        content_width
+                            .saturating_sub(label.chars().count() + 8)
+                            .min(80),
+                    ),
+                    Style::default().fg(theme.dim).add_modifier(Modifier::DIM),
+                ));
+                lines.push(Line::from(group_spans));
+            }
+        }
 
         let mut spans: Vec<Span<'static>> = Vec::with_capacity(8);
 
@@ -183,6 +228,32 @@ pub(crate) fn render(menu: &SlashMenu, area: Rect, buf: &mut Buffer) {
             line = line.style(Style::default().bg(theme.selected_bg));
         }
         lines.push(line);
+        // Show subcommands below the selected item (single-line, compact).
+        if is_selected && !item.subcommands.is_empty() {
+            let max_subs = 3.min(item.subcommands.len());
+            for (name, desc) in item.subcommands.iter().take(max_subs) {
+                let sub_spans: Vec<Span<'static>> = vec![
+                    Span::raw("   · "),
+                    Span::styled(
+                        name.to_string(),
+                        Style::default()
+                            .fg(theme.accent_dim())
+                            .add_modifier(Modifier::ITALIC),
+                    ),
+                    Span::styled(
+                        [" — ", desc].concat(),
+                        Style::default().fg(theme.dim).add_modifier(Modifier::DIM),
+                    ),
+                ];
+                lines.push(Line::from(sub_spans));
+            }
+            if item.subcommands.len() > max_subs {
+                lines.push(Line::from(Span::styled(
+                    format!("   … {} more", item.subcommands.len() - max_subs),
+                    Style::default().fg(theme.dim).add_modifier(Modifier::DIM),
+                )));
+            }
+        }
     }
 
     // ── Scroll-down hint ────────────────────────────────────────
@@ -325,6 +396,21 @@ fn truncate_ellipsis(s: &str, width: usize) -> String {
     out
 }
 
+/// Human-readable display name for a command group.
+fn group_display_name(group: CommandGroup) -> &'static str {
+    match group {
+        CommandGroup::Core => "Core",
+        CommandGroup::Workspace => "Workspace",
+        CommandGroup::SessionPlan => "Session & Plan",
+        CommandGroup::MemoryTasks => "Memory & Tasks",
+        CommandGroup::Observability => "Observability",
+        CommandGroup::Skills => "Skills",
+        CommandGroup::Mcp => "MCP",
+        CommandGroup::TeamAccount => "Team & Account",
+        CommandGroup::System => "System",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{SlashItem, SlashMenu};
@@ -403,7 +489,54 @@ mod tests {
         insta::assert_snapshot!("slash_popup_long_list_sel11_80", render_menu(&menu, 80, 12));
     }
 
-    // ─── Non-snapshot unit tests ──────────────────────────────────
+    #[test]
+    fn snapshot_groups_with_headers() {
+        // 6 items across 3 groups — should render group headers.
+        use crate::command_registry::CommandGroup;
+        let items: Vec<SlashItem> = vec![
+            SlashItem {
+                name: "/help",
+                description: "show help",
+                group: Some(CommandGroup::Core),
+                ..Default::default()
+            },
+            SlashItem {
+                name: "/clear",
+                description: "clear screen",
+                group: Some(CommandGroup::Core),
+                ..Default::default()
+            },
+            SlashItem {
+                name: "/resume",
+                description: "resume a session",
+                group: Some(CommandGroup::SessionPlan),
+                ..Default::default()
+            },
+            SlashItem {
+                name: "/plan",
+                description: "manage plan",
+                group: Some(CommandGroup::SessionPlan),
+                ..Default::default()
+            },
+            SlashItem {
+                name: "/model",
+                description: "pick a model",
+                group: Some(CommandGroup::Core),
+                ..Default::default()
+            },
+            SlashItem {
+                name: "/config",
+                description: "runtime config",
+                group: Some(CommandGroup::Observability),
+                ..Default::default()
+            },
+        ];
+        let menu = SlashMenu::new(items);
+        insta::assert_snapshot!(
+            "slash_popup_groups_with_headers_80",
+            render_menu(&menu, 80, 10)
+        );
+    }
 
     #[test]
     fn desired_height_clamps_at_max_plus_chrome() {
@@ -460,5 +593,36 @@ mod tests {
             "narrow popup should not draw box: {out}"
         );
         assert!(out.contains("/help"), "name must still render: {out}");
+    }
+
+    #[test]
+    fn selected_item_shows_subcommands() {
+        use crate::command_registry::TuiHandler;
+
+        const SUBS: &[(&str, &str)] = &[
+            ("list", "List all memories"),
+            ("search", "Search memories by query"),
+            ("inspect", "Inspect a single memory by ID"),
+        ];
+        let item = SlashItem {
+            name: "/memory",
+            description: "Memory operations",
+            subcommands: SUBS,
+            aliases: &[],
+            usage_boost: 0,
+            group: Some(CommandGroup::MemoryTasks),
+            tui_handler: TuiHandler::Panel,
+            usage_examples: &[],
+        };
+        let menu = SlashMenu::new(vec![item]);
+        let output = render_menu(&menu, 80, 10);
+        assert!(
+            output.contains("list"),
+            "should show 'list' subcommand: {output}"
+        );
+        assert!(
+            output.contains("Search memories"),
+            "should show 'search' subcommand desc: {output}"
+        );
     }
 }
