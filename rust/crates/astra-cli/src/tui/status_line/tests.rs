@@ -273,9 +273,11 @@ fn token_budget_renders_as_percent_and_absolute() {
         plain.contains("25k") || plain.contains("25000") || plain.contains("25,000"),
         "absolute used count expected; got {plain:?}"
     );
+    // The "... left" chip was removed — it duplicated the percentage
+    // and wasted status-line width during active turns.
     assert!(
-        plain.contains("75k left") || plain.contains("75000 left"),
-        "remaining budget expected; got {plain:?}"
+        !plain.contains("left"),
+        "unexpected 'left' chip; got {plain:?}"
     );
 }
 

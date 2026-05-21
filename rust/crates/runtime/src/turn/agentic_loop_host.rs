@@ -2540,8 +2540,17 @@ pub(crate) mod tests {
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
         assert_eq!(host.current_turn, 0); // No turns executed
-        assert_eq!(state.final_text, ""); // No text produced
+        assert!(state.final_text.contains("without a final answer")); // EmptyCompletion message
         assert_eq!(state.remaining_turns, 10); // Unchanged
+        // EmptyCompletion interruption recorded
+        let interruption = state
+            .interruption
+            .as_ref()
+            .expect("should record interruption");
+        assert_eq!(
+            interruption.kind,
+            astra_turn_core::interruption::InterruptionKind::EmptyCompletion
+        );
     }
 
     #[tokio::test]
