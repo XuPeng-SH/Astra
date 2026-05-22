@@ -209,8 +209,8 @@ pub use astra_services::{
     },
     triggers::{DatabaseTriggerService, TriggerRecord, TriggerService, UnconfiguredTriggerService},
     workflows::{
-        DatabaseWorkflowService, UnconfiguredWorkflowService, WorkflowDefRecord, WorkflowListItem,
-        WorkflowRunRecord, WorkflowService,
+        UnconfiguredWorkflowService, WorkflowDefRecord, WorkflowListItem, WorkflowRunRecord,
+        WorkflowService,
     },
 };
 
