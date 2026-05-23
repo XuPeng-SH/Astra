@@ -3,6 +3,7 @@ use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sqlx::{Row, query};
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use crate::auth::FernetTokenEncryptor;
@@ -60,10 +61,100 @@ pub struct QuirksData {
     /// column — so adding it required no DB migration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wire_model_name: Option<String>,
+    /// Explicit prompt-cache behavior for this concrete model deployment.
+    ///
+    /// OpenAI-compatible transport does not imply OpenAI-compatible cache
+    /// semantics. Storing this in `quirks_json` lets operators classify a
+    /// deployment once (provider + endpoint + upstream model) without baking
+    /// model-name guesses into runtime hot paths. `reuse_scope` captures how far
+    /// cache reuse actually survives (`conversation_turns` vs `intra_turn_rounds`)
+    /// so harness/runtime/CLI can adapt behavior without model-name branches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_capability: Option<PromptCacheCapabilityData>,
     /// Additional top-level request body fields to merge into outbound
     /// provider payloads for this model row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_body_overrides: Option<Map<String, Value>>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptCacheProtocolData {
+    #[serde(alias = "MarkerExplicit")]
+    MarkerExplicit,
+    #[serde(alias = "BedrockCachePoint")]
+    BedrockCachePoint,
+    #[serde(alias = "OpenAiAutoPrefix")]
+    #[serde(alias = "openai_auto_prefix")]
+    OpenAiAutoPrefix,
+    #[serde(alias = "StrictHistoryMatch")]
+    StrictHistoryMatch,
+    #[serde(alias = "None")]
+    None,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptCacheVolatilePlacementData {
+    #[serde(alias = "MarkerIsolated")]
+    MarkerIsolated,
+    #[serde(alias = "TailSuffix")]
+    TailSuffix,
+    #[serde(alias = "CurrentUserOnly")]
+    CurrentUserOnly,
+    #[serde(alias = "Free")]
+    Free,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptCacheReuseScopeData {
+    #[serde(alias = "ConversationTurns")]
+    ConversationTurns,
+    #[serde(alias = "IntraTurnRounds")]
+    IntraTurnRounds,
+}
+
+impl PromptCacheReuseScopeData {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ConversationTurns => "conversation_turns",
+            Self::IntraTurnRounds => "intra_turn_rounds",
+        }
+    }
+
+    #[must_use]
+    pub fn supports(self, required: Self) -> bool {
+        match (self, required) {
+            (Self::ConversationTurns, _) => true,
+            (Self::IntraTurnRounds, Self::IntraTurnRounds) => true,
+            (Self::IntraTurnRounds, Self::ConversationTurns) => false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PromptCacheCapabilityData {
+    pub protocol: PromptCacheProtocolData,
+    pub volatile_placement: PromptCacheVolatilePlacementData,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reuse_scope: Option<PromptCacheReuseScopeData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelsYamlPromptCacheEntry {
+    name: String,
+    #[serde(default)]
+    prompt_cache_capability: Option<PromptCacheCapabilityData>,
+    #[serde(default)]
+    quirks: Option<ModelsYamlPromptCacheQuirks>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ModelsYamlPromptCacheQuirks {
+    #[serde(default)]
+    prompt_cache_capability: Option<PromptCacheCapabilityData>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -217,6 +308,7 @@ pub struct ResolvedActiveLlmModel {
     pub fallback_chain: Vec<String>,
     pub tags: Vec<String>,
     pub request_body_overrides: Option<Map<String, Value>>,
+    pub prompt_cache_capability: Option<PromptCacheCapabilityData>,
     /// Probe-determined thinking capability. NULL if unprobed.
     pub thinking_capability: Option<ThinkingCapability>,
 }
@@ -231,6 +323,42 @@ impl ResolvedActiveLlmModel {
     pub fn upstream_model_name(&self) -> &str {
         self.wire_model_name.as_deref().unwrap_or(&self.model_name)
     }
+}
+
+fn models_yaml_path(working_dir: Option<&Path>) -> Option<PathBuf> {
+    let start = match working_dir {
+        Some(path) => path.to_path_buf(),
+        None => std::env::current_dir().ok()?,
+    };
+    let start = if start.is_dir() {
+        start
+    } else {
+        start.parent()?.to_path_buf()
+    };
+    start
+        .ancestors()
+        .map(|dir| dir.join(".models.yaml"))
+        .find(|path| path.is_file())
+}
+
+#[must_use]
+pub fn prompt_cache_capability_from_models_yaml(
+    model_name: &str,
+    working_dir: Option<&Path>,
+) -> Option<PromptCacheCapabilityData> {
+    let path = models_yaml_path(working_dir)?;
+    let yaml = std::fs::read_to_string(path).ok()?;
+    let entries: Vec<ModelsYamlPromptCacheEntry> = serde_yaml_ng::from_str(&yaml).ok()?;
+    entries.into_iter().find_map(|entry| {
+        if entry.name != model_name {
+            return None;
+        }
+        entry.prompt_cache_capability.or_else(|| {
+            entry
+                .quirks
+                .and_then(|quirks| quirks.prompt_cache_capability)
+        })
+    })
 }
 
 fn build_resolved_active_llm_from_row(
@@ -281,6 +409,7 @@ fn build_resolved_active_llm_from_row(
 
     let fallback_chain = quirks.fallback_chain;
     let wire_model_name = quirks.wire_model_name;
+    let prompt_cache_capability = quirks.prompt_cache_capability;
     let request_body_overrides = quirks.request_body_overrides;
 
     Ok(ResolvedActiveLlmModel {
@@ -292,6 +421,7 @@ fn build_resolved_active_llm_from_row(
         fallback_chain,
         tags,
         request_body_overrides,
+        prompt_cache_capability,
         thinking_capability,
     })
 }
@@ -2568,6 +2698,7 @@ mod tests {
             fallback_chain: vec![],
             tags: vec![],
             request_body_overrides: None,
+            prompt_cache_capability: None,
             thinking_capability: None,
         };
         assert_eq!(r.upstream_model_name(), "deepseek-v4-pro");
@@ -2586,6 +2717,7 @@ mod tests {
             fallback_chain: vec![],
             tags: vec![],
             request_body_overrides: None,
+            prompt_cache_capability: None,
             thinking_capability: None,
         };
         assert_eq!(r.upstream_model_name(), "claude-sonnet-4-6");
@@ -2624,6 +2756,50 @@ mod tests {
             q.request_body_overrides
                 .as_ref()
                 .and_then(|m| m.get("context_management"))
+        );
+    }
+
+    #[test]
+    fn quirks_prompt_cache_capability_round_trips_through_json() {
+        let q = QuirksData {
+            prompt_cache_capability: Some(PromptCacheCapabilityData {
+                protocol: PromptCacheProtocolData::StrictHistoryMatch,
+                volatile_placement: PromptCacheVolatilePlacementData::CurrentUserOnly,
+                reuse_scope: Some(PromptCacheReuseScopeData::ConversationTurns),
+            }),
+            ..QuirksData::default()
+        };
+
+        let json = serde_json::to_string(&q).unwrap();
+        assert!(json.contains("prompt_cache_capability"));
+        assert!(json.contains("strict_history_match"));
+        assert!(json.contains("current_user_only"));
+        assert!(json.contains("conversation_turns"));
+        let restored: QuirksData = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.prompt_cache_capability, q.prompt_cache_capability);
+    }
+
+    #[test]
+    fn quirks_prompt_cache_capability_accepts_legacy_variant_names() {
+        let q: QuirksData = serde_json::from_str(
+            r#"{
+                "prompt_cache_capability": {
+                    "protocol": "StrictHistoryMatch",
+                    "volatile_placement": "CurrentUserOnly",
+                    "reuse_scope": "IntraTurnRounds"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            q.prompt_cache_capability,
+            Some(PromptCacheCapabilityData {
+                protocol: PromptCacheProtocolData::StrictHistoryMatch,
+                volatile_placement: PromptCacheVolatilePlacementData::CurrentUserOnly,
+                reuse_scope: Some(PromptCacheReuseScopeData::IntraTurnRounds),
+            })
         );
     }
 
@@ -2692,6 +2868,11 @@ mod tests {
             system_as_user_prefix: true,
             fallback_chain: vec!["claude-haiku".into(), "gpt-4o-mini".into()],
             wire_model_name: Some("deepseek-v4-pro".into()),
+            prompt_cache_capability: Some(PromptCacheCapabilityData {
+                protocol: PromptCacheProtocolData::StrictHistoryMatch,
+                volatile_placement: PromptCacheVolatilePlacementData::CurrentUserOnly,
+                reuse_scope: Some(PromptCacheReuseScopeData::IntraTurnRounds),
+            }),
             request_body_overrides: Some(Map::from_iter([(
                 "context_management".into(),
                 serde_json::json!({"edits": [{"type": "clear_tool_uses_20250919"}]}),
@@ -2700,6 +2881,63 @@ mod tests {
         let json = serde_json::to_string(&q).unwrap();
         let restored: QuirksData = serde_json::from_str(&json).unwrap();
         assert_eq!(restored, q);
+    }
+
+    #[test]
+    fn prompt_cache_reuse_scope_supports_intra_turn_fallback() {
+        assert!(
+            PromptCacheReuseScopeData::ConversationTurns
+                .supports(PromptCacheReuseScopeData::IntraTurnRounds)
+        );
+        assert!(
+            !PromptCacheReuseScopeData::IntraTurnRounds
+                .supports(PromptCacheReuseScopeData::ConversationTurns)
+        );
+    }
+
+    #[test]
+    fn prompt_cache_capability_from_models_yaml_reads_top_level_and_walks_ancestors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let nested = repo.join("rust").join("crates").join("astra-cli");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(
+            repo.join(".models.yaml"),
+            r#"
+- name: kimi-k2.6
+  prompt_cache_capability:
+    protocol: openai_auto_prefix
+    volatile_placement: tail_suffix
+    reuse_scope: intra_turn_rounds
+- name: deepseek-v4-flash
+  quirks:
+    prompt_cache_capability:
+      protocol: strict_history_match
+      volatile_placement: current_user_only
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            prompt_cache_capability_from_models_yaml("kimi-k2.6", Some(&nested)),
+            Some(PromptCacheCapabilityData {
+                protocol: PromptCacheProtocolData::OpenAiAutoPrefix,
+                volatile_placement: PromptCacheVolatilePlacementData::TailSuffix,
+                reuse_scope: Some(PromptCacheReuseScopeData::IntraTurnRounds),
+            })
+        );
+        assert_eq!(
+            prompt_cache_capability_from_models_yaml("deepseek-v4-flash", Some(&nested)),
+            Some(PromptCacheCapabilityData {
+                protocol: PromptCacheProtocolData::StrictHistoryMatch,
+                volatile_placement: PromptCacheVolatilePlacementData::CurrentUserOnly,
+                reuse_scope: None,
+            })
+        );
+        assert_eq!(
+            prompt_cache_capability_from_models_yaml("missing", Some(&nested)),
+            None
+        );
     }
 
     #[test]

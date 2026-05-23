@@ -14,6 +14,56 @@ use serde_json::{Map, Value, json};
 use super::agentic_loop_host::AgenticLoopState;
 use super::prompt_cache::PromptCacheConfig;
 
+pub(crate) fn cache_capability_from_model_metadata(
+    value: Option<astra_services::PromptCacheCapabilityData>,
+) -> Option<astra_turn_core::cache_placement::CacheCapability> {
+    let value = value?;
+    let protocol = match value.protocol {
+        astra_services::PromptCacheProtocolData::MarkerExplicit => {
+            astra_turn_core::cache_placement::CacheProtocol::MarkerExplicit
+        }
+        astra_services::PromptCacheProtocolData::BedrockCachePoint => {
+            astra_turn_core::cache_placement::CacheProtocol::BedrockCachePoint
+        }
+        astra_services::PromptCacheProtocolData::OpenAiAutoPrefix => {
+            astra_turn_core::cache_placement::CacheProtocol::OpenAiAutoPrefix
+        }
+        astra_services::PromptCacheProtocolData::StrictHistoryMatch => {
+            astra_turn_core::cache_placement::CacheProtocol::StrictHistoryMatch
+        }
+        astra_services::PromptCacheProtocolData::None => {
+            astra_turn_core::cache_placement::CacheProtocol::None
+        }
+    };
+    let volatile_placement = match value.volatile_placement {
+        astra_services::PromptCacheVolatilePlacementData::MarkerIsolated => {
+            astra_turn_core::cache_placement::VolatilePlacement::MarkerIsolated
+        }
+        astra_services::PromptCacheVolatilePlacementData::TailSuffix => {
+            astra_turn_core::cache_placement::VolatilePlacement::TailSuffix
+        }
+        astra_services::PromptCacheVolatilePlacementData::CurrentUserOnly => {
+            astra_turn_core::cache_placement::VolatilePlacement::CurrentUserOnly
+        }
+        astra_services::PromptCacheVolatilePlacementData::Free => {
+            astra_turn_core::cache_placement::VolatilePlacement::Free
+        }
+    };
+    let reuse_scope = value.reuse_scope.map(|scope| match scope {
+        astra_services::PromptCacheReuseScopeData::ConversationTurns => {
+            astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns
+        }
+        astra_services::PromptCacheReuseScopeData::IntraTurnRounds => {
+            astra_turn_core::cache_placement::CacheReuseScope::IntraTurnRounds
+        }
+    });
+    Some(astra_turn_core::cache_placement::CacheCapability {
+        protocol,
+        volatile_placement,
+        reuse_scope,
+    })
+}
+
 fn estimate_json_tokens(value: &Value) -> u32 {
     (value.to_string().len() as u32 / 4).saturating_add(1)
 }
@@ -31,6 +81,7 @@ pub(crate) struct LlmContextAssemblyInput<'a> {
     pub cache_cfg: &'a PromptCacheConfig,
     pub provider: &'a str,
     pub model_name: &'a str,
+    pub cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
     pub user_content: &'a str,
     pub query_source: &'a str,
 }
@@ -291,6 +342,7 @@ impl<'a> BridgeRuntimeSignals<'a> {
 
 pub(crate) struct BridgeSessionContextInput<'a> {
     pub cache_cfg: &'a PromptCacheConfig,
+    pub cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
     pub session_id: &'a str,
     pub model_id: &'a str,
     pub provider: &'a str,
@@ -304,6 +356,7 @@ impl<'a> BridgeSessionContextInput<'a> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         cache_cfg: &'a PromptCacheConfig,
+        cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
         session_id: &'a str,
         model_id: &'a str,
         provider: &'a str,
@@ -313,6 +366,7 @@ impl<'a> BridgeSessionContextInput<'a> {
     ) -> Self {
         Self {
             cache_cfg,
+            cache_capability,
             session_id,
             model_id,
             provider,
@@ -348,6 +402,7 @@ pub(crate) struct LlmWireAssemblyInput<'a> {
     pub session_id: &'a str,
     pub provider: &'a str,
     pub model_name: &'a str,
+    pub cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
     pub cache_cfg: &'a PromptCacheConfig,
 }
 
@@ -557,6 +612,7 @@ pub(crate) fn assemble_bridge_context(
         input.runtime_signals.selection_confidence,
         input.runtime_signals.task_type,
         input.session.cache_cfg,
+        input.session.cache_capability,
         input.session.session_id,
         input.session.model_id,
         input.session.provider,
@@ -629,6 +685,11 @@ pub(crate) fn assemble_context_pipeline(
         })
         .collect();
     let tool_names: Vec<&str> = tool_names_owned.iter().map(String::as_str).collect();
+    let cache_cap = CacheCapability::from_explicit_or_provider_model(
+        input.cache_capability,
+        input.provider,
+        input.model_name,
+    );
 
     let mut external = build_external_sources(
         input.runtime_signals.edge_profile,
@@ -637,6 +698,7 @@ pub(crate) fn assemble_context_pipeline(
         &tool_names,
         input.runtime_signals.selection_confidence,
         input.runtime_signals.plan_resume_hint.as_deref(),
+        Some(cache_cap),
     );
     external
         .extra_stable_sections
@@ -664,6 +726,7 @@ pub(crate) fn assemble_context_pipeline(
         input.runtime_signals.edge_profile,
         input.provider,
         state.project_context.as_deref(),
+        Some(cache_cap),
     );
     if !input.tool_surface.deferred_tools_block.is_empty() {
         session_ctx.deferred_tools_block = input.tool_surface.deferred_tools_block.to_string();
@@ -714,7 +777,6 @@ pub(crate) fn assemble_context_pipeline(
         ..Default::default()
     };
 
-    let cache_cap = CacheCapability::for_provider_and_model(input.provider, input.model_name);
     let round_within_turn = state.current_round_index;
     let inject_volatile = cache_cap.should_inject_volatile_on_round(round_within_turn);
 
@@ -877,7 +939,7 @@ pub(crate) fn assemble_wire_messages(input: LlmWireAssemblyInput<'_>) -> Vec<Val
         cwd: input.edge_profile.get("cwd").and_then(Value::as_str),
     };
 
-    crate::turn::wire_assembly::assemble_llm_messages(
+    crate::turn::wire_assembly::assemble_llm_messages_with_cache_capability(
         input.system_messages,
         input.volatile_preamble,
         drained,
@@ -886,6 +948,7 @@ pub(crate) fn assemble_wire_messages(input: LlmWireAssemblyInput<'_>) -> Vec<Val
         input.session_id,
         input.provider,
         input.model_name,
+        input.cache_capability,
         input.cache_cfg,
     )
 }
@@ -896,6 +959,46 @@ pub(crate) fn annotate_tool_schemas_for_cache(
     cache_cfg: &PromptCacheConfig,
 ) {
     crate::turn::prompt_cache::annotate_tool_schemas_for_caching(tool_schemas, cache_cfg);
+}
+
+pub(crate) fn stabilize_tool_schemas_for_cache(
+    current_tool_schemas: &[Value],
+    previous_tool_schemas: &[Value],
+    visible_tool_schemas: &[Value],
+    cache_capability: astra_turn_core::cache_placement::CacheCapability,
+    round_in_turn: u32,
+) -> Vec<Value> {
+    if round_in_turn == 0
+        || previous_tool_schemas.is_empty()
+        || matches!(
+            cache_capability.protocol,
+            astra_turn_core::cache_placement::CacheProtocol::None
+        )
+    {
+        return current_tool_schemas.to_vec();
+    }
+
+    let visible_names: HashSet<&str> = visible_tool_schemas.iter().filter_map(tool_name).collect();
+    let mut stabilized = Vec::new();
+    let mut seen = HashSet::new();
+
+    for schema in previous_tool_schemas {
+        let Some(name) = tool_name(schema) else {
+            continue;
+        };
+        if visible_names.contains(name) {
+            push_unique_tool(&mut stabilized, &mut seen, schema);
+        }
+    }
+    for schema in current_tool_schemas {
+        push_unique_tool(&mut stabilized, &mut seen, schema);
+    }
+
+    if stabilized.is_empty() {
+        current_tool_schemas.to_vec()
+    } else {
+        stabilized
+    }
 }
 
 /// Apply provider-specific message cache metadata.
@@ -919,12 +1022,25 @@ pub(crate) fn finalize_bridge_wire_messages(
     volatile_text: Option<String>,
     provider: &str,
     model_name: &str,
+    cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
 ) -> bool {
     astra_turn_core::edge_ledger::strip_stale_reasoning(llm_messages, provider, model_name);
+    let cache_cap =
+        astra_turn_core::cache_placement::CacheCapability::from_explicit_or_provider_model(
+            cache_capability,
+            provider,
+            model_name,
+        );
     let mut appended_synthetic_tail = false;
     if let Some(text) = volatile_text
         && !text.is_empty()
     {
+        if matches!(
+            cache_cap.volatile_placement,
+            astra_turn_core::cache_placement::VolatilePlacement::CurrentUserOnly
+        ) {
+            return false;
+        }
         let wrapped = format!("<system-reminder>\n{text}</system-reminder>");
         let tail_role = llm_messages
             .last()
@@ -1025,6 +1141,78 @@ mod context_cache_contract_tests {
     }
 
     #[test]
+    fn stabilize_tool_schemas_keeps_prior_tools_visible_mid_turn() {
+        let visible = vec![tool("bash"), tool("read_file"), tool("git")];
+        let previous = vec![tool("bash"), tool("read_file"), tool("git")];
+        let current = vec![tool("bash"), tool("read_file")];
+
+        let stabilized = stabilize_tool_schemas_for_cache(
+            &current,
+            &previous,
+            &visible,
+            astra_turn_core::cache_placement::CacheCapability {
+                protocol: astra_turn_core::cache_placement::CacheProtocol::StrictHistoryMatch,
+                volatile_placement:
+                    astra_turn_core::cache_placement::VolatilePlacement::CurrentUserOnly,
+                reuse_scope: Some(
+                    astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns,
+                ),
+            },
+            1,
+        );
+
+        assert_eq!(tool_names(&stabilized), vec!["bash", "read_file", "git"]);
+    }
+
+    #[test]
+    fn stabilize_tool_schemas_resets_on_first_round() {
+        let visible = vec![tool("bash"), tool("read_file"), tool("git")];
+        let previous = vec![tool("bash"), tool("read_file"), tool("git")];
+        let current = vec![tool("bash"), tool("read_file")];
+
+        let stabilized = stabilize_tool_schemas_for_cache(
+            &current,
+            &previous,
+            &visible,
+            astra_turn_core::cache_placement::CacheCapability {
+                protocol: astra_turn_core::cache_placement::CacheProtocol::StrictHistoryMatch,
+                volatile_placement:
+                    astra_turn_core::cache_placement::VolatilePlacement::CurrentUserOnly,
+                reuse_scope: Some(
+                    astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns,
+                ),
+            },
+            0,
+        );
+
+        assert_eq!(tool_names(&stabilized), vec!["bash", "read_file"]);
+    }
+
+    #[test]
+    fn stabilize_tool_schemas_drops_no_longer_visible_tools() {
+        let visible = vec![tool("bash"), tool("read_file")];
+        let previous = vec![tool("bash"), tool("read_file"), tool("git")];
+        let current = vec![tool("bash"), tool("read_file")];
+
+        let stabilized = stabilize_tool_schemas_for_cache(
+            &current,
+            &previous,
+            &visible,
+            astra_turn_core::cache_placement::CacheCapability {
+                protocol: astra_turn_core::cache_placement::CacheProtocol::StrictHistoryMatch,
+                volatile_placement:
+                    astra_turn_core::cache_placement::VolatilePlacement::CurrentUserOnly,
+                reuse_scope: Some(
+                    astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns,
+                ),
+            },
+            1,
+        );
+
+        assert_eq!(tool_names(&stabilized), vec!["bash", "read_file"]);
+    }
+
+    #[test]
     fn context_meta_event_preserves_manifest_trace() {
         let breakdown = astra_turn_core::context_assembly_trace::SystemPromptBreakdown {
             total_tokens: 123,
@@ -1084,6 +1272,7 @@ mod context_cache_contract_tests {
             Some("volatile".to_string()),
             "openai",
             "gpt-4",
+            None,
         );
 
         assert_eq!(messages[0]["content"], "original user");
@@ -1104,6 +1293,7 @@ mod context_cache_contract_tests {
             Some("volatile".to_string()),
             "openai",
             "gpt-4",
+            None,
         );
 
         assert_eq!(messages.len(), 1);
@@ -1111,5 +1301,44 @@ mod context_cache_contract_tests {
             messages[0]["content"],
             "<system-reminder>\nvolatile</system-reminder>\n\noriginal user"
         );
+    }
+
+    #[test]
+    fn finalize_bridge_wire_messages_skips_current_user_only_models() {
+        let mut messages = vec![json!({"role": "user", "content": "original user"})];
+
+        let appended = finalize_bridge_wire_messages(
+            &mut messages,
+            Some("volatile".to_string()),
+            "openai",
+            "deepseek-v4-flash",
+            None,
+        );
+
+        assert!(!appended);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["content"], "original user");
+    }
+
+    #[test]
+    fn finalize_bridge_wire_messages_uses_explicit_cache_capability() {
+        let mut messages = vec![json!({"role": "user", "content": "original user"})];
+        let explicit = astra_turn_core::cache_placement::CacheCapability {
+            protocol: astra_turn_core::cache_placement::CacheProtocol::StrictHistoryMatch,
+            volatile_placement:
+                astra_turn_core::cache_placement::VolatilePlacement::CurrentUserOnly,
+            reuse_scope: Some(astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns),
+        };
+
+        let appended = finalize_bridge_wire_messages(
+            &mut messages,
+            Some("volatile".to_string()),
+            "openai",
+            "gpt-4o",
+            Some(explicit),
+        );
+
+        assert!(!appended);
+        assert_eq!(messages[0]["content"], "original user");
     }
 }

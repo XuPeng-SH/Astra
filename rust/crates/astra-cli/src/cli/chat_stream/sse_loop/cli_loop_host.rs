@@ -355,20 +355,23 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             }
         }
 
-        // Session c47c2dca regression fix: drain the structured volatile
-        // lane BEFORE subsequent immutable state borrows — the lane
-        // holds runtime nudges (stall reflection, circuit-breaker
-        // self-check, Task #42/#43 advisories, etc.) that must ride the
-        // outgoing payload or the LLM never sees them. Using the
-        // `_appended_to` variant so we never produce consecutive
-        // role=user pairs (Bedrock HTTP 400). See
-        // `take_volatile_pending_as_message` / `take_volatile_pending_appended_to`
-        // docs for the full context.
-        let augmented_messages_owned: Option<Vec<serde_json::Value>> =
-            state.take_volatile_pending_appended_to(state.messages.clone());
-
+        // Drain the structured volatile lane before immutable state borrows,
+        // but do not inline it into `messages[]`. The server resolves the
+        // concrete model row and applies prompt-cache capability metadata before
+        // deciding whether this lane is safe to inject.
         // If a skill activation overrode the model, use that; otherwise fall back to host default.
-        let effective_model = state.skills.model_override.as_deref().or(self.model);
+        let effective_model_owned = state
+            .skills
+            .model_override
+            .clone()
+            .or_else(|| self.model.map(str::to_owned));
+        let effective_model = effective_model_owned.as_deref();
+        let runtime_volatile_texts = state
+            .take_volatile_pending()
+            .into_iter()
+            .map(|injection| injection.content)
+            .filter(|content| !content.trim().is_empty())
+            .collect::<Vec<_>>();
 
         // Skill allowed_tools is additive — it ensures skill-referenced tools
         // are visible to the model via schema injection, but never restricts
@@ -434,15 +437,6 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
                 .or_else(|| self.root_send_message_context.clone()),
         );
 
-        // Use the augmented messages from the volatile drain if any;
-        // otherwise fall through to state.messages untouched. The
-        // augmentation is already protocol-safe (no consecutive-user
-        // pairs — see `take_volatile_pending_appended_to`).
-        let messages_slice: &[serde_json::Value] = match augmented_messages_owned.as_ref() {
-            Some(vec) => vec.as_slice(),
-            None => state.messages.as_slice(),
-        };
-
         let turn_result = fetch_chat_turn_sse(ChatTurnSseFetchRequest {
             api: self.api,
             token: self.token.as_str(),
@@ -458,7 +452,8 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             project_root: self.project_root.as_path(),
             executor: Arc::clone(&self.executor),
             registry: &self.registry,
-            messages: messages_slice,
+            messages: state.messages.as_slice(),
+            runtime_volatile_texts: &runtime_volatile_texts,
             ephemeral_prefix: state.skills.listing_message.as_ref(),
             current_session_id: state.current_session_id.as_deref(),
             tool_results: state.tool_results.as_slice(),
@@ -1202,7 +1197,7 @@ mod tests {
     // is there.
 
     #[test]
-    fn execute_turn_drains_volatile_lane_into_outgoing_messages() {
+    fn execute_turn_drains_volatile_lane_into_edge_profile() {
         // Guard against the session c47c2dca regression. The CLI must
         // drain the structured volatile lane before building the
         // outgoing HTTP payload; otherwise stall nudges, circuit-breaker
@@ -1220,38 +1215,35 @@ mod tests {
         // call syntax (dot prefix + parens suffix) assembled via
         // concat! so this test's literal cannot self-satisfy.
         //
-        // The accepted method is the protocol-safe `_appended_to`
-        // variant — appending a bare user msg via the non-safe variant
-        // would create consecutive-user-role pairs that Bedrock
-        // rejects. Either is better than dropping the lane entirely,
-        // but the safe one is what production must use.
+        // The accepted method is the structured drain. The CLI must not inline
+        // the text into messages because only the server has the resolved model
+        // row and prompt-cache capability metadata.
         //
         // Do NOT quote the call syntax verbatim anywhere in this
         // function body or its comments — it would defeat the check.
-        let safe_call = concat!(".take_volatile_pending", "_appended_to(");
+        let safe_call = concat!(".take_volatile_pending", "()");
         assert!(
             source.contains(safe_call),
-            "execute_turn must invoke the protocol-safe drain method \
-             (session c47c2dca regression + consecutive-user guard). \
+            "execute_turn must invoke the structured volatile drain method \
+             (session c47c2dca regression + cache-capability guard). \
              The expected call syntax is absent; nudges will be dropped \
-             or produce invalid payloads."
+             or model-specific cache policy will be bypassed."
         );
 
-        // Signature 2: the LOCAL outgoing-messages vec built from
-        // state.messages + the drained volatile msg. Pattern stays
-        // lexically distinct from this test's literals.
+        // Signature 2: the drained text travels in the dedicated request field,
+        // not as appended user messages.
         assert!(
-            source.contains("augmented.push(msg)"),
-            "execute_turn must append the drained volatile msg to a local \
-             clone of state.messages (session c47c2dca regression fix shape)"
+            source.contains("runtime_volatile_texts"),
+            "execute_turn must route the drained volatile lane through \
+             runtime_volatile_texts so the server can apply cache capability"
         );
 
-        // Signature 3: the slice handed to the fetch request must be
-        // the augmented one when non-empty, else state.messages.
+        // Signature 3: raw history stays raw; volatile must not mutate
+        // `messages[]` before server-side model resolution.
         assert!(
-            source.contains("messages_slice"),
-            "execute_turn must pass an augmented messages_slice to \
-             fetch_chat_turn_sse, not raw state.messages (session c47c2dca)"
+            source.contains("messages: state.messages.as_slice()"),
+            "execute_turn must pass raw state.messages and keep volatile \
+             separate from the conversation history"
         );
     }
 

@@ -230,6 +230,7 @@ struct BridgePipelineBaseline {
     next_turn: u32,
     stats: astra_turn_core::pipeline_stats::PipelineStats,
     cache_detector: astra_turn_core::cache_diagnostics::CacheBreakDetector,
+    last_tool_schemas: Vec<Value>,
 }
 
 const BRIDGE_CACHE_SOURCE: &str = "bridge_inprocess";
@@ -269,6 +270,7 @@ fn load_bridge_pipeline_baseline(session_id: &str) -> BridgePipelineBaseline {
     let mut response_count = 0u32;
     let mut max_turn = 0u32;
     let mut pending_request_snapshot = None;
+    let mut last_tool_schemas = Vec::new();
 
     for event in events {
         max_turn = max_turn.max(event.turn.unwrap_or(0));
@@ -286,6 +288,10 @@ fn load_bridge_pipeline_baseline(session_id: &str) -> BridgePipelineBaseline {
             astra_services::session_journal::JournalEventType::LlmRequestFull
                 if event_matches_bridge_cache_source(&event) =>
             {
+                let tools = bridge_tool_schemas_from_journal_event(&event);
+                if !tools.is_empty() {
+                    last_tool_schemas = tools;
+                }
                 pending_request_snapshot = bridge_prompt_snapshot_from_journal_event(&event);
             }
             astra_services::session_journal::JournalEventType::LlmResponseFull => {
@@ -334,6 +340,7 @@ fn load_bridge_pipeline_baseline(session_id: &str) -> BridgePipelineBaseline {
             ..Default::default()
         },
         cache_detector,
+        last_tool_schemas,
     }
 }
 
@@ -384,6 +391,20 @@ fn bridge_prompt_snapshot_from_journal_event(
         .unwrap_or("unknown");
     let provider = metadata.get("provider").and_then(Value::as_str)?;
     bridge_prompt_snapshot_from_messages(&messages, &tools, model, provider)
+}
+
+fn bridge_tool_schemas_from_journal_event(
+    event: &astra_services::session_journal::JournalEvent,
+) -> Vec<Value> {
+    event
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("request"))
+        .and_then(Value::as_object)
+        .and_then(|request| request.get("tools"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
 }
 
 fn bridge_prompt_snapshot_from_messages(
@@ -1286,13 +1307,14 @@ impl InProcessChatTurnBridge {
             // Resolve LLM model (skipped when `test_llm_rounds` drives the turn — feature `bridge-e2e-hooks`).
             // Also capture fallback_chain for rate-limit-triggered fallback.
             let pool_ref = shared_pool.as_ref().map(SharedPool::get);
-            let (mut model_name, mut wire_model_name, mut api_key, mut base_url, mut provider, mut request_body_overrides, fallback_chain) = if use_e2e_llm {
+            let (mut model_name, mut wire_model_name, mut api_key, mut base_url, mut provider, mut request_body_overrides, mut cache_capability, fallback_chain) = if use_e2e_llm {
                 (
                     "bridge-e2e-mock".to_string(),
                     None::<String>,
                     "unused".to_string(),
                     "http://127.0.0.1:1".to_string(),
                     "openai".to_string(),
+                    None,
                     None,
                     Vec::<String>::new(),
                 )
@@ -1312,6 +1334,9 @@ impl InProcessChatTurnBridge {
                         m.base_url,
                         m.provider,
                         m.request_body_overrides,
+                        crate::turn::llm_context::cache_capability_from_model_metadata(
+                            m.prompt_cache_capability,
+                        ),
                         m.fallback_chain,
                     ),
                     Err(e) => {
@@ -1325,7 +1350,8 @@ impl InProcessChatTurnBridge {
 
             // Latch cache config at session init — prevents mid-session env var
             // changes from busting the KV cache.
-            let cache_cfg = PromptCacheConfig::latch(&provider, &model_name);
+            let cache_cfg =
+                PromptCacheConfig::from_cache_capability(cache_capability, &provider, &model_name);
 
             // Check rate-limit cooldown and handle fallback model resolution
             let cooldown = rate_limit_cooldown();
@@ -1378,6 +1404,10 @@ impl InProcessChatTurnBridge {
                             base_url = fb.base_url;
                             provider = fb.provider;
                             request_body_overrides = fb.request_body_overrides;
+                            cache_capability =
+                                crate::turn::llm_context::cache_capability_from_model_metadata(
+                                    fb.prompt_cache_capability,
+                                );
                         }
                         FallbackOutcome::NoFallbackConfigured => {
                             astra_core::agent_warn!(
@@ -1929,6 +1959,23 @@ impl InProcessChatTurnBridge {
                 // once when skill catalog changes, then stabilizes.
                 stable_sections.push(section);
             }
+            if let Some(texts) = edge_profile
+                .get(astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS)
+                .and_then(Value::as_array)
+            {
+                let runtime_volatile = texts
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .filter(|text| !text.trim().is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                if !runtime_volatile.is_empty() {
+                    dynamic_sections.push(prompts::PromptSection::dynamic(
+                        runtime_volatile,
+                        prompts::PromptTokenBucket::Environment,
+                    ));
+                }
+            }
             if !tool_round_guidance.is_empty() {
                 dynamic_sections.push(
                     prompts::PromptSection::dynamic(
@@ -1964,10 +2011,12 @@ impl InProcessChatTurnBridge {
             // Provider-aware volatile gating — see
             // `effective_volatile_sections_for_round` for the full rationale.
             // CurrentUserOnly (MiniMax) drops ALL rounds, not just >0.
-            let cache_cap = astra_turn_core::cache_placement::CacheCapability::for_provider_and_model(
-                &provider,
-                &model_name,
-            );
+            let cache_cap =
+                astra_turn_core::cache_placement::CacheCapability::from_explicit_or_provider_model(
+                    cache_capability,
+                    &provider,
+                    &model_name,
+                );
             let effective_dynamic_sections = effective_volatile_sections_for_round(
                 cache_cap,
                 round_index,
@@ -2006,6 +2055,7 @@ impl InProcessChatTurnBridge {
                     ),
                     session: crate::turn::llm_context::BridgeSessionContextInput::new(
                         &cache_cfg,
+                        cache_capability,
                         &session_id,
                         &model_name,
                         &provider,
@@ -2160,6 +2210,7 @@ impl InProcessChatTurnBridge {
                 bridge_volatile_text.take(),
                 &provider,
                 &model_name,
+                cache_capability,
             );
 
             // Cloud loop: every tool round waits on §5.5 ledger (`POST /tools/result`) then continues LLM.
@@ -2204,7 +2255,14 @@ impl InProcessChatTurnBridge {
                 // tool-pruning paths. Phase 3 will feed last-measured back
                 // into the planner; until then rely on pipeline output.
                 let _ = last_measured_prompt; // referenced for future wiring
-                let mut pruned_tools = pipeline_tool_schemas.clone();
+                let mut pruned_tools = crate::turn::llm_context::stabilize_tool_schemas_for_cache(
+                    &pipeline_tool_schemas,
+                    &bridge_pipeline_baseline.last_tool_schemas,
+                    &round_edge_tools,
+                    cache_cap,
+                    round_index,
+                );
+                bridge_pipeline_baseline.last_tool_schemas = pruned_tools.clone();
                 crate::turn::llm_context::annotate_tool_schemas_for_cache(
                     &mut pruned_tools,
                     &cache_cfg,
@@ -4561,6 +4619,23 @@ mod tests {
     }
 
     #[test]
+    fn effective_volatile_deepseek_v4_flash_is_empty_on_every_round() {
+        let cap = astra_turn_core::cache_placement::CacheCapability::for_provider_and_model(
+            "openai",
+            "deepseek-v4-flash",
+        );
+        let dyn_sections = sample_volatile_sections();
+        for round in [0u32, 1, 2, 6, 12] {
+            let out = effective_volatile_sections_for_round(cap, round, &dyn_sections);
+            assert!(
+                out.is_empty(),
+                "DeepSeek v4 flash must suppress volatile on round {round}; got {} sections",
+                out.len(),
+            );
+        }
+    }
+
+    #[test]
     fn effective_volatile_openai_keeps_sections_on_every_round() {
         // OpenAI auto-prefix (TailSuffix): safe to inject every round
         // since volatile lives at the tail of the last user message.
@@ -4699,6 +4774,7 @@ mod tests {
             Some("volatile".to_string()),
             "anthropic",
             "claude-sonnet-4",
+            None,
         );
         if !bridge_tail_is_synthetic {
             crate::turn::llm_context::apply_message_cache_metadata(
@@ -6156,7 +6232,13 @@ mod tests {
                         {"role": "system", "content": system_text},
                         {"role": "user", "content": "ping"}
                     ],
-                    "tools": []
+                    "tools": [{
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "parameters": {"type": "object"}
+                        }
+                    }]
                 }
             })
         };
@@ -6219,6 +6301,20 @@ mod tests {
 
         let mut baseline = load_bridge_pipeline_baseline(session_id);
         assert_eq!(baseline.next_turn, 3);
+        let tool_names: Vec<&str> = baseline
+            .last_tool_schemas
+            .iter()
+            .filter_map(|tool| {
+                tool.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(Value::as_str)
+            })
+            .collect();
+        assert_eq!(
+            tool_names,
+            vec!["read_file"],
+            "baseline should reconstruct the last advertised tool schema set"
+        );
         assert!(
             baseline
                 .cache_detector
@@ -6232,7 +6328,13 @@ mod tests {
                 json!({"role": "system", "content": "stable prompt"}),
                 json!({"role": "user", "content": "continue"}),
             ],
-            &[],
+            &[json!({
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "parameters": {"type": "object"}
+                }
+            })],
             "test-model",
             "openai",
         )

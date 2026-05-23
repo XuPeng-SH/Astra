@@ -270,6 +270,7 @@ struct ResolvedTurnLlmConfig {
     api_key: String,
     base_url: String,
     provider: String,
+    cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
     fallback_chain: Vec<String>,
     header_overrides: HashMap<String, String>,
     request_body_overrides: Option<Map<String, Value>>,
@@ -356,6 +357,7 @@ async fn resolve_llm_model_for_turn(
             api_key: String::new(),
             base_url: "https://api.openai.com/v1".to_string(),
             provider: "openai".to_string(),
+            cache_capability: None,
             fallback_chain: Vec::new(),
             header_overrides: forward_headers.clone(),
             request_body_overrides: None,
@@ -372,6 +374,9 @@ async fn resolve_llm_model_for_turn(
         api_key: resolved.api_key,
         base_url: resolved.base_url,
         provider: resolved.provider,
+        cache_capability: crate::turn::llm_context::cache_capability_from_model_metadata(
+            resolved.prompt_cache_capability,
+        ),
         fallback_chain: resolved.fallback_chain,
         header_overrides: HashMap::new(),
         request_body_overrides: resolved.request_body_overrides,
@@ -1420,6 +1425,7 @@ impl ServerAgenticLoopHost {
             api_key: String::new(),
             base_url: String::new(),
             fallback_chain: Vec::new(),
+            cache_capability: None,
             header_overrides: HashMap::new(),
             request_body_overrides: None,
             completions_url_override: None,
@@ -2061,6 +2067,25 @@ impl ServerAgenticLoopHost {
         model_name: &str,
         user_content: &str,
     ) -> Result<PipelineTurnOutcome, astra_core::ClassifiedError> {
+        self.run_turn_pipeline_with_cache_capability(
+            state,
+            visible_tools,
+            provider,
+            model_name,
+            None,
+            user_content,
+        )
+    }
+
+    fn run_turn_pipeline_with_cache_capability(
+        &mut self,
+        state: &mut AgenticLoopState,
+        visible_tools: &[Value],
+        provider: &str,
+        model_name: &str,
+        cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
+        user_content: &str,
+    ) -> Result<PipelineTurnOutcome, astra_core::ClassifiedError> {
         let plan_hint = self.read_plan_resume_hint();
         let lifecycle_summary = if let Some(existing) = &self.turn_start_lifecycle_summary {
             if self.turn_start_plan_resume_hint.as_deref() != plan_hint.as_deref() {
@@ -2087,7 +2112,8 @@ impl ServerAgenticLoopHost {
             "visible_tool_count": visible_tools.len(),
             "restricted_tool_count": restricted_snapshot.len(),
         }));
-        let cache_cfg = PromptCacheConfig::latch(provider, model_name);
+        let cache_cfg =
+            PromptCacheConfig::from_cache_capability(cache_capability, provider, model_name);
         crate::turn::llm_context::assemble_context_pipeline(
             crate::turn::llm_context::LlmContextAssemblyInput {
                 state,
@@ -2106,6 +2132,7 @@ impl ServerAgenticLoopHost {
                 cache_cfg: &cache_cfg,
                 provider,
                 model_name,
+                cache_capability,
                 user_content,
                 query_source: "agentic_loop",
             },
@@ -2191,6 +2218,7 @@ impl ServerAgenticLoopHost {
                 session_id: &self.session_id,
                 provider: &llm_cfg.provider,
                 model_name: &llm_cfg.model_name,
+                cache_capability: llm_cfg.cache_capability,
                 cache_cfg,
             },
         )
@@ -2426,7 +2454,11 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
 
         // Latch prompt cache config from provider info (once per turn is fine;
         // provider doesn't change within a turn).
-        let cache_cfg = PromptCacheConfig::latch(&llm_cfg.provider, &llm_cfg.model_name);
+        let cache_cfg = PromptCacheConfig::from_cache_capability(
+            llm_cfg.cache_capability,
+            &llm_cfg.provider,
+            &llm_cfg.model_name,
+        );
         self.resolved_model_name = Some(llm_cfg.model_name.clone());
         self.resolved_llm_params = Some(astra_turn_core::cloud_summary::LlmConnParams {
             model_name: llm_cfg.model_name.clone(),
@@ -2442,11 +2474,12 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         //   * compaction tier selection
         //   * tier-pruned tool schemas
         // Runtime no longer re-derives any of these.
-        let turn_pipeline = self.run_turn_pipeline(
+        let turn_pipeline = self.run_turn_pipeline_with_cache_capability(
             state,
             &visible_tools,
             &llm_cfg.provider,
             &llm_cfg.model_name,
+            llm_cfg.cache_capability,
             &user_content,
         )?;
         let PipelineTurnOutcome {
@@ -2497,7 +2530,20 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let budget = crate::prompts::budget_for_model(Some(&llm_cfg.model_name));
         let max_output_tokens = crate::prompts::capped_output_tokens(&budget);
 
-        let mut final_tools = pipeline_tool_schemas;
+        let cache_cap =
+            astra_turn_core::cache_placement::CacheCapability::from_explicit_or_provider_model(
+                llm_cfg.cache_capability,
+                &llm_cfg.provider,
+                &llm_cfg.model_name,
+            );
+        let mut final_tools = crate::turn::llm_context::stabilize_tool_schemas_for_cache(
+            &pipeline_tool_schemas,
+            &state.sticky_tool_schemas,
+            &visible_tools,
+            cache_cap,
+            state.llm_rounds_completed,
+        );
+        state.sticky_tool_schemas = final_tools.clone();
         // Annotate tool schemas with cache_control for Anthropic.
         crate::turn::llm_context::annotate_tool_schemas_for_cache(&mut final_tools, &cache_cfg);
         if let Some(trace) = state.last_llm_context_manifest_trace.as_mut() {
@@ -3976,6 +4022,7 @@ mod tests {
             base_url: String::new(),
             provider: "openai".into(),
             fallback_chain: Vec::new(),
+            cache_capability: None,
             header_overrides: HashMap::new(),
             request_body_overrides: None,
             completions_url_override: None,
@@ -4293,6 +4340,45 @@ mod tests {
                 out.volatile_preamble.is_empty(),
                 "MiniMax must suppress volatile preamble on every round \
                  (strict-history provider). round={round} preamble={:?}",
+                out.volatile_preamble,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn run_turn_pipeline_deepseek_v4_flash_skips_volatile_on_tool_loop_round() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-deepseek".to_string(),
+            "s-deepseek".to_string(),
+        )
+        .with_edge_tools(vec![json!({
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "Shell.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        })])
+        .build();
+        let mut state = create_test_state();
+        state.current_session_id = Some("s-deepseek".into());
+        state.max_turn_input_tokens = 200_000;
+        state.pipeline_session = Some(astra_turn_core::pipeline_session::PipelineSession::new(
+            astra_turn_core::pipeline_config::PipelineConfig::default(),
+        ));
+        let tools = host.edge_tools.clone();
+
+        for round in [0u32, 1, 5] {
+            state.current_round_index = round;
+            let out = host
+                .run_turn_pipeline(&mut state, &tools, "openai", "deepseek-v4-flash", "hi")
+                .expect("pipeline should succeed");
+            assert!(
+                out.volatile_preamble.is_empty(),
+                "DeepSeek v4 flash must suppress volatile preamble on every round. \
+                 round={round} preamble={:?}",
                 out.volatile_preamble,
             );
         }
@@ -4818,6 +4904,7 @@ mod tests {
             consecutive_context_window_errors: 0,
             compaction_effectiveness: Default::default(),
             pinned_tool_schema_tokens: 0,
+            sticky_tool_schemas: Vec::new(),
             max_turn_input_tokens: 0,
             budget_wrapup_injected: false,
             budget_wrapup_ignored_rounds: 0,
