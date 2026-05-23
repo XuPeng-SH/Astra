@@ -310,7 +310,7 @@ fn is_completion_signal(content: &str) -> bool {
 pub(crate) fn assemble_llm_messages(
     system_messages: Vec<Value>,
     volatile_preamble: Vec<Value>,
-    drained_volatile: Vec<crate::turn::agentic_loop_host::VolatileInjection>,
+    drained_volatile: Vec<crate::turn::agentic_loop::host::VolatileInjection>,
     compacted_messages: Vec<Value>,
     attachments: &PostCompactAttachments<'_>,
     session_id: &str,
@@ -335,7 +335,7 @@ pub(crate) fn assemble_llm_messages(
 pub(crate) fn assemble_llm_messages_with_cache_capability(
     system_messages: Vec<Value>,
     volatile_preamble: Vec<Value>,
-    drained_volatile: Vec<crate::turn::agentic_loop_host::VolatileInjection>,
+    drained_volatile: Vec<crate::turn::agentic_loop::host::VolatileInjection>,
     compacted_messages: Vec<Value>,
     attachments: &PostCompactAttachments<'_>,
     session_id: &str,
@@ -477,7 +477,7 @@ pub(crate) fn assemble_llm_messages_with_cache_capability(
 /// function preserves insertion order so if multiple kinds were queued
 /// they come out in the order they were produced.
 pub(crate) fn render_drained_volatile(
-    drained: &[crate::turn::agentic_loop_host::VolatileInjection],
+    drained: &[crate::turn::agentic_loop::host::VolatileInjection],
 ) -> String {
     let mut out = String::new();
     for inj in drained {
@@ -1178,8 +1178,8 @@ mod tests {
             json!({"role": "user", "content": "<system-reminder>volatile</system-reminder>"}),
             json!({"role": "assistant", "content": "Understood."}),
         ];
-        let drained = vec![crate::turn::agentic_loop_host::VolatileInjection {
-            kind: crate::turn::agentic_loop_host::VolatileKind::AlreadyFetched,
+        let drained = vec![crate::turn::agentic_loop::host::VolatileInjection {
+            kind: crate::turn::agentic_loop::host::VolatileKind::AlreadyFetched,
             content: "## Already Fetched (do NOT re-read/re-grep these)\nFiles: foo.rs".into(),
             round_index: 1,
         }];
