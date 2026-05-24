@@ -257,9 +257,35 @@ const TASK_SUBCOMMANDS: &[(&str, &str)] = &[
 ];
 
 const MEMORY_SUBCOMMANDS: &[(&str, &str)] = &[
-    ("inspect", "Inspect memory entry (needs id)"),
-    ("list", "List memories"),
-    ("search", "Search memories (needs query)"),
+    // ── Browse ──
+    ("list", "List memories grouped by type"),
+    ("ls", "Alias for list"),
+    ("search", "Search memories by content (needs query)"),
+    ("show", "Inspect one memory in detail (needs id)"),
+    ("inspect", "Alias for show (needs id)"),
+    ("stats", "Count memories by type"),
+    (
+        "dismiss",
+        "Lower retrieval score for matching memories (needs query)",
+    ),
+    ("help", "Show the full /memory help surface"),
+    // ── Session ──
+    ("session", "Show current session memory"),
+    ("edit", "Edit a session memory section (needs section)"),
+    // ── Manage ──
+    ("forget", "Delete a memory (needs id)"),
+    ("snapshot", "Create a memory checkpoint"),
+    ("rollback", "Restore to a memory checkpoint (needs name)"),
+    ("snapshots", "List all memory checkpoints"),
+    // ── Branches ──
+    ("branch", "Create an experiment memory branch (needs name)"),
+    ("checkout", "Switch to a memory branch (needs name)"),
+    ("merge", "Merge a branch back into main (needs name)"),
+    ("diff", "Preview branch or snapshot changes (needs name)"),
+    ("branches", "List all memory branches"),
+    // ── Analysis ──
+    ("reflect", "Analyze memory patterns"),
+    ("health", "Memory hygiene status"),
 ];
 
 const PROFILE_SUBCOMMANDS: &[(&str, &str)] = &[
@@ -534,11 +560,11 @@ pub static COMMANDS: &[CommandMeta] = &[
     // ── Memory & tasks ────────────────────────────────────────────────────
     CommandMeta::new(
         "/memory",
-        "Memoria: list, search <q>, inspect <id>, …",
+        "Memoria: browse/search/stats in-panel; health pane; details/manage text-first",
         CommandGroup::MemoryTasks,
     )
     .with_subcommands(MEMORY_SUBCOMMANDS)
-    .with_arg_hint("[list|search <q>|inspect <id>]"),
+    .with_arg_hint("[list|ls|search <q>|stats|show <id>|session|help]"),
     CommandMeta::new(
         "/task",
         "Tasks: list, add, done, status, run <prompt>, result <id>",

@@ -692,6 +692,8 @@ async fn maybe_load_memory_model_params(
     #[derive(serde::Deserialize)]
     struct MemoryModelWire {
         model_name: String,
+        #[serde(default)]
+        candidate_thinking_capabilities: Vec<Option<String>>,
     }
 
     if state.memory_model_params.is_some() {
@@ -715,7 +717,16 @@ async fn maybe_load_memory_model_params(
                     base_url: format!("{}/v1", ctx.api.api_origin()),
                     api_key: token.to_string(),
                     model_name: response.model_name,
+                    wire_model_name: None,
                     provider: "openai".to_string(),
+                    request_body_overrides: None,
+                    thinking_capability: response
+                        .candidate_thinking_capabilities
+                        .into_iter()
+                        .next()
+                        .flatten()
+                        .as_deref()
+                        .and_then(|s| astra_services::models::ThinkingCapability::from_db(Some(s))),
                 });
         }
         Err(error) => {

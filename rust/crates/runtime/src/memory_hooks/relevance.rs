@@ -67,7 +67,10 @@ pub struct LlmConnParams {
     pub base_url: String,
     pub api_key: String,
     pub model_name: String,
+    pub wire_model_name: Option<String>,
     pub provider: String,
+    pub request_body_overrides: Option<serde_json::Map<String, serde_json::Value>>,
+    pub thinking_capability: Option<astra_services::models::ThinkingCapability>,
 }
 
 /// Filter a list of text items through the selector model.
@@ -95,7 +98,7 @@ pub async fn filter_memories(
     };
 
     let mut req_body = serde_json::json!({
-        "model": params.model_name,
+        "model": params.wire_model_name.as_deref().unwrap_or(&params.model_name),
         "messages": [
             {"role": "system", "content": RELEVANCE_FILTER_PROMPT},
             {"role": "user", "content": query},
@@ -262,7 +265,10 @@ mod tests {
             base_url: "https://api.example.com/v1".into(),
             api_key: "sk-test".into(),
             model_name: "qwen-flash".into(),
+            wire_model_name: None,
             provider: "openai".into(),
+            request_body_overrides: None,
+            thinking_capability: None,
         };
         let cloned = params.clone();
         assert_eq!(cloned.base_url, "https://api.example.com/v1");
@@ -276,7 +282,10 @@ mod tests {
             base_url: "http://localhost:8080".into(),
             api_key: "key".into(),
             model_name: "model".into(),
+            wire_model_name: None,
             provider: "openai".into(),
+            request_body_overrides: None,
+            thinking_capability: None,
         };
         let debug = format!("{params:?}");
         assert!(debug.contains("LlmConnParams"));
@@ -291,7 +300,10 @@ mod tests {
             base_url: "http://nonexistent:9999".into(),
             api_key: "key".into(),
             model_name: "model".into(),
+            wire_model_name: None,
             provider: "openai".into(),
+            request_body_overrides: None,
+            thinking_capability: None,
         };
         let result = filter_memories(&params, "query", &[]).await;
         assert!(result.is_empty());
@@ -303,7 +315,10 @@ mod tests {
             base_url: "http://127.0.0.1:1".into(),
             api_key: "key".into(),
             model_name: "model".into(),
+            wire_model_name: None,
             provider: "openai".into(),
+            request_body_overrides: None,
+            thinking_capability: None,
         };
         let items = vec!["a".into(), "b".into(), "c".into()];
         let result = filter_memories(&params, "query", &items).await;
@@ -349,7 +364,10 @@ mod tests {
             base_url: base,
             api_key: "k".into(),
             model_name: "qwen3.5-flash".into(),
+            wire_model_name: None,
             provider: "dashscope".into(),
+            request_body_overrides: None,
+            thinking_capability: None,
         };
         let items = vec!["mem-a".into(), "mem-b".into()];
         let _ = filter_memories(&params, "test query", &items).await;
@@ -369,7 +387,10 @@ mod tests {
             base_url: base,
             api_key: "k".into(),
             model_name: "gpt-4o-mini".into(),
+            wire_model_name: None,
             provider: "openai".into(),
+            request_body_overrides: None,
+            thinking_capability: None,
         };
         let items = vec!["mem-a".into()];
         let _ = filter_memories(&params, "test", &items).await;
@@ -389,7 +410,10 @@ mod tests {
             base_url: base,
             api_key: "k".into(),
             model_name: "m".into(),
+            wire_model_name: None,
             provider: "openai".into(),
+            request_body_overrides: None,
+            thinking_capability: None,
         };
         let items: Vec<String> = (0..3).map(|i| format!("mem-{i}")).collect();
         let result = filter_memories(&params, "query", &items).await;
@@ -405,7 +429,10 @@ mod tests {
             base_url: base,
             api_key: "k".into(),
             model_name: "m".into(),
+            wire_model_name: None,
             provider: "openai".into(),
+            request_body_overrides: None,
+            thinking_capability: None,
         };
         let items: Vec<String> = (0..3).map(|i| format!("mem-{i}")).collect();
         let result = filter_memories(&params, "query", &items).await;
@@ -422,7 +449,10 @@ mod tests {
             base_url: base,
             api_key: "k".into(),
             model_name: "m".into(),
+            wire_model_name: None,
             provider: "openai".into(),
+            request_body_overrides: None,
+            thinking_capability: None,
         };
         let items = vec!["irrelevant".into(), "relevant".into(), "noise".into()];
         let result = filter_memories(&params, "query", &items).await;

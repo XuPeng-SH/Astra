@@ -65,7 +65,48 @@ pub(crate) fn cache_capability_from_model_metadata(
 }
 
 fn estimate_json_tokens(value: &Value) -> u32 {
-    (value.to_string().len() as u32 / 4).saturating_add(1)
+    (estimate_json_chars(value) as u32 / 4).saturating_add(1)
+}
+
+fn estimate_json_chars(value: &Value) -> usize {
+    match value {
+        Value::Null => 4,
+        Value::Bool(true) => 4,
+        Value::Bool(false) => 5,
+        Value::Number(number) => number.to_string().len(),
+        Value::String(text) => text.len().saturating_add(2),
+        Value::Array(items) => {
+            let commas = items.len().saturating_sub(1);
+            2 + commas + items.iter().map(estimate_json_chars).sum::<usize>()
+        }
+        Value::Object(map) => {
+            let commas = map.len().saturating_sub(1);
+            2 + commas
+                + map
+                    .iter()
+                    .map(|(key, value)| key.len().saturating_add(3) + estimate_json_chars(value))
+                    .sum::<usize>()
+        }
+    }
+}
+
+fn session_memory_injection(
+    entry: Option<&astra_turn_core::context_sources::MemoryEntry>,
+) -> Option<astra_turn_core::context_assembly_trace::MemoryInjection> {
+    let entry = entry?;
+    if entry.content.trim().is_empty() {
+        return None;
+    }
+    Some(astra_turn_core::context_assembly_trace::MemoryInjection {
+        memory_id: "session-memory".into(),
+        memory_type: entry
+            .source
+            .clone()
+            .unwrap_or_else(|| "session_memory".into()),
+        tokens: (entry.content.chars().count() as u32 / 4).saturating_add(1),
+        relevance_score: 1.0,
+        content_preview: entry.content.chars().take(100).collect(),
+    })
 }
 
 /// Input for the shared context-pipeline assembly phase.
@@ -146,6 +187,7 @@ pub(crate) struct RuntimeSignals<'a> {
     pub selection_confidence: f64,
     pub extra_stable_sections: &'a [crate::prompts::PromptSection],
     pub extra_volatile_sections: &'a [crate::prompts::PromptSection],
+    pub session_memory_entry: Option<astra_turn_core::context_sources::MemoryEntry>,
 }
 
 impl<'a> RuntimeSignals<'a> {
@@ -160,6 +202,7 @@ impl<'a> RuntimeSignals<'a> {
             selection_confidence,
             extra_stable_sections: &[],
             extra_volatile_sections: &[],
+            session_memory_entry: None,
         }
     }
 
@@ -170,6 +213,14 @@ impl<'a> RuntimeSignals<'a> {
     ) -> Self {
         self.extra_stable_sections = stable;
         self.extra_volatile_sections = volatile;
+        self
+    }
+
+    pub(crate) fn with_session_memory_entry(
+        mut self,
+        session_memory_entry: Option<astra_turn_core::context_sources::MemoryEntry>,
+    ) -> Self {
+        self.session_memory_entry = session_memory_entry;
         self
     }
 }
@@ -318,6 +369,7 @@ pub(crate) struct BridgeRuntimeSignals<'a> {
     pub extra_stable_sections: &'a [crate::prompts::PromptSection],
     pub extra_volatile_sections: &'a [crate::prompts::PromptSection],
     pub memory_entries: &'a [astra_turn_core::context_sources::MemoryEntry],
+    pub session_memory_entry: Option<astra_turn_core::context_sources::MemoryEntry>,
     pub selection_confidence: f64,
     pub task_type: Option<&'a str>,
 }
@@ -327,6 +379,7 @@ impl<'a> BridgeRuntimeSignals<'a> {
         extra_stable_sections: &'a [crate::prompts::PromptSection],
         extra_volatile_sections: &'a [crate::prompts::PromptSection],
         memory_entries: &'a [astra_turn_core::context_sources::MemoryEntry],
+        session_memory_entry: Option<astra_turn_core::context_sources::MemoryEntry>,
         selection_confidence: f64,
         task_type: Option<&'a str>,
     ) -> Self {
@@ -334,6 +387,7 @@ impl<'a> BridgeRuntimeSignals<'a> {
             extra_stable_sections,
             extra_volatile_sections,
             memory_entries,
+            session_memory_entry,
             selection_confidence,
             task_type,
         }
@@ -609,6 +663,7 @@ pub(crate) fn assemble_bridge_context(
         input.runtime_signals.extra_stable_sections,
         input.runtime_signals.extra_volatile_sections,
         input.runtime_signals.memory_entries,
+        input.runtime_signals.session_memory_entry.as_ref(),
         input.runtime_signals.selection_confidence,
         input.runtime_signals.task_type,
         input.session.cache_cfg,
@@ -710,6 +765,7 @@ pub(crate) fn assemble_context_pipeline(
             .iter()
             .cloned(),
     );
+    external.session_memory_entry = input.runtime_signals.session_memory_entry.clone();
     let turn_state = build_turn_state(state, input.user_content);
     // `AgenticLoopState::max_turn_input_tokens` is an input-budget/wind-down
     // cap, and `0` is its legacy "unlimited" sentinel. The pipeline's
@@ -774,6 +830,9 @@ pub(crate) fn assemble_context_pipeline(
     );
     let breakdown = astra_turn_core::context_assembly_trace::SystemPromptBreakdown {
         total_tokens: pipeline_output.metrics.sections,
+        session_memory_injected: session_memory_injection(
+            input.runtime_signals.session_memory_entry.as_ref(),
+        ),
         ..Default::default()
     };
 

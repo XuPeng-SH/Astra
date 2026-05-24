@@ -770,6 +770,7 @@ fn maybe_run_memory_extraction(state: &mut AgenticLoopState) {
     let req = crate::session_memory::ExtractionRequest {
         session_id,
         messages: state.messages.clone(),
+        session_facts: state.session_facts.clone(),
         current_tokens,
         current_tool_calls: state.total_tool_calls as usize,
         had_error,
@@ -1721,13 +1722,16 @@ mod tests {
         use std::sync::Arc;
         let (ingestion, rx) = astra_services::event_ingestion::IngestionSender::for_tests(256);
         let memoria = Arc::new(CapturingMemoriaForFinalize::default());
-        let svc = Arc::new(crate::session_memory::MemoryExtractionService::new(
-            Arc::new(crate::session_memory::ConstSelectorResolver(None)),
-            Arc::clone(&memoria) as Arc<dyn crate::turn::cloud::memoria_compact::MemoriaClient>,
-            ingestion,
-            "test-user",
-            Arc::new(crate::session_memory::BackgroundActivityBroker::new()),
-        ));
+        let svc = Arc::new(
+            crate::session_memory::MemoryExtractionService::new(
+                Arc::new(crate::session_memory::ConstSelectorResolver(None)),
+                Arc::clone(&memoria) as Arc<dyn crate::turn::cloud::memoria_compact::MemoriaClient>,
+                ingestion,
+                "test-user",
+                Arc::new(crate::session_memory::BackgroundActivityBroker::new()),
+            )
+            .with_local_current_snapshot(),
+        );
         state.memory_extraction_service = Some(svc);
         (rx, memoria)
     }

@@ -934,12 +934,67 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 return SlashResult::Handled;
             };
 
-            let (query, top_k) = match route {
-                MemoryCommandRoute::Search(query) => (query, 20),
-                MemoryCommandRoute::List => {
-                    ("user preferences knowledge plans tasks".to_string(), 20)
+            if args.trim() == "session" {
+                let Some(session_id) = ctx.state.session_id.as_deref() else {
+                    ctx.show_error("No active session yet.".into());
+                    return SlashResult::Handled;
+                };
+                match crate::slash_memory::load_current_session_memory(ctx.api, &token, session_id)
+                    .await
+                {
+                    Ok(record) => {
+                        let body = record
+                            .as_ref()
+                            .map(|memory| memory.body.as_str())
+                            .unwrap_or_default();
+                        let hint = if body.trim().is_empty() {
+                            crate::slash_memory::latest_session_memory_status_hint(session_id)
+                        } else {
+                            None
+                        };
+                        let summary = record.as_ref().and_then(|memory| memory.summary.as_deref());
+                        ctx.show_response(crate::slash_memory::format_session_memory_response(
+                            summary,
+                            body,
+                            Some(session_id),
+                            hint.as_ref().map(|hint| hint.summary.as_str()),
+                        ));
+                    }
+                    Err(e) => ctx.show_error(format!("Session memory failed: {e}")),
                 }
-                MemoryCommandRoute::Inspect(_) => return SlashResult::Fallback,
+                return SlashResult::Handled;
+            }
+
+            if route == MemoryCommandRoute::Health {
+                use crate::tui::bottom_pane::info_view::InfoView;
+
+                match crate::edge_tools::memoria::memoria_health().await {
+                    Ok(body) => {
+                        let lines = crate::slash_memory::memory_health_lines(&body);
+                        ctx.bottom_pane.push_view(Box::new(
+                            InfoView::from_plain("Memory Health", lines)
+                                .with_reopen("/memory health"),
+                        ));
+                    }
+                    Err(e) => ctx.show_error(format!("Memory health failed: {e}")),
+                }
+                return SlashResult::Handled;
+            }
+
+            let (query, top_k, stats_view) = match route {
+                MemoryCommandRoute::Search(query) => (query, 20, false),
+                MemoryCommandRoute::List => (
+                    crate::slash_memory::MEMORY_BROWSE_QUERY.to_string(),
+                    crate::slash_memory::MEMORY_BROWSE_TOP_K,
+                    false,
+                ),
+                MemoryCommandRoute::Stats => (
+                    crate::slash_memory::MEMORY_BROWSE_QUERY.to_string(),
+                    crate::slash_memory::MEMORY_STATS_TOP_K,
+                    true,
+                ),
+                MemoryCommandRoute::Fallback => return SlashResult::Fallback,
+                MemoryCommandRoute::Health => unreachable!("handled above"),
             };
 
             let payload = serde_json::json!({
@@ -951,34 +1006,64 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                     let body = r.text().await.unwrap_or_default();
                     match serde_json::from_str::<Vec<serde_json::Value>>(&body) {
                         Ok(arr) if !arr.is_empty() => {
+                            if stats_view {
+                                use crate::tui::bottom_pane::info_view::InfoView;
+
+                                let lines = crate::slash_memory::memory_stats_lines(&arr);
+                                ctx.bottom_pane.push_view(Box::new(
+                                    InfoView::from_plain("Memory Stats", lines)
+                                        .with_reopen("/memory stats"),
+                                ));
+                                return SlashResult::Handled;
+                            }
+                            let mut hidden_session_entries = 0usize;
                             let items: Vec<SelectionItem> = arr
                                 .iter()
-                                .map(|m| {
+                                .filter_map(|m| {
                                     let content =
                                         m.get("content").and_then(|v| v.as_str()).unwrap_or("?");
+                                    if crate::slash_memory::is_session_proto(content) {
+                                        hidden_session_entries += 1;
+                                        return None;
+                                    }
                                     let id = m
                                         .get("memory_id")
                                         .or(m.get("id"))
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("");
                                     let short_id = &id[..std::cmp::min(8, id.len())];
-                                    let mtype = m
-                                        .get("memory_type")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("?");
-                                    let preview: String = content.chars().take(80).collect();
-                                    SelectionItem {
-                                        name: format!("[{mtype}] {preview}"),
+                                    Some(SelectionItem {
+                                        name: crate::slash_memory::format_memory_entry_line(m),
                                         description: Some(format!("id:{short_id}")),
                                         is_current: false,
-                                    }
+                                    })
                                 })
                                 .collect();
+                            if items.is_empty() {
+                                let mut message = "No non-session memories found.".to_string();
+                                if hidden_session_entries > 0 {
+                                    message.push_str(" Use /memory session to view session state.");
+                                }
+                                ctx.show_info(message);
+                                return SlashResult::Handled;
+                            }
                             let header = format!(
-                                "Memory — {} result{} for: {}",
+                                "Memory — {} result{} for: {}{}",
                                 items.len(),
                                 if items.len() == 1 { "" } else { "s" },
-                                query
+                                query,
+                                if hidden_session_entries > 0 {
+                                    format!(
+                                        " ({hidden_session_entries} session entr{} hidden)",
+                                        if hidden_session_entries == 1 {
+                                            "y"
+                                        } else {
+                                            "ies"
+                                        }
+                                    )
+                                } else {
+                                    String::new()
+                                }
                             );
                             ctx.bottom_pane.push_view(Box::new(
                                 ListSelectionView::new(items, Some(header))
@@ -1159,8 +1244,8 @@ pub(crate) fn build_panels_cheat_sheet_lines() -> Vec<String> {
             "type to filter · Enter select · Esc close",
         ),
         (
-            "/memory [list|search <q>|inspect <id>]",
-            "browse, search, and inspect episodic and semantic memories",
+            "/memory [list|search <q>|show <id>|session|help]",
+            "browse/search/stats in-panel; other subcommands stay text-first",
             "↑↓ navigate · Enter select · Esc close",
         ),
         (
@@ -2329,7 +2414,9 @@ fn config_command_route(args: &str) -> Result<ConfigCommandRoute, &'static str> 
 enum MemoryCommandRoute {
     List,
     Search(String),
-    Inspect(String),
+    Stats,
+    Health,
+    Fallback,
 }
 
 fn memory_command_route(args: &str) -> Result<MemoryCommandRoute, &'static str> {
@@ -2340,10 +2427,11 @@ fn memory_command_route(args: &str) -> Result<MemoryCommandRoute, &'static str> 
 
     let (sub, rest) = split_sub(trimmed);
     match sub {
-        "list" if rest.is_empty() => Ok(MemoryCommandRoute::List),
+        "list" | "ls" if rest.is_empty() => Ok(MemoryCommandRoute::List),
         "search" if !rest.is_empty() => Ok(MemoryCommandRoute::Search(rest.to_string())),
-        "inspect" if !rest.is_empty() => Ok(MemoryCommandRoute::Inspect(rest.to_string())),
-        _ => Err("Unknown subcommand. Try: list, search <query>, inspect <id>."),
+        "stats" | "count" if rest.is_empty() => Ok(MemoryCommandRoute::Stats),
+        "health" if rest.is_empty() => Ok(MemoryCommandRoute::Health),
+        _ => Ok(MemoryCommandRoute::Fallback),
     }
 }
 
@@ -2375,11 +2463,15 @@ pub(crate) const FORK_PICK_SENTINEL: &str = "__fork__\n";
 /// thinking modes.  Kept public(crate) so the mod.rs arm can
 /// strip it symmetrically with the other sentinels.
 pub(crate) const MODEL_PICK_SENTINEL: &str = "__model_pick__\n";
+pub(crate) const MODEL_PICKER_FOOTER_HINT: &str =
+    "Type to filter | Enter to choose | Some models then ask for thinking mode | Esc to go back";
 /// Sentinel prefix for the thinking-mode picker. Payload format is
 /// `__model_thinking__\n<base_model>\n<thinking_label>`.  The
 /// handler composes `base + thinking_suffix_for(label)` and sets
 /// `state.model`.
 pub(crate) const MODEL_THINKING_SENTINEL: &str = "__model_thinking__\n";
+pub(crate) const MODEL_THINKING_PICKER_FOOTER_HINT: &str =
+    "Type to filter | Enter to finish model selection | Esc to go back";
 
 /// `/model` with no args (or `list`) — fetch the catalog and push
 /// the picker.  The picker emits `MODEL_PICK_SENTINEL + <name>`; the
@@ -2419,6 +2511,7 @@ fn push_model_picker(ctx: &mut DispatchContext<'_>, models: Vec<String>) -> bool
         false
     } else {
         let view = ListSelectionView::new(items, Some("Select model:".into()))
+            .with_footer_hint(MODEL_PICKER_FOOTER_HINT)
             .with_result_prefix(MODEL_PICK_SENTINEL);
         ctx.bottom_pane.push_view(Box::new(view));
         true
@@ -3304,7 +3397,8 @@ mod panels_tests {
 #[cfg(test)]
 mod routing_tests {
     use super::{
-        CONTEXT_USAGE_MESSAGE, ConfigCommandRoute, MemoryCommandRoute, config_command_route,
+        CONTEXT_USAGE_MESSAGE, ConfigCommandRoute, MODEL_PICKER_FOOTER_HINT,
+        MODEL_THINKING_PICKER_FOOTER_HINT, MemoryCommandRoute, config_command_route,
         inspect_command_supported, memory_command_route,
     };
 
@@ -3333,16 +3427,44 @@ mod routing_tests {
     }
 
     #[test]
-    fn memory_route_distinguishes_list_search_and_inspect() {
+    fn model_picker_footer_warns_about_thinking_follow_up() {
+        assert!(MODEL_PICKER_FOOTER_HINT.contains("thinking mode"));
+        assert!(MODEL_THINKING_PICKER_FOOTER_HINT.contains("finish model selection"));
+    }
+
+    #[test]
+    fn memory_route_uses_panel_for_list_search_and_fallback_for_full_domain_commands() {
         assert_eq!(memory_command_route(""), Ok(MemoryCommandRoute::List));
         assert_eq!(memory_command_route("list"), Ok(MemoryCommandRoute::List));
+        assert_eq!(memory_command_route("ls"), Ok(MemoryCommandRoute::List));
         assert_eq!(
             memory_command_route("search auth preferences"),
             Ok(MemoryCommandRoute::Search("auth preferences".into()))
         );
         assert_eq!(
+            memory_command_route("show mem_123"),
+            Ok(MemoryCommandRoute::Fallback)
+        );
+        assert_eq!(
             memory_command_route("inspect mem_123"),
-            Ok(MemoryCommandRoute::Inspect("mem_123".into()))
+            Ok(MemoryCommandRoute::Fallback)
+        );
+        assert_eq!(
+            memory_command_route("search"),
+            Ok(MemoryCommandRoute::Fallback)
+        );
+        assert_eq!(memory_command_route("stats"), Ok(MemoryCommandRoute::Stats));
+        assert_eq!(
+            memory_command_route("health"),
+            Ok(MemoryCommandRoute::Health)
+        );
+        assert_eq!(
+            memory_command_route("session"),
+            Ok(MemoryCommandRoute::Fallback)
+        );
+        assert_eq!(
+            memory_command_route("help"),
+            Ok(MemoryCommandRoute::Fallback)
         );
     }
 
@@ -3619,7 +3741,7 @@ mod view_result_tests {
         let mut chat_widget = ChatWidget::new("");
 
         handle_view_result(
-            "[working] [@session/memory] foo",
+            "[working] [@session/active] foo",
             &mut state,
             &mut bottom_pane,
             &mut chat_widget,
