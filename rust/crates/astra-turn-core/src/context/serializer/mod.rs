@@ -171,13 +171,11 @@ fn remap_cache_markers_to_blocks(
 
     // Anthropic caps a single request at 4 `cache_control` markers. The
     // runtime's budget is:
-    //   1 × system  +  1 × tools  +  2 × messages (rolling historical+tail)
-    // Leaving the remaining 2 slots free for the rolling message-history
-    // pair is what gives cross-round prefix reuse — see the rolling
-    // breakpoint tests in `mock_llm_prompt_cache_e2e.rs`. So we collapse
-    // all system-level markers onto a single block (the latest one the
-    // planner requested), matching the single-marker policy applied on
-    // the legacy path in `apply_cache_policy_to_blocks`.
+    //   1 × system  +  1 × tools  +  1 × messages
+    // So we collapse all system-level markers onto a single block (the
+    // latest one the planner requested), matching the single-marker
+    // policy applied on the legacy path in `apply_cache_policy_to_blocks`
+    // and leaving one spare slot rather than overcommitting the request.
     let mut chosen_block: Option<usize> = None;
     let mut chosen_marker: Option<CacheMarker> = None;
     for marker in markers {
@@ -222,15 +220,11 @@ fn block_index_for_marker(
 /// Places a single `cache_control` marker on the last Session-scoped
 /// block (falling back to the last Global block if no Session block
 /// exists). We intentionally emit at most one marker here to leave the
-/// remaining breakpoint budget for the rolling `[historical, tail]` pair
-/// in `annotate_last_message_cache_breakpoint`, which is what lets
-/// message-history bytes stay stable across rounds. Anthropic caps
-/// requests at 4 `cache_control` entries (1 system + 1 tool + 2 messages
-/// = 4), and the rolling message pair is load-bearing: without it,
-/// `cache_read` collapses to `system + tools` size (~10 K tokens) even
-/// in a 50-round conversation. See the
-/// `mock_llm_prompt_cache_e2e::rolling_breakpoint_*` tests for the
-/// byte-identity invariant we're protecting.
+/// remaining breakpoint budget for the tool marker plus Claude Code's
+/// single tail marker in `annotate_last_message_cache_breakpoint`.
+/// Anthropic caps requests at 4 `cache_control` entries (system + tool +
+/// message comfortably fit), and the message marker must always remain
+/// available for the current tail.
 ///
 /// The last Session block is preferred over the last Global block
 /// because it extends the cached prefix further (blocks are emitted in
