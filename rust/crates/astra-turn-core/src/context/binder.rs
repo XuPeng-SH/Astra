@@ -257,10 +257,23 @@ fn bind_runtime_identity(sources: &ContextSources<'_>) -> String {
     let ext = &sources.external;
     let mut parts = Vec::new();
 
+    // Agent version: compile-time constant, truly session-stable.
+    parts.push(format!("Astra v{}", env!("CARGO_PKG_VERSION")));
+
     // Core identity. Exact model id is request metadata, not prompt content:
     // putting it in the Session-scoped prefix churns prompt caches when a
     // session switches between models in the same provider family.
     let _model_id_is_transport_metadata = &sources.session.model_id;
+
+    // Current date (session-stable: computed once at session creation)
+    let current_date = &sources.session.current_date;
+    parts.push(format!("Date: {current_date}"));
+
+    // Authenticated user (session-stable: set once at session creation)
+    if let Some(ref uid) = sources.session.user_id {
+        parts.push(format!("User: {uid}"));
+    }
+
     if let Some(cwd) = &ep.cwd {
         parts.push(format!("CWD: {cwd}"));
     }
@@ -300,6 +313,15 @@ fn bind_runtime_identity(sources: &ContextSources<'_>) -> String {
 fn bind_runtime_volatile(sources: &ContextSources<'_>) -> String {
     let ext = &sources.external;
     let mut parts = Vec::new();
+
+    // Model identity lives in the volatile (CacheScope::None) lane so
+    // model-switching mid-session doesn't invalidate the Session-scoped
+    // cache prefix. The model needs this for self-awareness ("what model
+    // are you?").
+    parts.push(format!(
+        "Model: {} (via {})",
+        sources.session.model_id, sources.session.provider_name,
+    ));
 
     // Session UUID is *not* emitted to the prompt. It used to ride the
     // volatile lane ("Session: <uuid>\n" = ~45c/turn) so it wouldn't
@@ -442,6 +464,8 @@ mod tests {
                 self_model: Some("Expert coder.".into()),
                 deferred_tools_block: String::new(),
                 skill_listing_block: String::new(),
+                current_date: chrono::Utc::now().format("%Y-%m-%d").to_string(),
+                user_id: None,
             },
             turn: TurnState {
                 messages: vec![serde_json::json!({"role": "user", "content": "hello"})],

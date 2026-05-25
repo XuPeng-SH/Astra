@@ -121,7 +121,7 @@ pub(crate) fn build_external_sources(
     };
 
     // 9. Active skill names as hint
-    let _active_skill_names: Vec<&str> = edge_profile
+    let active_skill_names: Vec<&str> = edge_profile
         .get("active_skills")
         .and_then(Value::as_array)
         .map(|arr| arr.iter().filter_map(Value::as_str).collect())
@@ -191,6 +191,36 @@ pub(crate) fn build_external_sources(
         ));
     }
 
+    // 9a. Active skills visibility hint (volatile)
+    if !active_skill_names.is_empty() {
+        extra_dynamic_sections.push(crate::prompts::PromptSection::dynamic(
+            format!(
+                "\n\n## Active Skills\nThe following skills are currently active: {}. Use `discover_skills` to see their full descriptions.",
+                active_skill_names.join(", ")
+            ),
+            crate::prompts::PromptTokenBucket::Environment,
+        ));
+    }
+
+    // 9b. Turn budget hint (volatile, tiered urgency)
+    if state.max_turns > 0 && state.remaining_turns > 0 {
+        let budget_pct = (state.remaining_turns as f64 / state.max_turns as f64) * 100.0;
+        let urgency = if budget_pct >= 80.0 {
+            ""
+        } else if budget_pct >= 50.0 {
+            " Use turns efficiently."
+        } else {
+            " Do not consume turns needlessly."
+        };
+        extra_dynamic_sections.push(crate::prompts::PromptSection::dynamic(
+            format!(
+                "\n\n## Turn Budget\n{}/{} turns remaining ({:.0}%).{urgency}",
+                state.remaining_turns, state.max_turns, budget_pct
+            ),
+            crate::prompts::PromptTokenBucket::Environment,
+        ));
+    }
+
     // Phase-9: promote skill listing into the stable lane so it joins the
     // session-cached prefix.
     let mut extra_stable_sections = extra_stable_sections;
@@ -199,6 +229,30 @@ pub(crate) fn build_external_sources(
     }
     if let Some(section) = cache_strategy_section(cache_capability) {
         extra_stable_sections.push(section);
+    }
+
+    // Tool and skill capability counts (per-turn volatile — tool_names and
+    // active_skill_names are clipped per turn by the optimizer, and
+    // max_turn_input_tokens can be adjusted mid-session by adaptive tuning).
+    // Skill names are NOT listed here — they already appear in ## Active Skills
+    // above. Duplicating them wastes tokens and risks stale data.
+    {
+        let tool_count = tool_names.len();
+        let skill_count = active_skill_names.len();
+        let mut cap = format!(
+            "\n\n## Capabilities\n{tool_count} tools available. {skill_count} active skills."
+        );
+        // Context window capacity (effective per-turn limit)
+        if state.max_turn_input_tokens > 0 {
+            cap.push_str(&format!(
+                " Context window: {} tokens per turn.",
+                state.max_turn_input_tokens
+            ));
+        }
+        extra_dynamic_sections.push(crate::prompts::PromptSection::dynamic(
+            cap,
+            crate::prompts::PromptTokenBucket::Environment,
+        ));
     }
 
     ExternalSources {
@@ -355,6 +409,8 @@ pub(crate) fn build_session_context(
     provider: &str,
     project_context: Option<&str>,
     cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
+    current_date: &str,
+    user_id: Option<&str>,
 ) -> SessionContext {
     let provider_policy =
         super::prompt_cache::provider_cache_policy_for(cache_capability, provider, model_name);
@@ -391,6 +447,10 @@ pub(crate) fn build_session_context(
         self_model: None,
         deferred_tools_block: String::new(),
         skill_listing_block: String::new(),
+        // Session-stable identity: capture once per session and thread through
+        // every turn so cacheable RuntimeIdentity bytes do not churn at UTC midnight.
+        current_date: current_date.to_string(),
+        user_id: user_id.map(str::to_string),
     }
 }
 
@@ -446,6 +506,8 @@ mod tests {
             "anthropic",
             None,
             None,
+            "2026-05-25",
+            None,
         );
         // anthropic policy supports cache_control markers (max_markers > 0).
         assert!(
@@ -466,6 +528,8 @@ mod tests {
             &ep,
             "bedrock",
             None,
+            None,
+            "2026-05-25",
             None,
         );
         // Bedrock Claude translates cache_control → cachePoint downstream,
@@ -489,6 +553,8 @@ mod tests {
             "bedrock",
             None,
             None,
+            "2026-05-25",
+            None,
         );
         assert_eq!(
             ctx.provider_policy.max_markers, 0,
@@ -500,14 +566,36 @@ mod tests {
     #[test]
     fn session_context_saturates_oversized_model_limit() {
         let ep = serde_json::Map::new();
-        let ctx = build_session_context("sid", None, "gpt-4o", u64::MAX, &ep, "openai", None, None);
+        let ctx = build_session_context(
+            "sid",
+            None,
+            "gpt-4o",
+            u64::MAX,
+            &ep,
+            "openai",
+            None,
+            None,
+            "2026-05-25",
+            None,
+        );
         assert_eq!(ctx.model_limit, u32::MAX);
     }
 
     #[test]
     fn session_context_picks_openai_policy_for_openai_provider() {
         let ep = serde_json::Map::new();
-        let ctx = build_session_context("sid", None, "gpt-4o", 128_000, &ep, "openai", None, None);
+        let ctx = build_session_context(
+            "sid",
+            None,
+            "gpt-4o",
+            128_000,
+            &ep,
+            "openai",
+            None,
+            None,
+            "2026-05-25",
+            None,
+        );
         // OpenAI uses prefix-only caching — emitting cache_control is a no-op
         // at best and (for some proxies) a 400 Bad Request at worst.
         assert_eq!(
@@ -533,6 +621,8 @@ mod tests {
             "unknown",
             None,
             None,
+            "2026-05-25",
+            None,
         );
         assert_eq!(ctx.provider_policy.max_markers, 0);
     }
@@ -556,6 +646,8 @@ mod tests {
                     astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns,
                 ),
             }),
+            "2026-05-25",
+            None,
         );
         assert!(
             ctx.provider_strategy.supports_cache_control,
@@ -584,6 +676,8 @@ mod tests {
                 "1. [active] (2026-05-06, 22 turns, branch: main)\n2. [active] (2026-05-05, 4 turns)",
             ),
             None,
+            "2026-05-25",
+            None,
         );
         assert!(
             ctx.project_context.contains("22 turns"),
@@ -595,8 +689,37 @@ mod tests {
     #[test]
     fn session_context_defaults_project_context_to_empty_when_absent() {
         let ep = serde_json::Map::new();
-        let ctx = build_session_context("sid", None, "gpt-4o", 128_000, &ep, "openai", None, None);
+        let ctx = build_session_context(
+            "sid",
+            None,
+            "gpt-4o",
+            128_000,
+            &ep,
+            "openai",
+            None,
+            None,
+            "2026-05-25",
+            None,
+        );
         assert!(ctx.project_context.is_empty());
+    }
+
+    #[test]
+    fn session_context_uses_caller_supplied_current_date() {
+        let ep = serde_json::Map::new();
+        let ctx = build_session_context(
+            "sid",
+            None,
+            "gpt-4o",
+            128_000,
+            &ep,
+            "openai",
+            None,
+            None,
+            "1999-12-31",
+            None,
+        );
+        assert_eq!(ctx.current_date, "1999-12-31");
     }
 
     #[test]
@@ -762,6 +885,8 @@ mod tests {
             edge_profile,
             provider,
             None,
+            None,
+            "2026-05-25",
             None,
         );
         let turn = build_turn_state(state, user_content);

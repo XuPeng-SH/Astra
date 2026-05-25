@@ -5031,20 +5031,6 @@ impl StreamRenderState {
                     _ => None,
                 }
             }
-            "spawn_agent" => {
-                let description = args.get("description").and_then(Value::as_str);
-                let agent_type = args.get("agent_type").and_then(Value::as_str);
-                match (description, agent_type) {
-                    (Some(description), Some(agent_type)) => Some(format!(
-                        "{} ({})",
-                        truncate_line(description, 28),
-                        truncate_line(agent_type, 12)
-                    )),
-                    (Some(description), None) => Some(truncate_line(description, 40)),
-                    (None, Some(agent_type)) => Some(truncate_line(agent_type, 24)),
-                    _ => None,
-                }
-            }
             "diagnose" => {
                 let category = args.get("category").and_then(Value::as_str);
                 let verbose = args.get("verbose").and_then(Value::as_bool);
@@ -6247,6 +6233,18 @@ async fn execute_with_metadata_responsive(
     }
 }
 
+fn is_agent_control_preview(preview: &str) -> bool {
+    [
+        "Spawn agent:",
+        "Get agent result:",
+        "Send message:",
+        "Running chain:",
+        "Delegating:",
+    ]
+    .iter()
+    .any(|prefix| preview.starts_with(prefix))
+}
+
 /// Human-friendly tool description from a `ToolCallRecord`'s name + args_preview.
 /// Mirrors `format_tool_description_with_output` but works without full args JSON.
 pub(crate) fn format_tool_display_from_preview(name: &str, args_preview: Option<&str>) -> String {
@@ -6298,9 +6296,15 @@ pub(crate) fn format_tool_display_from_preview(name: &str, args_preview: Option<
         "github" => format!("GitHub: {preview}"),
         "session" => format!("Session: {preview}"),
         "mo" => format!("MO: {preview}"),
-        "agent" => format!("Agent: {preview}"),
+        "agent" => {
+            if is_agent_control_preview(preview) {
+                preview.to_string()
+            } else {
+                format!("Agent: {preview}")
+            }
+        }
         "introspect" => "Introspecting…".to_string(),
-        // Legacy individual names
+        // Legacy individual names for journal replay / old sessions.
         "github_get_pr" => format!("Getting PR: {preview}"),
         "github_list_prs" => format!("Listing PRs: {preview}"),
         "github_get_issue" => format!("Getting issue: {preview}"),
@@ -6316,8 +6320,6 @@ pub(crate) fn format_tool_display_from_preview(name: &str, args_preview: Option<
         "rollback_database_snapshots" => format!("Revert DB snapshots: {preview}"),
         "rollback_turn_actions" => format!("Rollback turn actions: {preview}"),
         "send_message" => format!("Send message: {preview}"),
-        "spawn_agent" => format!("Spawn agent: {preview}"),
-        "get_agent_result" => format!("Get agent result: {preview}"),
         "diagnose" => format!("Diagnose: {preview}"),
         "env" => format!("Env: {preview}"),
         "notebook_edit" => format!("Notebook edit: {preview}"),
@@ -7839,6 +7841,21 @@ mod tests {
 
     #[test]
     fn format_meta_tool_preview_display_names() {
+        assert_eq!(
+            format_tool_display_from_preview(
+                "agent",
+                Some("Spawn agent: reviewer-A (code-review)")
+            ),
+            "Spawn agent: reviewer-A (code-review)"
+        );
+        assert_eq!(
+            format_tool_display_from_preview("agent", Some("Get agent result: reviewer@abc12345")),
+            "Get agent result: reviewer@abc12345"
+        );
+        assert_eq!(
+            format_tool_display_from_preview("agent", Some("Send message: agent-2: Need review")),
+            "Send message: agent-2: Need review"
+        );
         assert_eq!(
             format_tool_display_from_preview("send_message", Some("agent-2: Need review")),
             "Send message: agent-2: Need review"
