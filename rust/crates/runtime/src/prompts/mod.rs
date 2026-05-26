@@ -16,8 +16,9 @@ pub use astra_prompts::skills::{
 };
 pub use context::{
     CacheAwareEstimate, CompactConfig, CompactionTier, ContextBudget, DEFAULT_SYSTEM_PROMPT_TOKENS,
-    budget_for_model, capped_output_tokens, estimate_str_tokens, estimate_tokens,
-    estimate_tokens_cache_aware, estimate_tokens_cache_aware_split, estimate_tokens_precise,
+    budget_for_model, budget_for_model_with_override, capped_output_tokens, estimate_str_tokens,
+    estimate_tokens, estimate_tokens_cache_aware, estimate_tokens_cache_aware_split,
+    estimate_tokens_precise,
 };
 pub use system::{
     CacheScope, LOW_CONFIDENCE_THRESHOLD, PARALLEL_BATCHING_NUDGE_THRESHOLD, PromptOverrides,
@@ -361,7 +362,7 @@ mod tests {
     #[test]
     fn budget_for_model_claude() {
         let b = budget_for_model(Some("claude-3.5-sonnet"));
-        assert_eq!(b.model_limit, 200_000);
+        assert_eq!(b.model_limit, 128_000);
     }
 
     #[test]
