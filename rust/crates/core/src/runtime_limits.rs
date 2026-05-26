@@ -165,10 +165,30 @@ pub fn context_window_for_model_with_override(
     }
 
     let lower = model.to_lowercase();
+    // OpenAI — GPT-5 family (256K context)
+    if lower.contains("gpt-5") {
+        return Some(256_000);
+    }
+    // OpenAI — GPT-4o / GPT-4.1 / GPT-4 Turbo (128K context)
+    if lower.contains("gpt-4o") || lower.contains("gpt-4.1") || lower.contains("gpt-4-turbo") {
+        return Some(128_000);
+    }
+    // OpenAI — GPT-4 generic
+    if lower.contains("gpt-4") {
+        return Some(128_000);
+    }
+    // OpenAI — GPT-3.5
+    if lower.contains("gpt-3.5") {
+        return Some(16_000);
+    }
+    // OpenAI reasoning models
+    if has_model_token(&lower, "o1") || has_model_token(&lower, "o3") {
+        return Some(200_000);
+    }
     // Anthropic 4.6+ generation: 1M context window.
     // The 4.6 generation (Opus 4.6, Sonnet 4.6, Haiku 4.6) advertises a 1M
-    // token context. Earlier 4.x (4.0/4.1/4.5) stays at 200K. Match the
-    // specific suffix first so legacy members still get the 200K window.
+    // token context. Earlier Claude generations stay at 128K. Match the
+    // specific suffix first so legacy members still get the 128K window.
     if lower.contains("opus-4-6")
         || lower.contains("sonnet-4-6")
         || lower.contains("haiku-4-6")
@@ -178,13 +198,11 @@ pub fn context_window_for_model_with_override(
     {
         return Some(1_000_000);
     }
-    if lower.contains("opus-4") || lower.contains("claude-opus") {
-        return Some(128_000);
-    }
-    if lower.contains("sonnet-4") || lower.contains("claude-sonnet") {
-        return Some(128_000);
-    }
-    if lower.contains("haiku-4") || lower.contains("claude-haiku") {
+    if lower.contains("claude")
+        || lower.contains("opus-4")
+        || lower.contains("sonnet-4")
+        || lower.contains("haiku-4")
+    {
         return Some(128_000);
     }
     // DeepSeek V4 (1M context) — must precede generic deepseek arm
@@ -203,18 +221,21 @@ pub fn context_window_for_model_with_override(
     if lower.contains("qwen") {
         return Some(128_000);
     }
+    // Moonshot / Kimi
+    if lower.contains("kimi") || lower.contains("moonshot") {
+        return Some(128_000);
+    }
     // MiniMax
     if lower.contains("minimax") {
         return Some(200_000);
     }
-    // GPT-4o / GPT-4
-    if lower.contains("gpt-4o") || lower.contains("gpt-4-turbo") {
-        return Some(128_000);
-    }
-    if lower.contains("gpt-4") {
-        return Some(128_000);
-    }
     None
+}
+
+fn has_model_token(model: &str, token: &str) -> bool {
+    model
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .any(|part| part == token)
 }
 
 fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
@@ -277,5 +298,33 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(limits.effective_plan_subtask_turns(), 80);
+    }
+
+    #[test]
+    fn context_window_override_wins() {
+        assert_eq!(
+            context_window_for_model_with_override("deepseek-chat", Some(1_000_000)),
+            Some(1_000_000)
+        );
+    }
+
+    #[test]
+    fn context_window_recognizes_shared_model_families() {
+        assert_eq!(context_window_for_model("gpt-5-turbo"), Some(256_000));
+        assert_eq!(context_window_for_model("gpt-3.5-turbo"), Some(16_000));
+        assert_eq!(context_window_for_model("o3-mini"), Some(200_000));
+        assert_eq!(context_window_for_model("openai/o1-preview"), Some(200_000));
+        assert_eq!(context_window_for_model("claude-3.5-sonnet"), Some(128_000));
+        assert_eq!(context_window_for_model("kimi-k2"), Some(128_000));
+    }
+
+    #[test]
+    fn context_window_does_not_misclassify_embedded_o1_or_o3_substrings() {
+        assert_eq!(
+            context_window_for_model("claude-opus-2025-v01"),
+            Some(128_000)
+        );
+        assert_eq!(context_window_for_model("deepseek-chat-v03"), Some(64_000));
+        assert_eq!(context_window_for_model("custom-vision-v03-beta"), None);
     }
 }
