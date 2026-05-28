@@ -2676,7 +2676,7 @@ pub(crate) async fn execute_cli_command(
 
         // ── MCP server management (offline, no server needed) ──────────
         Some(Command::Mcp(mcp_cmd)) => {
-            execute_mcp_command(mcp_cmd)?;
+            execute_mcp_command(mcp_cmd).await?;
             Ok(ExitCode::Success)
         }
 
