@@ -840,6 +840,19 @@ impl Drop for BashProgressGuard {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum PostToolResultError {
+    AuthRefreshFailed,
+    TerminalAuthFailure(String),
+    RequestFailed(String),
+}
+
+impl PostToolResultError {
+    fn is_terminal_auth(&self) -> bool {
+        matches!(self, Self::AuthRefreshFailed | Self::TerminalAuthFailure(_))
+    }
+}
+
 impl<'a> CliSseStreamHost<'a> {
     fn from_edge_ctx(ctx: EdgeSseContext<'a>, term_width: usize, render_md: bool) -> Self {
         Self::from_edge_ctx_with_auth(ctx, term_width, render_md, None)
@@ -879,6 +892,7 @@ impl<'a> CliSseStreamHost<'a> {
         // The thinking spinner and tool status lines still stream normally,
         // so the terminal is never blank during generation.
         let buffer_from_start = true;
+        crate::cli::edge_lifecycle::register_replay_executor(&ctx.executor, ctx.cancel_token);
         let streaming_tool_exec = build_streaming_tool_exec(std::sync::Arc::clone(&ctx.executor));
         Self {
             api: ctx.api,
@@ -981,28 +995,46 @@ impl<'a> CliSseStreamHost<'a> {
         true
     }
 
+    /// Post a tool result to the cloud server with automatic token refresh on 401.
+    /// Returns `Ok(())` when the server acknowledged the result.
+    /// Callers MUST gate `record_completed_request` on `Ok(())` — recording a result
+    /// that never reached the server causes the dedup system to falsely mark it as
+    /// completed and the reconnection protocol will never re-issue it.
     async fn post_tool_result_with_auth_retry(
         &mut self,
         body: &astra_thin_client::ToolResultRequest,
-    ) -> bool {
+    ) -> Result<(), PostToolResultError> {
         let result = self
             .api
             .post_tool_result(Some(self.token.as_str()), Some(self.executor_id), body)
             .await;
         match result {
-            Ok(_) => false,
+            Ok(_) => Ok(()),
             Err(e) if is_edge_auth_failure(&e) && self.refresh_edge_token_after_401().await => {
                 let retry = self
                     .api
                     .post_tool_result(Some(self.token.as_str()), Some(self.executor_id), body)
                     .await;
-                if let Err(ref retry_err) = retry {
-                    self.handle_post_tool_result_error(retry_err)
-                } else {
-                    false
+                match retry {
+                    Ok(_) => Ok(()),
+                    Err(ref retry_err) => {
+                        if self.handle_post_tool_result_error(retry_err) {
+                            Err(PostToolResultError::TerminalAuthFailure(
+                                retry_err.to_string(),
+                            ))
+                        } else {
+                            Err(PostToolResultError::RequestFailed(retry_err.to_string()))
+                        }
+                    }
                 }
             }
-            Err(e) => self.handle_post_tool_result_error(&e),
+            Err(e) => {
+                if self.handle_post_tool_result_error(&e) {
+                    Err(PostToolResultError::AuthRefreshFailed)
+                } else {
+                    Err(PostToolResultError::RequestFailed(e.to_string()))
+                }
+            }
         }
     }
 
@@ -1161,13 +1193,17 @@ impl<'a> CliSseStreamHost<'a> {
             duration_ms,
         };
         self.edge_tool_round.push(result.clone());
-        let body = astra_thin_client::ToolResultRequest {
-            request_id: request_id.to_string(),
+
+        let body = astra_thin_client::ToolResultRequest::new_with_hash(
+            request_id.to_string(),
             status,
-            output: Some(output),
-            duration_ms: Some(duration_ms),
-        };
-        let _ = self.post_tool_result_with_auth_retry(&body).await;
+            output,
+            duration_ms,
+        );
+        // ── Reconnection dedup: only record when server acked the result ──
+        if self.post_tool_result_with_auth_retry(&body).await.is_ok() {
+            crate::cli::edge_lifecycle::record_completed_request(request_id.to_string());
+        }
         result
     }
 }
@@ -1719,13 +1755,16 @@ impl<'a> CliSseStreamHost<'a> {
         };
         self.edge_tool_round.push(result.clone());
 
-        let body = astra_thin_client::ToolResultRequest {
-            request_id: req.request_id.clone(),
-            status: status.to_string(),
-            output: Some(output),
-            duration_ms: Some(duration_ms),
-        };
-        let _ = self.post_tool_result_with_auth_retry(&body).await;
+        let body = astra_thin_client::ToolResultRequest::new_with_hash(
+            req.request_id.clone(),
+            status.to_string(),
+            output,
+            duration_ms,
+        );
+        // ── Reconnection dedup: only record when server acked the result ──
+        if self.post_tool_result_with_auth_retry(&body).await.is_ok() {
+            crate::cli::edge_lifecycle::record_completed_request(req.request_id.clone());
+        }
 
         result
     }
@@ -2979,6 +3018,8 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             } else if tool == astra_turn_core::interaction_types::ASK_USER_TOOL_NAME {
                 self.ask_user_via_tui(args).await
             } else {
+                let _pending_tool_request_guard =
+                    crate::cli::edge_lifecycle::PendingToolRequestGuard::acquire();
                 let mut outcome = execute_with_metadata_responsive(
                     std::sync::Arc::clone(&self.executor),
                     tool.to_string(),
@@ -3284,13 +3325,16 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             status: status.clone(),
             duration_ms,
         });
-        let body = astra_thin_client::ToolResultRequest {
-            request_id: request_id.to_string(),
-            status: status.clone(),
-            output: Some(output),
-            duration_ms: Some(duration_ms),
-        };
-        let _ = self.post_tool_result_with_auth_retry(&body).await;
+        let body = astra_thin_client::ToolResultRequest::new_with_hash(
+            request_id.to_string(),
+            status.clone(),
+            output,
+            duration_ms,
+        );
+        // ── Reconnection dedup: only record when server acked the result ──
+        if self.post_tool_result_with_auth_retry(&body).await.is_ok() {
+            crate::cli::edge_lifecycle::record_completed_request(request_id.to_string());
+        }
         self.edge_tool_round
             .last()
             .cloned()
@@ -3934,6 +3978,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             outputs[pos] = (retried, retry_dur);
         }
 
+        let mut terminal_post_failure = false;
         for (pos, (outcome, duration_ms)) in outputs.into_iter().enumerate() {
             let (orig_idx, req) = conc_reqs[pos];
             let output = outcome.output;
@@ -4009,14 +4054,25 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             results[orig_idx] = Some(result);
 
             // Post tool result to cloud API.
-            let body = astra_thin_client::ToolResultRequest {
-                request_id: req.request_id.clone(),
-                status: status.to_string(),
-                output: Some(output),
-                duration_ms: Some(duration_ms),
-            };
-            if self.post_tool_result_with_auth_retry(&body).await {
-                break;
+            let body = astra_thin_client::ToolResultRequest::new_with_hash(
+                req.request_id.clone(),
+                status.to_string(),
+                output,
+                duration_ms,
+            );
+            // ── Reconnection dedup: only record when server acked the result ──
+            if !terminal_post_failure {
+                match self.post_tool_result_with_auth_retry(&body).await {
+                    Ok(()) => {
+                        crate::cli::edge_lifecycle::record_completed_request(
+                            req.request_id.clone(),
+                        );
+                    }
+                    Err(err) if err.is_terminal_auth() => {
+                        terminal_post_failure = true;
+                    }
+                    Err(_) => {}
+                }
             }
         }
 
@@ -6226,7 +6282,7 @@ fn should_offload_blocking_tool(tool_name: &str) -> bool {
     }
 }
 
-async fn execute_with_metadata_responsive(
+pub(crate) async fn execute_with_metadata_responsive(
     executor: std::sync::Arc<crate::edge_tools::ToolExecutor>,
     tool_name: String,
     args: Value,
@@ -7381,13 +7437,91 @@ mod tests {
             status: "ok".to_string(),
             output: Some("done".to_string()),
             duration_ms: Some(1),
+            result_hash: None,
         };
 
-        let terminal_auth_failure = host.post_tool_result_with_auth_retry(&body).await;
+        let posted = host.post_tool_result_with_auth_retry(&body).await.is_ok();
 
-        assert!(!terminal_auth_failure);
+        assert!(posted);
         assert!(!host.auth_failure);
         assert_eq!(host.token, "fresh-token");
+    }
+
+    #[tokio::test]
+    async fn edge_tool_result_refresh_failure_returns_terminal_auth_error() {
+        let _creds_guard = crate::tests::isolate_credentials();
+
+        let mut creds = CredentialsFile {
+            current_profile: Some("test".to_string()),
+            ..Default::default()
+        };
+        creds.profiles.insert(
+            "test".to_string(),
+            Profile {
+                access_token: Some("expired-token".to_string()),
+                refresh_token: Some("refresh-token".to_string()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).expect("save credentials");
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(astra_thin_client::paths::TOOLS_RESULT))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "error": "expired"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(astra_thin_client::paths::AUTH_REFRESH))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "error": "refresh-expired"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(server.uri().as_str(), None).expect("client");
+        let workspace = tempdir().expect("workspace");
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(workspace.path()));
+        let mut tool_cache = EdgeToolCache::new(10);
+        let ctx = EdgeSseContext {
+            api: &api,
+            token: "expired-token",
+            executor_id: "edge-test",
+            executor,
+            render_policy: RenderPolicy::Silent,
+            perm_manager: None,
+            cancel_token: None,
+            stream_event_tx: None,
+            stream_event_sink: None,
+            approval_request_tx: None,
+            ask_user_request_tx: None,
+            skill_resolver: None,
+            skill_continuation: false,
+            turn_rollback_on_failure: false,
+            tool_cache: &mut tool_cache,
+            observability_hub: None,
+        };
+        let mut host = CliSseStreamHost::from_edge_ctx_with_auth(ctx, 80, false, Some("test"));
+        let body = astra_thin_client::ToolResultRequest {
+            request_id: "req-1".to_string(),
+            status: "ok".to_string(),
+            output: Some("done".to_string()),
+            duration_ms: Some(1),
+            result_hash: None,
+        };
+
+        let err = host
+            .post_tool_result_with_auth_retry(&body)
+            .await
+            .expect_err("terminal auth failure");
+
+        assert_eq!(err, PostToolResultError::AuthRefreshFailed);
+        assert!(err.is_terminal_auth());
+        assert!(host.auth_failure);
     }
 
     #[test]
