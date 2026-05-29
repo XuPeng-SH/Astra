@@ -38,6 +38,10 @@ pub enum InterruptionKind {
     ApprovalRejected,
     /// Server overload (503 / 529).
     ServerOverload,
+    /// Streaming transport failed after retry/recovery attempts.
+    StreamTransport,
+    /// Streaming response went idle and retry/recovery did not complete.
+    StreamIdle,
     /// Harness verifier returned Fatal → session blocked.
     HarnessBlocked,
     /// Harness debug breakpoint hit → session paused.
@@ -61,6 +65,8 @@ impl InterruptionKind {
             Self::CriticalVerdict => "critical_verdict",
             Self::ApprovalRejected => "approval_rejected",
             Self::ServerOverload => "server_overload",
+            Self::StreamTransport => "stream_transport",
+            Self::StreamIdle => "stream_idle",
             Self::HarnessBlocked => "harness_blocked",
             Self::HarnessPaused => "harness_paused",
         }
@@ -78,7 +84,9 @@ impl InterruptionKind {
             | Self::CooldownRejected
             | Self::UserCancelled
             | Self::CriticalVerdict
-            | Self::ServerOverload => true,
+            | Self::ServerOverload
+            | Self::StreamTransport
+            | Self::StreamIdle => true,
             Self::ContextOverflow => true, // resumable with compaction
             Self::AuthFailure => false,    // needs external credential refresh
             Self::ApprovalRejected => true,
@@ -470,6 +478,16 @@ pub fn build_resume_guidance_with_context(
                  and avoid the tool patterns that caused failures.\n",
             );
         }
+        "harness_paused" => {
+            guidance.push_str(
+                "  Action: The previous run was paused by the harness due to a \
+                 read-only stall — the agent was reading files without making edits. \
+                 Stop broad exploration; use the evidence already gathered and take \
+                 ONE concrete action: edit the relevant file, run targeted verification, \
+                 or explicitly report why the task cannot be completed. Do NOT continue \
+                 broad or duplicate reading.\n",
+            );
+        }
         "approval_rejected" => {
             guidance.push_str(
                 "  Action: Tool approvals were repeatedly denied. Use only read-only \
@@ -532,6 +550,14 @@ pub fn interruption_from_error_kind(
         )),
         ErrorKind::Cancelled => Some((
             InterruptionKind::UserCancelled,
+            ResumeAction::ContinueImmediately,
+        )),
+        ErrorKind::StreamTransport | ErrorKind::Network => Some((
+            InterruptionKind::StreamTransport,
+            ResumeAction::ContinueImmediately,
+        )),
+        ErrorKind::StreamIdle => Some((
+            InterruptionKind::StreamIdle,
             ResumeAction::ContinueImmediately,
         )),
         _ => None,
@@ -639,6 +665,27 @@ pub fn classify_error(error: &str) -> Option<(InterruptionKind, ResumeAction)> {
         ));
     }
 
+    if lower.contains("stream_transport")
+        || lower.contains("stream transport")
+        || lower.contains("transport error")
+        || lower.contains("network error")
+    {
+        return Some((
+            InterruptionKind::StreamTransport,
+            ResumeAction::ContinueImmediately,
+        ));
+    }
+
+    if lower.contains("stream_idle")
+        || lower.contains("stream idle")
+        || lower.contains("stream stalled")
+    {
+        return Some((
+            InterruptionKind::StreamIdle,
+            ResumeAction::ContinueImmediately,
+        ));
+    }
+
     None
 }
 
@@ -657,6 +704,8 @@ mod tests {
             InterruptionKind::ContextOverflow,
             InterruptionKind::AuthFailure,
             InterruptionKind::CriticalVerdict,
+            InterruptionKind::StreamTransport,
+            InterruptionKind::StreamIdle,
         ];
         for kind in kinds {
             let label = kind.label();
@@ -674,6 +723,8 @@ mod tests {
         assert!(InterruptionKind::EmptyCompletion.is_resumable());
         assert!(InterruptionKind::RateLimited.is_resumable());
         assert!(InterruptionKind::UserCancelled.is_resumable());
+        assert!(InterruptionKind::StreamTransport.is_resumable());
+        assert!(InterruptionKind::StreamIdle.is_resumable());
     }
 
     #[test]
@@ -1292,11 +1343,14 @@ mod tests {
     }
 
     #[test]
-    fn error_kind_stream_errors_return_none() {
-        // Stream errors are retryable at the LLM layer, not session interruptions
-        assert!(interruption_from_error_kind(astra_core::ErrorKind::StreamIdle).is_none());
-        assert!(interruption_from_error_kind(astra_core::ErrorKind::StreamTransport).is_none());
-        assert!(interruption_from_error_kind(astra_core::ErrorKind::Network).is_none());
+    fn error_kind_stream_errors_are_resumable_interruptions() {
+        let (idle, _) = interruption_from_error_kind(astra_core::ErrorKind::StreamIdle).unwrap();
+        assert_eq!(idle, InterruptionKind::StreamIdle);
+        let (transport, _) =
+            interruption_from_error_kind(astra_core::ErrorKind::StreamTransport).unwrap();
+        assert_eq!(transport, InterruptionKind::StreamTransport);
+        let (network, _) = interruption_from_error_kind(astra_core::ErrorKind::Network).unwrap();
+        assert_eq!(network, InterruptionKind::StreamTransport);
     }
 
     #[test]

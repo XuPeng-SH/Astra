@@ -29,7 +29,7 @@ use uuid::Uuid;
 use astra_core::SharedPool;
 use astra_services::{SessionArtifactJsonRecord, SessionArtifactJsonStore};
 use astra_tools::executor::DefaultToolExecutor;
-use astra_tools::exit_semantics::classify_exit;
+use astra_tools::exit_semantics::{classify_command_result, classify_exit};
 use astra_tools::task_mgmt::{
     InMemoryTaskStore, SessionTask, TaskManager, TaskManagerSnapshot, TaskStore,
 };
@@ -4650,8 +4650,11 @@ fn tool_result_from_server_bash_output(
         return astra_tools::ToolResult::error(format!("Error: {body}"));
     }
     let semantics = output.exit_code.map(|code| classify_exit(command, code));
+    let result_class =
+        classify_command_result(command, &output.stdout, &output.stderr, output.exit_code);
     let mut result = if output.exit_code.is_some_and(|code| code != 0)
         && semantics.is_some_and(|semantics| semantics.is_tool_error())
+        || result_class.is_tool_error()
         || output.exit_code.is_none() && output.stdout.is_empty() && !output.stderr.is_empty()
     {
         astra_tools::ToolResult::error(format!("Error: {body}"))
@@ -4661,6 +4664,7 @@ fn tool_result_from_server_bash_output(
     if let Some(semantics) = semantics {
         result = result.with_exit_semantics(semantics);
     }
+    result = result.with_result_class(result_class);
     result
 }
 
