@@ -4,9 +4,13 @@
 //! (poll + take) so each callback is delivered at most once.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::io::{self, BufRead, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use astra_pipeline::journal_crypto::{JournalCrypto, hex_decode, hex_encode};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -27,6 +31,108 @@ pub const MAX_LEDGER_ENTRY_AGE: Duration = Duration::from_secs(300);
 
 pub const MSG_TOOL_LEDGER_TIMEOUT: &str =
     "timed out waiting for edge POST /tools/result (§5.5 ledger)";
+
+/// Retry backoff configuration for [`take_ledger_entry`].
+const BACKOFF_BASE_MS: u64 = 50;
+const BACKOFF_CAP_MS: u64 = 2_000;
+const BACKOFF_MULTIPLIER: u64 = 2;
+const LEDGER_COMPACT_BYTES_THRESHOLD: u64 = 256 * 1024;
+
+/// Compute next poll interval with exponential backoff.
+/// Starts at `BACKOFF_BASE_MS`, doubles each retry, caps at `BACKOFF_CAP_MS`.
+fn backoff_delay(retry_count: u32) -> Duration {
+    let ms = BACKOFF_BASE_MS
+        .saturating_mul(BACKOFF_MULTIPLIER.saturating_pow(retry_count))
+        .min(BACKOFF_CAP_MS);
+    Duration::from_millis(ms)
+}
+
+fn ledger_crypto() -> &'static JournalCrypto {
+    static CRYPTO: OnceLock<JournalCrypto> = OnceLock::new();
+    CRYPTO.get_or_init(JournalCrypto::from_env_or_local_key)
+}
+
+fn encrypt_persisted_ledger_line(line: &str) -> String {
+    let encrypted = ledger_crypto().encrypt(line.as_bytes());
+    hex_encode(&encrypted)
+}
+
+fn decrypt_persisted_ledger_line(line: &str) -> Option<String> {
+    if line.starts_with('{') {
+        return Some(line.to_string());
+    }
+    let bytes = hex_decode(line.trim())?;
+    let decrypted = ledger_crypto().decrypt_with_legacy_support(&bytes)?;
+    String::from_utf8(decrypted).ok()
+}
+
+fn sync_parent_dir(dir: &Path) -> io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
+}
+
+/// Metadata tracked alongside each ledger entry for retry and expiry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LedgerEntryMeta {
+    /// Unix epoch millis when the entry was first inserted.
+    created_at_ms: u64,
+    /// Number of times `take_ledger_entry` polled for this key.
+    retry_count: u32,
+    /// Unix epoch millis of the most recent poll for this key.
+    last_poll_at_ms: u64,
+}
+
+impl LedgerEntryMeta {
+    fn now() -> Self {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        Self {
+            created_at_ms: now_ms,
+            retry_count: 0,
+            last_poll_at_ms: now_ms,
+        }
+    }
+
+    fn record_poll(&mut self) {
+        self.retry_count += 1;
+        self.last_poll_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+    }
+
+    #[allow(dead_code)]
+    fn age_ms(&self) -> u64 {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        now_ms.saturating_sub(self.created_at_ms)
+    }
+}
+
+/// Parallel side-channel of per-entry metadata (created_at, retry count, poll timestamps).
+fn ledger_meta() -> &'static StdMutex<HashMap<String, LedgerEntryMeta>> {
+    static META: std::sync::OnceLock<StdMutex<HashMap<String, LedgerEntryMeta>>> =
+        std::sync::OnceLock::new();
+    META.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn prune_ledger_meta(meta: &mut HashMap<String, LedgerEntryMeta>) {
+    if meta.len() <= LEDGER_MAX_ENTRIES {
+        return;
+    }
+    let remove_count = meta.len() - LEDGER_MAX_ENTRIES;
+    let mut victims: Vec<_> = meta
+        .iter()
+        .map(|(key, entry)| (key.clone(), entry.last_poll_at_ms, entry.created_at_ms))
+        .collect();
+    victims.sort_by_key(|(_, last_poll_at_ms, created_at_ms)| (*last_poll_at_ms, *created_at_ms));
+    for (key, _, _) in victims.into_iter().take(remove_count) {
+        meta.remove(&key);
+    }
+}
 
 /// Side-channel of "first-observed" timestamps for the ledger. We cannot
 /// modify the §5.5 insert helpers (locked down by PR #233) to embed an
@@ -85,7 +191,15 @@ pub async fn sweep_expired_entries(
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
     };
-    sweep_expired_entries_inner(&mut g, &mut ts, Instant::now(), MAX_LEDGER_ENTRY_AGE)
+    let removed =
+        sweep_expired_entries_inner(&mut g, &mut ts, Instant::now(), MAX_LEDGER_ENTRY_AGE);
+    // Also clean up ledger_meta for removed keys
+    if removed > 0 {
+        if let Ok(mut meta) = ledger_meta().lock() {
+            meta.retain(|k, _| g.contains_key(k));
+        }
+    }
+    removed
 }
 
 /// Returns `true` if any assistant message in `messages` carries a
@@ -114,23 +228,230 @@ pub fn user_prompt_callback_key(user_id: &str, request_id: &str) -> String {
     format!("{user_id}:user_prompt:{request_id}")
 }
 
-/// Remove and return the value for `key`, waiting up to `timeout` (50ms polling).
+/// Record metadata when a new entry is inserted into the ledger by
+/// HTTP callback handlers. Called from
+/// [`super::edge_callback_handlers::insert_ledger_entry`].
+pub fn on_ledger_insert(key: &str) {
+    if let Ok(mut meta) = ledger_meta().lock() {
+        meta.entry(key.to_string())
+            .or_insert_with(LedgerEntryMeta::now);
+        prune_ledger_meta(&mut meta);
+    }
+    // Persist if configured.
+    if let Some(p) = ledger_persistence() {
+        let _ = p.write_op("insert", key);
+    }
+}
+
+/// ── File-based persistence ──────────────────────────────────────────
+///
+/// Optional JSONL-based durability for edge callback ledger entries.
+/// When configured via [`set_ledger_persistence`], every insert and
+/// removal is appended to `edge_ledger.jsonl`. On process restart,
+/// [`recover_from_persistence`] replays the journal to restore
+/// un-consumed entries.
+/// Persistence handle for the edge callback ledger.
+#[derive(Debug, Clone)]
+pub struct LedgerPersistence {
+    dir: PathBuf,
+}
+
+impl LedgerPersistence {
+    pub fn new(dir: PathBuf) -> Self {
+        Self { dir }
+    }
+
+    fn file_path(&self) -> PathBuf {
+        self.dir.join("edge_ledger.jsonl")
+    }
+
+    /// Append an operation line to the JSONL journal.
+    fn write_op(&self, op: &str, key: &str) -> io::Result<()> {
+        std::fs::create_dir_all(&self.dir)?;
+        let path = self.file_path();
+        let existed = path.exists();
+        let line = serde_json::json!({
+            "op": op,
+            "key": key,
+            "ts_ms": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+        });
+        let encrypted = encrypt_persisted_ledger_line(&line.to_string());
+        #[cfg(unix)]
+        let mut file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .mode(0o600)
+                .open(&path)?
+        };
+        #[cfg(not(unix))]
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        writeln!(file, "{encrypted}")?;
+        file.sync_data()?;
+        drop(file);
+        if !existed {
+            sync_parent_dir(&self.dir)?;
+        }
+        self.maybe_compact(op)?;
+        Ok(())
+    }
+
+    fn maybe_compact(&self, op: &str) -> io::Result<()> {
+        if op != "remove" {
+            return Ok(());
+        }
+        let path = self.file_path();
+        let len = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+        if len < LEDGER_COMPACT_BYTES_THRESHOLD {
+            return Ok(());
+        }
+        let active = self.recover()?;
+        self.compact(&active)
+    }
+
+    /// Read all insert/remove operations and build a recovered ledger.
+    /// Returns the set of keys that were inserted but not yet removed.
+    pub fn recover(&self) -> io::Result<Vec<String>> {
+        let path = self.file_path();
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let file = std::fs::File::open(&path)?;
+        let mut active = std::collections::HashSet::new();
+        let mut order = Vec::new();
+        for line in io::BufReader::new(file).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let json = decrypt_persisted_ledger_line(&line).unwrap_or(line);
+            let entry: serde_json::Value = serde_json::from_str(&json).unwrap_or_default();
+            let Some(op) = entry.get("op").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some(key) = entry.get("key").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            match op {
+                "insert" => {
+                    active.insert(key.to_string());
+                    order.push(key.to_string());
+                }
+                "remove" => {
+                    active.remove(key);
+                }
+                _ => {}
+            }
+        }
+        let mut recovered = Vec::with_capacity(active.len());
+        let mut seen = std::collections::HashSet::with_capacity(active.len());
+        for key in order.into_iter().rev() {
+            if active.contains(&key) && seen.insert(key.clone()) {
+                recovered.push(key);
+            }
+        }
+        recovered.reverse();
+        Ok(recovered)
+    }
+
+    /// Compact the journal: rewrite with only active (non-removed) entries.
+    pub fn compact(&self, active_keys: &[String]) -> io::Result<()> {
+        std::fs::create_dir_all(&self.dir)?;
+        let path = self.file_path();
+        let tmp = path.with_extension("jsonl.tmp");
+        #[cfg(unix)]
+        let mut file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?
+        };
+        #[cfg(not(unix))]
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)?;
+        for key in active_keys {
+            let line = serde_json::json!({
+                "op": "insert",
+                "key": key,
+                "ts_ms": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64,
+            });
+            let encrypted = encrypt_persisted_ledger_line(&line.to_string());
+            writeln!(file, "{encrypted}")?;
+        }
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, &path)?;
+        sync_parent_dir(&self.dir)
+    }
+}
+
+static PERSISTENCE: std::sync::OnceLock<Option<LedgerPersistence>> = std::sync::OnceLock::new();
+
+/// Configure file-based persistence for the ledger.
+/// Must be called at most once, before any ledger operations.
+pub fn set_ledger_persistence(p: LedgerPersistence) {
+    let _ = PERSISTENCE.set(Some(p));
+}
+
+fn ledger_persistence() -> Option<&'static LedgerPersistence> {
+    PERSISTENCE.get().and_then(|opt| opt.as_ref())
+}
+
+/// Remove and return the value for `key`, waiting up to `timeout` with
+/// exponential backoff (50ms → 100ms → 200ms → … → cap 2s).
+///
+/// Each retry records metadata in [`ledger_meta`] for observability.
+/// Expired entries are swept opportunistically before each poll.
 pub async fn take_ledger_entry(
     ledger: &Arc<tokio::sync::Mutex<HashMap<String, Value>>>,
     key: &str,
     timeout: Duration,
 ) -> Option<Value> {
-    let poll = Duration::from_millis(DEFAULT_POLL_INTERVAL_MS);
     let started = Instant::now();
+    let mut retries: u32 = 0;
     loop {
-        // audit-#6: opportunistically reclaim stale entries before each poll
-        // so an idle ledger never silently fills to LEDGER_MAX_ENTRIES.
-        let _ = sweep_expired_entries(ledger).await;
+        // Sweep stale entries every 5th retry (avoid lock contention).
+        if retries.is_multiple_of(5) {
+            let _ = sweep_expired_entries(ledger).await;
+        }
+        // Record poll in metadata.
+        {
+            if let Ok(mut meta) = ledger_meta().lock() {
+                meta.entry(key.to_string())
+                    .or_insert_with(LedgerEntryMeta::now)
+                    .record_poll();
+                prune_ledger_meta(&mut meta);
+            }
+        }
         {
             let mut g = ledger.lock().await;
             if let Some(v) = g.remove(key) {
+                // Clean up metadata and timestamps.
                 if let Ok(mut ts) = ledger_timestamps().lock() {
                     ts.remove(key);
+                }
+                if let Ok(mut meta) = ledger_meta().lock() {
+                    meta.remove(key);
+                }
+                // Write tombstone for crash recovery.
+                if let Some(p) = ledger_persistence() {
+                    let _ = p.write_op("remove", key);
                 }
                 return Some(v);
             }
@@ -138,7 +459,11 @@ pub async fn take_ledger_entry(
         if started.elapsed() >= timeout {
             return None;
         }
-        tokio::time::sleep(poll).await;
+        let delay = backoff_delay(retries);
+        retries += 1;
+        // Don't sleep beyond the remaining timeout.
+        let remaining = timeout.saturating_sub(started.elapsed());
+        tokio::time::sleep(delay.min(remaining)).await;
     }
 }
 
@@ -282,74 +607,92 @@ pub fn assistant_message_with_tool_calls_and_reasoning(
     msg
 }
 
-/// Returns `true` when the provider requires **full** `reasoning_content` to be
-/// preserved on every assistant message in multi-turn tool-call conversations.
-///
-/// Moonshot (Kimi-k2.5, kimi-k2-thinking) rejects requests with empty-string
-/// `reasoning_content` on assistant+tool_calls messages when thinking mode is
-/// active (which is the default for kimi-k2.5).  Other providers (OpenAI,
-/// Anthropic, DeepSeek) accept empty strings and benefit from the token savings.
-pub fn provider_preserves_reasoning(provider: &str, model: &str) -> bool {
-    provider == "moonshot" || model.starts_with("kimi-k2")
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReasoningReplayPolicy {
+    enforce_reasoning_field: bool,
+    placeholder: String,
+    can_strip_unsigned_reasoning: bool,
+}
+
+impl ReasoningReplayPolicy {
+    pub fn infer(
+        messages: &[Value],
+        thinking: &crate::thinking_config::ThinkingConfig,
+        provider: &str,
+        model: &str,
+    ) -> Self {
+        let enforce_reasoning_field =
+            !matches!(thinking, crate::thinking_config::ThinkingConfig::Off)
+                || history_has_reasoning(messages);
+        let observed_placeholder = observed_reasoning_placeholder(messages);
+        let placeholder = observed_placeholder
+            .unwrap_or_else(|| fallback_reasoning_placeholder(provider, model))
+            .to_string();
+        Self {
+            enforce_reasoning_field,
+            placeholder,
+            can_strip_unsigned_reasoning: observed_placeholder.is_some()
+                || fallback_reasoning_placeholder(provider, model).is_empty(),
+        }
+    }
+
+    fn placeholder_value(&self) -> Value {
+        Value::String(self.placeholder.clone())
+    }
+}
+
+/// Inspect the message history for an assistant reasoning_content string that
+/// is all-whitespace but non-empty.  This is the pattern used by Moonshot
+/// (Kimi) to mark a turn where thinking is enabled but the model produced no
+/// reasoning — it emits `" "` rather than `""`.  If we observe this pattern,
+/// we adopt it as our own placeholder so that replayed messages match what the
+/// upstream provider sent.  Falls back to `""` if the history only contains
+/// genuinely empty strings, and `None` if no reasoning_content fields exist
+/// at all (leaving the choice entirely to [`fallback_reasoning_placeholder`]).
+fn observed_reasoning_placeholder(messages: &[Value]) -> Option<&str> {
+    let mut saw_empty = false;
+    for msg in messages {
+        if msg.get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let Some(reasoning) = msg.get("reasoning_content").and_then(Value::as_str) else {
+            continue;
+        };
+        if reasoning.trim().is_empty() {
+            if !reasoning.is_empty() {
+                return Some(reasoning);
+            }
+            saw_empty = true;
+        }
+    }
+    saw_empty.then_some("")
+}
+
+fn fallback_reasoning_placeholder(provider: &str, model: &str) -> &'static str {
+    if provider == "moonshot" || model.starts_with("kimi-k2") {
+        " "
+    } else {
+        ""
+    }
+}
+
+fn needs_reasoning_placeholder(msg: &Value, placeholder: &str) -> bool {
+    match msg.get("reasoning_content").and_then(Value::as_str) {
+        None => true,
+        Some(existing) if existing.trim().is_empty() && existing != placeholder => true,
+        _ => false,
+    }
 }
 
 /// Strip `reasoning_content` values from older assistant messages to reduce token usage.
 ///
 /// Thinking-model sessions accumulate large reasoning chains on every assistant message.
-/// Since the LLM gains no benefit from re-reading old reasoning, we clear the value
-/// (replace with empty string) on all assistant messages **except** the last one.
-/// The field is kept (as empty string) so thinking-model API contracts are satisfied.
-///
-/// **Skipped entirely** when `provider_preserves_reasoning` returns true (e.g. Moonshot),
-/// because those providers reject empty-string reasoning_content.
-///
-/// **Signature-bearing assistant messages are preserved verbatim** regardless of
-/// position. Anthropic's Messages API (and proxies like DeepSeek's
-/// `/anthropic` endpoint) require the full original `thinking` block plus
-/// its HMAC `signature` to be echoed on every assistant+tool_use turn in
-/// a thinking-enabled request. Stripping the content would work the first
-/// time but fail on the next round when the signature references a
-/// now-empty thinking block — session effccfcd-28d8-41f4-a4b0-ecd0ec503625
-/// t4_r2 hit `content[].thinking in the thinking mode must be passed
-/// back to the API`. Presence of a non-empty `reasoning_signature` is
-/// authoritative evidence that the upstream emitted a signed thinking
-/// block and will reject replay without it.
-///
-/// **Only affects the in-flight messages array** — heavy checkpoints and persisted events
-/// retain the full reasoning for debugging and audit.
-pub fn strip_stale_reasoning(messages: &mut [Value], provider: &str, model: &str) {
-    if provider_preserves_reasoning(provider, model) {
-        // Provider requires full reasoning on every assistant message — ensure
-        // the field exists on all assistant+tool_calls messages but do NOT clear
-        // any existing content.
-        //
-        // Moonshot rejects both absent and empty-string `reasoning_content` when
-        // thinking is enabled.  For messages that genuinely never had reasoning
-        // (e.g. pre-thinking-model messages in a mid-session switch), we insert
-        // a single space — the minimum non-empty value Moonshot accepts.
-        if !history_has_reasoning(messages) {
-            return;
-        }
-        let placeholder = Value::String(" ".to_string());
-        for msg in messages.iter_mut() {
-            if msg.get("role").and_then(Value::as_str) != Some("assistant") {
-                continue;
-            }
-            if msg.get("tool_calls").is_none() {
-                continue;
-            }
-            match msg.get("reasoning_content").and_then(Value::as_str) {
-                None => {
-                    msg["reasoning_content"] = placeholder.clone();
-                }
-                Some("") => {
-                    msg["reasoning_content"] = placeholder.clone();
-                }
-                Some(_) => {} // non-empty — keep as-is
-            }
-        }
+/// Since the LLM gains no benefit from re-reading old reasoning, we normalize
+pub fn strip_stale_reasoning_with_policy(messages: &mut [Value], policy: &ReasoningReplayPolicy) {
+    if !policy.enforce_reasoning_field {
         return;
     }
+    let placeholder = policy.placeholder_value();
     // Find index of the last assistant message that has non-empty reasoning.
     let last_reasoning_idx = messages
         .iter()
@@ -364,11 +707,20 @@ pub fn strip_stale_reasoning(messages: &mut [Value], provider: &str, model: &str
         .map(|(i, _)| i);
 
     let Some(last_idx) = last_reasoning_idx else {
-        return; // No reasoning in history — nothing to strip.
+        for msg in messages.iter_mut() {
+            if msg.get("role").and_then(Value::as_str) != Some("assistant") {
+                continue;
+            }
+            if needs_reasoning_placeholder(msg, policy.placeholder.as_str()) {
+                msg["reasoning_content"] = placeholder.clone();
+            }
+        }
+        return;
     };
 
-    // Thinking is active — every assistant message with tool_calls must have
-    // `reasoning_content` (even empty string) or providers like Kimi return 400.
+    // Thinking is active — every assistant message must keep an explicit
+    // `reasoning_content` field (even empty string) or providers such as
+    // DeepSeek/Kimi reject the replayed history with HTTP 400.
     for (i, msg) in messages.iter_mut().enumerate() {
         if msg.get("role").and_then(Value::as_str) != Some("assistant") {
             continue;
@@ -392,9 +744,10 @@ pub fn strip_stale_reasoning(messages: &mut [Value], provider: &str, model: &str
                 .get("reasoning_content")
                 .and_then(Value::as_str)
                 .is_some_and(|s| !s.is_empty())
+                && policy.can_strip_unsigned_reasoning
             {
-                // Replace with empty string (keep field for API compat).
-                msg["reasoning_content"] = Value::String(String::new());
+                // Replace with the policy placeholder (keep field for API compat).
+                msg["reasoning_content"] = placeholder.clone();
                 // Signature is meaningless without reasoning text — and
                 // defensively stripped in case an empty signature leaked
                 // through. The signed-message guard above already skipped
@@ -402,14 +755,16 @@ pub fn strip_stale_reasoning(messages: &mut [Value], provider: &str, model: &str
                 if let Some(obj) = msg.as_object_mut() {
                     obj.remove("reasoning_signature");
                 }
-            } else if msg.get("reasoning_content").is_none() && msg.get("tool_calls").is_some() {
-                // Assistant tool_call message from before thinking was enabled —
-                // add the field so the provider doesn't reject it.
-                msg["reasoning_content"] = Value::String(String::new());
+            } else if needs_reasoning_placeholder(msg, policy.placeholder.as_str()) {
+                // Assistant message from before thinking was enabled — add the
+                // field so replay stays valid after a mid-session switch or a
+                // provider that requires explicit reasoning placeholders.
+                msg["reasoning_content"] = placeholder.clone();
             }
-        } else if msg.get("reasoning_content").is_none() && msg.get("tool_calls").is_some() {
-            // Even at or after last_idx, ensure the field exists on tool_call messages.
-            msg["reasoning_content"] = Value::String(String::new());
+        } else if needs_reasoning_placeholder(msg, policy.placeholder.as_str()) {
+            // Even at or after last_idx, ensure the field exists on assistant
+            // messages that replay into a thinking-mode request.
+            msg["reasoning_content"] = placeholder.clone();
         }
     }
 }
@@ -419,6 +774,7 @@ mod tests {
     use super::*;
 
     use crate::history::{RecoveredEventRow, append_recovered_events};
+    use tempfile::tempdir;
 
     #[test]
     fn callback_keys_match_handler_convention() {
@@ -681,7 +1037,14 @@ mod tests {
             json!({"role": "assistant", "content": null, "reasoning_content": "think2", "tool_calls": []}),
             json!({"role": "tool", "tool_call_id": "t2", "content": "r2"}),
         ];
-        strip_stale_reasoning(&mut msgs, "openai", "gpt-4");
+        let policy = super::ReasoningReplayPolicy::infer(
+            &msgs,
+            &crate::thinking_config::ThinkingConfig::Off,
+            "openai",
+            "gpt-4",
+        );
+
+        strip_stale_reasoning_with_policy(&mut msgs, &policy);
         // First assistant: reasoning cleared to empty
         assert_eq!(msgs[1]["reasoning_content"].as_str(), Some(""));
         // Second assistant: reasoning preserved
@@ -695,7 +1058,14 @@ mod tests {
             json!({"role": "assistant", "content": "hello"}),
         ];
         let original = msgs.clone();
-        strip_stale_reasoning(&mut msgs, "openai", "gpt-4");
+        let policy = super::ReasoningReplayPolicy::infer(
+            &msgs,
+            &crate::thinking_config::ThinkingConfig::Off,
+            "openai",
+            "gpt-4",
+        );
+
+        strip_stale_reasoning_with_policy(&mut msgs, &policy);
         assert_eq!(msgs, original);
     }
 
@@ -705,7 +1075,14 @@ mod tests {
             json!({"role": "user", "content": "hi"}),
             json!({"role": "assistant", "reasoning_content": "deep thought", "content": "42"}),
         ];
-        strip_stale_reasoning(&mut msgs, "openai", "gpt-4");
+        let policy = super::ReasoningReplayPolicy::infer(
+            &msgs,
+            &crate::thinking_config::ThinkingConfig::Off,
+            "openai",
+            "gpt-4",
+        );
+
+        strip_stale_reasoning_with_policy(&mut msgs, &policy);
         assert_eq!(msgs[1]["reasoning_content"].as_str(), Some("deep thought"));
     }
 
@@ -715,7 +1092,14 @@ mod tests {
             json!({"role": "assistant", "reasoning_content": "", "content": "a"}),
             json!({"role": "assistant", "reasoning_content": "real", "content": "b"}),
         ];
-        strip_stale_reasoning(&mut msgs, "openai", "gpt-4");
+        let policy = super::ReasoningReplayPolicy::infer(
+            &msgs,
+            &crate::thinking_config::ThinkingConfig::Off,
+            "openai",
+            "gpt-4",
+        );
+
+        strip_stale_reasoning_with_policy(&mut msgs, &policy);
         // Already-empty field stays empty (not removed).
         assert_eq!(msgs[0]["reasoning_content"].as_str(), Some(""));
         assert_eq!(msgs[1]["reasoning_content"].as_str(), Some("real"));
@@ -754,7 +1138,14 @@ mod tests {
             }),
             json!({"role": "tool", "tool_call_id": "t2", "content": "r2"}),
         ];
-        strip_stale_reasoning(&mut msgs, "anthropic", "deepseek-v4-pro-anthropic");
+        let policy = super::ReasoningReplayPolicy::infer(
+            &msgs,
+            &crate::thinking_config::ThinkingConfig::Off,
+            "anthropic",
+            "deepseek-v4-pro-anthropic",
+        );
+
+        strip_stale_reasoning_with_policy(&mut msgs, &policy);
         // Older assistant (idx 1) has a signature — MUST be preserved verbatim,
         // not cleared to empty. That's the effccfcd regression.
         assert_eq!(
@@ -803,7 +1194,14 @@ mod tests {
                 ]
             }),
         ];
-        strip_stale_reasoning(&mut msgs, "anthropic", "claude-sonnet-4");
+        let policy = super::ReasoningReplayPolicy::infer(
+            &msgs,
+            &crate::thinking_config::ThinkingConfig::Off,
+            "anthropic",
+            "claude-sonnet-4",
+        );
+
+        strip_stale_reasoning_with_policy(&mut msgs, &policy);
         assert_eq!(
             msgs[1]["reasoning_content"].as_str(),
             Some("signed thought")
@@ -851,7 +1249,14 @@ mod tests {
                 ]
             }),
         ];
-        strip_stale_reasoning(&mut msgs, "anthropic", "claude-sonnet-4");
+        let policy = super::ReasoningReplayPolicy::infer(
+            &msgs,
+            &crate::thinking_config::ThinkingConfig::Off,
+            "anthropic",
+            "claude-sonnet-4",
+        );
+
+        strip_stale_reasoning_with_policy(&mut msgs, &policy);
         // Unsigned older → stripped to empty
         assert_eq!(msgs[1]["reasoning_content"].as_str(), Some(""));
         assert!(msgs[1].get("reasoning_signature").is_none());
@@ -875,7 +1280,14 @@ mod tests {
             json!({"role": "assistant", "content": null, "reasoning_content": "think", "tool_calls": [{"id":"t2","type":"function","function":{"name":"bash","arguments":"{}"}}]}),
             json!({"role": "tool", "tool_call_id": "t2", "content": "ok2"}),
         ];
-        strip_stale_reasoning(&mut msgs, "openai", "gpt-4");
+        let policy = super::ReasoningReplayPolicy::infer(
+            &msgs,
+            &crate::thinking_config::ThinkingConfig::Off,
+            "openai",
+            "gpt-4",
+        );
+
+        strip_stale_reasoning_with_policy(&mut msgs, &policy);
         // Old assistant+tool_calls at index 1 must now have reasoning_content
         assert_eq!(
             msgs[1]["reasoning_content"].as_str(),
@@ -884,6 +1296,54 @@ mod tests {
         );
         // Latest reasoning preserved
         assert_eq!(msgs[5]["reasoning_content"].as_str(), Some("think"));
+    }
+
+    #[test]
+    fn strip_stale_reasoning_adds_field_to_plain_assistant_missing_it() {
+        let mut msgs = vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "content": "hello"}),
+            json!({"role": "user", "content": "continue"}),
+            json!({"role": "assistant", "content": "done", "reasoning_content": "deep thought"}),
+        ];
+
+        let policy = super::ReasoningReplayPolicy::infer(
+            &msgs,
+            &crate::thinking_config::ThinkingConfig::Off,
+            "deepseek",
+            "deepseek-v4-pro-official",
+        );
+
+        strip_stale_reasoning_with_policy(&mut msgs, &policy);
+
+        assert_eq!(
+            msgs[1]["reasoning_content"].as_str(),
+            Some(""),
+            "older plain assistant messages still need explicit reasoning placeholders",
+        );
+        assert_eq!(msgs[3]["reasoning_content"].as_str(), Some("deep thought"));
+    }
+
+    #[test]
+    fn strip_stale_reasoning_moonshot_adds_placeholder_to_plain_assistant() {
+        let mut msgs = vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "content": "hello"}),
+            json!({"role": "user", "content": "continue"}),
+            json!({"role": "assistant", "content": "done", "reasoning_content": "deep thought"}),
+        ];
+
+        let policy = super::ReasoningReplayPolicy::infer(
+            &msgs,
+            &crate::thinking_config::ThinkingConfig::Off,
+            "moonshot",
+            "kimi-k2.5",
+        );
+
+        strip_stale_reasoning_with_policy(&mut msgs, &policy);
+
+        assert_eq!(msgs[1]["reasoning_content"].as_str(), Some(" "));
+        assert_eq!(msgs[3]["reasoning_content"].as_str(), Some("deep thought"));
     }
 
     // ── Thinking-model / Kimi: reasoning_content on every assistant+tool_calls ──
@@ -960,7 +1420,14 @@ mod tests {
     #[test]
     fn mid_session_switch_to_thinking_model_all_tool_call_msgs_get_reasoning() {
         let mut msgs = build_mid_switch_session();
-        strip_stale_reasoning(&mut msgs, "openai", "gpt-4");
+        let policy = super::ReasoningReplayPolicy::infer(
+            &msgs,
+            &crate::thinking_config::ThinkingConfig::Off,
+            "openai",
+            "gpt-4",
+        );
+
+        strip_stale_reasoning_with_policy(&mut msgs, &policy);
         assert!(history_has_reasoning(&msgs));
         assert_all_assistant_tool_calls_have_reasoning(&msgs);
     }
@@ -968,7 +1435,14 @@ mod tests {
     #[test]
     fn mid_session_switch_preserves_latest_reasoning_content() {
         let mut msgs = build_mid_switch_session();
-        strip_stale_reasoning(&mut msgs, "openai", "gpt-4");
+        let policy = super::ReasoningReplayPolicy::infer(
+            &msgs,
+            &crate::thinking_config::ThinkingConfig::Off,
+            "openai",
+            "gpt-4",
+        );
+
+        strip_stale_reasoning_with_policy(&mut msgs, &policy);
         let last_reasoning = msgs
             .iter()
             .rev()
@@ -990,7 +1464,14 @@ mod tests {
     #[test]
     fn old_non_thinking_tool_call_msgs_get_empty_reasoning() {
         let mut msgs = build_mid_switch_session();
-        strip_stale_reasoning(&mut msgs, "openai", "gpt-4");
+        let policy = super::ReasoningReplayPolicy::infer(
+            &msgs,
+            &crate::thinking_config::ThinkingConfig::Off,
+            "openai",
+            "gpt-4",
+        );
+
+        strip_stale_reasoning_with_policy(&mut msgs, &policy);
         assert_eq!(msgs[2]["reasoning_content"].as_str(), Some(""));
         assert_eq!(msgs[6]["reasoning_content"].as_str(), Some(""));
         assert_eq!(msgs[11]["reasoning_content"].as_str(), Some(""));
@@ -1100,7 +1581,14 @@ mod tests {
         }));
         history.push(json!({"role": "tool", "tool_call_id": "tc-new", "content": "result"}));
 
-        strip_stale_reasoning(&mut history, "openai", "gpt-4");
+        let policy = super::ReasoningReplayPolicy::infer(
+            &history,
+            &crate::thinking_config::ThinkingConfig::Off,
+            "openai",
+            "gpt-4",
+        );
+
+        strip_stale_reasoning_with_policy(&mut history, &policy);
         assert_all_assistant_tool_calls_have_reasoning(&history);
     }
 
@@ -1117,7 +1605,14 @@ mod tests {
             json!({"role": "assistant", "content": "done"}),
         ];
         let original = msgs.clone();
-        strip_stale_reasoning(&mut msgs, "openai", "gpt-4");
+        let policy = super::ReasoningReplayPolicy::infer(
+            &msgs,
+            &crate::thinking_config::ThinkingConfig::Off,
+            "openai",
+            "gpt-4",
+        );
+
+        strip_stale_reasoning_with_policy(&mut msgs, &policy);
         assert_eq!(msgs, original);
     }
 
@@ -1140,35 +1635,39 @@ mod tests {
                 "tool_calls": [{"id": "tc-2", "type": "function", "function": {"name": "bash", "arguments": "{}"}}]
             }),
         ];
-        strip_stale_reasoning(&mut msgs, "openai", "gpt-4");
+        let policy = super::ReasoningReplayPolicy::infer(
+            &msgs,
+            &crate::thinking_config::ThinkingConfig::Off,
+            "openai",
+            "gpt-4",
+        );
+
+        strip_stale_reasoning_with_policy(&mut msgs, &policy);
         assert_all_assistant_tool_calls_have_reasoning(&msgs);
         assert_eq!(msgs[1]["reasoning_content"].as_str(), Some(""));
         assert_eq!(msgs[5]["reasoning_content"].as_str(), Some("thinking..."));
     }
 
-    // ── Moonshot / provider_preserves_reasoning tests ────────────────────
+    // ── Reasoning replay policy tests ────────────────────────────────────
 
     #[test]
-    fn provider_preserves_reasoning_moonshot() {
-        assert!(super::provider_preserves_reasoning("moonshot", "kimi-k2.5"));
-        assert!(super::provider_preserves_reasoning(
-            "moonshot",
-            "kimi-k2-thinking"
-        ));
-        assert!(super::provider_preserves_reasoning(
-            "moonshot",
-            "some-other-model"
-        ));
-        assert!(super::provider_preserves_reasoning("other", "kimi-k2.5"));
-        assert!(!super::provider_preserves_reasoning("openai", "gpt-4"));
-        assert!(!super::provider_preserves_reasoning(
-            "deepseek",
-            "deepseek-chat"
-        ));
-        assert!(!super::provider_preserves_reasoning(
-            "anthropic",
-            "claude-3"
-        ));
+    fn reasoning_replay_policy_prefers_observed_placeholder_shape() {
+        let msgs = vec![
+            json!({"role": "assistant", "content": "older", "reasoning_content": "   "}),
+            json!({"role": "assistant", "content": "newer", "reasoning_content": "think"}),
+        ];
+
+        let policy = super::ReasoningReplayPolicy::infer(
+            &msgs,
+            &crate::thinking_config::ThinkingConfig::Enabled {
+                budget_tokens: 1024,
+            },
+            "openai",
+            "gpt-4",
+        );
+
+        assert_eq!(policy.placeholder, "   ");
+        assert!(policy.can_strip_unsigned_reasoning);
     }
 
     #[test]
@@ -1181,8 +1680,15 @@ mod tests {
             json!({"role": "assistant", "content": null, "reasoning_content": "think2", "tool_calls": [{"id":"t2","type":"function","function":{"name":"bash","arguments":"{}"}}]}),
             json!({"role": "tool", "tool_call_id": "t2", "content": "r2"}),
         ];
-        strip_stale_reasoning(&mut msgs, "moonshot", "kimi-k2.5");
-        // Both reasoning_content values must be preserved (not cleared).
+        let policy = super::ReasoningReplayPolicy::infer(
+            &msgs,
+            &crate::thinking_config::ThinkingConfig::Enabled {
+                budget_tokens: 1024,
+            },
+            "moonshot",
+            "kimi-k2.5",
+        );
+        strip_stale_reasoning_with_policy(&mut msgs, &policy);
         assert_eq!(msgs[1]["reasoning_content"].as_str(), Some("think1"));
         assert_eq!(msgs[4]["reasoning_content"].as_str(), Some("think2"));
     }
@@ -1198,7 +1704,15 @@ mod tests {
             json!({"role": "assistant", "content": null, "reasoning_content": "think", "tool_calls": [{"id":"t2","type":"function","function":{"name":"bash","arguments":"{}"}}]}),
             json!({"role": "tool", "tool_call_id": "t2", "content": "r2"}),
         ];
-        strip_stale_reasoning(&mut msgs, "moonshot", "kimi-k2.5");
+        let policy = super::ReasoningReplayPolicy::infer(
+            &msgs,
+            &crate::thinking_config::ThinkingConfig::Enabled {
+                budget_tokens: 1024,
+            },
+            "moonshot",
+            "kimi-k2.5",
+        );
+        strip_stale_reasoning_with_policy(&mut msgs, &policy);
         // Old message gets placeholder (no reasoning to preserve).
         assert_eq!(msgs[1]["reasoning_content"].as_str(), Some(" "));
         // Thinking message keeps its content.
@@ -1206,20 +1720,35 @@ mod tests {
     }
 
     #[test]
-    fn moonshot_strip_noop_without_reasoning() {
+    fn thinking_policy_without_reasoning_backfills_assistant_messages() {
         let mut msgs = vec![
             json!({"role": "user", "content": "hi"}),
             json!({"role": "assistant", "content": "hello"}),
         ];
-        let original = msgs.clone();
-        strip_stale_reasoning(&mut msgs, "moonshot", "kimi-k2.5");
-        assert_eq!(msgs, original);
+        let policy = super::ReasoningReplayPolicy::infer(
+            &msgs,
+            &crate::thinking_config::ThinkingConfig::Enabled {
+                budget_tokens: 1024,
+            },
+            "deepseek",
+            "deepseek-v4-pro-official",
+        );
+        strip_stale_reasoning_with_policy(&mut msgs, &policy);
+        assert_eq!(msgs[1]["reasoning_content"].as_str(), Some(""));
     }
 
     #[test]
     fn moonshot_full_mid_switch_session_preserves_all() {
         let mut msgs = build_mid_switch_session();
-        strip_stale_reasoning(&mut msgs, "moonshot", "kimi-k2.5");
+        let policy = super::ReasoningReplayPolicy::infer(
+            &msgs,
+            &crate::thinking_config::ThinkingConfig::Enabled {
+                budget_tokens: 1024,
+            },
+            "moonshot",
+            "kimi-k2.5",
+        );
+        strip_stale_reasoning_with_policy(&mut msgs, &policy);
         assert_all_assistant_tool_calls_have_reasoning(&msgs);
         // Old non-thinking tool_call messages get space placeholder.
         assert_eq!(msgs[2]["reasoning_content"].as_str(), Some(" "));
@@ -1245,8 +1774,15 @@ mod tests {
             json!({"role": "assistant", "content": null, "reasoning_content": "think2", "tool_calls": [{"id":"t2","type":"function","function":{"name":"bash","arguments":"{}"}}]}),
             json!({"role": "tool", "tool_call_id": "t2", "content": "r2"}),
         ];
-        // Even if provider is "other", model name "kimi-k2.5" triggers preserve.
-        strip_stale_reasoning(&mut msgs, "other", "kimi-k2.5");
+        let policy = super::ReasoningReplayPolicy::infer(
+            &msgs,
+            &crate::thinking_config::ThinkingConfig::Enabled {
+                budget_tokens: 1024,
+            },
+            "other",
+            "kimi-k2.5",
+        );
+        strip_stale_reasoning_with_policy(&mut msgs, &policy);
         assert_eq!(msgs[1]["reasoning_content"].as_str(), Some("think1"));
         assert_eq!(msgs[3]["reasoning_content"].as_str(), Some("think2"));
     }
@@ -1308,6 +1844,76 @@ mod tests {
                 .is_none(),
             "fresh ledger must not see the old entry"
         );
+    }
+
+    #[test]
+    fn ledger_persistence_recover_round_trips_insert_and_remove() {
+        let tmp = tempdir().unwrap();
+        let persistence = LedgerPersistence::new(tmp.path().to_path_buf());
+
+        persistence.write_op("insert", "k1").unwrap();
+        persistence.write_op("insert", "k2").unwrap();
+        persistence.write_op("remove", "k1").unwrap();
+
+        assert_eq!(persistence.recover().unwrap(), vec!["k2".to_string()]);
+    }
+
+    #[test]
+    fn ledger_persistence_compact_rewrites_only_active_keys() {
+        let tmp = tempdir().unwrap();
+        let persistence = LedgerPersistence::new(tmp.path().to_path_buf());
+
+        persistence.write_op("insert", "stale").unwrap();
+        persistence.write_op("insert", "keep").unwrap();
+        persistence.compact(&["keep".to_string()]).unwrap();
+
+        let persisted = std::fs::read_to_string(tmp.path().join("edge_ledger.jsonl")).unwrap();
+        let lines: Vec<_> = persisted.lines().collect();
+        assert_eq!(lines.len(), 1, "compact must rewrite a single active entry");
+        assert!(
+            !lines[0].contains("\"key\":\"keep\""),
+            "persisted ledger lines should be encrypted at rest"
+        );
+        assert_eq!(persistence.recover().unwrap(), vec!["keep".to_string()]);
+    }
+
+    #[test]
+    fn ledger_persistence_encrypts_raw_journal_lines() {
+        let tmp = tempdir().unwrap();
+        let persistence = LedgerPersistence::new(tmp.path().to_path_buf());
+
+        persistence.write_op("insert", "secret-key").unwrap();
+
+        let raw = std::fs::read_to_string(tmp.path().join("edge_ledger.jsonl")).unwrap();
+        assert!(
+            !raw.contains("secret-key"),
+            "raw persisted ledger should not expose callback keys"
+        );
+        assert_eq!(
+            persistence.recover().unwrap(),
+            vec!["secret-key".to_string()]
+        );
+    }
+
+    #[test]
+    fn prune_ledger_meta_caps_side_table_growth() {
+        let mut meta = HashMap::new();
+        for index in 0..(LEDGER_MAX_ENTRIES + 8) {
+            meta.insert(
+                format!("k-{index}"),
+                LedgerEntryMeta {
+                    created_at_ms: index as u64,
+                    retry_count: 0,
+                    last_poll_at_ms: index as u64,
+                },
+            );
+        }
+
+        prune_ledger_meta(&mut meta);
+
+        assert_eq!(meta.len(), LEDGER_MAX_ENTRIES);
+        assert!(!meta.contains_key("k-0"));
+        assert!(meta.contains_key(&format!("k-{}", LEDGER_MAX_ENTRIES + 7)));
     }
 
     /// Polling wakes on new insert within roughly one poll interval (~50ms).

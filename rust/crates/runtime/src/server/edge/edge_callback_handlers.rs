@@ -94,7 +94,8 @@ pub(crate) fn insert_ledger_entry(
     if ledger.len() >= LEDGER_MAX_ENTRIES {
         return Err(LedgerInsertError::CapacityExceeded);
     }
-    ledger.insert(key, value);
+    ledger.insert(key.clone(), value);
+    astra_turn_core::edge_ledger::on_ledger_insert(&key);
     Ok(true)
 }
 
@@ -121,7 +122,8 @@ pub(crate) fn insert_approval_ledger_entry(
         }
         return Err(LedgerInsertError::CapacityExceeded);
     }
-    ledger.insert(key, value);
+    ledger.insert(key.clone(), value);
+    astra_turn_core::edge_ledger::on_ledger_insert(&key);
     Ok(true)
 }
 

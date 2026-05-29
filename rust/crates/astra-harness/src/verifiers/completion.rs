@@ -1,4 +1,5 @@
 use crate::{DecisionRecord, HookPoint, Severity, Verifier, Violation};
+use astra_turn_core::interruption::InterruptionKind;
 
 /// Checks that terminal snapshots are machine-readable and not success-shaped
 /// when the run actually ended empty or interrupted.
@@ -27,6 +28,7 @@ impl Verifier for CompletionVerifier {
                 message:
                     "terminal snapshot is missing final_state; completion cannot be classified"
                         .into(),
+                recovery_threshold: None,
             });
         }
 
@@ -37,6 +39,7 @@ impl Verifier for CompletionVerifier {
                 message:
                     "completion is marked completed but has no final text; refusing empty success"
                         .into(),
+                recovery_threshold: None,
             });
         }
 
@@ -47,6 +50,7 @@ impl Verifier for CompletionVerifier {
                 message:
                     "run ended with empty final_state; this must be represented as an interruption or explicit failure"
                         .into(),
+            recovery_threshold: None,
             });
         }
 
@@ -55,6 +59,7 @@ impl Verifier for CompletionVerifier {
                 severity: Severity::Error,
                 verifier: self.name().to_string(),
                 message: "run is interrupted but interruption_kind is missing".into(),
+                recovery_threshold: None,
             });
         }
 
@@ -67,6 +72,7 @@ impl Verifier for CompletionVerifier {
                 message: format!(
                     "run ended interrupted by {kind}; do not treat this as normal completion"
                 ),
+                recovery_threshold: None,
             });
         }
 
@@ -75,15 +81,17 @@ impl Verifier for CompletionVerifier {
 }
 
 fn is_abnormal_interruption(kind: &str) -> bool {
-    matches!(
-        kind,
-        "budget_exhausted"
-            | "empty_completion"
-            | "stream_transport"
-            | "stream_idle"
-            | "circuit_breaker"
-            | "circuit_breaker_abort"
-    )
+    [
+        InterruptionKind::BudgetExhausted,
+        InterruptionKind::EmptyCompletion,
+        InterruptionKind::StreamTransport,
+        InterruptionKind::StreamIdle,
+        InterruptionKind::AuthFailure,
+        InterruptionKind::HarnessBlocked,
+        InterruptionKind::HarnessPaused,
+    ]
+    .into_iter()
+    .any(|candidate| candidate.label() == kind)
 }
 
 #[cfg(test)]
@@ -157,5 +165,16 @@ mod tests {
         assert_eq!(violations.len(), 1);
         assert_eq!(violations[0].severity, Severity::Error);
         assert!(violations[0].message.contains("budget_exhausted"));
+    }
+
+    #[test]
+    fn completion_verifier_flags_auth_and_harness_interruptions() {
+        let verifier = CompletionVerifier;
+        for kind in ["auth_failure", "harness_blocked", "harness_paused"] {
+            let violations = verifier.check(&record(Some("interrupted"), Some(kind), true));
+            assert_eq!(violations.len(), 1, "kind={kind}");
+            assert_eq!(violations[0].severity, Severity::Error);
+            assert!(violations[0].message.contains(kind));
+        }
     }
 }

@@ -1565,6 +1565,22 @@ pub(crate) const MAX_TRACKED_FILE_READS: usize = 20;
 /// a `HarnessPaused` interruption.
 const MAX_HARNESS_PAUSE_RECOVERIES: u32 = 2;
 
+fn apply_harness_pause_recovery_threshold(
+    state: &mut AgenticLoopState,
+    recovery_threshold: Option<u32>,
+) {
+    let current = state.stall.circuit_breaker.read_only_threshold();
+    let tighter = recovery_threshold.map(|value| value as usize);
+    if !state.stall.circuit_breaker.apply_pause_recovery(tighter) {
+        tracing::warn!(
+            proposed_threshold = tighter.unwrap_or(0),
+            current_threshold = current,
+            "ignoring invalid harness recovery threshold"
+        );
+        let _ = state.stall.circuit_breaker.apply_pause_recovery(None);
+    }
+}
+
 #[allow(unused_imports)]
 pub(crate) use super::super::agentic::adaptive_tuning::{
     DEFAULT_TUNING_CYCLE_INTERVAL, apply_adaptive_execution_profile, apply_per_turn_adaptation,
@@ -1670,7 +1686,7 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
             finalize_and_render(host, state).await;
             return Ok(AgenticLoopOutcome::Completed);
         }
-        astra_harness::HookVerdict::Pause { reason } => {
+        astra_harness::HookVerdict::Pause { reason, .. } => {
             tracing::info!(reason = %reason, "harness paused session at SessionStart");
             set_harness_interruption(
                 state,
@@ -1793,7 +1809,7 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                 finalize_and_render(host, state).await;
                 return Ok(AgenticLoopOutcome::Completed);
             }
-            astra_harness::HookVerdict::Pause { reason } => {
+            astra_harness::HookVerdict::Pause { reason, .. } => {
                 tracing::info!(reason = %reason, "harness paused session at PostLlmResponse");
                 set_harness_interruption(
                     state,
@@ -1815,7 +1831,7 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                 state
             ) {
                 astra_harness::HookVerdict::Block { reason }
-                | astra_harness::HookVerdict::Pause { reason } => {
+                | astra_harness::HookVerdict::Pause { reason, .. } => {
                     tracing::warn!(reason = %reason, "harness blocked tool batch at PreToolBatch");
                     for tc in &turn_result.accum.tool_calls {
                         let tc_id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
@@ -1902,7 +1918,7 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                     finalize_and_render(host, state).await;
                     return Ok(AgenticLoopOutcome::Completed);
                 }
-                astra_harness::HookVerdict::Pause { reason } => {
+                astra_harness::HookVerdict::Pause { reason, .. } => {
                     tracing::info!(reason = %reason, "harness paused session at PostToolBatch");
                     set_harness_interruption(
                         state,
@@ -1929,7 +1945,10 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                 finalize_and_render(host, state).await;
                 return Ok(AgenticLoopOutcome::Completed);
             }
-            astra_harness::HookVerdict::Pause { reason } => {
+            astra_harness::HookVerdict::Pause {
+                reason,
+                recovery_threshold,
+            } => {
                 harness_pause_recovery_count += 1;
                 if harness_pause_recovery_count > MAX_HARNESS_PAUSE_RECOVERIES {
                     tracing::warn!(
@@ -1954,7 +1973,7 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                     "role": "user",
                     "content": reason,
                 }));
-                state.stall.circuit_breaker.reset_read_only_streak();
+                apply_harness_pause_recovery_threshold(state, recovery_threshold);
                 // Fall through to continue the loop
             }
             astra_harness::HookVerdict::Continue => {}
@@ -2570,6 +2589,36 @@ pub(crate) mod tests {
             turn_event_buffer: None,
             harness: crate::turn::harness_adapter::HarnessSlot::empty(),
         }
+    }
+
+    #[test]
+    fn invalid_harness_recovery_threshold_resets_streak_instead_of_overriding() {
+        let mut state = make_state();
+        state.stall.circuit_breaker.set_read_only_threshold(12);
+        state
+            .stall
+            .circuit_breaker
+            .observe(astra_turn_core::loop_circuit_breaker::RoundSignal {
+                tool_signatures: std::iter::once("read_file:/tmp/test".to_string()).collect(),
+                produced_mutation: false,
+                task_completed: false,
+                tool_count: 1,
+            });
+
+        apply_harness_pause_recovery_threshold(&mut state, Some(0));
+
+        assert_eq!(state.stall.circuit_breaker.read_only_threshold(), 12);
+        assert_eq!(state.stall.circuit_breaker.consecutive_read_only(), 0);
+    }
+
+    #[test]
+    fn valid_harness_recovery_threshold_tightens_breaker() {
+        let mut state = make_state();
+        state.stall.circuit_breaker.set_read_only_threshold(12);
+
+        apply_harness_pause_recovery_threshold(&mut state, Some(4));
+
+        assert_eq!(state.stall.circuit_breaker.read_only_threshold(), 4);
     }
 
     #[test]
@@ -9456,6 +9505,7 @@ mod parallel_execution_tests {
                 if record.point == HookPoint::PostTurn {
                     HookVerdict::Pause {
                         reason: "decision checkpoint from test".into(),
+                        recovery_threshold: None,
                     }
                 } else {
                     HookVerdict::Continue

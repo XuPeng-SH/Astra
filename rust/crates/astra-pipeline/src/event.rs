@@ -18,8 +18,31 @@
 
 use std::time::Instant;
 
+use uuid::Uuid;
+
 // Re-export shared trace types from astra-core
-pub use astra_core::{TraceCategory, TraceLevel};
+pub use astra_core::{TraceCategory, TraceLevel, TraceVerbosity};
+
+/// Maximum Unicode scalars kept in [`EventKind::ToolCallOutput`]'s `output_preview`.
+pub const TOOL_OUTPUT_PREVIEW_CHARS: usize = 500;
+
+/// Maximum Unicode scalars in non-verbose mode.
+pub const TOOL_OUTPUT_PREVIEW_CHARS_COMPACT: usize = 200;
+
+/// Clip `s` to at most [`TOOL_OUTPUT_PREVIEW_CHARS`] Unicode scalars,
+/// appending … when the output was longer.
+///
+/// Use when constructing [`EventKind::ToolCallOutput`] so callers
+/// never accidentally store full (unbounded) tool output.
+pub fn clip_output_preview(s: &str) -> String {
+    let mut chars = s.chars();
+    let preview: String = chars.by_ref().take(TOOL_OUTPUT_PREVIEW_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{preview}…")
+    } else {
+        preview
+    }
+}
 
 /// Unique event identifier (monotonically increasing within a turn).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -37,6 +60,8 @@ pub struct TurnEvent {
     /// Optional tracing span id that was active when this event was emitted.
     /// Connects this pipeline event to the `tracing` crate's span tree.
     pub span_id: Option<tracing::Id>,
+    /// Canonical UUID v7 shared across all storage layers.
+    pub canonical_event_id: Uuid,
 }
 
 /// The kinds of events emitted during a turn.
@@ -73,6 +98,24 @@ pub enum EventKind {
     LlmChunk {
         text: String,
     },
+    /// A reasoning/thinking chunk emitted by extended-thinking models
+    /// (e.g. Claude thinking mode, Bedrock reasoning).
+    /// Only captured when `TraceCategory::Thinking` is enabled and
+    /// `min_level` ≤ `Trace`.
+    ThinkingChunk {
+        text: String,
+    },
+    /// LLM request metadata emitted before each LLM call (verbose-gated).
+    /// Only recorded when `TraceCategory::LlmExchanges` is enabled AND
+    /// `min_level` ≤ `Trace`.
+    LlmRequest {
+        model: String,
+        provider: String,
+        message_count: usize,
+        tool_count: usize,
+        max_output_tokens: Option<usize>,
+        round: u32,
+    },
     ToolCallStarted {
         call_id: String,
         tool_name: String,
@@ -83,6 +126,66 @@ pub enum EventKind {
         duration_ms: u64,
         success: bool,
         error: Option<String>,
+    },
+
+    /// Truncated tool output captured after a completed tool call (verbose-gated).
+    /// Emitted when `TraceCategory::ToolCalls` is enabled AND `min_level` ≤ `Trace`.
+    /// Output is truncated to at most [`TOOL_OUTPUT_PREVIEW_CHARS`] Unicode scalars.
+    ToolCallOutput {
+        call_id: String,
+        tool_name: String,
+        /// First `TOOL_OUTPUT_PREVIEW_CHARS` chars of output (appended with "…" if truncated).
+        output_preview: String,
+    },
+
+    // ── Memory ──
+    /// Memory retrieval query fired during context assembly (verbose-gated).
+    /// Emitted at `TraceLevel::Debug`, category `TraceCategory::MemoryRetrieval`.
+    MemoryQuery {
+        query: String,
+        top_k: usize,
+        /// Data source tag, e.g. `"local"`, `"cloud"`, `"hybrid"`.
+        source: String,
+    },
+    /// Result count and latency for a completed memory retrieval.
+    /// Emitted at `TraceLevel::Debug`, category `TraceCategory::MemoryRetrieval`.
+    MemoryRetrieved {
+        result_count: usize,
+        duration_ms: u64,
+    },
+
+    // ── Skill lifecycle ──
+    /// Skill loading started.
+    /// Emitted at `TraceLevel::Info`, category `TraceCategory::SkillExecution`.
+    SkillStarted {
+        skill_name: String,
+    },
+    /// Skill execution completed.
+    /// Emitted at `TraceLevel::Info`, category `TraceCategory::SkillExecution`.
+    SkillCompleted {
+        skill_name: String,
+        duration_ms: u64,
+        success: bool,
+    },
+
+    // ── Prompt assembly ──
+    /// System-prompt assembly completed (verbose-gated).
+    /// Emitted at `TraceLevel::Debug`, category `TraceCategory::PromptAssembly`.
+    PromptAssembled {
+        /// Number of logical components injected (system, memory, skill, etc.).
+        component_count: usize,
+        /// Rough token estimate for the assembled prompt.
+        estimated_tokens: usize,
+    },
+
+    // ── Guard evaluation ──
+    /// Safety/capability guard evaluated for this turn.
+    /// Emitted at `TraceLevel::Info`, category `TraceCategory::GuardEvaluation`.
+    GuardEvaluated {
+        guard_name: String,
+        allowed: bool,
+        /// Human-readable ruling summary (e.g. `"blocked: malware pattern detected"`).
+        reason: Option<String>,
     },
 
     // ── Evaluation ──
@@ -152,6 +255,13 @@ impl EventKind {
             EventKind::ReflectionGenerated { .. } => TraceLevel::Debug,
             // ── Trace ── fine-grained detail
             EventKind::LlmChunk { .. } => TraceLevel::Trace,
+            EventKind::ThinkingChunk { .. } => TraceLevel::Trace,
+            EventKind::LlmRequest { .. } => TraceLevel::Trace,
+            EventKind::ToolCallOutput { .. } => TraceLevel::Trace,
+            EventKind::MemoryQuery { .. } | EventKind::MemoryRetrieved { .. } => TraceLevel::Debug,
+            EventKind::SkillStarted { .. } | EventKind::SkillCompleted { .. } => TraceLevel::Info,
+            EventKind::PromptAssembled { .. } => TraceLevel::Debug,
+            EventKind::GuardEvaluated { .. } => TraceLevel::Info,
             EventKind::BudgetExpanded { .. } => TraceLevel::Trace,
         }
     }
@@ -161,8 +271,12 @@ impl EventKind {
         match self {
             EventKind::ToolCallStarted { .. }
             | EventKind::ToolCallCompleted { .. }
+            | EventKind::ToolCallOutput { .. }
             | EventKind::ToolsSelected { .. } => TraceCategory::ToolCalls,
-            EventKind::LlmChunk { .. } => TraceCategory::LlmExchanges,
+            EventKind::LlmChunk { .. } | EventKind::LlmRequest { .. } => {
+                TraceCategory::LlmExchanges
+            }
+            EventKind::ThinkingChunk { .. } => TraceCategory::Thinking,
             EventKind::IntentDetected { .. } | EventKind::EntityExtracted { .. } => {
                 TraceCategory::ContextAssembly
             }
@@ -174,6 +288,14 @@ impl EventKind {
             EventKind::ProgressRecorded { .. }
             | EventKind::StallDetected { .. }
             | EventKind::CircuitBreakerTripped { .. } => TraceCategory::Verification,
+            EventKind::MemoryQuery { .. } | EventKind::MemoryRetrieved { .. } => {
+                TraceCategory::MemoryRetrieval
+            }
+            EventKind::SkillStarted { .. } | EventKind::SkillCompleted { .. } => {
+                TraceCategory::SkillExecution
+            }
+            EventKind::PromptAssembled { .. } => TraceCategory::PromptAssembly,
+            EventKind::GuardEvaluated { .. } => TraceCategory::GuardEvaluation,
             EventKind::TurnCompleted { .. } => TraceCategory::DecisionExplain,
         }
     }
@@ -200,6 +322,7 @@ pub struct EventLog {
     /// Enabled trace categories. If empty, all categories pass through.
     /// If non-empty, only events matching these categories are recorded.
     enabled_categories: Vec<TraceCategory>,
+    enabled: bool,
 }
 
 impl EventLog {
@@ -212,6 +335,7 @@ impl EventLog {
             start: Instant::now(),
             min_level: TraceLevel::Info,
             enabled_categories: Vec::new(),
+            enabled: true,
         }
     }
 
@@ -224,6 +348,7 @@ impl EventLog {
             start: Instant::now(),
             min_level,
             enabled_categories: Vec::new(),
+            enabled: true,
         }
     }
 
@@ -236,7 +361,28 @@ impl EventLog {
             start: Instant::now(),
             min_level,
             enabled_categories,
+            enabled: true,
         }
+    }
+
+    /// Configure EventLog from [`TraceVerbosity`].
+    ///
+    /// Maps user-facing verbosity to the internal `min_level` and `enabled` flag.
+    /// - `Off` → `enabled = false`, no events emitted.
+    /// - `Terse` → `min_level = Warn`, only problems and degraded signals.
+    /// - `Normal` → `min_level = Info`, normal operational events (default).
+    /// - `Verbose` → `min_level = Trace`, all events including LLM bodies and thinking.
+    pub fn with_verbosity(mut self, verbosity: TraceVerbosity) -> Self {
+        match verbosity.min_level() {
+            Some(level) => {
+                self.min_level = level;
+                self.enabled = true;
+            }
+            None => {
+                self.enabled = false;
+            }
+        }
+        self
     }
 
     /// Emit a new event, returning its ID for use as `caused_by` in future events.
@@ -261,12 +407,14 @@ impl EventLog {
         let id = EventId(self.next_id);
         self.next_id += 1;
         let span_id = tracing::Span::current().id();
+        let canonical_event_id = Uuid::now_v7();
         let event = TurnEvent {
             id,
             kind,
             caused_by,
             elapsed_ms: self.start.elapsed().as_millis() as u64,
             span_id,
+            canonical_event_id,
         };
         self.events.push(event);
         Some(id)
@@ -463,5 +611,107 @@ mod tests {
         // But test root_cause terminates.
         let chain = log.causal_chain(e0);
         assert_eq!(chain.len(), 1);
+    }
+}
+
+// ─── Category/level contract tests for new variants ──────────────────────────
+
+#[cfg(test)]
+mod new_variant_contracts {
+    use super::*;
+
+    fn level(k: &EventKind) -> TraceLevel {
+        k.default_level()
+    }
+    fn cat(k: &EventKind) -> TraceCategory {
+        k.default_category()
+    }
+
+    #[test]
+    fn thinking_chunk_is_trace_and_thinking() {
+        let e = EventKind::ThinkingChunk {
+            text: "step 1".into(),
+        };
+        assert_eq!(level(&e), TraceLevel::Trace);
+        assert_eq!(cat(&e), TraceCategory::Thinking);
+    }
+
+    #[test]
+    fn llm_request_is_trace_and_llm_exchanges() {
+        let e = EventKind::LlmRequest {
+            model: "claude".into(),
+            provider: "anthropic".into(),
+            message_count: 4,
+            tool_count: 2,
+            max_output_tokens: Some(8192),
+            round: 1,
+        };
+        assert_eq!(level(&e), TraceLevel::Trace);
+        assert_eq!(cat(&e), TraceCategory::LlmExchanges);
+    }
+
+    #[test]
+    fn tool_call_output_is_trace_and_tool_calls() {
+        let e = EventKind::ToolCallOutput {
+            call_id: "c1".into(),
+            tool_name: "bash".into(),
+            output_preview: "ok".into(),
+        };
+        assert_eq!(level(&e), TraceLevel::Trace);
+        assert_eq!(cat(&e), TraceCategory::ToolCalls);
+    }
+
+    #[test]
+    fn memory_events_are_debug_and_memory_retrieval() {
+        let q = EventKind::MemoryQuery {
+            query: "rust tips".into(),
+            top_k: 5,
+            source: "hybrid".into(),
+        };
+        let r = EventKind::MemoryRetrieved {
+            result_count: 3,
+            duration_ms: 12,
+        };
+        for e in [&q, &r] {
+            assert_eq!(level(e), TraceLevel::Debug);
+            assert_eq!(cat(e), TraceCategory::MemoryRetrieval);
+        }
+    }
+
+    #[test]
+    fn skill_events_are_info_and_skill_execution() {
+        let s = EventKind::SkillStarted {
+            skill_name: "review-changes".into(),
+        };
+        let c = EventKind::SkillCompleted {
+            skill_name: "review-changes".into(),
+            duration_ms: 300,
+            success: true,
+        };
+        for e in [&s, &c] {
+            assert_eq!(level(e), TraceLevel::Info);
+            assert_eq!(cat(e), TraceCategory::SkillExecution);
+        }
+    }
+
+    #[test]
+    fn prompt_assembled_is_debug_and_prompt_assembly() {
+        let e = EventKind::PromptAssembled {
+            component_count: 3,
+            estimated_tokens: 512,
+        };
+        assert_eq!(level(&e), TraceLevel::Debug);
+        assert_eq!(cat(&e), TraceCategory::PromptAssembly);
+    }
+
+    #[test]
+    fn guard_evaluated_is_info_and_guard_evaluation() {
+        let e = EventKind::GuardEvaluated {
+            guard_name: "malware-check".into(),
+            allowed: true,
+            reason: None,
+        };
+        assert_eq!(level(&e), TraceLevel::Info);
+        assert_eq!(cat(&e), TraceCategory::GuardEvaluation);
     }
 }
