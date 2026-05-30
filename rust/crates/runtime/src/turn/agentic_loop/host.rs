@@ -1553,13 +1553,6 @@ impl AgenticLoopState {
             self.max_turns.saturating_sub(self.remaining_turns).max(1) as u32
         }
     }
-
-    /// Skill-scoped tool restrictions stay active until the next successful
-    /// skill activation replaces them. Failed loads do not mutate the active
-    /// allowlist, which keeps the session on the last known-good workflow.
-    pub fn skill_allowlist_active(&self) -> bool {
-        self.skills.allowed_tools.is_some()
-    }
 }
 
 /// Consecutive same-category error turns before forcing a strategy change.
@@ -4538,7 +4531,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn skill_allowed_tools_are_turn_scoped_only() {
-        // Skill allowlists may restrict tool visibility during the active turn,
+        // Skill tool hints may influence prompt shaping during the active turn,
         // but they must not leak into later turns after host cleanup runs.
         let resolver = StubSkillResolver::new().with_allowed_tools(vec!["bash".into()]);
         let turns = vec![
@@ -7422,6 +7415,14 @@ print(json.dumps({'context': 'user said: ' + msg}))
 
     #[test]
     fn stress_full_adaptive_loop_20_turns() {
+        // See `stress_multi_turn_state_continuity_50_turns` for why we pin
+        // journal I/O to a tempdir — adaptive-tuning fans out journal writes
+        // for `state.current_session_id` and would otherwise pollute
+        // `~/.astra/sessions/stress-test.jsonl` across local test runs.
+        let _journal_dir = tempfile::tempdir().unwrap();
+        let _journal_guard =
+            astra_services::session_journal::JournalDirGuard::new(_journal_dir.path());
+
         let hub = make_hub();
         let session = make_session();
         let mut state = make_state();
@@ -7708,6 +7709,17 @@ print(json.dumps({'context': 'user said: ' + msg}))
 
     #[test]
     fn stress_multi_turn_state_continuity_50_turns() {
+        // Test isolation: every adaptive-tuning turn fans out a journal write
+        // for the active session id.  Without a `JournalDirGuard`, those writes
+        // land in the developer's real `~/.astra/sessions/<sid>.jsonl` file,
+        // accumulating across runs (observed at >10 MB / 38k events) until
+        // the next invocation of this test re-reads the entire file on every
+        // append and blows the per-test timeout.  Pin journal I/O to a
+        // tempdir scoped to this thread.
+        let _journal_dir = tempfile::tempdir().unwrap();
+        let _journal_guard =
+            astra_services::session_journal::JournalDirGuard::new(_journal_dir.path());
+
         let hub = make_hub();
         let session = make_session();
         let mut state = make_state();

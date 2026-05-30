@@ -1526,9 +1526,28 @@ pub(crate) fn build_provider_request_body_with_overrides(
 ) -> Value {
     let sanitized_overrides =
         sanitize_request_body_overrides_for_thinking(thinking, request_body_overrides);
+    // Final send-time guard: some callers still reach request assembly without
+    // the earlier edge-ledger normalization pass. Repair reasoning replay here
+    // as the last line of defense so thinking providers never see a malformed
+    // assistant history just because an intermediate path skipped assembly.
+    //
+    // Hot-path optimisation: the common case (standard OpenAI/Anthropic, no
+    // thinking, no prior reasoning) yields a no-op policy. We skip the
+    // `messages.to_vec()` clone in that case using `Cow::Borrowed`, falling
+    // back to an owned clone only when the policy may actually mutate.
+    let policy = astra_turn_core::edge_ledger::ReasoningReplayPolicy::infer(
+        messages, thinking, provider, model_name,
+    );
+    let reasoning_repaired: std::borrow::Cow<'_, [Value]> = if policy.is_no_op() {
+        std::borrow::Cow::Borrowed(messages)
+    } else {
+        let mut owned = messages.to_vec();
+        astra_turn_core::edge_ledger::strip_stale_reasoning_with_policy(&mut owned, &policy);
+        std::borrow::Cow::Owned(owned)
+    };
     match llm_provider_protocol(provider) {
         LlmProviderProtocol::BedrockConverse => {
-            let repaired = repair_openai_tool_pairing(messages);
+            let repaired = repair_openai_tool_pairing(&reasoning_repaired);
             let (system, bedrock_messages) =
                 build_bedrock_messages(&repaired, thinking.is_enabled());
             let mut body = json!({
@@ -1577,7 +1596,8 @@ pub(crate) fn build_provider_request_body_with_overrides(
         LlmProviderProtocol::AnthropicMessages | LlmProviderProtocol::OpenAiCompatible => {
             let is_anthropic = provider_uses_anthropic_messages(provider);
             if is_anthropic {
-                let (system, anthropic_messages) = build_anthropic_system_and_messages(messages);
+                let (system, anthropic_messages) =
+                    build_anthropic_system_and_messages(&reasoning_repaired);
                 let anthropic_messages = repair_anthropic_tool_pairing(&anthropic_messages);
                 let mut body = json!({
                     "model": model_name,
@@ -1607,7 +1627,7 @@ pub(crate) fn build_provider_request_body_with_overrides(
                 );
                 return body;
             }
-            let repaired = repair_openai_tool_pairing(messages);
+            let repaired = repair_openai_tool_pairing(&reasoning_repaired);
             let normalized_messages = normalize_openai_tool_message_content(&repaired);
             let mut body = json!({
                 "model": model_name,
@@ -2000,16 +2020,26 @@ fn anthropic_message_from_openai(msg: &Value) -> Option<Value> {
         }
         "assistant" => {
             let mut blocks = Vec::new();
+            // Unsigned `reasoning_content` (no `reasoning_signature`) is
+            // silently dropped because Anthropic requires a signature for
+            // every `thinking` block.  This is the request-builder-side
+            // guard; see also `ReasoningReplayPolicy::can_strip_unsigned_reasoning`
+            // in `edge_ledger.rs` for the message-history-side policy
+            // (`strip_stale_reasoning_with_policy`).
             let has_thinking =
                 if let Some(rc) = msg.get("reasoning_content").and_then(Value::as_str) {
-                    if !rc.is_empty() {
-                        let mut thinking = json!({"type": "thinking", "thinking": rc});
-                        if let Some(sig) = msg.get("reasoning_signature").and_then(Value::as_str) {
-                            if !sig.is_empty() {
-                                thinking["signature"] = Value::String(sig.to_string());
-                            }
-                        }
-                        blocks.push(thinking);
+                    if rc.is_empty() {
+                        false
+                    } else if let Some(sig) = msg
+                        .get("reasoning_signature")
+                        .and_then(Value::as_str)
+                        .filter(|sig| !sig.is_empty())
+                    {
+                        blocks.push(json!({
+                            "type": "thinking",
+                            "thinking": rc,
+                            "signature": sig,
+                        }));
                         true
                     } else {
                         false
@@ -8525,6 +8555,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn anthropic_message_omits_unsigned_reasoning_block_but_keeps_tool_calls() {
+        let msg = json!({
+            "role": "assistant",
+            "content": null,
+            "reasoning_content": "unsigned historical reasoning",
+            "tool_calls": [{
+                "id": "tc1",
+                "type": "function",
+                "function": {"name": "bash", "arguments": "{}"}
+            }],
+        });
+        let result = anthropic_message_from_openai(&msg).unwrap();
+        let blocks = result["content"].as_array().unwrap();
+        assert!(
+            !blocks
+                .iter()
+                .any(|block| block.get("type").and_then(Value::as_str) == Some("thinking")),
+            "unsigned historical reasoning must not be serialized into Anthropic thinking blocks"
+        );
+        assert!(
+            blocks
+                .iter()
+                .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_use")),
+            "tool_use blocks must remain visible after omitting malformed reasoning replay"
+        );
+    }
+
     /// Helper for counter tests: feed a deliberately malformed Bedrock message
     /// directly into the guard. Normal request construction strips unsigned
     /// reasoning before this point, so direct guard tests are the only valid way
@@ -8941,6 +8999,76 @@ mod tests {
 
         assert_eq!(body["messages"][1]["role"], "assistant");
         assert_eq!(body["messages"][1]["content"], "hello");
+        assert_eq!(body["messages"][1]["reasoning_content"], "");
+    }
+
+    #[test]
+    fn build_openai_body_backfills_missing_reasoning_for_deepseek_history() {
+        let messages = vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "tc1",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": "{}"}
+                }]
+            }),
+            json!({"role": "tool", "tool_call_id": "tc1", "content": "ok"}),
+            json!({
+                "role": "assistant",
+                "content": "done",
+                "reasoning_content": "I should explain the result."
+            }),
+        ];
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "deepseek-v4-pro-official",
+            "openai",
+            Some(4096),
+            None,
+            true,
+            &ThinkingConfig::Enabled {
+                budget_tokens: 10_000,
+            },
+        );
+
+        assert_eq!(body["messages"][1]["reasoning_content"], "");
+        assert_eq!(
+            body["messages"][3]["reasoning_content"],
+            "I should explain the result."
+        );
+    }
+
+    #[test]
+    fn build_openai_body_backfills_reasoning_for_native_deepseek_without_explicit_thinking() {
+        let messages = vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "tc1",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": "{}"}
+                }]
+            }),
+            json!({"role": "tool", "tool_call_id": "tc1", "content": "ok"}),
+            json!({"role": "user", "content": "continue"}),
+        ];
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "deepseek-v4-pro-official",
+            "openai",
+            Some(4096),
+            None,
+            true,
+            &ThinkingConfig::Off,
+        );
+
         assert_eq!(body["messages"][1]["reasoning_content"], "");
     }
 

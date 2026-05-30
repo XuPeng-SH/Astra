@@ -67,6 +67,7 @@ pub mod parallel_tool_exec;
 pub mod permission;
 pub mod pipeline;
 pub mod prepare_turn_explain_text;
+pub mod reasoning_capabilities;
 pub mod recent_arg_hints;
 pub mod recovery_state;
 pub mod response_guard;

@@ -886,8 +886,17 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             Some(id) if !id.is_empty() => id.to_string(),
             _ => return,
         };
-        let model_id = self.model.unwrap_or("").to_string();
+        let model_selector = state
+            .skills
+            .model_override
+            .as_deref()
+            .or(self.model)
+            .unwrap_or("");
+        let model_id = model_selector.to_string();
         let provider = astra_turn_core::fork_prefix::ProviderKind::from_provider_hint(&model_id);
+        let raw_provider = provider.raw_provider_name().to_owned();
+        let capture_thinking =
+            astra_turn_core::thinking_config::resolve_model_thinking(model_selector).1;
         // Canonical prefix bytes: JSON-serialize the messages as-is.
         // This is the format `fork_reconstruct::reconstruct_messages`
         // expects on the consuming end. System prompts and tool
@@ -915,7 +924,11 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             parent_turn_seq: self.chat_turn_index,
             provider,
             model_id,
-            thinking: None,
+            thinking: astra_turn_core::thinking_config::fork_capture_thinking_slice(
+                &capture_thinking,
+                &raw_provider,
+                model_selector,
+            ),
             system_blocks: vec![],
             tool_schemas,
             beta_headers: vec![],

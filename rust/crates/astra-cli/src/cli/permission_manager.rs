@@ -157,6 +157,180 @@ fn parse_sandbox_target_path(reason: &str) -> Option<PathBuf> {
     Some(PathBuf::from(&rest[..end]))
 }
 
+fn trim_explicit_path_token(token: &str) -> &str {
+    token.trim_matches(|ch| {
+        matches!(
+            ch,
+            '\'' | '"'
+                | '`'
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '<'
+                | '>'
+                | ','
+                | ';'
+                | ':'
+                | '!'
+                | '?'
+        )
+    })
+}
+
+fn token_matches_any_intent(token: &str, cues: &[&str]) -> bool {
+    let token = trim_explicit_path_token(token);
+    if token.is_empty() {
+        return false;
+    }
+    cues.iter().any(|cue| {
+        if cue.is_ascii() {
+            // Exact match guards against substring false-positives like
+            // "already" matching the cue "read".  English intent cues are
+            // space-separated, so exact token matching is sufficient.
+            token.eq_ignore_ascii_case(cue)
+        } else if cue.chars().count() == 1 {
+            token == *cue
+        } else {
+            // CJK compound phrases (e.g. "请读取文件") are often run together
+            // without spaces, so `contains` is the best proxy for word-level
+            // matching.  False positives are less likely because CJK cue
+            // words rarely appear as accidental substrings of unrelated
+            // words (unlike English "read" inside "already").
+            token == *cue || token.contains(cue)
+        }
+    })
+}
+
+fn path_token_has_positive_intent(message_tokens: &[&str], path_index: usize) -> bool {
+    const POSITIVE_PATH_INTENT_CUES: &[&str] = &[
+        "read", "open", "inspect", "analyze", "analyse", "check", "review", "debug", "fix",
+        "repair", "patch", "examine", "load", "scan", "查看", "读取", "打开", "分析", "检查",
+        "修复", "处理", "审查", "排查", "看看", "看下",
+    ];
+    const NEGATIVE_PATH_INTENT_CUES: &[&str] = &[
+        "don't", "dont", "not", "never", "avoid", "skip", "ignore", "禁止", "不要", "忽略", "跳过",
+    ];
+
+    // Number of tokens on each side of a path token to scan for intent cues.
+    // A wider window catches more intent signals but increases false-positive
+    // rate (e.g. a cue word near an unrelated path). A narrower window is more
+    // precise but may miss intent when the cue is a few tokens away.
+    const INTENT_WINDOW: usize = 3;
+
+    let start = path_index.saturating_sub(INTENT_WINDOW);
+    let end = (path_index + INTENT_WINDOW + 1).min(message_tokens.len());
+    let mut saw_positive = false;
+    for (offset, token) in message_tokens[start..end].iter().enumerate() {
+        if start + offset == path_index {
+            continue;
+        }
+        if token_matches_any_intent(token, NEGATIVE_PATH_INTENT_CUES) {
+            return false;
+        }
+        if token_matches_any_intent(token, POSITIVE_PATH_INTENT_CUES) {
+            saw_positive = true;
+        }
+    }
+    saw_positive
+}
+
+fn resolve_explicit_user_path_token(token: &str) -> Option<PathBuf> {
+    let token = trim_explicit_path_token(token);
+    if token.is_empty() || token.contains("://") {
+        return None;
+    }
+    if let Some(rest) = token.strip_prefix("~/") {
+        return dirs::home_dir().map(|home| home.join(rest));
+    }
+    token.starts_with('/').then(|| PathBuf::from(token))
+}
+
+/// Tokenize a free-form user message for path/intent extraction.
+///
+/// Splits on whitespace **and** on bracket/punctuation characters that
+/// are never part of a real filesystem path.  This covers:
+///
+/// - ASCII brackets and quote-like wrappers: `( ) [ ] { } < >` —
+///   these can directly hug a path in commands like `look at (/tmp/x)`.
+/// - Sentence-end / clause separators that are also never path bytes:
+///   `, ; ! ?` and their full-width CJK counterparts (`，`, `；`, `！`,
+///   `？`, `：`, `。`, `、`).
+/// - Quote-like CJK brackets (`「」『』（）【】`).
+///
+/// Excluded on purpose: `:` half-width, because Windows-style drive
+/// letters (`C:\foo`) would otherwise split. Astra's path-trust path is
+/// POSIX-only today, but the half-width colon is also commonly used in
+/// URL prefixes (`http://...`) which are filtered separately by
+/// [`resolve_explicit_user_path_token`].
+///
+/// Without this split, `"修复：/tmp/x"` or `"please read [/tmp/x]"`
+/// collapse into a single token because `str::split_whitespace` doesn't
+/// split on punctuation, and the path never reaches
+/// [`resolve_explicit_user_path_token`].
+fn tokenize_user_message(message: &str) -> Vec<&str> {
+    message
+        .split(|ch: char| {
+            ch.is_whitespace()
+                || matches!(
+                    ch,
+                    // ASCII brackets and angle markers — never path bytes.
+                    '(' | ')'
+                        | '['
+                        | ']'
+                        | '{'
+                        | '}'
+                        | '<'
+                        | '>'
+                        // ASCII clause separators (excluding `:` — see doc above).
+                        | ','
+                        | ';'
+                        | '!'
+                        | '?'
+                        // CJK clause separators.
+                        | '：'
+                        | '，'
+                        | '。'
+                        | '；'
+                        | '！'
+                        | '？'
+                        | '、'
+                        // CJK brackets / quote-like wrappers.
+                        | '「'
+                        | '」'
+                        | '『'
+                        | '』'
+                        | '（'
+                        | '）'
+                        | '【'
+                        | '】'
+                )
+        })
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+fn explicit_user_paths(message: &str) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let message_tokens = tokenize_user_message(message);
+    for (index, token) in message_tokens.iter().enumerate() {
+        let Some(path) = resolve_explicit_user_path_token(token) else {
+            continue;
+        };
+        if !path_token_has_positive_intent(&message_tokens, index) {
+            continue;
+        }
+        if let Ok(canonical) = canonicalize_existing_or_parent(&path)
+            && !paths.iter().any(|existing| existing == &canonical)
+        {
+            paths.push(canonical);
+        }
+    }
+    paths
+}
+
 ///
 /// For shell/execute tools, extracts the command prefix (e.g. `git commit`).
 /// For file/write tools, extracts the path pattern (e.g. `src/turn/**`).
@@ -3286,6 +3460,18 @@ impl PermissionManager {
         }
     }
 
+    /// Trust user-explicit absolute / home-relative paths for this session.
+    ///
+    /// This is intentionally narrow: only literal path tokens that appear in an
+    /// affirmative user request ("read/analyze/fix <path>") are considered.
+    /// Mere mentions or negated references like "don't touch /etc/passwd" do
+    /// not authorize the path.
+    pub(crate) fn trust_explicit_user_paths(&mut self, message: &str) {
+        for path in explicit_user_paths(message) {
+            self.trust_sandbox_root(path);
+        }
+    }
+
     /// Does the given path sit under any trusted sandbox root?
     fn path_under_trusted_root(&self, candidate: &Path) -> bool {
         let Ok(abs) = canonicalize_existing_or_parent(candidate) else {
@@ -4998,6 +5184,208 @@ mod tests {
         assert!(
             matches!(decision, PermissionDecision::NeedApproval { .. }),
             "an unrelated outside path must still prompt; got {decision:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_user_path_trust_allows_named_outside_file() {
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("notes.txt");
+        std::fs::write(&target, "hello").unwrap();
+
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, project.path());
+        pm.trust_explicit_user_paths(&format!("请读取 '{}', 然后修复问题", target.display()));
+
+        let args = serde_json::json!({
+            "reason": format!(
+                "Path '{}' is outside the project directory '{}'.",
+                target.display(),
+                project.path().display()
+            ),
+        });
+        let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
+        assert!(
+            matches!(decision, PermissionDecision::Allow),
+            "user-explicit file path should be trusted for this session; got {decision:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_user_path_trust_accepts_unquoted_action_target() {
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("evidence.jsonl");
+        std::fs::write(&target, "hello").unwrap();
+
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, project.path());
+        pm.trust_explicit_user_paths(&format!("分析和修复: {}", target.display()));
+
+        let args = serde_json::json!({
+            "reason": format!(
+                "Path '{}' is outside the project directory '{}'.",
+                target.display(),
+                project.path().display()
+            ),
+        });
+        let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
+        assert!(
+            matches!(decision, PermissionDecision::Allow),
+            "affirmative action request should trust the named path; got {decision:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_user_path_trust_accepts_english_action_target() {
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("evidence.jsonl");
+        std::fs::write(&target, "hello").unwrap();
+
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, project.path());
+        pm.trust_explicit_user_paths(&format!("please read {}", target.display()));
+
+        let args = serde_json::json!({
+            "reason": format!(
+                "Path '{}' is outside the project directory '{}'.",
+                target.display(),
+                project.path().display()
+            ),
+        });
+        let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
+        assert!(
+            matches!(decision, PermissionDecision::Allow),
+            "english affirmative request should trust the named path; got {decision:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_user_path_trust_rejects_ascii_substring_false_positive() {
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("notes.txt");
+        std::fs::write(&target, "hello").unwrap();
+
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, project.path());
+        pm.trust_explicit_user_paths(&format!("already {}", target.display()));
+
+        let args = serde_json::json!({
+            "reason": format!(
+                "Path '{}' is outside the project directory '{}'.",
+                target.display(),
+                project.path().display()
+            ),
+        });
+        let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
+        assert!(
+            matches!(decision, PermissionDecision::NeedApproval { .. }),
+            "substring overlap like 'already' must not count as 'read'; got {decision:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_user_path_trust_rejects_negated_mentions() {
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("passwd");
+        std::fs::write(&target, "root:x:0:0").unwrap();
+
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, project.path());
+        pm.trust_explicit_user_paths(&format!("不要碰 {}", target.display()));
+
+        let args = serde_json::json!({
+            "reason": format!(
+                "Path '{}' is outside the project directory '{}'.",
+                target.display(),
+                project.path().display()
+            ),
+        });
+        let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
+        assert!(
+            matches!(decision, PermissionDecision::NeedApproval { .. }),
+            "negated path mention must not auto-trust; got {decision:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_user_path_trust_rejects_english_negation() {
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("passwd");
+        std::fs::write(&target, "root:x:0:0").unwrap();
+
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, project.path());
+        pm.trust_explicit_user_paths(&format!("don't touch {}", target.display()));
+
+        let args = serde_json::json!({
+            "reason": format!(
+                "Path '{}' is outside the project directory '{}'.",
+                target.display(),
+                project.path().display()
+            ),
+        });
+        let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
+        assert!(
+            matches!(decision, PermissionDecision::NeedApproval { .. }),
+            "english negation must not auto-trust; got {decision:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_user_path_trust_handles_ascii_brackets() {
+        // Real user phrasing wraps paths in ASCII brackets when quoting
+        // them inside commentary — e.g. "please look at (/tmp/x) carefully".
+        // Tokenizing on whitespace alone leaves the bracket characters
+        // attached to the path and the trust path never matches.
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("notes.txt");
+        std::fs::write(&target, "hello").unwrap();
+
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, project.path());
+        pm.trust_explicit_user_paths(&format!("please read [{}]", target.display()));
+
+        let args = serde_json::json!({
+            "reason": format!(
+                "Path '{}' is outside the project directory '{}'.",
+                target.display(),
+                project.path().display()
+            ),
+        });
+        let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
+        assert!(
+            matches!(decision, PermissionDecision::Allow),
+            "ASCII square brackets must split off the path; got {decision:?}",
+        );
+    }
+
+    #[test]
+    fn explicit_user_path_trust_handles_fullwidth_punctuation() {
+        // Real-world Chinese input often uses full-width punctuation
+        // (`：`, `，`, `。`).  `str::split_whitespace` does NOT split on
+        // these characters, so a naive tokenizer collapses
+        // `"修复：/tmp/x"` into a single token and never recognizes the
+        // path. Trust must still kick in for affirmative phrasing using
+        // full-width punctuation.
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("evidence.jsonl");
+        std::fs::write(&target, "hello").unwrap();
+
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, project.path());
+        pm.trust_explicit_user_paths(&format!("分析和修复：{}", target.display()));
+
+        let args = serde_json::json!({
+            "reason": format!(
+                "Path '{}' is outside the project directory '{}'.",
+                target.display(),
+                project.path().display()
+            ),
+        });
+        let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
+        assert!(
+            matches!(decision, PermissionDecision::Allow),
+            "full-width colon must not block tokenization of the path; got {decision:?}",
         );
     }
 

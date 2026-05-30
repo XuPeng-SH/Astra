@@ -621,23 +621,44 @@ impl ReasoningReplayPolicy {
         provider: &str,
         model: &str,
     ) -> Self {
+        let caps = crate::reasoning_capabilities::reasoning_capabilities(provider, model);
         let enforce_reasoning_field =
             !matches!(thinking, crate::thinking_config::ThinkingConfig::Off)
-                || history_has_reasoning(messages);
+                || history_has_reasoning(messages)
+                || caps.requires_replay();
         let observed_placeholder = observed_reasoning_placeholder(messages);
         let placeholder = observed_placeholder
-            .unwrap_or_else(|| fallback_reasoning_placeholder(provider, model))
+            .unwrap_or(caps.reasoning_placeholder)
             .to_string();
         Self {
             enforce_reasoning_field,
             placeholder,
-            can_strip_unsigned_reasoning: observed_placeholder.is_some()
-                || fallback_reasoning_placeholder(provider, model).is_empty(),
+            // `AlwaysReplay` providers (DeepSeek, Kimi, Moonshot) need the
+            // reasoning field preserved for API replay. `OnDemand` providers
+            // can strip unsigned reasoning to save tokens. Signed providers
+            // (Anthropic) have a separate guard in the request builder that
+            // omits malformed unsigned blocks.
+            // See also: `reasoning_capabilities.rs` (single source of truth).
+            can_strip_unsigned_reasoning: !caps.requires_replay(),
         }
     }
 
     fn placeholder_value(&self) -> Value {
         Value::String(self.placeholder.clone())
+    }
+
+    /// Whether `strip_stale_reasoning_with_policy` would be a no-op under
+    /// this policy. Hot-path callers (the request-builder send-time guard)
+    /// use this to avoid cloning the entire message vector when there is
+    /// nothing to repair.
+    ///
+    /// A policy is a no-op when it does not enforce a reasoning field —
+    /// in that case `strip_stale_reasoning_with_policy` returns
+    /// immediately. This includes the common case: standard OpenAI /
+    /// Anthropic providers, with thinking off, on a history that has not
+    /// already accumulated reasoning blocks.
+    pub fn is_no_op(&self) -> bool {
+        !self.enforce_reasoning_field
     }
 }
 
@@ -648,7 +669,7 @@ impl ReasoningReplayPolicy {
 /// we adopt it as our own placeholder so that replayed messages match what the
 /// upstream provider sent.  Falls back to `""` if the history only contains
 /// genuinely empty strings, and `None` if no reasoning_content fields exist
-/// at all (leaving the choice entirely to [`fallback_reasoning_placeholder`]).
+/// at all (leaving the choice entirely to [`reasoning_capabilities`]).
 fn observed_reasoning_placeholder(messages: &[Value]) -> Option<&str> {
     let mut saw_empty = false;
     for msg in messages {
@@ -668,14 +689,6 @@ fn observed_reasoning_placeholder(messages: &[Value]) -> Option<&str> {
     saw_empty.then_some("")
 }
 
-fn fallback_reasoning_placeholder(provider: &str, model: &str) -> &'static str {
-    if provider == "moonshot" || model.starts_with("kimi-k2") {
-        " "
-    } else {
-        ""
-    }
-}
-
 fn needs_reasoning_placeholder(msg: &Value, placeholder: &str) -> bool {
     match msg.get("reasoning_content").and_then(Value::as_str) {
         None => true,
@@ -684,10 +697,13 @@ fn needs_reasoning_placeholder(msg: &Value, placeholder: &str) -> bool {
     }
 }
 
-/// Strip `reasoning_content` values from older assistant messages to reduce token usage.
+/// Normalize assistant reasoning replay without corrupting provider-required history.
 ///
-/// Thinking-model sessions accumulate large reasoning chains on every assistant message.
-/// Since the LLM gains no benefit from re-reading old reasoning, we normalize
+/// Thinking-model sessions accumulate large reasoning chains on every assistant
+/// message. We still backfill missing placeholder fields for replay validity,
+/// but we do NOT rewrite non-empty unsigned reasoning text because several
+/// providers require the original content to be echoed verbatim on subsequent
+/// rounds.
 pub fn strip_stale_reasoning_with_policy(messages: &mut [Value], policy: &ReasoningReplayPolicy) {
     if !policy.enforce_reasoning_field {
         return;
@@ -721,6 +737,10 @@ pub fn strip_stale_reasoning_with_policy(messages: &mut [Value], policy: &Reason
     // Thinking is active — every assistant message must keep an explicit
     // `reasoning_content` field (even empty string) or providers such as
     // DeepSeek/Kimi reject the replayed history with HTTP 400.
+    // See also `anthropic_message_from_openai` in `llm/client.rs` for the
+    // request-builder-side guard that drops unsigned `reasoning_content`
+    // when converting to Anthropic protocol (Anthropic requires a
+    // `signature` for every `thinking` block).
     for (i, msg) in messages.iter_mut().enumerate() {
         if msg.get("role").and_then(Value::as_str) != Some("assistant") {
             continue;
@@ -1667,6 +1687,7 @@ mod tests {
         );
 
         assert_eq!(policy.placeholder, "   ");
+        // Non-reasoning providers can safely strip unsigned reasoning to save tokens
         assert!(policy.can_strip_unsigned_reasoning);
     }
 
@@ -1785,6 +1806,204 @@ mod tests {
         strip_stale_reasoning_with_policy(&mut msgs, &policy);
         assert_eq!(msgs[1]["reasoning_content"].as_str(), Some("think1"));
         assert_eq!(msgs[3]["reasoning_content"].as_str(), Some("think2"));
+    }
+
+    #[test]
+    fn deepseek_full_mid_switch_session_preserves_all_reasoning_content() {
+        let mut msgs = build_mid_switch_session();
+        let policy = super::ReasoningReplayPolicy::infer(
+            &msgs,
+            &crate::thinking_config::ThinkingConfig::Enabled {
+                budget_tokens: 1024,
+            },
+            "openai",
+            "deepseek-v4-pro-official",
+        );
+        strip_stale_reasoning_with_policy(&mut msgs, &policy);
+        assert_all_assistant_tool_calls_have_reasoning(&msgs);
+        assert_eq!(msgs[2]["reasoning_content"].as_str(), Some(""));
+        assert_eq!(msgs[6]["reasoning_content"].as_str(), Some(""));
+        assert_eq!(msgs[11]["reasoning_content"].as_str(), Some(""));
+        assert_eq!(
+            msgs[15]["reasoning_content"].as_str(),
+            Some("I need to read the code first, then plan the refactoring.")
+        );
+        assert_eq!(
+            msgs[17]["reasoning_content"].as_str(),
+            Some("Now I'll write the refactored version.")
+        );
+    }
+
+    #[test]
+    fn reasoning_policy_enforces_for_native_deepseek_even_without_explicit_thinking() {
+        let msgs = vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "content": "hello"}),
+        ];
+        let policy = super::ReasoningReplayPolicy::infer(
+            &msgs,
+            &crate::thinking_config::ThinkingConfig::Off,
+            "openai",
+            "deepseek-v4-pro-official",
+        );
+        assert!(
+            policy.enforce_reasoning_field,
+            "native DeepSeek replay must still force explicit reasoning fields",
+        );
+    }
+
+    #[test]
+    fn reasoning_policy_is_no_op_for_plain_openai_without_thinking() {
+        // Hot-path contract: hot callers (the send-time request-builder guard)
+        // use is_no_op() to skip cloning the message vector. The most common
+        // case — standard OpenAI/Anthropic, thinking off, no prior reasoning —
+        // must be a no-op so the clone is skipped.
+        let msgs = vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "content": "hello"}),
+        ];
+        let policy = super::ReasoningReplayPolicy::infer(
+            &msgs,
+            &crate::thinking_config::ThinkingConfig::Off,
+            "openai",
+            "gpt-4.1",
+        );
+        assert!(
+            policy.is_no_op(),
+            "plain OpenAI without thinking or reasoning history must be a no-op",
+        );
+    }
+
+    #[test]
+    fn reasoning_policy_is_not_no_op_when_replay_required() {
+        // Inverse: replay-required providers (DeepSeek native) and active
+        // thinking sessions must NOT report no-op, otherwise the send-time
+        // guard skips the field-backfill and the API rejects the request.
+        let msgs = vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "content": "hello"}),
+        ];
+        let native_deepseek = super::ReasoningReplayPolicy::infer(
+            &msgs,
+            &crate::thinking_config::ThinkingConfig::Off,
+            "openai",
+            "deepseek-v4-pro-official",
+        );
+        assert!(
+            !native_deepseek.is_no_op(),
+            "DeepSeek native replay required"
+        );
+
+        let thinking_active = super::ReasoningReplayPolicy::infer(
+            &msgs,
+            &crate::thinking_config::ThinkingConfig::Enabled {
+                budget_tokens: 1024,
+            },
+            "openai",
+            "gpt-4.1",
+        );
+        assert!(
+            !thinking_active.is_no_op(),
+            "explicit thinking forces the policy"
+        );
+    }
+
+    /// Contract: `is_no_op() == true` MUST imply that
+    /// `strip_stale_reasoning_with_policy` does not mutate the message
+    /// vector.  Hot-path callers (the request-builder send-time guard)
+    /// rely on this to skip cloning a multi-MB message vector.  If a
+    /// future early-exit branch in the strip function changes the
+    /// no-op semantics without updating `is_no_op`, this test fails
+    /// before the silent corruption ships.
+    #[test]
+    fn is_no_op_policy_does_not_mutate_under_diverse_histories() {
+        // Each fixture is a representative shape that the strip function
+        // could in principle want to touch — assistant messages with
+        // reasoning fields, mixed roles, tool calls, signed/unsigned
+        // reasoning combinations, empty placeholders, etc.  Any policy
+        // that returns `is_no_op()` must leave all of them byte-identical.
+        let fixtures: Vec<Vec<Value>> = vec![
+            vec![],
+            vec![json!({"role": "user", "content": "hi"})],
+            vec![
+                json!({"role": "user", "content": "hi"}),
+                json!({"role": "assistant", "content": "hello"}),
+            ],
+            vec![
+                json!({"role": "user", "content": "hi"}),
+                json!({
+                    "role": "assistant",
+                    "content": "ok",
+                    "tool_calls": [{
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {"name": "bash", "arguments": "{}"},
+                    }],
+                }),
+                json!({"role": "tool", "tool_call_id": "tc1", "content": "ran"}),
+                json!({"role": "assistant", "content": "done"}),
+            ],
+            vec![
+                json!({"role": "user", "content": "hi"}),
+                json!({
+                    "role": "assistant",
+                    "content": "with reasoning",
+                    "reasoning_content": "I should think.",
+                    "reasoning_signature": "abc",
+                }),
+            ],
+            vec![
+                json!({"role": "system", "content": "be terse"}),
+                json!({"role": "user", "content": "hi"}),
+                json!({
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": "",
+                }),
+            ],
+        ];
+
+        // Construct a no-op policy from a known-no-op call site (plain
+        // OpenAI / GPT-4.1 / thinking off / no reasoning history).  This
+        // is the canonical no-op shape.
+        for fixture in &fixtures {
+            let policy = super::ReasoningReplayPolicy::infer(
+                fixture,
+                &crate::thinking_config::ThinkingConfig::Off,
+                "openai",
+                "gpt-4.1",
+            );
+            // Skip fixtures that happen to push the policy out of no-op
+            // (e.g. signed reasoning is observed in history).  We only
+            // make claims about the no-op case.
+            if !policy.is_no_op() {
+                continue;
+            }
+            let mut copy = fixture.clone();
+            strip_stale_reasoning_with_policy(&mut copy, &policy);
+            assert_eq!(
+                &copy, fixture,
+                "is_no_op() == true must imply zero mutation; fixture: {fixture:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn reasoning_policy_does_not_force_plain_openai_without_history_or_thinking() {
+        let msgs = vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "content": "hello"}),
+        ];
+        let policy = super::ReasoningReplayPolicy::infer(
+            &msgs,
+            &crate::thinking_config::ThinkingConfig::Off,
+            "openai",
+            "gpt-4.1",
+        );
+        assert!(
+            !policy.enforce_reasoning_field,
+            "non-reasoning models should keep the old no-op behavior",
+        );
     }
 
     // ── Phase-R edge ledger contract pins ────────────────────────────────

@@ -178,6 +178,46 @@ impl ThinkingConfig {
     }
 }
 
+/// Convert the effective turn thinking config into the fork-prefix metadata slice.
+///
+/// Native reasoning models can require replay-safe assistant reasoning fields even
+/// when Astra did not surface an explicit `(thinking...)` selector suffix. We still
+/// encode those captures as enabled so forked children preserve valid replay.
+pub fn fork_capture_thinking_slice(
+    thinking: &ThinkingConfig,
+    provider: &str,
+    model: &str,
+) -> Option<crate::fork_prefix::ThinkingConfigSlice> {
+    match thinking {
+        ThinkingConfig::Off => {
+            crate::reasoning_capabilities::reasoning_capabilities(provider, model)
+                .requires_replay()
+                .then(|| crate::fork_prefix::ThinkingConfigSlice {
+                    enabled: true,
+                    budget_tokens: 0,
+                    kind: "native".to_string(),
+                })
+        }
+        ThinkingConfig::Enabled { budget_tokens } => {
+            Some(crate::fork_prefix::ThinkingConfigSlice {
+                enabled: true,
+                budget_tokens: *budget_tokens,
+                kind: "enabled".to_string(),
+            })
+        }
+        ThinkingConfig::Adaptive { effort } => Some(crate::fork_prefix::ThinkingConfigSlice {
+            enabled: true,
+            budget_tokens: 0,
+            // Effort level participates in cache identity: a `low` parent
+            // and a `max` parent send different `output_config.effort` on
+            // the wire, so reusing one's cache for the other corrupts the
+            // child's first-round response. Encode it into `kind` so
+            // `ForkPrefix::identity_hash` separates the buckets.
+            kind: format!("adaptive:{}", effort.as_str()),
+        }),
+    }
+}
+
 impl ThinkingEffort {
     pub fn as_str(self) -> &'static str {
         effort_str(self)
@@ -1279,5 +1319,103 @@ mod tests {
             "openai",
             "https://api.deepseek.com"
         ));
+    }
+}
+
+#[cfg(test)]
+mod fork_capture_thinking_slice_tests {
+    use super::*;
+
+    #[test]
+    fn off_mode_returns_none_for_non_replay_model() {
+        let result = fork_capture_thinking_slice(&ThinkingConfig::Off, "openai", "gpt-4");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn off_mode_returns_slice_for_replay_model() {
+        let result =
+            fork_capture_thinking_slice(&ThinkingConfig::Off, "deepseek", "deepseek-reasoner");
+        assert!(result.is_some());
+        let slice = result.unwrap();
+        assert!(slice.enabled);
+        assert_eq!(slice.budget_tokens, 0);
+        assert_eq!(slice.kind, "native");
+    }
+
+    #[test]
+    fn enabled_mode_returns_slice_with_budget() {
+        let result = fork_capture_thinking_slice(
+            &ThinkingConfig::Enabled {
+                budget_tokens: 10000,
+            },
+            "openai",
+            "gpt-4",
+        );
+        assert!(result.is_some());
+        let slice = result.unwrap();
+        assert!(slice.enabled);
+        assert_eq!(slice.budget_tokens, 10000);
+        assert_eq!(slice.kind, "enabled");
+    }
+
+    #[test]
+    fn adaptive_mode_returns_slice_with_effort_in_kind() {
+        let result = fork_capture_thinking_slice(
+            &ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::High,
+            },
+            "anthropic",
+            "claude-3-5-sonnet",
+        );
+        let slice = result.expect("adaptive must capture a slice");
+        assert!(slice.enabled);
+        assert_eq!(slice.budget_tokens, 0);
+        assert_eq!(
+            slice.kind, "adaptive:high",
+            "effort level participates in cache identity",
+        );
+    }
+
+    #[test]
+    fn adaptive_effort_levels_produce_distinct_slices() {
+        // Cache-correctness invariant: two parents that differ only in
+        // adaptive effort must NOT collapse to the same ThinkingConfigSlice
+        // (and therefore the same ForkPrefix::identity_hash). Without this,
+        // a Low-effort parent's cache entry would be reused by a Max-effort
+        // child, producing a wire mismatch on the next round.
+        let low = fork_capture_thinking_slice(
+            &ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::Low,
+            },
+            "anthropic",
+            "claude-3-5-sonnet",
+        )
+        .unwrap();
+        let max = fork_capture_thinking_slice(
+            &ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::Max,
+            },
+            "anthropic",
+            "claude-3-5-sonnet",
+        )
+        .unwrap();
+        assert_ne!(low, max, "adaptive effort must influence the slice");
+    }
+
+    #[test]
+    fn enabled_mode_works_for_replay_model() {
+        let result = fork_capture_thinking_slice(
+            &ThinkingConfig::Enabled {
+                budget_tokens: 5000,
+            },
+            "deepseek",
+            "deepseek-reasoner",
+        );
+        assert!(result.is_some());
+        let slice = result.unwrap();
+        assert!(slice.enabled);
+        assert_eq!(slice.budget_tokens, 5000);
+        assert_eq!(slice.kind, "enabled");
     }
 }
