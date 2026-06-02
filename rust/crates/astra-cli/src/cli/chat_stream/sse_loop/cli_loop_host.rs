@@ -19,6 +19,7 @@ use astra_runtime::{
         interaction_scoped_tool_restrictions,
     },
 };
+use astra_turn_core::compaction_types::CompactionEvent;
 use async_trait::async_trait;
 use crossterm::style::Stylize;
 use serde_json::Value;
@@ -780,6 +781,15 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             HeadlessStderrStyle::Normal => eprintln!("{}", line),
         }
         self.pending_clear_lines += 1;
+    }
+
+    fn on_compaction(&mut self, event: CompactionEvent) {
+        // Stderr fallback (always visible).
+        self.emit_headless_line(HeadlessStderrStyle::Dim, event.summary.clone());
+        // Structured event for TUI / stream consumers.
+        if let Some(tx) = &self.stream_event_tx {
+            let _ = tx.send(crate::cli::StreamEvent::Compaction(event));
+        }
     }
 
     fn is_quiet(&self) -> bool {
@@ -1557,5 +1567,39 @@ mod tests {
             "plan-mode cleanup must not delete entries it never owned"
         );
         assert_eq!(restricted.len(), 1);
+    }
+
+    #[test]
+    fn on_compaction_forwards_via_channel() {
+        // Verify that compaction events forwarded through the stream channel
+        // arrive with correct kind and summary.
+        use crate::cli::chat_stream::StreamEvent;
+        use astra_turn_core::compaction_types::{CompactionEvent, CompactionKind};
+        use tokio::sync::mpsc;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let event = CompactionEvent {
+            kind: CompactionKind::ReactiveBudget,
+            pressure: 0.85,
+            tokens_freed: 12000,
+            tokens_before: 48000,
+            tokens_after: 36000,
+            max_tokens: 64000,
+            summary: "reactive budget compaction".into(),
+        };
+
+        // Same pattern used by CliAgenticLoopHost::on_compaction:
+        let _ = tx.send(StreamEvent::Compaction(event));
+
+        let received = rx.try_recv().expect("must receive compaction event");
+        match received {
+            StreamEvent::Compaction(e) => {
+                assert_eq!(e.kind, CompactionKind::ReactiveBudget);
+                assert_eq!(e.pressure, 0.85);
+                assert_eq!(e.tokens_freed, 12000);
+                assert_eq!(e.summary, "reactive budget compaction");
+            }
+            other => panic!("expected Compaction event, got {other:?}"),
+        }
     }
 }

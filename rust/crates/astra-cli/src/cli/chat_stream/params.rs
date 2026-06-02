@@ -141,6 +141,8 @@ pub enum StreamEvent {
     ExplainText(String),
     /// Verdict audit events from the turn.
     VerdictReport(Vec<crate::VerdictEvent>),
+    /// Structured compaction event for real-time UX feedback.
+    Compaction(astra_turn_core::compaction_types::CompactionEvent),
 }
 
 pub type StreamEventTx = mpsc::UnboundedSender<StreamEvent>;

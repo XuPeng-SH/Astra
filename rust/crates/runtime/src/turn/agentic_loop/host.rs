@@ -65,7 +65,7 @@ use astra_text_utils::semantic_dedup::SemanticDedup;
 use astra_tools::task_mgmt::{SessionTask, TaskManager};
 use astra_turn_core::chat_turn_heuristics::TaskExecutionProfile;
 use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
-use astra_turn_core::compaction_types::CompactionTier;
+use astra_turn_core::compaction_types::{CompactionEvent, CompactionTier};
 use astra_turn_core::guardrails::turn_guard::TurnGuard;
 use astra_turn_core::guardrails::verdict_audit::AgenticVerdictAuditEvent;
 use astra_turn_core::headless_tool_body_preview::HeadlessStderrStyle;
@@ -191,6 +191,19 @@ pub trait AgenticLoopHost: Send {
     /// hasn't been updated yet.
     fn turn_interaction_mode(&self) -> TurnInteractionMode {
         TurnInteractionMode::NonInteractive
+    }
+
+    /// Emit a structured compaction event for real-time UX feedback.
+    ///
+    /// Default implementation falls back to [`emit_headless_line`] so
+    /// existing hosts get stderr output without changes. Hosts that
+    /// have a UI layer (CLI / TUI) should override to emit a structured
+    /// event (e.g. `StreamEvent::Compaction`) for richer rendering.
+    fn on_compaction(&mut self, event: CompactionEvent) {
+        // Clone to avoid moving event.summary — subclasses overriding this
+        // method receive the full event by value and may inspect all fields.
+        let summary = event.summary.clone();
+        self.emit_headless_line(HeadlessStderrStyle::Dim, summary);
     }
 
     /// Whether the current turn is still in read-only plan authoring mode.
@@ -1125,7 +1138,7 @@ pub struct AgenticLoopState {
     pub compaction_effectiveness: super::super::compaction_replay::CompactionEffectivenessTracker,
 
     /// Measured token cost of the tool schemas injected into the LLM request.
-    /// Passed to `estimate_tokens_precise` so pressure estimates include the
+    /// Passed to `estimate_tokens` so pressure estimates include the
     /// schema overhead the API will count. 0 = unknown (legacy / sub-runs).
     pub pinned_tool_schema_tokens: u64,
     /// Cache-sensitive sticky tool schema set for the current user turn.
@@ -5798,9 +5811,9 @@ pub(crate) mod tests {
     async fn compact_tier_gate_skips_mechanical_compression() {
         // When compact_tier_applied >= CompactHistory (e.g. after a pre-turn LLM
         // summary), handle_token_budget must NOT run the tier-1 mechanical
-        // CompressionPipeline again. We verify this by populating the history
+        // CompactionEngine again. We verify this by populating the history
         // with otherwise-compressible tool_result payloads: if the guard is
-        // broken, CompressionPipeline would rewrite them to `[Cleared]` and the
+        // broken, CompactionEngine would rewrite them to `[Cleared]` and the
         // original text would disappear. With the guard honoured the messages
         // stay intact and spill-to-disk (an independent tier-2 recovery) runs.
         let session_id = format!(

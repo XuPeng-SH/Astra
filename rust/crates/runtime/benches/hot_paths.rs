@@ -58,12 +58,12 @@ fn bench_estimate_tokens_messages(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("estimate_tokens");
     group.bench_with_input(BenchmarkId::new("2_messages", 2), &small_msgs, |b, msgs| {
-        b.iter(|| estimate_tokens(black_box(msgs)))
+        b.iter(|| estimate_tokens(black_box(msgs), 0, 0))
     });
     group.bench_with_input(
         BenchmarkId::new("20_messages", 20),
         &large_msgs,
-        |b, msgs| b.iter(|| estimate_tokens(black_box(msgs))),
+        |b, msgs| b.iter(|| estimate_tokens(black_box(msgs), 0, 0)),
     );
     group.finish();
 }

@@ -148,6 +148,18 @@ fn event_to_json(event: &StreamEvent) -> String {
         StreamEvent::ExplainReport(_) | StreamEvent::VerdictReport(_) => {
             serde_json::json!({"type": "ignored"})
         }
+        StreamEvent::Compaction(event) => {
+            serde_json::json!({
+                "type": "compaction",
+                "kind": event.kind,
+                "pressure": event.pressure,
+                "tokens_freed": event.tokens_freed,
+                "tokens_before": event.tokens_before,
+                "tokens_after": event.tokens_after,
+                "max_tokens": event.max_tokens,
+                "summary": event.summary,
+            })
+        }
     };
     serde_json::to_string(&value).unwrap_or_default()
 }
@@ -155,6 +167,7 @@ fn event_to_json(event: &StreamEvent) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astra_turn_core::compaction_types::{CompactionEvent, CompactionKind};
 
     #[test]
     fn token_event_serializes() {
@@ -294,6 +307,15 @@ mod tests {
             StreamEvent::WaitingForModel,
             StreamEvent::ModelResponding,
             StreamEvent::StatusLine("done".into()),
+            StreamEvent::Compaction(CompactionEvent {
+                kind: CompactionKind::Microcompact,
+                pressure: 0.5,
+                tokens_freed: 1000,
+                tokens_before: 30000,
+                tokens_after: 29000,
+                max_tokens: 64000,
+                summary: "test".into(),
+            }),
         ];
         for event in &events {
             let json = event_to_json(event);
@@ -361,6 +383,29 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["type"], "status");
         assert!(v["text"].as_str().unwrap().contains("clippy"));
+    }
+
+    #[test]
+    fn compaction_event_serializes() {
+        let event = CompactionEvent {
+            kind: CompactionKind::Microcompact,
+            pressure: 0.82,
+            tokens_freed: 4500,
+            tokens_before: 32000,
+            tokens_after: 27500,
+            max_tokens: 64000,
+            summary: "freed 4500 tokens".into(),
+        };
+        let json = event_to_json(&StreamEvent::Compaction(event));
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "compaction");
+        assert_eq!(v["kind"], "microcompact");
+        assert_eq!(v["pressure"], 0.82);
+        assert_eq!(v["tokens_freed"], 4500);
+        assert_eq!(v["tokens_before"], 32000);
+        assert_eq!(v["tokens_after"], 27500);
+        assert_eq!(v["max_tokens"], 64000);
+        assert_eq!(v["summary"], "freed 4500 tokens");
     }
 
     #[test]
