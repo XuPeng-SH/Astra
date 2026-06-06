@@ -30,8 +30,113 @@
 //! - **AdversarialReview**: One agent produces, another reviews/critiques
 //! - **Sequential**: Simple sequential delegation to agents in order
 
+use astra_core::SubRunState;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+pub const AGENT_RESULT_STATUS_COMPLETED: &str = "completed";
+pub const AGENT_RESULT_STATUS_FAILED: &str = "failed";
+pub const AGENT_RESULT_STATUS_TIMEOUT: &str = "timeout";
+pub const AGENT_RESULT_STATUS_WAITING: &str = "waiting";
+pub const AGENT_RESULT_STATUS_PAUSED: &str = "paused";
+pub const AGENT_RESULT_STATUS_CANCELLED: &str = "cancelled";
+pub const AGENT_RESULT_STATUS_PARTIAL: &str = "partial";
+pub const AGENT_RESULT_STATUS_VERIFICATION_FAILED: &str = "verification_failed";
+
+pub const DELEGATION_RESULT_STATUS_COMPLETED: &str = "completed";
+pub const DELEGATION_RESULT_STATUS_UNFINISHED: &str = "unfinished";
+pub const DELEGATION_RESULT_STATUS_PARTIAL: &str = "partial";
+pub const DELEGATION_RESULT_STATUS_FAILED: &str = "failed";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentResultStatusKind {
+    Completed,
+    Failed,
+    Timeout,
+    Waiting,
+    Paused,
+    Cancelled,
+    Partial,
+    VerificationFailed,
+    Other,
+}
+
+pub fn agent_result_status_kind(status: &str) -> AgentResultStatusKind {
+    let normalized = status.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        AGENT_RESULT_STATUS_COMPLETED => AgentResultStatusKind::Completed,
+        AGENT_RESULT_STATUS_FAILED => AgentResultStatusKind::Failed,
+        AGENT_RESULT_STATUS_TIMEOUT => AgentResultStatusKind::Timeout,
+        AGENT_RESULT_STATUS_WAITING => AgentResultStatusKind::Waiting,
+        AGENT_RESULT_STATUS_PAUSED => AgentResultStatusKind::Paused,
+        AGENT_RESULT_STATUS_CANCELLED => AgentResultStatusKind::Cancelled,
+        AGENT_RESULT_STATUS_PARTIAL => AgentResultStatusKind::Partial,
+        AGENT_RESULT_STATUS_VERIFICATION_FAILED => AgentResultStatusKind::VerificationFailed,
+        _ => AgentResultStatusKind::Other,
+    }
+}
+
+pub fn agent_result_status_is_success(status: &str) -> bool {
+    agent_result_status_kind(status) == AgentResultStatusKind::Completed
+}
+
+pub fn agent_result_status_is_unfinished(status: &str) -> bool {
+    matches!(
+        agent_result_status_kind(status),
+        AgentResultStatusKind::Waiting | AgentResultStatusKind::Paused
+    )
+}
+
+pub fn agent_result_status_is_failure(status: &str) -> bool {
+    matches!(
+        agent_result_status_kind(status),
+        AgentResultStatusKind::Failed
+            | AgentResultStatusKind::Timeout
+            | AgentResultStatusKind::Cancelled
+            | AgentResultStatusKind::VerificationFailed
+    )
+}
+
+pub fn agent_result_status_to_subrun_state(status: &str) -> SubRunState {
+    match agent_result_status_kind(status) {
+        AgentResultStatusKind::Completed => SubRunState::Completed,
+        AgentResultStatusKind::Waiting | AgentResultStatusKind::Paused => SubRunState::Paused,
+        AgentResultStatusKind::Cancelled => SubRunState::Cancelled,
+        AgentResultStatusKind::VerificationFailed => SubRunState::VerificationFailed,
+        AgentResultStatusKind::Failed
+        | AgentResultStatusKind::Timeout
+        | AgentResultStatusKind::Partial
+        | AgentResultStatusKind::Other => SubRunState::Failed,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DelegationResultStatusKind {
+    Completed,
+    Unfinished,
+    Partial,
+    Failed,
+    Other,
+}
+
+pub fn delegation_result_status_kind(status: &str) -> DelegationResultStatusKind {
+    let normalized = status.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        DELEGATION_RESULT_STATUS_COMPLETED => DelegationResultStatusKind::Completed,
+        DELEGATION_RESULT_STATUS_UNFINISHED => DelegationResultStatusKind::Unfinished,
+        DELEGATION_RESULT_STATUS_PARTIAL => DelegationResultStatusKind::Partial,
+        DELEGATION_RESULT_STATUS_FAILED => DelegationResultStatusKind::Failed,
+        _ => DelegationResultStatusKind::Other,
+    }
+}
+
+pub fn delegation_result_status_is_success(status: &str) -> bool {
+    delegation_result_status_kind(status) == DelegationResultStatusKind::Completed
+}
+
+pub fn delegation_result_status_is_unfinished(status: &str) -> bool {
+    delegation_result_status_kind(status) == DelegationResultStatusKind::Unfinished
+}
 
 // ─── Agent Profile ──────────────────────────────────────────────────────────
 
@@ -278,7 +383,9 @@ pub struct AgentResult {
     pub agent_id: String,
     /// Run ID for this agent's execution.
     pub run_id: String,
-    /// Status: "completed", "failed", "timeout".
+    /// Status taxonomy for a delegated sub-run result:
+    /// `completed`, `failed`, `timeout`, `waiting`, `paused`,
+    /// `cancelled`, `partial`, or `verification_failed`.
     pub status: String,
     /// The agent's output/response.
     pub output: Option<String>,
@@ -292,7 +399,15 @@ pub struct AgentResult {
 
 impl AgentResult {
     pub fn is_success(&self) -> bool {
-        self.status == "completed" && self.error.is_none()
+        agent_result_status_is_success(&self.status) && self.error.is_none()
+    }
+
+    pub fn is_unfinished(&self) -> bool {
+        agent_result_status_is_unfinished(&self.status)
+    }
+
+    pub fn is_failure(&self) -> bool {
+        agent_result_status_is_failure(&self.status) || self.error.is_some()
     }
 }
 
@@ -301,7 +416,7 @@ impl AgentResult {
 pub struct DelegationResult {
     /// Delegation ID.
     pub delegation_id: String,
-    /// Overall status.
+    /// Overall status: `completed`, `unfinished`, `partial`, or `failed`.
     pub status: String,
     /// Individual agent results.
     pub agent_results: Vec<AgentResult>,
@@ -314,6 +429,14 @@ pub struct DelegationResult {
 }
 
 impl DelegationResult {
+    pub fn is_success(&self) -> bool {
+        delegation_result_status_is_success(&self.status)
+    }
+
+    pub fn is_unfinished(&self) -> bool {
+        delegation_result_status_is_unfinished(&self.status)
+    }
+
     /// Aggregate token counts from agent results.
     pub fn from_results(
         delegation_id: &str,
@@ -323,17 +446,21 @@ impl DelegationResult {
         let total_prompt: u64 = results.iter().map(|r| r.prompt_tokens).sum();
         let total_completion: u64 = results.iter().map(|r| r.completion_tokens).sum();
         let total_tools: u32 = results.iter().map(|r| r.tool_calls).sum();
-        let all_ok = results.iter().all(|r| r.is_success());
+        let has_results = !results.is_empty();
+        let all_ok = has_results && results.iter().all(|r| r.is_success());
+        let any_unfinished = results.iter().any(|r| r.is_unfinished());
         let any_ok = results.iter().any(|r| r.is_success());
 
         Self {
             delegation_id: delegation_id.to_string(),
             status: if all_ok {
-                "completed".to_string()
+                DELEGATION_RESULT_STATUS_COMPLETED.to_string()
+            } else if any_unfinished {
+                DELEGATION_RESULT_STATUS_UNFINISHED.to_string()
             } else if any_ok {
-                "partial".to_string()
+                DELEGATION_RESULT_STATUS_PARTIAL.to_string()
             } else {
-                "failed".to_string()
+                DELEGATION_RESULT_STATUS_FAILED.to_string()
             },
             agent_results: results,
             aggregated_output,
@@ -993,7 +1120,7 @@ mod tests {
         AgentResult {
             agent_id: agent_id.into(),
             run_id: format!("run-{agent_id}"),
-            status: "completed".into(),
+            status: AGENT_RESULT_STATUS_COMPLETED.into(),
             output: Some(output.into()),
             error: None,
             prompt_tokens: 100,
@@ -1006,12 +1133,25 @@ mod tests {
         AgentResult {
             agent_id: agent_id.into(),
             run_id: format!("run-{agent_id}"),
-            status: "failed".into(),
+            status: AGENT_RESULT_STATUS_FAILED.into(),
             output: None,
             error: Some("timeout".into()),
             prompt_tokens: 50,
             completion_tokens: 0,
             tool_calls: 0,
+        }
+    }
+
+    fn make_unfinished(agent_id: &str) -> AgentResult {
+        AgentResult {
+            agent_id: agent_id.into(),
+            run_id: format!("run-{agent_id}"),
+            status: AGENT_RESULT_STATUS_WAITING.into(),
+            output: Some("waiting for approval".into()),
+            error: None,
+            prompt_tokens: 25,
+            completion_tokens: 5,
+            tool_calls: 1,
         }
     }
 
@@ -1101,9 +1241,149 @@ mod tests {
     }
 
     #[test]
+    fn delegation_result_is_success_only_for_completed_status() {
+        let completed = DelegationResult::from_results("d1", vec![make_result("a1", "one")], None);
+        assert!(completed.is_success());
+
+        let partial = DelegationResult::from_results(
+            "d2",
+            vec![make_result("a1", "one"), make_failed("a2")],
+            None,
+        );
+        assert!(!partial.is_success());
+
+        let failed = DelegationResult::from_results("d3", vec![make_failed("a1")], None);
+        assert!(!failed.is_success());
+    }
+
+    #[test]
     fn agent_result_is_success() {
         assert!(make_result("a1", "ok").is_success());
         assert!(!make_failed("a1").is_success());
+        assert!(!make_unfinished("a2").is_success());
+    }
+
+    #[test]
+    fn agent_result_status_helpers_distinguish_success_failure_and_unfinished() {
+        assert_eq!(
+            agent_result_status_kind(AGENT_RESULT_STATUS_COMPLETED),
+            AgentResultStatusKind::Completed
+        );
+        assert_eq!(
+            agent_result_status_kind(AGENT_RESULT_STATUS_VERIFICATION_FAILED),
+            AgentResultStatusKind::VerificationFailed
+        );
+        assert_eq!(
+            agent_result_status_kind(AGENT_RESULT_STATUS_WAITING),
+            AgentResultStatusKind::Waiting
+        );
+        assert!(agent_result_status_is_success(
+            AGENT_RESULT_STATUS_COMPLETED
+        ));
+        assert!(agent_result_status_is_failure(
+            AGENT_RESULT_STATUS_VERIFICATION_FAILED
+        ));
+        assert!(agent_result_status_is_unfinished(
+            AGENT_RESULT_STATUS_PAUSED
+        ));
+        assert!(!agent_result_status_is_failure(AGENT_RESULT_STATUS_PAUSED));
+        assert!(make_unfinished("a2").is_unfinished());
+        assert_eq!(
+            agent_result_status_to_subrun_state(AGENT_RESULT_STATUS_WAITING),
+            SubRunState::Paused
+        );
+        assert_eq!(
+            agent_result_status_to_subrun_state(AGENT_RESULT_STATUS_VERIFICATION_FAILED),
+            SubRunState::VerificationFailed
+        );
+        assert_eq!(
+            agent_result_status_to_subrun_state("mystery"),
+            SubRunState::Failed
+        );
+    }
+
+    #[test]
+    fn agent_result_status_kind_normalizes_case_and_whitespace() {
+        // Asymmetry-bug regression: ToolResultStatusKind::from_status_str
+        // already lowercases + trims, but agent_result_status_kind used to be
+        // exact-match. A producer that emitted "Completed" (capital C) or
+        // "FAILED" silently fell into AgentResultStatusKind::Other and was
+        // then projected to SubRunState::Failed — a successful sub-run was
+        // reported as failed.
+        for s in ["Completed", "COMPLETED", "  completed  ", "\tcompleted\n"] {
+            assert_eq!(
+                agent_result_status_kind(s),
+                AgentResultStatusKind::Completed,
+                "{s:?} must normalize to Completed",
+            );
+            assert!(agent_result_status_is_success(s), "{s:?} must be success");
+            assert_eq!(
+                agent_result_status_to_subrun_state(s),
+                SubRunState::Completed,
+                "{s:?} must project to Completed sub-run",
+            );
+        }
+        for s in ["FAILED", "Failed"] {
+            assert_eq!(agent_result_status_kind(s), AgentResultStatusKind::Failed);
+            assert!(agent_result_status_is_failure(s));
+        }
+        for s in ["Verification_Failed", "VERIFICATION_FAILED"] {
+            assert_eq!(
+                agent_result_status_kind(s),
+                AgentResultStatusKind::VerificationFailed
+            );
+        }
+        for s in ["Paused", "WAITING"] {
+            assert!(
+                agent_result_status_is_unfinished(s),
+                "{s:?} must be unfinished"
+            );
+        }
+        // Truly unknown still falls through to Other.
+        assert_eq!(
+            agent_result_status_kind("mystery"),
+            AgentResultStatusKind::Other
+        );
+    }
+
+    #[test]
+    fn delegation_result_status_helpers_match_from_results_projection() {
+        let completed = DelegationResult::from_results("d1", vec![make_result("a1", "one")], None);
+        let unfinished = DelegationResult::from_results(
+            "d1.5",
+            vec![make_result("a1", "one"), make_unfinished("a2")],
+            None,
+        );
+        let partial = DelegationResult::from_results(
+            "d2",
+            vec![make_result("a1", "one"), make_failed("a2")],
+            None,
+        );
+        let failed = DelegationResult::from_results("d3", vec![make_failed("a1")], None);
+
+        assert_eq!(
+            delegation_result_status_kind(&completed.status),
+            DelegationResultStatusKind::Completed
+        );
+        assert_eq!(
+            delegation_result_status_kind(&unfinished.status),
+            DelegationResultStatusKind::Unfinished
+        );
+        assert!(unfinished.is_unfinished());
+        assert_eq!(
+            delegation_result_status_kind(&partial.status),
+            DelegationResultStatusKind::Partial
+        );
+        assert_eq!(
+            delegation_result_status_kind(&failed.status),
+            DelegationResultStatusKind::Failed
+        );
+
+        let empty = DelegationResult::from_results("d4", vec![], None);
+        assert_eq!(
+            delegation_result_status_kind(&empty.status),
+            DelegationResultStatusKind::Failed
+        );
     }
 
     // ── Serialization ───

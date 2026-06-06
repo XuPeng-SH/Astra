@@ -18,6 +18,7 @@
 
 use std::{sync::Arc, time::Duration};
 
+use crate::lock_recovery::LockRecovery;
 #[cfg(test)]
 use astra_services::session_journal::ToolCallRecord;
 use astra_services::session_journal::{JournalEvent, JournalEventType};
@@ -121,7 +122,7 @@ fn context_trace_count(state: &crate::SessionState) -> usize {
         .observability_session
         .as_ref()
         .map(|session| {
-            let guard = session.read().unwrap_or_else(|e| e.into_inner());
+            let guard = astra_core::sync_poison::recover_rwlock_read(&session);
             guard.context_traces.len()
         })
         .unwrap_or(0)
@@ -148,7 +149,7 @@ fn latest_context_trace_since(
         return Some(trace.clone());
     }
     let session = state.observability_session.as_ref()?;
-    let guard = session.read().unwrap_or_else(|e| e.into_inner());
+    let guard = astra_core::sync_poison::recover_rwlock_read(&session);
     (guard.context_traces.len() > baseline_count)
         .then(|| guard.context_traces.last().cloned())
         .flatten()
@@ -182,6 +183,82 @@ fn commit_explain_dag(
         return false;
     };
     chat_widget.commit_system(history_cell::system::SystemCell::info(text));
+    true
+}
+
+/// Try to dispatch a kill sentinel emitted by the InFlightAgentsView.
+///
+/// Returns `true` when the sentinel matched (caller should `continue`
+/// the dispatch loop). Takes only the spawner + task service handles
+/// (Arcs) so the call site doesn't need a mutable session-state borrow
+/// — call sites that already hold &mut state can pass clones, call
+/// sites inside async blocks can pre-clone before awaiting.
+///
+/// Looks at the spawner first — that's the canonical kill path for
+/// `agent.spawn`-style children — and ALSO fires the durable-task
+/// service path for task-backed children. Both calls are
+/// fire-and-forget so the UI doesn't block on a hung backend; the
+/// spawner + task_service both honor cooperative cancel and will
+/// eventually surface a terminal status the chat strip refreshes
+/// against.
+fn try_dispatch_agent_kill_sentinel(
+    sentinel: &str,
+    spawner: Option<std::sync::Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
+    task_service: Option<std::sync::Arc<dyn astra_services::TaskService>>,
+    chat_widget: &mut chat_widget::ChatWidget,
+    bottom_pane: &mut BottomPane,
+    frame_requester: &FrameRequester,
+) -> bool {
+    let Some(agent_id) = bottom_pane::in_flight_agents_view::parse_kill_sentinel(sentinel) else {
+        return false;
+    };
+    let agent_id_owned = agent_id.to_string();
+
+    // Mark the row Cancelling immediately so the user gets feedback even
+    // if the actual cancel takes a moment to land.
+    chat_widget.mark_agent_controls_cancelling(std::slice::from_ref(&agent_id_owned));
+
+    let mut dispatched = false;
+    if let Some(spawner) = spawner {
+        let aid = agent_id_owned.clone();
+        tokio::spawn(async move {
+            // The spawner ignores unknown ids, so this is safe even if
+            // the agent already finished between the user pressing x
+            // and us dispatching. Reason text shows up in the journal.
+            let _ = spawner
+                .cancel_agent(&aid, "user-requested via Ctrl+G x")
+                .await;
+        });
+        dispatched = true;
+    }
+    if let Some(task_service) = task_service {
+        // Durable-task children: also try the task-service path. If the
+        // id is dynamic-only this is a no-op error (which we log, not
+        // user-facing); if it's a durable task this is the only path
+        // that actually marks it Cancelled in MatrixOne.
+        let aid = agent_id_owned.clone();
+        tokio::spawn(async move {
+            if let Err(e) = task_service
+                .update_status(&aid, astra_services::TaskStatus::Cancelled)
+                .await
+            {
+                tracing::debug!(
+                    target: "astra_cli::tui",
+                    task_id = %aid,
+                    error = %e,
+                    "Ctrl+G x: task_service cancel rejected (likely a non-durable agent id)"
+                );
+            }
+        });
+        dispatched = true;
+    }
+    if !dispatched {
+        chat_widget.commit_system(history_cell::system::SystemCell::error(format!(
+            "No spawner or task service available; cannot kill agent {agent_id}",
+        )));
+    }
+    bottom_pane.sync_popups();
+    frame_requester.schedule_frame();
     true
 }
 
@@ -570,11 +647,11 @@ pub(crate) async fn run_tui_session(
     max_budget: f64,
     cli_context: &crate::cli::cli_context::CliContext,
 ) -> Result<(), String> {
-    use crate::cli::session_runtime::{
+    use crate::cli::session::session_runtime::{
         initialize_session_state, install_task_service, install_task_store, resolve_task_service,
         resolve_task_store,
     };
-    use crate::cli::session_startup::complete_session_startup;
+    use crate::cli::session::session_startup::complete_session_startup;
     use crate::cli::startup_trace::StartupTracer;
 
     // ── Ensure terminal is in sane state before startup output ────────
@@ -766,7 +843,7 @@ pub(crate) async fn run_tui_session(
     // — it comes AFTER the replay so the banner is the last thing
     // the user sees before the prompt lands. Silent when the summary
     // is empty (either no resume, no task_service, or nothing
-    // finished since last_seen_at).
+    // finished since the last recorded turn).
     if let (Some(svc), Some(sid)) = (state.task_service.clone(), state.session_id.clone())
         && !sid.is_empty()
     {
@@ -774,17 +851,14 @@ pub(crate) async fn run_tui_session(
             .ingestion_user_id
             .clone()
             .unwrap_or_else(|| "local".into());
-        match svc.list_tasks(&user_id, None).await {
+        match svc
+            .list_recent_tasks_for_session(&user_id, &sid, None)
+            .await
+        {
             Ok(items) => {
-                // `last_seen_at` cutoff: we don't have a dedicated
-                // per-session cursor, so use "1 day ago" as a
-                // conservative window. Anything newer surfaces; anything
-                // older is assumed to have already been seen.
-                let cutoff = chrono::Utc::now()
-                    .checked_sub_signed(chrono::Duration::hours(24))
-                    .map(|t| t.to_rfc3339())
-                    .unwrap_or_default();
-                let summary = resume_summary::summarize(&items, &sid, &cutoff);
+                let cutoff =
+                    resume_summary::last_seen_cutoff(state.last_turn_event.as_ref()).unwrap_or("");
+                let summary = resume_summary::summarize(&items, &sid, cutoff);
                 if !summary.is_empty() {
                     chat_widget.commit_resume_summary(summary.render());
                 }
@@ -792,7 +866,7 @@ pub(crate) async fn run_tui_session(
             Err(e) => tracing::debug!(
                 target: "astra_cli::tui",
                 error = %e,
-                "resume summary: list_tasks failed; skipping banner"
+                "resume summary: list_recent_tasks failed; skipping banner"
             ),
         }
     }
@@ -1701,10 +1775,11 @@ pub(crate) async fn run_tui_session(
                                         // us from reaching through `state` inside the
                                         // inner select.
                                         let task_service_for_cancel = state.task_service.clone();
-                                        let ctx = crate::cli::chat_turn::TurnContext { api, profile };
+                                        let agent_spawner_for_cancel = state.agent_spawner.clone();
+                                        let ctx = crate::cli::turn_entry::TurnContext { api, profile };
                                         let token = crate::cli::session_runtime::fresh_access_token(api, profile).await;
                                         let mut tui_ui = ui_adapter::TuiUiAdapter::new(tui_tx.clone());
-                                        let fut = crate::cli::chat_turn::handle_chat_input_with_ui(submit_text, token.as_deref(), &mut state, ctx, &mut tui_ui);
+                                        let fut = crate::cli::turn_entry::handle_chat_input_with_ui(submit_text, token.as_deref(), &mut state, ctx, &mut tui_ui);
                                         tokio::pin!(fut);
 
                                         let r: Result<(), String> = loop {
@@ -1948,7 +2023,30 @@ pub(crate) async fn run_tui_session(
                                                                         }
                                                                         bottom_pane.queued_messages.push(queued_text);
                                                                     }
+                                                                    BottomPaneAction::ViewSideEffect { result } => {
+                                                                        let _ = try_dispatch_agent_kill_sentinel(
+                                                                            &result,
+                                                                            agent_spawner_for_cancel.clone(),
+                                                                            task_service_for_cancel.clone(),
+                                                                            &mut chat_widget,
+                                                                            &mut bottom_pane,
+                                                                            &frame_requester,
+                                                                        );
+                                                                        let rows = chat_widget.agents_drilldown_rows(AGENT_DRILLDOWN_RECENT_COMPLETED);
+                                                                        bottom_pane.refresh_agent_rows(rows);
+                                                                        frame_requester.schedule_frame();
+                                                                    }
                                                                     BottomPaneAction::ViewCompleted { result: Some(name), reopen: _ } => {
+                                                                        if try_dispatch_agent_kill_sentinel(
+                                                                            &name,
+                                                                            agent_spawner_for_cancel.clone(),
+                                                                            task_service_for_cancel.clone(),
+                                                                            &mut chat_widget,
+                                                                            &mut bottom_pane,
+                                                                            &frame_requester,
+                                                                        ) {
+                                                                            continue;
+                                                                        }
                                                                         if let Some(agent_id) = bottom_pane::in_flight_agents_view::parse_drilldown_sentinel(&name) {
                                                                             if let Some(tc) =
                                                                                 chat_widget.task_cell_anywhere(agent_id)
@@ -2439,8 +2537,40 @@ pub(crate) async fn run_tui_session(
                                     }
                                 }
                             }
+                            BottomPaneAction::ViewSideEffect { result } => {
+                                // View emitted a sentinel but stayed open
+                                // (e.g. Ctrl+G drill view's `x` kill).
+                                // Route the sentinel to the appropriate
+                                // handler without popping the view.
+                                let _ = try_dispatch_agent_kill_sentinel(
+                                    &result,
+                                    state.agent_spawner.clone(),
+                                    state.task_service.clone(),
+                                    &mut chat_widget,
+                                    &mut bottom_pane,
+                                    &frame_requester,
+                                );
+                                // Refresh strip rows so the view sees
+                                // Cancelling status immediately.
+                                let rows = chat_widget
+                                    .agents_drilldown_rows(AGENT_DRILLDOWN_RECENT_COMPLETED);
+                                bottom_pane.refresh_agent_rows(rows);
+                                frame_requester.schedule_frame();
+                            }
                             BottomPaneAction::ViewCompleted { result, reopen } => {
                                 if let Some(name) = result {
+                                    // Kill sentinel: route to the spawner / task service before
+                                    // any drilldown handling.
+                                    if try_dispatch_agent_kill_sentinel(
+                                        &name,
+                                        state.agent_spawner.clone(),
+                                        state.task_service.clone(),
+                                        &mut chat_widget,
+                                        &mut bottom_pane,
+                                        &frame_requester,
+                                    ) {
+                                        continue;
+                                    }
                                     // LoginView / RegisterView completion:
                                     // Agent drill-in sentinel: user
                                     // selected one parallel agent in
@@ -2998,7 +3128,7 @@ pub(crate) async fn run_tui_session(
                 // Drain background task commands from the tool executor.
                 {
                     let cmds: Vec<_> = {
-                        state.bg_task_commands.lock().unwrap().drain(..).collect()
+                        state.bg_task_commands.lock_recover().drain(..).collect()
                     };
                     for cmd in cmds {
                         match cmd {

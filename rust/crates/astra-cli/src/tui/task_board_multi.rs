@@ -14,7 +14,7 @@
 //! pins the output shape so the view layer and the storage layer
 //! can land in parallel.
 
-use astra_tools::task_mgmt::SessionTask;
+use astra_tools::task_mgmt::{SessionTask, SessionTaskStatusKind};
 
 /// A flat row in the cross-session task view. Mirrors the
 /// session-scoped `SessionTask` but adds a `session_id` column and
@@ -26,7 +26,7 @@ pub(crate) struct MultiSessionRow {
     pub session_short: String,
     pub task_id: String,
     pub title: String,
-    pub status: String,
+    pub status: SessionTaskStatusKind,
     pub updated_at: String,
 }
 
@@ -43,7 +43,7 @@ where
     for (sid, tasks) in per_session {
         let short = sid.chars().take(8).collect::<String>();
         for t in tasks {
-            if !matches!(t.status.as_str(), "pending" | "in_progress") {
+            if !t.status.is_active() {
                 continue;
             }
             rows.push(MultiSessionRow {
@@ -51,7 +51,7 @@ where
                 session_short: short.clone(),
                 task_id: t.id.clone(),
                 title: t.title.clone(),
-                status: t.status.clone(),
+                status: t.status,
                 updated_at: t.updated_at.clone(),
             });
         }

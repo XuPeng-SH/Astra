@@ -88,7 +88,7 @@ pub(crate) async fn finalize_turn_trace(state: &mut AgenticLoopState) {
     });
     let trace = collector.finalize();
     if let Some(ref session) = state.telemetry.observability_session {
-        let mut guard = session.write().unwrap_or_else(|e| e.into_inner());
+        let mut guard = astra_core::sync_poison::recover_rwlock_write(session);
         crate::observability::on_context_assembled(&mut guard, trace.clone());
     }
     if collector.has_data() {
@@ -116,7 +116,7 @@ async fn persist_latest_context_trace_signal(state: &mut AgenticLoopState) {
         _ => return,
     };
     let signal = {
-        let guard = session.read().unwrap_or_else(|e| e.into_inner());
+        let guard = astra_core::sync_poison::recover_rwlock_read(&session);
         crate::observability::latest_context_trace_signal(&guard)
     };
     let Some(signal) = signal else {
@@ -588,6 +588,13 @@ pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
     }
 }
 
+fn settlement_interruption_summary(
+    state: &AgenticLoopState,
+    error_detail: Option<String>,
+) -> astra_turn_core::interruption::InterruptionStateSummary {
+    interruption_state_summary(state, error_detail)
+}
+
 fn ensure_terminal_text(state: &mut AgenticLoopState) {
     if state.hooks.task_board_snapshot.has_unfinished_tasks() {
         let detail = format!(
@@ -598,7 +605,7 @@ fn ensure_terminal_text(state: &mut AgenticLoopState) {
             state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
                 astra_turn_core::interruption::InterruptionKind::EmptyCompletion,
                 astra_turn_core::interruption::ResumeAction::ContinueImmediately,
-                interruption_state_summary(state, Some(detail)),
+                settlement_interruption_summary(state, Some(detail)),
             ));
         }
         state.final_text = task_board_terminal_message(
@@ -615,7 +622,7 @@ fn ensure_terminal_text(state: &mut AgenticLoopState) {
         state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
             astra_turn_core::interruption::InterruptionKind::EmptyCompletion,
             astra_turn_core::interruption::ResumeAction::ContinueImmediately,
-            interruption_state_summary(
+            settlement_interruption_summary(
                 state,
                 Some("agentic loop completed without final text".to_string()),
             ),
@@ -1122,7 +1129,7 @@ mod tests {
 
     #[tokio::test]
     async fn finalize_and_render_converts_blank_completion_into_empty_completion() {
-        let mut host = MockHost::new(Vec::new());
+        let mut host = MockHost::new(Vec::new()).with_valid_tools(&["agent", "bash", "read_file"]);
         let mut state = make_state();
         state.final_text = "   ".into();
         state.total_tool_calls = 3;
@@ -1137,6 +1144,11 @@ mod tests {
         assert_eq!(
             interruption.kind,
             astra_turn_core::interruption::InterruptionKind::EmptyCompletion
+        );
+        assert_eq!(
+            interruption.resume_restricted_tools,
+            Vec::<String>::new(),
+            "empty completion should preserve the user's full tool surface; settlement is guidance/state, not a tool denylist"
         );
         assert!(state.final_text.contains("without a final answer"));
         assert_eq!(host.rendered_final_text, vec![state.final_text.clone()]);
@@ -1153,7 +1165,7 @@ mod tests {
                     id: "task-1".to_string(),
                     title: "finish validation".to_string(),
                     description: None,
-                    status: "in_progress".to_string(),
+                    status: astra_tools::task_mgmt::SessionTaskStatusKind::InProgress,
                     subtasks: Vec::new(),
                     created_at: "2025-01-01T00:00:00Z".to_string(),
                     updated_at: "2025-01-01T00:00:00Z".to_string(),
@@ -1201,7 +1213,7 @@ mod tests {
                     id: "task-1".to_string(),
                     title: "finish validation".to_string(),
                     description: None,
-                    status: "in_progress".to_string(),
+                    status: astra_tools::task_mgmt::SessionTaskStatusKind::InProgress,
                     subtasks: Vec::new(),
                     created_at: "2025-01-01T00:00:00Z".to_string(),
                     updated_at: "2025-01-01T00:00:00Z".to_string(),
@@ -1288,7 +1300,7 @@ mod tests {
                     id: "task-1".to_string(),
                     title: "finish validation".to_string(),
                     description: None,
-                    status: "in_progress".to_string(),
+                    status: astra_tools::task_mgmt::SessionTaskStatusKind::InProgress,
                     subtasks: Vec::new(),
                     created_at: "2025-01-01T00:00:00Z".to_string(),
                     updated_at: "2025-01-01T00:00:00Z".to_string(),

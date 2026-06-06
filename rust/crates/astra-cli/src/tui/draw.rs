@@ -67,6 +67,62 @@ pub(crate) struct MultiAgentEntry {
     pub elapsed_ms: u64,
     pub live: bool,
     pub failed: bool,
+    /// User-cancelled (via Ctrl+G x or Ctrl+C). Distinct from `failed`
+    /// so the strip can render a different icon/color: a cancelled
+    /// agent is the user's intent, not an error to alarm about.
+    pub cancelled: bool,
+    /// Cancel-in-flight: the user pressed `x`, the spawner has been
+    /// notified, but the terminal status hasn't landed yet. Surfaced
+    /// as a distinct icon (⊘) and "Cancelling…" suffix so the user
+    /// gets immediate feedback instead of staring at a still-Live row.
+    pub cancelling: bool,
+}
+
+/// Build the strip header.
+///
+/// Renders a per-status breakdown so the user sees
+/// `live` / `cancelling` / `failed` / `cancelled` / `done` at a glance,
+/// not just the total. Pre-fix the header only said "▶ N parallel
+/// agents" — failures were invisible, leading users to spawn
+/// replacement agents on top of dead ones without realising.
+///
+/// `cancelled` / `cancelling` are split out from `failed` because user
+/// cancellation is an intent, not an alarm — surfacing it as a separate
+/// bucket avoids confusing "I just killed one" with "one died on me".
+///
+/// Hint advertises both `Ctrl+G` (open drill view) and `x` (kill from
+/// inside drill view) so the new affordance is discoverable.
+pub(crate) fn multi_agent_strip_header(cells: &[MultiAgentEntry]) -> String {
+    let total = cells.len();
+    let live = cells.iter().filter(|c| c.live).count();
+    let cancelling = cells.iter().filter(|c| c.cancelling).count();
+    let failed = cells.iter().filter(|c| c.failed).count();
+    let cancelled = cells.iter().filter(|c| c.cancelled).count();
+    let done = total.saturating_sub(live + cancelling + failed + cancelled);
+
+    let mut breakdown = Vec::with_capacity(5);
+    if live > 0 {
+        breakdown.push(format!("{live} live"));
+    }
+    if cancelling > 0 {
+        breakdown.push(format!("{cancelling} cancelling"));
+    }
+    if failed > 0 {
+        breakdown.push(format!("{failed} failed"));
+    }
+    if cancelled > 0 {
+        breakdown.push(format!("{cancelled} cancelled"));
+    }
+    if done > 0 {
+        breakdown.push(format!("{done} done"));
+    }
+    let breakdown = if breakdown.is_empty() {
+        String::new()
+    } else {
+        format!(" · {}", breakdown.join(" · "))
+    };
+
+    format!("▶ {total} parallel agents{breakdown} · Ctrl+G drill · x kill")
 }
 
 /// Pair of (ActiveView, TaskBoard lines) produced by
@@ -132,27 +188,48 @@ pub(crate) fn active_viewport(
         let cells: Vec<MultiAgentEntry> = agent_ids
             .iter()
             .filter_map(|id| {
-                chat_widget.agent_run_cell(id).map(|tc| MultiAgentEntry {
-                    agent_id: id.clone(),
-                    label: tc.description.clone(),
-                    child_count: tc.children.len(),
-                    elapsed_ms: tc
-                        .duration_ms
-                        .unwrap_or_else(|| tc.started_at.elapsed().as_millis() as u64),
-                    live: matches!(
-                        tc.status,
-                        crate::tui::history_cell::task::TaskStatus::Running
-                    ),
-                    failed: matches!(
+                chat_widget.agent_run_cell(id).map(|tc| {
+                    let is_cancelled = chat_widget.agent_is_cancelled(id);
+                    let is_cancelling = chat_widget.agent_is_cancelling(id);
+                    let raw_failed = matches!(
                         tc.status,
                         crate::tui::history_cell::task::TaskStatus::Failed
-                    ),
+                    );
+                    let raw_running = matches!(
+                        tc.status,
+                        crate::tui::history_cell::task::TaskStatus::Running
+                    );
+                    // Cancellation is an overlay on the underlying
+                    // status. A user-cancelled agent that came back as
+                    // Failed renders as Cancelled (the underlying
+                    // failure is incidental to the user's intent); a
+                    // still-running agent the user just `x`-killed
+                    // renders as Cancelling until its terminal status
+                    // lands. Without this overlay the strip showed
+                    // `✗ red` indistinguishably from a real failure.
+                    MultiAgentEntry {
+                        agent_id: id.clone(),
+                        label: tc.description.clone(),
+                        child_count: tc.children.len(),
+                        elapsed_ms: tc
+                            .duration_ms
+                            .unwrap_or_else(|| tc.started_at.elapsed().as_millis() as u64),
+                        live: raw_running && !is_cancelling && !is_cancelled,
+                        failed: raw_failed && !is_cancelled,
+                        cancelled: is_cancelled,
+                        cancelling: is_cancelling && !is_cancelled,
+                    }
                 })
             })
             .collect();
 
-        let any_live = cells.iter().any(|entry| entry.live);
+        let any_live = cells.iter().any(|entry| entry.live || entry.cancelling);
         let any_failed = cells.iter().any(|entry| entry.failed);
+        // Treat user-cancelled like failed for visibility: keep the
+        // strip up so the user sees the row reach a stable Cancelled
+        // state instead of disappearing mid-cancel and leaving them
+        // wondering whether the kill landed.
+        let any_cancelled = cells.iter().any(|entry| entry.cancelled);
         let any_recently_terminal = !any_live
             && agent_ids.iter().any(|id| {
                 chat_widget.agent_run_cell(id).is_some_and(|tc| {
@@ -160,7 +237,7 @@ pub(crate) fn active_viewport(
                         .is_some_and(|completed_at| completed_at.elapsed() < STRIP_LINGER)
                 })
             });
-        if any_live || any_failed || any_recently_terminal {
+        if any_live || any_failed || any_cancelled || any_recently_terminal {
             Some(cells)
         } else {
             None
@@ -388,17 +465,22 @@ pub(crate) fn do_draw(
     // gradient-gutter frame containing a header and one short row
     // per live agent. Renders as e.g.:
     //
-    //   █ ▶ 3 parallel agents · Ctrl+G to drill in
+    //   █ ▶ 3 parallel agents · 1 live · 1 failed · 1 done · Ctrl+G drill · x kill
     //   █ ◦ review_tui      · 2 steps · 12s
-    //   █ ◦ review_fixes    · 0 steps · 8s
+    //   █ ✗ review_fixes    · 0 steps · 8s
     //   █ ✓ review_refactor · 4 steps · 18s
     //
     // (status: ◦ live / ✓ completed / ✗ failed)
     let multi_agent_renderable: Option<RenderableItem<'_>> = multi_agent.map(|cells| {
-        let count = cells.len();
         let theme = crate::tui::theme::current();
+        // Split live / failed / done so a 3-agent strip with one
+        // failure is visible at a glance — without this the user only
+        // sees "▶ 3 parallel agents" while one is silently dead.
+        // Hint mentions both drill (Ctrl+G to open the panel) and the
+        // kill key inside it (`x`) so the new affordance is
+        // discoverable from the strip itself.
         let header_line = Line::from(ratatui::text::Span::styled(
-            format!("▶ {count} parallel agents · Ctrl+G to drill in"),
+            multi_agent_strip_header(&cells),
             ratatui::style::Style::default()
                 .fg(theme.accent)
                 .add_modifier(ratatui::style::Modifier::BOLD),
@@ -414,7 +496,16 @@ pub(crate) fn do_draw(
         let mut lines: Vec<Line<'static>> = Vec::with_capacity(cells.len() + 1);
         lines.push(header_line);
         for entry in cells {
-            let (icon, icon_color) = if entry.failed {
+            // Order matters: cancelled overlays everything (the user's
+            // intent), then in-flight cancel, then real failure, then
+            // live, then completed. Without this, a user-cancelled
+            // agent that came back as Failed would render with the red
+            // ✗ "alarm" icon — same as a genuine error.
+            let (icon, icon_color) = if entry.cancelled {
+                ("■", ratatui::style::Color::DarkGray)
+            } else if entry.cancelling {
+                ("⊘", ratatui::style::Color::Yellow)
+            } else if entry.failed {
                 ("✗", ratatui::style::Color::Red)
             } else if entry.live {
                 ("◦", ratatui::style::Color::Yellow)
@@ -422,10 +513,18 @@ pub(crate) fn do_draw(
                 ("✓", ratatui::style::Color::Green)
             };
             let label = truncate_label(&entry.label, label_budget);
+            let trailing = if entry.cancelling {
+                " · Cancelling…"
+            } else if entry.cancelled {
+                " · Cancelled"
+            } else {
+                ""
+            };
             let suffix = format!(
-                " · {} steps · {}",
+                " · {} steps · {}{}",
                 entry.child_count,
                 format_short_elapsed(entry.elapsed_ms),
+                trailing,
             );
             let row = Line::from(vec![
                 ratatui::text::Span::styled(
@@ -944,7 +1043,110 @@ mod multi_agent_strip_tests {
     //! Each row fits in one line and surfaces label, step count, and
     //! elapsed time, plus a status icon that distinguishes live
     //! agents from completed ones.
-    use super::{format_short_elapsed, truncate_label};
+    use super::{MultiAgentEntry, format_short_elapsed, multi_agent_strip_header, truncate_label};
+
+    fn entry(live: bool, failed: bool) -> MultiAgentEntry {
+        MultiAgentEntry {
+            agent_id: "a".into(),
+            label: "agent".into(),
+            child_count: 0,
+            elapsed_ms: 0,
+            live,
+            failed,
+            cancelled: false,
+            cancelling: false,
+        }
+    }
+
+    fn cancelling_entry() -> MultiAgentEntry {
+        let mut e = entry(false, false);
+        e.cancelling = true;
+        e
+    }
+
+    fn cancelled_entry() -> MultiAgentEntry {
+        let mut e = entry(false, false);
+        e.cancelled = true;
+        e
+    }
+
+    #[test]
+    fn header_only_shows_total_when_all_live() {
+        let cells = vec![entry(true, false), entry(true, false)];
+        let header = multi_agent_strip_header(&cells);
+        assert!(header.contains("2 parallel agents"));
+        assert!(header.contains("2 live"));
+        assert!(!header.contains("failed"));
+        assert!(!header.contains("done"));
+        assert!(header.contains("Ctrl+G drill"));
+        assert!(header.contains("x kill"));
+    }
+
+    #[test]
+    fn header_surfaces_failed_count_when_any_failure() {
+        // Regression: pre-fix the user only saw "▶ 3 parallel agents"
+        // even though one was already dead. The breakdown must call out
+        // failures so the user catches them at a glance.
+        let cells = vec![entry(true, false), entry(false, true), entry(false, false)];
+        let header = multi_agent_strip_header(&cells);
+        assert!(header.contains("3 parallel agents"));
+        assert!(header.contains("1 live"));
+        assert!(header.contains("1 failed"));
+        assert!(header.contains("1 done"));
+    }
+
+    #[test]
+    fn header_skips_zero_buckets() {
+        let cells = vec![entry(false, false), entry(false, false)];
+        let header = multi_agent_strip_header(&cells);
+        assert!(header.contains("2 parallel agents"));
+        assert!(header.contains("2 done"));
+        assert!(!header.contains("0 live"));
+        assert!(!header.contains("0 failed"));
+    }
+
+    #[test]
+    fn header_distinguishes_cancelled_from_failed() {
+        // The user's complaint: cancelled rows looked identical to
+        // failed rows. Splitting the buckets means a user-cancelled
+        // agent shows in its own column and the user knows immediately
+        // that nothing went wrong — they triggered it.
+        let cells = vec![
+            entry(false, true),  // 1 failed
+            cancelled_entry(),   // 1 cancelled
+            entry(false, false), // 1 done
+        ];
+        let header = multi_agent_strip_header(&cells);
+        assert!(header.contains("1 failed"));
+        assert!(header.contains("1 cancelled"));
+        assert!(header.contains("1 done"));
+        assert!(!header.contains("2 failed"));
+    }
+
+    #[test]
+    fn header_surfaces_cancelling_as_in_flight_status() {
+        // While the kill is in flight the header reports "cancelling"
+        // — distinct from cancelled — so the user sees the request is
+        // being processed.
+        let cells = vec![entry(true, false), cancelling_entry()];
+        let header = multi_agent_strip_header(&cells);
+        assert!(header.contains("1 live"));
+        assert!(header.contains("1 cancelling"));
+        assert!(!header.contains("done"));
+    }
+
+    #[test]
+    fn header_advertises_kill_affordance() {
+        // The new `x` shortcut on the drill view is hidden inside a
+        // sub-panel; the header is the only place the user sees the
+        // outer flow, so the hint MUST mention it.
+        let cells = vec![entry(true, false)];
+        let header = multi_agent_strip_header(&cells);
+        assert!(
+            header.contains("x kill"),
+            "header must advertise the kill key: {header}"
+        );
+    }
 
     #[test]
     fn elapsed_under_a_second_renders_in_milliseconds() {
@@ -1021,11 +1223,15 @@ mod multi_agent_strip_tests {
             elapsed_ms: 12_000,
             live: true,
             failed: false,
+            cancelled: false,
+            cancelling: false,
         };
         assert_eq!(entry.label, "review_tui");
         assert_eq!(entry.child_count, 4);
         assert_eq!(format_short_elapsed(entry.elapsed_ms), "12s");
         assert!(entry.live);
         assert!(!entry.failed);
+        assert!(!entry.cancelled);
+        assert!(!entry.cancelling);
     }
 }

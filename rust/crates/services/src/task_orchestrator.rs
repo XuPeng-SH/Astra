@@ -69,6 +69,10 @@ impl TaskStatus {
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
     }
+
+    pub fn is_claimable(&self) -> bool {
+        matches!(self, Self::Pending | Self::InProgress)
+    }
 }
 
 /// A single subtask within a plan.
@@ -213,6 +217,8 @@ pub struct TaskRecord {
 pub struct TaskListItem {
     pub task_id: String,
     pub title: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
     pub status: TaskStatus,
     pub progress_pct: u32,
     pub items_done: u32,
@@ -221,7 +227,13 @@ pub struct TaskListItem {
     pub updated_at: String,
     pub completed_at: Option<String>,
     #[serde(default)]
+    pub outcome: Option<TaskOutcome>,
+    #[serde(default)]
+    pub error_message: Option<String>,
+    #[serde(default)]
     pub project_type: Option<String>,
+    #[serde(default)]
+    pub claimability: Option<TaskClaimability>,
 }
 
 /// Task outcome for learning.
@@ -250,6 +262,32 @@ impl TaskOutcome {
             "partial" => Some(Self::Partial),
             "failed" => Some(Self::Failed),
             "cancelled" => Some(Self::Cancelled),
+            _ => None,
+        }
+    }
+}
+
+/// Why a task appears in the worker claimable queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskClaimability {
+    Pending,
+    RecoverableInProgress,
+}
+
+impl TaskClaimability {
+    pub fn for_status(status: TaskStatus) -> Option<Self> {
+        match status {
+            TaskStatus::Pending => Some(Self::Pending),
+            TaskStatus::InProgress => Some(Self::RecoverableInProgress),
+            _ => None,
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "pending" => Some(Self::Pending),
+            "recoverable_in_progress" => Some(Self::RecoverableInProgress),
             _ => None,
         }
     }
@@ -300,7 +338,7 @@ pub struct TemplateRecommendation {
 pub struct LearningStats {
     /// Total tasks with this pattern
     pub total_tasks: u32,
-    /// Tasks that completed (status = completed)
+    /// Tasks that finished with successful outcome.
     pub completed_tasks: u32,
     /// Average rating (only rated tasks)
     pub avg_rating: Option<f32>,
@@ -325,11 +363,50 @@ pub trait TaskService: Send + Sync {
     /// Get a task by ID.
     async fn get_task(&self, task_id: &str) -> Result<Option<TaskRecord>, String>;
 
-    /// List tasks for a user (optionally filter by status).
-    async fn list_tasks(
+    /// List recent task history for a user (optionally filter by status).
+    async fn list_recent_tasks(
         &self,
         user_id: &str,
         status_filter: Option<TaskStatus>,
+    ) -> Result<Vec<TaskListItem>, String>;
+
+    /// List recent task history for a single session (optionally filter by status).
+    async fn list_recent_tasks_for_session(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        status_filter: Option<TaskStatus>,
+    ) -> Result<Vec<TaskListItem>, String>;
+
+    /// Search tasks for a user using the shared CLI lookup semantics.
+    ///
+    /// Matching is fail-closed and tiered:
+    /// 1. exact `task_id`
+    /// 2. `task_id` prefix
+    /// 3. case-insensitive exact title
+    /// 4. case-insensitive title substring
+    ///
+    /// Only matches from the best tier are returned, ordered by newest first.
+    async fn search_tasks(
+        &self,
+        user_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<TaskListItem>, String>;
+
+    /// List claimable tasks for worker claim order.
+    ///
+    /// This is intentionally distinct from `list_recent_tasks(status=pending)`: workers
+    /// need claim semantics, not a recent-list surface. Results are ordered
+    /// oldest-first so older claimable tasks cannot be starved by newer ones.
+    ///
+    /// "Claimable" means:
+    /// - `pending`
+    /// - `in_progress` with no active lease (or an expired lease)
+    async fn list_claimable_tasks_for_worker(
+        &self,
+        user_id: &str,
+        limit: usize,
     ) -> Result<Vec<TaskListItem>, String>;
 
     /// Update task status.
@@ -359,6 +436,16 @@ pub trait TaskService: Send + Sync {
 
     /// Mark task as completed.
     async fn complete_task(&self, task_id: &str) -> Result<(), String>;
+
+    /// Mark a non-plan task as completed with an explicit outcome.
+    ///
+    /// Used by one-shot and background task runs where the task has no
+    /// subtask progress but may still finish partially.
+    async fn complete_task_with_outcome(
+        &self,
+        task_id: &str,
+        outcome: TaskOutcome,
+    ) -> Result<(), String>;
 
     /// Mark a plan-run task finished with explicit progress and learning outcome.
     ///
@@ -423,6 +510,62 @@ pub struct MatrixOneTaskService {
 }
 
 const MAX_TASK_LIST_ROWS: usize = 200;
+const MAX_TASK_QUERY_MATCH_ROWS: usize = 8;
+
+fn task_query_match_rank(task_id: &str, title: &str, query: &str) -> Option<u8> {
+    if task_id == query {
+        return Some(1);
+    }
+    if task_id.starts_with(query) {
+        return Some(2);
+    }
+
+    let title_lower = title.to_lowercase();
+    let query_lower = query.to_lowercase();
+    if title_lower == query_lower {
+        return Some(3);
+    }
+    if title_lower.contains(&query_lower) {
+        return Some(4);
+    }
+    None
+}
+
+fn select_best_task_query_matches(
+    tasks: Vec<TaskListItem>,
+    query: &str,
+    limit: usize,
+) -> Vec<TaskListItem> {
+    let mut ranked: Vec<(u8, TaskListItem)> = tasks
+        .into_iter()
+        .filter_map(|task| {
+            task_query_match_rank(&task.task_id, &task.title, query).map(|rank| (rank, task))
+        })
+        .collect();
+    ranked.sort_by(|(left_rank, left_task), (right_rank, right_task)| {
+        left_rank
+            .cmp(right_rank)
+            .then_with(|| right_task.updated_at.cmp(&left_task.updated_at))
+    });
+
+    let Some(best_rank) = ranked.first().map(|(rank, _)| *rank) else {
+        return Vec::new();
+    };
+
+    ranked
+        .into_iter()
+        .filter(|(rank, _)| *rank == best_rank)
+        .take(limit)
+        .map(|(_, task)| task)
+        .collect()
+}
+
+fn escape_sql_like_fragment(fragment: &str) -> String {
+    fragment
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
 
 pub(crate) const AGENT_TASK_DETAIL_SELECT_COLUMNS: &str = "task_id, user_id, session_id, parent_task_id, title, description, \
      status, progress_pct, items_done, items_total, plan_json, checkpoint_json, \
@@ -434,7 +577,7 @@ pub(crate) const AGENT_TASK_DETAIL_SELECT_COLUMNS: &str = "task_id, user_id, ses
 
 pub(crate) const AGENT_TASK_LIST_SELECT_COLUMNS: &str = "task_id, user_id, session_id, parent_task_id, title, \
      NULL AS description, status, progress_pct, items_done, items_total, \
-     NULL AS plan_json, NULL AS checkpoint_json, NULL AS error_message, \
+     NULL AS plan_json, NULL AS checkpoint_json, error_message, \
      user_rating, completion_time_sec, replan_count, auto_adjustments, \
      outcome, project_type, goal_pattern, agent_id, \
      CAST(created_at AS CHAR) AS created_at, \
@@ -501,13 +644,55 @@ impl MatrixOneTaskService {
         })
     }
 
+    /// Convert a 0-rows-affected outcome from a guarded UPDATE into a structured
+    /// error: distinguish "not found" from "terminal-state immutability" by
+    /// reading the row's current status.
+    async fn report_terminal_guard_violation(
+        &self,
+        task_id: &str,
+        attempted: &str,
+    ) -> Result<(), String> {
+        use sqlx::Row;
+        let row = sqlx::query("SELECT status FROM agent_tasks WHERE task_id = ?")
+            .bind(task_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| format!("terminal_guard check: {e}"))?;
+        match row {
+            None => Err(format!("task not found: {task_id}")),
+            Some(r) => {
+                let cur: String = r.try_get("status").unwrap_or_default();
+                let cur_status = TaskStatus::parse_status(&cur);
+                if cur_status.is_terminal() {
+                    Err(format!(
+                        "invalid task status transition: {} → {} (terminal states are immutable)",
+                        cur_status.as_str(),
+                        attempted
+                    ))
+                } else {
+                    // The guard rejected the update for a non-status reason
+                    // (should not happen given current SQL); surface a generic
+                    // structured error rather than a silent success.
+                    Err(format!(
+                        "task {task_id} update rejected (status={}, attempted={attempted})",
+                        cur_status.as_str()
+                    ))
+                }
+            }
+        }
+    }
+
     pub fn parse_mysql_list_row(row: &sqlx::mysql::MySqlRow) -> Result<TaskListItem, String> {
         use sqlx::Row;
 
         let status_str: String = row.try_get("status").map_err(|e| e.to_string())?;
+        let outcome_str: Option<String> = row.try_get("outcome").ok().flatten();
+        let outcome = outcome_str.as_deref().and_then(TaskOutcome::parse);
+        let claimability_str: Option<String> = row.try_get("claimability").ok().flatten();
         Ok(TaskListItem {
             task_id: row.try_get("task_id").map_err(|e| e.to_string())?,
             title: row.try_get("title").map_err(|e| e.to_string())?,
+            session_id: row.try_get("session_id").ok().flatten(),
             status: TaskStatus::parse_status(&status_str),
             progress_pct: row.try_get::<i32, _>("progress_pct").unwrap_or(0) as u32,
             items_done: row.try_get::<i32, _>("items_done").unwrap_or(0) as u32,
@@ -515,7 +700,12 @@ impl MatrixOneTaskService {
             created_at: row.try_get::<String, _>("created_at").unwrap_or_default(),
             updated_at: row.try_get::<String, _>("updated_at").unwrap_or_default(),
             completed_at: row.try_get("completed_at").ok().flatten(),
+            outcome,
+            error_message: row.try_get("error_message").ok().flatten(),
             project_type: row.try_get("project_type").ok().flatten(),
+            claimability: claimability_str
+                .as_deref()
+                .and_then(TaskClaimability::parse),
         })
     }
 }
@@ -585,7 +775,7 @@ impl TaskService for MatrixOneTaskService {
         }
     }
 
-    async fn list_tasks(
+    async fn list_recent_tasks(
         &self,
         user_id: &str,
         status_filter: Option<TaskStatus>,
@@ -610,9 +800,115 @@ impl TaskService for MatrixOneTaskService {
             .fetch_all(&self.pool)
             .await
         }
-        .map_err(|e| format!("list_tasks: {e}"))?;
+        .map_err(|e| format!("list_recent_tasks: {e}"))?;
 
         rows.iter().map(Self::parse_mysql_list_row).collect()
+    }
+
+    async fn list_recent_tasks_for_session(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        status_filter: Option<TaskStatus>,
+    ) -> Result<Vec<TaskListItem>, String> {
+        let rows = if let Some(status) = status_filter {
+            sqlx::query(&format!(
+                "SELECT {AGENT_TASK_LIST_SELECT_COLUMNS} \
+                 FROM agent_tasks WHERE user_id = ? AND session_id = ? AND status = ? \
+                 ORDER BY updated_at DESC LIMIT {}",
+                MAX_TASK_LIST_ROWS
+            ))
+            .bind(user_id)
+            .bind(session_id)
+            .bind(status.as_str())
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            sqlx::query(&format!(
+                "SELECT {AGENT_TASK_LIST_SELECT_COLUMNS} \
+                 FROM agent_tasks WHERE user_id = ? AND session_id = ? \
+                 ORDER BY updated_at DESC LIMIT {}",
+                MAX_TASK_LIST_ROWS
+            ))
+            .bind(user_id)
+            .bind(session_id)
+            .fetch_all(&self.pool)
+            .await
+        }
+        .map_err(|e| format!("list_recent_tasks_for_session: {e}"))?;
+
+        rows.iter().map(Self::parse_mysql_list_row).collect()
+    }
+
+    async fn search_tasks(
+        &self,
+        user_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<TaskListItem>, String> {
+        let query = query.trim();
+        if query.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let like_fragment = escape_sql_like_fragment(query);
+        let task_id_prefix = format!("{like_fragment}%");
+        let title_substring = format!("%{like_fragment}%");
+        let sql_limit = limit.clamp(1, MAX_TASK_QUERY_MATCH_ROWS);
+        let rows = sqlx::query(&format!(
+            "SELECT {AGENT_TASK_LIST_SELECT_COLUMNS}, \
+                    CASE \
+                        WHEN task_id = ? THEN 1 \
+                        WHEN task_id LIKE ? ESCAPE '\\\\' THEN 2 \
+                        WHEN LOWER(title) = LOWER(?) THEN 3 \
+                        WHEN LOWER(title) LIKE LOWER(?) ESCAPE '\\\\' THEN 4 \
+                        ELSE 5 \
+                    END AS match_rank \
+             FROM agent_tasks \
+             WHERE user_id = ? AND ( \
+                    task_id = ? \
+                 OR task_id LIKE ? ESCAPE '\\\\' \
+                 OR LOWER(title) = LOWER(?) \
+                 OR LOWER(title) LIKE LOWER(?) ESCAPE '\\\\' \
+             ) \
+             ORDER BY match_rank ASC, updated_at DESC \
+             LIMIT {}",
+            sql_limit
+        ))
+        .bind(query)
+        .bind(&task_id_prefix)
+        .bind(query)
+        .bind(&title_substring)
+        .bind(user_id)
+        .bind(query)
+        .bind(&task_id_prefix)
+        .bind(query)
+        .bind(&title_substring)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("search_tasks: {e}"))?;
+
+        let mut matches = Vec::new();
+        let mut best_rank: Option<i32> = None;
+        for row in rows {
+            let rank: i32 = row.try_get("match_rank").map_err(|e| e.to_string())?;
+            if best_rank.is_none() {
+                best_rank = Some(rank);
+            }
+            if Some(rank) != best_rank {
+                break;
+            }
+            matches.push(Self::parse_mysql_list_row(&row)?);
+        }
+        Ok(matches)
+    }
+
+    async fn list_claimable_tasks_for_worker(
+        &self,
+        user_id: &str,
+        limit: usize,
+    ) -> Result<Vec<TaskListItem>, String> {
+        crate::multi_agent::task_lease::list_claimable_tasks_mysql(&self.pool, user_id, limit).await
     }
 
     async fn update_status(&self, task_id: &str, status: TaskStatus) -> Result<(), String> {
@@ -681,8 +977,9 @@ impl TaskService for MatrixOneTaskService {
         items_done: u32,
         items_total: u32,
     ) -> Result<(), String> {
-        sqlx::query(
-            "UPDATE agent_tasks SET progress_pct = ?, items_done = ?, items_total = ?, updated_at = NOW() WHERE task_id = ?",
+        let result = sqlx::query(
+            "UPDATE agent_tasks SET progress_pct = ?, items_done = ?, items_total = ?, updated_at = NOW() \
+             WHERE task_id = ? AND status NOT IN ('completed', 'failed', 'cancelled')",
         )
         .bind(progress_pct as i32)
         .bind(items_done as i32)
@@ -691,6 +988,11 @@ impl TaskService for MatrixOneTaskService {
         .execute(&self.pool)
         .await
         .map_err(|e| format!("update_progress: {e}"))?;
+        if result.rows_affected() == 0 {
+            return self
+                .report_terminal_guard_violation(task_id, "progress")
+                .await;
+        }
         Ok(())
     }
 
@@ -701,14 +1003,20 @@ impl TaskService for MatrixOneTaskService {
     ) -> Result<(), String> {
         let ckpt_json =
             serde_json::to_string(checkpoint).map_err(|e| format!("serialize ckpt: {e}"))?;
-        sqlx::query(
-            "UPDATE agent_tasks SET checkpoint_json = ?, updated_at = NOW() WHERE task_id = ?",
+        let result = sqlx::query(
+            "UPDATE agent_tasks SET checkpoint_json = ?, updated_at = NOW() \
+             WHERE task_id = ? AND status NOT IN ('completed', 'failed', 'cancelled')",
         )
         .bind(&ckpt_json)
         .bind(task_id)
         .execute(&self.pool)
         .await
         .map_err(|e| format!("save_checkpoint: {e}"))?;
+        if result.rows_affected() == 0 {
+            return self
+                .report_terminal_guard_violation(task_id, "checkpoint")
+                .await;
+        }
         Ok(())
     }
 
@@ -718,8 +1026,9 @@ impl TaskService for MatrixOneTaskService {
         let done = plan.items_done();
         let total = plan.subtasks.len() as i32;
 
-        sqlx::query(
-            "UPDATE agent_tasks SET plan_json = ?, progress_pct = ?, items_done = ?, items_total = ?, updated_at = NOW() WHERE task_id = ?",
+        let result = sqlx::query(
+            "UPDATE agent_tasks SET plan_json = ?, progress_pct = ?, items_done = ?, items_total = ?, updated_at = NOW() \
+             WHERE task_id = ? AND status NOT IN ('completed', 'failed', 'cancelled')",
         )
         .bind(&plan_json)
         .bind(progress as i32)
@@ -729,19 +1038,28 @@ impl TaskService for MatrixOneTaskService {
         .execute(&self.pool)
         .await
         .map_err(|e| format!("update_plan: {e}"))?;
+        if result.rows_affected() == 0 {
+            return self.report_terminal_guard_violation(task_id, "plan").await;
+        }
         Ok(())
     }
 
     async fn fail_task(&self, task_id: &str, error: &str) -> Result<(), String> {
-        sqlx::query(
-            "UPDATE agent_tasks SET status = 'failed', error_message = ?, \
-             updated_at = NOW(), completed_at = NOW() WHERE task_id = ?",
+        let result = sqlx::query(
+            "UPDATE agent_tasks SET status = 'failed', outcome = 'failed', error_message = ?, \
+             updated_at = NOW(), completed_at = NOW() \
+             WHERE task_id = ? AND status NOT IN ('completed', 'failed', 'cancelled')",
         )
         .bind(error)
         .bind(task_id)
         .execute(&self.pool)
         .await
         .map_err(|e| format!("fail_task: {e}"))?;
+        if result.rows_affected() == 0 {
+            return self
+                .report_terminal_guard_violation(task_id, "failed")
+                .await;
+        }
         let preview: String = error.chars().take(200).collect();
         tracing::warn!(
             target: "astra_services::task_orchestrator",
@@ -753,17 +1071,35 @@ impl TaskService for MatrixOneTaskService {
     }
 
     async fn complete_task(&self, task_id: &str) -> Result<(), String> {
-        sqlx::query(
+        self.complete_task_with_outcome(task_id, TaskOutcome::Success)
+            .await
+    }
+
+    async fn complete_task_with_outcome(
+        &self,
+        task_id: &str,
+        outcome: TaskOutcome,
+    ) -> Result<(), String> {
+        let result = sqlx::query(
             "UPDATE agent_tasks SET status = 'completed', progress_pct = 100, \
-             updated_at = NOW(), completed_at = NOW() WHERE task_id = ?",
+             outcome = ?, error_message = NULL, \
+             updated_at = NOW(), completed_at = NOW() \
+             WHERE task_id = ? AND status NOT IN ('completed', 'failed', 'cancelled')",
         )
+        .bind(outcome.as_str())
         .bind(task_id)
         .execute(&self.pool)
         .await
-        .map_err(|e| format!("complete_task: {e}"))?;
+        .map_err(|e| format!("complete_task_with_outcome: {e}"))?;
+        if result.rows_affected() == 0 {
+            return self
+                .report_terminal_guard_violation(task_id, "completed")
+                .await;
+        }
         tracing::info!(
             target: "astra_services::task_orchestrator",
             task_id,
+            outcome = outcome.as_str(),
             "task completed"
         );
         Ok(())
@@ -777,10 +1113,11 @@ impl TaskService for MatrixOneTaskService {
         items_total: u32,
         outcome: TaskOutcome,
     ) -> Result<(), String> {
-        sqlx::query(
+        let result = sqlx::query(
             "UPDATE agent_tasks SET status = 'completed', progress_pct = ?, items_done = ?, \
              items_total = ?, outcome = ?, error_message = NULL, \
-             updated_at = NOW(), completed_at = NOW() WHERE task_id = ?",
+             updated_at = NOW(), completed_at = NOW() \
+             WHERE task_id = ? AND status NOT IN ('completed', 'failed', 'cancelled')",
         )
         .bind(progress_pct as i32)
         .bind(items_done as i32)
@@ -790,6 +1127,11 @@ impl TaskService for MatrixOneTaskService {
         .execute(&self.pool)
         .await
         .map_err(|e| format!("complete_plan_run: {e}"))?;
+        if result.rows_affected() == 0 {
+            return self
+                .report_terminal_guard_violation(task_id, "completed")
+                .await;
+        }
         tracing::info!(
             target: "astra_services::task_orchestrator",
             task_id,
@@ -847,10 +1189,10 @@ impl TaskService for MatrixOneTaskService {
             .await?
             .ok_or_else(|| format!("task not found: {task_id}"))?;
 
-        // Check if task is eligible for template extraction
-        // Criteria: rating >= 4 OR (completed AND replan_count <= 1)
+        // Check if task is eligible for template extraction.
+        // Criteria: rating >= 4 OR (successful outcome AND replan_count <= 1).
         let eligible = task.user_rating.map(|r| r >= 4).unwrap_or(false)
-            || (task.status == TaskStatus::Completed && task.replan_count <= 1);
+            || (task.outcome == Some(TaskOutcome::Success) && task.replan_count <= 1);
 
         if !eligible || task.plan.is_none() {
             return Ok(None);
@@ -1037,7 +1379,7 @@ impl TaskService for MatrixOneTaskService {
         let query = format!(
             "SELECT \
              COUNT(*) as total_tasks, \
-             SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed_tasks, \
+             SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END) as completed_tasks, \
              AVG(user_rating) as avg_rating, \
              AVG(replan_count) as avg_replan_count \
              FROM agent_tasks \
@@ -1182,7 +1524,7 @@ impl TaskService for LocalTaskService {
         self.load_task(task_id)
     }
 
-    async fn list_tasks(
+    async fn list_recent_tasks(
         &self,
         user_id: &str,
         status_filter: Option<TaskStatus>,
@@ -1205,6 +1547,7 @@ impl TaskService for LocalTaskService {
                 tasks.push(TaskListItem {
                     task_id: record.task_id,
                     title: record.title,
+                    session_id: record.session_id,
                     status: record.status,
                     progress_pct: record.progress_pct,
                     items_done: record.items_done,
@@ -1212,7 +1555,10 @@ impl TaskService for LocalTaskService {
                     created_at: record.created_at,
                     updated_at: record.updated_at,
                     completed_at: record.completed_at,
+                    outcome: record.outcome,
+                    error_message: record.error_message,
                     project_type: record.project_type,
+                    claimability: None,
                 });
             }
         }
@@ -1220,10 +1566,121 @@ impl TaskService for LocalTaskService {
         Ok(tasks)
     }
 
+    async fn list_recent_tasks_for_session(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        status_filter: Option<TaskStatus>,
+    ) -> Result<Vec<TaskListItem>, String> {
+        let entries = match std::fs::read_dir(&self.tasks_dir) {
+            Ok(e) => e,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let mut tasks = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().map(|e| e == "json").unwrap_or(false)
+                && let Ok(data) = std::fs::read_to_string(&path)
+                && let Ok(record) = serde_json::from_str::<TaskRecord>(&data)
+                && record.user_id == user_id
+                && record.session_id.as_deref() == Some(session_id)
+                && status_filter
+                    .as_ref()
+                    .is_none_or(|filter| record.status == *filter)
+            {
+                tasks.push(TaskListItem {
+                    task_id: record.task_id,
+                    title: record.title,
+                    session_id: record.session_id,
+                    status: record.status,
+                    progress_pct: record.progress_pct,
+                    items_done: record.items_done,
+                    items_total: record.items_total,
+                    created_at: record.created_at,
+                    updated_at: record.updated_at,
+                    completed_at: record.completed_at,
+                    outcome: record.outcome,
+                    error_message: record.error_message,
+                    project_type: record.project_type,
+                    claimability: None,
+                });
+            }
+        }
+        tasks.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        Ok(tasks)
+    }
+
+    async fn search_tasks(
+        &self,
+        user_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<TaskListItem>, String> {
+        let query = query.trim();
+        if query.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let tasks = self.list_recent_tasks(user_id, None).await?;
+        Ok(select_best_task_query_matches(
+            tasks,
+            query,
+            limit.clamp(1, MAX_TASK_QUERY_MATCH_ROWS),
+        ))
+    }
+
+    async fn list_claimable_tasks_for_worker(
+        &self,
+        user_id: &str,
+        limit: usize,
+    ) -> Result<Vec<TaskListItem>, String> {
+        let entries = match std::fs::read_dir(&self.tasks_dir) {
+            Ok(e) => e,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let mut tasks = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().map(|e| e == "json").unwrap_or(false)
+                && let Ok(data) = std::fs::read_to_string(&path)
+                && let Ok(record) = serde_json::from_str::<TaskRecord>(&data)
+                && record.user_id == user_id
+                && record.status.is_claimable()
+            {
+                tasks.push(TaskListItem {
+                    task_id: record.task_id,
+                    title: record.title,
+                    session_id: record.session_id,
+                    status: record.status,
+                    progress_pct: record.progress_pct,
+                    items_done: record.items_done,
+                    items_total: record.items_total,
+                    created_at: record.created_at,
+                    updated_at: record.updated_at,
+                    completed_at: record.completed_at,
+                    outcome: record.outcome,
+                    error_message: record.error_message,
+                    project_type: record.project_type,
+                    claimability: TaskClaimability::for_status(record.status),
+                });
+            }
+        }
+        tasks.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+        tasks.truncate(limit.max(1));
+        Ok(tasks)
+    }
+
     async fn update_status(&self, task_id: &str, status: TaskStatus) -> Result<(), String> {
         let mut record = self
             .load_task(task_id)?
             .ok_or_else(|| format!("task not found: {task_id}"))?;
+        if record.status.is_terminal() && record.status != status {
+            return Err(format!(
+                "invalid task status transition: {} → {} (terminal states are immutable)",
+                record.status.as_str(),
+                status.as_str()
+            ));
+        }
         record.status = status;
         record.updated_at = chrono::Utc::now().to_rfc3339();
         if status.is_terminal() {
@@ -1242,6 +1699,12 @@ impl TaskService for LocalTaskService {
         let mut record = self
             .load_task(task_id)?
             .ok_or_else(|| format!("task not found: {task_id}"))?;
+        if record.status.is_terminal() {
+            return Err(format!(
+                "cannot update progress on terminal task {task_id} (status={})",
+                record.status.as_str()
+            ));
+        }
         record.progress_pct = progress_pct;
         record.items_done = items_done;
         record.items_total = items_total;
@@ -1257,6 +1720,12 @@ impl TaskService for LocalTaskService {
         let mut record = self
             .load_task(task_id)?
             .ok_or_else(|| format!("task not found: {task_id}"))?;
+        if record.status.is_terminal() {
+            return Err(format!(
+                "cannot save checkpoint on terminal task {task_id} (status={})",
+                record.status.as_str()
+            ));
+        }
         record.checkpoint = Some(checkpoint.clone());
         record.updated_at = chrono::Utc::now().to_rfc3339();
         self.save_task(&record)
@@ -1266,6 +1735,12 @@ impl TaskService for LocalTaskService {
         let mut record = self
             .load_task(task_id)?
             .ok_or_else(|| format!("task not found: {task_id}"))?;
+        if record.status.is_terminal() {
+            return Err(format!(
+                "cannot update plan on terminal task {task_id} (status={})",
+                record.status.as_str()
+            ));
+        }
         record.progress_pct = plan.progress_pct();
         record.items_done = plan.items_done();
         record.items_total = plan.subtasks.len() as u32;
@@ -1278,7 +1753,14 @@ impl TaskService for LocalTaskService {
         let mut record = self
             .load_task(task_id)?
             .ok_or_else(|| format!("task not found: {task_id}"))?;
+        if record.status.is_terminal() {
+            return Err(format!(
+                "invalid task status transition: {} → failed (terminal states are immutable)",
+                record.status.as_str()
+            ));
+        }
         record.status = TaskStatus::Failed;
+        record.outcome = Some(TaskOutcome::Failed);
         record.error_message = Some(error.to_string());
         let now = chrono::Utc::now().to_rfc3339();
         record.updated_at = now.clone();
@@ -1287,11 +1769,28 @@ impl TaskService for LocalTaskService {
     }
 
     async fn complete_task(&self, task_id: &str) -> Result<(), String> {
+        self.complete_task_with_outcome(task_id, TaskOutcome::Success)
+            .await
+    }
+
+    async fn complete_task_with_outcome(
+        &self,
+        task_id: &str,
+        outcome: TaskOutcome,
+    ) -> Result<(), String> {
         let mut record = self
             .load_task(task_id)?
             .ok_or_else(|| format!("task not found: {task_id}"))?;
+        if record.status.is_terminal() {
+            return Err(format!(
+                "invalid task status transition: {} → completed (terminal states are immutable)",
+                record.status.as_str()
+            ));
+        }
         record.status = TaskStatus::Completed;
         record.progress_pct = 100;
+        record.outcome = Some(outcome);
+        record.error_message = None;
         let now = chrono::Utc::now().to_rfc3339();
         record.updated_at = now.clone();
         record.completed_at = Some(now);
@@ -1309,6 +1808,12 @@ impl TaskService for LocalTaskService {
         let mut record = self
             .load_task(task_id)?
             .ok_or_else(|| format!("task not found: {task_id}"))?;
+        if record.status.is_terminal() {
+            return Err(format!(
+                "invalid task status transition: {} → completed (terminal states are immutable)",
+                record.status.as_str()
+            ));
+        }
         record.status = TaskStatus::Completed;
         record.progress_pct = progress_pct;
         record.items_done = items_done;
@@ -1360,7 +1865,7 @@ impl TaskService for LocalTaskService {
 
         // Check eligibility
         let eligible = task.user_rating.map(|r| r >= 4).unwrap_or(false)
-            || (task.status == TaskStatus::Completed && task.replan_count <= 1);
+            || (task.outcome == Some(TaskOutcome::Success) && task.replan_count <= 1);
 
         if !eligible || task.plan.is_none() {
             return Ok(None);
@@ -1513,7 +2018,7 @@ impl TaskService for LocalTaskService {
                     }
 
                     total_tasks += 1;
-                    if task.status == TaskStatus::Completed {
+                    if task.outcome == Some(TaskOutcome::Success) {
                         completed_tasks += 1;
                     }
                     if let Some(r) = task.user_rating {
@@ -1594,10 +2099,28 @@ impl TaskService for UnconfiguredTaskService {
     async fn get_task(&self, _: &str) -> Result<Option<TaskRecord>, String> {
         Err("task service not configured".into())
     }
-    async fn list_tasks(
+    async fn list_recent_tasks(
         &self,
         _: &str,
         _: Option<TaskStatus>,
+    ) -> Result<Vec<TaskListItem>, String> {
+        Err("task service not configured".into())
+    }
+    async fn list_recent_tasks_for_session(
+        &self,
+        _: &str,
+        _: &str,
+        _: Option<TaskStatus>,
+    ) -> Result<Vec<TaskListItem>, String> {
+        Err("task service not configured".into())
+    }
+    async fn search_tasks(&self, _: &str, _: &str, _: usize) -> Result<Vec<TaskListItem>, String> {
+        Err("task service not configured".into())
+    }
+    async fn list_claimable_tasks_for_worker(
+        &self,
+        _: &str,
+        _: usize,
     ) -> Result<Vec<TaskListItem>, String> {
         Err("task service not configured".into())
     }
@@ -1617,6 +2140,9 @@ impl TaskService for UnconfiguredTaskService {
         Err("task service not configured".into())
     }
     async fn complete_task(&self, _: &str) -> Result<(), String> {
+        Err("task service not configured".into())
+    }
+    async fn complete_task_with_outcome(&self, _: &str, _: TaskOutcome) -> Result<(), String> {
         Err("task service not configured".into())
     }
     async fn complete_plan_run(
@@ -1691,6 +2217,30 @@ mod tests {
         assert!(TaskStatus::Completed.is_terminal());
         assert!(TaskStatus::Failed.is_terminal());
         assert!(TaskStatus::Cancelled.is_terminal());
+    }
+
+    #[test]
+    fn task_status_claimable_accepts_only_unfinished_worker_states() {
+        assert!(TaskStatus::Pending.is_claimable());
+        assert!(TaskStatus::InProgress.is_claimable());
+        assert!(!TaskStatus::Paused.is_claimable());
+        assert!(!TaskStatus::Completed.is_claimable());
+        assert!(!TaskStatus::Failed.is_claimable());
+        assert!(!TaskStatus::Cancelled.is_claimable());
+    }
+
+    #[test]
+    fn task_claimability_for_status_surfaces_pending_and_recoverable_in_progress() {
+        assert_eq!(
+            TaskClaimability::for_status(TaskStatus::Pending),
+            Some(TaskClaimability::Pending)
+        );
+        assert_eq!(
+            TaskClaimability::for_status(TaskStatus::InProgress),
+            Some(TaskClaimability::RecoverableInProgress)
+        );
+        assert_eq!(TaskClaimability::for_status(TaskStatus::Paused), None);
+        assert_eq!(TaskClaimability::for_status(TaskStatus::Completed), None);
     }
 
     #[test]
@@ -1884,6 +2434,7 @@ mod tests {
         let item = TaskListItem {
             task_id: "t-1".into(),
             title: "Refactor auth".into(),
+            session_id: Some("sess-1".into()),
             status: TaskStatus::InProgress,
             progress_pct: 50,
             items_done: 2,
@@ -1891,14 +2442,24 @@ mod tests {
             created_at: "2025-01-01T00:00:00Z".into(),
             updated_at: "2025-01-01T01:00:00Z".into(),
             completed_at: None,
+            outcome: Some(TaskOutcome::Partial),
+            error_message: Some("disk full".into()),
             project_type: Some("Rust".into()),
+            claimability: Some(TaskClaimability::RecoverableInProgress),
         };
         let json = serde_json::to_string(&item).unwrap();
         let loaded: TaskListItem = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded.task_id, "t-1");
         assert_eq!(loaded.title, "Refactor auth");
+        assert_eq!(loaded.session_id.as_deref(), Some("sess-1"));
         assert_eq!(loaded.status, TaskStatus::InProgress);
         assert_eq!(loaded.items_total, 4);
+        assert_eq!(loaded.outcome, Some(TaskOutcome::Partial));
+        assert_eq!(loaded.error_message.as_deref(), Some("disk full"));
+        assert_eq!(
+            loaded.claimability,
+            Some(TaskClaimability::RecoverableInProgress)
+        );
     }
 
     #[test]
@@ -1929,6 +2490,7 @@ mod tests {
         let loaded = svc.get_task(&task_id).await.unwrap().unwrap();
         assert_eq!(loaded.title, "Test Task");
         assert_eq!(loaded.status, TaskStatus::Pending);
+        assert_eq!(loaded.outcome, None);
     }
 
     #[tokio::test]
@@ -1977,6 +2539,8 @@ mod tests {
         svc.complete_task(&tid).await.unwrap();
         let t = svc.get_task(&tid).await.unwrap().unwrap();
         assert_eq!(t.status, TaskStatus::Completed);
+        assert_eq!(t.outcome, Some(TaskOutcome::Success));
+        assert_eq!(t.error_message, None);
         assert!(t.completed_at.is_some());
     }
 
@@ -2008,6 +2572,193 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_task_complete_task_with_partial_outcome_preserves_non_plan_shape() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = LocalTaskService::new(tmp.path().to_path_buf());
+        let tid = svc
+            .create_task(
+                "user1",
+                "s1",
+                TaskCreateRequest {
+                    title: "goal".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        svc.complete_task_with_outcome(&tid, TaskOutcome::Partial)
+            .await
+            .unwrap();
+        let t = svc.get_task(&tid).await.unwrap().unwrap();
+        assert_eq!(t.status, TaskStatus::Completed);
+        assert_eq!(t.progress_pct, 100);
+        assert_eq!(t.items_done, 0);
+        assert_eq!(t.items_total, 0);
+        assert_eq!(t.outcome, Some(TaskOutcome::Partial));
+        assert!(t.completed_at.is_some());
+    }
+
+    // ── Terminal-state guards ──
+    //
+    // Once a task reaches Completed/Failed/Cancelled, all mutations to its
+    // status, outcome, error_message, or progress must be rejected. The
+    // historical behavior was: the SQL UPDATE would fire unconditionally,
+    // letting a late `fail_task` overwrite a successful completion (and erase
+    // the success record), or letting `update_progress` bump progress on a
+    // task that already finished (post-mortem mutation).
+
+    #[tokio::test]
+    async fn local_task_completed_cannot_be_failed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = LocalTaskService::new(tmp.path().to_path_buf());
+        let tid = svc
+            .create_task(
+                "u",
+                "s",
+                TaskCreateRequest {
+                    title: "t".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        svc.complete_task(&tid).await.unwrap();
+        let before = svc.get_task(&tid).await.unwrap().unwrap();
+
+        let err = svc.fail_task(&tid, "should be rejected").await;
+        assert!(err.is_err(), "fail_task on completed must error");
+        let after = svc.get_task(&tid).await.unwrap().unwrap();
+        assert_eq!(after.status, TaskStatus::Completed);
+        assert_eq!(after.outcome, Some(TaskOutcome::Success));
+        assert_eq!(after.error_message, None);
+        assert_eq!(after.completed_at, before.completed_at);
+    }
+
+    #[tokio::test]
+    async fn local_task_failed_cannot_be_completed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = LocalTaskService::new(tmp.path().to_path_buf());
+        let tid = svc
+            .create_task(
+                "u",
+                "s",
+                TaskCreateRequest {
+                    title: "t".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        svc.fail_task(&tid, "boom").await.unwrap();
+
+        let err = svc.complete_task(&tid).await;
+        assert!(err.is_err(), "complete_task on failed must error");
+        let err = svc
+            .complete_task_with_outcome(&tid, TaskOutcome::Success)
+            .await;
+        assert!(
+            err.is_err(),
+            "complete_task_with_outcome on failed must error"
+        );
+        let err = svc
+            .complete_plan_run(&tid, 100, 1, 1, TaskOutcome::Success)
+            .await;
+        assert!(err.is_err(), "complete_plan_run on failed must error");
+
+        let after = svc.get_task(&tid).await.unwrap().unwrap();
+        assert_eq!(after.status, TaskStatus::Failed);
+        assert_eq!(after.outcome, Some(TaskOutcome::Failed));
+        assert_eq!(after.error_message.as_deref(), Some("boom"));
+    }
+
+    #[tokio::test]
+    async fn local_task_progress_rejected_on_terminal() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = LocalTaskService::new(tmp.path().to_path_buf());
+        let tid = svc
+            .create_task(
+                "u",
+                "s",
+                TaskCreateRequest {
+                    title: "t".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        svc.complete_task(&tid).await.unwrap();
+        let before = svc.get_task(&tid).await.unwrap().unwrap();
+
+        let err = svc.update_progress(&tid, 50, 5, 10).await;
+        assert!(err.is_err(), "update_progress on completed must error");
+        let after = svc.get_task(&tid).await.unwrap().unwrap();
+        assert_eq!(after.progress_pct, before.progress_pct);
+        assert_eq!(after.updated_at, before.updated_at);
+    }
+
+    #[tokio::test]
+    async fn local_task_cancel_terminal_then_no_overwrite() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = LocalTaskService::new(tmp.path().to_path_buf());
+        let tid = svc
+            .create_task(
+                "u",
+                "s",
+                TaskCreateRequest {
+                    title: "t".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        svc.update_status(&tid, TaskStatus::Cancelled)
+            .await
+            .unwrap();
+
+        assert!(svc.fail_task(&tid, "late").await.is_err());
+        assert!(svc.complete_task(&tid).await.is_err());
+        assert!(svc.update_progress(&tid, 1, 1, 1).await.is_err());
+        assert!(
+            svc.update_status(&tid, TaskStatus::InProgress)
+                .await
+                .is_err()
+        );
+        assert!(
+            svc.save_checkpoint(
+                &tid,
+                &TaskCheckpoint {
+                    active_subtask_id: Some("late".into()),
+                    turn: 99,
+                    session_id: Some("s".into()),
+                    state: serde_json::Map::new(),
+                },
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            svc.update_plan(
+                &tid,
+                &TaskPlan {
+                    subtasks: vec![SubtaskPlan {
+                        id: "late".into(),
+                        title: "late mutation".into(),
+                        ..Default::default()
+                    }],
+                    notes: Some("late".into()),
+                },
+            )
+            .await
+            .is_err()
+        );
+
+        let after = svc.get_task(&tid).await.unwrap().unwrap();
+        assert_eq!(after.status, TaskStatus::Cancelled);
+        assert!(after.checkpoint.is_none());
+        assert!(after.plan.is_none());
+    }
+
+    #[tokio::test]
     async fn local_task_list_with_filter() {
         let tmp = tempfile::TempDir::new().unwrap();
         let svc = LocalTaskService::new(tmp.path().to_path_buf());
@@ -2036,22 +2787,313 @@ mod tests {
             .unwrap();
         svc.complete_task(&tid2).await.unwrap();
 
-        let all = svc.list_tasks("user1", None).await.unwrap();
+        let all = svc.list_recent_tasks("user1", None).await.unwrap();
         assert_eq!(all.len(), 2);
 
         let pending = svc
-            .list_tasks("user1", Some(TaskStatus::Pending))
+            .list_recent_tasks("user1", Some(TaskStatus::Pending))
             .await
             .unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].title, "Active");
 
         let completed = svc
-            .list_tasks("user1", Some(TaskStatus::Completed))
+            .list_recent_tasks("user1", Some(TaskStatus::Completed))
             .await
             .unwrap();
         assert_eq!(completed.len(), 1);
         assert_eq!(completed[0].title, "Done");
+    }
+
+    #[tokio::test]
+    async fn local_task_list_preserves_partial_outcome() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = LocalTaskService::new(tmp.path().to_path_buf());
+
+        let tid = svc
+            .create_task(
+                "user1",
+                "s1",
+                TaskCreateRequest {
+                    title: "Plan".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        svc.complete_plan_run(&tid, 100, 3, 3, TaskOutcome::Partial)
+            .await
+            .unwrap();
+
+        let completed = svc
+            .list_recent_tasks("user1", Some(TaskStatus::Completed))
+            .await
+            .unwrap();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].task_id, tid);
+        assert_eq!(completed[0].outcome, Some(TaskOutcome::Partial));
+    }
+
+    #[tokio::test]
+    async fn local_task_list_for_session_filters_foreign_sessions() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = LocalTaskService::new(tmp.path().to_path_buf());
+
+        let local = svc
+            .create_task(
+                "user1",
+                "sess-local",
+                TaskCreateRequest {
+                    title: "Local".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let foreign = svc
+            .create_task(
+                "user1",
+                "sess-foreign",
+                TaskCreateRequest {
+                    title: "Foreign".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        svc.complete_task(&local).await.unwrap();
+        svc.complete_task(&foreign).await.unwrap();
+
+        let local_tasks = svc
+            .list_recent_tasks_for_session("user1", "sess-local", Some(TaskStatus::Completed))
+            .await
+            .unwrap();
+        assert_eq!(local_tasks.len(), 1);
+        assert_eq!(local_tasks[0].task_id, local);
+        assert_eq!(local_tasks[0].session_id.as_deref(), Some("sess-local"));
+    }
+
+    #[tokio::test]
+    async fn local_task_search_prefers_exact_title_over_substring_matches() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = LocalTaskService::new(tmp.path().to_path_buf());
+
+        let exact = svc
+            .create_task(
+                "user1",
+                "s1",
+                TaskCreateRequest {
+                    title: "Build auth".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        svc.create_task(
+            "user1",
+            "s1",
+            TaskCreateRequest {
+                title: "Build auth module".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let matches = svc.search_tasks("user1", "Build auth", 8).await.unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].task_id, exact);
+    }
+
+    #[tokio::test]
+    async fn local_task_search_returns_all_best_tier_prefix_matches() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = LocalTaskService::new(tmp.path().to_path_buf());
+
+        let prefix = "task-prefix-";
+        let first = format!("{prefix}001");
+        let second = format!("{prefix}002");
+        let now = chrono::Utc::now().to_rfc3339();
+        svc.save_task(&TaskRecord {
+            task_id: first.clone(),
+            user_id: "user1".into(),
+            session_id: Some("s1".into()),
+            parent_task_id: None,
+            title: "First".into(),
+            description: None,
+            status: TaskStatus::Pending,
+            progress_pct: 0,
+            items_done: 0,
+            items_total: 0,
+            plan: None,
+            checkpoint: None,
+            error_message: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            completed_at: None,
+            user_rating: None,
+            completion_time_sec: None,
+            replan_count: 0,
+            auto_adjustments: 0,
+            outcome: None,
+            project_type: None,
+            goal_pattern: None,
+            agent_id: None,
+        })
+        .unwrap();
+        svc.save_task(&TaskRecord {
+            task_id: second.clone(),
+            user_id: "user1".into(),
+            session_id: Some("s1".into()),
+            parent_task_id: None,
+            title: "Second".into(),
+            description: None,
+            status: TaskStatus::Pending,
+            progress_pct: 0,
+            items_done: 0,
+            items_total: 0,
+            plan: None,
+            checkpoint: None,
+            error_message: None,
+            created_at: now.clone(),
+            updated_at: now,
+            completed_at: None,
+            user_rating: None,
+            completion_time_sec: None,
+            replan_count: 0,
+            auto_adjustments: 0,
+            outcome: None,
+            project_type: None,
+            goal_pattern: None,
+            agent_id: None,
+        })
+        .unwrap();
+
+        let matches = svc.search_tasks("user1", prefix, 8).await.unwrap();
+        let ids: Vec<&str> = matches.iter().map(|task| task.task_id.as_str()).collect();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&first.as_str()));
+        assert!(ids.contains(&second.as_str()));
+    }
+
+    #[tokio::test]
+    async fn local_claimable_tasks_for_worker_returns_oldest_tasks_first() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = LocalTaskService::new(tmp.path().to_path_buf());
+        for (task_id, created_at) in [
+            ("task-oldest", "2025-01-01T00:00:00Z"),
+            ("task-middle", "2025-01-02T00:00:00Z"),
+            ("task-newest", "2025-01-03T00:00:00Z"),
+        ] {
+            svc.save_task(&TaskRecord {
+                task_id: task_id.into(),
+                user_id: "user1".into(),
+                session_id: Some("s1".into()),
+                parent_task_id: None,
+                title: task_id.into(),
+                description: None,
+                status: TaskStatus::Pending,
+                progress_pct: 0,
+                items_done: 0,
+                items_total: 0,
+                plan: None,
+                checkpoint: None,
+                error_message: None,
+                created_at: created_at.into(),
+                updated_at: created_at.into(),
+                completed_at: None,
+                user_rating: None,
+                completion_time_sec: None,
+                replan_count: 0,
+                auto_adjustments: 0,
+                outcome: None,
+                project_type: None,
+                goal_pattern: None,
+                agent_id: None,
+            })
+            .unwrap();
+        }
+
+        let tasks = svc
+            .list_claimable_tasks_for_worker("user1", 2)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = tasks.iter().map(|task| task.task_id.as_str()).collect();
+        assert_eq!(ids, vec!["task-oldest", "task-middle"]);
+        assert_eq!(
+            tasks
+                .iter()
+                .map(|task| task.claimability)
+                .collect::<Vec<_>>(),
+            vec![
+                Some(TaskClaimability::Pending),
+                Some(TaskClaimability::Pending)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn local_claimable_tasks_for_worker_includes_in_progress_ordered_by_created_at() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = LocalTaskService::new(tmp.path().to_path_buf());
+        for (task_id, status, created_at) in [
+            (
+                "task-oldest-in-progress",
+                TaskStatus::InProgress,
+                "2025-01-01T00:00:00Z",
+            ),
+            (
+                "task-middle-pending",
+                TaskStatus::Pending,
+                "2025-01-02T00:00:00Z",
+            ),
+            ("task-failed", TaskStatus::Failed, "2025-01-03T00:00:00Z"),
+        ] {
+            svc.save_task(&TaskRecord {
+                task_id: task_id.into(),
+                user_id: "user1".into(),
+                session_id: Some("s1".into()),
+                parent_task_id: None,
+                title: task_id.into(),
+                description: None,
+                status,
+                progress_pct: 0,
+                items_done: 0,
+                items_total: 0,
+                plan: None,
+                checkpoint: None,
+                error_message: None,
+                created_at: created_at.into(),
+                updated_at: created_at.into(),
+                completed_at: None,
+                user_rating: None,
+                completion_time_sec: None,
+                replan_count: 0,
+                auto_adjustments: 0,
+                outcome: None,
+                project_type: None,
+                goal_pattern: None,
+                agent_id: None,
+            })
+            .unwrap();
+        }
+
+        let tasks = svc
+            .list_claimable_tasks_for_worker("user1", 10)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = tasks.iter().map(|task| task.task_id.as_str()).collect();
+        assert_eq!(ids, vec!["task-oldest-in-progress", "task-middle-pending"]);
+        assert_eq!(
+            tasks
+                .iter()
+                .map(|task| task.claimability)
+                .collect::<Vec<_>>(),
+            vec![
+                Some(TaskClaimability::RecoverableInProgress),
+                Some(TaskClaimability::Pending)
+            ]
+        );
     }
 
     #[tokio::test]
@@ -2074,6 +3116,7 @@ mod tests {
         svc.fail_task(&tid, "network timeout").await.unwrap();
         let t = svc.get_task(&tid).await.unwrap().unwrap();
         assert_eq!(t.status, TaskStatus::Failed);
+        assert_eq!(t.outcome, Some(TaskOutcome::Failed));
         assert_eq!(t.error_message.as_deref(), Some("network timeout"));
         assert!(t.completed_at.is_some());
     }
@@ -2295,6 +3338,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn learning_stats_excludes_partial_outcomes_from_completed_count() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = LocalTaskService::new(tmp.path().to_path_buf());
+
+        let tid = svc
+            .create_task(
+                "user1",
+                "s1",
+                TaskCreateRequest {
+                    title: "refactor auth module".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        svc.complete_plan_run(&tid, 100, 3, 3, TaskOutcome::Partial)
+            .await
+            .unwrap();
+
+        let stats = svc
+            .get_learning_stats("user1", "refactor auth")
+            .await
+            .unwrap();
+        assert_eq!(stats.total_tasks, 1);
+        assert_eq!(stats.completed_tasks, 0);
+        assert_eq!(stats.inferred_success_rate, 0.0);
+    }
+
+    #[tokio::test]
     async fn template_extraction_requires_eligibility() {
         let tmp = tempfile::TempDir::new().unwrap();
         let svc = LocalTaskService::new(tmp.path().to_path_buf());
@@ -2330,8 +3402,14 @@ mod tests {
             .await
             .unwrap();
 
-        // Still not eligible (low rating, but completed with low replan)
-        // Actually this SHOULD be eligible since completed + replan_count <= 1
+        // Still not eligible: partial outcome must not seed templates.
+        let template_id = svc.extract_template(&tid, "test *").await.unwrap();
+        assert!(template_id.is_none());
+
+        // A successful completion with the same replan count is eligible.
+        svc.record_feedback(&tid, 5, TaskOutcome::Success, None)
+            .await
+            .unwrap();
         let template_id = svc.extract_template(&tid, "test *").await.unwrap();
         assert!(template_id.is_some());
     }
@@ -2702,6 +3780,37 @@ mod tests {
             fn_body.contains("invalid task status transition"),
             "update_status must reject invalid transitions with descriptive error"
         );
+    }
+
+    fn matrixone_task_service_method_source<'a>(source: &'a str, name: &str) -> &'a str {
+        let impl_start = source
+            .find("impl TaskService for MatrixOneTaskService")
+            .expect("MatrixOneTaskService impl must exist");
+        let impl_source = &source[impl_start..];
+        let fn_start = impl_source
+            .find(&format!("async fn {name}"))
+            .unwrap_or_else(|| panic!("{name} must exist"));
+        let fn_end = impl_source[fn_start..]
+            .find("\n    async fn ")
+            .map(|p| fn_start + p)
+            .unwrap_or(impl_source.len());
+        &impl_source[fn_start..fn_end]
+    }
+
+    #[test]
+    fn matrixone_checkpoint_and_plan_updates_use_terminal_guards() {
+        let source = include_str!("task_orchestrator.rs");
+        for method in ["save_checkpoint", "update_plan"] {
+            let fn_body = matrixone_task_service_method_source(source, method);
+            assert!(
+                fn_body.contains("status NOT IN ('completed', 'failed', 'cancelled')"),
+                "{method} must use atomic terminal-state guard"
+            );
+            assert!(
+                fn_body.contains("report_terminal_guard_violation"),
+                "{method} must surface terminal-state guard violations"
+            );
+        }
     }
 
     /// P2-C: progress_pct must only count Completed subtasks, not Failed/Cancelled.

@@ -37,6 +37,8 @@ use ratatui::text::{Line, Span};
 use std::collections::HashSet;
 use unicode_width::UnicodeWidthStr;
 
+use crate::cli::surface::session_task_surface::SessionTaskStatusKind;
+
 /// Colour triple the widget reads for all status rendering. Built from
 /// `tui::theme::current()` at render time so light and dark terminals
 /// get readable palettes instead of hardcoded ANSI Cyan/Green.
@@ -96,12 +98,19 @@ fn spinner_frame() -> &'static str {
     }
 }
 
-fn status_icon_and_color(status: &str, colors: TaskBoardColors) -> (&'static str, Color) {
+fn status_icon_and_color(
+    status: &SessionTaskStatusKind,
+    colors: TaskBoardColors,
+) -> (&'static str, Color) {
     match status {
-        "completed" => ("✔", colors.success),
-        "in_progress" => (spinner_frame(), colors.accent),
-        "pending" => ("◻", colors.dim),
-        _ => ("·", colors.dim),
+        SessionTaskStatusKind::Completed => ("✔", colors.success),
+        SessionTaskStatusKind::InProgress => (spinner_frame(), colors.accent),
+        SessionTaskStatusKind::Pending
+        | SessionTaskStatusKind::Archived
+        | SessionTaskStatusKind::Deleted
+        | SessionTaskStatusKind::Other => ("◻", colors.dim),
+        SessionTaskStatusKind::Failed => ("✖", Color::Red),
+        SessionTaskStatusKind::Cancelled => ("■", Color::Yellow),
     }
 }
 
@@ -158,8 +167,8 @@ fn truncate_to_width(s: &str, max_cols: usize) -> String {
 }
 
 fn counts(tasks: &[SessionTask]) -> (usize, usize, usize) {
-    let completed = tasks.iter().filter(|t| t.status == "completed").count();
-    let pending = tasks.iter().filter(|t| t.status == "pending").count();
+    let completed = tasks.iter().filter(|t| t.status.is_completed()).count();
+    let pending = tasks.iter().filter(|t| t.status.is_pending()).count();
     let in_progress = tasks.len().saturating_sub(completed + pending);
     (completed, in_progress, pending)
 }
@@ -174,7 +183,7 @@ fn subtask_counts(tasks: &[SessionTask]) -> (usize, usize) {
     for task in tasks {
         for sub in &task.subtasks {
             total += 1;
-            if sub.status == "completed" {
+            if sub.status.is_completed() {
                 done += 1;
             }
         }
@@ -199,8 +208,8 @@ fn sort_by_id_asc(mut tasks: Vec<&SessionTask>) -> Vec<&SessionTask> {
 /// Order `tasks` by the reference TUI's display priority:
 /// in_progress → pending (open blockers last) → completed.
 fn prioritize<'a>(tasks: &'a [SessionTask], unresolved: &HashSet<String>) -> Vec<&'a SessionTask> {
-    let in_progress = sort_by_id_asc(tasks.iter().filter(|t| t.status == "in_progress").collect());
-    let mut pending: Vec<&SessionTask> = tasks.iter().filter(|t| t.status == "pending").collect();
+    let in_progress = sort_by_id_asc(tasks.iter().filter(|t| t.status.is_in_progress()).collect());
+    let mut pending: Vec<&SessionTask> = tasks.iter().filter(|t| t.status.is_pending()).collect();
     pending.sort_by(|a, b| {
         let a_blocked = a.blocked_by.iter().any(|id| unresolved.contains(id));
         let b_blocked = b.blocked_by.iter().any(|id| unresolved.contains(id));
@@ -217,7 +226,7 @@ fn prioritize<'a>(tasks: &'a [SessionTask], unresolved: &HashSet<String>) -> Vec
             }
         }
     });
-    let completed = sort_by_id_asc(tasks.iter().filter(|t| t.status == "completed").collect());
+    let completed = sort_by_id_asc(tasks.iter().filter(|t| t.status.is_completed()).collect());
     let mut out: Vec<&SessionTask> = Vec::with_capacity(tasks.len());
     out.extend(in_progress);
     out.extend(pending);
@@ -232,8 +241,8 @@ fn render_task_line(
     colors: TaskBoardColors,
 ) -> Line<'static> {
     let (icon, color) = status_icon_and_color(&task.status, colors);
-    let is_completed = task.status == "completed";
-    let is_in_progress = task.status == "in_progress";
+    let is_completed = task.status.is_completed();
+    let is_in_progress = task.status.is_in_progress();
     let is_blocked = !open_blockers.is_empty();
 
     let owner_badge = owner_badge(task);
@@ -251,9 +260,16 @@ fn render_task_line(
     // In-progress and completed get BOLD; pending and fallback statuses
     // already map to `colors.dim`, so adding DIM on top of dim would be
     // invisible — skip the modifier in that case.
-    let icon_style = match task.status.as_str() {
-        "in_progress" | "completed" => Style::default().fg(color).add_modifier(Modifier::BOLD),
-        _ => Style::default().fg(color).add_modifier(Modifier::DIM),
+    let icon_style = match task.status {
+        SessionTaskStatusKind::InProgress | SessionTaskStatusKind::Completed => {
+            Style::default().fg(color).add_modifier(Modifier::BOLD)
+        }
+        SessionTaskStatusKind::Failed => Style::default().fg(color).add_modifier(Modifier::BOLD),
+        SessionTaskStatusKind::Cancelled => Style::default().fg(color).add_modifier(Modifier::BOLD),
+        SessionTaskStatusKind::Pending
+        | SessionTaskStatusKind::Archived
+        | SessionTaskStatusKind::Deleted
+        | SessionTaskStatusKind::Other => Style::default().fg(color).add_modifier(Modifier::DIM),
     };
     spans.push(Span::styled(format!("{} ", icon), icon_style));
 
@@ -317,7 +333,7 @@ fn render_subtask_lines(
     let unresolved: HashSet<String> = parent
         .subtasks
         .iter()
-        .filter(|s| s.status != "completed")
+        .filter(|s| !s.status.is_completed())
         .map(|s| s.id.clone())
         .collect();
 
@@ -326,13 +342,26 @@ fn render_subtask_lines(
     let subject_w = (columns as usize).saturating_sub(indent.len() + 4).max(10);
     for sub in &parent.subtasks {
         let (icon, color) = status_icon_and_color(&sub.status, colors);
-        let is_completed = sub.status == "completed";
-        let is_in_progress = sub.status == "in_progress";
+        let is_completed = sub.status.is_completed();
+        let is_in_progress = sub.status.is_in_progress();
         let blocked = sub.depends_on.iter().any(|id| unresolved.contains(id));
 
-        let icon_style = match sub.status.as_str() {
-            "in_progress" | "completed" => Style::default().fg(color).add_modifier(Modifier::BOLD),
-            _ => Style::default().fg(color).add_modifier(Modifier::DIM),
+        let icon_style = match sub.status {
+            SessionTaskStatusKind::InProgress | SessionTaskStatusKind::Completed => {
+                Style::default().fg(color).add_modifier(Modifier::BOLD)
+            }
+            SessionTaskStatusKind::Failed => {
+                Style::default().fg(color).add_modifier(Modifier::BOLD)
+            }
+            SessionTaskStatusKind::Cancelled => {
+                Style::default().fg(color).add_modifier(Modifier::BOLD)
+            }
+            SessionTaskStatusKind::Pending
+            | SessionTaskStatusKind::Archived
+            | SessionTaskStatusKind::Deleted
+            | SessionTaskStatusKind::Other => {
+                Style::default().fg(color).add_modifier(Modifier::DIM)
+            }
         };
         let mut subject_style = Style::default().add_modifier(Modifier::DIM);
         if is_in_progress {
@@ -362,8 +391,8 @@ fn render_hidden_summary(hidden: &[&SessionTask]) -> Option<Line<'static>> {
         return None;
     }
     let (completed, in_progress, pending) = {
-        let c = hidden.iter().filter(|t| t.status == "completed").count();
-        let p = hidden.iter().filter(|t| t.status == "pending").count();
+        let c = hidden.iter().filter(|t| t.status.is_completed()).count();
+        let p = hidden.iter().filter(|t| t.status.is_pending()).count();
         let ip = hidden.len().saturating_sub(c + p);
         (c, ip, p)
     };
@@ -537,10 +566,7 @@ pub fn render_multi_with_colors(
         // across sessions are not actionable and would clutter the
         // cross-session overview. The single-session board still
         // shows its own completed history.
-        let active: Vec<&SessionTask> = tasks
-            .iter()
-            .filter(|t| t.status == "pending" || t.status == "in_progress")
-            .collect();
+        let active: Vec<&SessionTask> = tasks.iter().filter(|t| t.status.is_active()).collect();
         if active.is_empty() {
             continue;
         }
@@ -623,7 +649,7 @@ pub fn render_with_colors(
     let (completed, in_progress, pending) = counts(tasks);
     let unresolved: HashSet<String> = tasks
         .iter()
-        .filter(|t| t.status != "completed")
+        .filter(|t| !t.status.is_completed())
         .map(|t| t.id.clone())
         .collect();
 
@@ -770,8 +796,8 @@ pub fn render_collapsed_summary(tasks: &[SessionTask], columns: u16) -> Option<L
     let total = tasks.len();
     let current_task = tasks
         .iter()
-        .find(|t| t.status == "in_progress")
-        .or_else(|| tasks.iter().find(|t| t.status == "pending"));
+        .find(|t| t.status.is_in_progress())
+        .or_else(|| tasks.iter().find(|t| t.status.is_pending()));
     let (sub_done, sub_total) = subtask_counts(tasks);
 
     let theme = crate::tui::theme::current();
@@ -855,8 +881,8 @@ pub fn render_next_hint(tasks: &[SessionTask], columns: u16) -> Option<Line<'sta
     // Pick the first in-progress task, else first pending.
     let candidate = tasks
         .iter()
-        .find(|t| t.status == "in_progress")
-        .or_else(|| tasks.iter().find(|t| t.status == "pending"))?;
+        .find(|t| t.status.is_in_progress())
+        .or_else(|| tasks.iter().find(|t| t.status.is_pending()))?;
     let subject = truncate_to_width(
         &candidate.title,
         max_subject_width(columns).saturating_sub(6), // "Next: "

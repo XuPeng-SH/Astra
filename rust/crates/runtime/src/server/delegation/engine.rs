@@ -25,8 +25,12 @@ use async_trait::async_trait;
 use tokio::sync::RwLock;
 
 use astra_services::coordination::{
-    AgentProfile, AgentProfileRegistry, AgentResult, AggregationStrategy, CoordinationPattern,
-    DelegationRequest, DelegationResult, aggregate_results,
+    AGENT_RESULT_STATUS_FAILED, AgentProfile, AgentProfileRegistry, AgentResult,
+    AggregationStrategy, CoordinationPattern, DelegationRequest, DelegationResult,
+    agent_result_status_to_subrun_state, aggregate_results,
+};
+use astra_services::runs::{
+    DurableRunStatusKind, durable_run_status_kind, durable_run_status_to_subrun_state,
 };
 use astra_services::{BubbleUpTarget, DatabaseStateProjectionStore, LlmTokenServiceConfig};
 
@@ -612,13 +616,16 @@ impl DelegationTracker {
                 delegation_id: delegation_id.clone(),
                 agent_id: rec.agent_id.clone().unwrap_or_default(),
                 depth: 0, // Depth not stored in DB; 0 is safe for recovered records
-                state: SubRunState::from_str(&rec.status).unwrap_or_else(|| {
-                    eprintln!(
-                        "[delegation-tracker] unknown status '{}' for run '{}', defaulting to Failed",
-                        rec.status, rec.run_id
-                    );
-                    SubRunState::Failed
-                }),
+                state: match durable_run_status_kind(&rec.status) {
+                    DurableRunStatusKind::Other => {
+                        eprintln!(
+                            "[delegation-tracker] unknown status '{}' for run '{}', defaulting to Failed",
+                            rec.status, rec.run_id
+                        );
+                        SubRunState::Failed
+                    }
+                    _ => durable_run_status_to_subrun_state(&rec.status),
+                },
                 retry_of: rec.retry_of.clone(),
             };
 
@@ -871,24 +878,74 @@ impl DelegationTracker {
             .insert(run_id.to_string(), token);
     }
 
-    /// Cancel ALL sub-runs that have a given parent run ID.
-    /// Returns the number of sub-runs cancelled.
+    /// Cancel ALL sub-runs in the subtree rooted at `parent_run_id`.
+    ///
+    /// Walks the `parents` map transitively so grandchildren and deeper
+    /// descendants are cancelled too. A flat one-level scan would leave
+    /// sub-runs spawned by cancelled children executing — which was the
+    /// historical bug.
+    ///
+    /// Returns the number of cancel tokens fired (one per descendant that
+    /// has a registered token; descendants without a token are still pause-
+    /// flagged for cooperative loops).
+    ///
+    /// Lock order: `parents → pause_flags → cancel_tokens` (canonical engine
+    /// order; matches `cleanup_delegation` and the load path). Reversing
+    /// this order permits an ABBA deadlock with concurrent cleanup.
     pub async fn cancel_children_of(&self, parent_run_id: &str) -> usize {
-        let children = self.get_children(parent_run_id).await;
-        let tokens = self.cancel_tokens.read().await;
+        let descendants = self.collect_descendants(parent_run_id).await;
+        if descendants.is_empty() {
+            return 0;
+        }
         let flags = self.pause_flags.read().await;
+        let tokens = self.cancel_tokens.read().await;
         let mut count = 0;
-        for child_id in &children {
+        for child_id in &descendants {
             if let Some(token) = tokens.get(child_id) {
                 token.cancel();
                 count += 1;
             }
-            // Also set pause flag to stop cooperative loops
             if let Some(flag) = flags.get(child_id) {
                 flag.store(true, Ordering::SeqCst);
             }
         }
         count
+    }
+
+    /// Walk the `parents` map starting from `root`, collecting every
+    /// descendant run_id. BFS so siblings cancel before grandchildren —
+    /// minimizing the time a freshly-spawned grandchild has to do work
+    /// before being cancelled. Cycle-safe via `visited`.
+    async fn collect_descendants(&self, root: &str) -> Vec<String> {
+        let parents = self.parents.read().await;
+        // Build child-by-parent index once so the walk is O(N) total
+        // rather than O(N) per level.
+        let mut by_parent: std::collections::HashMap<&str, Vec<&str>> =
+            std::collections::HashMap::new();
+        for (child, parent) in parents.iter() {
+            by_parent
+                .entry(parent.as_str())
+                .or_default()
+                .push(child.as_str());
+        }
+        let mut visited = std::collections::HashSet::new();
+        let mut frontier: std::collections::VecDeque<String> = by_parent
+            .get(root)
+            .map(|v| v.iter().map(|s| s.to_string()).collect())
+            .unwrap_or_default();
+        let mut out = Vec::new();
+        while let Some(rid) = frontier.pop_front() {
+            if !visited.insert(rid.clone()) {
+                continue;
+            }
+            if let Some(grand) = by_parent.get(rid.as_str()) {
+                for g in grand {
+                    frontier.push_back((*g).to_string());
+                }
+            }
+            out.push(rid);
+        }
+        out
     }
 
     /// Check if a sub-run is currently paused.
@@ -968,21 +1025,50 @@ impl DelegationTracker {
         output_preview: Option<&str>,
     ) {
         debug_assert!(terminal_state.is_terminal());
+        self.set_sub_run_result_state(run_id, terminal_state, error, output_preview, true)
+            .await;
+    }
 
+    pub async fn apply_sub_run_result_state(
+        &self,
+        run_id: &str,
+        result_state: SubRunState,
+        error: Option<&str>,
+        output_preview: Option<&str>,
+    ) {
+        if result_state.is_terminal() {
+            self.complete_sub_run_with_result(run_id, result_state, error, output_preview)
+                .await;
+            return;
+        }
+
+        debug_assert_eq!(result_state, SubRunState::Paused);
+        self.set_sub_run_result_state(run_id, result_state, error, output_preview, false)
+            .await;
+    }
+
+    async fn set_sub_run_result_state(
+        &self,
+        run_id: &str,
+        result_state: SubRunState,
+        error: Option<&str>,
+        output_preview: Option<&str>,
+        emit_completion_event: bool,
+    ) {
         // Transition state in record
         let mut delegation_id = None;
         let mut agent_id = None;
-        let mut final_state = terminal_state;
+        let mut final_state = result_state;
         {
             let mut delegations = self.delegations.write().await;
             for records in delegations.values_mut() {
                 for record in records.iter_mut() {
                     if record.run_id == run_id {
-                        // Best-effort: if transition fails, force the terminal state
+                        // Best-effort: if transition fails, force the requested result state.
                         record.state = record
                             .state
-                            .try_transition(terminal_state)
-                            .unwrap_or(terminal_state);
+                            .try_transition(result_state)
+                            .unwrap_or(result_state);
                         final_state = record.state;
                         delegation_id = Some(record.delegation_id.clone());
                         agent_id = Some(record.agent_id.clone());
@@ -1000,44 +1086,65 @@ impl DelegationTracker {
 
         // Update progress + emit SSE event
         if let (Some(did), Some(aid)) = (delegation_id, agent_id) {
-            self.persist_journal_entry(
-                astra_services::session_journal::JournalEvent::delegation_sub_run_completed(
-                    self.session_id.as_deref(),
-                    &did,
-                    run_id,
-                    &aid,
-                    final_state.as_str(),
-                    error,
-                    output_preview,
-                ),
-            );
+            if emit_completion_event {
+                self.persist_journal_entry(
+                    astra_services::session_journal::JournalEvent::delegation_sub_run_completed(
+                        self.session_id.as_deref(),
+                        &did,
+                        run_id,
+                        &aid,
+                        final_state.as_str(),
+                        error,
+                        output_preview,
+                    ),
+                );
+            }
 
             self.update_progress(&did, &aid, final_state).await;
 
             // Emit completion SSE event for web clients
-            if let Some(ref broadcaster) = self.progress_broadcaster {
-                use crate::orchestration::{AgentProgressEvent, ProgressEventType};
-                let status_str = format!("{:?}", final_state);
-                let event_type = if final_state == SubRunState::Completed {
-                    ProgressEventType::Completed {
-                        result_summary: format!("Sub-run {} finished", run_id),
-                        total_tool_calls: 0,
-                        total_tokens: (0, 0),
-                        duration_ms: 0,
-                    }
-                } else {
-                    ProgressEventType::Failed {
-                        error: format!("Sub-run terminal state: {}", status_str),
-                    }
-                };
-                broadcaster.emit(AgentProgressEvent {
-                    agent_id: aid,
-                    event_type,
-                    timestamp_epoch_ms: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64,
-                });
+            if emit_completion_event {
+                if let Some(ref broadcaster) = self.progress_broadcaster {
+                    use crate::orchestration::{AgentProgressEvent, ProgressEventType};
+                    // Canonical wire string — `as_str()` is what every other
+                    // SSE/JSON site uses (line 1096 above, and the trace
+                    // emitters). Using `{:?}` here leaked Rust enum casing
+                    // ("VerificationFailed") into the user-visible payload
+                    // instead of the snake_case wire form
+                    // ("verification_failed"), and silently coupled the
+                    // SSE wire format to the Debug derive — a refactor of
+                    // the enum's variant names would corrupt SSE downstream.
+                    let status_str = final_state.as_str();
+                    let event_type = match final_state {
+                        SubRunState::Completed => ProgressEventType::Completed {
+                            result_summary: format!("Sub-run {} finished", run_id),
+                            total_tool_calls: 0,
+                            total_tokens: (0, 0),
+                            duration_ms: 0,
+                        },
+                        SubRunState::Paused => ProgressEventType::Interrupted {
+                            reason: "paused".to_string(),
+                            partial_summary: format!("Sub-run {} paused", run_id),
+                            total_tool_calls: 0,
+                            total_tokens: (0, 0),
+                            duration_ms: 0,
+                        },
+                        SubRunState::Cancelled => ProgressEventType::Cancelled {
+                            reason: format!("Sub-run {} cancelled", run_id),
+                        },
+                        _ => ProgressEventType::Failed {
+                            error: format!("Sub-run terminal state: {}", status_str),
+                        },
+                    };
+                    broadcaster.emit(AgentProgressEvent {
+                        agent_id: aid,
+                        event_type,
+                        timestamp_epoch_ms: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64,
+                    });
+                }
             }
         }
     }
@@ -1645,16 +1752,11 @@ impl DelegationEngine {
                         retry_exec.await
                     } {
                         Ok(r) => {
-                            // Transition retry to Running→Completed/Failed
-                            let terminal_state = if r.is_success() {
-                                SubRunState::Completed
-                            } else {
-                                SubRunState::Failed
-                            };
+                            let result_state = agent_result_status_to_subrun_state(&r.status);
                             self.tracker
-                                .complete_sub_run_with_result(
+                                .apply_sub_run_result_state(
                                     &r.run_id,
-                                    terminal_state,
+                                    result_state,
                                     r.error.as_deref(),
                                     r.output.as_deref(),
                                 )
@@ -2270,7 +2372,7 @@ impl DelegationEngine {
                             &run_id,
                             "status"
                         );
-                        SubRunState::from_str(&r.status).unwrap_or(SubRunState::Failed)
+                        agent_result_status_to_subrun_state(&r.status)
                     }
                     Err(e) => {
                         astra_core::log_persist!(
@@ -2289,7 +2391,7 @@ impl DelegationEngine {
                     Err(e) => (Some(e.as_str()), None),
                 };
                 tracker
-                    .complete_sub_run_with_result(&run_id, final_state, error, output_preview)
+                    .apply_sub_run_result_state(&run_id, final_state, error, output_preview)
                     .await;
                 (result, agent_id, run_id)
             });
@@ -2630,10 +2732,9 @@ impl DelegationEngine {
                         &sub_run_id,
                         "status"
                     );
-                    let final_state =
-                        SubRunState::from_str(&r.status).unwrap_or(SubRunState::Failed);
+                    let final_state = agent_result_status_to_subrun_state(&r.status);
                     self.tracker
-                        .complete_sub_run_with_result(
+                        .apply_sub_run_result_state(
                             &sub_run_id,
                             final_state,
                             r.error.as_deref(),
@@ -2925,10 +3026,9 @@ impl DelegationEngine {
                         &prod_run_id,
                         "status"
                     );
-                    let final_state =
-                        SubRunState::from_str(&r.status).unwrap_or(SubRunState::Failed);
+                    let final_state = agent_result_status_to_subrun_state(&r.status);
                     self.tracker
-                        .complete_sub_run_with_result(
+                        .apply_sub_run_result_state(
                             &prod_run_id,
                             final_state,
                             r.error.as_deref(),
@@ -3135,10 +3235,9 @@ impl DelegationEngine {
                         &rev_run_id,
                         "status"
                     );
-                    let final_state =
-                        SubRunState::from_str(&r.status).unwrap_or(SubRunState::Failed);
+                    let final_state = agent_result_status_to_subrun_state(&r.status);
                     self.tracker
-                        .complete_sub_run_with_result(
+                        .apply_sub_run_result_state(
                             &rev_run_id,
                             final_state,
                             r.error.as_deref(),
@@ -3416,7 +3515,7 @@ impl DelegationEngine {
                                 "Fork: failed to persist final status for {run_id}: {e}"
                             );
                         }
-                        SubRunState::from_str(&r.status).unwrap_or(SubRunState::Failed)
+                        agent_result_status_to_subrun_state(&r.status)
                     }
                     Err(e) => {
                         if let Err(pe) = run_engine
@@ -3436,7 +3535,7 @@ impl DelegationEngine {
                     Err(e) => (Some(e.as_str()), None),
                 };
                 tracker
-                    .complete_sub_run_with_result(&run_id, final_state, error, output_preview)
+                    .apply_sub_run_result_state(&run_id, final_state, error, output_preview)
                     .await;
                 (result, agent_id, run_id)
             });
@@ -4091,6 +4190,27 @@ mod tests {
         }
     }
 
+    struct StatusExecutor {
+        status: &'static str,
+        error: Option<&'static str>,
+    }
+
+    #[async_trait]
+    impl SubRunExecutor for StatusExecutor {
+        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+            Ok(AgentResult {
+                agent_id: config.agent_profile.agent_id,
+                run_id: config.run_id,
+                status: self.status.to_string(),
+                output: Some(format!("[{}] yielded", self.status)),
+                error: self.error.map(ToString::to_string),
+                prompt_tokens: 1,
+                completion_tokens: 0,
+                tool_calls: 0,
+            })
+        }
+    }
+
     /// Test executor that fails for specific agents.
     struct FailingExecutor {
         fail_agents: Vec<String>,
@@ -4172,6 +4292,29 @@ mod tests {
         // Tracker recorded hierarchy
         let subs = tracker.get_sub_runs("del-1").await;
         assert_eq!(subs.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn fan_out_paused_result_preserves_nonterminal_tracker_state() {
+        let (_, engine, tracker, de) = setup_with_executor(Arc::new(StatusExecutor {
+            status: STATUS_PAUSED,
+            error: None,
+        }));
+
+        let result = de
+            .execute(fan_out_request(vec!["coder"]), "orch", None)
+            .await
+            .unwrap();
+        assert_eq!(result.agent_results.len(), 1);
+        assert_eq!(result.agent_results[0].status, STATUS_PAUSED);
+
+        let run_id = &result.agent_results[0].run_id;
+        assert_eq!(
+            tracker.get_sub_run_state(run_id).await,
+            Some(SubRunState::Paused)
+        );
+        let run = engine.load_run(run_id).await.unwrap().unwrap();
+        assert_eq!(run.status, STATUS_PAUSED);
     }
 
     #[tokio::test]
@@ -5530,6 +5673,36 @@ mod tests {
                 created_at: "2026-01-01T00:00:00Z".into(),
                 updated_at: "2026-01-01T00:00:00Z".into(),
             },
+            DurableRunRecord {
+                run_id: "sub-3".into(),
+                user_id: "u1".into(),
+                session_id: "s1".into(),
+                parent_run_id: Some("parent-1".into()),
+                root_run_id: Some("parent-1".into()),
+                ancestor_path: Some("parent-1/sub-3".into()),
+                depth: 1,
+                delegation_id: Some("del-1".into()),
+                agent_id: Some("approver".into()),
+                retry_of: None,
+                retry_scope: Some("node".into()),
+                status: "waiting".into(),
+                waiting_for: Some("approval".into()),
+                owner_pod_id: None,
+                owner_lease_expires_at: None,
+                run_generation: 0,
+                last_event_idx: -1,
+                checkpoint_version: None,
+                checkpoint_json: None,
+                error_code: None,
+                error_message: None,
+                retry_count: 0,
+                total_prompt_tokens: 0,
+                total_completion_tokens: 0,
+                total_tool_calls: 0,
+                events: vec![],
+                created_at: "2026-01-01T00:00:00Z".into(),
+                updated_at: "2026-01-01T00:00:00Z".into(),
+            },
             // Root run — should be skipped
             DurableRunRecord {
                 run_id: "root-run".into(),
@@ -5568,9 +5741,10 @@ mod tests {
 
         // Hierarchy rebuilt
         let subs = tracker.get_sub_runs("del-1").await;
-        assert_eq!(subs.len(), 2);
+        assert_eq!(subs.len(), 3);
         assert!(tracker.is_sub_run("sub-1").await);
         assert!(tracker.is_sub_run("sub-2").await);
+        assert!(tracker.is_sub_run("sub-3").await);
         assert!(!tracker.is_sub_run("root-run").await);
 
         // Parent links rebuilt
@@ -5588,11 +5762,19 @@ mod tests {
                 .and_then(|sub| sub.retry_of.as_deref()),
             Some("sub-1")
         );
+        assert_eq!(
+            tracker.get_sub_run_state("sub-3").await,
+            Some(SubRunState::Paused)
+        );
 
         // Paused sub-run gets pause flag
         let flag = tracker.get_pause_flag("sub-2").await;
         assert!(flag.is_some());
         assert!(flag.unwrap().load(Ordering::SeqCst)); // paused = true
+
+        // Waiting sub-run maps to paused tracker state but does not recreate
+        // a cooperative pause flag.
+        assert!(tracker.get_pause_flag("sub-3").await.is_none());
 
         // Completed sub-run has no pause flag
         assert!(tracker.get_pause_flag("sub-1").await.is_none());
@@ -5975,7 +6157,7 @@ mod tests {
             run_id: "r1".into(),
             status: status.into(),
             output: output.map(|s| s.to_string()),
-            error: if status == "failed" {
+            error: if status == AGENT_RESULT_STATUS_FAILED {
                 Some("err".into())
             } else {
                 None
@@ -6600,6 +6782,261 @@ mod tests {
         assert_eq!(count, 2, "both children must be cancelled");
         assert!(token1.is_cancelled(), "child1 token must be cancelled");
         assert!(token2.is_cancelled(), "child2 token must be cancelled");
+    }
+
+    /// Regression: the SSE Failed event for a non-Completed/Paused/Cancelled
+    /// terminal state (e.g. VerificationFailed) must surface the canonical
+    /// `as_str()` wire form, NOT the Debug-formatted Rust enum variant.
+    /// Pre-fix the broadcaster received "Sub-run terminal state:
+    /// VerificationFailed"; the wire/JSON contract everywhere else uses
+    /// "verification_failed", so the Debug leak coupled SSE consumers to
+    /// the Debug derive — a refactor of the enum casing would have
+    /// silently broken downstream parsing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn sse_failed_event_uses_canonical_wire_status_not_debug() {
+        use crate::orchestration::{ProgressBroadcaster, ProgressEventType};
+        let broadcaster = Arc::new(ProgressBroadcaster::new(16));
+        let mut rx = broadcaster.subscribe();
+        let tracker = DelegationTracker::new().with_progress_broadcaster(broadcaster.clone());
+
+        tracker
+            .record_sub_run(SubRunRecord {
+                run_id: "run-vf".into(),
+                parent_run_id: "parent-vf".into(),
+                delegation_id: "deleg-vf".into(),
+                agent_id: "agent-vf".into(),
+                depth: 0,
+                state: SubRunState::Running,
+                retry_of: None,
+            })
+            .await;
+
+        tracker
+            .complete_sub_run_with_result(
+                "run-vf",
+                SubRunState::VerificationFailed,
+                Some("acceptance criterion 3 failed"),
+                None,
+            )
+            .await;
+
+        // Drain events until we see the terminal Failed (record_sub_run
+        // emits a Started/Spawned event which we don't care about here).
+        let error_text = loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("event should arrive within timeout")
+                .expect("broadcast must deliver");
+            match event.event_type {
+                ProgressEventType::Failed { error } => break error,
+                ProgressEventType::Completed { .. }
+                | ProgressEventType::Cancelled { .. }
+                | ProgressEventType::Interrupted { .. } => {
+                    panic!(
+                        "expected Failed for VerificationFailed terminal state, got {:?}",
+                        event.event_type
+                    );
+                }
+                _ => continue, // skip non-terminal events
+            }
+        };
+
+        assert!(
+            error_text.contains("verification_failed"),
+            "SSE Failed event must use canonical wire status; got: {error_text}"
+        );
+        assert!(
+            !error_text.contains("VerificationFailed"),
+            "SSE Failed event must not leak the Rust Debug variant casing; got: {error_text}"
+        );
+    }
+
+    /// Subtree cancellation: cancel_children_of must propagate to grandchildren
+    /// (and deeper). Previously the implementation filtered the parents map by
+    /// direct `parent_run_id` match only, leaving any sub-runs spawned by a
+    /// cancelled child still alive — a real correctness bug for any
+    /// multi-level delegation tree.
+    #[tokio::test]
+    async fn cancel_children_of_propagates_to_grandchildren() {
+        let tracker = DelegationTracker::new();
+        let parent = "parent-run";
+        let child = "child-run";
+        let grandchild = "grandchild-run";
+
+        for (rid, prid, did) in [(child, parent, "deleg-1"), (grandchild, child, "deleg-2")] {
+            tracker
+                .record_sub_run(SubRunRecord {
+                    run_id: rid.into(),
+                    parent_run_id: prid.into(),
+                    delegation_id: did.into(),
+                    agent_id: "agent".into(),
+                    depth: 0,
+                    state: SubRunState::Running,
+                    retry_of: None,
+                })
+                .await;
+        }
+
+        let token_child = Arc::new(tokio_util::sync::CancellationToken::new());
+        let token_grand = Arc::new(tokio_util::sync::CancellationToken::new());
+        tracker
+            .register_cancel_token(child, token_child.clone())
+            .await;
+        tracker
+            .register_cancel_token(grandchild, token_grand.clone())
+            .await;
+
+        let count = tracker.cancel_children_of(parent).await;
+        assert!(token_child.is_cancelled(), "direct child must be cancelled");
+        assert!(
+            token_grand.is_cancelled(),
+            "grandchild MUST be cancelled (subtree, not just first level)"
+        );
+        assert_eq!(count, 2, "count must include all descendants");
+    }
+
+    #[tokio::test]
+    async fn collect_descendants_visits_siblings_before_grandchildren() {
+        let tracker = DelegationTracker::new();
+        for (rid, prid) in [
+            ("child-a", "parent-run"),
+            ("child-b", "parent-run"),
+            ("grandchild-a", "child-a"),
+        ] {
+            tracker
+                .record_sub_run(SubRunRecord {
+                    run_id: rid.into(),
+                    parent_run_id: prid.into(),
+                    delegation_id: format!("deleg-{rid}"),
+                    agent_id: "agent".into(),
+                    depth: 0,
+                    state: SubRunState::Running,
+                    retry_of: None,
+                })
+                .await;
+        }
+
+        let descendants = tracker.collect_descendants("parent-run").await;
+        let child_b = descendants
+            .iter()
+            .position(|run_id| run_id == "child-b")
+            .expect("child-b should be collected");
+        let grandchild_a = descendants
+            .iter()
+            .position(|run_id| run_id == "grandchild-a")
+            .expect("grandchild-a should be collected");
+
+        assert!(
+            child_b < grandchild_a,
+            "BFS must visit direct siblings before grandchildren: {descendants:?}"
+        );
+    }
+
+    /// Lock-order regression: cancel_children_of and cleanup_delegation
+    /// must agree on the canonical lock order
+    /// (delegations → parents → pause_flags → cancel_tokens → progress).
+    ///
+    /// History: cancel_children_of used to take cancel_tokens THEN pause_flags
+    /// while cleanup_delegation takes pause_flags THEN cancel_tokens — a
+    /// classic ABBA deadlock under contention. This stress test interleaves
+    /// many concurrent calls of both and asserts everything completes within
+    /// a generous wall-clock budget. With reverse lock order the test would
+    /// hang and trip the timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancel_children_of_does_not_deadlock_with_cleanup_delegation() {
+        use std::time::Duration;
+        let tracker = Arc::new(DelegationTracker::new());
+
+        // Pre-populate many delegation/run records so each iteration has work.
+        const PARENTS: usize = 8;
+        const CHILDREN_PER: usize = 4;
+        for p in 0..PARENTS {
+            for c in 0..CHILDREN_PER {
+                let parent = format!("parent-{p}");
+                let child = format!("child-{p}-{c}");
+                tracker
+                    .record_sub_run(SubRunRecord {
+                        run_id: child.clone(),
+                        parent_run_id: parent.clone(),
+                        delegation_id: format!("deleg-{p}"),
+                        agent_id: format!("agent-{p}-{c}"),
+                        depth: 0,
+                        state: SubRunState::Running,
+                        retry_of: None,
+                    })
+                    .await;
+                tracker
+                    .register_cancel_token(
+                        &child,
+                        Arc::new(tokio_util::sync::CancellationToken::new()),
+                    )
+                    .await;
+            }
+        }
+
+        // Workload A: hammer cancel_children_of across all parents.
+        let a = {
+            let tracker = Arc::clone(&tracker);
+            tokio::spawn(async move {
+                for _ in 0..200 {
+                    for p in 0..PARENTS {
+                        let _ = tracker.cancel_children_of(&format!("parent-{p}")).await;
+                        tokio::task::yield_now().await;
+                    }
+                }
+            })
+        };
+
+        // Workload B: hammer cleanup_delegation cycles. Re-register records
+        // after each cleanup so the workload keeps having locks to take.
+        let b = {
+            let tracker = Arc::clone(&tracker);
+            tokio::spawn(async move {
+                for _ in 0..50 {
+                    for p in 0..PARENTS {
+                        // Force completion so cleanup can proceed.
+                        for c in 0..CHILDREN_PER {
+                            tracker
+                                .complete_sub_run(&format!("child-{p}-{c}"), SubRunState::Completed)
+                                .await;
+                        }
+                        let _ = tracker.cleanup_delegation(&format!("deleg-{p}")).await;
+
+                        // Re-register so the next iteration has work.
+                        for c in 0..CHILDREN_PER {
+                            let child = format!("child-{p}-{c}");
+                            tracker
+                                .record_sub_run(SubRunRecord {
+                                    run_id: child.clone(),
+                                    parent_run_id: format!("parent-{p}"),
+                                    delegation_id: format!("deleg-{p}"),
+                                    agent_id: format!("agent-{p}-{c}"),
+                                    depth: 0,
+                                    state: SubRunState::Running,
+                                    retry_of: None,
+                                })
+                                .await;
+                            tracker
+                                .register_cancel_token(
+                                    &child,
+                                    Arc::new(tokio_util::sync::CancellationToken::new()),
+                                )
+                                .await;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                }
+            })
+        };
+
+        let result = tokio::time::timeout(Duration::from_secs(20), async {
+            let _ = tokio::join!(a, b);
+        })
+        .await;
+        assert!(
+            result.is_ok(),
+            "cancel_children_of and cleanup_delegation must not deadlock"
+        );
     }
 
     /// P1-B source guard: cancel_run must call cancel_children_of on delegation engine.

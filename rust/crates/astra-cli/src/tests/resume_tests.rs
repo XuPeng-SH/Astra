@@ -1,6 +1,6 @@
 use super::chat_stream_tests::sse_text_response;
 use super::*;
-use crate::cli::cli_utils::{CredentialsFile, Profile, save_credentials};
+use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
 use axum::response::IntoResponse;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
@@ -17,7 +17,7 @@ struct EnvVarGuard {
 
 impl EnvVarGuard {
     fn set_path(key: &'static str, value: &std::path::Path) -> Self {
-        let lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let lock = astra_core::sync_poison::recover_mutex_lock(&env_lock());
         let previous = std::env::var_os(key);
         unsafe {
             std::env::set_var(key, value);
@@ -106,6 +106,32 @@ async fn find_task_by_title_substring() {
         .await
         .unwrap();
     assert!(found.is_some());
+}
+
+#[tokio::test]
+async fn find_task_by_title_substring_fails_on_ambiguity() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let svc = astra_services::LocalTaskService::new(tmp.path().to_path_buf());
+    for title in [
+        "Refactor authentication module",
+        "Refactor authentication tests",
+    ] {
+        svc.create_task(
+            "u1",
+            "s1",
+            astra_services::TaskCreateRequest {
+                title: title.into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let err = slash_task::find_task_by_query(&svc, "u1", "authentication")
+        .await
+        .unwrap_err();
+    assert!(err.contains("task query 'authentication' is ambiguous"));
 }
 
 #[tokio::test]
@@ -748,6 +774,7 @@ async fn resume_handles_missing_workspace() {
 #[tokio::test]
 async fn resume_lists_checkpoints_for_session() {
     let _creds = isolate_credentials();
+    use astra_services::session_journal;
     use astra_services::session_restore::SessionRestoreService;
 
     let sid = format!("test-checkpoints-{}", uuid::Uuid::new_v4());

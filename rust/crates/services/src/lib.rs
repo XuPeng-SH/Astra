@@ -56,6 +56,7 @@ pub mod sync_engine;
 pub mod task_orchestrator;
 pub mod team_persistence;
 pub mod triggers;
+pub mod turn_intent_judge;
 pub mod verification;
 pub mod workflows;
 
@@ -217,8 +218,9 @@ pub use models::{
 pub use multi_agent::{
     DatabaseEdgeDispatchService, DatabaseEdgeRegistryService, DatabaseTaskLeaseService,
     EdgeAgentRecord, EdgeDispatchRow, EdgeDispatchService, EdgeRegistryService, LeaseClaimResult,
-    TaskLeaseHoldCache, TaskLeaseService, TaskLeaseView, TasksPackPushResult,
-    UnconfiguredEdgeDispatchService, UnconfiguredEdgeRegistryService, UnconfiguredTaskLeaseService,
+    NextClaimableLeaseClaimResult, TaskLeaseHoldCache, TaskLeaseService, TaskLeaseView,
+    TasksPackPushResult, UnconfiguredEdgeDispatchService, UnconfiguredEdgeRegistryService,
+    UnconfiguredTaskLeaseService,
 };
 pub use pagination::{
     MAX_ADMIN_AUDIT_LOG_LIMIT, MAX_API_LIST_LIMIT, MAX_API_LIST_OFFSET,
@@ -295,12 +297,16 @@ pub use sync_engine::{
     SyncEvent, SyncOperation, SyncOrchestrator, SyncPayload, SyncPolicy, SyncState, SyncStats,
 };
 pub use task_orchestrator::{
-    LocalTaskService, MatrixOneTaskService, SubtaskPlan, TaskCheckpoint, TaskCreateRequest,
-    TaskListItem, TaskOutcome, TaskPlan, TaskRecord, TaskService, TaskStatus,
+    LocalTaskService, MatrixOneTaskService, SubtaskPlan, TaskCheckpoint, TaskClaimability,
+    TaskCreateRequest, TaskListItem, TaskOutcome, TaskPlan, TaskRecord, TaskService, TaskStatus,
     UnconfiguredTaskService,
 };
 pub use triggers::{
     DatabaseTriggerService, TriggerRecord, TriggerService, UnconfiguredTriggerService,
+};
+pub use turn_intent_judge::{
+    TurnIntentJudge, TurnIntentJudgeContext, TurnIntentJudgeError, build_turn_intent_prompt,
+    parse_turn_intent_response,
 };
 pub use workflows::{
     UnconfiguredWorkflowService, WorkflowDefRecord, WorkflowListItem, WorkflowRunRecord,

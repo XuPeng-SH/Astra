@@ -1413,6 +1413,13 @@ impl PermissionManager {
             astra_turn_core::approval_fingerprint::FingerprintedOverrides::default();
     }
 
+    /// Start a new session binding: session approvals from the previous
+    /// conversation must not leak into the next session.
+    pub(crate) fn clear_session_overrides(&mut self) {
+        self.session_overrides =
+            astra_turn_core::approval_fingerprint::FingerprintedOverrides::default();
+    }
+
     fn check_overrides(
         &self,
         fp: &astra_turn_core::approval_fingerprint::ApprovalFingerprint,
@@ -3660,6 +3667,7 @@ fn is_read_only_allowlisted(lower_cmd: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lock_recovery::LockRecovery;
 
     fn bare_fp(tool: &str) -> astra_turn_core::approval_fingerprint::ApprovalFingerprint {
         astra_turn_core::approval_fingerprint::ApprovalFingerprint::bare(tool)
@@ -7464,7 +7472,7 @@ mod tests {
             let pm = Arc::clone(&pm);
             handles.push(thread::spawn(move || {
                 for i in 0..iterations {
-                    let mut g = pm.lock().unwrap();
+                    let mut g = pm.lock_recover();
                     match i % 3 {
                         0 => g.add_allow_rule("Bash(echo:*)"),
                         1 => {
@@ -7494,7 +7502,7 @@ mod tests {
                 ];
                 for i in 0..iterations {
                     let (name, args) = &tools[(tid + i) % tools.len()];
-                    let mut g = pm.lock().unwrap();
+                    let mut g = pm.lock_recover();
                     let _ = g.check_nonblocking(name, args);
                 }
             }));
@@ -7505,7 +7513,7 @@ mod tests {
         }
 
         // After the storm, deny rule for `rm:*` MUST still bind.
-        let mut g = pm.lock().unwrap();
+        let mut g = pm.lock_recover();
         let d = g.check_nonblocking("bash", &serde_json::json!({"command": "rm -rf /"}));
         assert!(
             matches!(d, PermissionDecision::Deny(_)),

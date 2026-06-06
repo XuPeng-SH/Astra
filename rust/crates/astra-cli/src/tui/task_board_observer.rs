@@ -78,9 +78,7 @@ pub(crate) enum ViewMode {
 
 impl TaskBoardSnapshot {
     pub fn has_incomplete(&self) -> bool {
-        self.tasks
-            .iter()
-            .any(|t| t.status == "pending" || t.status == "in_progress")
+        self.tasks.iter().any(|t| t.status.is_active())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -295,7 +293,7 @@ impl TaskBoardObserver {
         let now = Instant::now();
         let mut snap = st.snapshot.clone();
         snap.tasks.retain(|task| {
-            if task.status != "completed" {
+            if !task.status.is_completed() {
                 return true;
             }
             match st.completed_at.get(&task.id) {
@@ -329,7 +327,7 @@ impl TaskBoardObserver {
             .snapshot
             .tasks
             .iter()
-            .filter(|t| t.status == "pending" || t.status == "in_progress")
+            .filter(|t| t.status.is_active())
             .count();
         (open, total, st.snapshot.hidden)
     }
@@ -565,7 +563,7 @@ impl TaskBoardObserver {
                                 ..
                             } = event
                             {
-                                if to == "completed" {
+                                if to.is_completed() {
                                     st.completed_at.insert(task_id.clone(), at);
                                 } else {
                                     st.completed_at.remove(task_id);
@@ -605,9 +603,8 @@ impl TaskBoardObserver {
                             .snapshot
                             .tasks
                             .iter()
-                            .filter(|t| {
-                                t.status == "completed" && !st.completed_at.contains_key(&t.id)
-                            })
+                            .filter(|t| t.status.is_completed())
+                            .filter(|t| !st.completed_at.contains_key(&t.id))
                             .map(|t| t.id.clone())
                             .collect();
                         for id in backfill_ids {
@@ -652,6 +649,7 @@ fn same_board(a: &[SessionTask], b: &[SessionTask]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lock_recovery::LockRecovery;
     use astra_tools::task_mgmt::{InMemoryTaskStore, TaskManager};
     use serde_json::json;
 
@@ -689,7 +687,7 @@ mod tests {
         // The fix path must respect both the dirty flag and the
         // window so this seeding still gates on FAST_POLL elapsing.
         {
-            let mut st = obs.inner.state.lock().unwrap();
+            let mut st = obs.inner.state.lock_recover();
             st.last_fetch = Instant::now()
                 .checked_sub(Duration::from_millis(60))
                 .unwrap_or_else(Instant::now);
@@ -754,7 +752,7 @@ mod tests {
         // Force the TTL clock backwards so the row is older than the
         // window without a 30s sleep in unit tests.
         {
-            let mut st = obs.inner.state.lock().unwrap();
+            let mut st = obs.inner.state.lock_recover();
             st.completed_at.insert(
                 "task-1".to_string(),
                 Instant::now()
@@ -805,7 +803,7 @@ mod tests {
             1,
             "observer must adopt the broadcast sid and surface mid-turn writes"
         );
-        let st = obs.inner.state.lock().unwrap();
+        let st = obs.inner.state.lock_recover();
         assert_eq!(st.session_id, "sess-mid-turn");
     }
 
@@ -893,7 +891,7 @@ mod tests {
         // state and force `hide_at` into the past, then one more tick
         // flips `hidden`.
         {
-            let mut st = obs.inner.state.lock().unwrap();
+            let mut st = obs.inner.state.lock_recover();
             st.hide_at = Some(
                 Instant::now()
                     .checked_sub(Duration::from_secs(1))
@@ -924,7 +922,7 @@ mod tests {
         )
         .await;
         {
-            let mut st = obs.inner.state.lock().unwrap();
+            let mut st = obs.inner.state.lock_recover();
             st.snapshot.hidden = true;
         }
 
@@ -964,7 +962,7 @@ mod tests {
         )
         .await;
         {
-            let mut st = obs.inner.state.lock().unwrap();
+            let mut st = obs.inner.state.lock_recover();
             st.snapshot.hidden = true;
             st.hide_at = None;
             st.last_fetch = Instant::now()
@@ -989,7 +987,7 @@ mod tests {
         )
         .await;
 
-        let st = obs.inner.state.lock().unwrap();
+        let st = obs.inner.state.lock_recover();
         assert!(
             st.hide_at.is_none(),
             "manual reveal should pin completed board open until the user collapses it"
@@ -1017,7 +1015,7 @@ mod tests {
         )
         .await;
         {
-            let mut st = obs.inner.state.lock().unwrap();
+            let mut st = obs.inner.state.lock_recover();
             st.snapshot.hidden = false;
             st.hide_at = Some(Instant::now() + HIDE_DELAY);
         }
@@ -1027,7 +1025,7 @@ mod tests {
             "manual expansion during hide grace should still pin the board"
         );
 
-        let st = obs.inner.state.lock().unwrap();
+        let st = obs.inner.state.lock_recover();
         assert!(
             st.hide_at.is_none(),
             "pending auto-hide should be cancelled"
@@ -1089,7 +1087,7 @@ mod tests {
         let poison_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
             let obs = obs.clone();
             move || {
-                let mut st = obs.inner.state.lock().unwrap();
+                let mut st = obs.inner.state.lock_recover();
                 st.fetch_in_flight = true;
                 panic!("poison task board state for regression test");
             }
@@ -1099,7 +1097,7 @@ mod tests {
 
         obs.maybe_refresh();
 
-        let st = obs.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        let st = astra_core::sync_poison::recover_mutex_lock(&obs.inner.state);
         assert!(
             !st.fetch_in_flight,
             "poison recovery must clear stale fetch_in_flight so future refreshes are not frozen"

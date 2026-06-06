@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use super::super::agentic::adaptive_tuning::apply_adaptive_execution_profile;
+use super::super::agentic::adaptive_tuning::apply_adaptive_execution_profile_with_intent;
 use super::super::agentic::headless_round::HeadlessStderrStyle;
 use super::super::{CompactionEngine, TokenBudget};
 use super::host::{
@@ -13,6 +13,10 @@ use super::host::{
     try_write_heavy_checkpoint,
 };
 use crate::orchestration::permission_sync::PermissionResponseMessaging;
+use crate::orchestration::{
+    AgentToolRecordActionKind, project_agent_tool_budget_record,
+    render_agent_tool_budget_unfinished_detail, summarize_agent_tool_budget_result,
+};
 use astra_services::SessionArtifactStore;
 use astra_turn_core::compaction_types::{CompactionEvent, CompactionKind, CompactionTier};
 use astra_turn_core::interruption::{
@@ -255,90 +259,6 @@ struct ParallelAgentBudgetRollup {
     unfinished: Vec<UnfinishedParallelAgent>,
 }
 
-fn parse_embedded_json(raw: Option<&str>) -> Option<Value> {
-    raw.and_then(|text| serde_json::from_str::<Value>(text).ok())
-}
-
-fn agent_id_from_record(
-    record: &astra_services::session_journal::ToolCallRecord,
-    parsed_result: Option<&Value>,
-) -> Option<String> {
-    record
-        .args_full
-        .as_deref()
-        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-        .and_then(|value| {
-            value
-                .get("agent_id")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .or_else(|| {
-            parsed_result
-                .and_then(|value| value.get("agent_id"))
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-}
-
-fn summarize_agent_result(text: &str) -> String {
-    const MAX_CHARS: usize = 320;
-    let trimmed = text.trim();
-    if trimmed.chars().count() <= MAX_CHARS {
-        trimmed.to_string()
-    } else {
-        let mut clipped: String = trimmed.chars().take(MAX_CHARS.saturating_sub(1)).collect();
-        clipped.push('…');
-        clipped
-    }
-}
-
-fn summarize_control_error(error: &str) -> String {
-    if error.contains("duplicate_within_turn") {
-        "same-turn retries hit duplicate_within_turn".to_string()
-    } else if error.contains("blocked_tool") {
-        "later retries were blocked after the tool was restricted".to_string()
-    } else {
-        error.lines().next().unwrap_or(error).trim().to_string()
-    }
-}
-
-fn summarize_incomplete_agent_state(parsed: &Value) -> Option<String> {
-    match parsed.get("status").and_then(Value::as_str) {
-        Some("still_running") => {
-            let detail = parsed
-                .get("current_status")
-                .and_then(Value::as_str)
-                .unwrap_or("still running");
-            Some(format!(
-                "still running when the wait window expired ({detail})"
-            ))
-        }
-        Some("timeout") => Some(
-            parsed
-                .get("error")
-                .and_then(Value::as_str)
-                .unwrap_or("timed out while waiting for the child result")
-                .to_string(),
-        ),
-        Some("failed") => Some(
-            parsed
-                .get("error")
-                .and_then(Value::as_str)
-                .unwrap_or("child result retrieval failed")
-                .to_string(),
-        ),
-        Some("unknown") => Some(
-            parsed
-                .get("detail")
-                .and_then(Value::as_str)
-                .unwrap_or("child agent returned an unknown status")
-                .to_string(),
-        ),
-        _ => None,
-    }
-}
-
 fn collect_parallel_agent_budget_rollup(
     state: &AgenticLoopState,
 ) -> Option<ParallelAgentBudgetRollup> {
@@ -349,17 +269,11 @@ fn collect_parallel_agent_budget_rollup(
         if record.name != "agent" {
             continue;
         }
-        let action = record.args_preview.as_deref().unwrap_or_default();
-        let parsed_result = parse_embedded_json(
-            record
-                .result_full
-                .as_deref()
-                .or(record.result_preview.as_deref()),
-        );
+        let projection = project_agent_tool_budget_record(record);
 
-        match action {
-            "spawn" => {
-                let Some(agent_id) = agent_id_from_record(record, parsed_result.as_ref()) else {
+        match projection.action {
+            AgentToolRecordActionKind::Spawn => {
+                let Some(agent_id) = projection.agent_id.clone() else {
                     continue;
                 };
                 if !order.iter().any(|id| id == &agent_id) {
@@ -367,35 +281,18 @@ fn collect_parallel_agent_budget_rollup(
                 }
                 let entry = summaries.entry(agent_id).or_default();
                 if entry.label.is_none() {
-                    entry.label = parsed_result
-                        .as_ref()
-                        .and_then(|value| value.get("description"))
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                        .or_else(|| {
-                            record
-                                .args_full
-                                .as_deref()
-                                .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-                                .and_then(|value| {
-                                    value
-                                        .get("description")
-                                        .and_then(Value::as_str)
-                                        .map(str::to_string)
-                                })
-                        });
+                    entry.label = projection.display_name_hint.clone();
                 }
             }
-            "get_result" => {
-                let Some(agent_id) = agent_id_from_record(record, parsed_result.as_ref()) else {
+            AgentToolRecordActionKind::GetResult => {
+                let Some(agent_id) = projection.agent_id.clone() else {
                     continue;
                 };
                 if !order.iter().any(|id| id == &agent_id) {
                     order.push(agent_id.clone());
                 }
                 let entry = summaries.entry(agent_id).or_default();
-                if let Some(error) = record.error.as_deref() {
-                    let summarized = summarize_control_error(error);
+                if let Some(summarized) = projection.control_error_summary.clone() {
                     if !entry
                         .control_errors
                         .iter()
@@ -404,22 +301,13 @@ fn collect_parallel_agent_budget_rollup(
                         entry.control_errors.push(summarized);
                     }
                 }
-                if let Some(parsed) = parsed_result.as_ref() {
-                    match parsed.get("status").and_then(Value::as_str) {
-                        Some("completed") | Some("interrupted") => {
-                            if let Some(result) = parsed.get("result").and_then(Value::as_str) {
-                                entry.completed_result = Some(result.to_string());
-                            }
-                        }
-                        _ => {
-                            if entry.completed_result.is_none() {
-                                entry.incomplete_reason = summarize_incomplete_agent_state(parsed);
-                            }
-                        }
-                    }
+                if let Some(result) = projection.completed_result.clone() {
+                    entry.completed_result = Some(result);
+                } else if entry.completed_result.is_none() {
+                    entry.incomplete_reason = projection.incomplete_reason.clone();
                 }
             }
-            _ => {}
+            AgentToolRecordActionKind::Other => {}
         }
     }
 
@@ -491,26 +379,17 @@ fn parallel_agent_budget_exhaustion_summary(
             "{}. {} — {}",
             idx + 1,
             entry.label,
-            summarize_agent_result(&entry.result)
+            summarize_agent_tool_budget_result(&entry.result)
         ));
     }
     lines.push(String::new());
     lines.push("Unfinished sub-agent results:".to_string());
     for (idx, entry) in rollup.unfinished.iter().enumerate() {
-        let mut detail = entry
-            .incomplete_reason
-            .as_deref()
-            .map(str::to_string)
-            .unwrap_or_else(|| "did not finish before the turn budget was exhausted".to_string());
-        if cancelled_agents.contains(&entry.agent_id) {
-            detail.push_str(
-                "; the parent turn budget was exhausted and the parent cancelled this sub-agent",
-            );
-        }
-        if !entry.control_errors.is_empty() {
-            detail.push_str("; ");
-            detail.push_str(&entry.control_errors.join("; "));
-        }
+        let detail = render_agent_tool_budget_unfinished_detail(
+            entry.incomplete_reason.as_deref(),
+            &entry.control_errors,
+            cancelled_agents.contains(&entry.agent_id),
+        );
         lines.push(format!("{}. {} — {}", idx + 1, entry.label, detail));
     }
     Some(lines.join("\n"))
@@ -1495,12 +1374,13 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     ) {
         let session_id = state.current_session_id.as_deref().unwrap_or("");
         let user_id = {
-            let s = session.read().unwrap_or_else(|e| e.into_inner());
+            let s = astra_core::sync_poison::recover_rwlock_read(session);
             s.user_id.clone()
         };
         crate::observability::on_turn_start(hub, session_id, &user_id, &state.message);
     }
-    apply_adaptive_execution_profile(state);
+    let turn_intent = host.judge_turn_intent(state).await;
+    apply_adaptive_execution_profile_with_intent(state, turn_intent.as_ref());
 
     if (state.telemetry.observability_session.is_some() || state.skills.resolver.is_some())
         && state.telemetry.turn_trace_collector.is_none()
@@ -1686,31 +1566,48 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         // retains() stay for a grace period to scrub checkpoints
         // restored from pre-migration sessions (working-set / attention
         // manifests were removed in wip-3).
-        const LEGACY_WORKING_SET_HEADER: &str = "[working-set:v1]\n";
-        const LEGACY_ATTENTION_HEADER: &str = "[attention:v1]\n";
         state.messages.retain(|m| {
             let role = m.get("role").and_then(Value::as_str);
             let content = m.get("content").and_then(Value::as_str);
             match (role, content) {
-                (Some("system"), Some(c)) if c.starts_with(LEGACY_WORKING_SET_HEADER) => false,
-                (Some("user"), Some(c)) if c.starts_with(LEGACY_ATTENTION_HEADER) => false,
+                (Some("system"), Some(c))
+                    if astra_turn_core::runtime_scaffolding::detect_runtime_scaffolding(c)
+                        == Some(
+                            astra_turn_core::runtime_scaffolding::RuntimeScaffoldingKind::WorkingSetManifest,
+                        ) =>
+                {
+                    false
+                }
+                (Some("user"), Some(c))
+                    if astra_turn_core::runtime_scaffolding::detect_runtime_scaffolding(c)
+                        == Some(
+                            astra_turn_core::runtime_scaffolding::RuntimeScaffoldingKind::AttentionManifest,
+                        ) =>
+                {
+                    false
+                }
                 _ => true,
             }
         });
 
-        const INVENTORY_HEADER: &str = "## Already Fetched (do NOT re-read/re-grep these)\n";
+        const INVENTORY_HEADER: &str = astra_turn_core::runtime_scaffolding::ALREADY_FETCHED_PREFIX;
         state.messages.retain(|m| {
             m.get("role").and_then(Value::as_str) != Some("system")
                 || !m
                     .get("content")
                     .and_then(Value::as_str)
-                    .is_some_and(|c| c.starts_with(INVENTORY_HEADER))
+                    .is_some_and(|c| {
+                        astra_turn_core::runtime_scaffolding::detect_runtime_scaffolding(c)
+                            == Some(
+                                astra_turn_core::runtime_scaffolding::RuntimeScaffoldingKind::AlreadyFetchedInventory,
+                            )
+                    })
         });
         let inventory = state.semantic_dedup.context_inventory();
         if !inventory.is_empty() {
             state.push_volatile(
                 super::host::VolatileKind::AlreadyFetched,
-                format!("{INVENTORY_HEADER}{inventory}"),
+                format!("{INVENTORY_HEADER} (do NOT re-read/re-grep these)\n{inventory}"),
             );
         }
     }
@@ -1918,6 +1815,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
 mod tests {
     use std::sync::Arc;
 
+    use astra_config::user_profile::{Scenario, TurnIntent};
     use astra_services::session_journal::ToolCallRecord;
     use astra_skills::hooks::SkillHooks;
     use astra_skills::manifest::{ExecutionContext, SkillSourceKind, TrustTier};
@@ -1925,7 +1823,9 @@ mod tests {
     use serde_json::json;
 
     use crate::turn::agentic_loop::host::run_agentic_loop_with_host;
-    use crate::turn::agentic_loop::host::tests::{MockHost, make_state, text_result};
+    use crate::turn::agentic_loop::host::tests::{
+        MockHost, make_hub, make_session, make_state, text_result,
+    };
 
     use super::*;
 
@@ -2346,6 +2246,184 @@ mod tests {
         );
     }
 
+    #[test]
+    fn budget_exhaustion_summary_uses_shared_child_result_projection() {
+        let mut state = make_state();
+        state.max_turns = 9;
+        state.remaining_turns = 0;
+        state.llm_rounds_completed = 9;
+        state.total_tool_calls = 6;
+        state.stall.tool_call_records = vec![
+            agent_record(
+                "spawn",
+                json!({"description":"Review architecture"}),
+                Some(json!({
+                    "status":"launched",
+                    "agent_id":"agent-a",
+                    "description":"Review architecture"
+                })),
+                None,
+            ),
+            agent_record(
+                "spawn",
+                json!({"description":"Review security"}),
+                Some(json!({
+                    "status":"launched",
+                    "agent_id":"agent-b",
+                    "description":"Review security"
+                })),
+                None,
+            ),
+            agent_record(
+                "spawn",
+                json!({"description":"Review infra"}),
+                Some(json!({
+                    "status":"launched",
+                    "agent_id":"agent-c",
+                    "description":"Review infra"
+                })),
+                None,
+            ),
+            agent_record(
+                "get_result",
+                json!({"agent_id":"agent-a"}),
+                Some(json!({
+                    "status":"interrupted",
+                    "agent_id":"agent-a",
+                    "finish_reason":"budget_exhausted",
+                    "result":"Partial architecture findings."
+                })),
+                None,
+            ),
+            agent_record(
+                "get_result",
+                json!({"agent_id":"agent-b"}),
+                Some(json!({
+                    "status":"launched",
+                    "agent_id":"agent-b"
+                })),
+                None,
+            ),
+            agent_record(
+                "get_result",
+                json!({"agent_id":"agent-c"}),
+                Some(json!({
+                    "status":"cancelled",
+                    "agent_id":"agent-c",
+                    "reason":"parent cancelled this sub-agent"
+                })),
+                None,
+            ),
+        ];
+
+        let text = budget_exhaustion_completion_text(&state, &HashSet::new());
+
+        assert!(text.contains("Partial architecture findings."), "{text}");
+        assert!(
+            text.contains("launched and has not produced a child result yet"),
+            "{text}"
+        );
+        assert!(text.contains("parent cancelled this sub-agent"), "{text}");
+    }
+
+    #[test]
+    fn budget_exhaustion_summary_uses_record_projection_when_args_preview_is_missing() {
+        let mut state = make_state();
+        state.max_turns = 5;
+        state.remaining_turns = 0;
+        state.llm_rounds_completed = 5;
+        state.total_tool_calls = 4;
+        state.stall.tool_call_records = vec![
+            ToolCallRecord {
+                name: "agent".into(),
+                ok: true,
+                ms: 0,
+                args_full: Some(
+                    json!({
+                        "action": "spawn",
+                        "agent_id": "agent-a",
+                        "description": "Review architecture"
+                    })
+                    .to_string(),
+                ),
+                result_full: Some(
+                    json!({
+                        "status":"launched",
+                        "description":"Review architecture"
+                    })
+                    .to_string(),
+                ),
+                ..Default::default()
+            },
+            ToolCallRecord {
+                name: "agent".into(),
+                ok: true,
+                ms: 0,
+                args_full: Some(
+                    json!({
+                        "action": "get_result",
+                        "agent_id": "agent-a"
+                    })
+                    .to_string(),
+                ),
+                result_full: Some(
+                    json!({
+                        "status":"interrupted",
+                        "result":"Partial architecture findings.",
+                        "finish_reason":"budget_exhausted"
+                    })
+                    .to_string(),
+                ),
+                ..Default::default()
+            },
+            ToolCallRecord {
+                name: "agent".into(),
+                ok: true,
+                ms: 0,
+                args_full: Some(
+                    json!({
+                        "action": "spawn",
+                        "agent_id": "agent-b",
+                        "description": "Review security"
+                    })
+                    .to_string(),
+                ),
+                result_full: Some(
+                    json!({
+                        "status":"launched",
+                        "description":"Review security"
+                    })
+                    .to_string(),
+                ),
+                ..Default::default()
+            },
+            ToolCallRecord {
+                name: "agent".into(),
+                ok: true,
+                ms: 0,
+                args_full: Some(
+                    json!({
+                        "action": "get_result",
+                        "agent_id": "agent-b"
+                    })
+                    .to_string(),
+                ),
+                result_full: Some(
+                    json!({
+                        "status":"launched"
+                    })
+                    .to_string(),
+                ),
+                ..Default::default()
+            },
+        ];
+
+        let text = budget_exhaustion_completion_text(&state, &HashSet::new());
+        assert!(text.contains("Review architecture"), "{text}");
+        assert!(text.contains("Partial architecture findings."), "{text}");
+        assert!(text.contains("Review security"), "{text}");
+    }
+
     #[tokio::test]
     async fn budget_exhaustion_wrapup_cancels_unfinished_parallel_agents() {
         let mut host = MockHost::new(Vec::new());
@@ -2478,6 +2556,71 @@ mod tests {
                         content.contains("<skill-loaded name=\"review-changes\"/>")
                     })
         }));
+    }
+
+    #[tokio::test]
+    async fn prepare_turn_iteration_applies_host_judged_turn_intent() {
+        let intent = TurnIntent::default().with_requested_scenario(Scenario::CodeReview);
+        let mut host = MockHost::new(Vec::new()).with_turn_intent(intent);
+        let hub = make_hub();
+        let session = make_session();
+        let mut state = make_state();
+        state.telemetry.observability_hub = Some(hub);
+        state.telemetry.observability_session = Some(session.clone());
+        state.message = "please inspect the current changes".into();
+        state.messages = vec![json!({"role": "user", "content": state.message.clone()})];
+
+        let prepared = prepare_turn_iteration(&mut host, &mut state, 0)
+            .await
+            .expect("turn should prepare");
+
+        assert!(matches!(prepared, PreparedTurnIteration::Ready(_)));
+        let guard = astra_core::sync_poison::recover_rwlock_read(&session);
+        assert_eq!(guard.profile.current_scenario, Some(Scenario::CodeReview));
+    }
+
+    #[tokio::test]
+    async fn prepare_turn_iteration_infers_default_code_review_intent() {
+        let mut host = MockHost::new(Vec::new());
+        let hub = make_hub();
+        let session = make_session();
+        let mut state = make_state();
+        state.telemetry.observability_hub = Some(hub);
+        state.telemetry.observability_session = Some(session.clone());
+        state.message = "please inspect the current changes".into();
+        state.task_profile =
+            astra_turn_core::chat_turn_heuristics::infer_task_execution_profile(&state.message);
+        state.messages = vec![json!({"role": "user", "content": state.message.clone()})];
+
+        let prepared = prepare_turn_iteration(&mut host, &mut state, 0)
+            .await
+            .expect("turn should prepare");
+
+        assert!(matches!(prepared, PreparedTurnIteration::Ready(_)));
+        let guard = astra_core::sync_poison::recover_rwlock_read(&session);
+        assert_eq!(guard.profile.current_scenario, Some(Scenario::CodeReview));
+    }
+
+    #[tokio::test]
+    async fn prepare_turn_iteration_infers_default_quick_answer_intent() {
+        let mut host = MockHost::new(Vec::new());
+        let hub = make_hub();
+        let session = make_session();
+        let mut state = make_state();
+        state.telemetry.observability_hub = Some(hub);
+        state.telemetry.observability_session = Some(session.clone());
+        state.message = "where is the auth flow defined?".into();
+        state.task_profile =
+            astra_turn_core::chat_turn_heuristics::infer_task_execution_profile(&state.message);
+        state.messages = vec![json!({"role": "user", "content": state.message.clone()})];
+
+        let prepared = prepare_turn_iteration(&mut host, &mut state, 0)
+            .await
+            .expect("turn should prepare");
+
+        assert!(matches!(prepared, PreparedTurnIteration::Ready(_)));
+        let guard = astra_core::sync_poison::recover_rwlock_read(&session);
+        assert_eq!(guard.profile.current_scenario, Some(Scenario::QuickAnswer));
     }
 
     #[test]

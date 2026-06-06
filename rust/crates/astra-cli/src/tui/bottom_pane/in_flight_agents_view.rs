@@ -29,6 +29,29 @@ use super::view::{BottomPaneView, CancellationEvent};
 
 pub(crate) const AGENT_DRILLDOWN_SENTINEL: &str = "__agent_drilldown__\n";
 
+/// Sentinel emitted when the user presses `x` (or Delete) on a live row in
+/// the in-flight agents drill view. The outer event loop strips the
+/// prefix and routes to the spawner's `cancel_agent` API.
+///
+/// Why a separate sentinel from drilldown: cancellation is irreversible
+/// — surfacing it through the same channel as drilldown ("open this
+/// agent") would conflate intent and risk a UI race where the user's
+/// cursor was off-by-one when they pressed Enter on a row that was
+/// about to fail. Distinct sentinels make the intent legible at the
+/// dispatch layer and at the test boundary.
+pub(crate) const AGENT_KILL_SENTINEL: &str = "__agent_kill__\n";
+
+/// Strip the kill sentinel and return the agent_id, with the same
+/// trailing-newline defensive trim as `parse_drilldown_sentinel`.
+pub(crate) fn parse_kill_sentinel(s: &str) -> Option<&str> {
+    s.strip_prefix(AGENT_KILL_SENTINEL)
+        .map(|rest| {
+            let rest = rest.trim_start_matches('\n');
+            rest.split_once('\n').map(|(id, _)| id).unwrap_or(rest)
+        })
+        .filter(|id| !id.is_empty())
+}
+
 /// Strip the drill-in sentinel and return the agent_id, defensively
 /// trimming after the first newline so a malformed id can't carry
 /// trailing garbage. Returns `None` when the input doesn't match.
@@ -93,13 +116,26 @@ pub(crate) struct AgentRow {
     pub status: AgentRowStatus,
 }
 
+/// What action the view emitted on completion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AcceptedAction {
+    /// User pressed Enter — drill into the agent's detail view.
+    Drilldown(String),
+}
+
 pub(crate) struct InFlightAgentsView {
     rows: Vec<AgentRow>,
     live_count: usize,
     failed_count: usize,
     selected: usize,
     completed: bool,
-    accepted_id: Option<String>,
+    accepted: Option<AcceptedAction>,
+    /// Sentinel queued by a non-terminating action (currently `x`/Delete →
+    /// kill). Drained by `take_pending_action`. The view stays open after
+    /// emitting so the user observes the row transition Live →
+    /// Cancelling → Cancelled in real time and can kill additional rows
+    /// without re-opening Ctrl+G.
+    pending_action: Option<String>,
 }
 
 impl InFlightAgentsView {
@@ -111,7 +147,8 @@ impl InFlightAgentsView {
             failed_count,
             selected: 0,
             completed: false,
-            accepted_id: None,
+            accepted: None,
+            pending_action: None,
         }
     }
 
@@ -168,8 +205,28 @@ impl InFlightAgentsView {
 
     fn accept(&mut self) {
         if let Some(row) = self.rows.get(self.selected) {
-            self.accepted_id = Some(row.agent_id.clone());
+            self.accepted = Some(AcceptedAction::Drilldown(row.agent_id.clone()));
             self.completed = true;
+        }
+    }
+
+    /// User pressed `x` (or Delete) on the selected row.
+    ///
+    /// Queues a kill sentinel as a *pending action* — the dispatcher
+    /// drains it via `take_pending_action` and routes to the spawner /
+    /// task service, but the view STAYS OPEN. That way the user sees
+    /// the row transition Live → Cancelling → Cancelled in real time
+    /// and can kill additional rows without re-opening Ctrl+G.
+    ///
+    /// Only fires when the row is actually killable (Live or already
+    /// Cancelling). Terminal rows (Completed / Failed / Cancelled) do
+    /// nothing — there's nothing to kill, and an inert keypress should
+    /// not silently dismiss the view.
+    fn request_kill(&mut self) {
+        if let Some(row) = self.rows.get(self.selected)
+            && row.status.is_live()
+        {
+            self.pending_action = Some(format!("{AGENT_KILL_SENTINEL}{}", row.agent_id));
         }
     }
 }
@@ -299,6 +356,10 @@ impl BottomPaneView for InFlightAgentsView {
             KeyCode::End if !self.rows.is_empty() => self.selected = self.rows.len() - 1,
             KeyCode::Char(ch) if ('1'..='9').contains(&ch) => self.select_number(ch as u8 - b'0'),
             KeyCode::Enter => self.accept(),
+            // Kill the selected live agent. `x` is the conventional
+            // "kill"/"close" gesture in dashboard-style TUIs; `Delete`
+            // is the keyboard-discoverable equivalent.
+            KeyCode::Char('x') | KeyCode::Char('X') | KeyCode::Delete => self.request_kill(),
             KeyCode::Esc | KeyCode::Left | KeyCode::Char('q') => {
                 self.completed = true;
             }
@@ -315,16 +376,19 @@ impl BottomPaneView for InFlightAgentsView {
     }
 
     fn completion(&self) -> Option<super::view::ViewCompletion> {
-        if self.completed {
-            self.accepted_id
-                .as_ref()
-                .map(|id| super::view::ViewCompletion {
-                    result: Some(format!("{AGENT_DRILLDOWN_SENTINEL}{id}")),
-                    reopen: None,
-                })
-        } else {
-            None
+        if !self.completed {
+            return None;
         }
+        match self.accepted.as_ref()? {
+            AcceptedAction::Drilldown(id) => Some(super::view::ViewCompletion {
+                result: Some(format!("{AGENT_DRILLDOWN_SENTINEL}{id}")),
+                reopen: None,
+            }),
+        }
+    }
+
+    fn take_pending_action(&mut self) -> Option<String> {
+        self.pending_action.take()
     }
 
     fn on_ctrl_c(&mut self) -> CancellationEvent {
@@ -342,7 +406,7 @@ impl BottomPaneView for InFlightAgentsView {
     }
 
     fn hint_keys(&self) -> Option<String> {
-        Some("↑↓/Pg select · 1-9 jump · Enter open · Esc/←/q back".into())
+        Some("↑↓/Pg select · 1-9 jump · Enter open · x/Del kill · Esc/←/q back".into())
     }
 }
 
@@ -424,6 +488,140 @@ mod tests {
             completion.result.as_deref(),
             Some("__agent_drilldown__\nagent-1")
         );
+    }
+
+    /// `x` on a Live row emits the kill sentinel as a *pending action*
+    /// — the view STAYS OPEN so the user keeps watching the row
+    /// transition Live → Cancelling → Cancelled, and can kill more
+    /// agents in the same Ctrl+G session without re-opening the view.
+    ///
+    /// Pre-fix: `x` set `completed=true`, dropping the user back into
+    /// the chat with no visibility into whether the cancel landed.
+    #[test]
+    fn x_on_live_row_emits_kill_sentinel_via_pending_action_and_stays_open() {
+        let mut v = InFlightAgentsView::new(rows(3));
+        v.handle_key(key(KeyCode::Down));
+        v.handle_key(key(KeyCode::Char('x')));
+
+        let pending = v.take_pending_action();
+        assert_eq!(
+            pending.as_deref(),
+            Some("__agent_kill__\nagent-1"),
+            "x on live row must emit kill sentinel as a pending action"
+        );
+        // Drained: a second poll returns None.
+        assert!(v.take_pending_action().is_none());
+        // Critical: the view is NOT complete — the user keeps watching.
+        assert!(
+            !v.is_complete(),
+            "x on live row must NOT close the drill view"
+        );
+        assert!(
+            v.completion().is_none(),
+            "view must not produce a completion until the user explicitly dismisses"
+        );
+    }
+
+    #[test]
+    fn delete_key_also_emits_kill_sentinel_via_pending_action() {
+        let mut v = InFlightAgentsView::new(rows(2));
+        v.handle_key(key(KeyCode::Delete));
+        let pending = v.take_pending_action();
+        assert_eq!(pending.as_deref(), Some("__agent_kill__\nagent-0"));
+        assert!(!v.is_complete());
+    }
+
+    #[test]
+    fn x_on_terminal_row_is_inert_and_keeps_view_open() {
+        // Pressing x on a row that already finished (Completed/Failed/
+        // Cancelled) must NOT emit a kill AND must not close the view.
+        let mut rows = rows(3);
+        rows[0].status = AgentRowStatus::Completed;
+        rows[1].status = AgentRowStatus::Failed;
+        rows[2].status = AgentRowStatus::Cancelled;
+        let mut v = InFlightAgentsView::new(rows);
+        for _ in 0..3 {
+            v.handle_key(key(KeyCode::Char('x')));
+            v.handle_key(key(KeyCode::Down));
+        }
+        assert!(
+            !v.is_complete(),
+            "x on terminal rows must not complete view"
+        );
+        assert!(v.take_pending_action().is_none());
+    }
+
+    #[test]
+    fn x_on_cancelling_row_re_issues_kill() {
+        // Re-pressing x while a row is mid-cancel is harmless and gives
+        // the user a way to nudge a stuck cancel — emit again, view
+        // stays open.
+        let mut rs = rows(2);
+        rs[0].status = AgentRowStatus::Cancelling;
+        let mut v = InFlightAgentsView::new(rs);
+        v.handle_key(key(KeyCode::Char('x')));
+        let pending = v.take_pending_action();
+        assert_eq!(pending.as_deref(), Some("__agent_kill__\nagent-0"));
+        assert!(!v.is_complete());
+    }
+
+    #[test]
+    fn x_can_be_invoked_repeatedly_in_the_same_session() {
+        // Multiple kills in one Ctrl+G session.
+        let mut v = InFlightAgentsView::new(rows(3));
+        v.handle_key(key(KeyCode::Char('x'))); // selected=0
+        let p1 = v.take_pending_action();
+        assert_eq!(p1.as_deref(), Some("__agent_kill__\nagent-0"));
+        assert!(!v.is_complete());
+
+        v.handle_key(key(KeyCode::Down));
+        v.handle_key(key(KeyCode::Char('x'))); // selected=1
+        let p2 = v.take_pending_action();
+        assert_eq!(p2.as_deref(), Some("__agent_kill__\nagent-1"));
+        assert!(!v.is_complete());
+    }
+
+    #[test]
+    fn esc_closes_view_after_kill() {
+        // After a kill, Esc still cleanly dismisses the view.
+        let mut v = InFlightAgentsView::new(rows(2));
+        v.handle_key(key(KeyCode::Char('x')));
+        let _ = v.take_pending_action();
+        v.handle_key(key(KeyCode::Esc));
+        assert!(v.is_complete());
+        assert!(v.completion().is_none());
+    }
+
+    #[test]
+    fn enter_after_kill_drills_into_selected_row() {
+        // Enter after kill must still open detail view.
+        let mut v = InFlightAgentsView::new(rows(3));
+        v.handle_key(key(KeyCode::Down));
+        v.handle_key(key(KeyCode::Char('x')));
+        let _ = v.take_pending_action();
+        v.handle_key(key(KeyCode::Enter));
+        assert!(v.is_complete());
+        let completion = v.completion().unwrap();
+        assert_eq!(
+            completion.result.as_deref(),
+            Some("__agent_drilldown__\nagent-1")
+        );
+    }
+
+    #[test]
+    fn parse_kill_sentinel_extracts_id() {
+        let s = format!("{AGENT_KILL_SENTINEL}reviewer@abc12345");
+        assert_eq!(parse_kill_sentinel(&s), Some("reviewer@abc12345"));
+        assert_eq!(parse_kill_sentinel("not a sentinel"), None);
+        assert_eq!(parse_kill_sentinel(AGENT_KILL_SENTINEL), None);
+    }
+
+    #[test]
+    fn drilldown_and_kill_sentinels_are_disjoint() {
+        // The two sentinels MUST share no prefix — otherwise a parser
+        // bug could route a kill to drilldown or vice versa.
+        assert!(!AGENT_DRILLDOWN_SENTINEL.starts_with(AGENT_KILL_SENTINEL));
+        assert!(!AGENT_KILL_SENTINEL.starts_with(AGENT_DRILLDOWN_SENTINEL));
     }
 
     /// Ctrl+C dismisses the view without producing a selection.

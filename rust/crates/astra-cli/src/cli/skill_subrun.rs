@@ -36,8 +36,8 @@ use serde_json::{Value, json};
 
 use super::effects::ChatTurnPrepLineGuard;
 use super::permission_manager::{PermissionManager, PermissionMode};
-use super::stream_render::{EdgeSseContext, RenderPolicy, consume_turn_sse};
 use crate::cli::chat_stream::turn_policy_from_payload_edge_tools;
+use crate::cli::stream::stream_render::{EdgeSseContext, RenderPolicy, consume_turn_sse};
 use crate::edge_tools;
 
 const SUBRUN_MAX_TURNS: usize = 25;
@@ -429,7 +429,12 @@ impl AgenticLoopHost for SubRunHost {
                     ..Default::default()
                 });
                 let events = buf.drain();
-                let _ = journal.append_bulk_no_sync(&events);
+                crate::cli::cli_utils::append_bulk_journal_events_no_sync_or_warn(
+                    journal,
+                    state.current_session_id.as_deref(),
+                    &events,
+                    "skill_subrun:flush_round_events",
+                );
             }
         }
     }

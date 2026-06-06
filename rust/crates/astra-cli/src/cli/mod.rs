@@ -35,12 +35,7 @@ pub mod app_server;
 pub mod arg_render;
 pub mod auth_flow;
 pub mod chat_stream;
-pub mod chat_turn;
-pub mod cli_args;
-pub mod cli_context;
-pub mod cli_formatting;
-pub mod cli_output;
-pub mod cli_utils;
+pub mod cli_config;
 pub mod cloud_sync;
 pub mod command_registry;
 pub mod command_router;
@@ -67,86 +62,77 @@ pub mod journal_tree;
 pub mod mcp_config;
 pub mod mock_llm;
 pub mod notifications;
+pub mod one_shot_session_routing;
 pub mod permission_manager;
-pub mod plan_commands;
-pub mod plan_executor;
-pub mod plan_lifecycle;
-pub mod plan_monitor;
-pub mod plan_runtime;
-pub mod plan_task_board;
+pub mod plan;
 pub mod preferences_client;
 pub mod project_instructions;
 pub mod self_command;
-pub mod session_cleanup;
-pub mod session_continuation;
-pub mod session_guard;
-pub mod session_runtime;
-pub mod session_startup;
-pub mod session_state;
-pub mod session_todo_client;
+pub mod session;
 pub mod skill_catalog;
 pub mod skill_subrun;
-pub mod slash_account;
-pub mod slash_agent;
-pub mod slash_bug;
-pub mod slash_cache;
-pub mod slash_config;
-pub mod slash_debug;
-pub mod slash_health;
-pub mod slash_info;
-pub mod slash_inspect;
-pub mod slash_mcp;
-pub mod slash_memory;
-pub mod slash_messaging;
-pub mod slash_plan;
-pub mod slash_profile;
-pub mod slash_router;
-pub mod slash_session;
-pub mod slash_skill;
-pub mod slash_state;
-pub mod slash_stats;
-pub mod slash_sync;
-pub mod slash_task;
-pub mod slash_team;
-pub mod slash_telemetry;
-pub mod slash_tools;
+pub mod slash;
 pub mod spawn_subrun;
 pub mod sse_utils;
 pub mod startup_trace;
-pub mod stream_events_writer;
-pub mod stream_render;
-pub mod streaming_md;
-pub mod streaming_types;
-pub mod task_summary;
+pub mod stream;
+pub mod surface;
+pub mod task;
 pub mod terminal_hyperlinks;
 pub mod terminal_region;
 pub mod theme;
 pub mod tool_call_groups;
-pub mod turn_facade;
+pub mod tool_result_status;
+pub mod turn;
 pub mod ui_adapter;
 pub mod workspace_trust;
 
-// ── Re-export all pub(crate) items so sibling modules see them via `use super::*` ──
-pub(crate) use self::agent_runtime::*;
-pub(crate) use self::auth_flow::*;
-pub(crate) use self::chat_stream::*;
-pub(crate) use self::chat_turn::*;
-pub(crate) use self::cli_args::*;
-pub(crate) use self::cli_utils::*;
-pub(crate) use self::cloud_sync::*;
-pub(crate) use self::edge_lifecycle::*;
-pub(crate) use self::permission_manager::*;
-pub(crate) use self::project_instructions::*;
-pub(crate) use self::session_runtime::*;
-pub(crate) use self::session_state::*;
-pub(crate) use self::slash_account::*;
-pub(crate) use self::slash_bug::*;
-pub(crate) use self::slash_debug::*;
-pub(crate) use self::slash_info::*;
-pub(crate) use self::slash_memory::*;
-pub(crate) use self::slash_messaging::*;
-pub(crate) use self::slash_session::*;
-pub(crate) use self::slash_skill::*;
-pub(crate) use self::slash_state::*;
-pub(crate) use self::startup_trace::*;
-pub(crate) use self::streaming_types::*;
+pub(crate) use self::agent_runtime::initialize_multi_agent_runtime;
+pub(crate) use self::auth_flow::{
+    do_login, do_register, is_auth_error, is_llm_provider_auth_error,
+};
+pub(crate) use self::chat_stream::{
+    ApprovalRequestTx, AskUserRequestTx, ChatTurnParams, PlanReviewRequestTx, StreamEvent,
+    StreamEventTx, stream_chat_sse,
+};
+pub(crate) use self::cli_config::cli_args;
+pub(crate) use self::cli_config::cli_args::JournalDigestArgs;
+pub(crate) use self::cli_config::cli_context;
+pub(crate) use self::cli_config::cli_output;
+pub(crate) use self::cli_config::cli_utils;
+pub(crate) use self::cli_config::cli_utils::{
+    SessionResumePreflight, clear_profile_last_session_if_matches_or_warn, compact_or_raw,
+    credential_store, get_profile_and_token, interactive_select, load_credentials, map_thin_err,
+    normalize_model_override, persist_profile_last_session_or_warn,
+    persist_profile_memoria_api_key, prefix_chars, preflight_remote_resume_session,
+    print_json_or_raw, profile_name, prompt_or, prompt_password_masked, truncate_str, urlencoding,
+};
+pub(crate) use self::cloud_sync::{
+    append_cloud_pull_sync_journal, try_cloud_pull, try_cloud_pull_preferences,
+};
+pub(crate) use self::edge_lifecycle::register_and_start_heartbeat;
+pub(crate) use self::permission_manager::PermissionManager;
+pub(crate) use self::plan::{
+    plan_commands, plan_executor, plan_lifecycle, plan_runtime, plan_task_board,
+};
+pub(crate) use self::project_instructions::discover_project_instructions;
+pub(crate) use self::session::session_runtime;
+pub(crate) use self::session::session_runtime::print_session_banner;
+pub(crate) use self::session::session_state;
+pub(crate) use self::session::session_state::{ContinuationAnchor, ExplainMode, SessionState};
+pub(crate) use self::session::{
+    session_checkpointing, session_compaction, session_continuation, session_input,
+    session_lessons, session_projection, session_recovery, session_restore_client,
+    session_side_effects, session_startup, session_stats_scan, session_todo_client,
+};
+pub(crate) use self::slash::{
+    slash_agent, slash_config, slash_info, slash_inspect, slash_mcp, slash_memory, slash_plan,
+    slash_router, slash_session, slash_stats, slash_task, slash_team, slash_telemetry,
+};
+pub(crate) use self::startup_trace::StartupTracer;
+pub(crate) use self::stream::stream_render;
+pub(crate) use self::stream::streaming_types::StreamResult;
+pub(crate) use self::stream::{stream_events_writer, streaming_md, streaming_types};
+pub(crate) use self::surface::{run_status_surface, task_checkpoint_surface};
+pub(crate) use self::task::{task_result_projection, task_summary};
+pub(crate) use self::turn::{turn_entry, turn_facade};

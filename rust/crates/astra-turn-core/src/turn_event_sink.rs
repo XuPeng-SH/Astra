@@ -245,7 +245,7 @@ impl IncrementalTurnState {
 
 /// Helper: lock a mutex, recovering from poison if the previous holder panicked.
 fn unwrap_lock<T>(mu: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mu.lock().unwrap_or_else(|e| e.into_inner())
+    astra_core::sync_poison::recover_mutex_lock(mu)
 }
 
 #[cfg(test)]
@@ -463,7 +463,10 @@ mod tests {
         // Poison the partial_text mutex by panicking while holding the lock.
         let state_clone = state.clone();
         let handle = std::thread::spawn(move || {
-            let _guard = state_clone.partial_text.lock().unwrap();
+            let _guard = state_clone
+                .partial_text
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             panic!("deliberate poison");
         });
         let _ = handle.join(); // thread panicked → mutex is poisoned

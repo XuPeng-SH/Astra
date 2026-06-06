@@ -594,10 +594,18 @@ mod tests {
                 let allow_stale_check_rx = allow_stale_check_rx.clone();
                 move || {
                     if stale_checks.fetch_add(1, Ordering::SeqCst) == 0 {
-                        if let Some(tx) = stale_check_started_tx.lock().unwrap().take() {
+                        if let Some(tx) = stale_check_started_tx
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .take()
+                        {
                             tx.send(()).unwrap();
                         }
-                        allow_stale_check_rx.lock().unwrap().recv().unwrap();
+                        allow_stale_check_rx
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .recv()
+                            .unwrap();
                     }
                     now.load(Ordering::SeqCst)
                 }

@@ -1,0 +1,1745 @@
+//! Plan execution progress rendering and blocking monitor loop.
+
+use super::*;
+use crate::cli::chat_stream;
+use crate::cli::cli_config::cli_formatting;
+use crate::cli::cli_config::cli_utils::append_journal_event_or_warn;
+use crate::cli::durable_bridge;
+use crate::cli::effects;
+use crate::cli::session::session_state::SessionState;
+use crate::cli::stream::stream_render;
+use crate::cli::stream::streaming_md;
+use crate::cli::theme;
+use crate::cli::tool_result_status::tool_result_status_icon;
+use crossterm::style::Stylize;
+
+/// Shown after Ctrl+C pauses plan auto-execution (interrupt is not sent to the model).
+fn eprint_plan_execution_paused_hints() {
+    eprintln!("{}", "  What you can do:".dim());
+    eprintln!(
+        "    {}",
+        "Slash lines keep the paused plan in memory so you can inspect or edit it.".dim()
+    );
+    eprintln!(
+        "    {}",
+        "After edits, start execution again from the current plan state.".dim()
+    );
+    eprintln!(
+        "    {}",
+        "Any other message — abandons the paused run and sends a normal chat turn".dim()
+    );
+    eprintln!(
+        "    {}",
+        "correct … / note … / adjust … — stack guidance for the next run (correct clear to drop)"
+            .dim()
+    );
+    eprintln!(
+        "    {}",
+        "rewind N · restart N · redo from N — reset step N and all later steps (1-based list order)"
+            .dim()
+    );
+    eprintln!(
+        "    {}",
+        "rewind <id-prefix> — same, anchored by subtask id (prefix must match exactly one id)"
+            .dim()
+    );
+}
+
+/// Format a progress bar line for plan execution.
+///
+/// Example: `[████████░░░░] 3/7 (42%) · ~2m14s remaining`
+pub(crate) fn format_plan_progress(
+    done: usize,
+    total: usize,
+    avg_duration: Option<std::time::Duration>,
+    elapsed: std::time::Duration,
+) -> String {
+    let bar_width = 16;
+    let pct = if total > 0 {
+        (done as f64 / total as f64 * 100.0) as u32
+    } else {
+        0
+    };
+    let filled = (done * bar_width).checked_div(total).unwrap_or(0);
+    let empty = bar_width - filled;
+    let bar = format!("{}{}", "█".repeat(filled), "░".repeat(empty),);
+
+    let elapsed_str = format_duration_short(elapsed);
+
+    let eta_str = if done > 0 {
+        if let Some(avg) = avg_duration {
+            let remaining = total.saturating_sub(done);
+            let eta = avg * remaining as u32;
+            format!(" · ~{} remaining", format_duration_short(eta))
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
+    format!("[{bar}] {done}/{total} ({pct}%) · {elapsed_str} elapsed{eta_str}")
+}
+
+/// Format a Duration as a short human-readable string (e.g., "1m32s", "45s", "2h5m").
+pub(crate) fn format_duration_short(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    if secs >= 3600 {
+        let h = secs / 3600;
+        let m = (secs % 3600) / 60;
+        format!("{h}h{m}m")
+    } else if secs >= 60 {
+        let m = secs / 60;
+        let s = secs % 60;
+        format!("{m}m{s}s")
+    } else {
+        format!("{secs}s")
+    }
+}
+
+/// Emit a structured plan-lifecycle journal event with common counters.
+///
+/// Takes individual field refs instead of `&SessionState` so callers inside
+/// `while let Some(update) = handle.try_recv()` (which holds a mutable
+/// borrow on `state.plan_handle`) can still call this without conflicting.
+fn emit_plan_lifecycle_event(
+    journal: Option<&astra_services::session_journal::JournalWriter>,
+    session_id: Option<&str>,
+    executing_plan: Option<&astra_services::task_orchestrator::TaskPlan>,
+    description: &str,
+    stage: &str,
+    mut extra: serde_json::Map<String, serde_json::Value>,
+) {
+    if let Some(journal) = journal {
+        let (items_done, items_total) =
+            executing_plan.map_or((0, 0), |p| (p.items_done(), p.subtasks.len() as u32));
+        extra.insert(
+            "stage".to_string(),
+            serde_json::Value::String(stage.to_string()),
+        );
+        extra.insert("items_done".to_string(), serde_json::json!(items_done));
+        extra.insert("items_total".to_string(), serde_json::json!(items_total));
+        let event = astra_services::session_journal::JournalEvent::plan_lifecycle(
+            session_id,
+            description,
+            Some(serde_json::Value::Object(extra)),
+        );
+        append_journal_event_or_warn(journal, session_id, &event, "plan_monitor:emit_plan_event");
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlanMonitorOutcome {
+    /// Normal drain — more updates may follow.
+    Continue,
+    /// `PlanPaused` received — return control to the caller with the current plan intact.
+    Paused,
+    /// `PlanFinished` or `PlanError` received — executor has exited.
+    Finished,
+}
+
+/// Wrapper enum for the different spinner types used in plan mode.
+/// Provides a uniform interface so the plan monitor can swap spinner styles.
+enum PlanSpinner {
+    /// Plan-specific spinner: `[subtask] Ns Label ⣾`
+    Activity(effects::PlanActivitySpinner),
+    /// Chat-style TTFT spinner: `Ns Waiting for stream ⣾`
+    Ttft(effects::TtftWaitLineSpinner),
+    /// Chat-style tool spinner: `Ns Running… description ⣾`
+    Tool(effects::ToolRunningLineSpinner),
+}
+
+impl PlanSpinner {
+    fn stop_clear(self) {
+        match self {
+            Self::Activity(s) => s.stop_clear(),
+            Self::Ttft(s) => s.stop_clear(),
+            Self::Tool(s) => s.stop_clear(),
+        }
+    }
+}
+
+/// Drain plan updates from the executor channel and display them via
+/// `eprintln!`. Returns the monitor outcome so the caller can decide
+/// whether to keep polling.
+fn display_plan_updates_live(
+    state: &mut SessionState,
+    plan_spinner: &mut Option<PlanSpinner>,
+    current_subtask_tag: &mut String,
+) -> PlanMonitorOutcome {
+    use crate::cli::plan::plan_executor::PlanUpdate;
+    let mut outcome = PlanMonitorOutcome::Continue;
+
+    /// Finish any in-flight markdown stream: clear spinner, finalize renderer, newline.
+    fn finalize_plan_stream(
+        in_stream: &mut bool,
+        spinner: &mut Option<PlanSpinner>,
+        md: &mut Option<streaming_md::StreamingMarkdown>,
+        thinking_pane: &mut Option<effects::ThinkingPreviewPane>,
+    ) {
+        // Finalize thinking pane before any other output
+        if let Some(mut pane) = thinking_pane.take() {
+            let summary = pane.summary_line();
+            pane.clear();
+            eprintln!("{summary}");
+        }
+        if *in_stream {
+            *in_stream = false;
+            if let Some(s) = spinner.take() {
+                s.stop_clear();
+            }
+            if let Some(renderer) = md {
+                renderer.finish();
+            }
+            *md = None;
+            eprintln!();
+        }
+    }
+
+    /// Clear active plan spinner (if any), finalize token/md stream, then print a line.
+    fn print_plan_monitor_line(
+        spinner: &mut Option<PlanSpinner>,
+        in_stream: &mut bool,
+        md: &mut Option<streaming_md::StreamingMarkdown>,
+        thinking_pane: &mut Option<effects::ThinkingPreviewPane>,
+        msg: String,
+    ) {
+        finalize_plan_stream(in_stream, spinner, md, thinking_pane);
+        if let Some(s) = spinner.take() {
+            s.stop_clear();
+        }
+        eprintln!("{msg}");
+    }
+
+    let handle = match state.plan_handle.as_mut() {
+        Some(h) => h,
+        None => return outcome,
+    };
+
+    while let Some(update) = handle.try_recv() {
+        enum PostSpinner {
+            None,
+            Ttft,
+            Tool(String),
+            Activity(String),
+        }
+        let (msg, post_spinner): (String, PostSpinner) = match update {
+            PlanUpdate::SubtaskStarted {
+                id,
+                title,
+                index,
+                total,
+                ..
+            } => {
+                *current_subtask_tag = id;
+                (
+                    format!(
+                        "\n  {} {} {}",
+                        format!("▸ [{index}/{total}]").bold().magenta(),
+                        title.bold(),
+                        ""
+                    ),
+                    PostSpinner::Ttft,
+                )
+            }
+            PlanUpdate::SubtaskCompleted {
+                id,
+                verification_passed,
+                elapsed,
+                ..
+            } => {
+                let dur = elapsed
+                    .map(|d| format!(" ({})", format_duration_short(d)))
+                    .unwrap_or_default();
+                if verification_passed {
+                    (
+                        format!(
+                            "  {} {} {}{}",
+                            theme::icon_ok(),
+                            "done".bold(),
+                            id.dim(),
+                            dur.dim()
+                        ),
+                        PostSpinner::Activity("Next subtask".to_string()),
+                    )
+                } else {
+                    (
+                        format!(
+                            "  {} {} — {}{}",
+                            theme::icon_warn(),
+                            id,
+                            "verification failed".yellow(),
+                            dur.dim()
+                        ),
+                        PostSpinner::Activity("Next subtask".to_string()),
+                    )
+                }
+            }
+            PlanUpdate::SubtaskTurnResult {
+                subtask_id,
+                prompt_tokens,
+                completion_tokens,
+                session_id,
+                ..
+            } => {
+                state.total_prompt_tokens += prompt_tokens;
+                state.total_completion_tokens += completion_tokens;
+                state.turn += 1;
+                state.current_plan_subtask_id = Some(subtask_id);
+                if let Some(sid) = session_id {
+                    if state.session_id.is_none() {
+                        state.task_manager.rebind(&sid);
+                        state.session_id = Some(sid);
+                    }
+                }
+                continue;
+            }
+            PlanUpdate::SubtaskStatusSync { id, status } => {
+                if let Some(ref mut plan) = state.executing_plan {
+                    if let Some(st) = plan.subtasks.iter_mut().find(|s| s.id == id) {
+                        st.status = status;
+                    }
+                }
+                if let Some(ref mut ps) = state.cloud_plan_mirror {
+                    if let Some(st) = ps.plan.subtasks.iter_mut().find(|s| s.id == id) {
+                        st.status = status;
+                    }
+                }
+                continue;
+            }
+            PlanUpdate::DurableStateReturn(durable) => {
+                state.durable_task_state = Some(*durable);
+                continue;
+            }
+            PlanUpdate::PlanProgress {
+                done,
+                total,
+                elapsed,
+                eta,
+            } => {
+                if state.plan_run_task_id.is_some() {
+                    let pct = (done * 100).checked_div(total).unwrap_or(0) as u32;
+                    state.plan_run_task_last_progress = Some((pct, done as u32, total as u32));
+                }
+                if let Some(PlanSpinner::Activity(spinner)) = plan_spinner.as_ref() {
+                    spinner.set_eta_secs(eta.map(|d| d.as_secs()).unwrap_or(0));
+                }
+                let _ = (elapsed, eta);
+                continue;
+            }
+            PlanUpdate::PlanFinished {
+                pct,
+                elapsed,
+                outcome,
+            } => {
+                if let Some(s) = plan_spinner.take() {
+                    s.stop_clear();
+                }
+                if state.plan_run_task_id.is_some() {
+                    let progress = state
+                        .executing_plan
+                        .as_ref()
+                        .map(|plan| (plan.items_done(), plan.subtasks.len() as u32))
+                        .or_else(|| {
+                            state
+                                .plan_run_task_last_progress
+                                .map(|(_, done, total)| (done, total))
+                        });
+                    if let Some((done, total)) = progress {
+                        state.plan_run_task_last_progress = Some((pct, done, total));
+                    }
+                    state.plan_run_task_last_outcome = Some(outcome);
+                }
+                if let Some(mut h) = state.plan_handle.take() {
+                    while let Some(trailing) = h.try_recv() {
+                        apply_trailing_update(trailing, state);
+                    }
+                }
+                // R3: emit structured journal event for plan completion.
+                let mut extra = serde_json::Map::new();
+                extra.insert(
+                    "elapsed_ms".to_string(),
+                    serde_json::json!(elapsed.as_millis() as u64),
+                );
+                extra.insert("pct".to_string(), serde_json::json!(pct));
+                extra.insert("outcome".to_string(), serde_json::json!(outcome.as_str()));
+                let (description, stage, msg, completion_hint) = match outcome {
+                    astra_services::task_orchestrator::TaskOutcome::Success => (
+                        "Plan execution completed",
+                        "completed",
+                        format!(
+                            "\n🏁  Plan complete — {pct}% verified in {}",
+                            format_duration_short(elapsed),
+                        ),
+                        "  ✓ Plan completed! Type exit for normal chat, or describe next goal."
+                            .to_string(),
+                    ),
+                    astra_services::task_orchestrator::TaskOutcome::Partial => (
+                        "Plan execution finished with verification failures",
+                        "partial",
+                        format!(
+                            "\n{}  Plan finished with verification failures — {pct}% verified in {}",
+                            theme::icon_warn(),
+                            format_duration_short(elapsed),
+                        ),
+                        "  ⚠ Plan finished with verification failures. Inspect /report, type exit, or describe next goal."
+                            .to_string(),
+                    ),
+                    astra_services::task_orchestrator::TaskOutcome::Failed => (
+                        "Plan execution finished as failed",
+                        "failed",
+                        format!(
+                            "\n{}  Plan finished as failed after {}",
+                            theme::icon_err(),
+                            format_duration_short(elapsed),
+                        ),
+                        "  ✗ Plan finished as failed. Inspect /report, adjust the plan, or exit plan mode."
+                            .to_string(),
+                    ),
+                    astra_services::task_orchestrator::TaskOutcome::Cancelled => (
+                        "Plan execution finished as cancelled",
+                        "cancelled",
+                        format!(
+                            "\n{}  Plan cancelled after {}",
+                            theme::icon_warn(),
+                            format_duration_short(elapsed),
+                        ),
+                        "  ⏹ Plan cancelled. Type exit for normal chat, or describe next goal."
+                            .to_string(),
+                    ),
+                };
+                emit_plan_lifecycle_event(
+                    state.journal.as_ref(),
+                    state.session_id.as_deref(),
+                    state.executing_plan.as_ref(),
+                    description,
+                    stage,
+                    extra,
+                );
+                state.executing_plan = None;
+                state.current_plan_subtask_id = None;
+                if let Some(tx) = state.pending_approval.take() {
+                    let _ = tx.send(crate::cli::chat_stream::ApprovalResponse::Deny);
+                }
+                print_plan_monitor_line(
+                    plan_spinner,
+                    &mut state.plan_in_token_stream,
+                    &mut state.plan_md_renderer,
+                    &mut state.plan_thinking_pane,
+                    msg,
+                );
+                if let Some(ref report) = state.last_delivery_report {
+                    eprintln!();
+                    durable_bridge::display_delivery_report(report);
+                }
+                if state.plan_mode_active() {
+                    eprintln!();
+                    eprintln!("{}", completion_hint.dim());
+                }
+                return PlanMonitorOutcome::Finished;
+            }
+            PlanUpdate::PlanError { error } => {
+                state.plan_run_task_last_error = Some(error.clone());
+                state.plan_run_task_last_outcome = None;
+                if let Some(s) = plan_spinner.take() {
+                    s.stop_clear();
+                }
+                if let Some(mut h) = state.plan_handle.take() {
+                    while let Some(trailing) = h.try_recv() {
+                        apply_trailing_update(trailing, state);
+                    }
+                }
+                // R3: emit structured journal event for plan error.
+                let mut extra = serde_json::Map::new();
+                extra.insert("error".to_string(), serde_json::json!(error));
+                emit_plan_lifecycle_event(
+                    state.journal.as_ref(),
+                    state.session_id.as_deref(),
+                    state.executing_plan.as_ref(),
+                    "Plan execution failed",
+                    "error",
+                    extra,
+                );
+                let msg = format!("\n❌  Plan error: {error}");
+                state.executing_plan = None;
+                state.current_plan_subtask_id = None;
+                if let Some(tx) = state.pending_approval.take() {
+                    let _ = tx.send(crate::cli::chat_stream::ApprovalResponse::Deny);
+                }
+                print_plan_monitor_line(
+                    plan_spinner,
+                    &mut state.plan_in_token_stream,
+                    &mut state.plan_md_renderer,
+                    &mut state.plan_thinking_pane,
+                    msg,
+                );
+                if state.plan_mode_active() {
+                    eprintln!();
+                    eprintln!("{}  {}", "📋".magenta(), "Recovery options:".bold());
+                    eprintln!("{}", "    go          — run the current plan again".dim());
+                    eprintln!(
+                        "{}",
+                        "    rewind N    — reset subtask N and try again".dim()
+                    );
+                    eprintln!(
+                        "{}",
+                        "    correct ... — add guidance before the next run".dim()
+                    );
+                    eprintln!("{}", "    show        — display current plan state".dim());
+                    eprintln!("{}", "    exit        — leave plan mode".dim());
+                }
+                return PlanMonitorOutcome::Finished;
+            }
+            PlanUpdate::PlanPaused {
+                pct,
+                remaining,
+                elapsed,
+                blocked_ids,
+            } => {
+                outcome = PlanMonitorOutcome::Paused;
+                // Surface blocked ids when the executor supplies them so the
+                // user can see *which* subtasks are gating progress instead
+                // of just a count. Empty blocked_ids means a Ctrl+C / normal
+                // interrupt pause where the full pending queue is "remaining".
+                let base = format!(
+                    "\n⏸  Plan paused — {pct}% done, {remaining} remaining ({})",
+                    format_duration_short(elapsed),
+                );
+                let msg = if blocked_ids.is_empty() {
+                    base
+                } else {
+                    // Cap to a reasonable number so a 50-subtask deadlock
+                    // doesn't overflow the terminal.
+                    let shown: Vec<String> = blocked_ids.iter().take(8).cloned().collect();
+                    let suffix = if blocked_ids.len() > shown.len() {
+                        format!(" (+{} more)", blocked_ids.len() - shown.len())
+                    } else {
+                        String::new()
+                    };
+                    format!("{base}\n    blocked by: {}{suffix}", shown.join(", "))
+                };
+                // R3: emit structured journal event for plan pause.
+                let mut extra = serde_json::Map::new();
+                extra.insert(
+                    "elapsed_ms".to_string(),
+                    serde_json::json!(elapsed.as_millis() as u64),
+                );
+                extra.insert("pct".to_string(), serde_json::json!(pct));
+                extra.insert("remaining".to_string(), serde_json::json!(remaining));
+                extra.insert("blocked_ids".to_string(), serde_json::json!(blocked_ids));
+                emit_plan_lifecycle_event(
+                    state.journal.as_ref(),
+                    state.session_id.as_deref(),
+                    state.executing_plan.as_ref(),
+                    "Plan execution paused",
+                    "paused",
+                    extra,
+                );
+                (msg, PostSpinner::None)
+            }
+            PlanUpdate::JournalEvent(event) => {
+                if let Some(ref journal) = state.journal {
+                    append_journal_event_or_warn(
+                        journal,
+                        state.session_id.as_deref(),
+                        &event,
+                        "plan_monitor:update_journal_event",
+                    );
+                }
+                continue;
+            }
+            PlanUpdate::HistoryEntry {
+                user_msg,
+                assistant_msg,
+            } => {
+                state.history.push((user_msg, assistant_msg));
+                continue;
+            }
+            PlanUpdate::DeliveryReport(report) => {
+                state.last_delivery_report = Some(report);
+                continue;
+            }
+            PlanUpdate::VerificationReport(report) => {
+                finalize_plan_stream(
+                    &mut state.plan_in_token_stream,
+                    plan_spinner,
+                    &mut state.plan_md_renderer,
+                    &mut state.plan_thinking_pane,
+                );
+                if let Some(s) = plan_spinner.take() {
+                    s.stop_clear();
+                }
+                durable_bridge::display_verification_report(&report);
+                *plan_spinner = Some(PlanSpinner::Activity(effects::PlanActivitySpinner::start(
+                    current_subtask_tag,
+                    "Continuing",
+                )));
+                continue;
+            }
+            PlanUpdate::SubtaskRetry {
+                id,
+                retries_exhausted,
+                attempt,
+                max_retries,
+                failure_hint,
+                ..
+            } => {
+                let attempt_str = if max_retries > 0 {
+                    format!(" ({attempt}/{max_retries})")
+                } else {
+                    String::new()
+                };
+                let hint_str = failure_hint.map(|h| format!(": {h}")).unwrap_or_default();
+                if retries_exhausted {
+                    (
+                        format!("  ⚠ {id} — verification failed{attempt_str}{hint_str}"),
+                        PostSpinner::None,
+                    )
+                } else {
+                    (
+                        format!("  ↻ {id} — verification failed{attempt_str}{hint_str}, retrying…"),
+                        PostSpinner::Ttft,
+                    )
+                }
+            }
+            PlanUpdate::StreamingEvent { event, .. } => {
+                use chat_stream::StreamEvent;
+                match event {
+                    StreamEvent::ToolStarted {
+                        name, description, ..
+                    } => {
+                        let styled = stream_render::style_tool_description(&name, &description);
+                        (
+                            format!("  {} {} …", "⬢".magenta(), styled),
+                            PostSpinner::Tool(description),
+                        )
+                    }
+                    StreamEvent::AgentControlStarted { label, .. } => (
+                        format!("  {} Agent {label} …", "⬢".magenta()),
+                        PostSpinner::Tool(label),
+                    ),
+                    StreamEvent::ToolCompleted {
+                        name,
+                        description,
+                        status,
+                        duration_ms,
+                        output_summary,
+                        ..
+                    } => {
+                        let dur = cli_formatting::format_duration_suffix(duration_ms);
+                        let icon = tool_result_status_icon(&status);
+                        let styled = stream_render::style_tool_description(&name, &description);
+                        let summary = output_summary
+                            .map(|s| format!("\n    {}", s.dim()))
+                            .unwrap_or_default();
+                        (
+                            format!("  {icon} {styled}{}{summary}", dur.dim()),
+                            PostSpinner::None,
+                        )
+                    }
+                    StreamEvent::AskUserPrompted { prompt, .. } => (
+                        format!(
+                            "  {} Asking user ({} questions) …",
+                            "⬢".magenta(),
+                            prompt
+                                .get("prompt")
+                                .and_then(|value| value.get("question_count"))
+                                .and_then(|value| value.as_u64())
+                                .unwrap_or(0)
+                        ),
+                        PostSpinner::Tool("ask_user".into()),
+                    ),
+                    StreamEvent::AskUserResolved { resolution, .. } => (
+                        format!(
+                            "  {} ask_user {}",
+                            theme::icon_ok(),
+                            resolution
+                                .get("audit")
+                                .and_then(|value| value.get("response"))
+                                .and_then(|value| value.get("outcome"))
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("resolved")
+                        ),
+                        PostSpinner::None,
+                    ),
+                    StreamEvent::AgentControlCompleted {
+                        label,
+                        status,
+                        duration_ms,
+                        ..
+                    } => {
+                        let dur = cli_formatting::format_duration_suffix(duration_ms);
+                        let icon = tool_result_status_icon(&status);
+                        (
+                            format!("  {icon} Agent {label}{}", dur.dim()),
+                            PostSpinner::None,
+                        )
+                    }
+                    StreamEvent::WaitingForModel => {
+                        finalize_plan_stream(
+                            &mut state.plan_in_token_stream,
+                            plan_spinner,
+                            &mut state.plan_md_renderer,
+                            &mut state.plan_thinking_pane,
+                        );
+                        if let Some(s) = plan_spinner.take() {
+                            s.stop_clear();
+                        }
+                        *plan_spinner =
+                            Some(PlanSpinner::Ttft(effects::TtftWaitLineSpinner::start()));
+                        continue;
+                    }
+                    StreamEvent::ModelResponding => {
+                        finalize_plan_stream(
+                            &mut state.plan_in_token_stream,
+                            plan_spinner,
+                            &mut state.plan_md_renderer,
+                            &mut state.plan_thinking_pane,
+                        );
+                        if let Some(s) = plan_spinner.take() {
+                            s.stop_clear();
+                        }
+                        *plan_spinner =
+                            Some(PlanSpinner::Activity(effects::PlanActivitySpinner::start(
+                                current_subtask_tag,
+                                "Model responding",
+                            )));
+                        continue;
+                    }
+                    StreamEvent::Thinking(true) => {
+                        if state.plan_thinking_pane.is_none() {
+                            finalize_plan_stream(
+                                &mut state.plan_in_token_stream,
+                                plan_spinner,
+                                &mut state.plan_md_renderer,
+                                &mut state.plan_thinking_pane,
+                            );
+                            if let Some(s) = plan_spinner.take() {
+                                s.stop_clear();
+                            }
+                            use std::io::IsTerminal;
+                            let rows = effects::thinking_viewport_rows();
+                            let tw = crossterm::terminal::size()
+                                .map(|(w, _)| w as usize)
+                                .unwrap_or(80);
+                            if rows > 0 && std::io::stdout().is_terminal() {
+                                state.plan_thinking_pane =
+                                    Some(effects::ThinkingPreviewPane::new(rows, tw));
+                            } else {
+                                *plan_spinner = Some(PlanSpinner::Activity(
+                                    effects::PlanActivitySpinner::start(
+                                        current_subtask_tag,
+                                        "Thinking",
+                                    ),
+                                ));
+                            }
+                        }
+                        continue;
+                    }
+                    StreamEvent::ThinkingChunk(text) => {
+                        if let Some(ref mut pane) = state.plan_thinking_pane {
+                            pane.push_chunk(&text);
+                        }
+                        continue;
+                    }
+                    StreamEvent::Thinking(false) => {
+                        continue;
+                    }
+                    StreamEvent::Token(text) => {
+                        if let Some(mut pane) = state.plan_thinking_pane.take() {
+                            let summary = pane.summary_line();
+                            pane.clear();
+                            eprintln!("{summary}");
+                        }
+                        if !state.plan_in_token_stream {
+                            if let Some(s) = plan_spinner.take() {
+                                s.stop_clear();
+                            }
+                            state.plan_in_token_stream = true;
+                            let tw = crossterm::terminal::size()
+                                .map(|(w, _)| w as usize)
+                                .unwrap_or(80);
+                            state.plan_md_renderer = Some(streaming_md::StreamingMarkdown::new(tw));
+                        }
+                        if let Some(ref mut md) = state.plan_md_renderer {
+                            md.push(&text);
+                        }
+                        continue;
+                    }
+                    StreamEvent::StatusLine(line) => {
+                        finalize_plan_stream(
+                            &mut state.plan_in_token_stream,
+                            plan_spinner,
+                            &mut state.plan_md_renderer,
+                            &mut state.plan_thinking_pane,
+                        );
+                        if let Some(s) = plan_spinner.take() {
+                            s.stop_clear();
+                        }
+                        eprintln!("    {line}");
+                        continue;
+                    }
+                    StreamEvent::PermissionAutoApproved { tool, reason } => {
+                        finalize_plan_stream(
+                            &mut state.plan_in_token_stream,
+                            plan_spinner,
+                            &mut state.plan_md_renderer,
+                            &mut state.plan_thinking_pane,
+                        );
+                        if let Some(s) = plan_spinner.take() {
+                            s.stop_clear();
+                        }
+                        eprintln!(
+                            "    {}",
+                            astra_turn_core::permission::notice::format_auto_approved_permission(
+                                &tool, &reason
+                            )
+                        );
+                        continue;
+                    }
+                    // Plan monitor runs headless (no TUI cells) — the
+                    // progress ticks have no visual home here. Drop.
+                    StreamEvent::ToolOutput { .. }
+                    | StreamEvent::AgentLive(_)
+                    | StreamEvent::ExplainReport(_)
+                    | StreamEvent::ExplainText(_)
+                    | StreamEvent::VerdictReport(_)
+                    | StreamEvent::Compaction(_) => continue,
+                }
+            }
+            PlanUpdate::ApprovalNeeded {
+                tool,
+                header,
+                detail,
+                reason,
+                response_tx,
+            } => {
+                if let Some(s) = plan_spinner.take() {
+                    s.stop_clear();
+                }
+                let msg = format!(
+                    "\n{}  {} — {}\n   {}\n   Reason: {}",
+                    theme::icon_warn(),
+                    tool,
+                    header,
+                    detail.as_deref().unwrap_or(""),
+                    reason,
+                );
+                print_plan_monitor_line(
+                    plan_spinner,
+                    &mut state.plan_in_token_stream,
+                    &mut state.plan_md_renderer,
+                    &mut state.plan_thinking_pane,
+                    msg,
+                );
+                state.pending_approval = Some(response_tx);
+                continue;
+            }
+            _ => continue,
+        };
+
+        print_plan_monitor_line(
+            plan_spinner,
+            &mut state.plan_in_token_stream,
+            &mut state.plan_md_renderer,
+            &mut state.plan_thinking_pane,
+            msg,
+        );
+
+        match post_spinner {
+            PostSpinner::Ttft => {
+                *plan_spinner = Some(PlanSpinner::Ttft(effects::TtftWaitLineSpinner::start()));
+            }
+            PostSpinner::Tool(desc) => {
+                *plan_spinner = Some(PlanSpinner::Tool(effects::ToolRunningLineSpinner::start(
+                    desc,
+                )));
+            }
+            PostSpinner::Activity(label) => {
+                *plan_spinner = Some(PlanSpinner::Activity(effects::PlanActivitySpinner::start(
+                    current_subtask_tag,
+                    &label,
+                )));
+            }
+            PostSpinner::None => {}
+        }
+    }
+
+    if let Some(ref mut pane) = state.plan_thinking_pane {
+        pane.tick();
+    }
+    outcome
+}
+
+/// Push latest plan progress to [`SessionState::task_service`] for `/task list`.
+pub(crate) async fn sync_plan_run_task_progress(state: &mut SessionState) {
+    let Some(ref tid) = state.plan_run_task_id else {
+        return;
+    };
+    let Some((pct, done, total)) = state.plan_run_task_last_progress else {
+        return;
+    };
+    let Some(ref svc) = state.task_service else {
+        return;
+    };
+    let _ = svc.update_progress(tid, pct, done, total).await;
+}
+
+/// Terminal sync: `/task list` stays `pending` unless we mark the row completed here.
+pub(crate) async fn finalize_plan_run_task_after_executor(state: &mut SessionState) {
+    let Some(tid) = state.plan_run_task_id.clone() else {
+        return;
+    };
+    let Some(ref svc) = state.task_service else {
+        return;
+    };
+    if let Some(ref err) = state.plan_run_task_last_error {
+        let err = err.clone();
+        let _ = svc.fail_task(&tid, &err).await;
+    } else if let Some(ref report) = state.last_delivery_report {
+        let (outcome, pct, done, total) =
+            durable_bridge::plan_run_finish_from_delivery_report(report);
+        let _ = svc.complete_plan_run(&tid, pct, done, total, outcome).await;
+    } else if let Some(outcome) = state.plan_run_task_last_outcome {
+        if let Some((pct, done, total)) = state.plan_run_task_last_progress {
+            let _ = svc.complete_plan_run(&tid, pct, done, total, outcome).await;
+        } else {
+            let _ = svc
+                .fail_task(
+                    &tid,
+                    "Plan executor exited without terminal progress state.",
+                )
+                .await;
+        }
+    } else if state.plan_run_task_last_progress.is_some() {
+        let _ = svc
+            .fail_task(&tid, "Plan executor exited without terminal outcome.")
+            .await;
+    } else {
+        let _ = svc.complete_task(&tid).await;
+    }
+    state.plan_run_task_id = None;
+    state.plan_run_task_last_progress = None;
+    state.plan_run_task_last_outcome = None;
+    state.plan_run_task_last_error = None;
+}
+
+/// Returns `true` when the executor sent a terminal event (`PlanFinished` / `PlanError`).
+pub(crate) fn flush_plan_updates_between_prompts(state: &mut SessionState) -> bool {
+    if state.plan_handle.is_none() {
+        return false;
+    }
+
+    let mut plan_spinner: Option<PlanSpinner> = None;
+    let mut current_subtask_tag = state.current_plan_subtask_id.clone().unwrap_or_default();
+    let outcome = display_plan_updates_live(state, &mut plan_spinner, &mut current_subtask_tag);
+    if let Some(spinner) = plan_spinner.take() {
+        spinner.stop_clear();
+    }
+    outcome == PlanMonitorOutcome::Finished
+}
+
+/// Clear plan-monitor state when the update channel closed without `PlanFinished` / `PlanError`.
+/// Emits structured journal events so the failure is observable in telemetry.
+fn cleanup_orphan_plan_executor(state: &mut SessionState, plan_spinner: &mut Option<PlanSpinner>) {
+    if let Some(s) = plan_spinner.take() {
+        s.stop_clear();
+    }
+    if let Some(mut pane) = state.plan_thinking_pane.take() {
+        pane.clear();
+    }
+    if let Some(mut h) = state.plan_handle.take() {
+        while h.try_recv().is_some() {}
+    }
+
+    // Emit structured failure events before clearing state.
+    if let Some(ref journal) = state.journal {
+        // 1. plan_progress with action=plan_failed
+        if let Some(ref plan) = state.executing_plan {
+            let goal = state.executing_plan_goal.as_deref().unwrap_or("unknown");
+            let total = plan.subtasks.len();
+            let done = plan
+                .subtasks
+                .iter()
+                .filter(|s| s.status == astra_services::task_orchestrator::TaskStatus::Completed)
+                .count();
+            let event = astra_services::session_journal::JournalEvent::plan_progress(
+                state.session_id.as_deref(),
+                state.turn,
+                state
+                    .current_plan_subtask_id
+                    .as_deref()
+                    .unwrap_or("unknown"),
+                goal,
+                "plan_failed",
+                plan.progress_pct(),
+                total,
+                done,
+            );
+            append_journal_event_or_warn(
+                journal,
+                state.session_id.as_deref(),
+                &event,
+                "plan_monitor:plan_failed_event",
+            );
+            super::session_side_effects::enqueue_ingestion_pub(state, &event);
+        }
+        // 2. interruption_recorded for the crash
+        let interruption = astra_services::session_journal::JournalEvent::interruption_recorded(
+            state.session_id.as_deref(),
+            state.turn,
+            serde_json::json!({
+                "kind": "plan_executor_crash",
+                "reason": "Plan executor channel closed without terminal status",
+                "resumable": false,
+            }),
+        );
+        append_journal_event_or_warn(
+            journal,
+            state.session_id.as_deref(),
+            &interruption,
+            "plan_monitor:plan_crash_interruption",
+        );
+        super::session_side_effects::enqueue_ingestion_pub(state, &interruption);
+    }
+
+    state.executing_plan = None;
+    state.current_plan_subtask_id = None;
+    if let Some(tx) = state.pending_approval.take() {
+        let _ = tx.send(crate::cli::chat_stream::ApprovalResponse::Deny);
+    }
+    eprintln!(
+        "\n{}  Plan executor stopped without a final status (channel closed). State cleared.",
+        theme::icon_warn()
+    );
+}
+
+/// Block the CLI until the plan executor finishes, pauses, or errors.
+///
+/// Replaces the old "fire and forget" background model: the user cannot type
+/// at the prompt while a plan is running. First Ctrl+C sends Pause; a second
+/// Ctrl-C within two seconds sends Cancel. Approval prompts are read from stdin inline.
+pub(crate) async fn run_blocking_plan_monitor(state: &mut SessionState) {
+    let mut plan_spinner: Option<PlanSpinner> = None;
+    let mut current_subtask_tag = state.current_plan_subtask_id.clone().unwrap_or_default();
+    let mut last_ctrl_c: Option<std::time::Instant> = None;
+    const CTRL_C_CANCEL_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
+    loop {
+        let outcome = display_plan_updates_live(state, &mut plan_spinner, &mut current_subtask_tag);
+
+        sync_task_board_from_executing_plan(state).await;
+        sync_plan_run_task_progress(state).await;
+
+        match outcome {
+            PlanMonitorOutcome::Finished => {
+                finalize_plan_run_task_after_executor(state).await;
+                break;
+            }
+            PlanMonitorOutcome::Paused => {
+                if state.plan_handle.as_ref().is_some_and(|h| h.is_finished())
+                    && let Some(mut h) = state.plan_handle.take()
+                {
+                    while h.try_recv().is_some() {}
+                }
+                break;
+            }
+            PlanMonitorOutcome::Continue => {}
+        }
+
+        if state.plan_handle.as_ref().is_some_and(|h| h.is_finished()) {
+            cleanup_orphan_plan_executor(state, &mut plan_spinner);
+            sync_plan_run_task_progress(state).await;
+            if state.plan_run_task_id.is_some() {
+                state.plan_run_task_last_error.get_or_insert(
+                    "Plan executor stopped without PlanFinished/PlanError (channel closed).".into(),
+                );
+                finalize_plan_run_task_after_executor(state).await;
+            }
+            break;
+        }
+
+        if state.pending_approval.is_some() {
+            // Issue #326 P0 (tui-only) / #331: with the old REPL path gone,
+            // plan_monitor no longer prompts on stdin. The approval
+            // is owned by the TUI's bottom_pane queue (which receives
+            // it via the same response_tx channel pending_approval
+            // wraps). plan_monitor's only job here is to **not
+            // block** — drop through and let the next select branch
+            // tick the TUI / plan executor. If for some reason no
+            // TUI sink is attached (regression in caller wiring),
+            // the silent-deny in stream_render.rs:1985 still fires
+            // so we never hang waiting for a stdin readline.
+            //
+            // Keep the early-continue for back-pressure: tools that
+            // landed approvals during the previous loop iteration
+            // are settled via state.pending_approval = None on the
+            // TUI side, so the if-check above is the right gate.
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            continue;
+        }
+
+        tokio::select! {
+            biased;
+            _ = tokio::signal::ctrl_c() => {
+                if let Some(ref handle) = state.plan_handle {
+                    let now = std::time::Instant::now();
+                    let second_in_window = last_ctrl_c
+                        .is_some_and(|t| now.duration_since(t) < CTRL_C_CANCEL_WINDOW);
+                    last_ctrl_c = Some(now);
+                    if second_in_window {
+                        let _ = handle.send_command(plan_executor::PlanCommand::Cancel);
+                        if let Some(s) = plan_spinner.take() {
+                            s.stop_clear();
+                        }
+                        if let Some(mut pane) = state.plan_thinking_pane.take() {
+                            pane.clear();
+                        }
+                        eprintln!(
+                            "\n{}  Second interrupt — cancelling plan.",
+                            "⏹".yellow()
+                        );
+                        break;
+                    } else {
+                        let _ = handle.send_command(plan_executor::PlanCommand::Pause);
+                        if let Some(s) = plan_spinner.take() {
+                            s.stop_clear();
+                        }
+                        if let Some(mut pane) = state.plan_thinking_pane.take() {
+                            pane.clear();
+                        }
+                        eprintln!(
+                            "\n{}  Pausing plan… (current subtask will finish first). Press Ctrl-C again within {}s to cancel.",
+                            "⏸".yellow(),
+                            CTRL_C_CANCEL_WINDOW.as_secs(),
+                        );
+                    }
+                }
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(30)) => {}
+        }
+    }
+
+    if let Some(s) = plan_spinner.take() {
+        s.stop_clear();
+    }
+    if let Some(mut pane) = state.plan_thinking_pane.take() {
+        pane.clear();
+    }
+
+    if state.executing_plan.is_some() {
+        eprint_plan_execution_paused_hints();
+    }
+}
+
+/// Apply a single trailing update from the plan executor channel.
+/// Called when draining remaining messages after PlanFinished/PlanError.
+fn apply_trailing_update(update: plan_executor::PlanUpdate, state: &mut SessionState) {
+    use crate::cli::plan::plan_executor::PlanUpdate;
+    match update {
+        PlanUpdate::HistoryEntry {
+            user_msg,
+            assistant_msg,
+        } => {
+            state.history.push((user_msg, assistant_msg));
+        }
+        PlanUpdate::JournalEvent(event) => {
+            if let Some(ref journal) = state.journal {
+                append_journal_event_or_warn(
+                    journal,
+                    state.session_id.as_deref(),
+                    &event,
+                    "plan_monitor:trailing_journal_event",
+                );
+            }
+        }
+        PlanUpdate::DeliveryReport(report) => {
+            state.last_delivery_report = Some(report);
+        }
+        PlanUpdate::SubtaskTurnResult {
+            subtask_id,
+            prompt_tokens,
+            completion_tokens,
+            session_id,
+            ..
+        } => {
+            state.total_prompt_tokens += prompt_tokens;
+            state.total_completion_tokens += completion_tokens;
+            state.turn += 1;
+            state.current_plan_subtask_id = Some(subtask_id);
+            if let Some(sid) = session_id {
+                if state.session_id.is_none() {
+                    state.set_session_id(sid);
+                }
+            }
+        }
+        PlanUpdate::SubtaskStatusSync { id, status } => {
+            sync_subtask_status(state, &id, status);
+        }
+        PlanUpdate::DurableStateReturn(durable) => {
+            state.durable_task_state = Some(*durable);
+        }
+        _ => {}
+    }
+}
+
+/// Update all in-memory plan copies so background execution stays observable
+/// after plan mode exits.
+fn sync_subtask_status(
+    state: &mut SessionState,
+    subtask_id: &str,
+    status: astra_services::task_orchestrator::TaskStatus,
+) {
+    if let Some(ref mut plan) = state.executing_plan {
+        if let Some(st) = plan.subtasks.iter_mut().find(|s| s.id == subtask_id) {
+            st.status = status;
+        }
+    }
+    if let Some(ref mut ps) = state.cloud_plan_mirror {
+        if let Some(st) = ps.plan.subtasks.iter_mut().find(|s| s.id == subtask_id) {
+            st.status = status;
+        }
+    }
+}
+
+async fn sync_task_board_subtask_status(
+    state: &SessionState,
+    plan_fingerprint: &str,
+    subtask_id: &str,
+    status: astra_services::task_orchestrator::TaskStatus,
+) -> Result<(), String> {
+    let task = state
+        .task_manager
+        .snapshot()
+        .await
+        .into_iter()
+        .find(|task| {
+            let is_plan_task = task
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("source"))
+                .and_then(serde_json::Value::as_str)
+                == Some("approved_plan");
+            let fingerprint_matches = task
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("plan_fingerprint"))
+                .and_then(serde_json::Value::as_str)
+                == Some(plan_fingerprint);
+            is_plan_task
+                && fingerprint_matches
+                && task.subtasks.iter().any(|subtask| subtask.id == subtask_id)
+        });
+
+    let Some(task) = task else {
+        return Ok(());
+    };
+
+    let output = state
+        .task_manager
+        .update(&serde_json::json!({
+            "task_id": task.id,
+            "subtask_id": subtask_id,
+            "new_status": status.as_str(),
+        }))
+        .await;
+    if output.starts_with("Error:") {
+        return Err(output);
+    }
+    Ok(())
+}
+
+async fn sync_task_board_from_executing_plan(state: &SessionState) {
+    let Some(plan) = state.executing_plan.as_ref() else {
+        return;
+    };
+    if let Some(goal) = state.executing_plan_goal.as_deref()
+        && let Err(error) =
+            crate::cli::plan_task_board::mirror_plan_to_task_board(state, goal, plan).await
+    {
+        tracing::warn!(
+            goal = %goal,
+            error = %error,
+            "failed to ensure executing plan is mirrored into task board"
+        );
+    }
+    let plan_fingerprint = crate::cli::plan_task_board::plan_task_board_fingerprint(plan);
+    for subtask in &plan.subtasks {
+        if let Err(error) =
+            sync_task_board_subtask_status(state, &plan_fingerprint, &subtask.id, subtask.status)
+                .await
+        {
+            tracing::warn!(
+                subtask_id = %subtask.id,
+                status = subtask.status.as_str(),
+                error = %error,
+                "failed to sync plan subtask status into task board"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use astra_services::task_orchestrator::{
+        LocalTaskService, SubtaskPlan, TaskCreateRequest, TaskOutcome, TaskPlan, TaskStatus,
+    };
+
+    #[test]
+    fn flush_plan_updates_syncs_status_into_executing_plan() {
+        let mut state = SessionState::default();
+        state.executing_plan = Some(TaskPlan {
+            subtasks: vec![SubtaskPlan {
+                id: "s1".into(),
+                title: "one".into(),
+                status: TaskStatus::Pending,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        let (handle, update_tx, _cmd_rx) = plan_executor::create_plan_channels();
+        state.plan_handle = Some(handle);
+        let _ = update_tx.send(plan_executor::PlanUpdate::SubtaskStatusSync {
+            id: "s1".into(),
+            status: TaskStatus::InProgress,
+        });
+
+        let terminal = flush_plan_updates_between_prompts(&mut state);
+        assert!(!terminal);
+        assert_eq!(
+            state
+                .executing_plan
+                .as_ref()
+                .expect("plan retained")
+                .subtasks[0]
+                .status,
+            TaskStatus::InProgress
+        );
+    }
+
+    #[tokio::test]
+    async fn task_board_subtask_status_sync_updates_visible_plan_step() {
+        let state = SessionState::default();
+        let plan = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan {
+                    id: "s1".into(),
+                    title: "Design state model".into(),
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "s2".into(),
+                    title: "Handle unhappy paths".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let plan_fingerprint = crate::cli::plan_task_board::plan_task_board_fingerprint(&plan);
+        let create = state
+            .task_manager
+            .create(&serde_json::json!({
+                "title": "Ship plan UX",
+                "metadata": {
+                    "source": "approved_plan",
+                    "plan_id": "plan-1",
+                    "plan_fingerprint": plan_fingerprint
+                },
+                "subtasks": [
+                    { "id": "s1", "title": "Design state model" },
+                    { "id": "s2", "title": "Handle unhappy paths" }
+                ]
+            }))
+            .await;
+        assert!(create.contains("created"), "{create}");
+
+        sync_task_board_subtask_status(&state, &plan_fingerprint, "s2", TaskStatus::InProgress)
+            .await
+            .unwrap();
+
+        let task = state
+            .task_manager
+            .snapshot()
+            .await
+            .into_iter()
+            .find(|task| task.title == "Ship plan UX")
+            .expect("plan task should exist");
+        assert_eq!(
+            task.status,
+            astra_tools::task_mgmt::SessionTaskStatusKind::InProgress
+        );
+        let subtask = task
+            .subtasks
+            .iter()
+            .find(|subtask| subtask.id == "s2")
+            .expect("subtask should exist");
+        assert_eq!(
+            subtask.status,
+            astra_tools::task_mgmt::SessionTaskStatusKind::InProgress
+        );
+    }
+
+    #[tokio::test]
+    async fn executing_plan_sync_does_not_update_stale_plan_with_same_subtask_id() {
+        let mut state = SessionState::default();
+        let stale = TaskPlan {
+            subtasks: vec![SubtaskPlan {
+                id: "s1".into(),
+                title: "old step".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        crate::cli::plan_task_board::mirror_plan_to_task_board(&state, "same goal", &stale)
+            .await
+            .unwrap();
+
+        let current = TaskPlan {
+            subtasks: vec![SubtaskPlan {
+                id: "s1".into(),
+                title: "new step".into(),
+                status: TaskStatus::InProgress,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        crate::cli::plan_task_board::mirror_plan_to_task_board(&state, "same goal", &current)
+            .await
+            .unwrap();
+        state.executing_plan = Some(current);
+        state.executing_plan_goal = Some("same goal".into());
+
+        sync_task_board_from_executing_plan(&state).await;
+
+        let tasks = state.task_manager.snapshot().await;
+        let stale_task = tasks
+            .iter()
+            .find(|task| {
+                task.subtasks
+                    .iter()
+                    .any(|subtask| subtask.title == "old step")
+            })
+            .expect("stale task exists");
+        assert_eq!(
+            stale_task.subtasks[0].status,
+            astra_tools::task_mgmt::SessionTaskStatusKind::Pending
+        );
+
+        let current_task = tasks
+            .iter()
+            .find(|task| {
+                task.subtasks
+                    .iter()
+                    .any(|subtask| subtask.title == "new step")
+            })
+            .expect("current task exists");
+        assert_eq!(
+            current_task.subtasks[0].status,
+            astra_tools::task_mgmt::SessionTaskStatusKind::InProgress
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_plan_run_task_after_executor_uses_partial_terminal_outcome() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc: std::sync::Arc<dyn astra_services::TaskService> =
+            std::sync::Arc::new(LocalTaskService::new(tmp.path().join("tasks")));
+        let task_id = svc
+            .create_task(
+                "user-1",
+                "session-1",
+                TaskCreateRequest {
+                    title: "Run plan".into(),
+                    description: None,
+                    plan: None,
+                    parent_task_id: None,
+                    project_type: None,
+                    goal_pattern: None,
+                },
+            )
+            .await
+            .unwrap();
+        let mut state = SessionState {
+            task_service: Some(svc.clone()),
+            plan_run_task_id: Some(task_id.clone()),
+            plan_run_task_last_progress: Some((67, 2, 3)),
+            plan_run_task_last_outcome: Some(TaskOutcome::Partial),
+            ..Default::default()
+        };
+
+        finalize_plan_run_task_after_executor(&mut state).await;
+
+        let task = svc
+            .get_task(&task_id)
+            .await
+            .unwrap()
+            .expect("task should exist");
+        assert_eq!(task.status, TaskStatus::Completed);
+        assert_eq!(task.progress_pct, 67);
+        assert_eq!(task.items_done, 2);
+        assert_eq!(task.items_total, 3);
+        assert_eq!(task.outcome, Some(TaskOutcome::Partial));
+        assert!(state.plan_run_task_id.is_none());
+        assert!(state.plan_run_task_last_progress.is_none());
+        assert!(state.plan_run_task_last_outcome.is_none());
+    }
+
+    #[tokio::test]
+    async fn finalize_plan_run_task_after_executor_fails_without_terminal_outcome() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc: std::sync::Arc<dyn astra_services::TaskService> =
+            std::sync::Arc::new(LocalTaskService::new(tmp.path().join("tasks")));
+        let task_id = svc
+            .create_task(
+                "user-1",
+                "session-1",
+                TaskCreateRequest {
+                    title: "Run plan".into(),
+                    description: None,
+                    plan: None,
+                    parent_task_id: None,
+                    project_type: None,
+                    goal_pattern: None,
+                },
+            )
+            .await
+            .unwrap();
+        let mut state = SessionState {
+            task_service: Some(svc.clone()),
+            plan_run_task_id: Some(task_id.clone()),
+            plan_run_task_last_progress: Some((100, 3, 3)),
+            ..Default::default()
+        };
+
+        finalize_plan_run_task_after_executor(&mut state).await;
+
+        let task = svc
+            .get_task(&task_id)
+            .await
+            .unwrap()
+            .expect("task should exist");
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert_eq!(
+            task.error_message.as_deref(),
+            Some("Plan executor exited without terminal outcome.")
+        );
+    }
+
+    // ── R3: journal metadata assertion tests ──────────────────────────────────
+
+    /// Create a JournalWriter in an isolated sessions dir and keep the guard alive.
+    fn make_test_journal(
+        session_id: &str,
+    ) -> (
+        tempfile::TempDir,
+        astra_services::session_journal::JournalDirGuard,
+        astra_services::session_journal::JournalWriter,
+        std::path::PathBuf,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let guard = astra_services::session_journal::JournalDirGuard::new(&sessions);
+        let writer = astra_services::session_journal::JournalWriter::new(session_id).unwrap();
+        let path = writer.path().clone();
+        (tmp, guard, writer, path)
+    }
+
+    /// Read all journal events from a jsonl file.
+    fn read_journal(path: &std::path::Path) -> Vec<serde_json::Value> {
+        let content = std::fs::read_to_string(path).unwrap_or_default();
+        content
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn plan_finished_success_journal_has_stage_elapsed_ms_and_outcome() {
+        let sid = format!("test-plan-finished-success-{}", std::process::id());
+        let (_tmp, _guard, writer, path) = make_test_journal(&sid);
+        let mut state = SessionState::default();
+        state.journal = Some(writer);
+        state.executing_plan = Some(TaskPlan {
+            subtasks: vec![SubtaskPlan {
+                id: "s1".into(),
+                title: "one".into(),
+                status: TaskStatus::Completed,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        let (handle, update_tx, _cmd_rx) = plan_executor::create_plan_channels();
+        state.plan_handle = Some(handle);
+        let _ = update_tx.send(plan_executor::PlanUpdate::PlanFinished {
+            pct: 100,
+            elapsed: std::time::Duration::from_millis(1234),
+            outcome: TaskOutcome::Success,
+        });
+
+        flush_plan_updates_between_prompts(&mut state);
+
+        let events = read_journal(&path);
+        let lifecycle = events
+            .iter()
+            .find(|e| e["type"] == "plan_lifecycle")
+            .expect("plan_lifecycle event emitted");
+        let detail = &lifecycle["metadata"]["detail"];
+        assert_eq!(detail["stage"], "completed", "stage field present");
+        assert_eq!(detail["elapsed_ms"], 1234u64, "elapsed_ms matches");
+        assert_eq!(detail["outcome"], "success", "outcome field present");
+        assert_eq!(detail["items_done"], 1u32, "items_done correct");
+        assert_eq!(detail["items_total"], 1u32, "items_total correct");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn plan_finished_partial_journal_has_partial_stage_and_outcome() {
+        let sid = format!("test-plan-finished-partial-{}", std::process::id());
+        let (_tmp, _guard, writer, path) = make_test_journal(&sid);
+        let mut state = SessionState::default();
+        state.journal = Some(writer);
+        state.executing_plan = Some(TaskPlan {
+            subtasks: vec![SubtaskPlan {
+                id: "s1".into(),
+                title: "one".into(),
+                status: TaskStatus::Completed,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        let (handle, update_tx, _cmd_rx) = plan_executor::create_plan_channels();
+        state.plan_handle = Some(handle);
+        let _ = update_tx.send(plan_executor::PlanUpdate::PlanFinished {
+            pct: 67,
+            elapsed: std::time::Duration::from_millis(987),
+            outcome: TaskOutcome::Partial,
+        });
+
+        flush_plan_updates_between_prompts(&mut state);
+
+        let events = read_journal(&path);
+        let lifecycle = events
+            .iter()
+            .find(|e| e["type"] == "plan_lifecycle")
+            .expect("plan_lifecycle event emitted");
+        let detail = &lifecycle["metadata"]["detail"];
+        assert_eq!(detail["stage"], "partial", "stage field present");
+        assert_eq!(detail["outcome"], "partial", "outcome field present");
+        assert_eq!(detail["elapsed_ms"], 987u64, "elapsed_ms matches");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn plan_error_journal_has_stage_and_error_field() {
+        let sid = format!("test-plan-error-{}", std::process::id());
+        let (_tmp, _guard, writer, path) = make_test_journal(&sid);
+        let mut state = SessionState::default();
+        state.journal = Some(writer);
+        state.executing_plan = Some(TaskPlan {
+            subtasks: vec![SubtaskPlan {
+                id: "s1".into(),
+                title: "one".into(),
+                status: TaskStatus::Pending,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        let (handle, update_tx, _cmd_rx) = plan_executor::create_plan_channels();
+        state.plan_handle = Some(handle);
+        let _ = update_tx.send(plan_executor::PlanUpdate::PlanError {
+            error: "subtask failed".into(),
+        });
+
+        flush_plan_updates_between_prompts(&mut state);
+
+        let events = read_journal(&path);
+        let lifecycle = events
+            .iter()
+            .find(|e| e["type"] == "plan_lifecycle")
+            .expect("plan_lifecycle event emitted");
+        let detail = &lifecycle["metadata"]["detail"];
+        assert_eq!(detail["stage"], "error", "stage field present");
+        assert_eq!(detail["error"], "subtask failed", "error field present");
+        assert_eq!(detail["items_total"], 1u32, "items_total correct");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn plan_paused_journal_has_stage_elapsed_ms_and_items() {
+        let sid = format!("test-plan-paused-{}", std::process::id());
+        let (_tmp, _guard, writer, path) = make_test_journal(&sid);
+        let mut state = SessionState::default();
+        state.journal = Some(writer);
+        state.executing_plan = Some(TaskPlan {
+            subtasks: vec![
+                SubtaskPlan {
+                    id: "s1".into(),
+                    title: "one".into(),
+                    status: TaskStatus::Completed,
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "s2".into(),
+                    title: "two".into(),
+                    status: TaskStatus::Pending,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+
+        let (handle, update_tx, _cmd_rx) = plan_executor::create_plan_channels();
+        state.plan_handle = Some(handle);
+        let _ = update_tx.send(plan_executor::PlanUpdate::PlanPaused {
+            pct: 50,
+            remaining: 1,
+            elapsed: std::time::Duration::from_millis(500),
+            blocked_ids: vec![],
+        });
+
+        flush_plan_updates_between_prompts(&mut state);
+
+        let events = read_journal(&path);
+        let lifecycle = events
+            .iter()
+            .find(|e| e["type"] == "plan_lifecycle")
+            .expect("plan_lifecycle event emitted");
+        let detail = &lifecycle["metadata"]["detail"];
+        assert_eq!(detail["stage"], "paused", "stage field present");
+        assert_eq!(detail["elapsed_ms"], 500u64, "elapsed_ms matches");
+        assert_eq!(detail["items_done"], 1u32, "items_done correct");
+        assert_eq!(detail["items_total"], 2u32, "items_total correct");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn cancel_journal_has_stage_cancelled() {
+        use astra_services::session_journal;
+        let sid = format!("test-plan-cancel-{}", std::process::id());
+        let (_tmp, _guard, writer, path) = make_test_journal(&sid);
+
+        // Replicate what the Cancel branch does.
+        let event = session_journal::JournalEvent::plan_lifecycle(
+            None,
+            "Plan mode cancelled",
+            Some(serde_json::json!({ "stage": "cancelled" })),
+        );
+        writer.append(&event).unwrap();
+        drop(writer);
+
+        let events = read_journal(&path);
+        let lifecycle = events
+            .iter()
+            .find(|e| e["type"] == "plan_lifecycle")
+            .expect("plan_lifecycle event emitted");
+        let detail = &lifecycle["metadata"]["detail"];
+        assert_eq!(detail["stage"], "cancelled");
+        let _ = std::fs::remove_file(&path);
+    }
+}

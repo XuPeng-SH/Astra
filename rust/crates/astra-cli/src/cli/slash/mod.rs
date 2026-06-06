@@ -1,0 +1,36 @@
+#[allow(unused_imports)]
+pub(crate) use super::*;
+pub mod slash_account;
+pub mod slash_agent;
+pub mod slash_bug;
+pub mod slash_cache;
+pub mod slash_config;
+pub mod slash_debug;
+pub mod slash_health;
+pub mod slash_info;
+pub mod slash_inspect;
+pub mod slash_mcp;
+pub mod slash_memory;
+pub mod slash_messaging;
+pub mod slash_plan;
+pub mod slash_profile;
+pub mod slash_router;
+pub mod slash_session;
+pub mod slash_skill;
+pub mod slash_state;
+pub mod slash_stats;
+pub mod slash_sync;
+pub mod slash_task;
+pub mod slash_team;
+pub mod slash_telemetry;
+pub mod slash_tools;
+
+pub(crate) use slash_account::handle_account_command;
+pub(crate) use slash_bug::handle_bug_command;
+pub(crate) use slash_debug::handle_debug_command;
+pub(crate) use slash_info::handle_info_command;
+pub(crate) use slash_memory::handle_memory_domain_command;
+pub(crate) use slash_messaging::handle_messaging_command;
+pub(crate) use slash_session::handle_session_command;
+pub(crate) use slash_skill::handle_skill_command;
+pub(crate) use slash_state::{StateCommandContext, handle_state_command};

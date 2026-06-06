@@ -826,9 +826,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn disambiguation_single_intent_no_conflict() {
-        let d = analyze("list the open PRs");
-        assert!(d.disambiguation.conflict_score < 0.5);
-    }
+    // Note: an `LlmIntentClassifier` semantic-fallback path used to live
+    // here. It was a partial implementation — every production caller passed
+    // `None` so the entire path was unreachable shipping code, and it had
+    // unguarded prompt-injection (raw user input interpolated into the
+    // LLM prompt), no timeout, no caching, no telemetry. Per the project
+    // rule against half-finished features, the path was removed entirely.
+    // If a real semantic fallback is needed in the future, it must be
+    // wired into the analyze() signature with explicit timeout, cache,
+    // and prompt-sanitization guarantees, not bolted on as an Option.
 }

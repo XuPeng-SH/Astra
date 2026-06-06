@@ -187,6 +187,7 @@ fn file_checkpoint_dir_for(session_id: &str) -> Option<PathBuf> {
 }
 #[path = "edge_tools/worktree.rs"]
 mod worktree;
+use crate::lock_recovery::LockRecovery;
 pub(crate) use worktree::GitWorktreeRollbackJournal;
 pub use worktree::WorktreeSession;
 use worktree::detect_git_remote_repos;
@@ -967,9 +968,17 @@ impl ToolExecutor {
         let session_id = session_id.into();
         let session_changed = self.active_session_id().as_deref() != Some(session_id.as_str());
         let (pinned_tools, deprioritized_tools) =
-            match astra_services::session_workspace::read_workspace(&session_id) {
-                Ok(ws) => (ws.pinned_tools, ws.deprioritized_tools),
-                Err(_) => (Vec::new(), Vec::new()),
+            match astra_services::session_workspace::read_workspace_optional(&session_id) {
+                Ok(Some(ws)) => (ws.pinned_tools, ws.deprioritized_tools),
+                Ok(None) => (Vec::new(), Vec::new()),
+                Err(error) => {
+                    tracing::warn!(
+                        "active session {} has unreadable workspace metadata; clearing self-mod tool preferences: {}",
+                        session_id,
+                        error
+                    );
+                    (Vec::new(), Vec::new())
+                }
             };
         if let Ok(mut pinned) = self.self_mod_pinned_tools.lock() {
             *pinned = pinned_tools;
@@ -1274,14 +1283,11 @@ impl ToolExecutor {
     }
 
     pub(crate) fn set_cloud_token(&self, token: impl Into<String>) {
-        *self.cloud_token.write().unwrap_or_else(|e| e.into_inner()) = Some(token.into());
+        *astra_core::sync_poison::recover_rwlock_write(&self.cloud_token) = Some(token.into());
     }
 
     pub(crate) fn cloud_token(&self) -> Option<String> {
-        self.cloud_token
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        astra_core::sync_poison::recover_rwlock_read(&self.cloud_token).clone()
     }
 
     // ─── Plan-mode write guard (parity with server_tool_executor) ───────────
@@ -1498,16 +1504,16 @@ impl ToolExecutor {
         let turn = self
             .journal_turn_index
             .load(std::sync::atomic::Ordering::Acquire);
-        if let Ok(writer) = astra_services::session_journal::JournalWriter::new(&session_id) {
-            let _ = writer.append(
-                &astra_services::session_journal::JournalEvent::task_lifecycle(
-                    Some(&session_id),
-                    turn,
-                    Self::task_lifecycle_summary(action, &payload),
-                    Some(Self::task_lifecycle_detail(action, args, &payload)),
-                ),
-            );
-        }
+        crate::cli::cli_utils::append_session_journal_event_or_warn(
+            &session_id,
+            &astra_services::session_journal::JournalEvent::task_lifecycle(
+                Some(&session_id),
+                turn,
+                Self::task_lifecycle_summary(action, &payload),
+                Some(Self::task_lifecycle_detail(action, args, &payload)),
+            ),
+            "edge_tools:record_task_lifecycle_event",
+        );
     }
 
     /// Route a `task` action either to the cloud (production) or the
@@ -2076,7 +2082,7 @@ impl ToolExecutor {
 
         let (tx, rx) = tokio::sync::oneshot::channel();
         {
-            let mut cmds = bg_commands.lock().unwrap();
+            let mut cmds = bg_commands.lock_recover();
             cmds.push(BgTaskCommand::SpawnShell {
                 command,
                 description,
@@ -2154,7 +2160,7 @@ impl ToolExecutor {
                 // with no output must exit the loop, not spin to timeout.
                 let (status_tx, status_rx) = tokio::sync::oneshot::channel();
                 {
-                    let mut cmds = bg_commands.lock().unwrap();
+                    let mut cmds = bg_commands.lock_recover();
                     cmds.push(BgTaskCommand::IsTerminal {
                         task_id: task_id.clone(),
                         reply: status_tx,
@@ -2168,7 +2174,7 @@ impl ToolExecutor {
 
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 {
-                    let mut cmds = bg_commands.lock().unwrap();
+                    let mut cmds = bg_commands.lock_recover();
                     cmds.push(BgTaskCommand::GetOutputSince {
                         task_id: task_id.clone(),
                         offset,
@@ -2200,7 +2206,7 @@ impl ToolExecutor {
         } else {
             let (tx, rx) = tokio::sync::oneshot::channel();
             {
-                let mut cmds = bg_commands.lock().unwrap();
+                let mut cmds = bg_commands.lock_recover();
                 cmds.push(BgTaskCommand::GetOutputSince {
                     task_id: task_id.clone(),
                     offset,
@@ -2232,7 +2238,7 @@ impl ToolExecutor {
         };
         let (tx, rx) = tokio::sync::oneshot::channel();
         {
-            let mut cmds = bg_commands.lock().unwrap();
+            let mut cmds = bg_commands.lock_recover();
             cmds.push(BgTaskCommand::Kill {
                 task_id: task_id.clone(),
                 reply: tx,
@@ -2396,14 +2402,11 @@ impl ToolExecutor {
         // Task status nudge: if there are active tasks, remind the
         // agent to update them (Claude Code parity: proactive nudge).
         let tasks = self.task_manager.snapshot().await;
-        let active_tasks: Vec<_> = tasks
-            .iter()
-            .filter(|t| t.status == "pending" || t.status == "in_progress")
-            .collect();
+        let active_tasks: Vec<_> = tasks.iter().filter(|t| t.status.is_active()).collect();
         if !active_tasks.is_empty() {
             out.push_str(&format!("\nActive tasks: {}\n", active_tasks.len()));
             for t in active_tasks.iter().take(5) {
-                let status_icon = if t.status == "in_progress" {
+                let status_icon = if t.status.is_in_progress() {
                     "▶"
                 } else {
                     "○"
@@ -2544,16 +2547,16 @@ impl ToolExecutor {
         let turn = self
             .journal_turn_index
             .load(std::sync::atomic::Ordering::Relaxed);
-        if let Ok(writer) = astra_services::session_journal::JournalWriter::new(&session_id) {
-            let _ = writer.append(
-                &astra_services::session_journal::JournalEvent::memory_suppressed(
-                    Some(&session_id),
-                    turn,
-                    memory_id,
-                    reason,
-                ),
-            );
-        }
+        crate::cli::cli_utils::append_session_journal_event_or_warn(
+            &session_id,
+            &astra_services::session_journal::JournalEvent::memory_suppressed(
+                Some(&session_id),
+                turn,
+                memory_id,
+                reason,
+            ),
+            "edge_tools:suppress_memory",
+        );
         format!(
             "Memory `{mid}` suppressed for this session. It will not be injected in future turns.",
             mid = memory_id
@@ -2629,16 +2632,16 @@ impl ToolExecutor {
         let turn = self
             .journal_turn_index
             .load(std::sync::atomic::Ordering::Relaxed);
-        if let Ok(writer) = astra_services::session_journal::JournalWriter::new(&session_id) {
-            let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
-            let _ = writer.append(
-                &astra_services::session_journal::JournalEvent::context_released(
-                    Some(&session_id),
-                    turn,
-                    &id_refs,
-                ),
-            );
-        }
+        let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        crate::cli::cli_utils::append_session_journal_event_or_warn(
+            &session_id,
+            &astra_services::session_journal::JournalEvent::context_released(
+                Some(&session_id),
+                turn,
+                &id_refs,
+            ),
+            "edge_tools:release_context",
+        );
         format!(
             "Released {} tool result(s). They will be stubbed on the next LLM call.",
             ids.len()
@@ -2777,12 +2780,16 @@ impl ToolExecutor {
             .as_ref()
             .map(crate::cli::slash_memory::render_session_memory_surface_status)
             .filter(|block| !block.trim().is_empty());
-        let journal_fallback = self.render_session_memory_journal_fallback();
-        let journal_pipeline = self
-            .active_session_id()
-            .filter(|sid| !sid.is_empty())
-            .and_then(|sid| astra_services::session_journal::read_journal(&sid).ok())
-            .and_then(|events| Self::render_session_memory_pipeline_traces(&events));
+        let (journal_fallback, journal_pipeline, journal_notice) =
+            match self.load_active_session_memory_journal() {
+                Ok(Some((session_id, events))) => (
+                    Self::render_session_memory_journal_fallback(&session_id, &events),
+                    Self::render_session_memory_pipeline_traces(&events),
+                    None,
+                ),
+                Ok(None) => (None, None, None),
+                Err(error) => (None, None, Some(format!("journal unavailable: {error}"))),
+            };
         let Some(obs) = self.session_memory_observatory.as_ref() else {
             let body = journal_fallback.unwrap_or_else(|| {
                 "# session-memory observatory\n\n\
@@ -2791,6 +2798,10 @@ impl ToolExecutor {
                      attach one so extractions + injections are traceable here."
                     .to_string()
             });
+            let body = journal_notice
+                .as_deref()
+                .map(|notice| Self::inject_session_memory_notice(&body, notice))
+                .unwrap_or(body);
             return Self::prepend_session_memory_surface_status(surface_block.as_deref(), &body);
         };
 
@@ -2808,6 +2819,9 @@ impl ToolExecutor {
         let mut out = String::from("# session-memory observatory\n\n");
         if let Some(block) = surface_block.as_deref() {
             writeln!(out, "{block}\n").ok();
+        }
+        if let Some(notice) = journal_notice.as_deref() {
+            writeln!(out, "{notice}\n").ok();
         }
 
         writeln!(
@@ -2915,11 +2929,23 @@ impl ToolExecutor {
         out
     }
 
-    fn render_session_memory_journal_fallback(&self) -> Option<String> {
+    fn load_active_session_memory_journal(
+        &self,
+    ) -> Result<Option<(String, Vec<astra_services::session_journal::JournalEvent>)>, String> {
+        let Some(session_id) = self.active_session_id().filter(|sid| !sid.is_empty()) else {
+            return Ok(None);
+        };
+        let events = astra_services::session_journal::read_journal(&session_id)
+            .map_err(|error| format!("failed to read session journal for {session_id}: {error}"))?;
+        Ok(Some((session_id, events)))
+    }
+
+    fn render_session_memory_journal_fallback(
+        session_id: &str,
+        events: &[astra_services::session_journal::JournalEvent],
+    ) -> Option<String> {
         use std::fmt::Write as _;
 
-        let session_id = self.active_session_id().filter(|sid| !sid.is_empty())?;
-        let events = astra_services::session_journal::read_journal(&session_id).ok()?;
         if events.is_empty() {
             return None;
         }
@@ -3161,6 +3187,15 @@ impl ToolExecutor {
         match surface_block.filter(|block| !block.trim().is_empty()) {
             Some(block) => format!("{block}\n\n{body}"),
             None => body.to_string(),
+        }
+    }
+
+    fn inject_session_memory_notice(body: &str, notice: &str) -> String {
+        const HEADER: &str = "# session-memory observatory\n\n";
+        if let Some(rest) = body.strip_prefix(HEADER) {
+            format!("{HEADER}{notice}\n\n{rest}")
+        } else {
+            format!("{notice}\n\n{body}")
         }
     }
 
@@ -4558,6 +4593,7 @@ impl ToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lock_recovery::LockRecovery;
     use std::path::PathBuf;
 
     pub(super) fn test_executor() -> ToolExecutor {
@@ -4993,7 +5029,7 @@ mod tests {
 
         let executor = test_executor().with_active_session_id("session-a");
 
-        let journal = executor.file_journal.lock().unwrap();
+        let journal = executor.file_journal.lock_recover();
         assert!(
             journal.persist_dir().is_some(),
             "persistence must be enabled after session-id is set"
@@ -5023,7 +5059,7 @@ mod tests {
             astra_turn_core::file_edit_journal::FileEditJournal::new(500),
         ));
         assert!(
-            shared.lock().unwrap().persist_dir().is_none(),
+            shared.lock_recover().persist_dir().is_none(),
             "fresh shared journal starts in-memory"
         );
 
@@ -5041,7 +5077,7 @@ mod tests {
         );
 
         // AND that shared journal must now carry the persistence binding.
-        let journal = shared.lock().unwrap();
+        let journal = shared.lock_recover();
         assert_eq!(
             journal.persist_dir(),
             Some(expected.as_path()),
@@ -5073,7 +5109,7 @@ mod tests {
         let file = work.path().join("pre.txt");
         std::fs::write(&file, b"v0").unwrap();
         {
-            let mut j = shared.lock().unwrap();
+            let mut j = shared.lock_recover();
             j.record_before(&file, "pre", 0);
             j.record_after(&file, "pre", b"v1");
         }
@@ -5083,7 +5119,7 @@ mod tests {
             .with_active_session_id("session-c");
 
         let expected = tmp.path().join("session-c").join("file_checkpoints");
-        let j = shared.lock().unwrap();
+        let j = shared.lock_recover();
         assert_eq!(j.persist_dir(), Some(expected.as_path()));
         assert!(std::sync::Arc::ptr_eq(&executor.file_journal, &shared));
         assert_eq!(
@@ -5125,11 +5161,11 @@ mod tests {
             astra_turn_core::file_edit_journal::FileEditJournal::new(500),
         ));
         {
-            let mut j = shared.lock().unwrap();
+            let mut j = shared.lock_recover();
             j.record_before(&file, "early-call", 0);
             j.record_after(&file, "early-call", b"after");
         }
-        assert_eq!(shared.lock().unwrap().len(), 1);
+        assert_eq!(shared.lock_recover().len(), 1);
 
         // Now wire into an executor and set the session id.
         let _executor = test_executor()
@@ -5137,7 +5173,7 @@ mod tests {
             .with_active_session_id("session-d");
 
         // The pre-session entry MUST survive the binding.
-        let j = shared.lock().unwrap();
+        let j = shared.lock_recover();
         assert_eq!(j.len(), 1, "pre-session in-memory entry must not be lost");
         let entries: Vec<_> = j.entries().collect();
         assert_eq!(entries[0].path, file);
@@ -5179,7 +5215,7 @@ mod tests {
             .with_shared_file_journal(shared.clone())
             .with_active_session_id("session-e");
 
-        let j = shared.lock().unwrap();
+        let j = shared.lock_recover();
         assert_eq!(j.len(), 1, "prior-run entry must load from disk");
         let entries: Vec<_> = j.entries().collect();
         assert_eq!(entries[0].tool_call_id, "prior");
@@ -5228,7 +5264,7 @@ mod tests {
             astra_turn_core::file_edit_journal::FileEditJournal::new(500),
         ));
         {
-            let mut j = shared.lock().unwrap();
+            let mut j = shared.lock_recover();
             j.record_before(&pre_file, "pre-session", 0);
             j.record_after(&pre_file, "pre-session", b"v1");
         }
@@ -5239,7 +5275,7 @@ mod tests {
             .with_active_session_id("session-f");
 
         // Must have ALL 3 entries (2 disk + 1 pre-session).
-        let j = shared.lock().unwrap();
+        let j = shared.lock_recover();
         assert_eq!(
             j.len(),
             3,
@@ -5279,18 +5315,18 @@ mod tests {
 
         let executor = test_executor().with_active_session_id("session-g");
         {
-            let mut j = executor.file_journal.lock().unwrap();
+            let mut j = executor.file_journal.lock_recover();
             j.record_before(&file, "call", 0);
             j.record_after(&file, "call", b"v1");
         }
 
-        let before_len = executor.file_journal.lock().unwrap().len();
+        let before_len = executor.file_journal.lock_recover().len();
         assert_eq!(before_len, 1);
 
         // Second call with same sid.
         executor.set_active_session_id("session-g");
 
-        let after_len = executor.file_journal.lock().unwrap().len();
+        let after_len = executor.file_journal.lock_recover().len();
         assert_eq!(
             after_len, before_len,
             "re-binding same sid must not duplicate entries"
@@ -5311,7 +5347,7 @@ mod tests {
 
         let executor = test_executor().with_active_session_id("session-h1");
         {
-            let mut j = executor.file_journal.lock().unwrap();
+            let mut j = executor.file_journal.lock_recover();
             j.record_before(&file, "call-h1", 0);
             j.record_after(&file, "call-h1", b"v1");
         }
@@ -5322,7 +5358,7 @@ mod tests {
         executor.set_active_session_id("session-h2");
         let h2_dir = tmp.path().join("session-h2").join("file_checkpoints");
         assert_eq!(
-            executor.file_journal.lock().unwrap().persist_dir(),
+            executor.file_journal.lock_recover().persist_dir(),
             Some(h2_dir.as_path()),
             "persist_dir must redirect to the new session"
         );
@@ -5359,12 +5395,12 @@ mod tests {
 
         let executor = test_executor().with_active_session_id("session-i1");
         {
-            let mut j = executor.file_journal.lock().unwrap();
+            let mut j = executor.file_journal.lock_recover();
             j.record_before(&file, "call-i1", 0);
             j.record_after(&file, "call-i1", b"v1");
         }
         // Confirm sid1 has an entry in memory.
-        assert_eq!(executor.file_journal.lock().unwrap().len(), 1);
+        assert_eq!(executor.file_journal.lock_recover().len(), 1);
 
         // Rebind to a fresh session.
         executor.set_active_session_id("session-i2");
@@ -5372,7 +5408,7 @@ mod tests {
 
         // In-memory journal starts clean under the new session.
         assert_eq!(
-            executor.file_journal.lock().unwrap().len(),
+            executor.file_journal.lock_recover().len(),
             0,
             "memory must be cleared on rebind-to-different-sid"
         );
@@ -5658,6 +5694,26 @@ mod tests {
             ),
             "{out}"
         );
+    }
+
+    #[test]
+    fn introspect_session_memory_unreadable_journal_surfaces_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let session_id = "sess-introspect-unreadable";
+        std::fs::create_dir_all(astra_services::session_journal::journal_file_path(
+            session_id,
+        ))
+        .unwrap();
+
+        let executor = test_executor().with_active_session_id(session_id);
+        let out = executor.handle_introspect(&serde_json::json!({"subtopic": "session_memory"}));
+        assert!(out.contains("journal unavailable:"), "{out}");
+        assert!(
+            out.contains("failed to read session journal for sess-introspect-unreadable"),
+            "{out}"
+        );
+        assert!(out.contains("No observatory attached"), "{out}");
     }
 
     #[test]

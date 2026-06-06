@@ -57,7 +57,7 @@ impl<'a> SandboxPolicyGuard<'a> {
         slot: &'a std::sync::RwLock<Option<SandboxPolicy>>,
         next: Option<SandboxPolicy>,
     ) -> Self {
-        let mut write = slot.write().unwrap_or_else(|e| e.into_inner());
+        let mut write = astra_core::sync_poison::recover_rwlock_write(&slot);
         let saved = write.take();
         // If `next` is None we keep the previous policy (no skill activation this turn).
         // If `next` is Some, it replaces the previous policy for the duration of the guard.
@@ -69,7 +69,7 @@ impl<'a> SandboxPolicyGuard<'a> {
 
 impl Drop for SandboxPolicyGuard<'_> {
     fn drop(&mut self) {
-        let mut write = self.slot.write().unwrap_or_else(|e| e.into_inner());
+        let mut write = astra_core::sync_poison::recover_rwlock_write(&self.slot);
         *write = self.saved.take();
     }
 }
@@ -485,6 +485,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             term_width: self.term_width,
             render_policy: self.render_policy,
             message: self.message,
+            semantic_query_override: None,
             history: self.history,
             recent_tools: self.recent_tools,
             project_root: self.project_root.as_path(),
