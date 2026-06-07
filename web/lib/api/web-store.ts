@@ -3,12 +3,15 @@ import {
   buildQueryString,
   chatRunStreamPath,
   parseSseDataEvents,
+  type RunListResponse,
+  type RunStatus,
   type RuntimeSessionListResponse,
   type RuntimeSessionResponse,
   type RuntimeTranscriptItemResponse,
   type RuntimeTranscriptResponse,
   type StreamEvent,
 } from '@astra/sdk';
+import { activeRunPriority, isTerminalChatRunStatus, runBlocksChatTurn } from '@/lib/chat-run-state';
 import {
   RuntimeClientError,
   WebRuntimeClient,
@@ -34,13 +37,21 @@ import type {
   UserSummary,
 } from '@/lib/api/types';
 
+type ChatActiveRunSource = 'backend_poll' | 'stream' | 'local_mutation';
+
+type ChatActiveRunRecord = NonNullable<ChatDetail['activeRun']> & {
+  source: ChatActiveRunSource;
+  observedAt: string;
+};
+
 type ChatRecord = ChatSummary & {
   createdAt: string;
   archivedAt?: string | null;
   messages: ChatMessage[];
+  activeRun?: ChatActiveRunRecord;
   pendingTurn?: {
-    messageId: string;
-    content: string;
+  messageId: string;
+  content: string;
     options: ComposerOptions;
   };
 };
@@ -55,7 +66,10 @@ type Store = {
 
 const AGENT_RESPONSE_TIMEOUT_MS = 30_000;
 const AGENT_STREAM_TIMEOUT_MS = 180_000;
+const LOCAL_ACTIVE_RUN_GRACE_MS = 30_000;
 const SESSION_SYNC_PAGE_SIZE = 200;
+const RUN_SYNC_PAGE_SIZE = 200;
+const MAX_DEFERRED_INPUT_CHARS = 20_000;
 const LEGACY_LOCAL_CHAT_IDS = new Set(['chat-web-agent-notes']);
 
 type StreamResult = {
@@ -95,6 +109,80 @@ function normalizedActiveSkills(skills?: string[]) {
   return [...new Set(skills.map((skill) => skill.trim()).filter(Boolean))].sort((left, right) => (
     left.localeCompare(right)
   ));
+}
+
+function makeActiveRunRecord(
+  activeRun: NonNullable<ChatDetail['activeRun']>,
+  source: ChatActiveRunSource,
+  observedAt = nowIso(),
+): ChatActiveRunRecord {
+  return {
+    runId: activeRun.runId,
+    status: activeRun.status,
+    waitingFor: activeRun.waitingFor ?? null,
+    source,
+    observedAt,
+  };
+}
+
+function isFreshLocalActiveRun(activeRun: ChatActiveRunRecord, now = Date.now()) {
+  if (activeRun.source === 'backend_poll') {
+    return false;
+  }
+  const observedAt = Date.parse(activeRun.observedAt);
+  return Number.isFinite(observedAt) && now - observedAt <= LOCAL_ACTIVE_RUN_GRACE_MS;
+}
+
+function compareActiveRunDeterministically(
+  left: ChatActiveRunRecord,
+  right: ChatActiveRunRecord,
+) {
+  const priorityDelta = activeRunPriority(left) - activeRunPriority(right);
+  if (priorityDelta !== 0) {
+    return priorityDelta;
+  }
+  return left.runId.localeCompare(right.runId);
+}
+
+function mergeActiveRunRecord(params: {
+  existing?: ChatActiveRunRecord;
+  backend?: ChatActiveRunRecord;
+  backendRunStatuses: Map<string, string>;
+  now?: number;
+}): ChatActiveRunRecord | undefined {
+  const { existing, backend, backendRunStatuses, now = Date.now() } = params;
+  if (existing) {
+    const backendStatusForExisting = backendRunStatuses.get(existing.runId);
+    if (isTerminalChatRunStatus(backendStatusForExisting)) {
+    return undefined;
+    }
+  }
+  if (!backend) {
+    return existing && runBlocksChatTurn(existing.status) && isFreshLocalActiveRun(existing, now)
+    ? existing
+    : undefined;
+  }
+  if (!existing) {
+    return backend;
+  }
+  if (existing.runId !== backend.runId) {
+    return backend;
+  }
+  if (existing.source !== 'backend_poll' && compareActiveRunDeterministically(existing, backend) >= 0) {
+    return existing;
+  }
+  return backend;
+}
+
+function publicActiveRun(activeRun?: ChatActiveRunRecord): ChatDetail['activeRun'] {
+  if (!activeRun) {
+    return undefined;
+  }
+  return {
+    runId: activeRun.runId,
+    status: activeRun.status,
+    waitingFor: activeRun.waitingFor ?? null,
+  };
 }
 
 function seedStore(): Store {
@@ -361,6 +449,7 @@ export function getChat(ownerUserId: string, chatId: string): ChatDetail | null 
     },
     messages: chat.messages,
     project: project ? { id: project.id, name: project.name } : undefined,
+    activeRun: publicActiveRun(chat.activeRun),
     pendingTurn: chat.pendingTurn,
   };
 }
@@ -406,6 +495,7 @@ export async function createChatWithMessage(ownerUserId: string, payload: {
     lastMessagePreview: payload.message,
     model: payload.model,
     messages: [userMessage],
+    activeRun: undefined,
     pendingTurn: {
       messageId: userMessage.id,
       content: payload.message,
@@ -525,6 +615,144 @@ export function beginStreamingMessage(ownerUserId: string, chatId: string, paylo
     userMessage,
     assistantMessage,
     sessionId: chat.id,
+  };
+}
+
+export function setChatActiveRun(
+  ownerUserId: string,
+  chatId: string,
+  activeRun?: ChatDetail['activeRun'] | ChatActiveRunRecord,
+) {
+  const store = getStore(ownerUserId);
+  const chat = store.chats.find((item) => item.id === chatId);
+  if (!chat) {
+    return null;
+  }
+  chat.activeRun = activeRun
+    ? makeActiveRunRecord(
+        activeRun,
+        'source' in activeRun ? activeRun.source : 'stream',
+        'observedAt' in activeRun ? activeRun.observedAt : nowIso(),
+      )
+    : undefined;
+  return chat.activeRun;
+}
+
+export async function queueDeferredRunInput(ownerUserId: string, chatId: string, payload: {
+  content: string;
+  options?: ComposerOptions;
+}) {
+  if ([...payload.content].length > MAX_DEFERRED_INPUT_CHARS) {
+    throw new Error('Deferred input is too large.');
+  }
+  await syncBackendSessions(ownerUserId);
+  const store = getStore(ownerUserId);
+  const chat = store.chats.find((item) => item.id === chatId);
+  if (!chat) {
+    return null;
+  }
+  if (!chat.activeRun?.runId) {
+    throw new Error('No active run is available for deferred input.');
+  }
+
+  const client = await requireRuntimeClient({
+    auth: 'required',
+    operation: `submit deferred run input for ${chat.activeRun.runId}`,
+  });
+
+  const activeSkills = normalizedActiveSkills(payload.options?.activeSkills);
+  await client.sdk.submitRunInput(chat.activeRun.runId, {
+    idempotencyKey: crypto.randomUUID(),
+    input: {
+      content: payload.content,
+      active_skills: activeSkills,
+    },
+  });
+
+  const timestamp = nowIso();
+  const userMessage: ChatMessage = {
+    id: crypto.randomUUID(),
+    role: 'user',
+    content: payload.content,
+    activeSkills: activeSkills.length ? activeSkills : undefined,
+    createdAt: timestamp,
+    status: 'complete',
+  };
+
+  chat.messages.push(userMessage);
+  chat.lastMessageAt = timestamp;
+  chat.lastMessagePreview = payload.content;
+  if (chat.projectId) {
+    touchProjectInStore(store, chat.projectId);
+  }
+  chat.activeRun = makeActiveRunRecord({
+    runId: chat.activeRun.runId,
+    status: 'input-queued',
+    waitingFor: 'user_input',
+  }, 'local_mutation');
+
+  return {
+    userMessage,
+    activeRun: publicActiveRun(chat.activeRun),
+  };
+}
+
+export async function stopActiveRun(ownerUserId: string, chatId: string) {
+  await syncBackendSessions(ownerUserId);
+  const store = getStore(ownerUserId);
+  const chat = store.chats.find((item) => item.id === chatId);
+  if (!chat) {
+    return null;
+  }
+  if (!chat.activeRun?.runId) {
+    throw new Error('No active run is available to stop.');
+  }
+
+  const client = await requireRuntimeClient({
+    auth: 'required',
+    operation: `cancel active run ${chat.activeRun.runId}`,
+  });
+
+  await client.sdk.cancelRun(chat.activeRun.runId);
+  chat.activeRun = makeActiveRunRecord({
+    runId: chat.activeRun.runId,
+    status: 'cancelling',
+    waitingFor: null,
+  }, 'local_mutation');
+
+  return {
+    activeRun: publicActiveRun(chat.activeRun),
+  };
+}
+
+export async function resumeActiveRun(ownerUserId: string, chatId: string) {
+  await syncBackendSessions(ownerUserId);
+  const store = getStore(ownerUserId);
+  const chat = store.chats.find((item) => item.id === chatId);
+  if (!chat) {
+    return null;
+  }
+  if (!chat.activeRun?.runId) {
+    throw new Error('No paused run is available to resume.');
+  }
+  if (chat.activeRun.status.trim().toLowerCase() !== 'paused') {
+    throw new Error('Only paused runs can be resumed.');
+  }
+
+  const client = await requireRuntimeClient({
+    auth: 'required',
+    operation: `resume active run ${chat.activeRun.runId}`,
+  });
+
+  await client.sdk.resumeRun(chat.activeRun.runId);
+  chat.activeRun = makeActiveRunRecord({
+    runId: chat.activeRun.runId,
+    status: 'running',
+    waitingFor: null,
+  }, 'local_mutation');
+
+  return {
+    activeRun: publicActiveRun(chat.activeRun),
   };
 }
 
@@ -792,8 +1020,54 @@ function chatRecordFromBackendSession(session: RuntimeSessionResponse, existing?
     archivedAt,
     model,
     messages: existing?.messages ?? [],
+    activeRun: existing?.activeRun,
     pendingTurn: existing?.pendingTurn,
   };
+}
+
+async function listAllBackendRuns(
+  client: WebRuntimeClient,
+  ownerUserId: string,
+): Promise<RunStatus[]> {
+  const runs: RunStatus[] = [];
+  let offset = 0;
+
+  for (;;) {
+    let parsed: RunListResponse;
+    try {
+      parsed = await client.sdk.listRuns({
+        limit: RUN_SYNC_PAGE_SIZE,
+        offset,
+      });
+    } catch (error) {
+      throw runtimeOperationError(
+        `Cannot sync active runs for user ${ownerUserId}`,
+        error,
+      );
+    }
+
+    const page = Array.isArray(parsed.runs) ? parsed.runs : [];
+    runs.push(...page);
+
+    const responseLimit = typeof parsed.limit === 'number' && parsed.limit > 0
+      ? parsed.limit
+      : RUN_SYNC_PAGE_SIZE;
+    const total = typeof parsed.total === 'number' && Number.isFinite(parsed.total)
+      ? parsed.total
+      : null;
+
+    if (
+      page.length === 0
+      || page.length < responseLimit
+      || (total !== null && offset + page.length >= total)
+    ) {
+      break;
+    }
+
+    offset += page.length;
+  }
+
+  return runs;
 }
 
 async function listAllBackendSessions(
@@ -851,9 +1125,29 @@ async function syncBackendSessions(ownerUserId: string): Promise<void> {
   }
 
   const sessions = await listAllBackendSessions(client, ownerUserId);
+  const runs = await listAllBackendRuns(client, ownerUserId);
+  const syncStartedAt = nowIso();
   const store = getStore(ownerUserId);
   const byId = new Map(store.chats.map((chat) => [chat.id, chat]));
   const backendChatIds = new Set<string>();
+  const activeRunBySession = new Map<string, ChatActiveRunRecord>();
+  const backendRunStatuses = new Map<string, string>();
+
+  for (const run of runs) {
+    backendRunStatuses.set(run.runId, run.status);
+    if (!runBlocksChatTurn(run.status)) {
+      continue;
+    }
+    const candidate = makeActiveRunRecord({
+      runId: run.runId,
+      status: run.status,
+      waitingFor: run.waitingFor ?? null,
+    }, 'backend_poll', syncStartedAt);
+    const current = activeRunBySession.get(run.sessionId);
+    if (!current || activeRunPriority(candidate) > activeRunPriority(current)) {
+      activeRunBySession.set(run.sessionId, candidate);
+    }
+  }
 
   for (const session of sessions) {
     const existing = session.session_id ? byId.get(session.session_id) : undefined;
@@ -861,6 +1155,11 @@ async function syncBackendSessions(ownerUserId: string): Promise<void> {
     if (!record) {
       continue;
     }
+    record.activeRun = mergeActiveRunRecord({
+      existing: existing?.activeRun,
+      backend: activeRunBySession.get(record.id),
+      backendRunStatuses,
+    });
     backendChatIds.add(record.id);
     const index = store.chats.findIndex((chat) => chat.id === record.id);
     if (index >= 0) {

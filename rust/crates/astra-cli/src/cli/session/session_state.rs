@@ -510,6 +510,16 @@ pub(crate) struct SessionState {
     /// External cancellation token for TUI Ctrl+C interrupt.
     /// When set, `run_chat_turn` monitors this alongside its own ctrl_c handler.
     pub tui_cancel_token: Option<std::sync::Arc<tokio_util::sync::CancellationToken>>,
+    /// Live local deferred-input provider for the currently streaming turn.
+    /// TUI mid-turn actions enqueue here so the in-process agentic loop can
+    /// release user input after the next tool-call boundary.
+    pub active_turn_local_run_control: std::sync::Arc<
+        std::sync::Mutex<
+            Option<
+                std::sync::Arc<crate::cli::turn::local_run_control::LocalDeferredInputRunControl>,
+            >,
+        >,
+    >,
     /// When set, tool approval requests are sent through this channel
     /// instead of using interactive inquire prompts.
     pub tui_approval_request_tx: Option<crate::cli::chat_stream::ApprovalRequestTx>,
@@ -702,6 +712,7 @@ impl Default for SessionState {
             tui_stream_event_tx: None,
             tui_agent_live_event_sink: None,
             tui_cancel_token: None,
+            active_turn_local_run_control: std::sync::Arc::new(std::sync::Mutex::new(None)),
             tui_approval_request_tx: None,
             tui_ask_user_request_tx: None,
             tui_plan_review_request_tx: None,
@@ -769,6 +780,7 @@ impl SessionState {
     pub fn reset_for_new_session(&mut self) {
         self.pending_recovery = None;
         self.run_id = None;
+        *astra_core::sync_poison::recover_mutex_lock(&self.active_turn_local_run_control) = None;
         self.turn = 0;
         self.last_response = None;
         self.continuation_anchor = None;

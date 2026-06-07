@@ -26,6 +26,7 @@ use astra_server_types::ws_progress_callback::ProgressEvent;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::turn::run_control::RunInputProvider;
 use astra_core::{ErrorResponse, SharedPool, connect_matrixone, error_response};
 use astra_services::coordination::{AgentProfile, AgentTier};
 use astra_services::runs::{
@@ -67,8 +68,8 @@ use astra_turn_core::contracts::{
 use astra_turn_core::trace_event::{TraceContext, TraceEvent, TraceEventWriter};
 
 use astra_core::{
-    STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED, STATUS_PAUSED, STATUS_RUNNING,
-    STATUS_WAITING,
+    STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED, STATUS_INPUT_QUEUED, STATUS_PAUSED,
+    STATUS_RUNNING, STATUS_WAITING,
 };
 
 use crate::orchestration::spawner::project_subrun_status_to_spawn;
@@ -77,6 +78,8 @@ use crate::server::run::handlers as run_handlers;
 use crate::server::runtime_mcp;
 use crate::server::server_loop_host::{self, ServerAgenticLoopHostBuilder};
 use crate::server::{server_skill_subrun, server_tool_executor};
+
+const MAX_DEFERRED_INPUT_CHARS: usize = 20_000;
 
 const RUNTIME_CONTEXT_TRACE_AGENT_ID: &str = "astra-server";
 const LLM_TOKEN_SERVICE_TRUSTED_DOMAINS_TABLE: &str = "runtime_llm_trusted_domains";
@@ -2143,6 +2146,7 @@ fn build_run_turn_complete_event_with_interruption(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunStatus {
     Running,
+    InputQueued,
     Paused,
     Waiting,
     Completed,
@@ -2154,6 +2158,7 @@ impl RunStatus {
     fn as_str(&self) -> &'static str {
         match self {
             Self::Running => STATUS_RUNNING,
+            Self::InputQueued => STATUS_INPUT_QUEUED,
             Self::Paused => STATUS_PAUSED,
             Self::Waiting => STATUS_WAITING,
             Self::Completed => STATUS_COMPLETED,
@@ -2165,6 +2170,7 @@ impl RunStatus {
     fn from_durable_status(status: &str) -> Option<Self> {
         match durable_run_status_kind(status) {
             DurableRunStatusKind::Running => Some(Self::Running),
+            DurableRunStatusKind::InputQueued => Some(Self::InputQueued),
             DurableRunStatusKind::Paused => Some(Self::Paused),
             DurableRunStatusKind::Waiting => Some(Self::Waiting),
             DurableRunStatusKind::Completed => Some(Self::Completed),
@@ -2180,7 +2186,7 @@ impl RunStatus {
 
     fn blocks_session(&self, waiting_for: Option<&str>) -> bool {
         match self {
-            Self::Running | Self::Waiting => true,
+            Self::Running | Self::InputQueued | Self::Waiting => true,
             Self::Paused => waiting_for.is_some(),
             Self::Completed | Self::Failed | Self::Cancelled => false,
         }
@@ -2190,17 +2196,36 @@ impl RunStatus {
     ///
     /// Rules:
     /// - Terminal states (Completed, Failed, Cancelled) cannot transition to anything.
-    /// - Running → Paused, Waiting, Completed, Failed, Cancelled
+    /// - Running → InputQueued, Paused, Waiting, Completed, Failed, Cancelled
+    /// - InputQueued → Running, Paused, Waiting, Completed, Failed, Cancelled
     /// - Paused → Running, Cancelled, Failed
-    /// - Waiting → Running, Cancelled, Failed (external input resumes to Running)
+    /// - Waiting → InputQueued, Running, Cancelled, Failed (external input resumes to Running)
     pub fn try_transition(&self, next: &RunStatus) -> Result<(), String> {
         let allowed = match self {
             Self::Running => matches!(
                 next,
-                Self::Paused | Self::Waiting | Self::Completed | Self::Failed | Self::Cancelled
+                Self::InputQueued
+                    | Self::Paused
+                    | Self::Waiting
+                    | Self::Completed
+                    | Self::Failed
+                    | Self::Cancelled
+            ),
+            Self::InputQueued => matches!(
+                next,
+                Self::InputQueued
+                    | Self::Running
+                    | Self::Paused
+                    | Self::Waiting
+                    | Self::Completed
+                    | Self::Failed
+                    | Self::Cancelled
             ),
             Self::Paused => matches!(next, Self::Running | Self::Cancelled | Self::Failed),
-            Self::Waiting => matches!(next, Self::Running | Self::Cancelled | Self::Failed),
+            Self::Waiting => matches!(
+                next,
+                Self::InputQueued | Self::Running | Self::Cancelled | Self::Failed
+            ),
             Self::Completed | Self::Failed | Self::Cancelled => false,
         };
         if allowed {
@@ -2216,6 +2241,15 @@ impl RunStatus {
 
 fn is_run_finished_event(event: &Value) -> bool {
     event.get("event_type").and_then(Value::as_str) == Some("run_finished")
+}
+
+fn deferred_input_text_len(input: &Value) -> usize {
+    input
+        .get("content")
+        .or_else(|| input.get("text"))
+        .and_then(Value::as_str)
+        .map(|text| text.chars().count())
+        .unwrap_or(0)
 }
 
 fn is_completed_run_finished_event(event: &Value) -> bool {
@@ -3612,6 +3646,7 @@ impl AgenticRunLifecycleService {
             },
             cancellation: Default::default(),
             messaging: Default::default(),
+            deferred_input: Default::default(),
             error_recovery: Default::default(),
             run_control: None,
             pipeline_session: Some(
@@ -5160,6 +5195,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 "idempotency_key is required",
             ));
         }
+        if deferred_input_text_len(&input.input) > MAX_DEFERRED_INPUT_CHARS {
+            return Err(error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "deferred input is too large",
+            ));
+        }
 
         let idempotency_key = input.idempotency_key.trim().to_string();
         let event = json!({
@@ -5172,7 +5213,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let durable_status = Self::run_status_from_durable(&durable.status)?;
         if matches!(
             durable_status,
-            RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled
+            RunStatus::Paused | RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled
         ) {
             return Err(Self::run_state_conflict("submit input to", &durable.status));
         }
@@ -5188,13 +5229,83 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             });
         }
 
+        durable_status
+            .try_transition(&RunStatus::InputQueued)
+            .map_err(|_| Self::run_state_conflict("submit input to", &durable.status))?;
+
         self.run_engine
             .append_event(&run_id, event.clone())
             .await
             .map_err(|error| Self::durable_persist_error("input", error))?;
 
+        let durable_after_append = self.require_durable_run_for_user(&run_id, &user_id).await?;
+        let durable_status_after_append =
+            Self::run_status_from_durable(&durable_after_append.status)?;
+        if matches!(
+            durable_status_after_append,
+            RunStatus::Paused | RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled
+        ) {
+            if let Some(event_index) = durable_after_append.events.iter().enumerate().find_map(
+                |(index, persisted_event)| {
+                    (persisted_event
+                        .get("idempotency_key")
+                        .and_then(Value::as_str)
+                        == Some(idempotency_key.as_str()))
+                    .then_some(index)
+                },
+            ) {
+                self.run_engine
+                    .mark_user_inputs_released(&run_id, &[event_index])
+                    .await
+                    .map_err(|error| {
+                        Self::durable_persist_error("input release rollback", error)
+                    })?;
+            }
+            return Err(Self::run_state_conflict(
+                "submit input to",
+                &durable_after_append.status,
+            ));
+        }
+        let status_updated = self
+            .run_engine
+            .persist_status_if_current(
+                &run_id,
+                &[STATUS_RUNNING, STATUS_INPUT_QUEUED, STATUS_WAITING],
+                STATUS_INPUT_QUEUED,
+                Some("user_input"),
+                None,
+            )
+            .await
+            .map_err(|error| Self::durable_persist_error("input status", error))?;
+        if !status_updated {
+            let durable_after_conflict =
+                self.require_durable_run_for_user(&run_id, &user_id).await?;
+            if let Some(event_index) = durable_after_conflict.events.iter().enumerate().find_map(
+                |(index, persisted_event)| {
+                    (persisted_event
+                        .get("idempotency_key")
+                        .and_then(Value::as_str)
+                        == Some(idempotency_key.as_str()))
+                    .then_some(index)
+                },
+            ) {
+                self.run_engine
+                    .mark_user_inputs_released(&run_id, &[event_index])
+                    .await
+                    .map_err(|error| {
+                        Self::durable_persist_error("input release rollback", error)
+                    })?;
+            }
+            return Err(Self::run_state_conflict(
+                "submit input to",
+                &durable_after_conflict.status,
+            ));
+        }
+
         if let Some(run) = self.runs.write().await.get_mut(&run_id) {
             run.events.push(event);
+            run.status = RunStatus::InputQueued;
+            run.waiting_for = Some("user_input".to_string());
         }
 
         Ok(RunInputRecord {
@@ -6030,6 +6141,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 mailbox: config.mailbox,
                 ..Default::default()
             },
+            deferred_input: Default::default(),
             error_recovery: Default::default(),
             run_control: None,
             pipeline_session: Some(
@@ -6844,6 +6956,31 @@ mod tests {
             }
             self.inner
                 .update_run_status(run_id, status, waiting_for, error_message)
+                .await
+        }
+
+        async fn update_run_status_if_current(
+            &self,
+            run_id: &str,
+            expected_statuses: &[&str],
+            status: &str,
+            waiting_for: Option<&str>,
+            error_message: Option<&str>,
+        ) -> Result<bool, String> {
+            let call = self.next_status_call();
+            if self.fail_status_calls.contains(&call) {
+                return Err(format!(
+                    "injected update_run_status_if_current failure on call {call}"
+                ));
+            }
+            self.inner
+                .update_run_status_if_current(
+                    run_id,
+                    expected_statuses,
+                    status,
+                    waiting_for,
+                    error_message,
+                )
                 .await
         }
 
@@ -7704,6 +7841,24 @@ mod tests {
         assert_eq!(page3.runs.len(), 1);
     }
 
+    #[tokio::test]
+    async fn list_runs_orders_by_latest_update() {
+        let svc = test_service();
+        let older = ok(svc.create_run("user-1".into(), test_request("older")).await);
+        let newer = ok(svc.create_run("user-1".into(), test_request("newer")).await);
+
+        let initial = ok(svc.list_runs("user-1".into(), 10, 0).await);
+        assert_eq!(initial.runs[0].run_id, newer.run_id);
+
+        ok(svc.pause_run(older.run_id.clone(), "user-1".into()).await);
+
+        let after_update = ok(svc.list_runs("user-1".into(), 10, 0).await);
+        assert_eq!(
+            after_update.runs[0].run_id, older.run_id,
+            "list_runs should surface the most recently updated run first"
+        );
+    }
+
     /// P2-B: list_runs must clamp pagination params like other list endpoints.
     #[tokio::test]
     async fn list_runs_clamps_pagination() {
@@ -8073,6 +8228,7 @@ mod tests {
     #[test]
     fn run_status_as_str() {
         assert_eq!(RunStatus::Running.as_str(), "running");
+        assert_eq!(RunStatus::InputQueued.as_str(), "input-queued");
         assert_eq!(RunStatus::Completed.as_str(), "completed");
         assert_eq!(RunStatus::Failed.as_str(), "failed");
         assert_eq!(RunStatus::Cancelled.as_str(), "cancelled");
@@ -8609,6 +8765,8 @@ mod tests {
         assert!(!first.duplicate);
         assert!(duplicate.duplicate);
         assert_eq!(matching_inputs, 1);
+        assert_eq!(durable.status, STATUS_INPUT_QUEUED);
+        assert_eq!(durable.waiting_for.as_deref(), Some("user_input"));
     }
 
     #[tokio::test]
@@ -8635,6 +8793,102 @@ mod tests {
             )
             .await);
         assert_eq!(e.0, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn submit_run_input_accepts_repeated_queueing_while_input_already_queued() {
+        let svc = test_service_with_engine();
+        let engine = &svc.run_engine;
+        engine
+            .start_run("run-queued-input", "user-1", "session-1")
+            .await
+            .unwrap();
+        engine
+            .persist_status(
+                "run-queued-input",
+                STATUS_INPUT_QUEUED,
+                Some("user_input"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let result = svc
+            .submit_run_input(
+                "run-queued-input".into(),
+                "user-1".into(),
+                RunInputData {
+                    idempotency_key: "key-queued-1".into(),
+                    input: json!({"answer": "keep queueing"}),
+                },
+            )
+            .await
+            .expect("input-queued runs should accept additional deferred input");
+
+        assert!(result.accepted);
+        assert!(!result.duplicate);
+        let durable = engine.load_run("run-queued-input").await.unwrap().unwrap();
+        assert_eq!(durable.status, STATUS_INPUT_QUEUED);
+        assert_eq!(durable.waiting_for.as_deref(), Some("user_input"));
+        assert!(durable.events.iter().any(|event| {
+            event.get("idempotency_key").and_then(Value::as_str) == Some("key-queued-1")
+        }));
+    }
+
+    #[tokio::test]
+    async fn submit_run_input_rejects_paused_durable_run() {
+        let svc = test_service_with_engine();
+        let engine = &svc.run_engine;
+        engine
+            .start_run("run-paused-input", "user-1", "session-1")
+            .await
+            .unwrap();
+        engine
+            .persist_status("run-paused-input", STATUS_PAUSED, None, None)
+            .await
+            .unwrap();
+
+        let e = err(svc
+            .submit_run_input(
+                "run-paused-input".into(),
+                "user-1".into(),
+                RunInputData {
+                    idempotency_key: "key-1".into(),
+                    input: json!({"answer": "late"}),
+                },
+            )
+            .await);
+        assert_eq!(e.0, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn submit_run_input_rejects_oversized_content() {
+        let svc = test_service_with_engine();
+        let engine = &svc.run_engine;
+        engine
+            .start_run("run-large-input", "user-1", "session-1")
+            .await
+            .unwrap();
+
+        let e = err(svc
+            .submit_run_input(
+                "run-large-input".into(),
+                "user-1".into(),
+                RunInputData {
+                    idempotency_key: "key-large".into(),
+                    input: json!({"content": "x".repeat(MAX_DEFERRED_INPUT_CHARS + 1)}),
+                },
+            )
+            .await);
+
+        assert_eq!(e.0, StatusCode::PAYLOAD_TOO_LARGE);
+        let durable = engine.load_run("run-large-input").await.unwrap().unwrap();
+        assert!(
+            durable.events.iter().all(|event| {
+                event.get("idempotency_key").and_then(Value::as_str) != Some("key-large")
+            }),
+            "oversized input must not be appended before validation"
+        );
     }
 
     #[tokio::test]
@@ -8940,13 +9194,21 @@ mod tests {
         use super::RunStatus::*;
 
         // Valid transitions
+        assert!(Running.try_transition(&InputQueued).is_ok());
         assert!(Running.try_transition(&Paused).is_ok());
         assert!(Running.try_transition(&Completed).is_ok());
         assert!(Running.try_transition(&Failed).is_ok());
         assert!(Running.try_transition(&Cancelled).is_ok());
+        assert!(InputQueued.try_transition(&Running).is_ok());
+        assert!(InputQueued.try_transition(&Paused).is_ok());
+        assert!(InputQueued.try_transition(&Waiting).is_ok());
+        assert!(InputQueued.try_transition(&Completed).is_ok());
+        assert!(InputQueued.try_transition(&Failed).is_ok());
+        assert!(InputQueued.try_transition(&Cancelled).is_ok());
         assert!(Paused.try_transition(&Running).is_ok());
         assert!(Paused.try_transition(&Cancelled).is_ok());
         assert!(Paused.try_transition(&Failed).is_ok());
+        assert!(Waiting.try_transition(&InputQueued).is_ok());
 
         // Terminal states cannot transition
         let err = Completed.try_transition(&Running);
@@ -8965,6 +9227,11 @@ mod tests {
         // Running cannot go back to Running
         let err = Running.try_transition(&Running);
         assert!(err.is_err(), "Running → Running must be rejected");
+
+        assert!(
+            InputQueued.try_transition(&InputQueued).is_ok(),
+            "InputQueued → InputQueued must stay queueable for repeated user input"
+        );
     }
 
     /// P1-F: list_runs pagination must be deterministic — all runs appear
@@ -9029,6 +9296,12 @@ mod tests {
         );
         // Waiting serializes as "waiting"
         assert_eq!(RunStatus::Waiting.as_str(), "waiting");
+        assert!(
+            RunStatus::Waiting
+                .try_transition(&RunStatus::InputQueued)
+                .is_ok(),
+            "Waiting → InputQueued must be allowed when user input arrives"
+        );
     }
 
     #[test]
@@ -9036,6 +9309,10 @@ mod tests {
         assert_eq!(
             RunStatus::from_durable_status(STATUS_RUNNING),
             Some(RunStatus::Running)
+        );
+        assert_eq!(
+            RunStatus::from_durable_status(STATUS_INPUT_QUEUED),
+            Some(RunStatus::InputQueued)
         );
         assert_eq!(
             RunStatus::from_durable_status(STATUS_WAITING),

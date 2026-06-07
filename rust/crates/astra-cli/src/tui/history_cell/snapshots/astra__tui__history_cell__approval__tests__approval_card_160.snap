@@ -1,13 +1,12 @@
 ---
 source: crates/astra-cli/src/tui/history_cell/approval.rs
-assertion_line: 1015
 expression: "render_at(&fixture_full(), 160)"
 ---
-╭─ ⏸ npm test --filter auth
-│ ⚑ BashExecute
+╭─ Approval · Bash
+│ npm test --filter auth
 │ npm test --filter auth -- --verbose
-│ ⚠ This command needs your approval before it runs.
-│ Remember: similar `npm test` commands in this workspace
+│ Needs approval before it runs.
+│ Remember · similar `npm test` commands in this workspace
 │
 │  Allow once   Always allow   Reject
-╰─ ←→ select · Enter confirm · Esc reject
+╰─ ←→ move · Enter select · Esc close

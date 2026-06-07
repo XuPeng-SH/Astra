@@ -2,8 +2,8 @@ use std::time::Instant;
 
 use super::super::agentic::headless_round::HeadlessStderrStyle;
 use super::host::{
-    AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, HostTurnResult, TaskBoardSnapshot,
-    finalize_and_render, finalize_turn_trace, try_write_heavy_checkpoint,
+    AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, DeferredInputState, HostTurnResult,
+    TaskBoardSnapshot, finalize_and_render, finalize_turn_trace, try_write_heavy_checkpoint,
 };
 use super::lifecycle::{
     TurnIterationPrep, current_agentic_step, interruption_diagnosis_summary,
@@ -60,6 +60,120 @@ fn global_alert_dispatcher()
             ))
         })
         .as_ref()
+}
+
+pub(crate) fn deferred_user_input_text(input: &serde_json::Value) -> Option<String> {
+    fn trimmed_text(value: Option<&serde_json::Value>) -> Option<String> {
+        value
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(ToString::to_string)
+    }
+
+    fn active_skills_text(input: &serde_json::Value) -> Option<String> {
+        let skills = input
+            .get("active_skills")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|skill| !skill.is_empty())
+            .collect::<Vec<_>>();
+        (!skills.is_empty()).then(|| format!("Requested active skills: {}.", skills.join(", ")))
+    }
+
+    if let Some(text) = trimmed_text(Some(input)) {
+        return Some(text);
+    }
+
+    let content = trimmed_text(input.get("content"));
+    let text = trimmed_text(input.get("text"));
+    let active_skills = active_skills_text(input);
+
+    match (content.or(text), active_skills) {
+        (Some(content), Some(active_skills)) => Some(format!("{active_skills}\n{content}")),
+        (Some(content), None) => Some(content),
+        (None, Some(active_skills)) => Some(active_skills),
+        (None, None) => None,
+    }
+}
+
+fn render_deferred_user_input(content: &str) -> String {
+    format!(
+        "A newer user message arrived during execution and now supersedes the previous plan.\n\nLatest user message:\n{content}\n\nRequired behavior:\n- Treat this as the newest user instruction.\n- Address it before making more tool calls.\n- Do not continue the previous plan blindly.\n- Only make another tool call if it is directly necessary to satisfy this newest user message."
+    )
+}
+
+pub(crate) async fn inject_polled_deferred_user_inputs<H: AgenticLoopHost>(
+    host: &mut H,
+    state: &mut AgenticLoopState,
+) {
+    let (run_control, run_id) = match (state.run_control.as_ref(), state.current_run_id.as_ref()) {
+        (Some(run_control), Some(run_id)) => (run_control.clone(), run_id.clone()),
+        _ => return,
+    };
+    let poll = run_control
+        .poll_user_inputs(&run_id, state.deferred_input.deferred_user_input_cursor())
+        .await;
+    if let Some(error) = &poll.error {
+        tracing::warn!(run_id, error = %error, "deferred user input poll failed");
+    }
+    let observed = state
+        .deferred_input
+        .observe_polled_user_inputs(poll, deferred_user_input_text);
+    let release_event_indices = state
+        .deferred_input
+        .release_event_indices_to_ack(&observed.released_event_indices);
+    if observed.raw_inputs.is_empty() && release_event_indices.is_empty() {
+        return;
+    }
+
+    for input in &observed.raw_inputs {
+        host.on_deferred_user_input(input);
+    }
+
+    if !observed.contents.is_empty() {
+        let combined = observed.contents.join("\n\n");
+        if !combined.is_empty() {
+            state.messages.push(serde_json::json!({
+                "role": "user",
+                "content": combined.clone(),
+            }));
+            state.message = combined.clone();
+            state.push_volatile(
+                super::host::VolatileKind::DeferredUserInput,
+                render_deferred_user_input(&combined),
+            );
+        }
+    }
+
+    state
+        .deferred_input
+        .commit_observed_cursor(observed.next_cursor);
+    if release_event_indices.is_empty() {
+        return;
+    }
+    match run_control
+        .mark_user_inputs_released(&run_id, &release_event_indices)
+        .await
+    {
+        Ok(()) => state
+            .deferred_input
+            .note_release_ack_result(&release_event_indices, true),
+        Err(error) => {
+            state
+                .deferred_input
+                .note_release_ack_result(&release_event_indices, false);
+            tracing::warn!(
+                run_id = %run_id,
+                ?release_event_indices,
+                error = %error,
+                "failed to durably acknowledge deferred user input release"
+            );
+        }
+    }
 }
 
 /// Record an `llm_round` event for an early-exit path (no tool calls).
@@ -312,6 +426,8 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     if let Some(ref emitter) = state.messaging.progress_emitter {
         emitter.llm_call_started(turn_index as u32);
     }
+
+    inject_polled_deferred_user_inputs(host, state).await;
 
     // ── Nudge suppression gate ──────────────────────────────────────────
     // In PermissionMode::Auto the user has explicitly asked to let the
@@ -2751,12 +2867,13 @@ fn record_tool_selection(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashSet, VecDeque};
     use std::sync::Arc;
     use std::time::Duration;
 
     use astra_services::session_journal::ToolCallRecord;
     use async_trait::async_trait;
+    use tokio::sync::Mutex;
 
     use super::*;
     use crate::observability::ObservabilityHub;
@@ -2764,6 +2881,7 @@ mod tests {
     use crate::turn::agentic_loop::host::{
         AgenticLoopHost, AgenticLoopState, VolatileKind, run_agentic_loop_with_host,
     };
+    use crate::turn::run_control::{RunInputProvider, RunQueuedInputPoll, RunStatusProvider};
     use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
 
     struct SnapshotClearingHost {
@@ -2783,6 +2901,74 @@ mod tests {
                 rendered_final_text: Vec::new(),
                 valid_tools: HashSet::new(),
             }
+        }
+    }
+
+    struct StubRunControlProvider {
+        polls: Mutex<VecDeque<RunQueuedInputPoll>>,
+        released: Mutex<Vec<usize>>,
+        release_failures: Mutex<usize>,
+    }
+
+    impl StubRunControlProvider {
+        fn new(polls: Vec<RunQueuedInputPoll>) -> Self {
+            Self {
+                polls: Mutex::new(VecDeque::from(polls)),
+                released: Mutex::new(Vec::new()),
+                release_failures: Mutex::new(0),
+            }
+        }
+
+        fn with_release_failures(polls: Vec<RunQueuedInputPoll>, release_failures: usize) -> Self {
+            Self {
+                polls: Mutex::new(VecDeque::from(polls)),
+                released: Mutex::new(Vec::new()),
+                release_failures: Mutex::new(release_failures),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl RunStatusProvider for StubRunControlProvider {
+        async fn control_status(
+            &self,
+            _run_id: &str,
+        ) -> Result<Option<crate::turn::run_control::RunControlStatus>, String> {
+            Ok(None)
+        }
+    }
+
+    #[async_trait]
+    impl RunInputProvider for StubRunControlProvider {
+        async fn poll_user_inputs(
+            &self,
+            _run_id: &str,
+            after_event_index: usize,
+        ) -> RunQueuedInputPoll {
+            self.polls
+                .lock()
+                .await
+                .pop_front()
+                .unwrap_or(RunQueuedInputPoll {
+                    next_cursor: after_event_index,
+                    inputs: Vec::new(),
+                    error: None,
+                })
+        }
+
+        async fn mark_user_inputs_released(
+            &self,
+            _run_id: &str,
+            event_indices: &[usize],
+        ) -> Result<(), String> {
+            let mut release_failures = self.release_failures.lock().await;
+            if *release_failures > 0 {
+                *release_failures -= 1;
+                return Err("release failed".to_string());
+            }
+            drop(release_failures);
+            self.released.lock().await.extend_from_slice(event_indices);
+            Ok(())
         }
     }
 
@@ -4557,6 +4743,152 @@ mod tests {
                 .and_then(|c| c.as_str())
                 .is_some_and(|s| s.starts_with(prefix))
         })
+    }
+
+    #[tokio::test]
+    async fn deferred_user_input_injects_immediately_at_loop_top() {
+        let mut state = make_state();
+        state.current_run_id = Some("run-queued".into());
+        let provider = Arc::new(StubRunControlProvider::new(vec![RunQueuedInputPoll {
+            next_cursor: 2,
+            inputs: vec![crate::turn::run_control::QueuedRunInputEvent {
+                event_index: 1,
+                input: serde_json::json!({"content": "Switch to writing tests first."}),
+            }],
+            error: None,
+        }]));
+        state.run_control = Some(provider.clone());
+        let mut host = MockHost::new(vec![]);
+
+        inject_polled_deferred_user_inputs(&mut host, &mut state).await;
+
+        assert_eq!(state.deferred_input.deferred_user_input_cursor(), 2);
+        assert_eq!(*provider.released.lock().await, vec![1]);
+        assert_eq!(state.message, "Switch to writing tests first.");
+        assert_eq!(
+            state
+                .messages
+                .last()
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_str()),
+            Some("Switch to writing tests first.")
+        );
+        assert!(state.volatile_pending.iter().any(|entry| {
+            entry.kind == VolatileKind::DeferredUserInput
+                && entry.content.contains("Switch to writing tests first.")
+        }));
+    }
+
+    #[tokio::test]
+    async fn deferred_user_input_does_not_reinject_after_cursor_advance() {
+        let mut state = make_state();
+        state.current_run_id = Some("run-repoll".into());
+        let provider = Arc::new(StubRunControlProvider::new(vec![
+            RunQueuedInputPoll {
+                next_cursor: 2,
+                inputs: vec![crate::turn::run_control::QueuedRunInputEvent {
+                    event_index: 1,
+                    input: serde_json::json!({"content": "only once"}),
+                }],
+                error: None,
+            },
+            RunQueuedInputPoll {
+                next_cursor: 2,
+                inputs: Vec::new(),
+                error: None,
+            },
+        ]));
+        state.run_control = Some(provider.clone());
+        let mut host = MockHost::new(vec![]);
+
+        inject_polled_deferred_user_inputs(&mut host, &mut state).await;
+        inject_polled_deferred_user_inputs(&mut host, &mut state).await;
+
+        assert_eq!(state.deferred_input.deferred_user_input_cursor(), 2);
+        assert_eq!(*provider.released.lock().await, vec![1]);
+        assert_eq!(
+            state
+                .messages
+                .iter()
+                .filter(|m| m.get("content").and_then(|c| c.as_str()) == Some("only once"))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_user_input_retries_release_without_reinjecting_after_ack_failure() {
+        let mut state = make_state();
+        state.current_run_id = Some("run-release-retry".into());
+        let provider = Arc::new(StubRunControlProvider::with_release_failures(
+            vec![
+                RunQueuedInputPoll {
+                    next_cursor: 2,
+                    inputs: vec![crate::turn::run_control::QueuedRunInputEvent {
+                        event_index: 1,
+                        input: serde_json::json!({"content": "inject once"}),
+                    }],
+                    error: None,
+                },
+                RunQueuedInputPoll {
+                    next_cursor: 2,
+                    inputs: Vec::new(),
+                    error: None,
+                },
+            ],
+            1,
+        ));
+        state.run_control = Some(provider.clone());
+        let mut host = MockHost::new(vec![]);
+
+        inject_polled_deferred_user_inputs(&mut host, &mut state).await;
+        inject_polled_deferred_user_inputs(&mut host, &mut state).await;
+
+        assert_eq!(state.deferred_input.deferred_user_input_cursor(), 2);
+        assert_eq!(*provider.released.lock().await, vec![1]);
+        assert_eq!(
+            state
+                .messages
+                .iter()
+                .filter(|m| m.get("content").and_then(|c| c.as_str()) == Some("inject once"))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_user_input_advances_cursor_even_when_content_is_unusable() {
+        let mut state = make_state();
+        state.current_run_id = Some("run-invalid".into());
+        let provider = Arc::new(StubRunControlProvider::new(vec![RunQueuedInputPoll {
+            next_cursor: 7,
+            inputs: vec![crate::turn::run_control::QueuedRunInputEvent {
+                event_index: 6,
+                input: serde_json::json!({"unexpected": true}),
+            }],
+            error: None,
+        }]));
+        state.run_control = Some(provider.clone());
+        let mut host = MockHost::new(vec![]);
+
+        inject_polled_deferred_user_inputs(&mut host, &mut state).await;
+
+        assert_eq!(state.deferred_input.deferred_user_input_cursor(), 7);
+        assert_eq!(*provider.released.lock().await, vec![6]);
+        assert!(state.messages.is_empty());
+        assert!(state.volatile_pending.is_empty());
+    }
+
+    #[test]
+    fn deferred_user_input_text_preserves_active_skills_hint() {
+        let rendered = deferred_user_input_text(&serde_json::json!({
+            "content": "Use the release checklist.",
+            "active_skills": ["release-manager", "deploy-auditor"],
+        }))
+        .expect("deferred input should render");
+
+        assert!(rendered.contains("Requested active skills: release-manager, deploy-auditor."));
+        assert!(rendered.contains("Use the release checklist."));
     }
 
     #[tokio::test]

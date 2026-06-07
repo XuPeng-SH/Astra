@@ -185,6 +185,19 @@ pub trait AgenticLoopHost: Send {
         false
     }
 
+    /// Observe a deferred `user_input` event that was appended to the active
+    /// run while execution was already in progress.
+    ///
+    /// Hosts that carry mutable request context, such as the server host's
+    /// `edge_profile`, can use this hook to keep the next LLM round aligned
+    /// with any per-input runtime hints before the deferred user message is
+    /// surfaced to the model.
+    ///
+    /// Contract: the loop calls this at most once per durable input event.
+    /// `DeferredInputState` advances its append-only cursor when staging a
+    /// poll result, so hosts do not need to deduplicate repeated hook calls.
+    fn on_deferred_user_input(&mut self, _input: &Value) {}
+
     /// Headless round terminal output.
     fn emit_headless_line(&mut self, style: HeadlessStderrStyle, line: String);
 
@@ -649,6 +662,89 @@ pub struct StallTrackingState {
     pub guardrail_tuner_records_cursor: usize,
 }
 
+#[derive(Default)]
+pub struct DeferredInputState {
+    /// Durable event cursor for deferred user-input polling.
+    deferred_user_input_cursor: usize,
+    /// Event indices already delivered to the model but not yet durably marked
+    /// as released. Retried on later poll points without re-injecting content.
+    pending_release_event_indices: Vec<usize>,
+}
+
+pub(crate) struct ObservedDeferredUserInputs {
+    pub(crate) raw_inputs: Vec<Value>,
+    pub(crate) contents: Vec<String>,
+    pub(crate) released_event_indices: Vec<usize>,
+    pub(crate) next_cursor: usize,
+}
+
+impl DeferredInputState {
+    pub fn deferred_user_input_cursor(&self) -> usize {
+        self.deferred_user_input_cursor
+    }
+
+    pub(crate) fn release_event_indices_to_ack(&self, observed: &[usize]) -> Vec<usize> {
+        let mut indices = self.pending_release_event_indices.clone();
+        indices.extend(observed.iter().copied());
+        indices.sort_unstable();
+        indices.dedup();
+        indices
+    }
+
+    pub(crate) fn note_release_ack_result(&mut self, event_indices: &[usize], released: bool) {
+        if released {
+            let released = event_indices
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>();
+            self.pending_release_event_indices
+                .retain(|event_index| !released.contains(event_index));
+            return;
+        }
+        self.pending_release_event_indices
+            .extend(event_indices.iter().copied());
+        self.pending_release_event_indices.sort_unstable();
+        self.pending_release_event_indices.dedup();
+    }
+
+    pub(crate) fn observe_polled_user_inputs<F>(
+        &mut self,
+        poll: crate::turn::run_control::RunQueuedInputPoll,
+        mut content_from_input: F,
+    ) -> ObservedDeferredUserInputs
+    where
+        F: FnMut(&Value) -> Option<String>,
+    {
+        let mut raw_inputs = Vec::new();
+        let mut contents = Vec::new();
+        let mut released_event_indices = Vec::new();
+        for event in poll.inputs {
+            released_event_indices.push(event.event_index);
+            raw_inputs.push(event.input.clone());
+            let Some(content) = content_from_input(&event.input) else {
+                continue;
+            };
+            contents.push(content);
+        }
+
+        ObservedDeferredUserInputs {
+            raw_inputs,
+            contents,
+            released_event_indices,
+            next_cursor: poll.next_cursor,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn set_deferred_user_input_cursor_for_test(&mut self, cursor: usize) {
+        self.deferred_user_input_cursor = cursor;
+    }
+
+    pub fn commit_observed_cursor(&mut self, next_cursor: usize) {
+        self.deferred_user_input_cursor = self.deferred_user_input_cursor.max(next_cursor);
+    }
+}
+
 /// Inter-agent messaging state for the agentic loop.
 #[derive(Default)]
 pub struct MessagingState {
@@ -907,6 +1003,9 @@ pub enum VolatileKind {
     Corrective,
     /// Mailbox / agent-to-agent volatile drop-offs.
     Mailbox,
+    /// User message queued during execution for delivery after the next
+    /// completed tool-call round.
+    DeferredUserInput,
     /// Budget-review acknowledgment.
     BudgetReview,
     /// Open-ended exploration budget reminder.
@@ -973,6 +1072,7 @@ impl VolatileKind {
             | Self::TaskBoardCompletionGate
             | Self::ExecutionRetry
             | Self::ExplorationBudget
+            | Self::DeferredUserInput
             | Self::BudgetReview => "user",
             // System-role: prevents injection via attacker-crafted file content.
             Self::HallucinationTripwire => "system",
@@ -1096,6 +1196,9 @@ pub struct AgenticLoopState {
     pub telemetry: TelemetryState,
     pub stall: StallTrackingState,
     pub messaging: MessagingState,
+    /// Durable user input queued while a run is active. Kept separate from
+    /// `messaging`, which is reserved for agent-to-agent routing state.
+    pub deferred_input: DeferredInputState,
     pub hooks: StopHookState,
     pub cancellation: CancellationState,
     pub error_recovery: ErrorRecoveryState,
@@ -2209,6 +2312,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         hooks: Default::default(),
         messaging: Default::default(),
         cancellation: Default::default(),
+        deferred_input: Default::default(),
         error_recovery: Default::default(),
         pipeline_session: Some(astra_turn_core::pipeline_session::PipelineSession::new(
             astra_turn_core::pipeline_config::PipelineConfig::default(),
@@ -2585,6 +2689,7 @@ pub(crate) mod tests {
             hooks: Default::default(),
             messaging: Default::default(),
             cancellation: Default::default(),
+            deferred_input: Default::default(),
             error_recovery: Default::default(),
             pipeline_session: None,
             message: "test query".to_string(),

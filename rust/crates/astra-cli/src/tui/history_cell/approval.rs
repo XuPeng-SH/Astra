@@ -3,12 +3,12 @@
 //! Visual language mirrors Cursor/Copilot:
 //!
 //! ```text
-//! ⏸ bash wants to run
+//! Approval · Bash
 //!   rm -rf /tmp/scratch
 //!   destructive path outside cwd
 //!
 //! ▸ Allow once    Always allow    Reject
-//!   ← → navigate · Enter confirm · Esc reject
+//!   ← → move · Enter confirm · Esc close
 //! ```
 //!
 //! The focused button uses a reversed pill (accent bg, contrasting fg);
@@ -28,6 +28,7 @@ use ratatui::text::{Line, Span};
 
 use super::HistoryCell;
 use crate::tui::approval::ButtonRow;
+use crate::tui::history_cell::tool::humanize_tool_name;
 use crate::tui::turn_event::TurnEvent;
 
 /// Issue #326 P3 / R1 Major 7: pick the most-alarming colour
@@ -59,6 +60,32 @@ fn highest_risk_color(labels: &[String]) -> Color {
     // BashExecute and other "vanilla" tags fall through to a
     // softer colour so the screen isn't shouting on every prompt.
     Color::Cyan
+}
+
+fn humanize_risk_tag(label: &str) -> &'static str {
+    match label {
+        "BashExecute" => "Bash",
+        "WritesOutsidePackage" => "Outside package",
+        "WritesOutsideWorkspace" => "Outside workspace",
+        "WritesSensitiveFile" => "Sensitive file",
+        "NetworkExfiltration" => "Network",
+        "CredentialAccess" => "Credentials",
+        "GitDestructive" => "Git destructive",
+        "SqlDestructive" => "SQL destructive",
+        "MCPUnknownCapability" => "Unknown MCP capability",
+        "WorkspaceUntrusted" => "Untrusted workspace",
+        "SandboxExpansion" => "Sandbox expansion",
+        _ => "Risk",
+    }
+}
+
+fn compact_reason(reason: &str) -> String {
+    match reason.trim() {
+        "This command needs your approval before it runs." => {
+            "Needs approval before it runs.".to_string()
+        }
+        other => other.to_string(),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -401,6 +428,13 @@ impl ApprovalCell {
         }
         Line::from(spans)
     }
+
+    fn visible_risk_labels(&self) -> Vec<&str> {
+        if self.risk_tag_labels.len() == 1 && self.risk_tag_labels[0] == "BashExecute" {
+            return Vec::new();
+        }
+        self.risk_tag_labels.iter().map(String::as_str).collect()
+    }
 }
 
 impl HistoryCell for ApprovalCell {
@@ -421,24 +455,23 @@ impl HistoryCell for ApprovalCell {
         let mut lines = Vec::new();
 
         // ── Top border with embedded title ────────────────────────
-        //     ╭─ ⏸ bash wants to run ─[agent:foo]─[ssh:host]──
+        //     ╭─ Approval · Bash · agent foo · bastion-prod
         let mut top_spans = vec![
             Span::styled("╭─ ".to_string(), accent_style),
-            Span::styled("⏸ ".to_string(), accent_style),
             Span::styled(
-                self.header.clone(),
+                format!("Approval · {}", humanize_tool_name(&self.tool)),
                 accent_style.add_modifier(Modifier::BOLD),
             ),
         ];
         if let Some(agent) = &self.source_agent {
             top_spans.push(Span::styled(
-                format!(" [agent: {agent}]"),
+                format!(" · agent {agent}"),
                 muted.add_modifier(Modifier::ITALIC),
             ));
         }
         if let Some(host) = &self.host {
             top_spans.push(Span::styled(
-                format!(" [{host}]"),
+                format!(" · {host}"),
                 muted.add_modifier(Modifier::ITALIC),
             ));
         }
@@ -450,18 +483,30 @@ impl HistoryCell for ApprovalCell {
         let bar = Span::styled("│ ".to_string(), accent_style);
         let empty_bar = Span::styled("│".to_string(), accent_style);
 
-        // Risk badge row (issue #326 P3 / R1 Major 7).
-        if !self.risk_tag_labels.is_empty() {
-            let risk_color = highest_risk_color(&self.risk_tag_labels);
-            let risk_style = Style::default().fg(risk_color).add_modifier(Modifier::BOLD);
-            let badges = self
-                .risk_tag_labels
-                .iter()
-                .map(|t| format!("⚑ {t}"))
-                .collect::<Vec<_>>()
-                .join("  ");
+        if !self.header.is_empty() {
             lines.push(Line::from(vec![
                 bar.clone(),
+                Span::styled(self.header.clone(), body_style.add_modifier(Modifier::BOLD)),
+            ]));
+        }
+
+        // Risk badge row (issue #326 P3 / R1 Major 7).
+        let visible_risks = self.visible_risk_labels();
+        if !visible_risks.is_empty() {
+            let visible_risks_owned = visible_risks
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>();
+            let risk_color = highest_risk_color(&visible_risks_owned);
+            let risk_style = Style::default().fg(risk_color).add_modifier(Modifier::BOLD);
+            let badges = visible_risks
+                .iter()
+                .map(|label| humanize_risk_tag(label))
+                .collect::<Vec<_>>()
+                .join(" · ");
+            lines.push(Line::from(vec![
+                bar.clone(),
+                Span::styled("Risk · ".to_string(), muted),
                 Span::styled(badges, risk_style),
             ]));
         }
@@ -482,8 +527,7 @@ impl HistoryCell for ApprovalCell {
         if !self.reason.is_empty() {
             lines.push(Line::from(vec![
                 bar.clone(),
-                Span::styled("⚠ ".to_string(), muted),
-                Span::styled(self.reason.clone(), muted),
+                Span::styled(compact_reason(&self.reason), muted),
             ]));
         }
 
@@ -492,7 +536,7 @@ impl HistoryCell for ApprovalCell {
         if let Some(preview) = &self.remember_preview {
             lines.push(Line::from(vec![
                 bar.clone(),
-                Span::styled("Remember: ".to_string(), muted),
+                Span::styled("Remember · ".to_string(), muted),
                 Span::styled(preview.clone(), body_style.add_modifier(Modifier::BOLD)),
             ]));
         }
@@ -517,7 +561,7 @@ impl HistoryCell for ApprovalCell {
         if let Some(hint) = &self.selection_hint {
             lines.push(Line::from(vec![
                 bar.clone(),
-                Span::styled("Note: ".to_string(), muted),
+                Span::styled("Note · ".to_string(), muted),
                 Span::styled(hint.clone(), body_style),
             ]));
         }
@@ -528,7 +572,7 @@ impl HistoryCell for ApprovalCell {
             lines.push(Line::from(vec![
                 bar.clone(),
                 Span::styled(
-                    format!("Can't save: {reason_text}"),
+                    format!("Can't remember · {reason_text}"),
                     Style::default()
                         .fg(Color::DarkGray)
                         .add_modifier(Modifier::ITALIC),
@@ -549,7 +593,7 @@ impl HistoryCell for ApprovalCell {
         // style. Unfocused: plain border close — the user isn't
         // looking at this card for actions yet.
         let bottom = if self.focused {
-            let hint = "←→ select · Enter confirm · Esc reject";
+            let hint = "←→ move · Enter select · Esc close";
             Line::from(vec![
                 Span::styled("╰─ ".to_string(), accent_style),
                 Span::styled(hint.to_string(), muted),
@@ -604,7 +648,7 @@ mod tests {
             true,
         );
         let rendered = render(&cell);
-        assert!(rendered.contains("⏸"), "header glyph missing");
+        assert!(rendered.contains("Approval · Bash"), "header missing");
         assert!(rendered.contains("rm -rf /tmp/x"), "detail missing");
         assert!(rendered.contains("destructive path"), "reason missing");
         // Cursor-style rounded box edges.
@@ -617,12 +661,16 @@ mod tests {
         // Hint is advertised on the bottom border for focused cells,
         // including every key binding the user can reach.
         assert!(
-            rendered.contains("←→ select"),
+            rendered.contains("←→ move"),
             "arrow-key hint missing on focused cell"
         );
         assert!(
-            rendered.contains("Esc reject"),
-            "Esc reject shortcut hint missing on focused cell"
+            rendered.contains("Esc close"),
+            "Esc close shortcut hint missing on focused cell"
+        );
+        assert!(
+            rendered.contains("Enter select"),
+            "Enter select hint missing on focused cell"
         );
     }
 
@@ -643,7 +691,7 @@ mod tests {
         assert!(rendered.contains("╰─"));
         // But the action hint is reserved for the focused cell.
         assert!(
-            !rendered.contains("←→ select"),
+            !rendered.contains("←→ choose"),
             "unfocused cell should not advertise actions"
         );
     }
@@ -669,10 +717,17 @@ mod tests {
         .with_risk_tag_labels(vec!["BashExecute".into(), "WritesOutsidePackage".into()]);
         let rendered = render(&cell);
         assert!(
-            rendered.contains("⚑ BashExecute"),
+            rendered.contains("Risk · Bash"),
             "risk tag chip should appear, got:\n{rendered}"
         );
-        assert!(rendered.contains("⚑ WritesOutsidePackage"));
+        assert!(rendered.contains("Outside package"));
+    }
+
+    #[test]
+    fn plain_bash_execute_does_not_render_redundant_risk_row() {
+        let cell = fixture_full();
+        let rendered = render(&cell);
+        assert!(!rendered.contains("Risk · Bash"), "{rendered}");
     }
 
     #[test]
@@ -688,7 +743,7 @@ mod tests {
         .with_remember_preview("similar `npm test` commands in this workspace");
         let rendered = render(&cell);
         assert!(
-            rendered.contains("Remember: similar `npm test` commands in this workspace"),
+            rendered.contains("Remember · similar `npm test` commands in this workspace"),
             "expected remember preview line, got:\n{rendered}"
         );
         assert!(
@@ -739,8 +794,8 @@ mod tests {
             .with_source_agent("review-subagent");
         let rendered = render(&cell);
         assert!(
-            rendered.contains("[agent: review-subagent]"),
-            "expected [agent: …] chip, got:\n{rendered}"
+            rendered.contains("· agent review-subagent"),
+            "expected agent chip, got:\n{rendered}"
         );
     }
 
@@ -757,8 +812,8 @@ mod tests {
         .with_host("ssh:bastion-prod");
         let rendered = render(&cell);
         assert!(
-            rendered.contains("[ssh:bastion-prod]"),
-            "expected [host:] chip, got:\n{rendered}"
+            rendered.contains("· ssh:bastion-prod"),
+            "expected host chip, got:\n{rendered}"
         );
     }
 
@@ -770,10 +825,10 @@ mod tests {
         let rendered = render(&cell);
         assert!(!rendered.contains("⚑ "), "no risk badge expected");
         assert!(
-            !rendered.contains("Remember:"),
+            !rendered.contains("Remember ·"),
             "no remember-preview row expected"
         );
-        assert!(!rendered.contains("[agent:"), "no agent chip expected");
+        assert!(!rendered.contains("· agent "), "no agent chip expected");
     }
 
     #[test]
@@ -937,7 +992,7 @@ mod tests {
         .with_risk_tag_labels(vec!["GitDestructive".into()]);
         let rendered = render(&cell);
         assert!(
-            rendered.contains("Can't save: git destructive"),
+            rendered.contains("Can't remember · git destructive"),
             "destructive cell must advertise the disabled-Always state, got:\n{rendered}"
         );
     }
@@ -958,7 +1013,7 @@ mod tests {
         let rendered = render(&cell);
         assert!(
             rendered
-                .contains("Note: Always allow stays session-only until you trust this workspace."),
+                .contains("Note · Always allow stays session-only until you trust this workspace."),
             "selection hints should render as a note, got:\n{rendered}"
         );
         assert!(
@@ -1070,5 +1125,12 @@ mod tests {
             lines <= 9,
             "approval card grew past budget: {lines} lines for width=80, content:\n{rendered}"
         );
+    }
+
+    #[test]
+    fn default_reason_uses_compact_copy() {
+        let rendered = render(&fixture_full());
+        assert!(rendered.contains("Needs approval before it runs."));
+        assert!(!rendered.contains("This command needs your approval before it runs."));
     }
 }

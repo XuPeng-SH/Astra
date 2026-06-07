@@ -435,9 +435,27 @@ export type ChatRequest = {
 export type RunStatus = {
   runId: string;
   sessionId: string;
-  status: 'running' | 'completed' | 'failed' | 'cancelled' | 'paused' | string;
+  status:
+    | 'running'
+    | 'input-queued'
+    | 'completed'
+    | 'failed'
+    | 'cancelled'
+    | 'paused'
+    | string;
   eventsCount: number;
   waitingFor?: string | null;
+};
+
+export type RunInputRequestBody = {
+  idempotencyKey: string;
+  input?: unknown;
+};
+
+export type RunInputResponse = {
+  runId: string;
+  accepted: boolean;
+  duplicate: boolean;
 };
 
 export type SessionInfo = {

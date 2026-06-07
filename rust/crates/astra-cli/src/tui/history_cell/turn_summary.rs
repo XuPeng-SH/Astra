@@ -1,21 +1,22 @@
-//! Turn-summary history cell — the single-line metrics band
-//! after every completed turn.
+//! Turn-summary history cell — the compact post-turn metrics band.
 //!
 //! Shape:
 //!
 //! ```text
-//! ⏱ 16.6s (ttft 1.7s) │ ⚡ 23.7k ↑23.2k ↓408 │ 🛠 2 │ Σ 145k · $0.014
+//!   16s total · ttft 1.8s · 23.6k tokens · 2 tools (145.0k overall · $0.014 spent)
 //! ```
 //!
-//! Icons encode the section type so the reader can locate
-//! elapsed / tokens / tools / session totals at a glance. Sections
-//! that don't apply to this turn are elided.
+//! The summary intentionally stays in product language rather than
+//! exposing raw telemetry grammar. Lower-value details such as
+//! per-direction token arrows are omitted so the band reads like a
+//! calm recap instead of an engineering dashboard. Sections that
+//! don't apply to this turn are elided.
 //!
 //! Persists as [`TurnEvent::TurnSummary`]. Never live.
 
 use std::any::Any;
 
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 use super::HistoryCell;
@@ -71,74 +72,16 @@ impl TurnSummaryCell {
 }
 
 impl HistoryCell for TurnSummaryCell {
-    fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
-        let mut segments: Vec<String> = Vec::new();
-
-        // ⏱ elapsed + optional ttft.
-        if let Some(elapsed) = self.elapsed_ms {
-            match self.ttft_ms {
-                Some(ttft) if ttft > 0 => segments.push(format!(
-                    "⏱ {} (ttft {})",
-                    fmt_duration_ms(elapsed),
-                    fmt_ms(ttft)
-                )),
-                _ => segments.push(format!("⏱ {}", fmt_duration_ms(elapsed))),
-            }
-        }
-
-        // ⚡ tokens: total + in/out breakdown.
-        if let (Some(tin), Some(tout)) = (self.tokens_in, self.tokens_out) {
-            segments.push(format!(
-                "⚡ {} ↑{} ↓{}",
-                fmt_tokens(tin + tout),
-                fmt_tokens(tin),
-                fmt_tokens(tout)
-            ));
-        }
-
-        if self.tools > 0 {
-            segments.push(format!("🛠 {}", self.tools));
-        }
-
-        // ▓░ cache-hit percentage of input tokens. Only shown when
-        // the provider actually reported a non-zero `cache_read`
-        // this turn — first turn and non-caching providers elide
-        // the segment entirely so the band doesn't lie about 0%
-        // coverage when the cache just isn't participating yet.
-        if let (Some(cache_read), Some(tin)) = (self.cache_read_tokens, self.tokens_in)
-            && cache_read > 0
-            && tin > 0
-        {
-            let pct = ((cache_read as f64 / tin as f64) * 100.0).round() as u32;
-            segments.push(format!("▓░ {pct}%"));
-        }
-
-        // Σ session totals — either the running cumulative token
-        // count, the session cost, or both (joined by ` · `).
-        let mut sigma_parts: Vec<String> = Vec::new();
-        if let Some(c) = self.cumulative_tokens
-            && c > 0
-        {
-            sigma_parts.push(fmt_tokens(c));
-        }
-        if let Some(cost) = self.cumulative_cost_usd
-            && cost > 0.0
-        {
-            sigma_parts.push(fmt_cost(cost));
-        }
-        if !sigma_parts.is_empty() {
-            segments.push(format!("Σ {}", sigma_parts.join(" · ")));
-        }
-
-        if segments.is_empty() {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let theme = crate::tui::theme::current();
+        let label = Style::default().fg(theme.dim);
+        let value = Style::default().fg(theme.selected_fg);
+        let sections = self.sections(label, value);
+        if sections.is_empty() {
             return Vec::new();
         }
 
-        let dim = Style::default().fg(Color::DarkGray);
-        vec![Line::from(Span::styled(
-            format!("  ─ {} ─", segments.join(" │ ")),
-            dim,
-        ))]
+        pack_sections_into_lines(sections, width)
     }
 
     fn as_any_ref(&self) -> &dyn Any {
@@ -163,6 +106,87 @@ impl HistoryCell for TurnSummaryCell {
     }
 }
 
+impl TurnSummaryCell {
+    fn sections(&self, label: Style, value: Style) -> Vec<Section> {
+        let mut sections: Vec<Section> = Vec::new();
+        let mut secondary_parts: Vec<Vec<Span<'static>>> = Vec::new();
+
+        if let Some(elapsed) = self.elapsed_ms {
+            sections.push(Section::primary(vec![
+                Span::styled(fmt_duration_ms(elapsed), value),
+                Span::styled(" total", label),
+            ]));
+        }
+
+        if let Some(ttft) = self.ttft_ms
+            && ttft > 0
+        {
+            sections.push(Section::primary(vec![
+                Span::styled("ttft ", label),
+                Span::styled(fmt_ms(ttft), value),
+            ]));
+        }
+
+        if let (Some(tin), Some(tout)) = (self.tokens_in, self.tokens_out) {
+            sections.push(Section::primary(vec![
+                Span::styled(fmt_tokens(tin + tout), value),
+                Span::styled(" tokens", label),
+            ]));
+        }
+
+        if let (Some(cache_read), Some(tin)) = (self.cache_read_tokens, self.tokens_in)
+            && cache_read > 0
+            && tin > 0
+        {
+            let pct = ((cache_read as f64 / tin as f64) * 100.0).round() as u32;
+            sections.push(Section::primary(vec![
+                Span::styled(format!("{pct}%"), value),
+                Span::styled(" cached", label),
+            ]));
+        }
+
+        if self.tools > 0 {
+            sections.push(Section::primary(vec![
+                Span::styled(self.tools.to_string(), value),
+                Span::styled(if self.tools == 1 { " tool" } else { " tools" }, label),
+            ]));
+        }
+
+        let cumulative_tokens = self
+            .cumulative_tokens
+            .filter(|c| *c > 0)
+            .map(|c| Span::styled(fmt_tokens(c), value));
+
+        if let Some(cost) = self.cumulative_cost_usd
+            && cost > 0.0
+        {
+            secondary_parts.push(vec![
+                Span::styled(fmt_cost(cost), value),
+                Span::styled(" spent", label),
+            ]);
+        }
+
+        if cumulative_tokens.is_some() || !secondary_parts.is_empty() {
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            spans.push(Span::styled("(", label));
+            if let Some(tokens) = cumulative_tokens {
+                spans.push(tokens);
+                spans.push(Span::styled(" overall", label));
+            } else {
+                spans.push(Span::styled("Overall", label));
+            }
+            for part in secondary_parts {
+                spans.push(Span::styled(" · ", label));
+                spans.extend(part);
+            }
+            spans.push(Span::styled(")", label));
+            sections.push(Section::secondary(spans));
+        }
+
+        sections
+    }
+}
+
 // ── Formatting helpers ──────────────────────────────────────────
 //
 // Kept local so the TurnSummaryCell renders deterministically
@@ -170,7 +194,7 @@ impl HistoryCell for TurnSummaryCell {
 // themselves be rewritten in Phase 3.
 
 /// Elapsed duration in ms. Whole seconds below a minute, `Nm Ss`
-/// above — matches the coarse format we use in the orbiter so the
+/// above — matches the coarse format we use elsewhere so the
 /// band doesn't jitter sub-second.
 fn fmt_duration_ms(ms: u64) -> String {
     let secs = ms / 1000;
@@ -215,6 +239,72 @@ fn fmt_cost(usd: f64) -> String {
     }
 }
 
+fn spans_width(spans: &[Span<'_>]) -> usize {
+    spans
+        .iter()
+        .map(|span| unicode_width::UnicodeWidthStr::width(span.content.as_ref()))
+        .sum()
+}
+
+#[derive(Debug, Clone)]
+struct Section {
+    spans: Vec<Span<'static>>,
+    secondary: bool,
+}
+
+impl Section {
+    fn primary(spans: Vec<Span<'static>>) -> Self {
+        Self {
+            spans,
+            secondary: false,
+        }
+    }
+
+    fn secondary(spans: Vec<Span<'static>>) -> Self {
+        Self {
+            spans,
+            secondary: true,
+        }
+    }
+}
+
+fn pack_sections_into_lines(sections: Vec<Section>, width: u16) -> Vec<Line<'static>> {
+    let available = usize::from(width.max(24));
+    let indent = Span::styled("  ", Style::default().fg(crate::tui::theme::current().dim));
+    let indent_width = unicode_width::UnicodeWidthStr::width(indent.content.as_ref());
+    let sep = Span::styled(" · ", Style::default().fg(crate::tui::theme::current().dim));
+    let sep_width = unicode_width::UnicodeWidthStr::width(sep.content.as_ref());
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut current: Vec<Span<'static>> = vec![indent.clone()];
+    let mut current_width = indent_width;
+
+    for section in sections {
+        let section_width = spans_width(&section.spans);
+        let extra = if current_width == indent_width {
+            0
+        } else {
+            sep_width
+        };
+        if current_width > indent_width && current_width + extra + section_width > available {
+            lines.push(Line::from(current));
+            current = vec![indent.clone()];
+            current_width = indent_width;
+        }
+        if current_width > indent_width {
+            current.push(sep.clone());
+            current_width += sep_width;
+        }
+        current_width += section_width;
+        current.extend(section.spans);
+    }
+
+    if current_width > indent_width {
+        lines.push(Line::from(current));
+    }
+
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,7 +314,7 @@ mod tests {
         let lines = cell.display_lines(width);
         let p =
             ratatui::widgets::Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false });
-        buffer_to_string(&draw_widget(p, width, 1))
+        buffer_to_string(&draw_widget(p, width, 3))
     }
 
     fn mk_full() -> TurnSummaryCell {
@@ -246,10 +336,9 @@ mod tests {
     #[test]
     fn full_summary_contains_all_sections() {
         let out = render(&mk_full(), 120);
-        for seg in ["⏱", "⚡", "🛠", "Σ"] {
+        for seg in ["total", "ttft", "tokens", "tools", "overall", "spent"] {
             assert!(out.contains(seg), "missing section {seg:?} in {out}");
         }
-        assert!(out.contains("ttft"), "ttft nested missing: {out}");
         assert!(out.contains("145.0k"));
     }
 
@@ -258,7 +347,7 @@ mod tests {
         let mut c = mk_full();
         c.tools = 0;
         let out = render(&c, 120);
-        assert!(!out.contains("🛠"), "tools=0 should not render: {out}");
+        assert!(!out.contains(" tools"), "tools=0 should not render: {out}");
     }
 
     #[test]
@@ -267,7 +356,7 @@ mod tests {
         c.ttft_ms = Some(0);
         let out = render(&c, 120);
         assert!(!out.contains("ttft"), "ttft=0 must not render: {out}");
-        assert!(out.contains("⏱"));
+        assert!(out.contains("total"));
     }
 
     #[test]
@@ -276,7 +365,7 @@ mod tests {
         // 23.2k tokens in, 18k cache read → ~78%
         c.cache_read_tokens = Some(18_000);
         let out = render(&c, 120);
-        assert!(out.contains("▓░"), "cache icon missing: {out}");
+        assert!(out.contains("cached"), "cache label missing: {out}");
         assert!(out.contains("78%"), "expected ~78% hit rate in: {out}");
     }
 
@@ -288,7 +377,7 @@ mod tests {
         let mut c = mk_full();
         c.cache_read_tokens = None;
         let out = render(&c, 120);
-        assert!(!out.contains("▓░"), "cache chip must be elided: {out}");
+        assert!(!out.contains("cached"), "cache chip must be elided: {out}");
     }
 
     #[test]
@@ -298,7 +387,10 @@ mod tests {
         let mut c = mk_full();
         c.cache_read_tokens = Some(0);
         let out = render(&c, 120);
-        assert!(!out.contains("💾"), "zero-hit cache chip must elide: {out}");
+        assert!(
+            !out.contains("cached"),
+            "zero-hit cache chip must elide: {out}"
+        );
     }
 
     #[test]
@@ -307,7 +399,18 @@ mod tests {
         c.cumulative_tokens = Some(0);
         c.cumulative_cost_usd = Some(0.0);
         let out = render(&c, 120);
-        assert!(!out.contains('Σ'));
+        assert!(!out.contains("overall"));
+        assert!(!out.contains("spent"));
+    }
+
+    #[test]
+    fn narrow_width_wraps_summary_into_multiple_lines() {
+        let out = render(&mk_full(), 46);
+        let non_empty: Vec<&str> = out.lines().filter(|line| !line.trim().is_empty()).collect();
+        assert!(
+            non_empty.len() >= 2,
+            "narrow summaries should wrap cleanly; got {out:?}"
+        );
     }
 
     #[test]

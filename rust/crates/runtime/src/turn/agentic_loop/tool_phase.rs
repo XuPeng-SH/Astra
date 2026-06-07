@@ -988,20 +988,19 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     }
 
     let evo_records_before = state.stall.tool_call_records.len();
+    let plan_mode_active = host.plan_mode_active(state);
+    let headless_quiet = prep.quiet || state.skill_produced_output;
+    let obs_turn_start = state
+        .turn_event_buffer
+        .as_ref()
+        .map(|b| b.turn_start_instant());
+    let obs_llm_round = state
+        .turn_event_buffer
+        .as_ref()
+        .map(|b| b.current_round())
+        .unwrap_or(0);
     {
-        let plan_mode_active = host.plan_mode_active(state);
         let mut term_adapter = HostTerminalAdapter(host);
-        let headless_quiet = prep.quiet || state.skill_produced_output;
-        let obs_turn_start = state
-            .turn_event_buffer
-            .as_ref()
-            .map(|b| b.turn_start_instant());
-        let obs_llm_round = state
-            .turn_event_buffer
-            .as_ref()
-            .map(|b| b.current_round())
-            .unwrap_or(0);
-
         run_agentic_headless_tool_round(HeadlessToolRoundCtx {
             turn_index,
             quiet: headless_quiet,

@@ -2443,6 +2443,29 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         }
     }
 
+    fn on_deferred_user_input(&mut self, input: &Value) {
+        let Some(raw_skills) = input.get("active_skills") else {
+            return;
+        };
+
+        let active_skills: Vec<Value> = raw_skills
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|skill| !skill.is_empty())
+            .map(|skill| Value::String(skill.to_string()))
+            .collect();
+
+        if active_skills.is_empty() {
+            self.edge_profile.remove("active_skills");
+        } else {
+            self.edge_profile
+                .insert("active_skills".to_string(), Value::Array(active_skills));
+        }
+    }
+
     async fn execute_turn(
         &mut self,
         state: &mut AgenticLoopState,
@@ -4075,6 +4098,35 @@ mod tests {
     }
 
     #[test]
+    fn deferred_user_input_updates_active_skills_in_edge_profile() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .build();
+
+        host.on_deferred_user_input(&json!({
+            "content": "Use the release format.",
+            "active_skills": ["release-manager", "deploy-auditor"],
+        }));
+        assert_eq!(
+            host.edge_profile.get("active_skills"),
+            Some(&json!(["release-manager", "deploy-auditor"]))
+        );
+
+        host.on_deferred_user_input(&json!({
+            "content": "No special output formatting now.",
+            "active_skills": [],
+        }));
+        assert!(
+            host.edge_profile.get("active_skills").is_none(),
+            "explicitly empty deferred active_skills should clear prior run-level skill hints"
+        );
+    }
+
+    #[test]
     fn pipeline_abort_returns_error_and_records_alert() {
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
@@ -5122,6 +5174,7 @@ mod tests {
             hooks: Default::default(),
             cancellation: Default::default(),
             messaging: Default::default(),
+            deferred_input: Default::default(),
             error_recovery: Default::default(),
             run_control: None,
             pipeline_session: Some(astra_turn_core::pipeline_session::PipelineSession::new(

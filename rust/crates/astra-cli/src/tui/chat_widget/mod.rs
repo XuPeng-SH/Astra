@@ -682,8 +682,8 @@ impl ChatWidget {
         if count == 0 {
             return;
         }
-        let plural = if count == 1 { "task" } else { "tasks" };
-        let msg = format!("Cancelled {count} background {plural}.");
+        let noun = if count == 1 { "job" } else { "jobs" };
+        let msg = format!("Stopped {count} background {noun}.");
         self.commit_cell(Box::new(SystemCell::warning(msg)));
     }
 
@@ -795,6 +795,16 @@ impl ChatWidget {
     pub fn commit_system(&mut self, cell: SystemCell) {
         self.commit_active(); // finalise anything live first
         self.commit_cell(Box::new(cell));
+    }
+
+    /// Commit a user message directly into history without opening a new turn
+    /// or draining the current live tool/assistant state.
+    ///
+    /// Used for deferred inputs that become active mid-turn: the transcript
+    /// should show the newest user message as a first-class user row, but the
+    /// current streaming turn should remain live until the runtime yields.
+    pub fn commit_deferred_user(&mut self, text: impl Into<String>) {
+        self.commit_cell(Box::new(UserCell::new(text.into())));
     }
 
     /// Single choke-point for routing events into state mutation.
@@ -1974,6 +1984,26 @@ mod tests {
         assert!(matches!(&persisted, TurnEvent::User { text, .. } if text == "hello"));
     }
 
+    #[test]
+    fn commit_deferred_user_keeps_live_active_cell() {
+        let mut w = fresh();
+        w.active_cell = Some(Box::new(AssistantCell::new_streaming()));
+
+        w.commit_deferred_user("stop after this tool");
+
+        assert_eq!(w.history.len(), 1, "deferred input is committed as history");
+        let persisted = w.history[0].to_persist().expect("user cell persists");
+        assert!(matches!(
+            &persisted,
+            TurnEvent::User { text, .. } if text == "stop after this tool"
+        ));
+        assert_eq!(
+            w.active_cell.as_deref().map(cell_kind),
+            Some(CellKind::Assistant),
+            "deferred input must not finalize the live assistant/tool cell"
+        );
+    }
+
     // ── AnswerDelta ──────────────────────────────────────────────
 
     #[test]
@@ -2486,7 +2516,7 @@ mod tests {
             .downcast_ref::<SystemCell>()
             .expect("cancel banner must be a SystemCell");
         assert!(
-            sys.message().contains("Cancelled 2 background tasks"),
+            sys.message().contains("Stopped 2 background jobs"),
             "banner must name the plural count: {}",
             sys.message()
         );
@@ -2501,7 +2531,7 @@ mod tests {
             .downcast_ref::<SystemCell>()
             .unwrap();
         assert!(
-            sys.message().contains("Cancelled 1 background task."),
+            sys.message().contains("Stopped 1 background job."),
             "singular copy required: {}",
             sys.message()
         );
@@ -2510,13 +2540,16 @@ mod tests {
     #[test]
     fn resume_summary_commits_info_cell_with_message() {
         let mut w = fresh();
-        w.commit_resume_summary("3 background tasks finished while you were away.".into());
+        w.commit_resume_summary(
+            "While you were away: 3 background jobs finished (2 ok, 1 failed).".into(),
+        );
         assert_eq!(w.history.len(), 1);
         let sys = w.history[0]
             .as_any_ref()
             .downcast_ref::<SystemCell>()
             .expect("resume summary must be a SystemCell");
-        assert!(sys.message().contains("3 background tasks"));
+        assert!(sys.message().contains("While you were away"));
+        assert!(sys.message().contains("3 background jobs"));
     }
 
     #[test]

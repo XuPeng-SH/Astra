@@ -1,6 +1,7 @@
 use astra_core::{
-    ErrorResponse, STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED, STATUS_PAUSED,
-    STATUS_RUNNING, STATUS_WAITING, SharedPool, SubRunState, error_response, error_response_coded,
+    ErrorResponse, STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED, STATUS_INPUT_QUEUED,
+    STATUS_PAUSED, STATUS_RUNNING, STATUS_WAITING, SharedPool, SubRunState, error_response,
+    error_response_coded,
 };
 use async_trait::async_trait;
 use axum::{Json, http::StatusCode};
@@ -462,6 +463,7 @@ pub struct DurableRunRecord {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DurableRunStatusKind {
     Running,
+    InputQueued,
     Waiting,
     Paused,
     Completed,
@@ -473,6 +475,7 @@ pub enum DurableRunStatusKind {
 pub fn durable_run_status_kind(status: &str) -> DurableRunStatusKind {
     match status {
         STATUS_RUNNING => DurableRunStatusKind::Running,
+        STATUS_INPUT_QUEUED => DurableRunStatusKind::InputQueued,
         STATUS_WAITING => DurableRunStatusKind::Waiting,
         STATUS_PAUSED => DurableRunStatusKind::Paused,
         STATUS_COMPLETED => DurableRunStatusKind::Completed,
@@ -494,13 +497,15 @@ pub fn durable_run_status_is_terminal(status: &str) -> bool {
 pub fn durable_run_status_blocks_session(status: &str, waiting_for: Option<&str>) -> bool {
     matches!(
         durable_run_status_kind(status),
-        DurableRunStatusKind::Running | DurableRunStatusKind::Waiting
+        DurableRunStatusKind::Running
+            | DurableRunStatusKind::InputQueued
+            | DurableRunStatusKind::Waiting
     ) || (durable_run_status_kind(status) == DurableRunStatusKind::Paused && waiting_for.is_some())
 }
 
 pub fn durable_run_status_to_subrun_state(status: &str) -> SubRunState {
     match durable_run_status_kind(status) {
-        DurableRunStatusKind::Running => SubRunState::Running,
+        DurableRunStatusKind::Running | DurableRunStatusKind::InputQueued => SubRunState::Running,
         DurableRunStatusKind::Waiting | DurableRunStatusKind::Paused => SubRunState::Paused,
         DurableRunStatusKind::Completed => SubRunState::Completed,
         DurableRunStatusKind::Failed | DurableRunStatusKind::Other => SubRunState::Failed,
@@ -559,6 +564,19 @@ pub trait RunStateStore: Send + Sync {
     async fn update_run_status(
         &self,
         run_id: &str,
+        status: &str,
+        waiting_for: Option<&str>,
+        error_message: Option<&str>,
+    ) -> Result<bool, String>;
+
+    /// Update run status only if the current status is one of `expected_statuses`.
+    ///
+    /// This is the compare-and-set primitive used by control-plane races where
+    /// a stale load must not overwrite a newer pause/cancel/terminal status.
+    async fn update_run_status_if_current(
+        &self,
+        run_id: &str,
+        expected_statuses: &[&str],
         status: &str,
         waiting_for: Option<&str>,
         error_message: Option<&str>,
@@ -911,6 +929,43 @@ impl RunStateStore for InMemoryRunStateStore {
         }
     }
 
+    async fn update_run_status_if_current(
+        &self,
+        run_id: &str,
+        expected_statuses: &[&str],
+        status: &str,
+        waiting_for: Option<&str>,
+        error_message: Option<&str>,
+    ) -> Result<bool, String> {
+        if expected_statuses.is_empty() {
+            return Ok(false);
+        }
+        let updated = {
+            let mut runs = self.runs.write().await;
+            if let Some(run) = runs.get_mut(run_id) {
+                if !expected_statuses.contains(&run.status.as_str()) {
+                    None
+                } else {
+                    run.status = status.to_string();
+                    run.waiting_for = waiting_for.map(ToString::to_string);
+                    if let Some(msg) = error_message {
+                        run.error_message = Some(msg.to_string());
+                    }
+                    run.updated_at = chrono::Utc::now().to_rfc3339();
+                    Some(run.clone())
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(run) = updated {
+            self.sync_projection(&run, None, None).await;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     async fn update_run_usage(
         &self,
         run_id: &str,
@@ -1048,7 +1103,12 @@ impl RunStateStore for InMemoryRunStateStore {
             .filter(|r| r.user_id == user_id)
             .cloned()
             .collect();
-        user_runs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        user_runs.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| b.created_at.cmp(&a.created_at))
+                .then_with(|| b.run_id.cmp(&a.run_id))
+        });
         let total = user_runs.len() as i64;
         let page = user_runs
             .into_iter()
@@ -1071,7 +1131,12 @@ impl RunStateStore for InMemoryRunStateStore {
         let runs = self.runs.read().await;
         Ok(runs
             .values()
-            .filter(|r| durable_run_status_kind(&r.status) == DurableRunStatusKind::Running)
+            .filter(|r| {
+                matches!(
+                    durable_run_status_kind(&r.status),
+                    DurableRunStatusKind::Running | DurableRunStatusKind::InputQueued
+                )
+            })
             .cloned()
             .collect())
     }
@@ -2050,6 +2115,52 @@ impl RunStateStore for DatabaseRunStateStore {
         Ok(result.rows_affected() > 0)
     }
 
+    async fn update_run_status_if_current(
+        &self,
+        run_id: &str,
+        expected_statuses: &[&str],
+        status: &str,
+        waiting_for: Option<&str>,
+        error_message: Option<&str>,
+    ) -> Result<bool, String> {
+        if expected_statuses.is_empty() {
+            return Ok(false);
+        }
+        let predicates = std::iter::repeat_n("?", expected_statuses.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = if error_message.is_some() {
+            format!(
+                "UPDATE agent_runs
+                 SET status = ?, waiting_for = ?, error_message = ?, updated_at = NOW(6)
+                 WHERE run_id = ? AND status IN ({predicates})"
+            )
+        } else {
+            format!(
+                "UPDATE agent_runs
+                 SET status = ?, waiting_for = ?, updated_at = NOW(6)
+                 WHERE run_id = ? AND status IN ({predicates})"
+            )
+        };
+        let mut query = sqlx::query(&sql).bind(status).bind(waiting_for);
+        if let Some(error_message) = error_message {
+            query = query.bind(error_message);
+        }
+        query = query.bind(run_id);
+        for expected in expected_statuses {
+            query = query.bind(*expected);
+        }
+        let result = query.execute(self.pool.get()).await.map_err(|source| {
+            db_error("update_run_status_if_current", run_id, source).to_string()
+        })?;
+        if result.rows_affected() > 0 {
+            self.sync_projection(run_id, None, None)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(result.rows_affected() > 0)
+    }
+
     async fn update_run_usage(
         &self,
         run_id: &str,
@@ -2265,7 +2376,17 @@ impl RunStateStore for DatabaseRunStateStore {
     }
 
     async fn find_running_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
-        self.find_runs_by_status(STATUS_RUNNING).await
+        let rows =
+            sqlx::query("SELECT * FROM agent_runs WHERE status IN (?, ?) ORDER BY updated_at ASC")
+                .bind(STATUS_RUNNING)
+                .bind(STATUS_INPUT_QUEUED)
+                .fetch_all(self.pool.get())
+                .await
+                .map_err(|source| db_error("find_running_runs", "active", source).to_string())?;
+        rows.into_iter()
+            .map(run_record_from_row)
+            .collect::<DbStoreResult<Vec<_>>>()
+            .map_err(|e| e.to_string())
     }
 
     async fn find_blocking_session_run(
@@ -2276,13 +2397,14 @@ impl RunStateStore for DatabaseRunStateStore {
         let row = sqlx::query(
             "SELECT * FROM agent_runs \
              WHERE user_id = ? AND session_id = ? \
-               AND (status IN (?, ?) OR (status = ? AND waiting_for IS NOT NULL)) \
+               AND (status IN (?, ?, ?) OR (status = ? AND waiting_for IS NOT NULL)) \
              ORDER BY updated_at DESC \
              LIMIT 1",
         )
         .bind(user_id)
         .bind(session_id)
         .bind(STATUS_RUNNING)
+        .bind(STATUS_INPUT_QUEUED)
         .bind(STATUS_WAITING)
         .bind(STATUS_PAUSED)
         .fetch_optional(self.pool.get())
@@ -2944,6 +3066,10 @@ mod tests {
             DurableRunStatusKind::Running
         );
         assert_eq!(
+            durable_run_status_kind(STATUS_INPUT_QUEUED),
+            DurableRunStatusKind::InputQueued
+        );
+        assert_eq!(
             durable_run_status_kind(STATUS_WAITING),
             DurableRunStatusKind::Waiting
         );
@@ -2972,10 +3098,12 @@ mod tests {
         assert!(durable_run_status_is_terminal(STATUS_FAILED));
         assert!(durable_run_status_is_terminal(STATUS_CANCELLED));
         assert!(!durable_run_status_is_terminal(STATUS_RUNNING));
+        assert!(!durable_run_status_is_terminal(STATUS_INPUT_QUEUED));
         assert!(!durable_run_status_is_terminal(STATUS_WAITING));
         assert!(!durable_run_status_is_terminal(STATUS_PAUSED));
 
         assert!(durable_run_status_blocks_session(STATUS_RUNNING, None));
+        assert!(durable_run_status_blocks_session(STATUS_INPUT_QUEUED, None));
         assert!(durable_run_status_blocks_session(STATUS_WAITING, None));
         assert!(durable_run_status_blocks_session(
             STATUS_PAUSED,
@@ -2989,6 +3117,10 @@ mod tests {
         );
         assert_eq!(
             durable_run_status_to_subrun_state(STATUS_RUNNING),
+            SubRunState::Running
+        );
+        assert_eq!(
+            durable_run_status_to_subrun_state(STATUS_INPUT_QUEUED),
             SubRunState::Running
         );
         assert_eq!(

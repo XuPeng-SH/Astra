@@ -743,6 +743,7 @@ pub(crate) async fn stream_chat_sse(
             progress_emitter: None,
             ..Default::default()
         },
+        deferred_input: Default::default(),
         cancellation: CancellationState {
             flag: None,
             pause_flag: None,
@@ -752,7 +753,7 @@ pub(crate) async fn stream_chat_sse(
             consecutive_same_error: 0,
             last_error_category: None,
         },
-        run_control: None,
+        run_control: p.run_control.clone(),
         pipeline_session: Some({
             let config = astra_turn_core::pipeline_config::PipelineConfig::default();
             let session_current_date =

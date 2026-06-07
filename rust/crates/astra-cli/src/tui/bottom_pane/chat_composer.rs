@@ -9,7 +9,7 @@ use ratatui::{
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::textarea::{TextArea, TextAreaAction};
 
@@ -18,7 +18,7 @@ use super::textarea::{TextArea, TextAreaAction};
 /// rewritten after an append crosses this threshold.
 const HISTORY_MAX_ENTRIES: usize = 500;
 
-/// Duration the `›` prefix glows after the user submits a message.
+/// Duration the `·` prefix glows after the user submits a message.
 /// Short enough to feel instantaneous, long enough to be noticed at a
 /// glance even when the next frame arrives quickly.
 const SUBMIT_FLASH_DURATION: Duration = Duration::from_millis(180);
@@ -37,7 +37,7 @@ pub(crate) struct ChatComposer {
     pasted_blobs: Vec<(String, String)>,
     paste_counter: u32,
     /// Wall-clock instant of the most recent submit. When within
-    /// `SUBMIT_FLASH_DURATION`, the `›` prefix renders in an accent
+    /// `SUBMIT_FLASH_DURATION`, the `·` prefix renders in an accent
     /// color so the user gets instant visual feedback that the message
     /// was accepted.
     last_submit_at: Option<Instant>,
@@ -51,7 +51,9 @@ pub(crate) struct ChatComposer {
 /// expect URLs and one-liners to appear verbatim.
 const PASTE_INLINE_MAX_CHARS: usize = 800;
 const PASTE_INLINE_MAX_LINES: usize = 2;
-const COMPOSER_PLACEHOLDER: &str = "Ask astra to do anything  · Ctrl+E editor  · Ctrl+C interrupt";
+const COMPOSER_PLACEHOLDER: &str = "Message astra";
+const IDLE_COMPOSER_HELPER: &str = "Ctrl+E editor · Shift+Enter newline";
+const ACTIVE_TURN_HELPER: &str = "Queued for next tool · Ctrl+C stops";
 
 impl ChatComposer {
     pub fn new() -> Self {
@@ -73,7 +75,7 @@ impl ChatComposer {
             history,
             history_index: None,
             draft: None,
-            prompt_prefix: "› ".to_string(),
+            prompt_prefix: "· ".to_string(),
             pasted_blobs: Vec::new(),
             paste_counter: 0,
             last_submit_at: None,
@@ -337,7 +339,8 @@ impl ChatComposer {
 
     pub fn desired_height(&self, width: u16) -> u16 {
         let inner_w = width.saturating_sub(self.prefix_display_width());
-        self.textarea.desired_height(inner_w)
+        let helper_rows = u16::from(text_area_can_show_helper(2));
+        (self.textarea.desired_height(inner_w) + helper_rows).clamp(2, 4)
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> ComposerAction {
@@ -415,51 +418,106 @@ impl ChatComposer {
         }
     }
 
-    pub fn render(&self, area: Rect, buf: &mut Buffer) {
+    pub fn render(&self, area: Rect, buf: &mut Buffer, task_active: bool) {
         if area.height == 0 || area.width == 0 {
             return;
         }
 
-        // Codex: › bold when active. While a submit flash is active,
-        // paint the prefix in the theme accent — gives users a quick
-        // "message accepted" cue that doesn't require reading the
-        // scrollback.
-        let mut prefix_style = Style::default().add_modifier(ratatui::style::Modifier::BOLD);
+        let theme = crate::tui::theme::current();
+        let panel = crate::tui::style::composer_surface_style();
+        fill_area(buf, area, panel);
+
+        let top_inset = 0;
+        let content_y = area.y.saturating_add(top_inset);
+        let content_h = area.height.saturating_sub(top_inset);
+        let content_area = Rect::new(area.x, content_y, area.width, content_h.max(1));
+
+        // Keep the composer prompt visible without shouting. The
+        // submit flash still upgrades it to the full accent to signal
+        // that the input was accepted.
+        let mut prefix_style = Style::default()
+            .fg(theme.accent_dim())
+            .add_modifier(ratatui::style::Modifier::BOLD)
+            .bg(panel.bg.unwrap_or(Color::Reset));
         if self.is_flashing() {
-            let theme = crate::tui::theme::current();
             prefix_style = prefix_style.fg(theme.accent);
         }
         let prefix = Span::styled(&self.prompt_prefix, prefix_style);
         let prefix_width = self.prefix_display_width();
-        let prefix_area = Rect::new(area.x, area.y, prefix_width.min(area.width), 1);
+        let prefix_area = Rect::new(
+            content_area.x,
+            content_area.y,
+            prefix_width.min(content_area.width),
+            1,
+        );
         Widget::render(Line::from(prefix), prefix_area, buf);
 
+        let helper_h = u16::from(text_area_can_show_helper(content_area.height));
         let text_area = Rect::new(
-            area.x + prefix_width.min(area.width),
-            area.y,
-            area.width.saturating_sub(prefix_width),
-            area.height,
+            content_area.x + prefix_width.min(content_area.width),
+            content_area.y,
+            content_area.width.saturating_sub(prefix_width),
+            content_area.height.saturating_sub(helper_h).max(1),
+        );
+        let helper_area = Rect::new(
+            text_area.x,
+            text_area.y + text_area.height.min(content_area.height.saturating_sub(1)),
+            text_area.width,
+            helper_h,
         );
 
         if self.textarea.is_empty() {
-            let placeholder =
-                Span::styled(COMPOSER_PLACEHOLDER, Style::default().fg(Color::DarkGray));
-            Widget::render(Line::from(placeholder), text_area, buf);
+            let placeholder = Span::styled(
+                truncate_end(COMPOSER_PLACEHOLDER, text_area.width as usize),
+                Style::default()
+                    .fg(theme.selected_fg)
+                    .bg(panel.bg.unwrap_or(Color::Reset)),
+            );
+            Widget::render(
+                Line::from(placeholder),
+                Rect::new(text_area.x, text_area.y, text_area.width, 1),
+                buf,
+            );
         } else {
             self.textarea.render(text_area, buf);
+        }
+
+        if helper_area.height > 0 {
+            let helper_text = if task_active {
+                ACTIVE_TURN_HELPER
+            } else {
+                IDLE_COMPOSER_HELPER
+            };
+            let helper = Span::styled(
+                truncate_end(helper_text, helper_area.width as usize),
+                Style::default()
+                    .fg(theme.dim)
+                    .bg(panel.bg.unwrap_or(Color::Reset))
+                    .add_modifier(ratatui::style::Modifier::DIM),
+            );
+            Widget::render(Line::from(helper), helper_area, buf);
         }
     }
 
     pub fn cursor_position(&self, area: Rect) -> Option<(u16, u16)> {
+        let top_inset = 0;
+        let content_y = area.y.saturating_add(top_inset);
+        let content_h = area.height.saturating_sub(top_inset);
+        let content_area = Rect::new(area.x, content_y, area.width, content_h.max(1));
         let prefix_width = self.prefix_display_width();
+        let helper_h = u16::from(text_area_can_show_helper(content_area.height));
         let text_area = Rect::new(
-            area.x + prefix_width.min(area.width),
-            area.y,
-            area.width.saturating_sub(prefix_width),
-            area.height,
+            content_area.x + prefix_width.min(content_area.width),
+            content_area.y,
+            content_area.width.saturating_sub(prefix_width),
+            content_area.height.saturating_sub(helper_h).max(1),
         );
         self.textarea.cursor_position(text_area)
     }
+}
+
+fn text_area_can_show_helper(content_h: u16) -> bool {
+    content_h >= 2
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -470,6 +528,35 @@ pub(crate) enum ComposerAction {
     Quit,
     Consumed,
     Unhandled,
+}
+
+fn fill_area(buf: &mut Buffer, area: Rect, style: Style) {
+    for y in area.y..area.y + area.height {
+        buf.set_string(area.x, y, " ".repeat(area.width as usize), style);
+    }
+}
+
+fn truncate_end(text: &str, max_width: usize) -> String {
+    let width = text.width();
+    if width <= max_width {
+        return text.to_string();
+    }
+    if max_width <= 1 {
+        return "…".to_string();
+    }
+    let keep = max_width - 1;
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in text.chars() {
+        let w = ch.width().unwrap_or(0);
+        if used + w > keep {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out.push('…');
+    out
 }
 
 #[cfg(test)]
@@ -620,8 +707,14 @@ mod paste_tests {
     }
 
     #[test]
-    fn placeholder_mentions_external_editor_shortcut() {
-        assert!(COMPOSER_PLACEHOLDER.contains("Ctrl+E"));
-        assert!(COMPOSER_PLACEHOLDER.contains("editor"));
+    fn idle_placeholder_is_clean_primary_prompt() {
+        assert!(COMPOSER_PLACEHOLDER.contains("Message"));
+        assert!(!COMPOSER_PLACEHOLDER.contains("Ctrl+E"));
+    }
+
+    #[test]
+    fn active_turn_helper_surfaces_queue_semantics() {
+        assert!(ACTIVE_TURN_HELPER.contains("Queued"));
+        assert!(ACTIVE_TURN_HELPER.contains("Ctrl+C"));
     }
 }

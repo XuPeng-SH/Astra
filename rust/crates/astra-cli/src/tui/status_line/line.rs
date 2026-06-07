@@ -77,79 +77,51 @@ pub(crate) struct StatusLine {
     pub right: Vec<Segment>,
 }
 
-/// Idle hint: make each prefix legible instead of showing raw symbols.
-/// These prefixes change the meaning of the next keystroke, so the
-/// footer should label them directly rather than expecting the user to
-/// remember `/ @ $` by heart.
-pub(crate) const IDLE_HINT_FULL: &str = "/commands @mention $shell";
-/// Same hint, but compressed enough to preserve the right-side model/cwd
-/// chips on 80-column terminals.
-pub(crate) const IDLE_HINT_SHORT: &str = "/cmd @mention $sh";
-/// Same hint collapsed for narrow terminals so the model chip still fits.
-pub(crate) const IDLE_HINT_TINY: &str = "/ @ $";
-
 /// Threshold below which the budget chip is dim, above which it warns.
 const BUDGET_WARN_PERCENT: f32 = 75.0;
 const BUDGET_ERROR_PERCENT: f32 = 90.0;
 /// Max cwd segment width before the middle is elided.
-const CWD_MAX_WIDTH: usize = 28;
+const MODEL_MAX_WIDTH: usize = 24;
+const BRANCH_MAX_WIDTH: usize = 16;
+const CWD_MAX_WIDTH: usize = 26;
+const PRIMARY_LEFT_FLOOR_WIDTH: usize = 14;
+
+fn permission_mode_label(mode: PermissionMode) -> &'static str {
+    match mode {
+        PermissionMode::Prompt => "Ask",
+        PermissionMode::Auto => "Auto",
+        PermissionMode::Plan => "Plan",
+        PermissionMode::AcceptEdits => "Edits",
+        PermissionMode::Deny => "Deny",
+    }
+}
 
 impl StatusLine {
     /// Build a status line from context.
     pub fn from_context(ctx: &StatusContext) -> Self {
         let muted = Style::default().fg(Color::Gray);
-        let hint = Style::default().fg(Color::White);
         let mut out = Self::default();
 
-        // ── Left: short hint, then permission chip if non-default ─
-        //
-        // Idle hint is built in two forms so the renderer can swap to the
-        // short form when the terminal is too narrow for the full one.
-        // `render()` picks between them based on remaining width.
-        let active_objective = ctx
-            .turn_active
-            .then(|| ctx.current_objective.clone())
-            .flatten();
-        let hint_text = if let Some(objective) = active_objective.clone() {
-            objective
-        } else if ctx.turn_active {
-            String::new()
-        } else {
-            IDLE_HINT_FULL.to_string()
-        };
-        let active_hint_style = Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD);
-        if !hint_text.is_empty() {
+        // ── Left: stable agent context, not a second live-status bar ─
+        if let Some(model) = ctx.model.as_deref() {
             out.left.push(Segment::styled(
-                hint_text,
-                if ctx.turn_active {
-                    active_hint_style
-                } else {
-                    hint
-                },
+                format_model_label(model, MODEL_MAX_WIDTH),
+                Style::default().fg(Color::White),
             ));
         }
 
-        if ctx.turn_active
-            && let Some(elapsed) = ctx.turn_elapsed
-        {
-            out.left
-                .push(Segment::styled(format_duration_compact(elapsed), muted));
-        }
-
+        // Permission mode changes whether tools run automatically or ask first.
+        // Keep it visible so `/mode` feedback matches the persistent status line.
         match ctx.permission_mode {
             PermissionMode::Prompt => {
                 out.left.push(Segment::styled(
-                    ctx.permission_mode.chip_text(),
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
+                    permission_mode_label(ctx.permission_mode),
+                    muted.add_modifier(Modifier::BOLD),
                 ));
             }
             PermissionMode::Auto => {
                 out.left.push(Segment::styled(
-                    ctx.permission_mode.chip_text(),
+                    permission_mode_label(ctx.permission_mode),
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
@@ -157,7 +129,7 @@ impl StatusLine {
             }
             PermissionMode::Plan => {
                 out.left.push(Segment::styled(
-                    ctx.permission_mode.chip_text(),
+                    permission_mode_label(ctx.permission_mode),
                     Style::default()
                         .fg(Color::Blue)
                         .add_modifier(Modifier::BOLD),
@@ -165,7 +137,7 @@ impl StatusLine {
             }
             PermissionMode::AcceptEdits => {
                 out.left.push(Segment::styled(
-                    ctx.permission_mode.chip_text(),
+                    permission_mode_label(ctx.permission_mode),
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
@@ -173,18 +145,11 @@ impl StatusLine {
             }
             PermissionMode::Deny => {
                 out.left.push(Segment::styled(
-                    ctx.permission_mode.chip_text(),
+                    permission_mode_label(ctx.permission_mode),
                     Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                 ));
             }
         }
-
-        // Hint that the chip itself is the cycle anchor — without
-        // this the user has no surface clue that ⇧Tab moves between
-        // modes (the previous global "⇧Tab mode" hint was deleted
-        // for being repetitive and unanchored). Dim so it reads as
-        // metadata of the chip, not an action of its own.
-        out.left.push(Segment::styled("⇧Tab", muted));
 
         if ctx.pending_approvals > 0 {
             let text = if ctx.pending_approvals == 1 {
@@ -228,9 +193,13 @@ impl StatusLine {
         //   - both 0 → chip hidden (registry exists but is idle)
         if let Some((running, stalled)) = ctx.bg_task_counts {
             if running > 0 || stalled > 0 {
-                let mut text = format!("BG: {running} running");
+                let mut text = if running == 1 {
+                    "1 background job".to_string()
+                } else {
+                    format!("{running} background jobs")
+                };
                 if stalled > 0 {
-                    text.push_str(&format!(" · {stalled} stalled"));
+                    text.push_str(&format!(" · {stalled} waiting"));
                 }
                 let style = if stalled > 0 {
                     Style::default().fg(Color::Yellow)
@@ -241,22 +210,12 @@ impl StatusLine {
             }
         }
 
-        // ── Right: model · branch · cwd · tokens · cost ───────────
-        if let Some(model) = ctx.model.as_deref() {
-            out.right.push(Segment::styled(
-                model.to_string(),
-                Style::default().fg(Color::White),
-            ));
-        }
-
-        if let Some(branch) = ctx.git_branch.as_deref() {
-            out.right
-                .push(Segment::styled(format!("⎇ {branch}"), muted));
-        }
-
+        // ── Right: cwd · budget · branch · cost ────────────────────
         if let Some(cwd) = ctx.cwd.as_deref() {
-            out.right
-                .push(Segment::styled(truncate_cwd(cwd, CWD_MAX_WIDTH), muted));
+            out.right.push(Segment::styled(
+                truncate_cwd(cwd, CWD_MAX_WIDTH),
+                Style::default().fg(Color::Green),
+            ));
         }
 
         if let Some((used, limit)) = ctx.token_budget {
@@ -276,7 +235,15 @@ impl StatusLine {
             }
         }
 
-        if let Some(cost) = ctx.cost_usd {
+        if let Some(branch) = ctx.git_branch.as_deref() {
+            out.right.push(Segment::styled(
+                format!("⎇ {}", truncate_middle(branch, BRANCH_MAX_WIDTH)),
+                muted,
+            ));
+        }
+
+        if should_render_cost(ctx) {
+            let cost = ctx.cost_usd.expect("cost checked above");
             out.right
                 .push(Segment::styled(format!("${cost:.2}"), muted));
         }
@@ -287,17 +254,11 @@ impl StatusLine {
     /// Render to a simple string for testing: left joined by ' · ',
     /// two-space gap, right joined by ' · '.
     pub fn plain(&self) -> String {
-        let left: Vec<&str> = self.left.iter().map(|s| s.text.as_str()).collect();
-        let right: Vec<&str> = self.right.iter().map(|s| s.text.as_str()).collect();
-        let l = left.join(" · ");
-        let r = right.join(" · ");
-        if l.is_empty() {
-            r
-        } else if r.is_empty() {
-            l
-        } else {
-            format!("{l}  {r}")
-        }
+        ordered_render_segments(&self.left, &self.right)
+            .into_iter()
+            .map(|seg| seg.text)
+            .collect::<Vec<_>>()
+            .join(" · ")
     }
 
     /// Draw into `area` of `buf`. Left side sticks to the left edge; right
@@ -308,121 +269,295 @@ impl StatusLine {
         if area.width == 0 || area.height == 0 {
             return;
         }
-        let sep = Span::styled(" · ", Style::default().fg(Color::Gray));
+        let surface = crate::tui::style::footer_surface_style();
+        let bg = surface.bg.unwrap_or(Color::Reset);
+        let sep = Span::styled(" · ", Style::default().fg(Color::Gray).bg(bg));
 
-        // Narrow-width degradation of the idle hint. When the full hint
-        // won't leave room for the model name / key stats on the right,
-        // swap to the short form, and ultimately to the tiny form. Only
-        // triggers if segment 0 is one of our known hint strings, so we
-        // never mutate user-supplied content.
-        let left_segments = self.narrowed_left_segments(area.width);
+        let mut right_segments = self.right.clone();
+        if !should_render_budget_segment(area.width, &self.left, &right_segments)
+            && right_segments.len() >= 2
+        {
+            right_segments.remove(1);
+        }
 
-        let left_spans = join_segments(&left_segments, &sep, 2 /* leading indent */);
-        let mut right_segments: &[Segment] = &self.right;
-        let mut right_spans;
-        let left_w: usize = left_spans.iter().map(|s| s.content.width()).sum();
-
+        tighten_primary_right_segment(&self.left, &mut right_segments, area.width);
+        let mut ordered = ordered_render_segments(&self.left, &right_segments);
         loop {
-            right_spans = join_segments(right_segments, &sep, 0);
-            let right_w: usize = right_spans.iter().map(|s| s.content.width()).sum();
-            let total = left_w + right_w + 2; // 2-char trailing margin
-            if total <= area.width as usize || right_segments.is_empty() {
+            let spans = join_segments(&ordered, &sep, 2 /* leading indent */, bg);
+            let used: usize = spans.iter().map(|s| s.content.width()).sum();
+            let total = used + 2; // trailing margin
+            if total <= area.width as usize || ordered.len() <= 1 {
+                let padding = (area.width as usize).saturating_sub(used + 2);
+                let mut all = spans;
+                all.push(Span::styled(" ".repeat(padding), Style::default().bg(bg)));
+                Widget::render(Line::from(all), area, buf);
                 break;
             }
-            // Drop the trailing right segment and retry.
-            right_segments = &right_segments[..right_segments.len() - 1];
+            ordered.pop();
         }
-
-        let right_w: usize = right_spans.iter().map(|s| s.content.width()).sum();
-        let padding = (area.width as usize).saturating_sub(left_w + right_w + 2);
-
-        let mut all = left_spans;
-        all.push(Span::raw(" ".repeat(padding)));
-        all.extend(right_spans);
-
-        Widget::render(Line::from(all), area, buf);
     }
+}
 
-    /// Return `self.left` with the lead hint swapped for a shorter
-    /// variant if the full form plus non-droppable right segments
-    /// wouldn't fit. The "floor" right width is the first right segment
-    /// only (typically the model name) — we want to protect that above
-    /// the nice-to-have hint detail.
-    fn narrowed_left_segments(&self, width: u16) -> Vec<Segment> {
-        let Some(first) = self.left.first() else {
-            return self.left.clone();
-        };
-        // Only degrade the known idle-hint strings.
-        if first.text != IDLE_HINT_FULL {
-            return self.left.clone();
-        }
-        // Width of everything except the lead hint: rest of left segs +
-        // separators, all of right (floor) + margins. The lead hint
-        // itself is what we're shrinking, so exclude it from this sum.
-        let sep_w = " · ".chars().count();
-        let lead_indent = 2;
-        let trailing_margin = 2;
+fn should_render_cost(ctx: &StatusContext) -> bool {
+    ctx.cost_usd.is_some() && !is_dense_footer_context(ctx)
+}
 
-        let other_left_w: usize = self
-            .left
-            .iter()
-            .skip(1)
-            .map(|s| s.text.chars().count() + sep_w)
-            .sum();
-        // Prefer preserving the current right-side context (model, branch,
-        // cwd, budget) before spending width on a verbose legend.
-        let right_desired: usize = self
-            .right
-            .iter()
-            .enumerate()
-            .map(|(idx, s)| s.text.chars().count() + if idx > 0 { sep_w } else { 0 })
-            .sum();
-
-        let overhead = lead_indent + other_left_w + right_desired + trailing_margin;
-        let available = (width as usize).saturating_sub(overhead);
-
-        let chosen = if IDLE_HINT_FULL.chars().count() <= available {
-            IDLE_HINT_FULL
-        } else if IDLE_HINT_SHORT.chars().count() <= available {
-            IDLE_HINT_SHORT
-        } else {
-            IDLE_HINT_TINY
-        };
-
-        let mut out = self.left.clone();
-        out[0] = Segment::styled(chosen, first.style);
-        out
+fn is_dense_footer_context(ctx: &StatusContext) -> bool {
+    let mut signals = 0usize;
+    if ctx.token_budget.is_some() {
+        signals += 1;
     }
+    if ctx.git_branch.is_some() {
+        signals += 1;
+    }
+    if ctx.cost_usd.is_some() {
+        signals += 1;
+    }
+    signals >= 2
 }
 
 fn join_segments(
     segments: &[Segment],
     sep: &Span<'_>,
     leading_spaces: usize,
+    bg: Color,
 ) -> Vec<Span<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(segments.len() * 2 + 1);
     if leading_spaces > 0 {
-        spans.push(Span::raw(" ".repeat(leading_spaces)));
+        spans.push(Span::styled(
+            " ".repeat(leading_spaces),
+            Style::default().bg(bg),
+        ));
     }
     for (i, seg) in segments.iter().enumerate() {
         if i > 0 {
             spans.push(Span::styled(sep.content.to_string(), sep.style));
         }
-        spans.push(Span::styled(seg.text.clone(), seg.style));
+        spans.push(Span::styled(seg.text.clone(), seg.style.bg(bg)));
     }
     spans
+}
+
+fn ordered_render_segments(left: &[Segment], right: &[Segment]) -> Vec<Segment> {
+    let mut ordered = Vec::with_capacity(left.len() + right.len());
+    ordered.extend(left.iter().cloned());
+    ordered.extend(right.iter().cloned());
+    ordered
+}
+
+fn tighten_ordered_cwd_segment(ordered: &mut [Segment], total_width: u16) {
+    if ordered.len() < 2 {
+        return;
+    }
+
+    let sep_w = " · ".width();
+    let lead_indent = 2usize;
+    let trailing_margin = 2usize;
+    let model_width = ordered[0].text.width();
+    let other_width: usize = ordered
+        .iter()
+        .skip(2)
+        .map(|seg| seg.text.width() + sep_w)
+        .sum();
+    let separator_count = ordered.len().saturating_sub(1);
+    let separator_width = separator_count * sep_w;
+    let available = usize::from(total_width)
+        .saturating_sub(lead_indent + trailing_margin + model_width + other_width + separator_width)
+        .max(8);
+
+    if ordered[1].text.width() > available {
+        ordered[1].text = truncate_cwd(&ordered[1].text, available);
+    }
+}
+
+fn tighten_primary_right_segment(left: &[Segment], right: &mut [Segment], total_width: u16) {
+    if left.is_empty() || right.is_empty() {
+        return;
+    }
+
+    let sep_w = " · ".width();
+    let lead_indent = 2usize;
+    let trailing_margin = 2usize;
+    let preferred_left = left[0]
+        .text
+        .width()
+        .min(MODEL_MAX_WIDTH.max(PRIMARY_LEFT_FLOOR_WIDTH));
+    let other_right_width: usize = right
+        .iter()
+        .skip(1)
+        .map(|seg| seg.text.width() + sep_w)
+        .sum();
+    let available_for_primary_right = usize::from(total_width)
+        .saturating_sub(lead_indent + trailing_margin + preferred_left + other_right_width);
+
+    if right[0].text.width() <= available_for_primary_right {
+        return;
+    }
+
+    let max_width = available_for_primary_right.max(8);
+    right[0].text = truncate_cwd(&right[0].text, max_width);
 }
 
 /// Shorten `cwd` to at most `max_width` characters by replacing the
 /// middle with an ellipsis, keeping the meaningful tail visible.
 fn truncate_cwd(cwd: &str, max_width: usize) -> String {
-    let count = cwd.chars().count();
-    if count <= max_width {
+    if cwd.width() <= max_width {
         return cwd.to_string();
     }
-    // Keep the last `max_width - 1` characters, prefixed with "…".
-    let tail: String = cwd.chars().skip(count - (max_width - 1)).collect();
-    format!("…{tail}")
+    if max_width <= 3 {
+        return "…".to_string();
+    }
+
+    let (lead, rest) = if let Some(stripped) = cwd.strip_prefix("~/") {
+        ("~/", stripped)
+    } else if let Some(stripped) = cwd.strip_prefix('/') {
+        ("/", stripped)
+    } else {
+        ("", cwd)
+    };
+
+    let parts: Vec<&str> = rest.split('/').filter(|part| !part.is_empty()).collect();
+    if parts.is_empty() {
+        return truncate_end(cwd, max_width);
+    }
+
+    let mut best: Option<String> = None;
+    for keep_count in 1..=parts.len() {
+        let tail = parts[parts.len() - keep_count..].join("/");
+        let candidate = if keep_count < parts.len() {
+            format!("{lead}…/{tail}")
+        } else {
+            format!("{lead}{tail}")
+        };
+        if candidate.width() > max_width {
+            break;
+        }
+        best = Some(candidate);
+    }
+
+    best.unwrap_or_else(|| truncate_end(cwd, max_width))
+}
+
+fn format_model_label(model: &str, max_width: usize) -> String {
+    if model.width() <= max_width {
+        return model.to_string();
+    }
+
+    if let Some((base, suffix)) = split_model_suffix(model) {
+        let compact_suffix = compact_model_suffix(suffix);
+        let suffix_width = compact_suffix.width();
+        if suffix_width < max_width {
+            let base_budget = max_width.saturating_sub(suffix_width);
+            let truncated_base = truncate_end(base, base_budget.max(8));
+            let candidate = format!("{truncated_base}{compact_suffix}");
+            if candidate.width() <= max_width {
+                return candidate;
+            }
+        }
+        return truncate_end(base, max_width);
+    }
+
+    truncate_end(model, max_width)
+}
+
+fn split_model_suffix(model: &str) -> Option<(&str, &str)> {
+    if !model.ends_with(')') {
+        return None;
+    }
+    let start = model.rfind('(')?;
+    let base = &model[..start];
+    if base.is_empty() {
+        return None;
+    }
+    Some((base, &model[start..]))
+}
+
+fn compact_model_suffix(suffix: &str) -> String {
+    let inner = suffix.trim_start_matches('(').trim_end_matches(')');
+    if let Some(level) = inner.strip_prefix("thinking:") {
+        format!("({level})")
+    } else {
+        suffix.to_string()
+    }
+}
+
+fn truncate_middle(text: &str, max_width: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_width {
+        return text.to_string();
+    }
+    if max_width <= 1 {
+        return "…".to_string();
+    }
+    let head_len = (max_width - 1) / 2;
+    let tail_len = max_width - 1 - head_len;
+    let head: String = text.chars().take(head_len).collect();
+    let tail: String = text.chars().skip(count - tail_len).collect();
+    format!("{head}…{tail}")
+}
+
+fn truncate_end(text: &str, max_width: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_width {
+        return text.to_string();
+    }
+    if max_width <= 1 {
+        return "…".to_string();
+    }
+    let head: String = text.chars().take(max_width - 1).collect();
+    format!("{head}…")
+}
+
+fn truncate_left_segments_to_fit(
+    segments: &[Segment],
+    right_width: usize,
+    total_width: u16,
+) -> Vec<Segment> {
+    if segments.is_empty() {
+        return Vec::new();
+    }
+
+    let sep_w = " · ".width();
+    let lead_indent = 2usize;
+    let trailing_margin = 2usize;
+    let mut kept = segments.to_vec();
+
+    loop {
+        let other_width: usize = kept
+            .iter()
+            .skip(1)
+            .map(|seg| seg.text.width() + sep_w)
+            .sum();
+        let available = usize::from(total_width)
+            .saturating_sub(right_width + lead_indent + trailing_margin + other_width);
+
+        if kept[0].text.width() <= available {
+            return kept;
+        }
+
+        if kept.len() > 1 {
+            kept.pop();
+            continue;
+        }
+
+        let floor = 10usize;
+        kept[0].text = truncate_end(&kept[0].text, available.max(floor));
+        return kept;
+    }
+}
+
+fn should_render_budget_segment(total_width: u16, left: &[Segment], right: &[Segment]) -> bool {
+    if right.len() < 2 {
+        return true;
+    }
+    let left_primary = left.first().map(|seg| seg.text.width()).unwrap_or_default();
+    let cwd_width = right
+        .first()
+        .map(|seg| seg.text.width())
+        .unwrap_or_default();
+    let budget_width = right.get(1).map(|seg| seg.text.width()).unwrap_or_default();
+    let minimum_useful = 2 + left_primary + 2 + cwd_width.min(14) + 3 + budget_width;
+    usize::from(total_width) >= minimum_useful
 }
 
 /// "25000" → "25k"; preserves exact count under 1k.
@@ -433,14 +568,5 @@ fn format_tokens_compact(n: u64) -> String {
         format!("{}k", n / 1_000)
     } else {
         format!("{:.1}M", n as f64 / 1_000_000.0)
-    }
-}
-
-fn format_duration_compact(d: Duration) -> String {
-    let secs = d.as_secs();
-    if secs >= 60 {
-        format!("{}m {}s", secs / 60, secs % 60)
-    } else {
-        format!("{secs}s")
     }
 }

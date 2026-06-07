@@ -6,8 +6,10 @@ import type {
   ChatListResponse,
   CreateChatRequest,
   CreateChatResponse,
+  QueueRunInputResponse,
   SendMessageRequest,
   SendMessageResponse,
+  ActiveRunMutationResponse,
 } from '@/lib/api/types';
 
 export function listChats(params: {
@@ -64,12 +66,37 @@ export function sendChatMessage(chatId: string, payload: SendMessageRequest) {
   });
 }
 
+export function queueChatRunInput(chatId: string, payload: SendMessageRequest) {
+  return requestJson<QueueRunInputResponse>(`/api/chats/${encodeURIComponent(chatId)}/input`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export function stopChatRun(chatId: string) {
+  return requestJson<ActiveRunMutationResponse>(`/api/chats/${encodeURIComponent(chatId)}/stop`, {
+    method: 'POST',
+  });
+}
+
+export function resumeChatRun(chatId: string) {
+  return requestJson<ActiveRunMutationResponse>(`/api/chats/${encodeURIComponent(chatId)}/resume`, {
+    method: 'POST',
+  });
+}
+
 export type ChatStreamHandlers = {
+  signal?: AbortSignal;
   onLocalMessages?: (messages: { userMessage: ChatMessage; assistantMessage: ChatMessage }) => void;
   onArtifacts?: (artifacts: NonNullable<ChatMessage['artifacts']>) => void;
   onReasoning?: (reasoning: string) => void;
   onReasoningDone?: (reasoning: string) => void;
   onText?: (text: string) => void;
+  onRunStarted?: (runId: string) => void;
+  onRunUpdated?: (run: { runId: string; status: string; waitingFor?: string | null }) => void;
+  onRunFinished?: (run: { runId?: string; status: string; error?: string | null }) => void;
+  onCancelled?: (text: string) => void;
+  onPaused?: (text: string) => void;
   onDone?: (text: string) => void;
 };
 
@@ -77,6 +104,8 @@ type ChatStreamState = {
   rawText: string;
   text: string;
   reasoning: string;
+  cancelled?: boolean;
+  paused?: boolean;
   error?: string;
 };
 
@@ -209,9 +238,33 @@ function applyStreamEvent(event: Record<string, unknown>, state: ChatStreamState
     return;
   }
 
+  if (type === 'session_info' && typeof event.run_id === 'string') {
+    handlers.onRunStarted?.(event.run_id);
+    handlers.onRunUpdated?.({ runId: event.run_id, status: 'running', waitingFor: null });
+    return;
+  }
+
   if (type === 'text_delta' && typeof event.content === 'string') {
     state.rawText = mergeTextDelta(state.rawText, event.content);
     applyAssistantText(state.rawText, state, handlers);
+    return;
+  }
+
+  if (type === 'run_started' && typeof event.run_id === 'string') {
+    handlers.onRunStarted?.(event.run_id);
+    handlers.onRunUpdated?.({ runId: event.run_id, status: 'running', waitingFor: null });
+    return;
+  }
+
+  if (type === 'run_paused' && typeof event.run_id === 'string') {
+    state.paused = true;
+    handlers.onRunUpdated?.({ runId: event.run_id, status: 'paused', waitingFor: null });
+    return;
+  }
+
+  if (type === 'run_resumed' && typeof event.run_id === 'string') {
+    state.paused = false;
+    handlers.onRunUpdated?.({ runId: event.run_id, status: 'running', waitingFor: null });
     return;
   }
 
@@ -253,23 +306,23 @@ function applyStreamEvent(event: Record<string, unknown>, state: ChatStreamState
 
   if (type === 'run_finished') {
     const status = typeof event.status === 'string' ? event.status : 'completed';
-    if (status === 'failed' || status === 'cancelled') {
+    handlers.onRunFinished?.({
+      runId: typeof event.run_id === 'string' ? event.run_id : undefined,
+      status,
+      error: typeof event.error === 'string' ? event.error : null,
+    });
+    if (status === 'cancelled') {
+      state.cancelled = true;
+      return;
+    }
+    if (status === 'failed') {
       state.error = typeof event.error === 'string' ? event.error : state.error ?? 'Astra run failed.';
     }
+    state.paused = false;
   }
 }
 
-export async function streamChatMessage(
-  chatId: string,
-  payload: SendMessageRequest,
-  handlers: ChatStreamHandlers,
-) {
-  const response = await fetch(`/api/chats/${encodeURIComponent(chatId)}/stream`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
-
+async function consumeChatStream(response: Response, handlers: ChatStreamHandlers) {
   if (!response.ok) {
     let detail = `${response.status} ${response.statusText}`;
     try {
@@ -289,39 +342,94 @@ export async function streamChatMessage(
   const decoder = new TextDecoder();
   const state: ChatStreamState = { rawText: '', text: '', reasoning: '' };
   let buffer = '';
+  let abortListener: (() => void) | undefined;
 
-  for (;;) {
-    const { value, done } = await reader.read();
-    if (done) {
-      break;
+  try {
+    if (handlers.signal) {
+      abortListener = () => {
+        void reader.cancel();
+      };
+      handlers.signal.addEventListener('abort', abortListener, { once: true });
     }
-    buffer += decoder.decode(value, { stream: true });
-    const frames = buffer.split(/\r?\n\r?\n/);
-    buffer = frames.pop() ?? '';
-    for (const frame of frames) {
-      const event = parseSseFrame(frame);
+    for (;;) {
+      if (handlers.signal?.aborted) {
+        await reader.cancel();
+        throw new DOMException('The chat stream was aborted.', 'AbortError');
+      }
+      const { value, done } = await reader.read();
+      if (handlers.signal?.aborted) {
+        throw new DOMException('The chat stream was aborted.', 'AbortError');
+      }
+      if (done) {
+        break;
+      }
+      buffer += decoder.decode(value, { stream: true });
+      const frames = buffer.split(/\r?\n\r?\n/);
+      buffer = frames.pop() ?? '';
+      for (const frame of frames) {
+        const event = parseSseFrame(frame);
+        if (event) {
+          applyStreamEvent(event, state, handlers);
+        }
+      }
+    }
+
+    const tail = decoder.decode();
+    if (tail) {
+      buffer += tail;
+    }
+    if (buffer.trim()) {
+      const event = parseSseFrame(buffer);
       if (event) {
         applyStreamEvent(event, state, handlers);
       }
     }
-  }
-
-  const tail = decoder.decode();
-  if (tail) {
-    buffer += tail;
-  }
-  if (buffer.trim()) {
-    const event = parseSseFrame(buffer);
-    if (event) {
-      applyStreamEvent(event, state, handlers);
+  } finally {
+    if (handlers.signal && abortListener) {
+      handlers.signal.removeEventListener('abort', abortListener);
     }
+    reader.releaseLock();
   }
 
   if (state.error) {
     throw new Error(state.error);
   }
+  if (state.cancelled) {
+    handlers.onCancelled?.(state.text);
+    return state.text;
+  }
+  if (state.paused) {
+    handlers.onPaused?.(state.text);
+    return state.text;
+  }
   handlers.onDone?.(state.text);
   return state.text;
+}
+
+export async function streamChatMessage(
+  chatId: string,
+  payload: SendMessageRequest,
+  handlers: ChatStreamHandlers,
+) {
+  const response = await fetch(`/api/chats/${encodeURIComponent(chatId)}/stream`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+    signal: handlers.signal,
+  });
+  return consumeChatStream(response, handlers);
+}
+
+export async function streamExistingChatRun(
+  chatId: string,
+  runId: string,
+  handlers: ChatStreamHandlers,
+) {
+  const response = await fetch(
+    `/api/chats/${encodeURIComponent(chatId)}/stream?runId=${encodeURIComponent(runId)}`,
+    { method: 'GET', signal: handlers.signal },
+  );
+  return consumeChatStream(response, handlers);
 }
 
 export function updateChatProject(chatId: string, projectId: string | null) {

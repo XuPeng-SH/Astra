@@ -41,7 +41,9 @@ use astra_services::{
     },
 };
 
-use astra_core::{STATUS_CANCELLED, STATUS_PAUSED, STATUS_RUNNING, STATUS_WAITING};
+use astra_core::{
+    STATUS_CANCELLED, STATUS_INPUT_QUEUED, STATUS_PAUSED, STATUS_RUNNING, STATUS_WAITING,
+};
 
 /// Durable run execution engine.
 ///
@@ -270,6 +272,35 @@ impl RunEngine {
         Ok(updated)
     }
 
+    /// Persist a status change only if the durable row is still in one of the
+    /// expected states. This prevents stale control-plane observations from
+    /// overwriting a newer pause/cancel/terminal status.
+    pub async fn persist_status_if_current(
+        &self,
+        run_id: &str,
+        expected_statuses: &[&str],
+        status: &str,
+        waiting_for: Option<&str>,
+        error_message: Option<&str>,
+    ) -> Result<bool, String> {
+        let updated = self
+            .store
+            .update_run_status_if_current(
+                run_id,
+                expected_statuses,
+                status,
+                waiting_for,
+                error_message,
+            )
+            .await?;
+        if updated {
+            let summary = error_message.or(waiting_for);
+            self.project_delegation_run_if_needed(run_id, status, summary)
+                .await?;
+        }
+        Ok(updated)
+    }
+
     async fn project_delegation_run_if_needed(
         &self,
         run_id: &str,
@@ -369,7 +400,7 @@ impl RunEngine {
     ) -> Result<Option<RunControlStatus>, String> {
         let record = self.store.load_run(run_id).await?;
         Ok(match record {
-            None => Some(RunControlStatus::Cancelled),
+            None => None,
             Some(r) => match durable_run_status_kind(&r.status) {
                 DurableRunStatusKind::Cancelled => Some(RunControlStatus::Cancelled),
                 DurableRunStatusKind::Paused => Some(RunControlStatus::Paused),
@@ -503,13 +534,150 @@ impl RunEngine {
     }
 }
 
-use crate::turn::run_control::{RunControlProvider, RunControlStatus};
+use crate::turn::run_control::{
+    QueuedRunInputEvent, RunControlStatus, RunInputProvider, RunQueuedInputPoll, RunStatusProvider,
+};
 
 #[async_trait::async_trait]
-impl RunControlProvider for RunEngine {
+impl RunStatusProvider for RunEngine {
     #[allow(clippy::blocks_in_conditions)]
-    async fn control_status(&self, run_id: &str) -> Option<RunControlStatus> {
-        self.check_control_status(run_id).await.ok().flatten()
+    async fn control_status(&self, run_id: &str) -> Result<Option<RunControlStatus>, String> {
+        self.check_control_status(run_id).await
+    }
+}
+
+#[async_trait::async_trait]
+impl RunInputProvider for RunEngine {
+    async fn poll_user_inputs(&self, run_id: &str, after_event_index: usize) -> RunQueuedInputPoll {
+        let run = match self.store.load_run(run_id).await {
+            Ok(Some(run)) => run,
+            Ok(None) => {
+                return RunQueuedInputPoll {
+                    next_cursor: after_event_index,
+                    inputs: Vec::new(),
+                    error: None,
+                };
+            }
+            Err(error) => {
+                tracing::warn!(
+                    run_id,
+                    error = %error,
+                    "failed to poll queued user inputs from run store"
+                );
+                return RunQueuedInputPoll {
+                    next_cursor: after_event_index,
+                    inputs: Vec::new(),
+                    error: Some(error),
+                };
+            }
+        };
+        let released_indices = run
+            .events
+            .iter()
+            .filter(|event| {
+                event.get("event_type").and_then(serde_json::Value::as_str)
+                    == Some("user_inputs_released")
+            })
+            .flat_map(|event| {
+                event
+                    .get("data")
+                    .and_then(|data| data.get("event_indices"))
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_u64)
+                    .map(|value| value as usize)
+            })
+            .collect::<std::collections::HashSet<_>>();
+        let start_index = after_event_index.min(run.events.len());
+
+        let inputs: Vec<QueuedRunInputEvent> = run
+            .events
+            .iter()
+            .enumerate()
+            .skip(start_index)
+            .filter_map(|(event_index, event)| {
+                let payload = event
+                    .get("event_type")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|event_type| *event_type == "user_input")
+                    .and_then(|_| event.get("data"))
+                    .and_then(|data| data.get("input"))
+                    .cloned()?;
+                if released_indices.contains(&event_index) {
+                    return None;
+                }
+                Some(QueuedRunInputEvent {
+                    event_index,
+                    input: payload,
+                })
+            })
+            .collect();
+
+        let mut error = None;
+        if run.status == STATUS_INPUT_QUEUED && inputs.is_empty() && !released_indices.is_empty() {
+            if let Err(update_error) = self
+                .persist_status_if_current(
+                    run_id,
+                    &[STATUS_INPUT_QUEUED],
+                    STATUS_RUNNING,
+                    None,
+                    None,
+                )
+                .await
+            {
+                tracing::warn!(
+                    run_id,
+                    error = %update_error,
+                    "failed to auto-heal stale input-queued status after released inputs"
+                );
+                error = Some(update_error);
+            }
+        }
+
+        RunQueuedInputPoll {
+            next_cursor: after_event_index.max(run.events.len()),
+            inputs,
+            error,
+        }
+    }
+
+    async fn mark_user_inputs_released(
+        &self,
+        run_id: &str,
+        event_indices: &[usize],
+    ) -> Result<(), String> {
+        if event_indices.is_empty() {
+            return Ok(());
+        }
+        let run =
+            self.store.load_run(run_id).await?.ok_or_else(|| {
+                format!("run not found while acknowledging deferred input: {run_id}")
+            })?;
+        match durable_run_status_kind(&run.status) {
+            DurableRunStatusKind::Cancelled
+            | DurableRunStatusKind::Completed
+            | DurableRunStatusKind::Failed => return Ok(()),
+            _ => {}
+        }
+        self.append_event(
+            run_id,
+            serde_json::json!({
+                "event_type": "user_inputs_released",
+                "data": { "event_indices": event_indices },
+            }),
+        )
+        .await?;
+        let current =
+            self.store.load_run(run_id).await?.ok_or_else(|| {
+                format!("run not found after acknowledging deferred input: {run_id}")
+            })?;
+        if current.status != STATUS_INPUT_QUEUED {
+            return Ok(());
+        }
+        self.persist_status_if_current(run_id, &[STATUS_INPUT_QUEUED], STATUS_RUNNING, None, None)
+            .await
+            .map(|_| ())
     }
 }
 
@@ -608,6 +776,121 @@ mod tests {
 
     fn test_engine() -> RunEngine {
         RunEngine::new(Arc::new(InMemoryRunStateStore::new()))
+    }
+
+    struct FailingLoadRunStore;
+
+    #[async_trait::async_trait]
+    impl RunStateStore for FailingLoadRunStore {
+        async fn insert_run(&self, _record: DurableRunRecord) -> Result<(), String> {
+            Err("store unavailable".into())
+        }
+
+        async fn load_run(&self, _run_id: &str) -> Result<Option<DurableRunRecord>, String> {
+            Err("load failed".into())
+        }
+
+        async fn update_run_status(
+            &self,
+            _run_id: &str,
+            _status: &str,
+            _waiting_for: Option<&str>,
+            _error_message: Option<&str>,
+        ) -> Result<bool, String> {
+            Err("store unavailable".into())
+        }
+
+        async fn update_run_status_if_current(
+            &self,
+            _run_id: &str,
+            _expected_statuses: &[&str],
+            _status: &str,
+            _waiting_for: Option<&str>,
+            _error_message: Option<&str>,
+        ) -> Result<bool, String> {
+            Err("store unavailable".into())
+        }
+
+        async fn update_run_usage(
+            &self,
+            _run_id: &str,
+            _prompt_tokens: u64,
+            _completion_tokens: u64,
+            _tool_calls: u32,
+        ) -> Result<bool, String> {
+            Err("store unavailable".into())
+        }
+
+        async fn save_checkpoint(
+            &self,
+            _run_id: &str,
+            _checkpoint_json: &str,
+        ) -> Result<bool, String> {
+            Err("store unavailable".into())
+        }
+
+        async fn load_latest_checkpoint(
+            &self,
+            _run_id: &str,
+            _checkpoint_kind: Option<&str>,
+        ) -> Result<Option<DurableRunCheckpointRecord>, String> {
+            Err("store unavailable".into())
+        }
+
+        async fn load_run_projection(
+            &self,
+            _run_id: &str,
+        ) -> Result<Option<DurableRunDisplayProjectionRecord>, String> {
+            Err("store unavailable".into())
+        }
+
+        async fn append_events_batch(
+            &self,
+            _run_id: &str,
+            _events: &[serde_json::Value],
+        ) -> Result<(), String> {
+            Err("store unavailable".into())
+        }
+
+        async fn list_user_runs(
+            &self,
+            _user_id: &str,
+            _limit: u32,
+            _offset: u32,
+        ) -> Result<(Vec<DurableRunRecord>, i64), String> {
+            Err("store unavailable".into())
+        }
+
+        async fn find_waiting_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
+            Err("store unavailable".into())
+        }
+
+        async fn find_running_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
+            Err("store unavailable".into())
+        }
+
+        async fn find_blocking_session_run(
+            &self,
+            _user_id: &str,
+            _session_id: &str,
+        ) -> Result<Option<DurableRunRecord>, String> {
+            Err("store unavailable".into())
+        }
+
+        async fn find_sub_runs(
+            &self,
+            _delegation_id: &str,
+        ) -> Result<Vec<DurableRunRecord>, String> {
+            Err("store unavailable".into())
+        }
+
+        async fn update_retry_count(
+            &self,
+            _run_id: &str,
+            _retry_count: u32,
+        ) -> Result<bool, String> {
+            Err("store unavailable".into())
+        }
     }
 
     #[tokio::test]
@@ -940,6 +1223,180 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn poll_user_inputs_keeps_cursor_when_after_index_exceeds_events() {
+        let engine = test_engine();
+        engine
+            .start_run("run-input", "user-1", "sess-input")
+            .await
+            .unwrap();
+        engine
+            .append_event(
+                "run-input",
+                serde_json::json!({
+                    "event_type": "user_input",
+                    "data": { "input": { "content": "queued" } },
+                }),
+            )
+            .await
+            .unwrap();
+
+        let poll = engine.poll_user_inputs("run-input", 99).await;
+
+        assert_eq!(poll.next_cursor, 99);
+        assert!(poll.inputs.is_empty());
+        assert_eq!(poll.error, None);
+    }
+
+    #[tokio::test]
+    async fn poll_user_inputs_reports_store_load_errors() {
+        let engine = RunEngine::new(Arc::new(FailingLoadRunStore));
+
+        let poll = engine.poll_user_inputs("run-input", 7).await;
+
+        assert_eq!(poll.next_cursor, 7);
+        assert!(poll.inputs.is_empty());
+        assert_eq!(poll.error.as_deref(), Some("load failed"));
+    }
+
+    #[tokio::test]
+    async fn mark_user_inputs_released_clears_input_queued_status() {
+        let engine = test_engine();
+        engine
+            .start_run("run-queued", "user-1", "sess-queued")
+            .await
+            .unwrap();
+        engine
+            .persist_status("run-queued", STATUS_INPUT_QUEUED, Some("user_input"), None)
+            .await
+            .unwrap();
+
+        engine
+            .mark_user_inputs_released("run-queued", &[1])
+            .await
+            .unwrap();
+
+        let run = engine.load_run("run-queued").await.unwrap().unwrap();
+        assert_eq!(run.status, STATUS_RUNNING);
+        assert_eq!(run.waiting_for, None);
+        let poll = engine.poll_user_inputs("run-queued", 0).await;
+        assert!(
+            poll.inputs.is_empty(),
+            "released inputs must not replay after crash recovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_user_inputs_released_does_not_overwrite_paused_status() {
+        let engine = test_engine();
+        engine
+            .start_run("run-paused-release", "user-1", "sess-paused")
+            .await
+            .unwrap();
+        engine
+            .persist_status(
+                "run-paused-release",
+                STATUS_INPUT_QUEUED,
+                Some("user_input"),
+                None,
+            )
+            .await
+            .unwrap();
+        engine
+            .persist_status(
+                "run-paused-release",
+                STATUS_PAUSED,
+                Some("user_resume"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        engine
+            .mark_user_inputs_released("run-paused-release", &[1])
+            .await
+            .unwrap();
+
+        let run = engine
+            .load_run("run-paused-release")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.status, STATUS_PAUSED);
+        assert_eq!(run.waiting_for.as_deref(), Some("user_resume"));
+    }
+
+    #[tokio::test]
+    async fn mark_user_inputs_released_does_not_append_on_cancelled_run() {
+        let engine = test_engine();
+        engine
+            .start_run("run-cancelled-release", "user-1", "sess-cancelled")
+            .await
+            .unwrap();
+        engine
+            .persist_status("run-cancelled-release", STATUS_CANCELLED, None, None)
+            .await
+            .unwrap();
+        let before = engine
+            .load_run("run-cancelled-release")
+            .await
+            .unwrap()
+            .unwrap()
+            .events
+            .len();
+
+        engine
+            .mark_user_inputs_released("run-cancelled-release", &[1])
+            .await
+            .unwrap();
+
+        let run = engine
+            .load_run("run-cancelled-release")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.status, STATUS_CANCELLED);
+        assert_eq!(run.events.len(), before);
+    }
+
+    #[tokio::test]
+    async fn persist_status_if_current_does_not_overwrite_unexpected_status() {
+        let engine = test_engine();
+        engine
+            .start_run("run-cas", "user-1", "sess-cas")
+            .await
+            .unwrap();
+        engine
+            .persist_status("run-cas", STATUS_PAUSED, Some("user_resume"), None)
+            .await
+            .unwrap();
+
+        let updated = engine
+            .persist_status_if_current(
+                "run-cas",
+                &[STATUS_INPUT_QUEUED],
+                STATUS_RUNNING,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let run = engine.load_run("run-cas").await.unwrap().unwrap();
+        assert!(!updated);
+        assert_eq!(run.status, STATUS_PAUSED);
+        assert_eq!(run.waiting_for.as_deref(), Some("user_resume"));
+    }
+
+    #[tokio::test]
+    async fn missing_run_does_not_report_cancelled_control_status() {
+        let engine = test_engine();
+        assert_eq!(
+            engine.check_control_status("missing-run").await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
     async fn list_user_runs_pagination() {
         let engine = test_engine();
         for i in 0..5 {
@@ -1187,6 +1644,37 @@ mod tests {
         assert_eq!(
             waiting.status, "waiting",
             "waiting run must remain waiting for resume"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_active_runs_includes_input_queued_runs() {
+        let engine = test_engine();
+        engine
+            .start_run("run-input-queued", "user-1", "sess-queued")
+            .await
+            .unwrap();
+        engine
+            .persist_status(
+                "run-input-queued",
+                STATUS_INPUT_QUEUED,
+                Some("user_input"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let recovered = engine.recover_active_runs().await.unwrap();
+
+        assert!(
+            recovered.iter().any(|run| run.run_id == "run-input-queued"),
+            "input-queued runs must be part of active crash recovery"
+        );
+        let durable = engine.load_run("run-input-queued").await.unwrap().unwrap();
+        assert_eq!(durable.status, "failed");
+        assert_eq!(
+            durable.error_message.as_deref(),
+            Some("recovered from crash")
         );
     }
 }

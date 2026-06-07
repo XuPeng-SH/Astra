@@ -35,6 +35,7 @@ use super::draw::{active_viewport, do_draw};
 use super::event::{TuiEvent, TuiEventStream};
 use super::frame_requester::FrameRequester;
 use super::history_cell::HistoryCell;
+use super::keymap::{AppAction, AppKeymap};
 use super::render::line_utils::sanitize_lines_for_terminal;
 use super::task_status::TaskStatus;
 use super::terminal::TerminalGuard;
@@ -45,6 +46,7 @@ use super::{
 
 const AGENT_DRILLDOWN_RECENT_COMPLETED: usize = 5;
 const WORKSPACE_TRUST_SENTINEL: &str = "__workspace_trust__\n";
+const DEFERRED_INPUT_APPLIED_PREFIX: &str = "__deferred_input_applied__:";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReopenTarget {
@@ -86,34 +88,95 @@ fn flush_chat_widget(
     guard.queue_history_lines(batch);
 }
 
+fn deferred_input_preview(text: &str) -> String {
+    let single_line = text.trim().replace('\n', " ↩ ");
+    let mut preview: String = single_line.chars().take(120).collect();
+    if single_line.chars().count() > 120 {
+        preview.push_str("...");
+    }
+    preview
+}
+
+async fn submit_deferred_tui_input(
+    run_control: &std::sync::Arc<
+        std::sync::Mutex<
+            Option<
+                std::sync::Arc<crate::cli::turn::local_run_control::LocalDeferredInputRunControl>,
+            >,
+        >,
+    >,
+    text: &str,
+) -> Result<(), String> {
+    let provider = astra_core::sync_poison::recover_mutex_lock(run_control)
+        .clone()
+        .ok_or_else(|| {
+            "Current turn is not ready to accept deferred input yet. Press Ctrl+C to interrupt immediately."
+                .to_string()
+        })?;
+    provider.enqueue_text(text)
+}
+
 fn render_history_batch_lines(
     cells: &[Arc<dyn history_cell::HistoryCell>],
     width: u16,
 ) -> Vec<ratatui::text::Line<'static>> {
-    // Batch layout: each cell renders its lines then usually gets a trailing
-    // blank for visual separation. Slash user cells must stay tight to the
-    // slash outcome even when a deferred picker/view causes the paired
-    // response to flush in a later batch, so `/cmd` suppresses its own
-    // trailing blank unconditionally. Response cells (`⎿ Set model to …`)
-    // also suppress their trailing blank so the pair stays compact.
+    // Batch layout: each cell renders its lines then gets spacing based on
+    // its transcript role. Slash command pairs stay tight, compact notes keep
+    // a single blank, and primary content blocks get a little more air.
     let mut batch: Vec<ratatui::text::Line<'static>> = Vec::new();
-    for cell in cells {
+    for (idx, cell) in cells.iter().enumerate() {
         batch.extend(cell.display_lines(width));
-        let suppress_blank = is_slash_user_cell(cell.as_ref()) || is_response_cell(cell.as_ref());
-        if !suppress_blank {
+        let next = cells.get(idx + 1).map(|next| next.as_ref());
+        for _ in 0..history_cell::separator_rows_after(cell.as_ref(), next) {
             batch.push(ratatui::text::Line::default());
         }
     }
     batch
 }
 
+fn render_transcript_view_lines(
+    chat_widget: &chat_widget::ChatWidget,
+    width: u16,
+) -> Vec<ratatui::text::Line<'static>> {
+    let mut lines: Vec<ratatui::text::Line<'static>> = Vec::new();
+    let history = chat_widget.history();
+    for (idx, cell) in history.iter().enumerate() {
+        lines.extend(sanitize_lines_for_terminal(cell.display_lines(width)));
+        let next = history
+            .get(idx + 1)
+            .map(|next| next.as_ref())
+            .or_else(|| chat_widget.active_cell());
+        for _ in 0..history_cell::separator_rows_after(cell.as_ref(), next) {
+            lines.push(ratatui::text::Line::default());
+        }
+    }
+    if let Some(active) = chat_widget.active_cell() {
+        lines.extend(sanitize_lines_for_terminal(active.display_lines(width)));
+        for _ in 0..history_cell::trailing_blank_rows(active) {
+            lines.push(ratatui::text::Line::default());
+        }
+    }
+    while lines.last().is_some_and(|line| line.spans.is_empty()) {
+        lines.pop();
+    }
+    lines
+}
+
 fn surface_status_line_system_cell(event: &TuiAppEvent, chat_widget: &mut chat_widget::ChatWidget) {
-    if let TuiAppEvent::PermissionAutoApproved { tool, reason } = event {
-        chat_widget.commit_system(history_cell::system::SystemCell::info(
-            astra_turn_core::permission::notice::format_auto_approved_permission(tool, reason)
-                .trim()
-                .to_string(),
-        ));
+    match event {
+        TuiAppEvent::PermissionAutoApproved { tool, reason } => {
+            chat_widget.commit_system(history_cell::system::SystemCell::info(
+                astra_turn_core::permission::notice::format_auto_approved_permission(tool, reason)
+                    .trim()
+                    .to_string(),
+            ));
+        }
+        TuiAppEvent::StatusLine(text) => {
+            if let Some(message) = text.strip_prefix(DEFERRED_INPUT_APPLIED_PREFIX) {
+                chat_widget.commit_deferred_user(message.trim().to_string());
+            }
+        }
+        _ => {}
     };
 }
 
@@ -374,27 +437,9 @@ fn refresh_open_agent_detail_by_id(
     }
 }
 
-/// Detect a `SystemLevel::Response` cell (the `⎿`-prefixed kind).
-/// Used by `flush_chat_widget` to omit the usual trailing blank so
-/// the response hugs the `› /cmd` line above it.
-fn is_response_cell(cell: &dyn history_cell::HistoryCell) -> bool {
-    cell.as_any_ref()
-        .downcast_ref::<history_cell::system::SystemCell>()
-        .is_some_and(|sc| sc.level() == crate::tui::turn_event::SystemLevel::Response)
-}
-
-/// Detect a UserCell whose text is a slash command (`/model`,
-/// `/login`, …). These pair tightly with a following response cell
-/// so their trailing blank is suppressed — `› /cmd` hugs `⎿ reply`.
-fn is_slash_user_cell(cell: &dyn history_cell::HistoryCell) -> bool {
-    cell.as_any_ref()
-        .downcast_ref::<history_cell::user::UserCell>()
-        .is_some_and(|uc| uc.text().trim_start().starts_with('/'))
-}
-
 /// Prose submits should hit scrollback immediately; slash commands wait
 /// until their paired response/view result is ready so `› /cmd` and
-/// `⎿ reply` land in one flush with no synthetic blank row between them.
+/// `Result · reply` land in one flush with no synthetic blank row between them.
 fn should_flush_submitted_user_cell_immediately(text: &str) -> bool {
     !text.trim_start().starts_with('/')
 }
@@ -873,7 +918,6 @@ pub(crate) async fn run_tui_session(
         }
     }
     let mut status_indicator = status_indicator::StatusIndicator::new();
-    let mut inject_submit: Option<String> = None;
     let mut pending_deferred_slash_flush = false;
 
     // Task board observer + toggle state. Observer is tick-driven
@@ -908,18 +952,30 @@ pub(crate) async fn run_tui_session(
         let tick = tokio::time::sleep(Duration::from_millis(50));
         tokio::pin!(tick);
 
-        // After turn ends, load first queued message into composer for review/send.
-        // The inner `select!` blocks until the turn completes, so by the time
-        // control returns here the turn is always over — no guard needed.
-        if let Some(text) = inject_submit.take() {
-            bottom_pane.composer.set_text(&text);
-            frame_requester.schedule_frame();
-        }
-
         tokio::select! {
             Some(ev) = event_stream.next() => {
                 match ev {
                     TuiEvent::Key(key) => {
+                        if let Some(AppAction::ToggleTranscript) = AppKeymap::resolve(key) {
+                            use bottom_pane::transcript_view::TranscriptView;
+                            if bottom_pane.transcript_view_is_open() {
+                                bottom_pane.close_active_view();
+                            } else if !bottom_pane.has_active_view() {
+                                let size = guard.terminal.size().ok();
+                                let w = size.map(|s| s.width).unwrap_or(80);
+                                let h = size.map(|s| s.height).unwrap_or(0);
+                                let lines = render_transcript_view_lines(&chat_widget, w);
+                                if !lines.is_empty() {
+                                    bottom_pane.push_view(Box::new(TranscriptView::new(lines, h)));
+                                } else {
+                                    chat_widget.commit_system(history_cell::system::SystemCell::info(
+                                        "Transcript is empty so far.".to_string(),
+                                    ));
+                                }
+                            }
+                            frame_requester.schedule_frame();
+                            continue;
+                        }
                         // Ctrl+L: force full redraw
                         if key.code == crossterm::event::KeyCode::Char('l')
                             && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
@@ -1005,25 +1061,6 @@ pub(crate) async fn run_tui_session(
                             && let Some(prev) = chat_widget.last_user_text()
                         {
                             bottom_pane.composer.set_text(&prev);
-                            frame_requester.schedule_frame();
-                            continue;
-                        }
-                        if key.code == crossterm::event::KeyCode::Char('o')
-                            && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
-                            && !bottom_pane.has_active_view()
-                        {
-                            use bottom_pane::transcript_view::TranscriptView;
-                            let size = guard.terminal.size().ok();
-                            let w = size.map(|s| s.width).unwrap_or(80);
-                            let h = size.map(|s| s.height).unwrap_or(0);
-                            let mut lines: Vec<ratatui::text::Line<'static>> = Vec::new();
-                            for cell in chat_widget.history() {
-                                lines.extend(sanitize_lines_for_terminal(cell.display_lines(w)));
-                                lines.push(ratatui::text::Line::default());
-                            }
-                            if !lines.is_empty() {
-                                bottom_pane.push_view(Box::new(TranscriptView::new(lines, h)));
-                            }
                             frame_requester.schedule_frame();
                             continue;
                         }
@@ -1778,6 +1815,8 @@ pub(crate) async fn run_tui_session(
                                         // inner select.
                                         let task_service_for_cancel = state.task_service.clone();
                                         let agent_spawner_for_cancel = state.agent_spawner.clone();
+                                        let active_turn_local_run_control =
+                                            state.active_turn_local_run_control.clone();
                                         let ctx = crate::cli::turn::turn_entry::TurnContext { api, profile };
                                         let token = crate::cli::session::session_runtime::fresh_access_token(api, profile).await;
                                         let mut tui_ui = ui_adapter::TuiUiAdapter::new(tui_tx.clone());
@@ -1982,16 +2021,9 @@ pub(crate) async fn run_tui_session(
                                                                 continue;
                                                             }
                                                             // During turn: composer stays usable.
-                                                            // Enter queues message (shown as preview, not in scrollback).
-                                                            // Up edits last queued. Ctrl+C interrupts.
-                                                            // Up arrow with queued messages → edit last
-                                                            if k.code == crossterm::event::KeyCode::Up
-                                                                && !bottom_pane.queued_messages.is_empty()
-                                                                && bottom_pane.composer.is_empty()
-                                                            {
-                                                                bottom_pane.edit_last_queued();
-                                                            } else {
-                                                                match bottom_pane.handle_key(k) {
+                                                            // Enter queues a deferred input against the active run.
+                                                            // Ctrl+C interrupts.
+                                                            match bottom_pane.handle_key(k) {
                                                                     BottomPaneAction::SubmitInput(queued_text) => {
                                                                         // Agent drill-in sentinel: user pressed Enter
                                                                         // on a row in InFlightAgentsView mid-turn.
@@ -2023,7 +2055,29 @@ pub(crate) async fn run_tui_session(
                                                                             frame_requester.schedule_frame();
                                                                             continue;
                                                                         }
-                                                                        bottom_pane.queued_messages.push(queued_text);
+                                                                        match submit_deferred_tui_input(
+                                                                            &active_turn_local_run_control,
+                                                                            &queued_text,
+                                                                        )
+                                                                        .await
+                                                                        {
+                                                                            Ok(()) => {
+                                                                                chat_widget.commit_system(
+                                                                                    history_cell::system::SystemCell::info(
+                                                                                        format!(
+                                                                                            "Queued for next tool call: {}",
+                                                                                            deferred_input_preview(&queued_text)
+                                                                                        ),
+                                                                                    ),
+                                                                                );
+                                                                            }
+                                                                            Err(error) => {
+                                                                                bottom_pane.composer.set_text(&queued_text);
+                                                                                chat_widget.commit_system(
+                                                                                    history_cell::system::SystemCell::error(error),
+                                                                                );
+                                                                            }
+                                                                        }
                                                                     }
                                                                     BottomPaneAction::ViewSideEffect { result } => {
                                                                         let _ = try_dispatch_agent_kill_sentinel(
@@ -2143,7 +2197,6 @@ pub(crate) async fn run_tui_session(
                                                                     }
                                                                     _ => {}
                                                                 }
-                                                            }
                                                             frame_requester.schedule_frame();
                                                             {
                                     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
@@ -2502,8 +2555,6 @@ pub(crate) async fn run_tui_session(
                                     tui_cancel_token = new_tok.clone();
                                     state.tui_cancel_token = Some(new_tok);
 
-                                    // Auto-send first queued message (will be picked up next iteration)
-                                    inject_submit = bottom_pane.take_next_queued();
                                 }
                             }
                             BottomPaneAction::OpenExternalEditor(initial) => {
@@ -3341,6 +3392,8 @@ fn handle_app_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::turn::local_run_control::LocalDeferredInputRunControl;
+    use astra_runtime::turn::run_control::RunInputProvider;
 
     /// REGRESSION (reviewer L3 — Architecture): the
     /// `ReopenTarget::as_str() ↔ ReopenTarget::parse()` round-trip
@@ -3359,6 +3412,86 @@ mod tests {
             let decoded = ReopenTarget::parse(encoded).expect("known variant must round-trip");
             assert_eq!(decoded, target, "variant {encoded} did not round-trip");
         }
+    }
+
+    #[tokio::test]
+    async fn submit_deferred_tui_input_enqueues_against_active_local_run_control() {
+        let run_control = Arc::new(std::sync::Mutex::new(Some(
+            LocalDeferredInputRunControl::shared(),
+        )));
+
+        submit_deferred_tui_input(&run_control, "先停下来吧")
+            .await
+            .expect("deferred input should be accepted");
+
+        let provider = astra_core::sync_poison::recover_mutex_lock(&run_control)
+            .clone()
+            .expect("run control should stay installed");
+        let polled = provider.poll_user_inputs("run-local", 0).await;
+        assert_eq!(
+            polled.inputs.len(),
+            1,
+            "one deferred input should be queued"
+        );
+        assert_eq!(polled.inputs[0].input["content"], "先停下来吧");
+    }
+
+    #[tokio::test]
+    async fn submit_deferred_tui_input_rejects_missing_local_run_control() {
+        let run_control = Arc::new(std::sync::Mutex::new(None));
+        let error = submit_deferred_tui_input(&run_control, "先停下来吧")
+            .await
+            .expect_err("missing run control must be rejected locally");
+        assert!(
+            error.contains("not ready to accept deferred input"),
+            "missing run control should surface a local readiness error"
+        );
+    }
+
+    #[test]
+    fn active_turn_submit_routes_to_run_input_api_not_local_queue() {
+        let source = include_str!("event_loop.rs");
+        let arm_start = source
+            .find("BottomPaneAction::SubmitInput(queued_text) => {")
+            .expect("active-turn SubmitInput arm must exist");
+        let arm_end = source[arm_start..]
+            .find("BottomPaneAction::ViewSideEffect { result } => {")
+            .expect("active-turn SubmitInput arm must end before ViewSideEffect");
+        let arm = &source[arm_start..arm_start + arm_end];
+
+        assert!(
+            arm.contains("submit_deferred_tui_input("),
+            "active-turn Enter must queue against the live local run control via submit_deferred_tui_input"
+        );
+        assert!(
+            !arm.contains("queued_messages.push(queued_text)"),
+            "active-turn Enter must not fall back to the old local queue that waited until turn end"
+        );
+        assert!(
+            !arm.contains("state.run_id.clone()"),
+            "active-turn Enter must not read the stale per-session run_id"
+        );
+        assert!(
+            arm.contains("active_turn_local_run_control"),
+            "active-turn Enter should use the live local run-control slot for the current turn"
+        );
+    }
+
+    #[test]
+    fn deferred_input_status_lines_are_committed_to_chat_history() {
+        let source = include_str!("event_loop.rs");
+        assert!(
+            source.contains("DEFERRED_INPUT_APPLIED_PREFIX"),
+            "deferred-input feedback should have a dedicated status-line prefix"
+        );
+        assert!(
+            source.contains("text.strip_prefix(DEFERRED_INPUT_APPLIED_PREFIX)"),
+            "TUI should surface deferred-input-applied status lines into chat history"
+        );
+        assert!(
+            source.contains("chat_widget.commit_deferred_user"),
+            "applied deferred input should be rendered as a user transcript row"
+        );
     }
 
     #[test]
@@ -3807,35 +3940,70 @@ mod tests {
             vec![Arc::new(history_cell::user::UserCell::new("hi"))];
         let lines = render_history_batch_lines(&cells, 80);
 
-        assert_eq!(lines.len(), 2, "prose cells should keep one separator row");
-        assert!(lines[1].spans.is_empty(), "separator should be blank");
+        assert!(
+            lines
+                .last()
+                .is_some_and(|line| line.spans.iter().all(|span| span.content.is_empty())),
+            "prose cells should keep a trailing separator row"
+        );
+        let blank_count = lines
+            .iter()
+            .rev()
+            .take_while(|line| line.spans.iter().all(|span| span.content.is_empty()))
+            .count();
+        assert_eq!(blank_count, 1, "prose cells should end with one blank row");
     }
 
     #[test]
-    fn render_history_batch_lines_omits_slash_user_gap() {
+    fn render_history_batch_lines_gives_tool_blocks_more_air() {
+        let mut tool = history_cell::tool::ToolCell::new_running("bash", "ls /tmp");
+        tool.complete("success", 42, String::new(), Some("3 entries".into()), None);
+        let cells: Vec<Arc<dyn history_cell::HistoryCell>> = vec![Arc::new(tool)];
+        let lines = render_history_batch_lines(&cells, 80);
+
+        let blank_count = lines
+            .iter()
+            .rev()
+            .take_while(|line| line.spans.is_empty())
+            .count();
+        assert_eq!(blank_count, 1, "tool blocks should end with one blank row");
+    }
+
+    #[test]
+    fn render_history_batch_lines_keeps_slash_user_readable() {
         let cells: Vec<Arc<dyn history_cell::HistoryCell>> =
             vec![Arc::new(history_cell::user::UserCell::new("/allow"))];
         let lines = render_history_batch_lines(&cells, 80);
 
         assert_eq!(
-            lines.len(),
+            lines
+                .iter()
+                .rev()
+                .take_while(|line| line.spans.iter().all(|span| span.content.is_empty()))
+                .count(),
             1,
-            "slash command should not emit a trailing blank row"
+            "slash command should keep one trailing blank row"
         );
     }
 
     #[test]
-    fn render_history_batch_lines_keeps_slash_pair_tight() {
+    fn render_history_batch_lines_gives_slash_pair_one_breath() {
+        let slash = history_cell::user::UserCell::new("/allow");
+        let slash_rows = slash.display_lines(80).len();
         let cells: Vec<Arc<dyn history_cell::HistoryCell>> = vec![
-            Arc::new(history_cell::user::UserCell::new("/allow")),
-            Arc::new(history_cell::system::SystemCell::response("Mode → auto")),
+            Arc::new(slash),
+            Arc::new(history_cell::system::SystemCell::response("Mode → Auto")),
         ];
         let lines = render_history_batch_lines(&cells, 80);
 
         assert_eq!(
-            lines.len(),
-            2,
-            "slash command and response should hug with no blank row"
+            lines
+                .iter()
+                .rev()
+                .take_while(|line| line.spans.iter().all(|span| span.content.is_empty()))
+                .count(),
+            1,
+            "slash command and response should end with one blank row"
         );
         let rendered: Vec<String> = lines
             .iter()
@@ -3846,8 +4014,45 @@ mod tests {
                     .collect()
             })
             .collect();
-        assert!(rendered[0].contains("/allow"));
-        assert!(rendered[1].contains("Mode → auto"));
+        assert!(
+            rendered.iter().any(|line| line.contains("/allow")),
+            "slash command row present"
+        );
+        let response_idx = rendered
+            .iter()
+            .position(|line| line.contains("Mode → Auto"))
+            .expect("response row present");
+        assert_eq!(
+            response_idx, slash_rows,
+            "slash response should start right after the slash card's own breathing room"
+        );
+    }
+
+    #[test]
+    fn transcript_view_lines_include_active_cell_output() {
+        let mut w = chat_widget::ChatWidget::new("");
+        w.handle_event(chat_widget::AppEvent::User(chat_widget::UserEvent::Submit(
+            "review".into(),
+        )));
+        w.handle_event(chat_widget::AppEvent::Wire(
+            chat_widget::WireEvent::AnswerDelta("still working".into()),
+        ));
+
+        let rendered = render_transcript_view_lines(&w, 80);
+        let text: Vec<String> = rendered
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+
+        assert!(
+            text.iter().any(|line| line.contains("still working")),
+            "active assistant output should be visible in transcript overlay"
+        );
     }
 
     #[test]

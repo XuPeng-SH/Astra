@@ -12,23 +12,59 @@ import { MoveChatModal } from '@/components/app/move-chat-modal';
 import { IconButton } from '@/components/ui/icon-button';
 import { useChatLifecycleActions } from '@/hooks/use-chat-lifecycle-actions';
 import { subscribeChatLifecycleChange } from '@/lib/chat-lifecycle-events';
-import { getChat, streamChatMessage, updateChatModel } from '@/lib/api/chats';
-import { isAuthRequiredError, isNotFoundError } from '@/lib/api/errors';
+import { getChat, queueChatRunInput, resumeChatRun, stopChatRun, streamChatMessage, streamExistingChatRun, updateChatModel } from '@/lib/api/chats';
+import { WebApiError, isAuthRequiredError, isNotFoundError } from '@/lib/api/errors';
 import type { ChatDetail, ChatMessage, ComposerOptions } from '@/lib/api/types';
+import { deriveChatRunUiState } from '@/lib/chat-run-state';
+import { isChatScrolledToBottom, shouldAutoScrollChat } from '@/lib/chat-scroll-state';
+
+function isAbortError(error: unknown) {
+  return error instanceof DOMException && error.name === 'AbortError';
+}
 
 export function ChatView({ initial }: { initial: ChatDetail }) {
   const router = useRouter();
   const [detail, setDetail] = useState(initial);
   const [moveOpen, setMoveOpen] = useState(false);
-  const [sending, setSending] = useState(false);
+  const [startingRun, setStartingRun] = useState(false);
+  const [queueingDeferredInput, setQueueingDeferredInput] = useState(false);
+  const [resumingRun, setResumingRun] = useState(false);
+  const [stoppingRun, setStoppingRun] = useState(false);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const pinnedRef = useRef(true);
   const pendingStartedRef = useRef<string | null>(null);
+  const streamAbortRef = useRef<AbortController | null>(null);
+  const runControlMutationRef = useRef(false);
   const lifecycle = useChatLifecycleActions({ onChatUpdated: setDetail });
 
   const latestMessage = detail.messages[detail.messages.length - 1];
   const isArchived = Boolean(detail.chat.archivedAt);
   const chatListHref = detail.chat.projectId ? `/projects/${detail.chat.projectId}` : '/chats';
+  const {
+    activeRunStatus,
+    canQueueDeferredInput,
+    canResumeRun,
+    canStopRun,
+    activeRunBlocksNewInput,
+    runControlBusy,
+    composerDisabled,
+    composerPlaceholder,
+    activeRunLabel,
+  } = deriveChatRunUiState({
+    activeRun: detail.activeRun,
+    archived: isArchived,
+    startingRun,
+    queueingDeferredInput,
+    resumingRun,
+    stoppingRun,
+  });
+
+  const nextStreamAbortSignal = useCallback(() => {
+    streamAbortRef.current?.abort();
+    const controller = new AbortController();
+    streamAbortRef.current = controller;
+    return controller.signal;
+  }, []);
 
   const startStream = useCallback(async ({
     text,
@@ -74,7 +110,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
       }));
     };
 
-    setSending(true);
+    setStartingRun(true);
     setDetail((current) => ({
       ...current,
       chat: {
@@ -92,6 +128,36 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
         options,
         pendingMessageId,
       }, {
+        signal: nextStreamAbortSignal(),
+        onRunStarted: (runId) => {
+          setStartingRun(false);
+          setDetail((current) => ({
+            ...current,
+            activeRun: {
+              runId,
+              status: 'running',
+              waitingFor: null,
+            },
+          }));
+        },
+        onRunUpdated: (run) => {
+          setDetail((current) => ({
+            ...current,
+            activeRun: {
+              runId: run.runId,
+              status: run.status,
+              waitingFor: run.waitingFor ?? null,
+            },
+          }));
+        },
+        onRunFinished: () => {
+          setStoppingRun(false);
+          setStartingRun(false);
+          setDetail((current) => ({
+            ...current,
+            activeRun: undefined,
+          }));
+        },
         onReasoning: (reasoning) => {
           patchAssistant({ reasoning, reasoningStatus: 'streaming', status: 'streaming' });
         },
@@ -111,8 +177,24 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
             status: 'complete',
           });
         },
+        onCancelled: (content) => {
+          patchAssistant({
+            content: content || 'Stopped.',
+            reasoningStatus: 'complete',
+            status: 'complete',
+          });
+        },
+        onPaused: (content) => {
+          patchAssistant({
+            content,
+            status: 'streaming',
+          });
+        },
       });
     } catch (error) {
+      if (isAbortError(error)) {
+        return;
+      }
       if (isAuthRequiredError(error)) {
         router.push(`/login?next=${encodeURIComponent(`/chats/${detail.chat.id}`)}`);
         return;
@@ -133,12 +215,243 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
         status: 'failed',
       });
     } finally {
-      setSending(false);
+      setStartingRun(false);
     }
-  }, [chatListHref, detail.chat.archivedAt, detail.chat.id, router]);
+  }, [chatListHref, detail.chat.archivedAt, detail.chat.id, nextStreamAbortSignal, router]);
+
+  const queueDeferredInput = useCallback(async ({
+    text,
+    options,
+  }: {
+    text: string;
+    options: ComposerOptions;
+  }) => {
+    if (detail.chat.archivedAt) {
+      return;
+    }
+    if (runControlMutationRef.current) {
+      return;
+    }
+    runControlMutationRef.current = true;
+    setQueueingDeferredInput(true);
+
+    try {
+      const result = await queueChatRunInput(detail.chat.id, {
+        content: text,
+        options,
+      });
+      setDetail((current) => ({
+        ...current,
+        activeRun: result.activeRun,
+        messages: [...current.messages, result.userMessage],
+      }));
+    } catch (error) {
+      if (isAuthRequiredError(error)) {
+        router.push(`/login?next=${encodeURIComponent(`/chats/${detail.chat.id}`)}`);
+        return;
+      }
+      if (isNotFoundError(error)) {
+        router.replace(chatListHref);
+        return;
+      }
+      if (error instanceof WebApiError && error.status === 409) {
+        const refreshed = await getChat(detail.chat.id).catch(() => null);
+        if (refreshed) {
+          setDetail(refreshed);
+          if (!refreshed.chat.archivedAt && !refreshed.activeRun?.runId) {
+            try {
+              await startStream({ text, options, appendUser: true });
+              return;
+            } catch (fallbackError) {
+              window.alert(fallbackError instanceof Error ? fallbackError.message : 'Failed to start a new run.');
+              return;
+            }
+          }
+        }
+      }
+      window.alert(error instanceof Error ? error.message : 'Failed to queue input for the active run.');
+    } finally {
+      runControlMutationRef.current = false;
+      setQueueingDeferredInput(false);
+    }
+  }, [chatListHref, detail.chat.archivedAt, detail.chat.id, router, startStream]);
+
+  const stopActiveRun = useCallback(async () => {
+    if (!detail.activeRun?.runId || !canStopRun) {
+      return;
+    }
+    if (runControlMutationRef.current) {
+      return;
+    }
+    runControlMutationRef.current = true;
+    setStoppingRun(true);
+    try {
+      const result = await stopChatRun(detail.chat.id);
+      setDetail((current) => ({
+        ...current,
+        activeRun: result.activeRun,
+      }));
+    } catch (error) {
+      if (isAuthRequiredError(error)) {
+        router.push(`/login?next=${encodeURIComponent(`/chats/${detail.chat.id}`)}`);
+        return;
+      }
+      if (isNotFoundError(error)) {
+        router.replace(chatListHref);
+        return;
+      }
+      window.alert(error instanceof Error ? error.message : 'Failed to stop the active run.');
+    } finally {
+      runControlMutationRef.current = false;
+      setStoppingRun(false);
+    }
+  }, [canStopRun, chatListHref, detail.activeRun?.runId, detail.chat.id, router]);
+
+  const resumeActiveRun = useCallback(async () => {
+    if (!detail.activeRun?.runId || !canResumeRun) {
+      return;
+    }
+    if (runControlMutationRef.current) {
+      return;
+    }
+    runControlMutationRef.current = true;
+    const existingAssistantMessageId = [...detail.messages]
+      .reverse()
+      .find((message) => (
+        message.role === 'assistant'
+        && (message.status === 'streaming' || message.reasoningStatus === 'streaming')
+      ))?.id;
+    const assistantMessageId = existingAssistantMessageId ?? crypto.randomUUID();
+    setResumingRun(true);
+    try {
+      const result = await resumeChatRun(detail.chat.id);
+      setDetail((current) => ({
+        ...current,
+        activeRun: result.activeRun,
+        messages: existingAssistantMessageId || current.messages.some((message) => message.id === assistantMessageId)
+          ? current.messages
+          : [
+              ...current.messages,
+              {
+                id: assistantMessageId,
+                role: 'assistant',
+                content: '',
+                createdAt: new Date().toISOString(),
+                status: 'streaming',
+                reasoning: '',
+                reasoningStatus: 'streaming',
+              },
+            ],
+      }));
+      const patchAssistant = (patch: Partial<ChatMessage>) => {
+        setDetail((current) => ({
+          ...current,
+          messages: current.messages.map((message) => (
+            message.id === assistantMessageId ? { ...message, ...patch } : message
+          )),
+        }));
+      };
+      try {
+        await streamExistingChatRun(detail.chat.id, result.activeRun.runId, {
+          signal: nextStreamAbortSignal(),
+          onRunUpdated: (run) => {
+            setDetail((current) => ({
+              ...current,
+              activeRun: {
+                runId: run.runId,
+                status: run.status,
+                waitingFor: run.waitingFor ?? null,
+              },
+            }));
+          },
+          onRunFinished: () => {
+            setStoppingRun(false);
+            setDetail((current) => ({
+              ...current,
+              activeRun: undefined,
+            }));
+          },
+          onReasoning: (reasoning) => {
+            patchAssistant({ reasoning, reasoningStatus: 'streaming', status: 'streaming' });
+          },
+          onReasoningDone: (reasoning) => {
+            patchAssistant({ reasoning, reasoningStatus: 'complete', status: 'streaming' });
+          },
+          onText: (content) => {
+            patchAssistant({ content, status: 'streaming' });
+          },
+          onArtifacts: (artifacts) => {
+            patchAssistant({ artifacts });
+          },
+          onDone: (content) => {
+            patchAssistant({
+              content: content || 'Astra completed the run without returning visible text.',
+              reasoningStatus: 'complete',
+              status: 'complete',
+            });
+          },
+          onCancelled: (content) => {
+            patchAssistant({
+              content: content || 'Stopped.',
+              reasoningStatus: 'complete',
+              status: 'complete',
+            });
+          },
+          onPaused: (content) => {
+            patchAssistant({
+              content,
+              status: 'streaming',
+            });
+          },
+        });
+      } catch (streamError) {
+        if (isAbortError(streamError)) {
+          return;
+        }
+        if (isAuthRequiredError(streamError)) {
+          router.push(`/login?next=${encodeURIComponent(`/chats/${detail.chat.id}`)}`);
+          return;
+        }
+        if (isNotFoundError(streamError)) {
+          router.replace(chatListHref);
+          return;
+        }
+        try {
+          const refreshed = await getChat(detail.chat.id);
+          setDetail(refreshed);
+        } catch {
+          // Keep the local running state if refresh also fails; the alert still
+          // tells the user that stream reconnection did not attach.
+        }
+        window.alert(streamError instanceof Error
+          ? `The run resumed, but the web UI could not reconnect to its stream. (${streamError.message})`
+          : 'The run resumed, but the web UI could not reconnect to its stream.');
+      }
+    } catch (error) {
+      if (isAbortError(error)) {
+        return;
+      }
+      if (isAuthRequiredError(error)) {
+        router.push(`/login?next=${encodeURIComponent(`/chats/${detail.chat.id}`)}`);
+        return;
+      }
+      if (isNotFoundError(error)) {
+        router.replace(chatListHref);
+        return;
+      }
+      window.alert(error instanceof Error ? error.message : 'Failed to resume the paused run.');
+    } finally {
+      runControlMutationRef.current = false;
+      setResumingRun(false);
+    }
+  }, [canResumeRun, chatListHref, detail.activeRun?.runId, detail.chat.id, detail.messages, nextStreamAbortSignal, router]);
+
+  useEffect(() => () => {
+    streamAbortRef.current?.abort();
+  }, []);
 
   useEffect(() => {
-    if (pinnedRef.current) {
+    if (shouldAutoScrollChat({ pinnedToBottom: pinnedRef.current })) {
       scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
     }
   }, [detail.messages.length, latestMessage?.content, latestMessage?.reasoning, latestMessage?.artifacts?.length]);
@@ -222,7 +535,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
           <h1 className="truncate text-sm font-semibold tracking-[-0.01em]">{detail.chat.title ?? 'Untitled'}</h1>
           <div className="mt-0.5 flex items-center gap-1.5 text-xs text-text-muted">
             <span className="size-1.5 rounded-full bg-success" />
-            <span>{isArchived ? 'Archived' : 'Active'} · {detail.chat.model ?? 'Default model'}</span>
+            <span>{activeRunLabel} · {detail.chat.model ?? 'Default model'}</span>
           </div>
         </div>
         <div className="min-w-0 flex-1" />
@@ -244,9 +557,10 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
 
       <div
         ref={scrollRef}
+        data-testid="chat-scroll-container"
         onScroll={(event) => {
           const target = event.currentTarget;
-          pinnedRef.current = target.scrollHeight - target.scrollTop - target.clientHeight < 80;
+          pinnedRef.current = isChatScrolledToBottom(target);
         }}
         className="min-h-0 flex-1 overscroll-contain overflow-y-auto scroll-smooth"
       >
@@ -280,17 +594,58 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
               </div>
             </div>
           ) : (
-            <Composer
-              disabled={sending}
-              placeholder="Reply to Astra..."
-              initialModel={detail.pendingTurn?.options.model ?? detail.chat.model ?? undefined}
-              persistModelPreference={false}
-              onModelChange={handleModelChange}
-              projectContext={detail.chat.projectId ? { projectId: detail.chat.projectId } : undefined}
-              onSubmit={async ({ text, options }) => {
-                await startStream({ text, options, appendUser: true });
-              }}
-            />
+            <>
+              <Composer
+                disabled={composerDisabled}
+                placeholder={composerPlaceholder}
+                initialModel={detail.pendingTurn?.options.model ?? detail.chat.model ?? undefined}
+                persistModelPreference={false}
+                onModelChange={handleModelChange}
+                projectContext={detail.chat.projectId ? { projectId: detail.chat.projectId } : undefined}
+                onSubmit={async ({ text, options }) => {
+                  if (canQueueDeferredInput) {
+                    await queueDeferredInput({ text, options });
+                    return;
+                  }
+                  await startStream({ text, options, appendUser: true });
+                }}
+              />
+              {detail.activeRun?.runId ? (
+                <div className="mt-3 flex items-center justify-between gap-3 rounded-[16px] border border-border/70 bg-surface px-4 py-3 text-sm text-text-muted">
+                  <p>
+                    {canQueueDeferredInput
+                      ? 'New messages are queued after the next tool call. Use Stop to interrupt now.'
+                      : activeRunStatus === 'paused'
+                        ? 'This run is paused. Resume to continue or Stop to cancel it.'
+                        : activeRunBlocksNewInput
+                          ? `Run status is ${detail.activeRun.status}. Stop it or refresh before sending new input.`
+                          : 'Stopping the current run. New input stays disabled until cancellation completes.'}
+                  </p>
+                  <div className="flex shrink-0 items-center gap-2">
+                    {canResumeRun ? (
+                      <button
+                        type="button"
+                        onClick={() => { void resumeActiveRun(); }}
+                        disabled={runControlBusy}
+                        className="rounded-control bg-text px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-text/90 disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {resumingRun ? 'Resuming...' : 'Resume'}
+                      </button>
+                    ) : null}
+                    {canStopRun ? (
+                      <button
+                        type="button"
+                        onClick={() => { void stopActiveRun(); }}
+                        disabled={runControlBusy}
+                        className="rounded-control border border-border bg-bg px-3 py-2 text-sm font-medium text-text transition-colors hover:bg-surface-muted disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {stoppingRun ? 'Stopping...' : 'Stop'}
+                      </button>
+                    ) : null}
+                  </div>
+                </div>
+              ) : null}
+            </>
           )}
         </div>
       </div>
