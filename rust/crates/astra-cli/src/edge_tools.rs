@@ -5489,13 +5489,14 @@ mod tests {
     mod diagnose_tests;
     mod env_tests;
     mod executor_core_tests;
-    mod fs_tests;
+
     mod lsp_tests;
     mod memoria_tests;
     mod notebook_tests;
     mod sandbox_tests;
     mod schema_tests;
     mod self_mod_tests;
+    mod sleep_tests;
     mod task_tests;
     mod tool_search_tests;
     mod utf16_tests;
