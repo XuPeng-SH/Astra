@@ -960,7 +960,12 @@ pub(crate) async fn run_tui_session(
                             use bottom_pane::transcript_view::TranscriptView;
                             if bottom_pane.transcript_view_is_open() {
                                 bottom_pane.close_active_view();
-                            } else if !bottom_pane.has_active_view() {
+                            } else {
+                                // Close any other active view first so the
+                                // transcript overlay can take over.
+                                if bottom_pane.has_active_view() {
+                                    bottom_pane.close_active_view();
+                                }
                                 let size = guard.terminal.size().ok();
                                 let w = size.map(|s| s.width).unwrap_or(80);
                                 let h = size.map(|s| s.height).unwrap_or(0);
@@ -3380,6 +3385,8 @@ fn handle_app_event(
         | TuiAppEvent::Compaction(_)
         | TuiAppEvent::ExplainReport(_)
         | TuiAppEvent::VerdictReport(_)
+        | TuiAppEvent::TurnWarning(_)
+        | TuiAppEvent::TurnInfo(_)
         | TuiAppEvent::PermissionAutoApproved { .. } => {}
         TuiAppEvent::TurnComplete | TuiAppEvent::TurnError(_) => {
             bottom_pane.set_task_status(TaskStatus::Idle);
