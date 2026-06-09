@@ -32,6 +32,7 @@ pub mod agent_messaging;
 pub mod agent_spawning;
 use astra_tools::build_test;
 pub use astra_tools::code_intel;
+use astra_tools::truncate_output;
 #[path = "edge_tools/context_sharing.rs"]
 pub mod context_sharing;
 #[path = "edge_tools/fs.rs"]
@@ -298,57 +299,6 @@ fn utf16_col_to_char_idx(line: &str, col_utf16: usize) -> usize {
     }
     // Column is past end of line - return line length
     line.chars().count()
-}
-
-/// Truncate tool output to `max_bytes`, cutting at a newline boundary when
-/// possible (avoids mid-line cuts that confuse the LLM). Inspired by Claude
-/// Code's `generatePreview` pattern.
-fn truncate_output(mut output: String, max_bytes: usize) -> String {
-    if output.len() > max_bytes {
-        let end = output.floor_char_boundary(max_bytes);
-        // Prefer cutting at a newline within the last 50% of the budget
-        let cut = output[..end]
-            .rfind('\n')
-            .filter(|&pos| pos > end / 2)
-            .map(|pos| pos + 1) // include the newline
-            .unwrap_or(end);
-        output.truncate(cut);
-        output.push_str("\n[truncated]");
-    }
-    output
-}
-
-#[cfg(test)]
-mod truncate_output_tests {
-    // Regression: multi-byte UTF-8 chars at the byte boundary must not panic.
-    // Bug: `end byte index 2000 is not a char boundary; it is inside '─'`
-
-    #[test]
-    fn multibyte_at_boundary_no_panic() {
-        let prefix = "x".repeat(97);
-        let mb = "─".repeat(10); // 3 bytes each
-        let suffix = "y".repeat(200);
-        let s = format!("{prefix}{mb}{suffix}");
-        let result = super::truncate_output(s, 100);
-        assert!(result.ends_with("[truncated]"));
-    }
-
-    #[test]
-    fn emoji_4byte_at_boundary_no_panic() {
-        let prefix = "a".repeat(98);
-        let emoji = "🔥🔥🔥"; // 4 bytes each
-        let suffix = "z".repeat(200);
-        let s = format!("{prefix}{emoji}{suffix}");
-        let result = super::truncate_output(s, 100);
-        assert!(result.ends_with("[truncated]"));
-    }
-
-    #[test]
-    fn all_multibyte_no_panic() {
-        let s = "─".repeat(100); // 300 bytes
-        let result = super::truncate_output(s, 100);
-        assert!(result.ends_with("[truncated]"));
-    }
 }
 
 /// Normalize empty/whitespace-only tool output to a short marker.
