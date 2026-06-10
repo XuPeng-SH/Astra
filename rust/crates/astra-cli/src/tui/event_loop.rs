@@ -39,23 +39,37 @@ use super::keymap::{AppAction, AppKeymap};
 use super::render::line_utils::sanitize_lines_for_terminal;
 use super::task_status::TaskStatus;
 use super::terminal::TerminalGuard;
+
+use super::agent_view::*;
+use super::bg_task_proxy::*;
+use super::bg_task_rendering::*;
+use super::plan_mode::*;
 use super::{
     bottom_pane, chat_widget, history_cell, mention_menu, resume_summary, slash_dispatch,
-    slash_menu, status_indicator, stream_bridge, task_board_observer, ui_adapter,
+    slash_menu, status_indicator, status_line, stream_bridge, task_board_observer, ui_adapter,
 };
 
 const AGENT_DRILLDOWN_RECENT_COMPLETED: usize = 5;
 const WORKSPACE_TRUST_SENTINEL: &str = "__workspace_trust__\n";
 const DEFERRED_INPUT_APPLIED_PREFIX: &str = "__deferred_input_applied__:";
 
-fn ctrl_b_promoted_notification(job_id: &str) -> String {
+fn ctrl_b_promoted_notification(task_id: &str) -> String {
     format!(
-        "<background_job_notification>\n<status>promoted</status>\n<job_id>{job_id}</job_id>\n<hint>The user pressed Ctrl+B and the running bash command was promoted to a background shell job. Continue normally; use job(action='output') for the latest job, job(action='output', job_id='{job_id}') for this job, or job(action='list') to inspect jobs.</hint>\n</background_job_notification>"
+        "<background_task_notification>\n<status>promoted</status>\n<task_id>{task_id}</task_id>\n<hint>The user pressed Ctrl+B and the running bash command was promoted to a background shell task. Continue normally; use task_output(task_id='{task_id}') for this task, task_list() to inspect tasks, or task_stop(task_id='{task_id}') to stop it.</hint>\n</background_task_notification>"
     )
 }
 
-fn ctrl_b_cancelled_without_promotion_notification() -> String {
-    "<background_job_notification>\n<status>cancelled_without_promotion</status>\n<hint>The user pressed Ctrl+B, but no active bash command could be promoted. The current turn was cancelled. If the work still needs to run in the background, re-run the shell command with job(action='shell', command='...').</hint>\n</background_job_notification>".to_string()
+fn ctrl_b_promoted_agent_message(agent_id: &str, description: &str) -> String {
+    let description = description.trim();
+    if description.is_empty() {
+        format!("Backgrounded agent {agent_id}. Opened background tasks.")
+    } else {
+        format!("Backgrounded agent {agent_id} ({description}). Opened background tasks.")
+    }
+}
+
+fn should_show_ctrl_b_background_hint(detach_ready: bool) -> bool {
+    detach_ready
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -270,7 +284,7 @@ fn commit_explain_dag(
 /// sites inside async blocks can pre-clone before awaiting.
 ///
 /// Looks at the spawner first — that's the canonical kill path for
-/// `agent.spawn`-style children — and ALSO fires the durable-task
+/// `agent(action='spawn')`-style children — and ALSO fires the durable-task
 /// service path for task-backed children. Both calls are
 /// fire-and-forget so the UI doesn't block on a hung backend; the
 /// spawner + task_service both honor cooperative cancel and will
@@ -337,116 +351,6 @@ fn try_dispatch_agent_kill_sentinel(
     true
 }
 
-fn reopen_agents_view(
-    chat_widget: &chat_widget::ChatWidget,
-    bottom_pane: &mut BottomPane,
-    frame_requester: &FrameRequester,
-) -> bool {
-    let rows = chat_widget.agents_drilldown_rows(AGENT_DRILLDOWN_RECENT_COMPLETED);
-    if rows.is_empty() {
-        return false;
-    }
-    use bottom_pane::in_flight_agents_view::InFlightAgentsView;
-    bottom_pane.push_view(Box::new(InFlightAgentsView::new(rows)));
-    bottom_pane.sync_popups();
-    frame_requester.schedule_frame();
-    true
-}
-
-fn refresh_open_agent_detail_for_event(
-    ae: &TuiAppEvent,
-    chat_widget: &chat_widget::ChatWidget,
-    bottom_pane: &mut BottomPane,
-) -> bool {
-    let Some(open_id) = bottom_pane.active_live_task_id() else {
-        return false;
-    };
-    match ae {
-        TuiAppEvent::AgentLive(event) => {
-            if open_id != event.agent_id {
-                return false;
-            }
-            refresh_open_agent_detail_by_id(&event.agent_id, chat_widget, bottom_pane)
-        }
-        TuiAppEvent::AgentLiveBatch(events) => {
-            let Some(event) = events.iter().rev().find(|event| open_id == event.agent_id) else {
-                return false;
-            };
-            refresh_open_agent_detail_by_id(&event.agent_id, chat_widget, bottom_pane)
-        }
-        TuiAppEvent::AgentControlStarted {
-            agent_id: Some(agent_id),
-            ..
-        }
-        | TuiAppEvent::AgentControlCompleted {
-            agent_id: Some(agent_id),
-            ..
-        } => {
-            if open_id != agent_id {
-                return false;
-            }
-            refresh_open_agent_detail_by_id(agent_id, chat_widget, bottom_pane)
-        }
-        _ => false,
-    }
-}
-
-fn agent_live_event_affects_monitor_row(
-    event: &astra_turn_core::agent_live_event::AgentLiveEvent,
-) -> bool {
-    use astra_turn_core::agent_live_event::AgentLiveEventKind;
-    matches!(
-        event.kind,
-        AgentLiveEventKind::ToolStarted { .. }
-            | AgentLiveEventKind::ToolCompleted { .. }
-            | AgentLiveEventKind::AgentTerminated { .. }
-    )
-}
-
-fn agent_event_affects_monitor_rows(ae: &TuiAppEvent) -> bool {
-    match ae {
-        TuiAppEvent::AgentLive(event) => agent_live_event_affects_monitor_row(event),
-        TuiAppEvent::AgentLiveBatch(events) => {
-            events.iter().any(agent_live_event_affects_monitor_row)
-        }
-        TuiAppEvent::AgentControlStarted { .. } | TuiAppEvent::AgentControlCompleted { .. } => true,
-        _ => false,
-    }
-}
-
-fn refresh_open_agent_monitor_for_event(
-    ae: &TuiAppEvent,
-    chat_widget: &chat_widget::ChatWidget,
-    bottom_pane: &mut BottomPane,
-) -> bool {
-    if !bottom_pane.agent_monitor_is_open() || !agent_event_affects_monitor_rows(ae) {
-        return false;
-    }
-    bottom_pane.refresh_agent_rows(chat_widget.agents_drilldown_rows(50))
-}
-
-fn refresh_open_agent_views_for_event(
-    ae: &TuiAppEvent,
-    chat_widget: &chat_widget::ChatWidget,
-    bottom_pane: &mut BottomPane,
-) -> bool {
-    let detail = refresh_open_agent_detail_for_event(ae, chat_widget, bottom_pane);
-    let monitor = refresh_open_agent_monitor_for_event(ae, chat_widget, bottom_pane);
-    detail || monitor
-}
-
-fn refresh_open_agent_detail_by_id(
-    agent_id: &str,
-    chat_widget: &chat_widget::ChatWidget,
-    bottom_pane: &mut BottomPane,
-) -> bool {
-    if let Some(cell) = chat_widget.task_cell_anywhere(agent_id) {
-        bottom_pane.refresh_task_detail(agent_id, cell)
-    } else {
-        false
-    }
-}
-
 /// Prose submits should hit scrollback immediately; slash commands wait
 /// until their paired response/view result is ready so `› /cmd` and
 /// `Result · reply` land in one flush with no synthetic blank row between them.
@@ -502,133 +406,6 @@ fn next_pending_deferred_slash_flush(result: &slash_dispatch::SlashResult) -> bo
 fn should_flush_ambient_commits(pending_deferred_slash_flush: bool) -> bool {
     !pending_deferred_slash_flush
 }
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct PlanModeUiSnapshot {
-    active: bool,
-    goal: String,
-    executing: bool,
-}
-
-fn capture_plan_mode_ui_snapshot(
-    state: &crate::cli::session::session_state::SessionState,
-) -> PlanModeUiSnapshot {
-    PlanModeUiSnapshot {
-        active: state.plan_mode_active(),
-        goal: state
-            .cloud_plan_mirror
-            .as_ref()
-            .map(|ps| ps.goal.trim().to_string())
-            .unwrap_or_default(),
-        executing: state.executing_plan.is_some() || state.plan_handle.is_some(),
-    }
-}
-
-fn summarize_plan_goal(goal: &str) -> String {
-    let summary: String = goal.chars().take(80).collect();
-    if goal.chars().count() > 80 {
-        format!("{summary}...")
-    } else {
-        summary
-    }
-}
-
-fn plan_transition_notice(
-    before: &PlanModeUiSnapshot,
-    after: &PlanModeUiSnapshot,
-    triggered_by_plan_request: bool,
-) -> Option<String> {
-    match (before.active, after.active) {
-        (false, true) => {
-            if after.goal.is_empty() {
-                Some(
-                    "Plan mode active - describe your goal. Use `go` to run once a plan is ready, or `/plan` to exit.".into(),
-                )
-            } else {
-                Some(format!(
-                    "Plan mode active - goal: {}. Send edits, `show` to inspect, `go` to run, `/plan` to exit.",
-                    summarize_plan_goal(&after.goal)
-                ))
-            }
-        }
-        (true, true) if before.goal != after.goal && !after.goal.is_empty() => Some(format!(
-            "Plan goal set - {}. Send edits, `show` to inspect, `go` to run, `/plan` to exit.",
-            summarize_plan_goal(&after.goal)
-        )),
-        (true, false) if after.executing => {
-            Some("Plan mode closed - execution is running in the background.".into())
-        }
-        (true, false) => Some("Plan mode closed - back to normal chat.".into()),
-        (false, false) if triggered_by_plan_request => {
-            Some("Planning response delivered - continuing in normal chat.".into())
-        }
-        _ => None,
-    }
-}
-
-fn commit_plan_transition_notice(
-    chat_widget: &mut chat_widget::ChatWidget,
-    before: &PlanModeUiSnapshot,
-    state: &crate::cli::session::session_state::SessionState,
-    triggered_by_plan_request: bool,
-) {
-    let after = capture_plan_mode_ui_snapshot(state);
-    if let Some(msg) = plan_transition_notice(before, &after, triggered_by_plan_request) {
-        chat_widget.commit_system(history_cell::system::SystemCell::response(msg));
-    }
-}
-
-fn looks_like_implicit_plan_request(text: &str) -> bool {
-    let trimmed = text.trim();
-    if trimmed.is_empty() || trimmed.starts_with('/') {
-        return false;
-    }
-
-    let lowered = trimmed.to_lowercase();
-    let meta_queries = [
-        "what is /plan",
-        "how does /plan",
-        "what does /plan",
-        "plan mode",
-        "plan模式",
-        "现在plan是怎么",
-        "什么是/plan",
-        "/plan是什么意思",
-        "怎么进入plan",
-    ];
-    if meta_queries.iter().any(|needle| lowered.contains(needle)) {
-        return false;
-    }
-
-    let planning_requests = [
-        "help me plan",
-        "please plan",
-        "plan how to",
-        "make a plan",
-        "draft a plan",
-        "come up with a plan",
-        "plan out",
-        "帮我计划",
-        "帮我规划",
-        "给我一个计划",
-        "给我个计划",
-        "做个计划",
-        "规划一下",
-        "计划一下",
-        "制定计划",
-        "先计划",
-    ];
-    planning_requests
-        .iter()
-        .any(|needle| lowered.contains(needle))
-}
-
-fn slash_plan_goal(text: &str) -> Option<&str> {
-    let rest = text.trim().strip_prefix("/plan")?;
-    let goal = rest.trim();
-    (!goal.is_empty()).then_some(goal)
-}
-
 fn refresh_footer_from_state(
     bottom_pane: &mut BottomPane,
     state: &crate::cli::session::session_state::SessionState,
@@ -894,7 +671,7 @@ pub(crate) async fn run_tui_session(
         chat_widget.commit_system(history_cell::system::SystemCell::info(notice));
     }
 
-    // Resume-time summary: surface background commands that reached
+    // Resume-time summary: surface background shells that reached
     // terminal state while the user was away. One ResumeSummary
     // rollup becomes a single banner cell at the top of scrollback
     // — it comes AFTER the replay so the banner is the last thing
@@ -941,12 +718,14 @@ pub(crate) async fn run_tui_session(
     let mut board_expanded = false;
 
     // Background task registry — owns spawned shell/agent processes.
-    let bg_output_dir = std::env::temp_dir()
-        .join("astra")
-        .join("bg_tasks")
-        .join(state.session_id.as_deref().unwrap_or("default"));
-    let mut background_registry =
-        super::background_tasks::BackgroundTaskRegistry::new(bg_output_dir);
+    let mut background_registry = super::background_tasks::BackgroundTaskRegistry::new(
+        background_task_output_dir(state.session_id.as_deref()),
+    );
+    let mut restored_local_agent_task_projections =
+        restore_background_task_projections(&mut background_registry, state.session_id.as_deref());
+    let mut background_task_projection_cache = background_registry.export_shell_task_projections();
+    let mut background_local_agent_projection_cache = restored_local_agent_task_projections.clone();
+    let mut background_registry_session_id = state.session_id.clone();
     // User's explicit Ctrl+T choice. `None` = auto-rules apply;
     // `Some(true|false)` = honour the user's pin even when the
     // auto-hide timer fires or new tasks appear. Reset by
@@ -1034,6 +813,18 @@ pub(crate) async fn run_tui_session(
                             {
                                 task_board.toggle_view_mode();
                                 frame_requester.schedule_frame();
+                                continue;
+                            }
+                            if !bottom_pane.has_active_view()
+                                && open_background_task_view(
+                                    &mut background_registry,
+                                    state.agent_spawner.as_ref(),
+                                    &restored_local_agent_task_projections,
+                                    &mut bottom_pane,
+                                    &frame_requester,
+                                )
+                                .await
+                            {
                                 continue;
                             }
                             // Flip the user pin. The tick loop's
@@ -1297,10 +1088,10 @@ pub(crate) async fn run_tui_session(
                                     should_flush_submitted_user_cell_immediately(&text);
                                 // Shadow: mirror the user submit into
                                 // ChatWidget so its history stays in
-                                // sync with legacy scrollback. Does
+                                // sync with transcript scrollback. Does
                                 // persistence (when sid is non-empty)
                                 // even though rendering still runs
-                                // through the legacy path.
+                                // through the existing app-event path.
                                 chat_widget.handle_event(
                                     chat_widget::AppEvent::User(UserEvent::Submit(text.clone())),
                                 );
@@ -1800,8 +1591,7 @@ pub(crate) async fn run_tui_session(
                                     let mut turn_tool_count: u32 = 0;
                                     let mut turn_ttft: Option<std::time::Instant> = None;
                                     let mut explain_items: Vec<serde_json::Value> = Vec::new();
-                                    let mut ctrl_b_promoted_job_id: Option<String> = None;
-                                    let mut ctrl_b_fallback_cancelled = false;
+                                    let mut ctrl_b_promoted_task_id: Option<String> = None;
                                     // Phase 3b.3c: prime the bash detach slot for this
                                     // turn. The bash runner takes the handle on entry;
                                     // we keep the listener so a Ctrl+B keypress can
@@ -1810,10 +1600,15 @@ pub(crate) async fn run_tui_session(
                                     // prior turn that was never consumed (e.g. the model
                                     // didn't run bash last turn).
                                     let mut bash_detach_listener = {
-                                        let (handle, listener) = astra_tools::detach::new_detach_pair();
-                                        if let Ok(mut slot) = state.bash_detach_slot.try_lock() {
-                                            *slot = Some(handle);
-                                        }
+                                            let (handle, listener) = astra_tools::detach::new_detach_pair();
+                                            if let Ok(mut slot) = state.bash_detach_slot.try_lock() {
+                                                *slot = Some(handle);
+                                                chat_widget.set_bash_background_hint_enabled(
+                                                    should_show_ctrl_b_background_hint(true),
+                                                );
+                                            } else {
+                                                chat_widget.set_bash_background_hint_enabled(false);
+                                            }
                                         Some(listener)
                                     };
 
@@ -1835,6 +1630,9 @@ pub(crate) async fn run_tui_session(
                                             state.active_turn_local_run_control.clone();
                                         let bash_detach_slot_for_ctrl_b =
                                             state.bash_detach_slot.clone();
+                                        let background_registry_turn_session_id =
+                                            state.session_id.clone();
+                                        let background_registry_turn_model = state.model.clone();
                                         let ctx = crate::cli::turn::turn_entry::TurnContext { api, profile };
                                         let token = crate::cli::session::session_runtime::fresh_access_token(api, profile).await;
                                         let mut tui_ui = ui_adapter::TuiUiAdapter::new(tui_tx.clone());
@@ -1897,20 +1695,33 @@ pub(crate) async fn run_tui_session(
                                                                 frame_requester.schedule_frame();
                                                                 continue;
                                                             }
-                                                            // Ctrl+B: foreground bash → background promotion.
+                                                            // Ctrl+B: foreground bash/agent → background promotion.
                                                             // If a bash invocation is currently in flight and
                                                             // listening on the detach signal, fire it: the
                                                             // runner transfers child + live streams to the
                                                             // BackgroundTaskRegistry without kill, output
                                                             // continues uninterrupted, the turn ends with a
                                                             // <bash_detached> marker the LLM can reason
-                                                            // about. Falls back to legacy cancel-and-advise
-                                                            // when no listener (no bash, or already detached).
+                                                            // about. Otherwise, try to promote a foreground
+                                                            // synchronous agent wait into a normal background
+                                                            // agent. If neither path is available, the key is
+                                                            // explicitly unavailable and does not cancel the
+                                                            // parent turn.
                                                             if k.code == crossterm::event::KeyCode::Char('b')
                                                                 && k.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
                                                             {
                                                                 let listener = bash_detach_listener.take();
                                                                 if let Some(listener) = listener {
+                                                                    if !background_registry.can_spawn_shell_task() {
+                                                                        bash_detach_listener = Some(listener);
+                                                                        chat_widget.commit_system(
+                                                                            history_cell::system::SystemCell::error(
+                                                                                "⏎ Backgrounding unavailable: background shell task limit reached."
+                                                                            ),
+                                                                        );
+                                                                        frame_requester.schedule_frame();
+                                                                        continue;
+                                                                    }
                                                                     // Fire the watch signal to request detach.
                                                                     // If the runner already completed, send
                                                                     // fails silently — the handler moves on.
@@ -1921,8 +1732,7 @@ pub(crate) async fn run_tui_session(
                                                                     // bash runner's 25ms idle-poll tick;
                                                                     // longer waits indicate bash wasn't
                                                                     // actually running when the user hit
-                                                                    // Ctrl+B and we should fall back to
-                                                                    // legacy cancel.
+                                                                    // Ctrl+B.
                                                                     let payload = tokio::time::timeout(
                                                                         std::time::Duration::from_millis(500),
                                                                         listener.payload_rx,
@@ -1935,21 +1745,48 @@ pub(crate) async fn run_tui_session(
                                                                             // adopt_detached_shell API
                                                                             // takes the live child + streams
                                                                             // and emits Started/Completed
-                                                                            // events like a normal bg job.
-                                                                            let id = background_registry.adopt_detached_shell(
+                                                                            // events like a normal bg task.
+                                                                            let id = match background_registry.adopt_detached_shell(
                                                                                 p.child,
                                                                                 p.stdout,
                                                                                 p.stderr,
                                                                                 &p.command,
                                                                                 p.partial_stdout,
                                                                                 p.partial_stderr,
-                                                                            );
+                                                                            ) {
+                                                                                Ok(id) => id,
+                                                                                Err(error) => {
+                                                                                    chat_widget.commit_system(
+                                                                                        history_cell::system::SystemCell::error(
+                                                                                            format!("⏎ Backgrounding failed: {error}")
+                                                                                        ),
+                                                                                    );
+                                                                                    frame_requester.schedule_frame();
+                                                                                    continue;
+                                                                                }
+                                                                            };
                                                                             chat_widget.commit_system(
                                                                                 history_cell::system::SystemCell::info(
-                                                                                    format!("⏎ Backgrounded as {id} — output continues; poll with job(action='output')")
+                                                                                    format!("⏎ Backgrounded as {id}. Opened background tasks; Enter details, S stop.")
                                                                                 ),
                                                                             );
-                                                                            ctrl_b_promoted_job_id = Some(id);
+                                                                            ctrl_b_promoted_task_id = Some(id);
+                                                                            persist_background_task_projections_if_changed(
+                                                                                &mut background_registry,
+                                                                                background_registry_turn_session_id.as_deref(),
+                                                                                background_registry_turn_model.as_deref(),
+                                                                                &mut background_task_projection_cache,
+                                                                            );
+                                                                            let selected_id = ctrl_b_promoted_task_id.as_deref();
+                                                                            let _ = reveal_background_task_view(
+                                                                                &mut background_registry,
+                                                                                agent_spawner_for_cancel.as_ref(),
+                                                                                &restored_local_agent_task_projections,
+                                                                                &mut bottom_pane,
+                                                                                &frame_requester,
+                                                                                selected_id,
+                                                                            )
+                                                                            .await;
                                                                             // The turn is over from the
                                                                             // model's perspective; cancel
                                                                             // gracefully so it sees the
@@ -1962,8 +1799,7 @@ pub(crate) async fn run_tui_session(
                                                                         }
                                                                         // No payload — bash wasn't running,
                                                                         // or completed normally before
-                                                                        // detach landed. Fall through to
-                                                                        // legacy cancel-and-advise.
+                                                                        // detach landed.
                                                                         _ => {
                                                                             if let Ok(mut slot) = bash_detach_slot_for_ctrl_b.try_lock() {
                                                                                 *slot = None;
@@ -1971,13 +1807,38 @@ pub(crate) async fn run_tui_session(
                                                                         }
                                                                     }
                                                                 }
+                                                                    if let Some(spawner) = agent_spawner_for_cancel.as_ref() {
+                                                                        if let Some(agent) = spawner
+                                                                            .promote_foreground_agent_to_background(None)
+                                                                            .await
+                                                                        {
+                                                                            chat_widget.commit_system(
+                                                                                history_cell::system::SystemCell::info(
+                                                                                    ctrl_b_promoted_agent_message(
+                                                                                        &agent.agent_id,
+                                                                                        &agent.description,
+                                                                                    ),
+                                                                                ),
+                                                                            );
+                                                                            let _ = reveal_background_task_view(
+                                                                                &mut background_registry,
+                                                                                agent_spawner_for_cancel.as_ref(),
+                                                                                &restored_local_agent_task_projections,
+                                                                                &mut bottom_pane,
+                                                                                &frame_requester,
+                                                                                Some(&agent.agent_id),
+                                                                            )
+                                                                            .await;
+                                                                            tui_cancel_token.cancel();
+                                                                            frame_requester.schedule_frame();
+                                                                            continue;
+                                                                        }
+                                                                    }
                                                                 chat_widget.commit_system(
                                                                     history_cell::system::SystemCell::info(
-                                                                        "⏎ Backgrounding: cancelling current turn. Re-issue the command with job(action='shell') to run it in the background."
+                                                                        "⏎ Backgrounding unavailable: no active bash or agent can be promoted right now."
                                                                     ),
                                                                 );
-                                                                tui_cancel_token.cancel();
-                                                                ctrl_b_fallback_cancelled = true;
                                                                 frame_requester.schedule_frame();
                                                                 continue;
                                                             }
@@ -2032,6 +1893,18 @@ pub(crate) async fn run_tui_session(
                                                                 {
                                                                     task_board.toggle_view_mode();
                                                                     frame_requester.schedule_frame();
+                                                                    continue;
+                                                                }
+                                                                if !bottom_pane.has_active_view()
+                                                                    && open_background_task_view(
+                                                                        &mut background_registry,
+                                                                        agent_spawner_for_cancel.as_ref(),
+                                                                        &restored_local_agent_task_projections,
+                                                                        &mut bottom_pane,
+                                                                        &frame_requester,
+                                                                    )
+                                                                    .await
+                                                                {
                                                                     continue;
                                                                 }
                                                                 let new_pin = !board_expanded;
@@ -2105,6 +1978,28 @@ pub(crate) async fn run_tui_session(
                                                                         }
                                                                     }
                                                                     BottomPaneAction::ViewSideEffect { result } => {
+                                                                        if try_dispatch_background_task_stop_sentinel(
+                                                                            &result,
+                                                                            &mut background_registry,
+                                                                            agent_spawner_for_cancel.clone(),
+                                                                            &restored_local_agent_task_projections,
+                                                                            &mut chat_widget,
+                                                                            &mut bottom_pane,
+                                                                            &frame_requester,
+                                                                        )
+                                                                        .await
+                                                                        {
+                                                                            continue;
+                                                                        }
+                                                                        if try_dispatch_background_task_output_sentinel(
+                                                                            &result,
+                                                                            &mut background_registry,
+                                                                            &mut chat_widget,
+                                                                            &mut bottom_pane,
+                                                                            &frame_requester,
+                                                                        ) {
+                                                                            continue;
+                                                                        }
                                                                         let _ = try_dispatch_agent_kill_sentinel(
                                                                             &result,
                                                                             agent_spawner_for_cancel.clone(),
@@ -2118,6 +2013,28 @@ pub(crate) async fn run_tui_session(
                                                                         frame_requester.schedule_frame();
                                                                     }
                                                                     BottomPaneAction::ViewCompleted { result: Some(name), reopen: _ } => {
+                                                                        if try_dispatch_background_task_stop_sentinel(
+                                                                            &name,
+                                                                            &mut background_registry,
+                                                                            agent_spawner_for_cancel.clone(),
+                                                                            &restored_local_agent_task_projections,
+                                                                            &mut chat_widget,
+                                                                            &mut bottom_pane,
+                                                                            &frame_requester,
+                                                                        )
+                                                                        .await
+                                                                        {
+                                                                            continue;
+                                                                        }
+                                                                        if try_dispatch_background_task_output_sentinel(
+                                                                            &name,
+                                                                            &mut background_registry,
+                                                                            &mut chat_widget,
+                                                                            &mut bottom_pane,
+                                                                            &frame_requester,
+                                                                        ) {
+                                                                            continue;
+                                                                        }
                                                                         if try_dispatch_agent_kill_sentinel(
                                                                             &name,
                                                                             agent_spawner_for_cancel.clone(),
@@ -2276,7 +2193,7 @@ pub(crate) async fn run_tui_session(
                                                     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
                                                     // Shadow mirror into ChatWidget.
                                                     // Clone the event because handle_app_event
-                                                    // consumes it by value on the legacy path.
+                                                    // consumes it by value on the app-event path.
                                                     if let Some(new_ev) = chat_widget::translate(
                                                         ae.clone(),
                                                         chat_widget::TurnContext::default(),
@@ -2474,6 +2391,7 @@ pub(crate) async fn run_tui_session(
                                     // Turn end — ChatWidget handles any
                                     // remaining live cell on TurnComplete.
                                     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+                                    chat_widget.set_bash_background_hint_enabled(false);
 
                                     bottom_pane.set_task_status(TaskStatus::Idle);
                                     status_indicator.set_state(
@@ -2500,18 +2418,13 @@ pub(crate) async fn run_tui_session(
                                     }
 
                                     // Ctrl+B notification: tell the next turn
-                                    // which path actually happened. A true
-                                    // promotion must not suggest re-running the
-                                    // command; doing so risks duplicate side
-                                    // effects.
-                                    if let Some(job_id) = ctrl_b_promoted_job_id {
+                                    // about true promotions. Unavailable
+                                    // keypresses are UI-only and must not
+                                    // perturb model context.
+                                    if let Some(task_id) = ctrl_b_promoted_task_id {
                                         state
                                             .pending_bg_notifications
-                                            .push(ctrl_b_promoted_notification(&job_id));
-                                    } else if ctrl_b_fallback_cancelled {
-                                        state.pending_bg_notifications.push(
-                                            ctrl_b_cancelled_without_promotion_notification(),
-                                        );
+                                            .push(ctrl_b_promoted_notification(&task_id));
                                     }
 
                                     // Update footer
@@ -2628,6 +2541,28 @@ pub(crate) async fn run_tui_session(
                                 // (e.g. Ctrl+G drill view's `x` kill).
                                 // Route the sentinel to the appropriate
                                 // handler without popping the view.
+                                if try_dispatch_background_task_stop_sentinel(
+                                    &result,
+                                    &mut background_registry,
+                                    state.agent_spawner.clone(),
+                                    &restored_local_agent_task_projections,
+                                    &mut chat_widget,
+                                    &mut bottom_pane,
+                                    &frame_requester,
+                                )
+                                .await
+                                {
+                                    continue;
+                                }
+                                if try_dispatch_background_task_output_sentinel(
+                                    &result,
+                                    &mut background_registry,
+                                    &mut chat_widget,
+                                    &mut bottom_pane,
+                                    &frame_requester,
+                                ) {
+                                    continue;
+                                }
                                 let _ = try_dispatch_agent_kill_sentinel(
                                     &result,
                                     state.agent_spawner.clone(),
@@ -2645,6 +2580,28 @@ pub(crate) async fn run_tui_session(
                             }
                             BottomPaneAction::ViewCompleted { result, reopen } => {
                                 if let Some(name) = result {
+                                    if try_dispatch_background_task_stop_sentinel(
+                                        &name,
+                                        &mut background_registry,
+                                        state.agent_spawner.clone(),
+                                        &restored_local_agent_task_projections,
+                                        &mut chat_widget,
+                                        &mut bottom_pane,
+                                        &frame_requester,
+                                    )
+                                    .await
+                                    {
+                                        continue;
+                                    }
+                                    if try_dispatch_background_task_output_sentinel(
+                                        &name,
+                                        &mut background_registry,
+                                        &mut chat_widget,
+                                        &mut bottom_pane,
+                                        &frame_requester,
+                                    ) {
+                                        continue;
+                                    }
                                     // Kill sentinel: route to the spawner / task service before
                                     // any drilldown handling.
                                     if try_dispatch_agent_kill_sentinel(
@@ -3211,6 +3168,35 @@ pub(crate) async fn run_tui_session(
                 // `board_pin::resolve_board_visibility` state
                 // machine so auto-open/hide never fights with the
                 // user's explicit Ctrl+T pin.
+                if state.session_id != background_registry_session_id {
+                    persist_background_task_projections_if_changed(
+                        &mut background_registry,
+                        background_registry_session_id.as_deref(),
+                        state.model.as_deref(),
+                        &mut background_task_projection_cache,
+                    );
+                    let _ = persist_background_local_agent_task_projections_if_changed(
+                        state.agent_spawner.as_ref(),
+                        &restored_local_agent_task_projections,
+                        background_registry_session_id.as_deref(),
+                        state.model.as_deref(),
+                        &mut background_local_agent_projection_cache,
+                    )
+                    .await;
+                    background_registry.kill_all();
+                    background_registry = super::background_tasks::BackgroundTaskRegistry::new(
+                        background_task_output_dir(state.session_id.as_deref()),
+                    );
+                    restored_local_agent_task_projections = restore_background_task_projections(
+                        &mut background_registry,
+                        state.session_id.as_deref(),
+                    );
+                    background_task_projection_cache =
+                        background_registry.export_shell_task_projections();
+                    background_local_agent_projection_cache =
+                        restored_local_agent_task_projections.clone();
+                    background_registry_session_id = state.session_id.clone();
+                }
                 // Drain background shell commands from the tool executor.
                 {
                     let cmds: Vec<_> = {
@@ -3218,99 +3204,104 @@ pub(crate) async fn run_tui_session(
                     };
                     for cmd in cmds {
                         match cmd {
-                            crate::edge_tools::BgTaskCommand::SpawnShell { command, description, reply } => {
-                                let id = background_registry.spawn_shell(&command, &description);
-                                let _ = reply.send(id);
-                            }
-                            crate::edge_tools::BgTaskCommand::Kill { job_id, reply } => {
-                                let _ = reply.send(background_registry.kill(&job_id));
-                            }
-                            crate::edge_tools::BgTaskCommand::GetOutput { job_id, tail_bytes, reply } => {
-                                let output = background_registry.get_combined_output(&job_id, tail_bytes);
-                                let _ = reply.send(output);
+                            crate::edge_tools::BgTaskCommand::Kill { task_id, reply } => {
+                                let _ = reply.send(
+                                    stop_background_task_with_agents(
+                                        &mut background_registry,
+                                        state.agent_spawner.as_ref(),
+                                        &restored_local_agent_task_projections,
+                                        &task_id,
+                                    )
+                                    .await,
+                                );
                             }
                             crate::edge_tools::BgTaskCommand::GetOutputSince {
-                                job_id,
+                                task_id,
                                 offset,
                                 max_bytes,
                                 reply,
                             } => {
-                                let output =
-                                    background_registry.get_output_since(&job_id, offset, max_bytes);
-                                let _ = reply.send(output);
+                                let _ = reply.send(
+                                    background_task_output_snapshot_with_agents(
+                                        &mut background_registry,
+                                        state.agent_spawner.as_ref(),
+                                        &restored_local_agent_task_projections,
+                                        &task_id,
+                                        offset,
+                                        max_bytes,
+                                    )
+                                    .await,
+                                );
                             }
                             crate::edge_tools::BgTaskCommand::List { reply } => {
-                                let _ = reply.send(background_registry.render_job_list_xml());
-                            }
-                            crate::edge_tools::BgTaskCommand::Latest { reply } => {
-                                let result = background_registry
-                                    .latest_job_id()
-                                    .ok_or_else(|| "no background commands".to_string());
-                                let _ = reply.send(result);
-                            }
-                            crate::edge_tools::BgTaskCommand::IsTerminal { job_id, reply } => {
-                                // Drain join_set so terminal status is current.
-                                // Use drain_join_set (not poll_completions) to
-                                // preserve pending_completions for the next tick.
-                                background_registry.drain_join_set();
-                                let result = match background_registry.get(&job_id) {
-                                    Some(h) => Ok(matches!(
-                                        h.status(),
-                                        crate::tui::background_tasks::BgTaskStatus::Completed
-                                            | crate::tui::background_tasks::BgTaskStatus::Failed
-                                            | crate::tui::background_tasks::BgTaskStatus::Killed
-                                    )),
-                                    None => Err(format!("no background command with id '{job_id}'")),
-                                };
-                                let _ = reply.send(result);
+                                let _ = reply.send(
+                                    render_background_task_list_xml_with_agents(
+                                        &mut background_registry,
+                                        state.agent_spawner.as_ref(),
+                                        &restored_local_agent_task_projections,
+                                    )
+                                    .await,
+                                );
                             }
                         }
                     }
                 }
 
-                // Poll background command completions.
+                // Poll background shell completions.
                 let bg_events = background_registry.poll_completions();
                 for ev in &bg_events {
                     let notification = super::background_tasks::format_notification_xml(ev);
                     if !notification.is_empty() {
                         state.pending_bg_notifications.push(notification);
                     }
-                    let msg = match ev {
-                        super::background_tasks::BgTaskEvent::Completed { id, summary, .. } => {
-                            Some(format!("Background command {id} completed: {summary}"))
-                        }
-                        super::background_tasks::BgTaskEvent::Failed { id, error } => {
-                            Some(format!("Background command {id} failed: {error}"))
-                        }
-                        super::background_tasks::BgTaskEvent::Stalled { id, .. } => {
-                            Some(format!("Background command {id} may be stalled (waiting for input)"))
-                        }
-                        super::background_tasks::BgTaskEvent::Killed { id } => {
-                            Some(format!("Background command {id} killed"))
-                        }
-                        _ => None,
-                    };
-                    if let Some(msg) = msg {
-                        chat_widget.commit_system(
-                            history_cell::system::SystemCell::info(&msg),
-                        );
-                        frame_requester.schedule_frame();
-                    }
+                }
+                for msg in background_task_event_system_messages(&bg_events) {
+                    chat_widget.commit_system(
+                        history_cell::system::SystemCell::info(&msg),
+                    );
+                    frame_requester.schedule_frame();
                 }
                 // Stall check every tick (internal timer gates at 5s intervals).
                 background_registry.stall_check();
+                persist_background_task_projections_if_changed(
+                    &mut background_registry,
+                    state.session_id.as_deref(),
+                    state.model.as_deref(),
+                    &mut background_task_projection_cache,
+                );
+                restored_local_agent_task_projections =
+                    persist_background_local_agent_task_projections_if_changed(
+                        state.agent_spawner.as_ref(),
+                        &restored_local_agent_task_projections,
+                        state.session_id.as_deref(),
+                        state.model.as_deref(),
+                        &mut background_local_agent_projection_cache,
+                    )
+                    .await;
+                let rows_for_footer =
+                    background_task_rows_with_agents(
+                        &mut background_registry,
+                        state.agent_spawner.as_ref(),
+                        &restored_local_agent_task_projections,
+                    )
+                    .await;
+                if bottom_pane.accepts_background_task_rows() {
+                    bottom_pane.refresh_background_task_rows(rows_for_footer.clone());
+                    frame_requester.schedule_frame();
+                }
 
-                // Surface bg task counts on the status line. `(0, 0)` keeps
-                // the chip hidden so a long-lived idle registry doesn't
-                // waste status-line width. Cheap snapshot — both counters
-                // are O(N) over a small N (registries hold ≤ a few jobs).
-                let bg_running = background_registry.running_count();
-                let bg_stalled = background_registry.stalled_count();
-                bottom_pane.footer.bg_task_counts = if bg_running == 0 && bg_stalled == 0 {
+                // Surface bg task counts on the status line from the
+                // same typed rows used by the switcher. That keeps
+                // footer and list projection in lock-step as more
+                // task kinds land.
+                let bg_counts = status_line::BackgroundTaskCounts::from_rows(&rows_for_footer);
+                bottom_pane.footer.bg_task_counts = if bg_counts.is_empty() {
                     None
                 } else {
-                    Some((bg_running, bg_stalled))
+                    Some(bg_counts)
                 };
+                bottom_pane.footer.bg_fanout_summaries =
+                    status_line::BackgroundTaskFanoutSummary::from_rows(&rows_for_footer);
 
                 task_board.maybe_refresh();
                 let snap = task_board.snapshot();
@@ -3331,7 +3322,7 @@ pub(crate) async fn run_tui_session(
             }
         }
     };
-    // Clean up background commands on exit.
+    // Clean up background shells on exit.
     background_registry.kill_all();
     drop(guard);
     result
@@ -3437,7 +3428,99 @@ fn handle_app_event(
 mod tests {
     use super::*;
     use crate::cli::turn::local_run_control::LocalDeferredInputRunControl;
+    use crate::tui::background_tasks::BgTaskEvent;
     use astra_runtime::turn::run_control::RunInputProvider;
+    use astra_turn_core::orchestration_spawn_tool::{SpawnAgentInput, SpawnAgentOutput};
+    use astra_turn_core::orchestration_types::{
+        AgentStatus, SpawnedAgentInfo, SpawnedAgentMetrics,
+    };
+    use std::path::PathBuf;
+
+    async fn wait_for_background_shell_terminal(
+        registry: &mut crate::tui::background_tasks::BackgroundTaskRegistry,
+        id: &str,
+    ) {
+        crate::tests::wait_until(
+            std::time::Duration::from_secs(3),
+            std::time::Duration::from_millis(25),
+            || {
+                registry.drain_join_set();
+                registry
+                    .get(id)
+                    .map(|handle| {
+                        matches!(handle.projected_status(), "completed" | "failed" | "killed")
+                    })
+                    .unwrap_or(false)
+            },
+        )
+        .await
+        .unwrap_or_else(|()| {
+            let status = registry
+                .get(id)
+                .map(|handle| handle.projected_status())
+                .unwrap_or("missing");
+            panic!("background shell {id} did not terminate; current status: {status}");
+        });
+    }
+
+    fn agent_info(
+        agent_id: &str,
+        status: AgentStatus,
+        run_in_background: bool,
+    ) -> SpawnedAgentInfo {
+        SpawnedAgentInfo {
+            agent_id: agent_id.to_string(),
+            run_id: format!("run-{agent_id}"),
+            parent_run_id: "root".to_string(),
+            agent_type: "task".to_string(),
+            description: "review auth flow".to_string(),
+            status,
+            started_at: std::time::SystemTime::now(),
+            metrics: SpawnedAgentMetrics::default(),
+            has_permission_issues: false,
+            run_in_background,
+            fanout_slot: None,
+        }
+    }
+
+    fn test_spawn_context() -> astra_runtime::orchestration::SpawnContext {
+        astra_runtime::orchestration::SpawnContext {
+            parent_run_id: "root".to_string(),
+            parent_agent_id: "root".to_string(),
+            recursion_depth: 0,
+            parent_is_fork_child: false,
+            working_dir: PathBuf::from("/tmp"),
+            inherited_permissions: None,
+            inherited_skills: Vec::new(),
+            live_event_sink: None,
+            trace_context: None,
+            spawn_tool_call_id: None,
+        }
+    }
+
+    fn test_agent_spawner(
+        executor: Arc<dyn astra_runtime::orchestration::SpawnAgentExecutor>,
+    ) -> Arc<astra_runtime::orchestration::DynamicAgentSpawner> {
+        let transport = Arc::new(astra_messaging::InProcessTransport::new());
+        let tracker = Arc::new(astra_runtime::server::delegation::engine::DelegationTracker::new());
+        let router = Arc::new(astra_messaging::AgentMailboxRouter::new(transport, tracker));
+        Arc::new(
+            astra_runtime::orchestration::DynamicAgentSpawner::new(router).with_executor(executor),
+        )
+    }
+
+    struct PendingAgentExecutor;
+
+    #[async_trait::async_trait]
+    impl astra_runtime::orchestration::SpawnAgentExecutor for PendingAgentExecutor {
+        async fn execute(
+            &self,
+            _config: astra_runtime::orchestration::SpawnRunConfig,
+        ) -> Result<astra_runtime::orchestration::SpawnRunResult, String> {
+            std::future::pending::<Result<astra_runtime::orchestration::SpawnRunResult, String>>()
+                .await
+        }
+    }
 
     /// REGRESSION (reviewer L3 — Architecture): the
     /// `ReopenTarget::as_str() ↔ ReopenTarget::parse()` round-trip
@@ -3463,10 +3546,9 @@ mod tests {
         let notification = ctrl_b_promoted_notification("bg-shell-7");
 
         assert!(notification.contains("<status>promoted</status>"));
-        assert!(notification.contains("<job_id>bg-shell-7</job_id>"));
-        assert!(notification.contains("job(action='output')"));
-        assert!(notification.contains("job(action='output', job_id='bg-shell-7')"));
-        assert!(notification.contains("job(action='list')"));
+        assert!(notification.contains("<task_id>bg-shell-7</task_id>"));
+        assert!(notification.contains("task_output(task_id='bg-shell-7')"));
+        assert!(notification.contains("task_list()"));
         assert!(
             !notification.contains("job(action='shell'"),
             "true Ctrl+B promotion must not tell the model to re-run a side-effecting command: {notification}"
@@ -3474,16 +3556,942 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_b_fallback_notification_guides_explicit_background_rerun() {
-        let notification = ctrl_b_cancelled_without_promotion_notification();
+    fn ctrl_b_promoted_agent_message_is_user_facing() {
+        let message = ctrl_b_promoted_agent_message("reviewer@run-1", "review auth");
 
-        assert!(notification.contains("<status>cancelled_without_promotion</status>"));
-        assert!(notification.contains("no active bash command could be promoted"));
-        assert!(notification.contains("job(action='shell', command='...')"));
-        assert!(
-            !notification.contains("<job_id>"),
-            "fallback cancellation should not invent a background command id: {notification}"
+        assert!(message.contains("Backgrounded agent reviewer@run-1"));
+        assert!(message.contains("review auth"));
+        assert!(message.contains("Opened background tasks"));
+        assert!(!message.contains("agent(action="), "{message}");
+        assert!(!message.contains("task_output"), "{message}");
+        assert!(!message.contains("job("), "{message}");
+    }
+
+    #[test]
+    fn background_task_row_for_local_agent_only_projects_background_agents() {
+        let foreground = agent_info(
+            "agent-foreground",
+            AgentStatus::Running {
+                activity: "reviewing".into(),
+            },
+            false,
         );
+        assert!(
+            background_task_row_for_local_agent(&foreground).is_none(),
+            "foreground sync agents must not appear in the background task footer"
+        );
+
+        let background = agent_info(
+            "agent-background",
+            AgentStatus::Running {
+                activity: "reviewing".into(),
+            },
+            true,
+        );
+        let row = background_task_row_for_local_agent(&background)
+            .expect("background agent should project to a task row");
+        assert_eq!(
+            row.kind,
+            bottom_pane::background_task_view::BackgroundTaskKind::LocalAgent
+        );
+        assert_eq!(
+            row.status,
+            bottom_pane::background_task_view::BackgroundTaskStatus::Running
+        );
+        assert_eq!(row.title, "review auth flow");
+
+        let counts = status_line::BackgroundTaskCounts::from_rows(&[row]);
+        assert_eq!(counts.local_agents, 1);
+        assert_eq!(counts.running, 0);
+    }
+
+    #[test]
+    fn failed_background_agent_projects_as_failed_local_agent_attention() {
+        let failed = agent_info(
+            "agent-failed",
+            AgentStatus::Failed {
+                error: "review failed".into(),
+                finish_reason: Some("failed".into()),
+            },
+            true,
+        );
+        let row = background_task_row_for_local_agent(&failed)
+            .expect("failed background agent should remain reachable");
+
+        assert_eq!(
+            row.status,
+            bottom_pane::background_task_view::BackgroundTaskStatus::Failed
+        );
+        assert_eq!(row.output_tail.as_deref(), Some("review failed"));
+        assert_eq!(row.terminal_reason.as_deref(), Some("failed"));
+
+        let counts = status_line::BackgroundTaskCounts::from_rows(&[row]);
+        assert_eq!(counts.failed_local_agents, 1);
+    }
+
+    #[test]
+    fn background_task_rows_xml_projects_local_agent_rows() {
+        let agent = agent_info(
+            "agent-1",
+            AgentStatus::Running {
+                activity: "reviewing auth middleware".into(),
+            },
+            true,
+        );
+        let row = background_task_row_for_local_agent(&agent)
+            .expect("background agent should project to a task row");
+
+        let xml = render_background_task_rows_xml(&[row]);
+
+        assert!(xml.contains("<background_tasks count=\"1\">"), "{xml}");
+        assert!(xml.contains("id=\"agent-1\""), "{xml}");
+        assert!(xml.contains("kind=\"local agent\""), "{xml}");
+        assert!(xml.contains("status=\"running\""), "{xml}");
+        assert!(xml.contains("description=\"review auth flow\""), "{xml}");
+        assert!(
+            xml.contains("preview=\"reviewing auth middleware\""),
+            "{xml}"
+        );
+        assert!(!xml.contains("Job"), "{xml}");
+    }
+
+    #[test]
+    fn background_local_agent_row_preserves_fanout_membership_for_footer_and_switcher() {
+        let mut agent = agent_info(
+            "agent-auth",
+            AgentStatus::Running {
+                activity: "reviewing auth middleware".into(),
+            },
+            true,
+        );
+        agent.fanout_slot = Some(
+            astra_turn_core::orchestration_fanout_group::AgentFanoutSlotIdentity::new(
+                "review-1", 3, 0,
+            )
+            .unwrap(),
+        );
+
+        let row =
+            background_task_row_for_local_agent_with_fanout_title(&agent, Some("review fanout"))
+                .expect("background fanout agent should project to a task row");
+        let fanout = row.fanout.as_ref().expect("fanout metadata");
+        assert_eq!(fanout.group_id, "review-1");
+        assert_eq!(fanout.group_title, "review fanout");
+        assert_eq!(fanout.target_count, 3);
+        assert_eq!(fanout.slot_index, 0);
+
+        let summaries =
+            status_line::BackgroundTaskFanoutSummary::from_rows(std::slice::from_ref(&row));
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].target_count, 3);
+        assert_eq!(summaries[0].running, 1);
+
+        let xml = render_background_task_rows_xml(&[row]);
+        assert!(xml.contains("fanout_group_id=\"review-1\""), "{xml}");
+        assert!(
+            xml.contains("fanout_group_title=\"review fanout\""),
+            "{xml}"
+        );
+        assert!(xml.contains("fanout_target_count=\"3\""), "{xml}");
+        assert!(xml.contains("fanout_slot_index=\"0\""), "{xml}");
+    }
+
+    #[test]
+    fn background_task_row_projects_rejected_fanout_slot_without_agent_history() {
+        let mut group =
+            astra_turn_core::orchestration_fanout_group::AgentFanoutGroupProjection::new(
+                "review-1",
+                "review fanout",
+                3,
+            );
+        group
+            .set_slot_request(1, "api reviewer", "review API surface")
+            .unwrap();
+        group
+            .record_spawn_rejected(1, "concurrency cap reached")
+            .unwrap();
+
+        let row = background_task_row_for_rejected_fanout_slot(&group, &group.slots[1])
+            .expect("rejected fanout slot should project to a task row");
+
+        assert_eq!(row.id, "fanout:review-1:slot:1:spawn_rejected");
+        assert_eq!(
+            row.status,
+            bottom_pane::background_task_view::BackgroundTaskStatus::Failed
+        );
+        assert_eq!(row.title, "review API surface");
+        assert_eq!(row.output_tail.as_deref(), Some("concurrency cap reached"));
+        assert_eq!(
+            row.terminal_reason.as_deref(),
+            Some("concurrency cap reached")
+        );
+        assert_eq!(
+            row.live_control,
+            bottom_pane::background_task_view::LiveControlState::UnsupportedInMode
+        );
+
+        let fanout = row.fanout.as_ref().expect("fanout metadata");
+        assert_eq!(fanout.group_id, "review-1");
+        assert_eq!(fanout.group_title, "review fanout");
+        assert_eq!(fanout.target_count, 3);
+        assert_eq!(fanout.slot_index, 1);
+        assert_eq!(fanout.slot_label, "review API surface");
+
+        let summaries =
+            status_line::BackgroundTaskFanoutSummary::from_rows(std::slice::from_ref(&row));
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].failed, 1);
+
+        let xml = render_background_task_rows_xml(std::slice::from_ref(&row));
+        assert!(
+            xml.contains("id=\"fanout:review-1:slot:1:spawn_rejected\""),
+            "{xml}"
+        );
+        assert!(xml.contains("status=\"failed\""), "{xml}");
+        assert!(xml.contains("preview=\"concurrency cap reached\""), "{xml}");
+
+        let snapshot =
+            background_task_output_snapshot_for_rejected_fanout_slot(&group, &group.slots[1], 0, 9)
+                .expect("snapshot");
+        assert_eq!(snapshot.kind, "local agent");
+        assert_eq!(snapshot.status, "failed");
+        assert!(snapshot.terminal);
+        assert_eq!(snapshot.output, "concurren");
+        assert_eq!(snapshot.total_bytes, "concurrency cap reached".len() as u64);
+    }
+
+    #[test]
+    fn background_task_output_snapshot_projects_local_agent_state() {
+        let agent = agent_info(
+            "agent-1",
+            AgentStatus::Running {
+                activity: "reviewing auth middleware".into(),
+            },
+            true,
+        );
+
+        let snapshot = background_task_output_snapshot_for_local_agent(&agent, 0, 8192);
+
+        assert_eq!(snapshot.kind, "local agent");
+        assert_eq!(snapshot.title.as_deref(), Some("review auth flow"));
+        assert_eq!(snapshot.status, "running");
+        assert_eq!(snapshot.output, "reviewing auth middleware");
+        assert_eq!(snapshot.output_ref, "agent_state: agent-1");
+        assert!(!snapshot.terminal);
+    }
+
+    fn restored_local_agent_projection(
+        status: &str,
+    ) -> astra_services::session_workspace::BackgroundLocalAgentTaskProjection {
+        astra_services::session_workspace::BackgroundLocalAgentTaskProjection {
+            id: "agent-restored".into(),
+            status: status.into(),
+            title: "review auth flow".into(),
+            started_at_ms: 1,
+            ended_at_ms: None,
+            output_tail: Some("reviewing auth middleware".into()),
+            terminal_reason: None,
+            fanout: None,
+        }
+    }
+
+    fn restored_fanout_local_agent_projection(
+        status: &str,
+    ) -> astra_services::session_workspace::BackgroundLocalAgentTaskProjection {
+        astra_services::session_workspace::BackgroundLocalAgentTaskProjection {
+            id: "agent-restored-fanout".into(),
+            status: status.into(),
+            title: "review auth flow".into(),
+            started_at_ms: 1,
+            ended_at_ms: None,
+            output_tail: Some("reviewing auth middleware".into()),
+            terminal_reason: None,
+            fanout: Some(
+                astra_services::session_workspace::BackgroundLocalAgentFanoutProjection {
+                    group_id: "review-1".into(),
+                    group_title: "review fanout".into(),
+                    target_count: 3,
+                    slot_index: 1,
+                    slot_label: "auth review".into(),
+                },
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn restored_local_agent_projects_as_unavailable_stale_task() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut registry =
+            crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
+        let restored = vec![restored_local_agent_projection("running")];
+
+        let rows = background_task_rows_with_agents(&mut registry, None, &restored).await;
+
+        let row = rows
+            .iter()
+            .find(|row| row.id == "agent-restored")
+            .expect("restored local agent row");
+        assert_eq!(
+            row.kind,
+            bottom_pane::background_task_view::BackgroundTaskKind::LocalAgent
+        );
+        assert_eq!(
+            row.status,
+            bottom_pane::background_task_view::BackgroundTaskStatus::Unavailable
+        );
+        assert_eq!(
+            row.live_control,
+            bottom_pane::background_task_view::LiveControlState::StaleHandle
+        );
+        assert_eq!(
+            row.output_tail.as_deref(),
+            Some("reviewing auth middleware")
+        );
+
+        let counts = status_line::BackgroundTaskCounts::from_rows(&rows);
+        assert_eq!(counts.unavailable_local_agents, 1);
+        assert!(!counts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn background_task_list_xml_includes_restored_local_agent_without_spawner() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut registry =
+            crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
+        let restored = vec![restored_local_agent_projection("running")];
+
+        let xml = render_background_task_list_xml_with_agents(&mut registry, None, &restored).await;
+
+        assert!(xml.contains("<background_tasks count=\"1\">"), "{xml}");
+        assert!(xml.contains("id=\"agent-restored\""), "{xml}");
+        assert!(xml.contains("kind=\"local agent\""), "{xml}");
+        assert!(xml.contains("status=\"unavailable\""), "{xml}");
+        assert!(xml.contains("live_control=\"stale_handle\""), "{xml}");
+        assert!(
+            xml.contains("preview=\"reviewing auth middleware\""),
+            "{xml}"
+        );
+        assert!(!xml.contains("Job"), "{xml}");
+    }
+
+    #[tokio::test]
+    async fn restored_local_agent_keeps_fanout_group_metadata_for_resume_footer() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut registry =
+            crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
+        let restored = vec![restored_fanout_local_agent_projection("running")];
+
+        let rows = background_task_rows_with_agents(&mut registry, None, &restored).await;
+        let row = rows
+            .iter()
+            .find(|row| row.id == "agent-restored-fanout")
+            .expect("restored fanout row");
+        let fanout = row.fanout.as_ref().expect("fanout metadata");
+        assert_eq!(fanout.group_id, "review-1");
+        assert_eq!(fanout.group_title, "review fanout");
+        assert_eq!(fanout.target_count, 3);
+        assert_eq!(fanout.slot_index, 1);
+        assert_eq!(
+            row.status,
+            bottom_pane::background_task_view::BackgroundTaskStatus::Unavailable
+        );
+
+        let summaries = status_line::BackgroundTaskFanoutSummary::from_rows(&rows);
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].target_count, 3);
+        assert_eq!(summaries[0].unavailable, 1);
+
+        let xml = render_background_task_rows_xml(&rows);
+        assert!(xml.contains("fanout_group_id=\"review-1\""), "{xml}");
+        assert!(xml.contains("fanout_target_count=\"3\""), "{xml}");
+        assert!(xml.contains("live_control=\"stale_handle\""), "{xml}");
+    }
+
+    #[tokio::test]
+    async fn task_output_command_reads_restored_local_agent_projection() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut registry =
+            crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
+        let restored = vec![restored_local_agent_projection("running")];
+
+        let snapshot = background_task_output_snapshot_with_agents(
+            &mut registry,
+            None,
+            &restored,
+            "agent-restored",
+            0,
+            8192,
+        )
+        .await
+        .expect("restored projection should be readable");
+
+        assert_eq!(snapshot.kind, "local agent");
+        assert_eq!(snapshot.status, "unavailable");
+        assert!(snapshot.terminal);
+        assert_eq!(snapshot.output, "reviewing auth middleware");
+        assert_eq!(snapshot.output_ref, "workspace_projection: agent-restored");
+    }
+
+    #[tokio::test]
+    async fn task_stop_command_reports_stale_handle_for_restored_local_agent() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut registry =
+            crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
+        let restored = vec![restored_local_agent_projection("running")];
+
+        let error =
+            stop_background_task_with_agents(&mut registry, None, &restored, "agent-restored")
+                .await
+                .expect_err("restored local agent has no live handle");
+
+        assert!(error.contains("stale handle"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn background_task_list_xml_includes_local_agent_without_shells() {
+        let spawner = test_agent_spawner(Arc::new(PendingAgentExecutor));
+        let input = SpawnAgentInput {
+            description: "review auth flow".to_string(),
+            prompt: "review auth flow".to_string(),
+            agent_type: "explore".to_string(),
+            run_in_background: true,
+            ..Default::default()
+        };
+        let spawned = spawner.spawn(input, &test_spawn_context()).await.unwrap();
+        assert!(matches!(spawned, SpawnAgentOutput::Launched { .. }));
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut registry =
+            crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
+
+        let xml =
+            render_background_task_list_xml_with_agents(&mut registry, Some(&spawner), &[]).await;
+
+        assert!(xml.contains("<background_tasks count=\"1\">"), "{xml}");
+        assert!(xml.contains("kind=\"local agent\""), "{xml}");
+        assert!(xml.contains("description=\"review auth flow\""), "{xml}");
+        assert!(!xml.contains("kind=\"shell\""), "{xml}");
+        assert!(!xml.contains("Job"), "{xml}");
+
+        spawner
+            .shutdown_and_wait(std::time::Duration::from_millis(1))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn task_stop_command_can_cancel_local_agent() {
+        let spawner = test_agent_spawner(Arc::new(PendingAgentExecutor));
+        let input = SpawnAgentInput {
+            description: "review auth flow".to_string(),
+            prompt: "review auth flow".to_string(),
+            agent_type: "explore".to_string(),
+            run_in_background: true,
+            ..Default::default()
+        };
+        let spawned = spawner.spawn(input, &test_spawn_context()).await.unwrap();
+        let agent_id = match spawned {
+            SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
+            other => panic!("expected launched background agent, got {other:?}"),
+        };
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut registry =
+            crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
+
+        stop_background_task_with_agents(&mut registry, Some(&spawner), &[], &agent_id)
+            .await
+            .expect("task_stop should cancel a background local agent");
+
+        let archived = spawner
+            .get_agent_state_any(&agent_id)
+            .await
+            .expect("cancelled agent should remain in history");
+        assert!(matches!(
+            archived.status,
+            AgentStatus::Cancelled { by_user: true, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn task_output_command_projects_local_agent_without_shell_output() {
+        let spawner = test_agent_spawner(Arc::new(PendingAgentExecutor));
+        let input = SpawnAgentInput {
+            description: "review auth flow".to_string(),
+            prompt: "review auth flow".to_string(),
+            agent_type: "explore".to_string(),
+            run_in_background: true,
+            ..Default::default()
+        };
+        let spawned = spawner.spawn(input, &test_spawn_context()).await.unwrap();
+        let agent_id = match spawned {
+            SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
+            other => panic!("expected launched background agent, got {other:?}"),
+        };
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut registry =
+            crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
+
+        let snapshot = background_task_output_snapshot_with_agents(
+            &mut registry,
+            Some(&spawner),
+            &[],
+            &agent_id,
+            0,
+            8192,
+        )
+        .await
+        .expect("task_output should project a background local agent");
+
+        assert_eq!(snapshot.kind, "local agent");
+        assert_eq!(snapshot.title.as_deref(), Some("review auth flow"));
+        assert_ne!(snapshot.output_ref, "");
+
+        spawner
+            .shutdown_and_wait(std::time::Duration::from_millis(1))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn background_task_stop_sentinel_can_cancel_local_agent() {
+        let spawner = test_agent_spawner(Arc::new(PendingAgentExecutor));
+        let input = SpawnAgentInput {
+            description: "review auth flow".to_string(),
+            prompt: "review auth flow".to_string(),
+            agent_type: "explore".to_string(),
+            run_in_background: true,
+            ..Default::default()
+        };
+        let spawned = spawner.spawn(input, &test_spawn_context()).await.unwrap();
+        let agent_id = match spawned {
+            SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
+            other => panic!("expected launched background agent, got {other:?}"),
+        };
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut registry =
+            crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
+        let mut chat_widget = chat_widget::ChatWidget::new("");
+        let mut bottom_pane = BottomPane::new();
+        let sentinel = format!(
+            "{}{}",
+            bottom_pane::background_task_view::BACKGROUND_TASK_STOP_SENTINEL,
+            agent_id
+        );
+
+        assert!(
+            try_dispatch_background_task_stop_sentinel(
+                &sentinel,
+                &mut registry,
+                Some(spawner.clone()),
+                &[],
+                &mut chat_widget,
+                &mut bottom_pane,
+                &FrameRequester::test_dummy(),
+            )
+            .await,
+            "background task stop sentinel should be consumed"
+        );
+
+        let archived = spawner
+            .get_agent_state_any(&agent_id)
+            .await
+            .expect("cancelled agent should remain in history");
+        assert!(matches!(
+            archived.status,
+            AgentStatus::Cancelled { by_user: true, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn background_task_switcher_opens_for_local_agent_without_shells() {
+        let spawner = test_agent_spawner(Arc::new(PendingAgentExecutor));
+        let input = SpawnAgentInput {
+            description: "review auth flow".to_string(),
+            prompt: "review auth flow".to_string(),
+            agent_type: "explore".to_string(),
+            run_in_background: true,
+            ..Default::default()
+        };
+        let spawned = spawner.spawn(input, &test_spawn_context()).await.unwrap();
+        assert!(matches!(spawned, SpawnAgentOutput::Launched { .. }));
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut registry =
+            crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
+        let mut bottom_pane = BottomPane::new();
+
+        assert!(
+            open_background_task_view(
+                &mut registry,
+                Some(&spawner),
+                &[],
+                &mut bottom_pane,
+                &FrameRequester::test_dummy(),
+            )
+            .await,
+            "local agent rows must open the background task switcher even when no shell tasks exist"
+        );
+        assert!(bottom_pane.has_active_view());
+
+        spawner
+            .shutdown_and_wait(std::time::Duration::from_millis(1))
+            .await;
+    }
+
+    #[test]
+    fn ctrl_b_background_hint_requires_detach() {
+        assert!(should_show_ctrl_b_background_hint(true));
+        assert!(!should_show_ctrl_b_background_hint(false));
+    }
+
+    #[tokio::test]
+    async fn background_task_rows_include_typed_status_and_combined_tail() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut registry = crate::tui::background_tasks::BackgroundTaskRegistry::new(
+            temp.path().join("bg-task-row-projection"),
+        );
+        let id = registry.spawn_shell("printf 'stdout-line'; printf 'stderr-line' >&2", "demo");
+
+        for _ in 0..50 {
+            registry.poll_completions();
+            if registry.get(&id).unwrap().status().as_str() == "completed" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let rows = background_task_rows(&mut registry);
+        let row = rows
+            .iter()
+            .find(|row| row.id == id)
+            .expect("spawned task should project into switcher rows");
+        assert_eq!(row.kind.as_str(), "shell");
+        assert_eq!(row.status.as_str(), "completed");
+        let output_ref = row.output_ref.as_deref().unwrap_or_default();
+        assert!(output_ref.contains("stdout:"), "{output_ref:?}");
+        assert!(output_ref.contains("stderr:"), "{output_ref:?}");
+        let tail = row.output_tail.as_deref().unwrap_or_default();
+        assert!(tail.contains("stdout-line"), "{tail:?}");
+        assert!(tail.contains("stderr-line"), "{tail:?}");
+        assert!(
+            row.total_bytes.unwrap_or_default() >= "stdout-linestderr-line".len() as u64,
+            "total bytes should include captured stdout and stderr"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_task_rows_surface_missing_output_artifact() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut registry = crate::tui::background_tasks::BackgroundTaskRegistry::new(
+            temp.path().join("bg-task-missing-output"),
+        );
+        let id = registry.spawn_shell("printf 'done'", "missing output artifact");
+
+        for _ in 0..50 {
+            registry.poll_completions();
+            if registry.get(&id).unwrap().status().as_str() == "completed" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let stdout_path = registry.get(&id).unwrap().stdout_path.clone();
+        std::fs::remove_file(&stdout_path).expect("remove captured stdout artifact");
+
+        let rows = background_task_rows(&mut registry);
+        let row = rows
+            .iter()
+            .find(|row| row.id == id)
+            .expect("spawned task should project into switcher rows");
+        let tail = row.output_tail.as_deref().unwrap_or_default();
+
+        assert!(tail.contains("Output artifact missing"), "{tail}");
+        assert!(tail.contains(&stdout_path.display().to_string()), "{tail}");
+        assert!(row.total_bytes.is_none(), "{row:?}");
+        assert!(row.output_offset.is_none(), "{row:?}");
+    }
+
+    #[test]
+    fn background_task_rows_project_restored_running_as_unavailable_stale() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let stdout = temp.path().join("restored.stdout");
+        let stderr = temp.path().join("restored.stderr");
+        std::fs::write(&stdout, "line from previous session\n").unwrap();
+        std::fs::write(&stderr, "").unwrap();
+        let mut registry = crate::tui::background_tasks::BackgroundTaskRegistry::new(
+            temp.path().join("bg-task-restored-row"),
+        );
+        registry
+            .restore_shell_task_projection(
+                astra_services::session_workspace::BackgroundShellTaskProjection {
+                    id: "bg-shell-restored".into(),
+                    status: "running".into(),
+                    title: "cargo build".into(),
+                    started_at_ms: 1,
+                    ended_at_ms: None,
+                    stdout_path: stdout.display().to_string(),
+                    stderr_path: stderr.display().to_string(),
+                    exit_code: None,
+                    terminal_reason: None,
+                },
+            )
+            .unwrap();
+
+        let rows = background_task_rows(&mut registry);
+        let row = rows
+            .iter()
+            .find(|row| row.id == "bg-shell-restored")
+            .expect("restored row");
+
+        assert_eq!(row.status.as_str(), "unavailable");
+        assert_eq!(row.started_at_ms, Some(1));
+        assert_eq!(row.ended_at_ms, None);
+        assert_eq!(
+            row.live_control,
+            bottom_pane::background_task_view::LiveControlState::StaleHandle
+        );
+        assert_eq!(
+            row.output_tail.as_deref(),
+            Some("line from previous session")
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn background_task_projection_persistence_round_trips_workspace() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
+        let session_id = "bg-projection-session";
+        let mut workspace = astra_services::session_workspace::WorkspaceMetadata::with_context(
+            session_id,
+            "gpt-5",
+            "/tmp",
+            Some("main"),
+        );
+        astra_services::session_workspace::write_workspace(&workspace).unwrap();
+
+        let stdout = temp.path().join("restored.stdout");
+        let stderr = temp.path().join("restored.stderr");
+        std::fs::write(&stdout, "persisted\n").unwrap();
+        std::fs::write(&stderr, "").unwrap();
+        let mut registry = crate::tui::background_tasks::BackgroundTaskRegistry::new(
+            temp.path().join("bg-task-persist"),
+        );
+        registry
+            .restore_shell_task_projection(
+                astra_services::session_workspace::BackgroundShellTaskProjection {
+                    id: "bg-shell-persist".into(),
+                    status: "completed".into(),
+                    title: "cargo test".into(),
+                    started_at_ms: 42,
+                    ended_at_ms: Some(84),
+                    stdout_path: stdout.display().to_string(),
+                    stderr_path: stderr.display().to_string(),
+                    exit_code: Some(0),
+                    terminal_reason: Some("exit code 0".into()),
+                },
+            )
+            .unwrap();
+
+        let mut cache = Vec::new();
+        persist_background_task_projections_if_changed(
+            &mut registry,
+            Some(session_id),
+            Some("gpt-5"),
+            &mut cache,
+        );
+        workspace = astra_services::session_workspace::read_workspace(session_id).unwrap();
+
+        assert_eq!(workspace.background_shell_tasks.len(), 1);
+        assert_eq!(workspace.background_shell_tasks[0].id, "bg-shell-persist");
+        assert_eq!(workspace.background_shell_tasks[0].status, "completed");
+        assert_eq!(workspace.background_shell_tasks[0].ended_at_ms, Some(84));
+        assert_eq!(workspace.background_shell_tasks[0].exit_code, Some(0));
+        assert_eq!(cache, workspace.background_shell_tasks);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn background_local_agent_projection_persistence_round_trips_workspace() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
+        let session_id = "bg-local-agent-projection-session";
+        let workspace = astra_services::session_workspace::WorkspaceMetadata::with_context(
+            session_id,
+            "gpt-5",
+            "/tmp",
+            Some("main"),
+        );
+        astra_services::session_workspace::write_workspace(&workspace).unwrap();
+
+        let spawner = test_agent_spawner(Arc::new(PendingAgentExecutor));
+        let input = SpawnAgentInput {
+            description: "review auth flow".to_string(),
+            prompt: "review auth flow".to_string(),
+            agent_type: "explore".to_string(),
+            run_in_background: true,
+            ..Default::default()
+        };
+        let spawned = spawner.spawn(input, &test_spawn_context()).await.unwrap();
+        let agent_id = match spawned {
+            SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
+            other => panic!("expected launched background agent, got {other:?}"),
+        };
+
+        let mut cache = Vec::new();
+        let projections = persist_background_local_agent_task_projections_if_changed(
+            Some(&spawner),
+            &[],
+            Some(session_id),
+            Some("gpt-5"),
+            &mut cache,
+        )
+        .await;
+        let workspace = astra_services::session_workspace::read_workspace(session_id).unwrap();
+
+        assert_eq!(workspace.background_local_agent_tasks.len(), 1);
+        assert_eq!(workspace.background_local_agent_tasks[0].id, agent_id);
+        assert_eq!(
+            workspace.background_local_agent_tasks[0].title,
+            "review auth flow"
+        );
+        assert_eq!(cache, workspace.background_local_agent_tasks);
+        assert_eq!(projections, workspace.background_local_agent_tasks);
+
+        spawner
+            .shutdown_and_wait(std::time::Duration::from_millis(1))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn background_task_output_snapshot_drains_completion_before_status() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut registry = crate::tui::background_tasks::BackgroundTaskRegistry::new(
+            temp.path().join("bg-task-output-snapshot"),
+        );
+        let id = registry.spawn_shell("printf 'done\\n'", "quick output");
+
+        wait_for_background_shell_terminal(&mut registry, &id).await;
+        let snapshot =
+            background_task_output_snapshot(&mut registry, &id, 0, 1024).expect("snapshot");
+
+        assert_eq!(snapshot.status, "completed");
+        assert!(snapshot.terminal, "{snapshot:?}");
+        assert!(snapshot.output.contains("done"), "{snapshot:?}");
+        assert!(snapshot.output_ref.contains("stdout:"), "{snapshot:?}");
+        assert!(snapshot.output_ref.contains("stderr:"), "{snapshot:?}");
+    }
+
+    #[tokio::test]
+    async fn background_task_output_snapshot_includes_stderr_only_shell_output() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut registry = crate::tui::background_tasks::BackgroundTaskRegistry::new(
+            temp.path().join("bg-task-output-stderr"),
+        );
+        let id = registry.spawn_shell("printf 'stderr-line\\n' >&2; exit 2", "stderr output");
+
+        wait_for_background_shell_terminal(&mut registry, &id).await;
+        let snapshot =
+            background_task_output_snapshot(&mut registry, &id, 0, 1024).expect("snapshot");
+
+        assert_eq!(snapshot.status, "failed");
+        assert!(snapshot.terminal, "{snapshot:?}");
+        assert!(snapshot.output.contains("<stderr>"), "{snapshot:?}");
+        assert!(snapshot.output.contains("stderr-line"), "{snapshot:?}");
+        assert!(snapshot.output_ref.contains("stdout:"), "{snapshot:?}");
+        assert!(snapshot.output_ref.contains("stderr:"), "{snapshot:?}");
+    }
+
+    #[test]
+    fn background_task_output_snapshot_projects_restored_running_as_unavailable() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let stdout = temp.path().join("restored.stdout");
+        let stderr = temp.path().join("restored.stderr");
+        std::fs::write(&stdout, "old output\n").unwrap();
+        std::fs::write(&stderr, "").unwrap();
+        let mut registry = crate::tui::background_tasks::BackgroundTaskRegistry::new(
+            temp.path().join("bg-task-output-restored"),
+        );
+        registry
+            .restore_shell_task_projection(
+                astra_services::session_workspace::BackgroundShellTaskProjection {
+                    id: "bg-shell-restored".into(),
+                    status: "running".into(),
+                    title: "cargo build".into(),
+                    started_at_ms: 1,
+                    ended_at_ms: None,
+                    stdout_path: stdout.display().to_string(),
+                    stderr_path: stderr.display().to_string(),
+                    exit_code: None,
+                    terminal_reason: None,
+                },
+            )
+            .unwrap();
+
+        let snapshot = background_task_output_snapshot(&mut registry, "bg-shell-restored", 0, 1024)
+            .expect("snapshot");
+
+        assert_eq!(snapshot.status, "unavailable");
+        assert!(snapshot.terminal, "{snapshot:?}");
+        assert_eq!(snapshot.output, "old output\n");
+    }
+
+    #[tokio::test]
+    async fn background_task_switcher_opens_for_failed_but_not_completed_only() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut completed_registry = crate::tui::background_tasks::BackgroundTaskRegistry::new(
+            temp.path().join("completed-only"),
+        );
+        let completed_id = completed_registry.spawn_shell("true", "completed");
+        for _ in 0..50 {
+            completed_registry.poll_completions();
+            if completed_registry
+                .get(&completed_id)
+                .is_some_and(|h| h.status().as_str() == "completed")
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let mut bottom_pane = BottomPane::new();
+        assert!(
+            !open_background_task_view(
+                &mut completed_registry,
+                None,
+                &[],
+                &mut bottom_pane,
+                &FrameRequester::test_dummy(),
+            )
+            .await,
+            "completed-only background tasks should not steal Ctrl+T from the task board"
+        );
+        assert!(!bottom_pane.has_active_view());
+
+        let mut failed_registry =
+            crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("failed"));
+        let failed_id = failed_registry.spawn_shell("/definitely_missing_astra_binary", "failed");
+        for _ in 0..50 {
+            failed_registry.poll_completions();
+            if failed_registry
+                .get(&failed_id)
+                .is_some_and(|h| h.status().as_str() == "failed")
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            open_background_task_view(
+                &mut failed_registry,
+                None,
+                &[],
+                &mut bottom_pane,
+                &FrameRequester::test_dummy(),
+            )
+            .await,
+            "failed background tasks must remain reachable from Ctrl+T"
+        );
+        assert!(bottom_pane.has_active_view());
     }
 
     #[tokio::test]
@@ -3906,6 +4914,7 @@ mod tests {
             child_count: 0,
             elapsed_ms: 0,
             status: AgentRowStatus::Live,
+            fanout: None,
         }])));
 
         let token = TuiAppEvent::AgentLive(AgentLiveEvent {
@@ -3956,6 +4965,7 @@ mod tests {
             child_count: 0,
             elapsed_ms: 0,
             status: AgentRowStatus::Live,
+            fanout: None,
         }])));
         assert!(refresh_open_agent_monitor_for_event(
             &event,
@@ -4344,5 +5354,236 @@ mod tests {
             })
             .expect("expected a committed system cell");
         assert!(sys.message().contains("cache_write=?"));
+    }
+
+    #[test]
+    fn background_task_event_system_message_uses_typed_shell_vocabulary() {
+        let completed = background_task_event_system_message(&BgTaskEvent::Completed {
+            id: "bg-shell-1".to_string(),
+            title: "cargo test -p astra-cli".to_string(),
+            exit_code: Some(0),
+            summary: "ok".to_string(),
+        })
+        .expect("completed should notify");
+        assert!(
+            completed.contains("Background shell \"cargo test -p astra-cli\" completed (exit 0)"),
+            "{completed}"
+        );
+        assert!(!completed.contains("Background command"));
+
+        let stalled = background_task_event_system_message(&BgTaskEvent::Stalled {
+            id: "bg-shell-2".to_string(),
+            title: "python script.py".to_string(),
+            last_output_tail: "Continue? [y/N]".to_string(),
+        })
+        .expect("stalled should notify");
+        assert!(stalled.contains("waiting for input"), "{stalled}");
+        assert!(stalled.contains("\"python script.py\""), "{stalled}");
+        assert!(!stalled.contains("Background command"));
+
+        let killed = background_task_event_system_message(&BgTaskEvent::Killed {
+            id: "bg-shell-3".to_string(),
+            title: "deploy.sh".to_string(),
+        })
+        .expect("killed should notify");
+        assert!(killed.contains("stopped"), "{killed}");
+        assert!(killed.contains("\"deploy.sh\""), "{killed}");
+        assert!(!killed.contains("killed"), "{killed}");
+    }
+
+    #[test]
+    fn background_task_output_system_message_includes_title_offsets_and_lines() {
+        let message = format_background_task_output_system_message(
+            "bg-shell-1",
+            "npm run dev",
+            "running",
+            8192,
+            13_244,
+            312,
+            "Listening on http://localhost:5173/\n",
+        );
+
+        assert!(
+            message.contains("Read shell output bg-shell-1"),
+            "{message}"
+        );
+        assert!(message.contains("\"npm run dev\""), "{message}");
+        assert!(message.contains("1 new line"), "{message}");
+        assert!(message.contains("offset 8192 -> 13244"), "{message}");
+        assert!(message.contains("total 13244 bytes"), "{message}");
+        assert!(message.contains("312 total lines"), "{message}");
+        assert!(message.contains("still running"), "{message}");
+        assert!(message.contains("Output chunk:"), "{message}");
+        assert!(
+            message.contains("Listening on http://localhost:5173/"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("Background shell bg-shell-1 output"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn background_task_output_system_message_names_terminal_empty_output() {
+        let message = format_background_task_output_system_message(
+            "bg-shell-2",
+            "cargo test -p astra-cli",
+            "completed",
+            0,
+            0,
+            0,
+            "",
+        );
+
+        assert!(
+            message.contains("Read shell output bg-shell-2"),
+            "{message}"
+        );
+        assert!(message.contains("Completed with no output"), "{message}");
+        assert!(message.contains("offset 0 -> 0"), "{message}");
+        assert!(!message.contains("No output captured yet"), "{message}");
+    }
+
+    #[test]
+    fn background_task_stop_terminal_race_is_not_reported_as_failure() {
+        let message = format_background_task_stop_error_system_message(
+            "bg-shell-1",
+            "background shell 'bg-shell-1' already terminated",
+        );
+
+        assert_eq!(message, "Background task bg-shell-1 already finished.");
+        assert!(is_background_task_terminal_race_error(
+            "background shell 'bg-shell-1' already terminated"
+        ));
+        assert!(!message.contains("Failed to stop"), "{message}");
+    }
+
+    #[test]
+    fn background_task_stop_stale_handle_is_not_reported_as_generic_failure() {
+        let message = format_background_task_stop_error_system_message(
+            "bg-shell-1",
+            "background shell 'bg-shell-1' has a stale handle",
+        );
+
+        assert!(message.contains("cannot be stopped"), "{message}");
+        assert!(message.contains("no live process handle"), "{message}");
+        assert!(!message.contains("Failed to stop"), "{message}");
+    }
+
+    #[test]
+    fn background_task_output_read_unknown_id_uses_typed_not_found() {
+        let message = format_background_task_output_read_error(
+            "bg-shell-missing",
+            "no background shell with id 'bg-shell-missing'",
+        );
+
+        assert_eq!(message, "Background task not found: bg-shell-missing");
+        assert!(!message.contains("background shell with id"), "{message}");
+        assert!(!message.contains("Output unavailable"), "{message}");
+    }
+
+    #[test]
+    fn background_task_stop_unknown_id_uses_typed_not_found() {
+        let message = format_background_task_stop_error_system_message(
+            "bg-shell-missing",
+            "no background shell with id 'bg-shell-missing'",
+        );
+
+        assert_eq!(message, "Background task not found: bg-shell-missing");
+        assert!(!message.contains("Failed to stop"), "{message}");
+        assert!(!message.contains("background shell with id"), "{message}");
+    }
+
+    #[test]
+    fn background_task_event_system_messages_collapses_many_successes() {
+        let messages = background_task_event_system_messages(&[
+            BgTaskEvent::Completed {
+                id: "bg-shell-1".to_string(),
+                title: "cmd one".to_string(),
+                exit_code: Some(0),
+                summary: "ok".to_string(),
+            },
+            BgTaskEvent::Completed {
+                id: "bg-shell-2".to_string(),
+                title: "cmd two".to_string(),
+                exit_code: Some(0),
+                summary: "ok".to_string(),
+            },
+        ]);
+
+        assert_eq!(messages, vec!["2 background shells completed".to_string()]);
+    }
+
+    #[test]
+    fn background_task_event_system_messages_keeps_attention_events_explicit() {
+        let messages = background_task_event_system_messages(&[
+            BgTaskEvent::Completed {
+                id: "bg-shell-1".to_string(),
+                title: "cmd one".to_string(),
+                exit_code: Some(0),
+                summary: "ok".to_string(),
+            },
+            BgTaskEvent::Failed {
+                id: "bg-shell-2".to_string(),
+                title: "npm test".to_string(),
+                error: "exit 2".to_string(),
+            },
+            BgTaskEvent::Completed {
+                id: "bg-shell-3".to_string(),
+                title: "cmd three".to_string(),
+                exit_code: Some(0),
+                summary: "ok".to_string(),
+            },
+            BgTaskEvent::Killed {
+                id: "bg-shell-4".to_string(),
+                title: "deploy.sh".to_string(),
+            },
+            BgTaskEvent::Stalled {
+                id: "bg-shell-5".to_string(),
+                title: "python script.py".to_string(),
+                last_output_tail: "Continue? [y/N]".to_string(),
+            },
+        ]);
+
+        assert_eq!(messages[0], "2 background shells completed");
+        assert!(messages[1].contains("\"npm test\" failed"), "{messages:?}");
+        assert!(
+            messages[2].contains("\"deploy.sh\" was stopped"),
+            "{messages:?}"
+        );
+        assert!(
+            messages[3].contains("\"python script.py\" appears to be waiting for input"),
+            "{messages:?}"
+        );
+        assert_eq!(messages.len(), 4);
+    }
+
+    #[test]
+    fn background_task_event_system_messages_does_not_collapse_unknown_or_nonzero_exit() {
+        let messages = background_task_event_system_messages(&[
+            BgTaskEvent::Completed {
+                id: "bg-shell-1".to_string(),
+                title: "false".to_string(),
+                exit_code: Some(1),
+                summary: "exit 1".to_string(),
+            },
+            BgTaskEvent::Completed {
+                id: "bg-shell-2".to_string(),
+                title: "".to_string(),
+                exit_code: None,
+                summary: "unknown exit".to_string(),
+            },
+        ]);
+
+        assert_eq!(messages.len(), 2);
+        assert!(messages[0].contains("\"false\" completed"), "{messages:?}");
+        assert!(messages[1].contains("bg-shell-2 completed"), "{messages:?}");
+        assert!(
+            messages
+                .iter()
+                .all(|msg| !msg.contains("background shells completed")),
+            "{messages:?}"
+        );
     }
 }

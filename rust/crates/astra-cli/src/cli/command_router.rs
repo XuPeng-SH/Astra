@@ -1,12 +1,12 @@
 use crate::cli::arg_render::{
     apply_system_prompt, join_words, render_agent_args, render_bug_args, render_debug_args,
-    render_diff_args, render_grep_args, render_job_args, render_memory_args, render_messaging_args,
-    render_permissions_args, render_review_args, render_team_args,
+    render_diff_args, render_grep_args, render_memory_args, render_messaging_args,
+    render_permissions_args, render_review_args, render_task_args, render_team_args,
 };
 use crate::cli::auth_flow::{clear_profile_auth, do_login, do_register, is_auth_error};
 use crate::cli::cli_config::cli_args::{
-    AuditCmd, Cli, Command, JobRunArgs, JobSubcommand, JobWorkerArgs, JournalCmd, ModelCmd,
-    SessionCaptureCmd, SessionCmd, SkillCmd,
+    AuditCmd, Cli, Command, JournalCmd, ModelCmd, SessionCaptureCmd, SessionCmd, SkillCmd,
+    TaskRunArgs, TaskSubcommand, TaskWorkerArgs,
 };
 use crate::cli::cli_config::cli_utils;
 use crate::cli::cli_config::cli_utils::{
@@ -121,7 +121,7 @@ fn maybe_wire_delegation_engine(
     state.delegation_engine = Some(std::sync::Arc::new(engine));
 }
 
-fn emit_job_event(enabled: bool, value: serde_json::Value) {
+fn emit_task_event(enabled: bool, value: serde_json::Value) {
     if enabled {
         if let Ok(line) = serde_json::to_string(&value) {
             eprintln!("{line}");
@@ -153,7 +153,7 @@ pub(crate) fn error_kind_for_exit_code(exit_code: ExitCode) -> Option<&'static s
     }
 }
 
-fn job_status_for_exit_code(exit_code: ExitCode) -> &'static str {
+fn task_status_for_exit_code(exit_code: ExitCode) -> &'static str {
     match exit_code {
         ExitCode::Success => "completed",
         ExitCode::Partial => "partial",
@@ -163,8 +163,8 @@ fn job_status_for_exit_code(exit_code: ExitCode) -> &'static str {
     }
 }
 
-fn job_notification_payload(
-    job_id: &str,
+fn task_notification_payload(
+    task_id: &str,
     sr: &StreamResult,
     output_path: Option<&str>,
     exit_code: ExitCode,
@@ -172,12 +172,12 @@ fn job_notification_payload(
     let mut payload = serde_json::Map::new();
     payload.insert(
         "type".to_string(),
-        serde_json::json!("background_job_notification"),
+        serde_json::json!("background_task_notification"),
     );
-    payload.insert("job_id".to_string(), serde_json::json!(job_id));
+    payload.insert("task_id".to_string(), serde_json::json!(task_id));
     payload.insert(
         "status".to_string(),
-        serde_json::json!(job_status_for_exit_code(exit_code)),
+        serde_json::json!(task_status_for_exit_code(exit_code)),
     );
     payload.insert(
         "success".to_string(),
@@ -208,8 +208,8 @@ fn job_notification_payload(
     serde_json::Value::Object(payload)
 }
 
-fn failed_job_notification_payload(
-    job_id: &str,
+fn failed_task_notification_payload(
+    task_id: &str,
     summary: &str,
     error_kind: &str,
     output_path: Option<&str>,
@@ -218,9 +218,9 @@ fn failed_job_notification_payload(
     let mut payload = serde_json::Map::new();
     payload.insert(
         "type".to_string(),
-        serde_json::json!("background_job_notification"),
+        serde_json::json!("background_task_notification"),
     );
-    payload.insert("job_id".to_string(), serde_json::json!(job_id));
+    payload.insert("task_id".to_string(), serde_json::json!(task_id));
     let status = if error_kind == "persistence_error" {
         "persistence_error"
     } else {
@@ -239,8 +239,8 @@ fn failed_job_notification_payload(
     serde_json::Value::Object(payload)
 }
 
-fn job_terminal_summary_line(
-    job_id: &str,
+fn task_terminal_summary_line(
+    task_id: &str,
     output_path: Option<&str>,
     exit_code: ExitCode,
 ) -> String {
@@ -254,16 +254,16 @@ fn job_terminal_summary_line(
     };
     match output_path {
         Some(output_path) => format!(
-            "\n  {} Job {} {}; output saved to {}",
+            "\n  {} Task {} {}; output saved to {}",
             icon,
-            prefix_chars(job_id, 8).cyan(),
+            prefix_chars(task_id, 8).cyan(),
             outcome,
             output_path.dim(),
         ),
         None => format!(
-            "\n  {} Job {} {}; output file unavailable",
+            "\n  {} Task {} {}; output file unavailable",
             icon,
-            prefix_chars(job_id, 8).cyan(),
+            prefix_chars(task_id, 8).cyan(),
             outcome,
         ),
     }
@@ -319,6 +319,43 @@ fn finalize_one_shot_stream_result(
     compute_exit_code(sr)
 }
 
+fn effective_one_shot_model<'a>(
+    explicit_model: Option<&'a str>,
+    restored_model: Option<&'a str>,
+    fallback_model: Option<&'a str>,
+) -> Option<&'a str> {
+    explicit_model
+        .filter(|model| !model.trim().is_empty())
+        .or_else(|| restored_model.filter(|model| !model.trim().is_empty()))
+        .or_else(|| fallback_model.filter(|model| !model.trim().is_empty()))
+}
+
+fn effective_one_shot_permission_mode(
+    explicit_mode: Option<&str>,
+    explicit_auto: bool,
+    restored_mode: Option<&str>,
+    fallback_auto: bool,
+) -> Result<PermissionMode, String> {
+    if let Some(mode) = explicit_mode.filter(|mode| !mode.trim().is_empty()) {
+        return mode
+            .parse::<PermissionMode>()
+            .map_err(|error| format!("invalid permission mode '{mode}': {error}"));
+    }
+    if explicit_auto {
+        return Ok(PermissionMode::Auto);
+    }
+    if let Some(mode) = restored_mode.filter(|mode| !mode.trim().is_empty()) {
+        return mode.parse::<PermissionMode>().map_err(|error| {
+            format!("invalid restored session permission mode '{mode}': {error}")
+        });
+    }
+    Ok(if fallback_auto {
+        PermissionMode::Auto
+    } else {
+        PermissionMode::Prompt
+    })
+}
+
 fn one_shot_completion_warning(sr: &StreamResult, exit_code: ExitCode) -> Option<String> {
     if let Some(error) = sr.session_persistence_error.as_deref() {
         Some(format!("Session persistence degraded: {error}"))
@@ -344,25 +381,25 @@ fn print_one_shot_completion_warning(sr: &StreamResult, exit_code: ExitCode, jso
     }
 }
 
-struct HeadlessJobInput {
-    job_id: std::sync::Arc<String>,
-    job_session_id: std::sync::Arc<String>,
+struct HeadlessTaskInput {
+    task_id: std::sync::Arc<String>,
+    task_session_id: std::sync::Arc<String>,
     prompt: String,
     svc: std::sync::Arc<dyn astra_services::TaskService>,
     session_routing: OneShotSessionRouting,
 }
 
 #[derive(Debug, Clone, Copy)]
-struct HeadlessJobOptions {
+struct HeadlessTaskOptions {
     json: bool,
     quiet: bool,
     stream_events: bool,
     print_started: bool,
 }
 
-const NON_CANONICAL_JOB_SCOPE: &str = "no-session";
+const NON_CANONICAL_TASK_SCOPE: &str = "no-session";
 
-async fn build_one_shot_job_manager(
+async fn build_one_shot_task_manager(
     profile: Option<&str>,
     api_origin: &str,
     session_id: Option<&str>,
@@ -378,23 +415,23 @@ async fn build_one_shot_job_manager(
         ))
     } else {
         std::sync::Arc::new(crate::edge_tools::TaskManager::new(
-            NON_CANONICAL_JOB_SCOPE.to_string(),
+            NON_CANONICAL_TASK_SCOPE.to_string(),
             std::sync::Arc::new(astra_tools::task_mgmt::InMemoryTaskStore::new().with_validation()),
         ))
     }
 }
 
-async fn execute_headless_job_body(
-    input: HeadlessJobInput,
-    options: HeadlessJobOptions,
+async fn execute_headless_task_body(
+    input: HeadlessTaskInput,
+    options: HeadlessTaskOptions,
     profile: Option<&str>,
     global_model: Option<&str>,
     api: &astra_thin_client::ThinClient,
     cli_context: &crate::cli::cli_config::cli_context::CliContext,
 ) -> Result<ExitCode, String> {
-    let HeadlessJobInput {
-        job_id,
-        job_session_id,
+    let HeadlessTaskInput {
+        task_id,
+        task_session_id,
         prompt,
         svc,
         session_routing,
@@ -402,36 +439,49 @@ async fn execute_headless_job_body(
     use astra_services::TaskStatus;
     let (_creds, profile_name, _, token) = get_profile_and_token(profile)?;
     let session_id = session_routing.server_session_id.clone();
+    let effective_model =
+        effective_one_shot_model(None, session_routing.restored_model(), global_model)
+            .map(str::to_owned);
+    let effective_permission_mode = effective_one_shot_permission_mode(
+        None,
+        false,
+        session_routing.restored_permission_mode(),
+        true,
+    )?;
     let mut continuation_messages = session_routing.continuation_messages();
 
-    emit_job_event(
+    emit_task_event(
         options.stream_events,
         serde_json::json!({
-            "type": "background_job_started",
-            "job_id": job_id.as_str(),
-            "job_type": "local_agent",
+            "type": "background_task_started",
+            "task_id": task_id.as_str(),
+            "task_kind": "local_agent",
             "description": prompt,
         }),
     );
 
     if options.print_started && !options.quiet && !options.json {
         eprintln!(
-            "  {} Job started: {} ({})",
+            "  {} Task started: {} ({})",
             "▶".cyan(),
             prompt.chars().take(50).collect::<String>(),
-            prefix_chars(job_id.as_str(), 8).dim()
+            prefix_chars(task_id.as_str(), 8).dim()
         );
     }
 
-    svc.update_status(job_id.as_str(), TaskStatus::InProgress)
+    svc.update_status(task_id.as_str(), TaskStatus::InProgress)
         .await?;
 
     let pipeline_modules = session_runtime::create_pipeline_modules_quiet(api, profile);
     let skill_search = astra_core::SkillSearchSettings::default();
     let project_root = std::env::current_dir().unwrap_or_default();
-    let mut pm = PermissionManager::with_project(true, &project_root);
+    let mut pm = PermissionManager::with_load_policy(
+        effective_permission_mode,
+        &project_root,
+        &crate::cli::permission_manager::PermissionLoadPolicy::HeadlessSafe,
+    );
     let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
-    let root_agent_id = format!("task-{}", job_id.as_str());
+    let root_agent_id = format!("task-{}", task_id.as_str());
     let spawner = super::agent_runtime::build_one_shot_spawner(
         api,
         token.clone(),
@@ -439,7 +489,7 @@ async fn execute_headless_job_body(
         pm.mode(),
         skill_search.clone(),
         session_id.clone(),
-        global_model.map(str::to_owned),
+        effective_model.clone(),
     )
     .await;
     let spawner_handle_for_drain = spawner.clone();
@@ -459,7 +509,7 @@ async fn execute_headless_job_body(
     };
     // Headless single-shot path: use the MO-backed task store when available
     // so session_todos is authoritative here the same way it is in the REPL.
-    let task_manager = build_one_shot_job_manager(
+    let task_manager = build_one_shot_task_manager(
         profile,
         &api.api_origin(),
         session_routing.task_scope_session_id(),
@@ -470,7 +520,7 @@ async fn execute_headless_job_body(
         api,
         auth_profile: profile,
         message: &prompt,
-        model: global_model,
+        model: effective_model.as_deref(),
         provider: None,
         explain: ExplainMode::Off,
         render_md: terminal::size().is_ok() && !options.quiet && !options.json,
@@ -514,11 +564,11 @@ async fn execute_headless_job_body(
     {
         Ok(sr) => sr,
         Err(e) => {
-            let _ = svc.fail_task(job_id.as_str(), &e.error).await;
-            emit_job_event(
+            let _ = svc.fail_task(task_id.as_str(), &e.error).await;
+            emit_task_event(
                 options.stream_events,
-                failed_job_notification_payload(
-                    job_id.as_str(),
+                failed_task_notification_payload(
+                    task_id.as_str(),
                     &e.error,
                     "turn_error",
                     None,
@@ -540,13 +590,13 @@ async fn execute_headless_job_body(
 
     persist_one_shot_session_state(
         Some(&profile_name),
-        global_model,
+        effective_model.as_deref(),
         &prompt,
         &mut sr,
         turn_start,
     );
 
-    let output_path_result = write_task_output(job_id.as_str(), &sr.full_text);
+    let output_path_result = write_task_output(task_id.as_str(), &sr.full_text);
     let output_path_string = match output_path_result.as_ref() {
         Ok(path) => Some(path.to_string_lossy().to_string()),
         Err(error) => {
@@ -556,9 +606,9 @@ async fn execute_headless_job_body(
     };
     let exit_code = match crate::cli::task::task_result_command::finalize_headless_task_result(
         svc.as_ref(),
-        job_id.as_str(),
+        task_id.as_str(),
         &sr,
-        Some(job_session_id.as_str()),
+        Some(task_session_id.as_str()),
         output_path_string.as_deref(),
     )
     .await
@@ -567,16 +617,16 @@ async fn execute_headless_job_body(
         Err(e) => {
             let _ = svc
                 .fail_task(
-                    job_id.as_str(),
+                    task_id.as_str(),
                     &encode_task_failure_message("persistence_error", &e),
                 )
                 .await;
-            emit_job_event(
+            emit_task_event(
                 options.stream_events,
-                failed_job_notification_payload(
-                    job_id.as_str(),
+                failed_task_notification_payload(
+                    task_id.as_str(),
                     &e,
-                    "job_record_error",
+                    "task_record_error",
                     output_path_string.as_deref(),
                     sr.session_persistence_error.as_deref(),
                 ),
@@ -585,10 +635,10 @@ async fn execute_headless_job_body(
         }
     };
 
-    emit_job_event(
+    emit_task_event(
         options.stream_events,
-        job_notification_payload(
-            job_id.as_str(),
+        task_notification_payload(
+            task_id.as_str(),
             &sr,
             output_path_string.as_deref(),
             exit_code,
@@ -598,10 +648,10 @@ async fn execute_headless_job_body(
     if options.json {
         let mut json_output = final_json_output(&sr, exit_code);
         if let Some(obj) = json_output.as_object_mut() {
-            obj.insert("job_id".to_string(), serde_json::json!(job_id.as_str()));
+            obj.insert("task_id".to_string(), serde_json::json!(task_id.as_str()));
             obj.insert(
-                "job_status".to_string(),
-                serde_json::json!(job_status_for_exit_code(exit_code)),
+                "task_status".to_string(),
+                serde_json::json!(task_status_for_exit_code(exit_code)),
             );
             obj.insert(
                 "output_file".to_string(),
@@ -626,7 +676,7 @@ async fn execute_headless_job_body(
     } else {
         eprintln!(
             "{}",
-            job_terminal_summary_line(job_id.as_str(), output_path_string.as_deref(), exit_code)
+            task_terminal_summary_line(task_id.as_str(), output_path_string.as_deref(), exit_code)
         );
     }
 
@@ -635,8 +685,8 @@ async fn execute_headless_job_body(
     Ok(exit_code)
 }
 
-async fn execute_headless_job_run(
-    args: JobRunArgs,
+async fn execute_headless_task_run(
+    args: TaskRunArgs,
     profile: Option<&str>,
     global_model: Option<&str>,
     api: &astra_thin_client::ThinClient,
@@ -646,7 +696,7 @@ async fn execute_headless_job_run(
 
     let prompt = join_words(&args.text);
     if prompt.trim().is_empty() {
-        return Err("job prompt cannot be empty".to_string());
+        return Err("task prompt cannot be empty".to_string());
     }
 
     let session_routing =
@@ -655,7 +705,7 @@ async fn execute_headless_job_run(
     let user_id = cli_user_id();
     let task_session_id = session_routing
         .task_scope_session_id()
-        .unwrap_or(NON_CANONICAL_JOB_SCOPE)
+        .unwrap_or(NON_CANONICAL_TASK_SCOPE)
         .to_string();
     let svc = session_runtime::resolve_task_service(profile).await;
     let task_id = svc
@@ -673,15 +723,15 @@ async fn execute_headless_job_run(
         )
         .await?;
 
-    execute_headless_job_body(
-        HeadlessJobInput {
-            job_id: std::sync::Arc::new(task_id),
-            job_session_id: std::sync::Arc::new(task_session_id),
+    execute_headless_task_body(
+        HeadlessTaskInput {
+            task_id: std::sync::Arc::new(task_id),
+            task_session_id: std::sync::Arc::new(task_session_id),
             prompt,
             svc,
             session_routing,
         },
-        HeadlessJobOptions {
+        HeadlessTaskOptions {
             json: args.json,
             quiet: args.quiet,
             stream_events: args.stream_events,
@@ -697,15 +747,15 @@ async fn execute_headless_job_run(
 
 /// Outcome of a single worker poll. `Interrupted` lets the outer
 /// `--loop` driver tell a user-initiated Ctrl+C apart from a normal
-/// "job done" cycle, so the loop exits promptly instead of requiring
+/// "task done" cycle, so the loop exits promptly instead of requiring
 /// a second Ctrl+C during the poll-interval sleep.
 enum WorkerOutcome {
     Completed(ExitCode),
     Interrupted,
 }
 
-async fn execute_job_worker_once(
-    args: &JobWorkerArgs,
+async fn execute_task_worker_once(
+    args: &TaskWorkerArgs,
     profile: Option<&str>,
     global_model: Option<&str>,
     api: &astra_thin_client::ThinClient,
@@ -733,7 +783,7 @@ async fn execute_job_worker_once(
                     );
                 } else if !args.quiet {
                     eprintln!(
-                        "  {} Claimed cloud job {} as {}",
+                        "  {} Claimed cloud task {} as {}",
                         "▶".cyan(),
                         prefix_chars(&grant.task_id, 8).dim(),
                         agent_id.as_str().cyan()
@@ -770,7 +820,7 @@ async fn execute_job_worker_once(
     let task_session_id = std::sync::Arc::new(
         session_id
             .clone()
-            .unwrap_or_else(|| NON_CANONICAL_JOB_SCOPE.to_string()),
+            .unwrap_or_else(|| NON_CANONICAL_TASK_SCOPE.to_string()),
     );
     let user_id = std::sync::Arc::new(user_id);
     let task_id = std::sync::Arc::new(task_id);
@@ -794,10 +844,10 @@ async fn execute_job_worker_once(
             metrics: None,
         });
 
-    // Honour Ctrl+C during long-running job execution. Without this the
-    // worker has to wait for the job body to finish, which can be
+    // Honour Ctrl+C during long-running task execution. Without this the
+    // worker has to wait for the task body to finish, which can be
     // minutes; users expect interrupt to be prompt. On Ctrl+C we fall
-    // through to release_lease so the job is freed for another worker.
+    // through to release_lease so the task is freed for another worker.
     // `interrupted` lets the outer --loop driver exit cleanly instead
     // of requiring a second Ctrl+C during the poll-interval sleep.
     let (body_result, interrupted): (Result<ExitCode, String>, bool) = tokio::select! {
@@ -808,15 +858,15 @@ async fn execute_job_worker_once(
                 session_id,
                 true,
             ).await?;
-            execute_headless_job_body(
-                HeadlessJobInput {
-                    job_id: task_id.clone(),
-                    job_session_id: task_session_id.clone(),
+            execute_headless_task_body(
+                HeadlessTaskInput {
+                    task_id: task_id.clone(),
+                    task_session_id: task_session_id.clone(),
                     prompt,
                     svc: svc.clone(),
                     session_routing,
                 },
-                HeadlessJobOptions {
+                HeadlessTaskOptions {
                     json: args.json,
                     quiet: args.quiet,
                     stream_events: args.stream_events,
@@ -830,7 +880,7 @@ async fn execute_job_worker_once(
         } => (res, false),
         _ = tokio::signal::ctrl_c() => {
             if !args.quiet && !args.json {
-                eprintln!("  {}", "Job interrupted — releasing lease.".dim());
+                eprintln!("  {}", "Task interrupted — releasing lease.".dim());
             }
             (Ok(ExitCode::Success), true)
         }
@@ -861,25 +911,26 @@ async fn execute_job_worker_once(
     })
 }
 
-async fn execute_job_worker(
-    args: JobWorkerArgs,
+async fn execute_task_worker(
+    args: TaskWorkerArgs,
     profile: Option<&str>,
     global_model: Option<&str>,
     api: &astra_thin_client::ThinClient,
     cli_context: &crate::cli::cli_config::cli_context::CliContext,
 ) -> Result<ExitCode, String> {
     if !args.once && !args.loop_mode {
-        return Err("choose --once or --loop for job worker".to_string());
+        return Err("choose --once or --loop for task worker".to_string());
     }
     if args.once {
-        return match execute_job_worker_once(&args, profile, global_model, api, cli_context).await?
+        return match execute_task_worker_once(&args, profile, global_model, api, cli_context)
+            .await?
         {
             WorkerOutcome::Completed(code) => Ok(code),
             WorkerOutcome::Interrupted => Ok(ExitCode::Success),
         };
     }
     loop {
-        match execute_job_worker_once(&args, profile, global_model, api, cli_context).await? {
+        match execute_task_worker_once(&args, profile, global_model, api, cli_context).await? {
             WorkerOutcome::Completed(code) if code != ExitCode::Success => return Ok(code),
             WorkerOutcome::Completed(_) => {}
             // User Ctrl+C'd mid-task — exit the loop now so they don't
@@ -939,7 +990,7 @@ async fn execute_repl_bridge_command(
     match slash_cmd {
         "/team" => slash_team::handle_team_command(arg, api, profile, &mut state).await,
         "/telemetry" => slash_telemetry::handle_telemetry_command(arg, &state),
-        "/job" => {
+        "/task" => {
             slash_task::handle_task_command(arg, &mut state, api, profile, token.as_deref()).await
         }
         "/memory" => {
@@ -1146,14 +1197,16 @@ pub(crate) async fn execute_cli_command(
     match command {
         // No subcommand → interactive TUI (Codex-style default)
         None | Some(Command::Interactive) => {
+            let mut interactive_context = cli_context.clone();
+            let resume_session_id = interactive_context.session_id.take();
             run_interactive_chat(
                 api,
                 profile.as_deref(),
                 global_model.as_deref(),
-                None,
+                resume_session_id.as_deref(),
                 no_instructions,
                 max_budget,
-                cli_context,
+                &interactive_context,
             )
             .await?;
             Ok(ExitCode::Success)
@@ -1195,15 +1248,22 @@ pub(crate) async fn execute_cli_command(
             )
             .await?;
             let session_id = session_routing.server_session_id.clone();
+            let effective_model = effective_one_shot_model(
+                None,
+                session_routing.restored_model(),
+                global_model.as_deref(),
+            )
+            .map(str::to_owned);
+            let effective_permission_mode = effective_one_shot_permission_mode(
+                None,
+                auto_approve,
+                session_routing.restored_permission_mode(),
+                false,
+            )?;
             let mut continuation_messages = session_routing.continuation_messages();
             let _pipeline = create_pipeline_modules(api, profile.as_deref());
-            let mode = if auto_approve {
-                PermissionMode::Auto
-            } else {
-                PermissionMode::Prompt
-            };
             let mut pm = PermissionManager::with_load_policy(
-                mode,
+                effective_permission_mode,
                 &std::env::current_dir().unwrap_or_default(),
                 &crate::cli::permission_manager::PermissionLoadPolicy::HeadlessSafe,
             );
@@ -1213,7 +1273,7 @@ pub(crate) async fn execute_cli_command(
                 api,
                 auth_profile: profile.as_deref(),
                 message: &message,
-                model: global_model.as_deref(),
+                model: effective_model.as_deref(),
                 provider: None,
                 explain: ExplainMode::Off,
                 render_md: terminal::size().is_ok(),
@@ -1222,10 +1282,6 @@ pub(crate) async fn execute_cli_command(
                 cli_context: Some(cli_context),
                 unified_skill_registry: astra_runtime::skills::default_unified_registry(),
                 skill_search: &skill_search,
-                // Non-Chat (Message-style) path — legacy single-shot
-                // invocation without dynamic sub-agent support. Keep
-                // pre-fix behavior; extend later if this path needs
-                // spawning too.
                 agent_spawner: None,
                 root_agent_id: None,
                 task_manager: None,
@@ -1290,7 +1346,7 @@ pub(crate) async fn execute_cli_command(
             };
             let exit_code = finalize_one_shot_stream_result(
                 profile.as_deref(),
-                global_model.as_deref(),
+                effective_model.as_deref(),
                 &message,
                 &mut sr,
                 turn_start,
@@ -1416,9 +1472,9 @@ pub(crate) async fn execute_cli_command(
             .await
         }
 
-        Some(Command::Job(mut args)) => match args.command.take() {
-            Some(JobSubcommand::Run(run_args)) => {
-                execute_headless_job_run(
+        Some(Command::Task(mut args)) => match args.command.take() {
+            Some(TaskSubcommand::Run(run_args)) => {
+                execute_headless_task_run(
                     run_args,
                     profile.as_deref(),
                     global_model.as_deref(),
@@ -1427,12 +1483,12 @@ pub(crate) async fn execute_cli_command(
                 )
                 .await
             }
-            Some(JobSubcommand::Queue(queue_args)) => {
-                crate::cli::task::task_queue_command::execute_job_queue(queue_args, cli_context)
+            Some(TaskSubcommand::Queue(queue_args)) => {
+                crate::cli::task::task_queue_command::execute_task_queue(queue_args, cli_context)
                     .await
             }
-            Some(JobSubcommand::Worker(worker_args)) => {
-                execute_job_worker(
+            Some(TaskSubcommand::Worker(worker_args)) => {
+                execute_task_worker(
                     worker_args,
                     profile.as_deref(),
                     global_model.as_deref(),
@@ -1441,13 +1497,13 @@ pub(crate) async fn execute_cli_command(
                 )
                 .await
             }
-            Some(JobSubcommand::Result(result_args)) => {
-                crate::cli::task::task_result_command::execute_job_result(result_args).await
+            Some(TaskSubcommand::Result(result_args)) => {
+                crate::cli::task::task_result_command::execute_task_result(result_args).await
             }
             _ => {
                 execute_repl_bridge_command(
-                    "/job",
-                    &render_job_args(&args),
+                    "/task",
+                    &render_task_args(&args),
                     profile.as_deref(),
                     global_model.as_deref(),
                     api,
@@ -1649,14 +1705,21 @@ pub(crate) async fn execute_cli_command(
             } else {
                 // No message → start interactive TUI with optional pre-set session/model
                 let model = args.model.as_deref().or(global_model.as_deref());
+                let mut interactive_context = cli_context
+                    .clone()
+                    .with_permission_mode(args.permission_mode.clone());
+                let resume_session_id = args
+                    .session_id
+                    .clone()
+                    .or_else(|| interactive_context.session_id.take());
                 run_interactive_chat(
                     api,
                     profile.as_deref(),
                     model,
-                    None,
+                    resume_session_id.as_deref(),
                     no_instructions,
                     max_budget,
-                    cli_context,
+                    &interactive_context,
                 )
                 .await?;
                 return Ok(ExitCode::Success);
@@ -1675,33 +1738,28 @@ pub(crate) async fn execute_cli_command(
             )
             .await?;
             let session_id = session_routing.server_session_id.clone();
+            let effective_model = effective_one_shot_model(
+                args.model.as_deref(),
+                session_routing.restored_model(),
+                global_model.as_deref(),
+            )
+            .map(str::to_owned);
+            let effective_permission_mode = effective_one_shot_permission_mode(
+                args.permission_mode.as_deref(),
+                args.auto_approve || auto_approve,
+                session_routing.restored_permission_mode(),
+                false,
+            )?;
             let mut continuation_messages = session_routing.continuation_messages();
             let is_tty = terminal::size().is_ok();
             let _pipeline = create_pipeline_modules(api, profile.as_deref());
             let mut pm = {
                 let project_root = std::env::current_dir().unwrap_or_default();
-                if let Some(ref mode_str) = args.permission_mode {
-                    let mode: PermissionMode = mode_str.parse().unwrap_or_else(|e| {
-                        eprintln!("{}", format!("  ⚠  {e}, defaulting to prompt").yellow());
-                        PermissionMode::Prompt
-                    });
-                    PermissionManager::with_load_policy(
-                        mode,
-                        &project_root,
-                        &crate::cli::permission_manager::PermissionLoadPolicy::HeadlessSafe,
-                    )
-                } else {
-                    let mode = if args.auto_approve || auto_approve {
-                        PermissionMode::Auto
-                    } else {
-                        PermissionMode::Prompt
-                    };
-                    PermissionManager::with_load_policy(
-                        mode,
-                        &project_root,
-                        &crate::cli::permission_manager::PermissionLoadPolicy::HeadlessSafe,
-                    )
-                }
+                PermissionManager::with_load_policy(
+                    effective_permission_mode,
+                    &project_root,
+                    &crate::cli::permission_manager::PermissionLoadPolicy::HeadlessSafe,
+                )
             };
             let explain_mode = args.explain.unwrap_or(ExplainMode::Off);
 
@@ -1718,15 +1776,8 @@ pub(crate) async fn execute_cli_command(
                 crate::cli::stream::stream_render::RenderPolicy::Stream
             };
 
-            // Bug-A fix: build a DynamicAgentSpawner so `astra chat -m`
-            // can service `agent(action='spawn', ...)`, matching the REPL
-            // path. Without this, one-shot LLM invocations that try
-            // to spawn hit "Agent spawning not available in
-            // this context." — discovered during real-world MiniMax
-            // verification. Mirrors the REPL's
-            // `initialize_multi_agent_runtime` wiring via the
-            // extracted `build_one_shot_spawner` helper so the
-            // fork-prefix pipeline is identically configured.
+            // One-shot chat uses the same local agent spawner wiring as the
+            // REPL so agent(action='spawn', ...) has the same behavior.
             let root_agent_id = format!("root-{}", uuid::Uuid::new_v4());
             let one_shot_spawner = super::agent_runtime::build_one_shot_spawner(
                 api,
@@ -1735,10 +1786,7 @@ pub(crate) async fn execute_cli_command(
                 pm.mode(),
                 skill_search.clone(),
                 session_id.clone(),
-                args.model
-                    .as_deref()
-                    .or(global_model.as_deref())
-                    .map(str::to_owned),
+                effective_model.clone(),
             )
             .await;
 
@@ -1767,7 +1815,7 @@ pub(crate) async fn execute_cli_command(
             // through to `session_todos`. Without this the tool runs against
             // a throwaway in-memory manager and the Tier 1 board is invisible
             // across edge/cloud boundaries.
-            let chat_task_manager = build_one_shot_job_manager(
+            let chat_task_manager = build_one_shot_task_manager(
                 profile.as_deref(),
                 &api.api_origin(),
                 session_id.as_deref(),
@@ -1777,7 +1825,7 @@ pub(crate) async fn execute_cli_command(
                 api,
                 auth_profile: profile.as_deref(),
                 message: &message,
-                model: args.model.as_deref().or(global_model.as_deref()),
+                model: effective_model.as_deref(),
                 provider: None,
                 explain: explain_mode,
                 render_md,
@@ -1824,7 +1872,7 @@ pub(crate) async fn execute_cli_command(
 
             let exit_code = finalize_one_shot_stream_result(
                 profile.as_deref(),
-                args.model.as_deref().or(global_model.as_deref()),
+                effective_model.as_deref(),
                 &message,
                 &mut sr,
                 turn_start,
@@ -2472,24 +2520,25 @@ pub(crate) async fn run_print_mode(
         resolve_one_shot_session_routing(api, profile, cli_context.session_id.clone(), true)
             .await?;
     let session_id = session_routing.server_session_id.clone();
+    let effective_model =
+        effective_one_shot_model(None, session_routing.restored_model(), model).map(str::to_owned);
+    let effective_permission_mode = effective_one_shot_permission_mode(
+        None,
+        false,
+        session_routing.restored_permission_mode(),
+        true,
+    )?;
     let mut continuation_messages = session_routing.continuation_messages();
     let _pipeline = create_pipeline_modules(api, profile);
-    // Issue #326 P0 / R1 Major 2: print mode (headless `astra -p`) is
-    // non-interactive — there is no TUI to ask for approvals. We force
-    // `auto_approve = true` (= PermissionMode::Auto) here. The
-    // bypass-immune deny rules (sensitive paths, git-destructive,
-    // execute hard-deny, sandbox circuit breaker) still fire in Auto
-    // mode; this only avoids popping a non-existent prompt. If a tool genuinely requires
-    // NeedApproval (e.g. compensation prompts after a denial), the
-    // gate fans out to silent-fail-closed in stream_render.rs (line
-    // ~1983), surfacing the deny reason to the LLM instead of hanging.
+    // Print mode is non-interactive. Restored session mode wins when present;
+    // otherwise Auto is the headless fallback.
     // Issue #326 P5b: print mode is headless — strip project
     // allow rules so a hostile project file can't quietly enable
     // capabilities the user didn't ask for. Project deny rules
     // still apply (a project can tighten, never loosen, the
     // headless policy).
     let mut pm = PermissionManager::with_load_policy(
-        crate::cli::permission_manager::PermissionMode::Auto,
+        effective_permission_mode,
         &std::env::current_dir().unwrap_or_default(),
         &crate::cli::permission_manager::PermissionLoadPolicy::HeadlessSafe,
     );
@@ -2510,7 +2559,7 @@ pub(crate) async fn run_print_mode(
     // path handles them. Without this, single-shot runs silently drop to
     // in-memory scratchpad and the Tier 1 board is invisible across turns
     // that reuse the same `session_id`.
-    let print_task_manager = build_one_shot_job_manager(
+    let print_task_manager = build_one_shot_task_manager(
         profile,
         &api.api_origin(),
         session_routing.task_scope_session_id(),
@@ -2521,7 +2570,7 @@ pub(crate) async fn run_print_mode(
         api,
         auth_profile: profile,
         message: &message,
-        model,
+        model: effective_model.as_deref(),
         provider: None,
         explain: ExplainMode::Off,
         render_md: false,
@@ -2567,7 +2616,13 @@ pub(crate) async fn run_print_mode(
         Err(e) => return Err(e.error),
     };
 
-    let exit_code = finalize_one_shot_stream_result(profile, model, &message, &mut sr, turn_start);
+    let exit_code = finalize_one_shot_stream_result(
+        profile,
+        effective_model.as_deref(),
+        &message,
+        &mut sr,
+        turn_start,
+    );
 
     match output_format {
         "json" | "stream-json" => {
@@ -3285,6 +3340,49 @@ mod final_json_output_tests {
 }
 
 #[cfg(test)]
+mod one_shot_effective_settings_tests {
+    use super::{effective_one_shot_model, effective_one_shot_permission_mode};
+    use crate::cli::permission_manager::PermissionMode;
+
+    #[test]
+    fn effective_one_shot_model_prefers_explicit_then_restored_then_fallback() {
+        assert_eq!(
+            effective_one_shot_model(Some("chat-explicit"), Some("restored"), Some("fallback")),
+            Some("chat-explicit")
+        );
+        assert_eq!(
+            effective_one_shot_model(None, Some("restored"), Some("fallback")),
+            Some("restored")
+        );
+        assert_eq!(
+            effective_one_shot_model(None, None, Some("fallback")),
+            Some("fallback")
+        );
+    }
+
+    #[test]
+    fn effective_one_shot_permission_mode_prefers_explicit_then_auto_then_restored() {
+        assert_eq!(
+            effective_one_shot_permission_mode(Some("plan"), true, Some("accept_edits"), false)
+                .unwrap(),
+            PermissionMode::Plan
+        );
+        assert_eq!(
+            effective_one_shot_permission_mode(None, true, Some("plan"), false).unwrap(),
+            PermissionMode::Auto
+        );
+        assert_eq!(
+            effective_one_shot_permission_mode(None, false, Some("accept_edits"), false).unwrap(),
+            PermissionMode::AcceptEdits
+        );
+        assert_eq!(
+            effective_one_shot_permission_mode(None, false, None, true).unwrap(),
+            PermissionMode::Auto
+        );
+    }
+}
+
+#[cfg(test)]
 mod one_shot_persistence_tests {
     use super::{
         ExitCode, StreamResult, finalize_one_shot_stream_result, persist_one_shot_session_state,
@@ -3518,9 +3616,9 @@ mod one_shot_persistence_tests {
 #[cfg(test)]
 mod task_run_projection_tests {
     use super::{
-        ExitCode, NON_CANONICAL_JOB_SCOPE, StreamResult, build_one_shot_job_manager,
-        failed_job_notification_payload, job_notification_payload, job_terminal_summary_line,
-        one_shot_completion_warning,
+        ExitCode, NON_CANONICAL_TASK_SCOPE, StreamResult, build_one_shot_task_manager,
+        failed_task_notification_payload, one_shot_completion_warning, task_notification_payload,
+        task_terminal_summary_line,
     };
     use crate::cli::task::task_result_projection::{
         stream_result_failure_reason, task_checkpoint_state_from_result,
@@ -3613,17 +3711,17 @@ mod task_run_projection_tests {
     }
 
     #[test]
-    fn job_notification_payload_includes_exit_semantics_for_persistence_error() {
+    fn task_notification_payload_includes_exit_semantics_for_persistence_error() {
         let sr = stream_result_for_task_checkpoint();
-        let payload = job_notification_payload(
+        let payload = task_notification_payload(
             "task-12345678",
             &sr,
             Some("/tmp/out.txt"),
             ExitCode::PersistenceError,
         );
 
-        assert_eq!(payload["type"], "background_job_notification");
-        assert_eq!(payload["job_id"], "task-12345678");
+        assert_eq!(payload["type"], "background_task_notification");
+        assert_eq!(payload["task_id"], "task-12345678");
         assert_eq!(payload["status"], "persistence_error");
         assert_eq!(payload["success"], false);
         assert_eq!(payload["exit_code"], 4);
@@ -3639,13 +3737,13 @@ mod task_run_projection_tests {
     }
 
     #[test]
-    fn job_notification_payload_marks_partial_outcome() {
+    fn task_notification_payload_marks_partial_outcome() {
         let mut sr = stream_result_for_task_checkpoint();
         sr.session_persistence_error = None;
         sr.final_state = "interrupted".into();
         sr.interruption_kind = Some("budget_exhausted".into());
 
-        let payload = job_notification_payload(
+        let payload = task_notification_payload(
             "task-12345678",
             &sr,
             Some("/tmp/out.txt"),
@@ -3661,58 +3759,62 @@ mod task_run_projection_tests {
     }
 
     #[test]
-    fn failed_job_notification_payload_carries_failure_detail() {
-        let payload = failed_job_notification_payload(
+    fn failed_task_notification_payload_carries_failure_detail() {
+        let payload = failed_task_notification_payload(
             "task-12345678",
-            "write job output: permission denied",
+            "write task output: permission denied",
             "persistence_error",
             None,
-            Some("write job output: permission denied"),
+            Some("write task output: permission denied"),
         );
 
-        assert_eq!(payload["type"], "background_job_notification");
-        assert_eq!(payload["job_id"], "task-12345678");
+        assert_eq!(payload["type"], "background_task_notification");
+        assert_eq!(payload["task_id"], "task-12345678");
         assert_eq!(payload["status"], "persistence_error");
         assert_eq!(payload["success"], false);
         assert_eq!(payload["error_kind"], "persistence_error");
-        assert_eq!(payload["summary"], "write job output: permission denied");
+        assert_eq!(payload["summary"], "write task output: permission denied");
         assert_eq!(
             payload["persistence_error"],
-            "write job output: permission denied"
+            "write task output: permission denied"
         );
         assert!(payload.get("output_file").is_none());
     }
 
     #[test]
-    fn job_terminal_summary_line_distinguishes_success_and_persistence_failure() {
+    fn task_terminal_summary_line_distinguishes_success_and_persistence_failure() {
         let success =
-            job_terminal_summary_line("task-12345678", Some("/tmp/out.txt"), ExitCode::Success);
+            task_terminal_summary_line("task-12345678", Some("/tmp/out.txt"), ExitCode::Success);
         assert!(success.contains("finished; output saved to"));
         assert!(!success.contains("persistence degradation"));
 
         let partial =
-            job_terminal_summary_line("task-12345678", Some("/tmp/out.txt"), ExitCode::Partial);
+            task_terminal_summary_line("task-12345678", Some("/tmp/out.txt"), ExitCode::Partial);
         assert!(partial.contains("finished partially; output saved to"));
 
-        let degraded = job_terminal_summary_line(
+        let degraded = task_terminal_summary_line(
             "task-12345678",
             Some("/tmp/out.txt"),
             ExitCode::PersistenceError,
         );
         assert!(degraded.contains("finished with persistence degradation; output saved to"));
 
-        let tool_failure =
-            job_terminal_summary_line("task-12345678", Some("/tmp/out.txt"), ExitCode::ToolFailure);
+        let tool_failure = task_terminal_summary_line(
+            "task-12345678",
+            Some("/tmp/out.txt"),
+            ExitCode::ToolFailure,
+        );
         assert!(tool_failure.contains("failed; output saved to"));
 
         let unfinished =
-            job_terminal_summary_line("task-12345678", Some("/tmp/out.txt"), ExitCode::Unfinished);
+            task_terminal_summary_line("task-12345678", Some("/tmp/out.txt"), ExitCode::Unfinished);
         assert!(unfinished.contains("unfinished; output saved to"));
     }
 
     #[test]
-    fn job_terminal_summary_line_handles_missing_output_file() {
-        let degraded = job_terminal_summary_line("task-12345678", None, ExitCode::PersistenceError);
+    fn task_terminal_summary_line_handles_missing_output_file() {
+        let degraded =
+            task_terminal_summary_line("task-12345678", None, ExitCode::PersistenceError);
         assert!(degraded.contains("output file unavailable"));
     }
 
@@ -3744,14 +3846,14 @@ mod task_run_projection_tests {
     }
 
     #[tokio::test]
-    async fn build_one_shot_job_manager_without_canonical_session_uses_ephemeral_store() {
+    async fn build_one_shot_task_manager_without_canonical_session_uses_ephemeral_store() {
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
 
-        let first = build_one_shot_job_manager(None, &api.api_origin(), None).await;
-        let second = build_one_shot_job_manager(None, &api.api_origin(), None).await;
+        let first = build_one_shot_task_manager(None, &api.api_origin(), None).await;
+        let second = build_one_shot_task_manager(None, &api.api_origin(), None).await;
 
-        assert_eq!(first.session_id(), NON_CANONICAL_JOB_SCOPE);
-        assert_eq!(second.session_id(), NON_CANONICAL_JOB_SCOPE);
+        assert_eq!(first.session_id(), NON_CANONICAL_TASK_SCOPE);
+        assert_eq!(second.session_id(), NON_CANONICAL_TASK_SCOPE);
 
         let created = first
             .create(&serde_json::json!({ "title": "ephemeral" }))

@@ -82,6 +82,16 @@ impl<'a> Drop for DetachHandleGuard<'a> {
         }
     }
 }
+
+async fn restore_detach_signal_receiver(
+    detach: &DetachShellHandle,
+    signal_rx: Option<tokio::sync::watch::Receiver<bool>>,
+) {
+    if let Some(signal_rx) = signal_rx {
+        *detach.signal_rx.lock().await = Some(signal_rx);
+    }
+}
+
 const GLOB_TIMEOUT: Duration = Duration::from_secs(15);
 /// Fallback `bash` timeout when the caller omits `timeout` AND the classifier
 /// cannot confidently identify the command family. See [`classify_bash_command`]
@@ -792,7 +802,7 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
     // ToolContext AND it currently holds a handle, run via the
     // sibling runner so Ctrl+B can transfer child + streams to the
     // BackgroundTaskRegistry. Without a slot OR with an empty slot
-    // we fall through to the legacy reader (zero hot-path overhead).
+    // this bash invocation remains a normal foreground command.
     //
     // RAII guard pattern: take handle from slot, wrap in guard that
     // tracks ownership. Callers must explicitly restore() on error
@@ -849,7 +859,7 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
                 let mut result = ToolResult::text(
                     "<bash_detached>The bash command was promoted to a background task. \
                      The host will resume reading its output via the BackgroundTaskRegistry; \
-                     poll progress with `job(action='output')` or `job(action='output', job_id=<bg-shell-N>)`.\
+                     poll progress with `task_output(task_id=<bg-shell-N>)` or inspect tasks with `task_list()`.\
                      </bash_detached>"
                         .to_string(),
                 );
@@ -3113,8 +3123,8 @@ pub(crate) async fn run_bash_with_detach(
         stderr_detach.clone(),
     ));
 
-    // Take the watch receiver for detach. If absent, treat as no detach
-    // plumbing (legacy path). The watch receiver is borrowed in select!
+    // Take the watch receiver for detach. If absent, the command
+    // cannot be promoted. The watch receiver is borrowed in select!
     // so we don't need ownership gymnastics.
     let mut signal_rx = detach.signal_rx.lock().await.take();
 
@@ -3216,6 +3226,7 @@ pub(crate) async fn run_bash_with_detach(
                     max_stderr_bytes,
                     &mut stderr_capped,
                 );
+                restore_detach_signal_receiver(detach, signal_rx).await;
                 return Err(error_msg);
             }
         }
@@ -3279,6 +3290,7 @@ pub(crate) async fn run_bash_with_detach(
         truncate_partial_line(&mut stderr_text);
     }
 
+    restore_detach_signal_receiver(detach, signal_rx).await;
     Ok(BashRunOutcome::Completed(ReadOnlyCommandOutput {
         stdout: stdout_text,
         stderr: stderr_text,
@@ -5462,7 +5474,7 @@ printf 'probe.txt:1:needle\n'
     async fn bash_detach_slot_is_reusable_after_normal_completion() {
         let dir = tempdir().unwrap();
         let mut ctx = crate::ToolContext::test(dir.path());
-        let (slot, _listener) = crate::detach::new_slot_with_handle();
+        let (slot, listener) = crate::detach::new_slot_with_handle();
         ctx.detach_shell_handle = Some(slot.clone());
 
         let first = execute_bash(&ctx, &serde_json::json!({"command": "printf 'first\\n'"})).await;
@@ -5472,13 +5484,34 @@ printf 'probe.txt:1:needle\n'
             "normal bash completion must return the detach handle so later bash calls in the same turn can still be backgrounded"
         );
 
-        let second =
-            execute_bash(&ctx, &serde_json::json!({"command": "printf 'second\\n'"})).await;
-        assert!(second.output.contains("second"), "{}", second.output);
+        let second = tokio::spawn({
+            let ctx = ctx.clone();
+            async move {
+                execute_bash(
+                    &ctx,
+                    &serde_json::json!({
+                        "command": "printf 'before-second\\n'; sleep 1; printf 'after-second\\n'"
+                    }),
+                )
+                .await
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        listener.signal_tx.send(true).expect("detach signal send");
+        let payload = listener
+            .payload_rx
+            .await
+            .expect("listener must receive second bash payload");
         assert!(
-            slot.lock().await.is_some(),
-            "second normal bash completion must also return the detach handle"
+            payload.partial_stdout.contains("before-second"),
+            "second bash must still observe Ctrl+B after first normal completion: {:?}",
+            payload.partial_stdout
         );
+        drop(payload);
+
+        let second = second.await.expect("second bash task");
+        assert!(second.output.contains("bash_detached"), "{}", second.output);
     }
 
     /// Sanity: when no detach handle is wired, the bash tool falls

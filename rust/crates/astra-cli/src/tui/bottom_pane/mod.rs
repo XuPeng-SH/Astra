@@ -1,4 +1,5 @@
 pub(crate) mod ask_user_view;
+pub(crate) mod background_task_view;
 pub(crate) mod busy_view;
 pub(crate) mod chat_composer;
 pub(crate) mod config_edit_view;
@@ -226,6 +227,29 @@ impl BottomPane {
 
     pub fn active_live_task_id(&self) -> Option<&str> {
         self.view_stack.last().and_then(|view| view.live_task_id())
+    }
+
+    pub fn refresh_background_task_rows(
+        &mut self,
+        rows: Vec<background_task_view::BackgroundTaskRow>,
+    ) -> bool {
+        self.active_view_mut()
+            .is_some_and(|view| view.refresh_background_task_rows(rows))
+    }
+
+    pub fn refresh_background_task_rows_selecting(
+        &mut self,
+        rows: Vec<background_task_view::BackgroundTaskRow>,
+        selected_id: Option<&str>,
+    ) -> bool {
+        self.active_view_mut()
+            .is_some_and(|view| view.refresh_background_task_rows_selecting(rows, selected_id))
+    }
+
+    pub fn accepts_background_task_rows(&self) -> bool {
+        self.view_stack
+            .last()
+            .is_some_and(|view| view.accepts_background_task_rows())
     }
 
     pub fn refresh_agent_rows(
