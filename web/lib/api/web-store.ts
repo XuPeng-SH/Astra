@@ -845,8 +845,14 @@ export async function queueDeferredRunInput(
   };
 }
 
-export async function stopActiveRun(ownerUserId: string, chatId: string) {
-  await syncBackendSessions(ownerUserId);
+export async function stopActiveRun(
+  ownerUserId: string,
+  chatId: string,
+  options?: { skipSync?: boolean },
+) {
+  if (!options?.skipSync) {
+    await syncBackendSessions(ownerUserId);
+  }
   const store = getStore(ownerUserId);
   const chat = store.chats.find((item) => item.id === chatId);
   if (!chat) {
@@ -861,10 +867,11 @@ export async function stopActiveRun(ownerUserId: string, chatId: string) {
     operation: `cancel active run ${chat.activeRun.runId}`,
   });
 
-  await client.sdk.cancelRun(chat.activeRun.runId);
+  const runId = chat.activeRun.runId;
+  await client.sdk.cancelRun(runId);
   chat.activeRun = makeActiveRunRecord(
     {
-      runId: chat.activeRun.runId,
+      runId,
       status: "cancelling",
       waitingFor: null,
     },

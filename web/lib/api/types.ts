@@ -116,6 +116,23 @@ export type ChatDetail = {
   };
 };
 
+export type WorkSurfaceResponse = {
+  sessionId: string | null;
+  runId: string | null;
+  tasks: Array<Record<string, unknown>>;
+  events: Array<Record<string, unknown>>;
+  generatedAt: string;
+  warnings?: string[];
+};
+
+export type WorkSurfaceRunResponse = {
+  runId: string;
+  sessionId: string | null;
+  status?: string | null;
+  events: Array<Record<string, unknown>>;
+  generatedAt: string;
+};
+
 export type ChatListResponse = {
   items: ChatSummary[];
   nextCursor: string | null;
@@ -156,7 +173,7 @@ export type QueueRunInputResponse = {
 };
 
 export type ActiveRunMutationResponse = {
-  activeRun: {
+  activeRun?: {
     runId: string;
     status: string;
     waitingFor?: string | null;

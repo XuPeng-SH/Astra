@@ -1,6 +1,13 @@
 "use client";
 
-import { MoreVertical } from "lucide-react";
+import {
+  Bot,
+  ClipboardList,
+  Loader2,
+  MoreVertical,
+  Terminal,
+  type LucideIcon,
+} from "lucide-react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import {
@@ -16,11 +23,17 @@ import { ChatDotNavigator } from "@/components/app/chat-dot-navigator";
 import { Composer } from "@/components/app/composer";
 import { MessageBubble } from "@/components/app/message-bubble";
 import { MoveChatModal } from "@/components/app/move-chat-modal";
+import {
+  WorkSurfacePanel,
+  type WorkSurfaceTab,
+} from "@/components/app/work-surface-panel";
 import { IconButton } from "@/components/ui/icon-button";
 import { useChatLifecycleActions } from "@/hooks/use-chat-lifecycle-actions";
 import { subscribeChatLifecycleChange } from "@/lib/chat-lifecycle-events";
 import {
   getChat,
+  getChatWorkSurface,
+  getChatWorkSurfaceRun,
   queueChatRunInput,
   resumeChatRun,
   stopChatRun,
@@ -39,10 +52,26 @@ import {
   isChatScrolledToBottom,
   shouldAutoScrollChat,
 } from "@/lib/chat-scroll-state";
+import {
+  applyWorkSurfaceEvent,
+  beginWorkSurfaceLoad,
+  createEmptyWorkSurface,
+  failWorkSurfaceLoad,
+  hydrateWorkSurface,
+  resetWorkSurfaceForRun,
+  type WorkSurfaceResponse as WorkSurfaceProjection,
+} from "@/lib/work-surface";
 import { useToast } from "@/components/ui/toast";
 
 const STREAM_RECONCILE_INITIAL_DELAY_MS = 3_000;
 const STREAM_RECONCILE_INTERVAL_MS = 5_000;
+const RUN_ATTACH_MAX_RETRIES = 4;
+const ATTACHABLE_RUN_STATUSES = new Set([
+  "running",
+  "input-queued",
+  "waiting",
+  "cancelling",
+]);
 
 function isAbortError(error: unknown) {
   return error instanceof DOMException && error.name === "AbortError";
@@ -65,6 +94,56 @@ function hasCompletedAssistantAfterUser(
     }
   }
   return false;
+}
+
+function findStreamingAssistantMessageId(messages: ChatMessage[]) {
+  return [...messages].reverse().find(
+    (message) =>
+      message.role === "assistant" &&
+      (message.status === "streaming" ||
+        message.reasoningStatus === "streaming"),
+  )?.id;
+}
+
+function createStreamingAssistantMessage(id: string): ChatMessage {
+  return {
+    id,
+    role: "assistant",
+    content: "",
+    createdAt: new Date().toISOString(),
+    status: "streaming",
+    reasoning: "",
+    reasoningStatus: "streaming",
+  };
+}
+
+function completeLatestStreamingAssistantAsStopped(messages: ChatMessage[]) {
+  const index = [...messages]
+    .reverse()
+    .findIndex(
+      (message) =>
+        message.role === "assistant" &&
+        (message.status === "streaming" ||
+          message.reasoningStatus === "streaming"),
+    );
+  if (index < 0) {
+    return messages;
+  }
+  const messageIndex = messages.length - 1 - index;
+  return messages.map((message, currentIndex) =>
+    currentIndex === messageIndex
+      ? {
+          ...message,
+          content: message.content.trim() ? message.content : "Stopped.",
+          status: "complete" as const,
+          reasoningStatus: "complete" as const,
+        }
+      : message,
+  );
+}
+
+function canAttachRunStream(status: string | undefined | null) {
+  return status ? ATTACHABLE_RUN_STATUSES.has(status) : false;
 }
 
 function createAssistantPatchController(params: {
@@ -128,10 +207,24 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
   const [queueingDeferredInput, setQueueingDeferredInput] = useState(false);
   const [resumingRun, setResumingRun] = useState(false);
   const [stoppingRun, setStoppingRun] = useState(false);
+  const [runAttachRetrySignal, setRunAttachRetrySignal] = useState(0);
+  const [workSurface, setWorkSurface] = useState(() =>
+    createEmptyWorkSurface(
+      initial.session?.backendSessionId ?? null,
+      initial.activeRun?.runId ?? null,
+    ),
+  );
+  const [workSurfaceTab, setWorkSurfaceTab] =
+    useState<WorkSurfaceTab>("tasks");
+  const [workSurfaceOpenSignal, setWorkSurfaceOpenSignal] = useState(0);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const pinnedRef = useRef(true);
   const pendingStartedRef = useRef<string | null>(null);
   const streamAbortRef = useRef<AbortController | null>(null);
+  const attachedRunRef = useRef<string | null>(null);
+  const autoAttachAttemptedRunRef = useRef<string | null>(null);
+  const autoAttachRetryTimerRef = useRef<number | undefined>(undefined);
+  const autoAttachRetryCountsRef = useRef<Map<string, number>>(new Map());
   const reconcileTimerRef = useRef<number | undefined>(undefined);
   const reconcileIntervalRef = useRef<number | undefined>(undefined);
   const stopReconcileRef = useRef<() => void>(() => {
@@ -173,10 +266,28 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
   });
   const showRunStatusPanel = Boolean(
     detail.activeRun?.runId &&
-    (canResumeRun ||
-      activeRunBlocksNewInput ||
-      activeRunStatus === "cancelling"),
+    canResumeRun,
   );
+  const runningAgentCount = workSurface.agents.filter((agent) =>
+    ["running", "started", "tool_executing", "metrics_update"].includes(
+      agent.status,
+    ),
+  ).length;
+  const runningToolCount = workSurface.tools.filter(
+    (tool) => tool.status === "running",
+  ).length;
+  const workingTaskCount = workSurface.tasks.filter(
+    (task) => task.status === "in_progress",
+  ).length;
+  const showRunActivityBar = Boolean(
+    !isArchived && !canResumeRun && (startingRun || detail.activeRun?.runId),
+  );
+  const runActivityLabel =
+    stoppingRun || activeRunStatus === "cancelling"
+      ? "Stopping"
+      : startingRun
+        ? "Starting run"
+        : activeRunLabel;
 
   const nextStreamAbortSignal = useCallback(() => {
     streamAbortRef.current?.abort();
@@ -184,6 +295,252 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
     streamAbortRef.current = controller;
     return controller.signal;
   }, []);
+
+  const applyWorkSurfaceStreamEvent = useCallback(
+    (event: Record<string, unknown>) => {
+      setWorkSurface((current) => applyWorkSurfaceEvent(current, event));
+    },
+    [],
+  );
+
+  const resetWorkSurfaceRun = useCallback(
+    (runId: string | null, sessionId?: string | null) => {
+      setWorkSurface((current) =>
+        resetWorkSurfaceForRun(current, {
+          sessionId:
+            sessionId === undefined
+              ? (detail.session?.backendSessionId ?? current.sessionId)
+              : sessionId,
+          runId,
+        }),
+      );
+    },
+    [detail.session?.backendSessionId],
+  );
+
+  const ensureStreamingAssistantMessage = useCallback(() => {
+    const existingAssistantMessageId = findStreamingAssistantMessageId(
+      detail.messages,
+    );
+    if (existingAssistantMessageId) {
+      return existingAssistantMessageId;
+    }
+
+    const assistantMessageId = crypto.randomUUID();
+    setDetail((current) =>
+      findStreamingAssistantMessageId(current.messages)
+        ? current
+        : {
+            ...current,
+            messages: [
+              ...current.messages,
+              createStreamingAssistantMessage(assistantMessageId),
+            ],
+          },
+    );
+    return assistantMessageId;
+  }, [detail.messages]);
+
+  const scheduleAutoAttachRetry = useCallback((runId: string) => {
+    const attempts = autoAttachRetryCountsRef.current.get(runId) ?? 0;
+    if (attempts >= RUN_ATTACH_MAX_RETRIES) {
+      return false;
+    }
+    const nextAttempts = attempts + 1;
+    autoAttachRetryCountsRef.current.set(runId, nextAttempts);
+    if (autoAttachRetryTimerRef.current) {
+      window.clearTimeout(autoAttachRetryTimerRef.current);
+    }
+    const delayMs = Math.min(1_000 * 2 ** attempts, 8_000);
+    autoAttachRetryTimerRef.current = window.setTimeout(() => {
+      autoAttachRetryTimerRef.current = undefined;
+      if (autoAttachAttemptedRunRef.current === runId) {
+        autoAttachAttemptedRunRef.current = null;
+      }
+      setRunAttachRetrySignal((signal) => signal + 1);
+    }, delayMs);
+    return true;
+  }, []);
+
+  const attachExistingRunStream = useCallback(
+    (
+      runId: string,
+      assistantMessageId: string,
+      failureMessage: string,
+      options?: { scheduleRetry?: () => boolean },
+    ) => {
+      if (attachedRunRef.current === runId) {
+        return;
+      }
+
+      attachedRunRef.current = runId;
+      resetWorkSurfaceRun(runId);
+      const assistantPatcher = createAssistantPatchController({
+        setDetail,
+        getAssistantId: () => assistantMessageId,
+      });
+      const clearActiveRun = () => {
+        setDetail((current) =>
+          current.activeRun?.runId === runId
+            ? {
+                ...current,
+                activeRun: undefined,
+              }
+            : current,
+        );
+      };
+
+      void streamExistingChatRun(detail.chat.id, runId, {
+        signal: nextStreamAbortSignal(),
+        onWorkSurfaceEvent: applyWorkSurfaceStreamEvent,
+        onRunUpdated: (run) => {
+          setDetail((current) => ({
+            ...current,
+            activeRun: {
+              runId: run.runId,
+              status: run.status,
+              waitingFor: run.waitingFor ?? null,
+            },
+          }));
+        },
+        onRunFinished: () => {
+          setStoppingRun(false);
+          clearActiveRun();
+        },
+        onReasoning: (reasoning) => {
+          assistantPatcher.patchBatched({
+            reasoning,
+            reasoningStatus: "streaming",
+            status: "streaming",
+          });
+        },
+        onReasoningDone: (reasoning) => {
+          assistantPatcher.patchBatched({
+            reasoning,
+            reasoningStatus: "complete",
+            status: "streaming",
+          });
+        },
+        onText: (content) => {
+          assistantPatcher.patchBatched({ content, status: "streaming" });
+        },
+        onArtifacts: (artifacts) => {
+          assistantPatcher.patchBatched({ artifacts });
+        },
+        onDone: (content) => {
+          assistantPatcher.flushNow();
+          clearActiveRun();
+          assistantPatcher.patchNow({
+            content:
+              content ||
+              "Astra completed the run without returning visible text.",
+            reasoningStatus: "complete",
+            status: "complete",
+          });
+        },
+        onCancelled: (content) => {
+          assistantPatcher.flushNow();
+          clearActiveRun();
+          assistantPatcher.patchNow({
+            content: content || "Stopped.",
+            reasoningStatus: "complete",
+            status: "complete",
+          });
+        },
+        onPaused: (content) => {
+          assistantPatcher.flushNow();
+          assistantPatcher.patchNow({
+            content,
+            status: "streaming",
+          });
+        },
+      })
+        .catch((streamError: unknown) => {
+          if (isAbortError(streamError)) {
+            return;
+          }
+          if (isAuthRequiredError(streamError)) {
+            router.push(
+              `/login?next=${encodeURIComponent(`/chats/${detail.chat.id}`)}`,
+            );
+            return;
+          }
+          if (isNotFoundError(streamError)) {
+            router.replace(chatListHref);
+            return;
+          }
+          if (options?.scheduleRetry?.()) {
+            assistantPatcher.patchNow({
+              status: "streaming",
+              reasoningStatus: "streaming",
+            });
+            return;
+          }
+          assistantPatcher.patchNow({
+            content:
+              streamError instanceof Error
+                ? `${failureMessage} (${streamError.message})`
+                : failureMessage,
+            reasoningStatus: "complete",
+            status: "failed",
+          });
+        })
+        .finally(() => {
+          if (attachedRunRef.current === runId) {
+            attachedRunRef.current = null;
+          }
+          assistantPatcher.cancel();
+        });
+    },
+    [
+      applyWorkSurfaceStreamEvent,
+      chatListHref,
+      detail.chat.id,
+      nextStreamAbortSignal,
+      resetWorkSurfaceRun,
+      router,
+    ],
+  );
+
+  const openWorkSurfaceTab = useCallback((tab: WorkSurfaceTab) => {
+    setWorkSurfaceTab(tab);
+    setWorkSurfaceOpenSignal((signal) => signal + 1);
+  }, []);
+
+  const hydrateWorkSurfaceForChat = useCallback(
+    async (options?: { silent?: boolean }) => {
+      const sessionId = detail.session?.backendSessionId ?? null;
+      if (!options?.silent) {
+        setWorkSurface((current) =>
+          beginWorkSurfaceLoad(current, sessionId, current.runId),
+        );
+      }
+      try {
+        const response = await getChatWorkSurface(detail.chat.id);
+        setWorkSurface((current) =>
+          hydrateWorkSurface(
+            current,
+            response as unknown as WorkSurfaceProjection,
+          ),
+        );
+      } catch (error) {
+        setWorkSurface((current) =>
+          failWorkSurfaceLoad(
+            current,
+            error instanceof Error
+              ? error.message
+              : "Failed to load work surface.",
+          ),
+        );
+      }
+    },
+    [detail.chat.id, detail.session?.backendSessionId],
+  );
+
+  const loadAgentRunProjection = useCallback(
+    (runId: string) => getChatWorkSurfaceRun(detail.chat.id, runId),
+    [detail.chat.id],
+  );
 
   const startStream = useCallback(
     async ({
@@ -228,6 +585,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
         getAssistantId: () => currentAssistantId,
       });
       let recoveredFromHydration = false;
+      let streamRunId: string | null = null;
       const canReconcilePersistedTranscript = Boolean(pendingMessageId);
       const stopReconcile = () => {
         reconcileTimerRef.current = undefined;
@@ -285,6 +643,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
           },
           {
             signal: nextStreamAbortSignal(),
+            onWorkSurfaceEvent: applyWorkSurfaceStreamEvent,
             onLocalMessages: ({
               userMessage: localUserMessage,
               assistantMessage: localAssistantMessage,
@@ -335,6 +694,9 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
               });
             },
             onRunStarted: (runId) => {
+              streamRunId = runId;
+              attachedRunRef.current = runId;
+              resetWorkSurfaceRun(runId);
               setStartingRun(false);
               setDetail((current) => ({
                 ...current,
@@ -346,6 +708,13 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
               }));
             },
             onSessionBound: ({ sessionId }) => {
+              setWorkSurface((current) => ({
+                ...resetWorkSurfaceForRun(current, {
+                  sessionId,
+                  runId: current.runId,
+                }),
+                error: null,
+              }));
               setDetail((current) => ({
                 ...current,
                 session: {
@@ -369,10 +738,14 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
             onRunFinished: () => {
               setStoppingRun(false);
               setStartingRun(false);
-              setDetail((current) => ({
-                ...current,
-                activeRun: undefined,
-              }));
+              setDetail((current) =>
+                streamRunId && current.activeRun?.runId === streamRunId
+                  ? {
+                      ...current,
+                      activeRun: undefined,
+                    }
+                  : current,
+              );
             },
             onReasoning: (reasoning) => {
               assistantPatcher.patchBatched({
@@ -397,10 +770,14 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
             onDone: (content) => {
               assistantPatcher.flushNow();
               setStartingRun(false);
-              setDetail((current) => ({
-                ...current,
-                activeRun: undefined,
-              }));
+              setDetail((current) =>
+                streamRunId && current.activeRun?.runId === streamRunId
+                  ? {
+                      ...current,
+                      activeRun: undefined,
+                    }
+                  : current,
+              );
               assistantPatcher.patchNow({
                 content:
                   content ||
@@ -413,10 +790,14 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
               assistantPatcher.flushNow();
               setStoppingRun(false);
               setStartingRun(false);
-              setDetail((current) => ({
-                ...current,
-                activeRun: undefined,
-              }));
+              setDetail((current) =>
+                streamRunId && current.activeRun?.runId === streamRunId
+                  ? {
+                      ...current,
+                      activeRun: undefined,
+                    }
+                  : current,
+              );
               assistantPatcher.patchNow({
                 content: content || "Stopped.",
                 reasoningStatus: "complete",
@@ -463,17 +844,22 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
           status: "failed",
         });
       } finally {
+        if (streamRunId && attachedRunRef.current === streamRunId) {
+          attachedRunRef.current = null;
+        }
         assistantPatcher.cancel();
         stopReconcile();
         setStartingRun(false);
       }
     },
     [
+      applyWorkSurfaceStreamEvent,
       chatListHref,
       detail.chat.archivedAt,
       detail.chat.id,
       nextStreamAbortSignal,
       router,
+      resetWorkSurfaceRun,
     ],
   );
 
@@ -494,6 +880,9 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
           options,
         });
         const assistantMessageId = crypto.randomUUID();
+        const runId = result.activeRun.runId;
+        attachedRunRef.current = runId;
+        resetWorkSurfaceRun(runId);
         setDetail((current) => ({
           ...current,
           activeRun: result.activeRun,
@@ -518,8 +907,9 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
           setDetail,
           getAssistantId: () => assistantMessageId,
         });
-        void streamExistingChatRun(detail.chat.id, result.activeRun.runId, {
+        void streamExistingChatRun(detail.chat.id, runId, {
           signal: nextStreamAbortSignal(),
+          onWorkSurfaceEvent: applyWorkSurfaceStreamEvent,
           onRunUpdated: (run) => {
             setDetail((current) => ({
               ...current,
@@ -532,10 +922,14 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
           },
           onRunFinished: () => {
             setStoppingRun(false);
-            setDetail((current) => ({
-              ...current,
-              activeRun: undefined,
-            }));
+            setDetail((current) =>
+              current.activeRun?.runId === runId
+                ? {
+                    ...current,
+                    activeRun: undefined,
+                  }
+                : current,
+            );
           },
           onReasoning: (reasoning) => {
             assistantPatcher.patchBatched({
@@ -559,10 +953,14 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
           },
           onDone: (content) => {
             assistantPatcher.flushNow();
-            setDetail((current) => ({
-              ...current,
-              activeRun: undefined,
-            }));
+            setDetail((current) =>
+              current.activeRun?.runId === runId
+                ? {
+                    ...current,
+                    activeRun: undefined,
+                  }
+                : current,
+            );
             assistantPatcher.patchNow({
               content:
                 content ||
@@ -573,10 +971,14 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
           },
           onCancelled: (content) => {
             assistantPatcher.flushNow();
-            setDetail((current) => ({
-              ...current,
-              activeRun: undefined,
-            }));
+            setDetail((current) =>
+              current.activeRun?.runId === runId
+                ? {
+                    ...current,
+                    activeRun: undefined,
+                  }
+                : current,
+            );
             assistantPatcher.patchNow({
               content: content || "Stopped.",
               reasoningStatus: "complete",
@@ -614,6 +1016,9 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
             });
           })
           .finally(() => {
+            if (attachedRunRef.current === runId) {
+              attachedRunRef.current = null;
+            }
             assistantPatcher.cancel();
           });
       } catch (error) {
@@ -650,11 +1055,13 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
     },
     [
       addToast,
+      applyWorkSurfaceStreamEvent,
       chatListHref,
       detail.chat.archivedAt,
       detail.chat.id,
       nextStreamAbortSignal,
       router,
+      resetWorkSurfaceRun,
       startStream,
     ],
   );
@@ -663,17 +1070,35 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
     if (!detail.activeRun?.runId || !canStopRun) {
       return;
     }
+    const runId = detail.activeRun.runId;
     if (runControlMutationRef.current) {
       return;
     }
     runControlMutationRef.current = true;
     setStoppingRun(true);
+    setDetail((current) => ({
+      ...current,
+      activeRun: current.activeRun?.runId
+        ? {
+            runId: current.activeRun.runId,
+            status: "cancelling",
+            waitingFor: null,
+          }
+        : current.activeRun,
+    }));
     try {
-      const result = await stopChatRun(detail.chat.id);
+      await stopChatRun(detail.chat.id);
+      streamAbortRef.current?.abort();
+      if (attachedRunRef.current === runId) {
+        attachedRunRef.current = null;
+      }
       setDetail((current) => ({
         ...current,
-        activeRun: result.activeRun,
+        activeRun:
+          current.activeRun?.runId === runId ? undefined : current.activeRun,
+        messages: completeLatestStreamingAssistantAsStopped(current.messages),
       }));
+      void hydrateWorkSurfaceForChat({ silent: true });
     } catch (error) {
       if (isAuthRequiredError(error)) {
         router.push(
@@ -684,6 +1109,10 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
       if (isNotFoundError(error)) {
         router.replace(chatListHref);
         return;
+      }
+      const refreshed = await getChat(detail.chat.id).catch(() => null);
+      if (refreshed) {
+        setDetail(refreshed);
       }
       addToast(
         error instanceof Error
@@ -701,6 +1130,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
     chatListHref,
     detail.activeRun?.runId,
     detail.chat.id,
+    hydrateWorkSurfaceForChat,
     router,
   ]);
 
@@ -725,6 +1155,12 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
     setResumingRun(true);
     try {
       const result = await resumeChatRun(detail.chat.id);
+      if (!result.activeRun?.runId) {
+        throw new Error("Resume response did not include an active run.");
+      }
+      const runId = result.activeRun.runId;
+      attachedRunRef.current = runId;
+      resetWorkSurfaceRun(runId);
       setDetail((current) => ({
         ...current,
         activeRun: result.activeRun,
@@ -750,8 +1186,9 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
         getAssistantId: () => assistantMessageId,
       });
       try {
-        await streamExistingChatRun(detail.chat.id, result.activeRun.runId, {
+        await streamExistingChatRun(detail.chat.id, runId, {
           signal: nextStreamAbortSignal(),
+          onWorkSurfaceEvent: applyWorkSurfaceStreamEvent,
           onRunUpdated: (run) => {
             setDetail((current) => ({
               ...current,
@@ -764,10 +1201,14 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
           },
           onRunFinished: () => {
             setStoppingRun(false);
-            setDetail((current) => ({
-              ...current,
-              activeRun: undefined,
-            }));
+            setDetail((current) =>
+              current.activeRun?.runId === runId
+                ? {
+                    ...current,
+                    activeRun: undefined,
+                  }
+                : current,
+            );
           },
           onReasoning: (reasoning) => {
             assistantPatcher.patchBatched({
@@ -791,10 +1232,14 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
           },
           onDone: (content) => {
             assistantPatcher.flushNow();
-            setDetail((current) => ({
-              ...current,
-              activeRun: undefined,
-            }));
+            setDetail((current) =>
+              current.activeRun?.runId === runId
+                ? {
+                    ...current,
+                    activeRun: undefined,
+                  }
+                : current,
+            );
             assistantPatcher.patchNow({
               content:
                 content ||
@@ -805,10 +1250,14 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
           },
           onCancelled: (content) => {
             assistantPatcher.flushNow();
-            setDetail((current) => ({
-              ...current,
-              activeRun: undefined,
-            }));
+            setDetail((current) =>
+              current.activeRun?.runId === runId
+                ? {
+                    ...current,
+                    activeRun: undefined,
+                  }
+                : current,
+            );
             assistantPatcher.patchNow({
               content: content || "Stopped.",
               reasoningStatus: "complete",
@@ -851,6 +1300,9 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
           "warning",
         );
       } finally {
+        if (attachedRunRef.current === runId) {
+          attachedRunRef.current = null;
+        }
         assistantPatcher.cancel();
       }
     } catch (error) {
@@ -879,22 +1331,73 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
     }
   }, [
     addToast,
+    applyWorkSurfaceStreamEvent,
     canResumeRun,
     chatListHref,
     detail.activeRun?.runId,
     detail.chat.id,
     detail.messages,
     nextStreamAbortSignal,
+    resetWorkSurfaceRun,
     router,
   ]);
 
   useEffect(
     () => () => {
       streamAbortRef.current?.abort();
+      if (autoAttachRetryTimerRef.current) {
+        window.clearTimeout(autoAttachRetryTimerRef.current);
+        autoAttachRetryTimerRef.current = undefined;
+      }
       stopReconcileRef.current();
     },
     [],
   );
+
+  useEffect(() => {
+    void hydrateWorkSurfaceForChat();
+  }, [hydrateWorkSurfaceForChat]);
+
+  useEffect(() => {
+    const activeRun = detail.activeRun;
+    if (!activeRun?.runId) {
+      autoAttachAttemptedRunRef.current = null;
+      autoAttachRetryCountsRef.current.clear();
+      if (autoAttachRetryTimerRef.current) {
+        window.clearTimeout(autoAttachRetryTimerRef.current);
+        autoAttachRetryTimerRef.current = undefined;
+      }
+      return;
+    }
+    if (
+      isArchived ||
+      detail.pendingTurn ||
+      !canAttachRunStream(activeRun.status) ||
+      attachedRunRef.current === activeRun.runId ||
+      autoAttachAttemptedRunRef.current === activeRun.runId
+    ) {
+      return;
+    }
+
+    autoAttachAttemptedRunRef.current = activeRun.runId;
+    const assistantMessageId = ensureStreamingAssistantMessage();
+    attachExistingRunStream(
+      activeRun.runId,
+      assistantMessageId,
+      "The run is active, but the web UI could not reconnect to its stream.",
+      {
+        scheduleRetry: () => scheduleAutoAttachRetry(activeRun.runId),
+      },
+    );
+  }, [
+    attachExistingRunStream,
+    detail.activeRun,
+    detail.pendingTurn,
+    ensureStreamingAssistantMessage,
+    isArchived,
+    runAttachRetrySignal,
+    scheduleAutoAttachRetry,
+  ]);
 
   useEffect(() => {
     if (shouldAutoScrollChat({ pinnedToBottom: pinnedRef.current })) {
@@ -993,179 +1496,285 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
   );
 
   return (
-    <div className="astra-chat-view relative flex h-full min-h-0 flex-col overflow-hidden bg-bg">
-      <header className="relative z-10 flex min-h-[58px] shrink-0 items-center gap-4 border-b border-border/60 bg-bg/85 px-7 backdrop-blur">
-        <Link
-          href={
-            detail.chat.projectId
-              ? `/projects/${detail.chat.projectId}`
-              : "/chats"
-          }
-          className="inline-flex items-center gap-1 text-[13px] text-text-muted transition-colors hover:text-text"
-        >
-          ← {detail.project?.name ?? "Chats"}
-        </Link>
-        <div className="min-w-0">
-          <h1 className="truncate text-sm font-semibold tracking-[-0.01em]">
-            {detail.chat.title ?? "Untitled"}
-          </h1>
-          <div className="mt-0.5 flex items-center gap-1.5 text-xs text-text-muted">
-            <span className="size-1.5 rounded-full bg-success" />
-            <span>
-              {activeRunLabel} · {detail.chat.model ?? "Default model"}
+    <div className="astra-chat-view relative flex h-full min-h-0 overflow-hidden bg-bg">
+      <div className="relative flex min-w-0 flex-1 flex-col overflow-hidden bg-bg">
+        <header className="relative z-10 flex min-h-[58px] shrink-0 items-center gap-4 border-b border-border/60 bg-bg/85 px-7 backdrop-blur">
+          <Link
+            href={
+              detail.chat.projectId
+                ? `/projects/${detail.chat.projectId}`
+                : "/chats"
+            }
+            className="inline-flex items-center gap-1 text-[13px] text-text-muted transition-colors hover:text-text"
+          >
+            ← {detail.project?.name ?? "Chats"}
+          </Link>
+          <div className="min-w-0">
+            <h1 className="truncate text-sm font-semibold tracking-[-0.01em]">
+              {detail.chat.title ?? "Untitled"}
+            </h1>
+            <div className="mt-0.5 flex items-center gap-1.5 text-xs text-text-muted">
+              <span className="size-1.5 rounded-full bg-success" />
+              <span>
+                {detail.chat.model ?? "Default model"}
+              </span>
+            </div>
+          </div>
+          <div className="min-w-0 flex-1" />
+          {detail.chat.archivedAt ? (
+            <span className="rounded-full bg-surface-muted px-2 py-1 text-xs font-medium text-text-muted">
+              Archived
             </span>
+          ) : null}
+          <ChatActionsMenu
+            chatId={detail.chat.id}
+            archived={isArchived}
+            active
+            afterMutationHref={chatListHref}
+            onMove={() => setMoveOpen(true)}
+            onChatUpdated={setDetail}
+            trigger={
+              <IconButton
+                icon={MoreVertical}
+                label="Chat menu"
+                className="size-8"
+              />
+            }
+          />
+        </header>
+
+        <div
+          ref={scrollRef}
+          data-testid="chat-scroll-container"
+          onScroll={(event) => {
+            const target = event.currentTarget;
+            pinnedRef.current = isChatScrolledToBottom(target);
+          }}
+          className="min-h-0 flex-1 overscroll-contain overflow-y-auto scroll-smooth"
+        >
+          <div className="mx-auto w-full max-w-[860px] px-7 pb-44 pt-10">
+            {detail.messages.map((message, index) => (
+              <div key={message.id} data-chat-message-index={index}>
+                <MessageBubble message={message} />
+              </div>
+            ))}
           </div>
         </div>
-        <div className="min-w-0 flex-1" />
-        {detail.chat.archivedAt ? (
-          <span className="rounded-full bg-surface-muted px-2 py-1 text-xs font-medium text-text-muted">
-            Archived
-          </span>
-        ) : null}
-        <ChatActionsMenu
-          chatId={detail.chat.id}
-          archived={isArchived}
-          active
-          afterMutationHref={chatListHref}
-          onMove={() => setMoveOpen(true)}
-          onChatUpdated={setDetail}
-          trigger={
-            <IconButton
-              icon={MoreVertical}
-              label="Chat menu"
-              className="size-8"
-            />
-          }
+        <ChatDotNavigator
+          messages={detail.messages}
+          scrollContainerRef={scrollRef}
         />
-      </header>
 
-      <div
-        ref={scrollRef}
-        data-testid="chat-scroll-container"
-        onScroll={(event) => {
-          const target = event.currentTarget;
-          pinnedRef.current = isChatScrolledToBottom(target);
-        }}
-        className="min-h-0 flex-1 overscroll-contain overflow-y-auto scroll-smooth"
-      >
-        <div className="mx-auto w-full px-7 pb-44 pt-10 md:w-[70%]">
-          {detail.messages.map((message, index) => (
-            <div key={message.id} data-chat-message-index={index}>
-              <MessageBubble message={message} />
-            </div>
-          ))}
-        </div>
-      </div>
-      <ChatDotNavigator
-        messages={detail.messages}
-        scrollContainerRef={scrollRef}
-      />
-
-      <div className="pointer-events-none absolute inset-x-0 bottom-0 z-10 bg-gradient-to-t from-bg via-bg/95 to-bg/0 px-7 pb-6 pt-12">
-        <div className="pointer-events-auto mx-auto w-full md:w-[70%]">
-          {isArchived ? (
-            <div className="rounded-[20px] border border-border bg-surface px-5 py-4 shadow-[0_0.25rem_1.25rem_rgba(28,25,23,0.06),0_0_0_0.5px_rgba(120,113,108,0.18)]">
-              <div className="flex items-center justify-between gap-4">
-                <div className="min-w-0">
-                  <p className="text-sm font-medium text-text">
-                    This chat is archived.
-                  </p>
-                  <p className="mt-1 text-sm text-text-muted">
-                    Archived chats are read-only. Unarchive it to continue.
-                  </p>
-                </div>
-                <button
-                  type="button"
-                  disabled={lifecycle.busyChatId === detail.chat.id}
-                  onClick={() => {
-                    void lifecycle.unarchive(detail.chat.id);
-                  }}
-                  className="shrink-0 rounded-control bg-text px-3 py-2 text-sm font-medium text-white hover:bg-text/90 disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  Unarchive
-                </button>
-              </div>
-            </div>
-          ) : (
-            <>
-              <Composer
-                disabled={composerDisabled}
-                placeholder={composerPlaceholder}
-                initialModel={
-                  detail.pendingTurn?.options.model ??
-                  detail.chat.model ??
-                  undefined
-                }
-                persistModelPreference={false}
-                onModelChange={handleModelChange}
-                showStop={Boolean(canStopRun && canQueueDeferredInput)}
-                stopping={stoppingRun}
-                stopDisabled={runControlBusy}
-                onStop={() => {
-                  void stopActiveRun();
-                }}
-                projectContext={
-                  detail.chat.projectId
-                    ? { projectId: detail.chat.projectId }
-                    : undefined
-                }
-                onSubmit={async ({ text, options }) => {
-                  if (canQueueDeferredInput) {
-                    await queueDeferredInput({ text, options });
-                    return;
-                  }
-                  void startStream({ text, options, appendUser: true });
-                }}
-              />
-              {showRunStatusPanel ? (
-                <div className="mt-3 flex items-center justify-between gap-3 rounded-[16px] border border-border/70 bg-surface px-4 py-3 text-sm text-text-muted">
-                  <p>
-                    {activeRunStatus === "paused"
-                      ? "This run is paused. Resume to continue or Stop to cancel it."
-                      : activeRunBlocksNewInput
-                        ? `Run status is ${activeRunStatus}. Stop it or refresh before sending new input.`
-                        : "Stopping current run"}
-                  </p>
-                  <div className="flex shrink-0 items-center gap-2">
-                    {canResumeRun ? (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          void resumeActiveRun();
-                        }}
-                        disabled={runControlBusy}
-                        className="rounded-control bg-text px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-text/90 disabled:cursor-not-allowed disabled:opacity-50"
-                      >
-                        {resumingRun ? "Resuming..." : "Resume"}
-                      </button>
-                    ) : null}
-                    {canStopRun ? (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          void stopActiveRun();
-                        }}
-                        disabled={runControlBusy}
-                        className="rounded-control border border-border bg-bg px-3 py-2 text-sm font-medium text-text transition-colors hover:bg-surface-muted disabled:cursor-not-allowed disabled:opacity-50"
-                      >
-                        {stoppingRun ? "Stopping..." : "Stop"}
-                      </button>
-                    ) : null}
+        <div className="pointer-events-none absolute inset-x-0 bottom-0 z-10 bg-gradient-to-t from-bg via-bg/95 to-bg/0 px-7 pb-6 pt-12">
+          <div className="pointer-events-auto mx-auto w-full max-w-[860px]">
+            {isArchived ? (
+              <div className="rounded-[20px] border border-border bg-surface px-5 py-4 shadow-[0_0.25rem_1.25rem_rgba(28,25,23,0.06),0_0_0_0.5px_rgba(120,113,108,0.18)]">
+                <div className="flex items-center justify-between gap-4">
+                  <div className="min-w-0">
+                    <p className="text-sm font-medium text-text">
+                      This chat is archived.
+                    </p>
+                    <p className="mt-1 text-sm text-text-muted">
+                      Archived chats are read-only. Unarchive it to continue.
+                    </p>
                   </div>
+                  <button
+                    type="button"
+                    disabled={lifecycle.busyChatId === detail.chat.id}
+                    onClick={() => {
+                      void lifecycle.unarchive(detail.chat.id);
+                    }}
+                    className="shrink-0 rounded-control bg-text px-3 py-2 text-sm font-medium text-white hover:bg-text/90 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    Unarchive
+                  </button>
                 </div>
-              ) : null}
-            </>
-          )}
+              </div>
+            ) : (
+              <>
+                {showRunActivityBar ? (
+                  <RunActivityBar
+                    label={runActivityLabel}
+                    agents={runningAgentCount}
+                    tools={runningToolCount}
+                    tasks={workingTaskCount}
+                    onOpenAgents={() => openWorkSurfaceTab("agents")}
+                    onOpenTasks={() => openWorkSurfaceTab("tasks")}
+                    onOpenTools={() => openWorkSurfaceTab("tools")}
+                  />
+                ) : null}
+                <Composer
+                  disabled={composerDisabled}
+                  placeholder={composerPlaceholder}
+                  initialModel={
+                    detail.pendingTurn?.options.model ??
+                    detail.chat.model ??
+                    undefined
+                  }
+                  persistModelPreference={false}
+                  onModelChange={handleModelChange}
+                  showStop={Boolean(canStopRun && canQueueDeferredInput)}
+                  stopping={stoppingRun}
+                  stopDisabled={runControlBusy}
+                  onStop={() => {
+                    void stopActiveRun();
+                  }}
+                  projectContext={
+                    detail.chat.projectId
+                      ? { projectId: detail.chat.projectId }
+                      : undefined
+                  }
+                  onSubmit={async ({ text, options }) => {
+                    if (canQueueDeferredInput) {
+                      await queueDeferredInput({ text, options });
+                      return;
+                    }
+                    void startStream({ text, options, appendUser: true });
+                  }}
+                />
+                {showRunStatusPanel ? (
+                  <div className="mt-3 flex items-center justify-between gap-3 rounded-[16px] border border-border/70 bg-surface px-4 py-3 text-sm text-text-muted">
+                    <p>
+                      {activeRunStatus === "paused"
+                        ? "This run is paused. Resume to continue or Stop to cancel it."
+                        : activeRunBlocksNewInput
+                          ? `Run status is ${activeRunStatus}. Stop it or refresh before sending new input.`
+                          : "Stopping current run"}
+                    </p>
+                    <div className="flex shrink-0 items-center gap-2">
+                      {canResumeRun ? (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            void resumeActiveRun();
+                          }}
+                          disabled={runControlBusy}
+                          className="rounded-control bg-text px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-text/90 disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          {resumingRun ? "Resuming..." : "Resume"}
+                        </button>
+                      ) : null}
+                      {canStopRun ? (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            void stopActiveRun();
+                          }}
+                          disabled={runControlBusy}
+                          className="rounded-control border border-border bg-bg px-3 py-2 text-sm font-medium text-text transition-colors hover:bg-surface-muted disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          {stoppingRun ? "Stopping..." : "Stop"}
+                        </button>
+                      ) : null}
+                    </div>
+                  </div>
+                ) : null}
+              </>
+            )}
+          </div>
         </div>
-      </div>
 
-      <MoveChatModal
-        open={moveOpen}
-        chatId={detail.chat.id}
-        currentProjectId={detail.chat.projectId}
-        onOpenChange={setMoveOpen}
-        onMoved={refresh}
+        <MoveChatModal
+          open={moveOpen}
+          chatId={detail.chat.id}
+          currentProjectId={detail.chat.projectId}
+          onOpenChange={setMoveOpen}
+          onMoved={refresh}
+        />
+      </div>
+      <WorkSurfacePanel
+        state={workSurface}
+        activeRun={detail.activeRun}
+        tab={workSurfaceTab}
+        onTabChange={setWorkSurfaceTab}
+        openSignal={workSurfaceOpenSignal}
+        onRefresh={() => {
+          void hydrateWorkSurfaceForChat();
+        }}
+        onLoadAgentRun={loadAgentRunProjection}
       />
     </div>
+  );
+}
+
+function RunActivityBar({
+  label,
+  agents,
+  tools,
+  tasks,
+  onOpenAgents,
+  onOpenTasks,
+  onOpenTools,
+}: {
+  label: string;
+  agents: number;
+  tools: number;
+  tasks: number;
+  onOpenAgents: () => void;
+  onOpenTasks: () => void;
+  onOpenTools: () => void;
+}) {
+  return (
+    <div className="mb-3 flex flex-wrap items-center gap-2 rounded-[14px] border border-border/70 bg-surface/95 px-3 py-2 text-xs text-text-muted shadow-[0_0.15rem_0.8rem_rgba(28,25,23,0.05)]">
+      <span className="inline-flex items-center gap-2 font-medium text-text">
+        <Loader2 className="size-3.5 animate-spin text-accent" />
+        {label}
+      </span>
+      <span className="inline-flex items-center gap-1 pl-0.5" aria-hidden="true">
+        <span className="size-1.5 animate-bounce rounded-full bg-text-muted" />
+        <span
+          className="size-1.5 animate-bounce rounded-full bg-text-muted"
+          style={{ animationDelay: "120ms" }}
+        />
+        <span
+          className="size-1.5 animate-bounce rounded-full bg-text-muted"
+          style={{ animationDelay: "240ms" }}
+        />
+      </span>
+      <span className="h-4 w-px bg-border" />
+      <RunActivityMetric
+        icon={Bot}
+        label="Agents"
+        value={agents}
+        onClick={onOpenAgents}
+      />
+      <RunActivityMetric
+        icon={ClipboardList}
+        label="Tasks"
+        value={tasks}
+        onClick={onOpenTasks}
+      />
+      <RunActivityMetric
+        icon={Terminal}
+        label="Tools"
+        value={tools}
+        onClick={onOpenTools}
+      />
+    </div>
+  );
+}
+
+function RunActivityMetric({
+  icon: Icon,
+  label,
+  value,
+  onClick,
+}: {
+  icon: LucideIcon;
+  label: string;
+  value: number;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      className="inline-flex items-center gap-1 rounded-full bg-bg px-2 py-1 font-medium text-text-secondary transition hover:bg-surface-muted hover:text-text focus:outline-none focus:ring-2 focus:ring-accent/30"
+      onClick={onClick}
+      aria-label={`Open ${label.toLowerCase()} work surface`}
+      title={`Open ${label}`}
+    >
+      <Icon className="size-3.5 text-text-muted" />
+      {value}
+    </button>
   );
 }
