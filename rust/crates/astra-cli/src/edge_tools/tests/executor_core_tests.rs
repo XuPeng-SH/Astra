@@ -150,22 +150,14 @@ async fn agent_missing_action_with_spawn_wrapper_redirects_to_action_field() {
     );
 }
 
-/// REGRESSION: after the Phase 1 split, `task.background_shell` and
-/// the other 3 background actions live on the new `agent_job` tool.
-/// Calling them on `task` is a sign the model is on a stale schema or
-/// hallucinating a path that no longer exists. The executor must
-/// surface this as an Error: with a redirect — same shape as the
-/// `agent.delegate` rejection — so the model self-corrects on the
-/// next turn instead of silently failing.
+/// `task` is only the durable checklist surface. Background process
+/// actions belong to `job`; if they arrive on `task`, treat them
+/// as ordinary unknown task actions rather than preserving per-action
+/// migration branches.
 #[tokio::test]
-async fn task_background_actions_are_rejected_with_redirect_to_agent_job() {
+async fn task_background_actions_are_plain_unknown_task_actions() {
     let executor = test_executor();
-    for (action, redirect_action) in &[
-        ("background_shell", "shell"),
-        ("background_agent", "agent"),
-        ("output", "output"),
-        ("kill", "kill"),
-    ] {
+    for action in ["background_shell", "background_agent", "output", "kill"] {
         let result = executor
             .execute(
                 "task",
@@ -183,16 +175,10 @@ async fn task_background_actions_are_rejected_with_redirect_to_agent_job() {
              a red banner — got: {result}"
         );
         assert!(
-            result.contains("agent_job"),
-            "task.{action} error must name `agent_job` as the new home — \
-             without that, the model has no path to recovery. Got: {result}"
+            result.contains("unknown `task` action") && result.contains(action),
+            "task.{action} must be rejected by the ordinary unknown-action path. Got: {result}"
         );
-        assert!(
-            result.contains(&format!("agent_job(action='{redirect_action}')"))
-                || result.contains(redirect_action),
-            "task.{action} error must point at the specific replacement \
-             action `agent_job(action='{redirect_action}')`. Got: {result}"
-        );
+        assert!(!result.contains("agent_job(action='"), "{result}");
         assert!(
             astra_turn_core::tool_result_semantics::is_tool_error(&result),
             "task.{action} rejection must classify as an error so cloud \
@@ -235,11 +221,10 @@ async fn session_enter_exit_plan_actions_redirect_to_top_level_tools() {
 }
 
 #[tokio::test]
-async fn exit_plan_mode_with_approved_bypasses_overlay() {
-    // Explicit `approved: true` is the headless / harness escape hatch:
-    // it bypasses the interactive Approve / Keep-planning overlay and
-    // commits the plan directly. Works for any plan status and both
-    // cloud-backed and offline plans.
+async fn exit_plan_mode_ignores_model_supplied_approval_without_overlay() {
+    // LLM/tool arguments are not a trusted approval source. Even if the
+    // model passes `approved: true`, exit_plan_mode must require the
+    // interactive plan-review overlay before unlocking writes.
     for (label, use_cloud, status, plan_id) in [
         ("cloud planning", true, "planning", "plan-cloud-plan"),
         ("cloud refining", true, "refining", "plan-cloud-ref"),
@@ -250,19 +235,6 @@ async fn exit_plan_mode_with_approved_bypasses_overlay() {
         if use_cloud {
             let server = MockServer::start().await;
             mock_authoring_plan_present(&server, &session_id, plan_id, status).await;
-            Mock::given(method("POST"))
-                .and(path(format!("/plans/{plan_id}/exit-plan-mode")))
-                .and(header("authorization", "Bearer token"))
-                .and(body_json(json!({
-                    "approved": true,
-                    "plan_md": "1. Ship auth"
-                })))
-                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                    "plan_id": plan_id,
-                    "phase": "refining"
-                })))
-                .mount(&server)
-                .await;
 
             let temp = tempfile::tempdir().unwrap();
             let executor = ToolExecutor::new(temp.path().to_path_buf())
@@ -277,21 +249,13 @@ async fn exit_plan_mode_with_approved_bypasses_overlay() {
                 .await;
 
             assert!(
-                result.starts_with("Exited plan mode."),
-                "[{label}] must exit. Got: {result}"
-            );
-            assert!(
-                result.contains(plan_id),
-                "[{label}] result should mention plan id ({plan_id}). Got: {result}"
-            );
-            assert!(
-                result.contains("auto"),
-                "[{label}] explicit approval should default to auto mode. Got: {result}"
+                result.contains("trusted interactive plan-review overlay"),
+                "[{label}] model-supplied approval must not bypass UI review. Got: {result}"
             );
             assert_eq!(
                 executor.take_pending_permission_mode_change(),
-                Some(crate::cli::permission_manager::PermissionMode::Auto),
-                "[{label}] explicit approval must stage a non-plan permission mode"
+                None,
+                "[{label}] no trusted approval means no permission-mode change"
             );
         } else {
             let temp = tempfile::tempdir().unwrap();
@@ -318,17 +282,13 @@ async fn exit_plan_mode_with_approved_bypasses_overlay() {
                 )
                 .await;
             assert!(
-                exit_result.starts_with("Exited plan mode"),
-                "[{label}] offline approval should succeed. Got: {exit_result}"
-            );
-            assert!(
-                exit_result.contains("auto"),
-                "[{label}] offline approval should default to auto. Got: {exit_result}"
+                exit_result.contains("trusted interactive plan-review overlay"),
+                "[{label}] model-supplied approval must not bypass local UI review. Got: {exit_result}"
             );
             assert_eq!(
                 executor.take_pending_permission_mode_change(),
-                Some(crate::cli::permission_manager::PermissionMode::Auto),
-                "[{label}] offline approval must leave plan mode"
+                None,
+                "[{label}] no trusted approval means local plan mode stays active"
             );
         }
     }
@@ -430,7 +390,7 @@ async fn exit_plan_mode_overlay_paths() {
             install_overlay: false,
             decision: None,
             expect_starts_with: "Error:",
-            expect_contains: &["interactive TUI overlay", "approved"],
+            expect_contains: &["trusted interactive plan-review overlay"],
             expect_not_contains: &[],
             expect_pending_mode: None,
             expect_tool_boost: None,
@@ -775,6 +735,26 @@ async fn setup_blocked_executor(
     (server, executor, temp)
 }
 
+#[test]
+fn plan_mode_job_guard_blocks_shell_and_kill_but_allows_reads() {
+    assert!(crate::edge_tools::is_plan_mode_blocked_tool(
+        "job",
+        &json!({"action": "shell", "command": "npm run dev"})
+    ));
+    assert!(crate::edge_tools::is_plan_mode_blocked_tool(
+        "job",
+        &json!({"action": "kill", "job_id": "bg-shell-1"})
+    ));
+    assert!(!crate::edge_tools::is_plan_mode_blocked_tool(
+        "job",
+        &json!({"action": "output", "job_id": "bg-shell-1"})
+    ));
+    assert!(!crate::edge_tools::is_plan_mode_blocked_tool(
+        "job",
+        &json!({"action": "list"})
+    ));
+}
+
 #[tokio::test]
 async fn read_only_tools_are_not_blocked_while_plan_mode_is_authoring() {
     let server = MockServer::start().await;
@@ -835,13 +815,26 @@ async fn writes_are_unblocked_after_exit_plan_mode_approved() {
         "precondition: writes must be blocked before exit. Got: {blocked}"
     );
 
-    // Approve exit.
+    let (tx, mut rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::cli::chat_stream::PlanReviewRequest>();
+    executor.set_plan_review_request_tx(Some(tx));
+    let overlay_task = tokio::spawn(async move {
+        let request = rx.recv().await.expect("overlay request");
+        let _ = request
+            .response_tx
+            .send(crate::cli::chat_stream::PlanReviewDecision::Approve {
+                mode: crate::cli::permission_manager::PermissionMode::Auto,
+            });
+    });
+
+    // Approve exit through the trusted overlay.
     let exit = executor
-        .execute("exit_plan_mode", &json!({"approved": true}))
+        .execute("exit_plan_mode", &json!({"plan": "1. Ship"}))
         .await;
+    overlay_task.await.unwrap();
     assert!(
         exit.starts_with("Exited plan mode."),
-        "exit_plan_mode(approved=true) must succeed. Got: {exit}"
+        "trusted overlay approval must succeed. Got: {exit}"
     );
 
     // After approval, writes go through.
@@ -853,7 +846,7 @@ async fn writes_are_unblocked_after_exit_plan_mode_approved() {
         .await;
     assert!(
         !unblocked.contains("blocked while plan mode is active"),
-        "after exit_plan_mode(approved=true), writes must be unblocked. Got: {unblocked}"
+        "after trusted exit_plan_mode approval, writes must be unblocked. Got: {unblocked}"
     );
 }
 
@@ -894,28 +887,25 @@ async fn write_guard_is_inactive_when_no_authoring_plan() {
     }
 }
 
-/// `agent_job` is the new entry point. It must dispatch the four
-/// background actions to the same handlers that previously sat on
-/// `task` — verified here with the cheapest possible smoke: an
+/// `job` is the entry point. It must dispatch the background
+/// shell actions to the same handlers that previously sat on `task` —
+/// verified here with the cheapest possible smoke: an
 /// unwired CLI executor returns a known fail-fast string for each
 /// action (the BackgroundTaskRegistry is wired only inside the TUI
 /// REPL — see `task_background_shell_fails_fast_when_unwired`).
 #[tokio::test]
-async fn agent_job_actions_dispatch_through_executor() {
+async fn job_actions_dispatch_through_executor() {
     let executor = test_executor();
     // shell — needs `command`; without the registry wired we expect
     // the unwired-fast-fail path, not the missing-arg path.
     let result = executor
-        .execute(
-            "agent_job",
-            &json!({"action": "shell", "command": "echo hi"}),
-        )
+        .execute("job", &json!({"action": "shell", "command": "echo hi"}))
         .await;
     assert!(
         result.contains("background_shell")
             || result.contains("interactive REPL")
             || result.contains("not available"),
-        "agent_job.shell should reach the same fail-fast path that \
+        "job.shell should reach the same fail-fast path that \
          task.background_shell used to hit (registry only wired inside \
          the TUI). Got: {result}"
     );
@@ -923,18 +913,46 @@ async fn agent_job_actions_dispatch_through_executor() {
     // output — must reach the same handler that returns the unwired
     // message; both kill and output share the registry dependency.
     let result = executor
-        .execute(
-            "agent_job",
-            &json!({"action": "kill", "task_id": "bg-shell-1"}),
-        )
+        .execute("job", &json!({"action": "kill", "job_id": "bg-shell-1"}))
         .await;
     assert!(
         result.contains("background")
             || result.contains("interactive REPL")
             || result.contains("Nothing to kill"),
-        "agent_job.kill should reach the registry-unwired fail-fast path. \
+        "job.kill should reach the registry-unwired fail-fast path. \
          Got: {result}"
     );
+}
+
+#[tokio::test]
+async fn job_agent_action_is_rejected_with_agent_tool_guidance() {
+    let executor = test_executor();
+    let result = executor
+        .execute("job", &json!({"action": "agent", "prompt": "audit TODOs"}))
+        .await;
+
+    assert!(result.contains("not a supported user journey"), "{result}");
+    assert!(result.contains("agent(action='spawn'"), "{result}");
+    assert!(result.contains("agent(action='get_result'"), "{result}");
+    assert!(
+        !result.contains("background_agent requires"),
+        "job.agent must not route into the old background_agent shim. Got: {result}"
+    );
+}
+
+#[tokio::test]
+async fn legacy_agent_job_tool_is_rejected_with_job_guidance() {
+    let executor = test_executor();
+    let result = executor
+        .execute(
+            "agent_job",
+            &json!({"action": "shell", "command": "echo hi"}),
+        )
+        .await;
+
+    assert!(result.contains("removed from the user journey"), "{result}");
+    assert!(result.contains("job(action='shell'"), "{result}");
+    assert!(result.contains("agent(action='spawn'"), "{result}");
 }
 
 /// The `agent` tool's action enum must NOT advertise "delegate" to

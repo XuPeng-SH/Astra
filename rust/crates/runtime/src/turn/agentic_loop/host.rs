@@ -2805,6 +2805,7 @@ pub(crate) mod tests {
     fn task_board_snapshot_summarizes_active_tasks_stably() {
         let snapshot = TaskBoardSnapshot::from_active_tasks(&[
             SessionTask {
+                archived_at: None,
                 id: "task-2".to_string(),
                 title: "add runtime tests".to_string(),
                 description: None,
@@ -2819,6 +2820,7 @@ pub(crate) mod tests {
                 blocked_by: vec!["task-1".to_string()],
             },
             SessionTask {
+                archived_at: None,
                 id: "task-1".to_string(),
                 title: "wire completion guard".to_string(),
                 description: None,
@@ -2833,6 +2835,7 @@ pub(crate) mod tests {
                 blocked_by: Vec::new(),
             },
             SessionTask {
+                archived_at: None,
                 id: "task-3".to_string(),
                 title: "already done".to_string(),
                 description: None,
@@ -2871,6 +2874,7 @@ pub(crate) mod tests {
     fn task_board_snapshot_ignores_terminal_and_archived_tasks() {
         let snapshot = TaskBoardSnapshot::from_active_tasks(&[
             SessionTask {
+                archived_at: None,
                 id: "task-1".to_string(),
                 title: "waiting".to_string(),
                 description: None,
@@ -2885,6 +2889,7 @@ pub(crate) mod tests {
                 blocked_by: Vec::new(),
             },
             SessionTask {
+                archived_at: None,
                 id: "task-2".to_string(),
                 title: "done".to_string(),
                 description: None,
@@ -2899,6 +2904,7 @@ pub(crate) mod tests {
                 blocked_by: Vec::new(),
             },
             SessionTask {
+                archived_at: None,
                 id: "task-3".to_string(),
                 title: "cancelled".to_string(),
                 description: None,
@@ -2913,6 +2919,7 @@ pub(crate) mod tests {
                 blocked_by: Vec::new(),
             },
             SessionTask {
+                archived_at: None,
                 id: "task-4".to_string(),
                 title: "archived".to_string(),
                 description: None,
@@ -2935,6 +2942,62 @@ pub(crate) mod tests {
             snapshot.active_tasks,
             vec!["task-1 waiting [pending]".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn refresh_task_board_snapshot_preserves_previous_snapshot_on_load_failure() {
+        struct LoadFailsTaskStore;
+
+        #[async_trait::async_trait]
+        impl astra_tools::task_mgmt::TaskStore for LoadFailsTaskStore {
+            async fn load(&self, _session_id: &str) -> Result<Vec<SessionTask>, String> {
+                Err("simulated task-board load failure".to_string())
+            }
+
+            async fn save(
+                &self,
+                _session_id: &str,
+                _tasks: Vec<SessionTask>,
+            ) -> Result<(), String> {
+                Ok(())
+            }
+
+            async fn next_task_id(&self, _session_id: &str) -> Result<u32, String> {
+                Ok(1)
+            }
+
+            async fn peek_next_task_id(&self, _session_id: &str) -> Result<u32, String> {
+                Ok(1)
+            }
+        }
+
+        let mut state = make_state();
+        state.current_session_id = Some("session-load-fails".to_string());
+        state.hooks.task_board_monitor = Some(Arc::new(TaskManager::new(
+            "session-load-fails",
+            Arc::new(LoadFailsTaskStore),
+        )));
+        state.hooks.task_board_snapshot = TaskBoardSnapshot::from_active_tasks(&[SessionTask {
+            archived_at: None,
+            id: "task-1".to_string(),
+            title: "finish cloud runtime task guard".to_string(),
+            description: None,
+            status: astra_tools::task_mgmt::SessionTaskStatusKind::InProgress,
+            subtasks: Vec::new(),
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+            updated_at: "2025-01-01T00:00:00Z".to_string(),
+            active_form: None,
+            owner: None,
+            metadata: None,
+            blocks: Vec::new(),
+            blocked_by: Vec::new(),
+        }]);
+        let previous = state.hooks.task_board_snapshot.clone();
+
+        state.refresh_task_board_snapshot().await;
+
+        assert_eq!(state.hooks.task_board_snapshot, previous);
+        assert!(state.hooks.task_board_snapshot.has_unfinished_tasks());
     }
 
     // ── Original tests ──────────────────────────────────────────────────────
