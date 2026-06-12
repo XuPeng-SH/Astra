@@ -473,10 +473,15 @@ impl BackgroundTaskView {
         selected_id: Option<&str>,
     ) -> Self {
         let mut view = Self::new(rows);
+        let mut selected = false;
         if let Some(selected_id) = selected_id
             && let Some(idx) = view.rows.iter().position(|row| row.id == selected_id)
         {
             view.selected = idx;
+            selected = true;
+        }
+        if selected || view.rows.len() == 1 {
+            view.mode = Mode::Detail;
         }
         view
     }
@@ -496,11 +501,16 @@ impl BackgroundTaskView {
         let fallback_idx = current_selected_id
             .and_then(|id| rows.iter().position(|row| row.id == id))
             .or_else(|| rows.first().map(|_| 0));
+        let explicit_selection_found = selected_idx.is_some();
         self.selected = selected_idx
             .or(fallback_idx)
             .unwrap_or(0)
             .min(rows.len().saturating_sub(1));
         self.rows = rows;
+        if explicit_selection_found {
+            self.mode = Mode::Detail;
+        }
+        // CRITICAL FIX: Always clamp after mutation to prevent OOB panic
         self.clamp_selection();
     }
 
@@ -593,7 +603,7 @@ impl BackgroundTaskView {
 
     fn request_output(&mut self) {
         if let Some(row) = self.selected_row()
-            && row.kind.supports_output_action()
+            && row_can_open_output(row)
         {
             self.pending_action = Some(format!("{BACKGROUND_TASK_OUTPUT_SENTINEL}{}", row.id));
         }
@@ -604,11 +614,6 @@ impl BackgroundTaskView {
         let title_style = Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD);
-        let running = self
-            .rows
-            .iter()
-            .filter(|row| row.status == BackgroundTaskStatus::Running)
-            .count();
         let waiting = self
             .rows
             .iter()
@@ -623,9 +628,7 @@ impl BackgroundTaskView {
             "  Background tasks".to_string()
         } else {
             let mut parts = vec![format!("{} total", self.rows.len())];
-            if running > 0 {
-                parts.push(format!("{running} running"));
-            }
+            parts.extend(background_task_active_count_parts(&self.rows));
             if waiting > 0 {
                 parts.push(pluralize_with_count(waiting, "needs input", "need input"));
             }
@@ -815,20 +818,17 @@ impl BackgroundTaskView {
         for line in tail.lines().take(DETAIL_TAIL_LINES) {
             lines.push(Line::from(format!("  {}", line)));
         }
+        let can_output = row_can_open_output(row);
         if row.status.is_killable() && row.live_control.can_stop() {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                detail_actions_label(row.kind.supports_output_action(), true, area.width as usize),
+                detail_actions_label(can_output, true, area.width as usize),
                 dim,
             )));
         } else {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                detail_actions_label(
-                    row.kind.supports_output_action(),
-                    false,
-                    area.width as usize,
-                ),
+                detail_actions_label(can_output, false, area.width as usize),
                 dim,
             )));
         }
@@ -933,8 +933,8 @@ impl BottomPaneView for BackgroundTaskView {
 
     fn hint_keys(&self) -> Option<String> {
         match self.mode {
-            Mode::List => Some("↑↓ move · Enter details · S stop · Esc close".into()),
-            Mode::Detail => Some("S stop · Esc list · Q close".into()),
+            Mode::List => Some("↑↓ select · Enter details · O output · S stop · Esc close".into()),
+            Mode::Detail => Some("O output · S stop · Esc list · Q close".into()),
         }
     }
 
@@ -990,6 +990,45 @@ fn fanout_slot_title(row: &BackgroundTaskRow) -> String {
     format!("slot {}: {}", fanout.slot_index + 1, label)
 }
 
+fn background_task_active_count_parts(rows: &[BackgroundTaskRow]) -> Vec<String> {
+    let mut shells = 0usize;
+    let mut local_agents = 0usize;
+    let mut cloud_sessions = 0usize;
+    let mut main_sessions = 0usize;
+    let mut monitors = 0usize;
+
+    for row in rows.iter().filter(|row| {
+        matches!(
+            row.status,
+            BackgroundTaskStatus::Pending | BackgroundTaskStatus::Running
+        )
+    }) {
+        match row.kind {
+            BackgroundTaskKind::Shell => shells += 1,
+            BackgroundTaskKind::LocalAgent => local_agents += 1,
+            BackgroundTaskKind::CloudSession => cloud_sessions += 1,
+            BackgroundTaskKind::MainSession => main_sessions += 1,
+            BackgroundTaskKind::Monitor => monitors += 1,
+        }
+    }
+
+    [
+        (shells, "active shell", "active shells"),
+        (local_agents, "active local agent", "active local agents"),
+        (
+            cloud_sessions,
+            "active cloud session",
+            "active cloud sessions",
+        ),
+        (main_sessions, "active main session", "active main sessions"),
+        (monitors, "active monitor", "active monitors"),
+    ]
+    .into_iter()
+    .filter(|(count, _, _)| *count > 0)
+    .map(|(count, singular, plural)| pluralize_with_count(count, singular, plural))
+    .collect()
+}
+
 fn compact_list_row_text(
     row: &BackgroundTaskRow,
     title: &str,
@@ -1035,6 +1074,10 @@ fn detail_actions_label(can_output: bool, can_stop: bool, width: usize) -> &'sta
         (false, true, _) => "  actions: stop",
         (false, false, _) => "  actions: return",
     }
+}
+
+fn row_can_open_output(row: &BackgroundTaskRow) -> bool {
+    row.kind.supports_output_action() && row.output_ref.is_some()
 }
 
 fn pluralize_with_count(count: usize, singular: &str, plural: &str) -> String {
@@ -1164,6 +1207,61 @@ mod tests {
     }
 
     #[test]
+    fn list_header_summarizes_active_background_task_kinds() {
+        let view = BackgroundTaskView::new(vec![
+            typed_row("shell", BackgroundTaskKind::Shell, "running", "make check"),
+            typed_row(
+                "agent",
+                BackgroundTaskKind::LocalAgent,
+                "running",
+                "review auth",
+            ),
+            typed_row(
+                "cloud",
+                BackgroundTaskKind::CloudSession,
+                "pending",
+                "remote review",
+            ),
+            typed_row("done", BackgroundTaskKind::Shell, "completed", "old build"),
+        ]);
+
+        let text = render(&view, 140, 5);
+
+        assert!(text.contains("4 total"), "{text}");
+        assert!(text.contains("1 active shell"), "{text}");
+        assert!(text.contains("1 active local agent"), "{text}");
+        assert!(text.contains("1 active cloud session"), "{text}");
+        assert!(
+            !text.contains("3 running"),
+            "header should describe active background kinds instead of a vague running count: {text}"
+        );
+    }
+
+    #[test]
+    fn pending_shell_without_output_ref_does_not_emit_output_action() {
+        let mut view = BackgroundTaskView::new(vec![BackgroundTaskRow::shell(
+            "bg-shell-handoff",
+            "pending",
+            0,
+            "make build",
+            None,
+            Some("Waiting for foreground Bash to hand off its process.".to_string()),
+            Some(51),
+        )]);
+
+        view.handle_key(key(KeyCode::Enter));
+        view.handle_key(key(KeyCode::Enter));
+
+        assert!(
+            view.take_pending_action().is_none(),
+            "pending handoff rows do not have a readable output artifact yet"
+        );
+        let text = render(&view, 80, 10);
+        assert!(text.contains("actions: return"), "{text}");
+        assert!(!text.contains("actions: output"), "{text}");
+    }
+
+    #[test]
     fn new_with_selected_selects_matching_row_after_sort() {
         let view = BackgroundTaskView::new_with_selected(
             vec![
@@ -1175,6 +1273,71 @@ mod tests {
         );
 
         assert_eq!(view.selected_row().map(|row| row.id.as_str()), Some("run"));
+    }
+
+    #[test]
+    fn open_view_enters_detail_for_single_background_task() {
+        let view = BackgroundTaskView::new_with_selected(
+            vec![row("bg-shell-1", "running", "cargo test")],
+            None,
+        );
+
+        let text = render(&view, 90, 12);
+        assert!(text.contains("bg-shell-1 · running"), "{text}");
+        assert!(text.contains("command cargo test"), "{text}");
+        assert!(text.contains("Tail"), "{text}");
+        assert_eq!(
+            view.hint_keys().as_deref(),
+            Some("O output · S stop · Esc list · Q close")
+        );
+    }
+
+    #[test]
+    fn open_view_enters_detail_for_explicit_selected_task() {
+        let view = BackgroundTaskView::new_with_selected(
+            vec![
+                row("first", "running", "first command"),
+                row("second", "running", "second command"),
+            ],
+            Some("second"),
+        );
+
+        let text = render(&view, 90, 12);
+        assert!(text.contains("second · running"), "{text}");
+        assert!(text.contains("command second command"), "{text}");
+        assert_eq!(
+            view.hint_keys().as_deref(),
+            Some("O output · S stop · Esc list · Q close")
+        );
+    }
+
+    #[test]
+    fn explicit_refresh_keeps_adopted_handoff_in_detail() {
+        let mut view = BackgroundTaskView::new_with_selected(
+            vec![BackgroundTaskRow::shell(
+                "bg-shell-handoff",
+                "pending",
+                0,
+                "make build",
+                None,
+                Some("Waiting for foreground Bash to hand off its process.".to_string()),
+                Some(51),
+            )],
+            Some("bg-shell-handoff"),
+        );
+        assert!(
+            render(&view, 90, 12).contains("bg-shell-handoff · pending"),
+            "pending handoff should open in detail"
+        );
+
+        view.replace_rows_with_selected(
+            vec![row("bg-shell-7", "running", "make build")],
+            Some("bg-shell-7"),
+        );
+
+        let text = render(&view, 90, 12);
+        assert!(text.contains("bg-shell-7 · running"), "{text}");
+        assert!(text.contains("command make build"), "{text}");
     }
 
     #[test]

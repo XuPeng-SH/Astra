@@ -74,6 +74,7 @@ impl Default for IndicatorState {
 #[derive(Debug, Default)]
 pub(crate) struct StatusIndicator {
     state: IndicatorState,
+    bash_background_hint_enabled: bool,
     /// Per-turn streamed-char count (for the `↓ 5.1k tokens`
     /// counter). Reset on each new turn.
     stream_chars: u64,
@@ -107,12 +108,26 @@ impl StatusIndicator {
         &self.state
     }
 
+    pub fn set_bash_background_hint_enabled(&mut self, enabled: bool) {
+        self.bash_background_hint_enabled = enabled;
+    }
+
     pub fn set_state(&mut self, state: IndicatorState) {
         // The stream counter resets across state changes only when
         // entering a *brand new turn*. Within a turn, tool ↔ thinking
         // transitions preserve `stream_chars` so `↓ Nk tokens` keeps
         // climbing instead of flashing back to 0 each time the model
         // fires a tool. `begin_turn` is the explicit reset point.
+        // The Ctrl+B hint is bash-tool-scoped — drop it on any state
+        // that isn't a bash tool so a stale flag can't render under
+        // a different tool or thinking state.
+        let entering_bash_tool = matches!(
+            &state,
+            IndicatorState::Tool { name, .. } if name == "bash"
+        );
+        if !entering_bash_tool {
+            self.bash_background_hint_enabled = false;
+        }
         if matches!(state, IndicatorState::Idle) {
             self.stream_chars = 0;
             self.turn_started_at = None;
@@ -159,12 +174,13 @@ impl StatusIndicator {
     /// clock without mocking `Instant`. Production callers use
     /// `render()`.
     pub fn render_at(&self, now: Instant) -> Option<Line<'static>> {
-        render_for(
+        render_for_with_bash_hint(
             &self.state,
             self.stream_chars,
             self.turn_started_at,
             self.turn_label,
             now,
+            self.bash_background_hint_enabled,
         )
     }
 }
@@ -179,6 +195,17 @@ fn render_for(
     turn_started_at: Option<Instant>,
     turn_label: Option<&'static str>,
     now: Instant,
+) -> Option<Line<'static>> {
+    render_for_with_bash_hint(state, stream_chars, turn_started_at, turn_label, now, false)
+}
+
+fn render_for_with_bash_hint(
+    state: &IndicatorState,
+    stream_chars: u64,
+    turn_started_at: Option<Instant>,
+    turn_label: Option<&'static str>,
+    now: Instant,
+    bash_background_hint_enabled: bool,
 ) -> Option<Line<'static>> {
     if !state.is_active() {
         return None;
@@ -220,7 +247,14 @@ fn render_for(
 
     let mut spans = vec![Span::styled(format!("{} ", star_frame(now)), star_style)];
     spans.extend(label_spans(label, label_style, now));
-    let suffix = suffix(state, elapsed, stream_chars, thought_for, activity);
+    let suffix = suffix(
+        state,
+        elapsed,
+        stream_chars,
+        thought_for,
+        activity,
+        bash_background_hint_enabled,
+    );
     if !suffix.is_empty() {
         spans.push(Span::styled(format!(" {suffix}"), dim));
     }
@@ -295,6 +329,7 @@ fn suffix(
     stream_chars: u64,
     thought_for: Option<Duration>,
     activity: Option<&str>,
+    bash_background_hint_enabled: bool,
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
     if let Some(activity) = activity {
@@ -313,6 +348,14 @@ fn suffix(
         && streamed_tokens >= TOKEN_COUNT_VISIBILITY_THRESHOLD
     {
         parts.push(format!("{} tokens", fmt_tokens(streamed_tokens)));
+    }
+    if bash_background_hint_enabled
+        && matches!(state, IndicatorState::Tool { name, .. } if name == "bash")
+    {
+        parts.push(format!(
+            "{} to background",
+            crate::tui::background_shortcut::ctrl_b_background_shortcut()
+        ));
     }
     parts.push("Esc to stop".into());
     parts.join(" · ")
@@ -521,6 +564,75 @@ mod tests {
         let line = render_for(&state, 0, None, None, t0 + Duration::from_secs(1)).unwrap();
         let text = text_of(&line);
         assert!(text.contains("Bash"));
+    }
+
+    #[test]
+    fn bash_tool_can_surface_ctrl_b_hint() {
+        let t0 = Instant::now();
+        let mut s = StatusIndicator::new();
+        s.set_state(IndicatorState::Tool {
+            name: "bash".into(),
+            started_at: t0,
+        });
+        s.set_bash_background_hint_enabled(true);
+
+        let text = text_of(&s.render_at(t0 + Duration::from_secs(18)).unwrap());
+        assert!(text.contains("Bash"), "{text}");
+        assert!(
+            text.contains(&format!(
+                "{} to background",
+                crate::tui::background_shortcut::ctrl_b_background_shortcut()
+            )),
+            "{text}"
+        );
+        assert!(text.contains("Esc to stop"), "{text}");
+
+        s.set_state(IndicatorState::Idle);
+        assert!(
+            !s.bash_background_hint_enabled,
+            "idle transition must clear stale Ctrl+B affordance"
+        );
+    }
+
+    /// Bash-only hint state must not survive a transition to any other
+    /// indicator state — even within the same turn. Without this guard,
+    /// a bash → read_file transition would leave `bash_background_hint`
+    /// flipped to true, and any future renderer that forgets to gate on
+    /// `IndicatorState::Tool { name == "bash" }` would draw the Ctrl+B
+    /// affordance under an unrelated tool. Better to drop the flag at
+    /// the source.
+    #[test]
+    fn non_bash_state_transition_clears_ctrl_b_hint() {
+        let t0 = Instant::now();
+        let mut s = StatusIndicator::new();
+        s.set_state(IndicatorState::Tool {
+            name: "bash".into(),
+            started_at: t0,
+        });
+        s.set_bash_background_hint_enabled(true);
+        assert!(s.bash_background_hint_enabled);
+
+        // bash → another tool: hint must drop.
+        s.set_state(IndicatorState::Tool {
+            name: "read_file".into(),
+            started_at: t0,
+        });
+        assert!(
+            !s.bash_background_hint_enabled,
+            "non-bash tool transition must clear stale Ctrl+B affordance"
+        );
+
+        // re-arming, then bash → thinking must also drop.
+        s.set_state(IndicatorState::Tool {
+            name: "bash".into(),
+            started_at: t0,
+        });
+        s.set_bash_background_hint_enabled(true);
+        s.set_state(IndicatorState::Thinking { started_at: t0 });
+        assert!(
+            !s.bash_background_hint_enabled,
+            "bash → thinking must clear stale Ctrl+B affordance"
+        );
     }
 
     #[test]

@@ -6,8 +6,14 @@ use super::{
     SANDBOX_DENIED_PREFIX, ToolExecutor, apply_env_overlay, build_test, code_intel,
     sandbox_command, validate_path, wrap_command_with_limits,
 };
-use astra_runtime::tool_sandbox::{SandboxMode, SandboxPolicy};
+use astra_runtime::tool_sandbox::{SandboxMode, SandboxPolicy, filter_environment};
+use astra_tools::detach::{
+    AdoptionAckOutcome, await_adoption_ack, detach_signal_observed, render_bash_detached_marker,
+    restore_detach_signal_receiver, sigkill_process_group, terminate_detached_payload,
+};
 use serde_json::Value;
+use tokio::io::AsyncReadExt;
+use tokio::process::Command as TokioCommand;
 
 pub(crate) fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
@@ -2816,7 +2822,7 @@ fn run_command_with_cleanup(
             Ok(None) => {
                 if std::time::Instant::now() > deadline {
                     // Kill entire process group (command + all children)
-                    sigkill_process_group(&mut child);
+                    sync_sigkill_process_group(&mut child);
                     // Reap the zombie process to prevent resource leak
                     let _ = child.wait();
                     return Err(format!("Error: command timed out after {timeout_secs}s"));
@@ -2824,7 +2830,7 @@ fn run_command_with_cleanup(
                 std::thread::sleep(Duration::from_millis(50));
             }
             Err(e) => {
-                sigkill_process_group(&mut child);
+                sync_sigkill_process_group(&mut child);
                 let _ = child.wait();
                 return Err(format!("Error: {e}"));
             }
@@ -2857,7 +2863,7 @@ const BASH_PIPE_READ_TIMEOUT: Duration = Duration::from_millis(500);
 ///
 /// Failures are silently ignored because the child may already have been
 /// reaped by the caller in a race; this helper is strictly best-effort.
-fn sigkill_process_group(child: &mut std::process::Child) {
+fn sync_sigkill_process_group(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
         let pid = child.id();
@@ -2867,7 +2873,7 @@ fn sigkill_process_group(child: &mut std::process::Child) {
         } else {
             tracing::warn!(
                 pid,
-                "sigkill_process_group: PID exceeds i32::MAX, skipping killpg"
+                "sync_sigkill_process_group: PID exceeds i32::MAX, skipping killpg"
             );
         }
     }
@@ -2941,8 +2947,16 @@ struct ShellRunConfig {
     cancel_token: Option<tokio_util::sync::CancellationToken>,
 }
 
-fn run_shell_output_with_config(config: ShellRunConfig) -> Result<std::process::Output, String> {
-    let effective_command = if config.harden_command {
+enum DetachableShellOutput {
+    Completed(std::process::Output),
+    Detached {
+        payload: Box<astra_tools::detach::DetachedShellPayload>,
+        adoption_rx: tokio::sync::oneshot::Receiver<Result<String, String>>,
+    },
+}
+
+fn effective_shell_command(config: &ShellRunConfig) -> String {
+    if config.harden_command {
         if let Some(ref policy) = config.sandbox_policy {
             if !matches!(policy.mode, SandboxMode::Permissive) {
                 wrap_command_with_limits(policy, &config.command)
@@ -2954,7 +2968,11 @@ fn run_shell_output_with_config(config: ShellRunConfig) -> Result<std::process::
         }
     } else {
         config.command.clone()
-    };
+    }
+}
+
+fn run_shell_output_with_config(config: ShellRunConfig) -> Result<std::process::Output, String> {
+    let effective_command = effective_shell_command(&config);
 
     let mut child_cmd = Command::new(&config.program);
     child_cmd
@@ -3024,13 +3042,13 @@ fn run_shell_output_with_config(config: ShellRunConfig) -> Result<std::process::
                     .as_ref()
                     .is_some_and(|token| token.is_cancelled())
                 {
-                    sigkill_process_group(&mut child);
+                    sync_sigkill_process_group(&mut child);
                     let _ = child.wait();
                     return Err("Error: command cancelled by user".to_string());
                 }
                 if std::time::Instant::now() > deadline {
                     // Kill entire process group (bash + all children)
-                    sigkill_process_group(&mut child);
+                    sync_sigkill_process_group(&mut child);
                     // Reap the zombie process to prevent resource leak
                     let _ = child.wait();
                     return Err(format!(
@@ -3041,7 +3059,7 @@ fn run_shell_output_with_config(config: ShellRunConfig) -> Result<std::process::
                 std::thread::sleep(Duration::from_millis(50));
             }
             Err(e) => {
-                sigkill_process_group(&mut child);
+                sync_sigkill_process_group(&mut child);
                 let _ = child.wait();
                 return Err(format!("Error: {e}"));
             }
@@ -3064,6 +3082,288 @@ fn run_shell_output_with_config(config: ShellRunConfig) -> Result<std::process::
         stdout: stdout_buf,
         stderr: stderr_buf,
     })
+}
+
+fn apply_overlay_to_tokio_command(cmd: &mut TokioCommand) {
+    cmd.env_clear();
+    for (key, value) in astra_core::session_env_overlay::merged_pairs() {
+        cmd.env(key, value);
+    }
+}
+
+fn configure_detachable_tokio_command(config: &ShellRunConfig) -> TokioCommand {
+    let effective_command = effective_shell_command(config);
+    let mut child_cmd = TokioCommand::new(&config.program);
+    child_cmd
+        .arg(&config.shell_flag)
+        .arg(&effective_command)
+        .current_dir(&config.effective_project_root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    apply_overlay_to_tokio_command(&mut child_cmd);
+
+    #[cfg(unix)]
+    child_cmd.process_group(0);
+
+    if let Some(ref policy) = config.sandbox_policy
+        && !matches!(policy.mode, SandboxMode::Permissive)
+    {
+        child_cmd.current_dir(&policy.project_root);
+        child_cmd.env_clear();
+        for (key, value) in filter_environment(policy) {
+            child_cmd.env(key, value);
+        }
+    }
+
+    child_cmd
+}
+
+fn record_async_bash_chunk(
+    sink: &Option<std::sync::Arc<crate::cli::chat_stream::ToolProgressSink>>,
+    bytes: &[u8],
+) {
+    if let Some(sink) = sink {
+        sink.record_chunk(bytes);
+    }
+}
+
+async fn drain_tokio_stdout(
+    stdout: &mut tokio::process::ChildStdout,
+    output: &mut Vec<u8>,
+    sink: &Option<std::sync::Arc<crate::cli::chat_stream::ToolProgressSink>>,
+    timeout: Duration,
+) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut buf = [0u8; 8192];
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => break,
+            read = stdout.read(&mut buf) => {
+                match read {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        record_async_bash_chunk(sink, &buf[..n]);
+                        output.extend_from_slice(&buf[..n]);
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+}
+
+async fn drain_tokio_stderr(
+    stderr: &mut tokio::process::ChildStderr,
+    output: &mut Vec<u8>,
+    sink: &Option<std::sync::Arc<crate::cli::chat_stream::ToolProgressSink>>,
+    timeout: Duration,
+) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut buf = [0u8; 8192];
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => break,
+            read = stderr.read(&mut buf) => {
+                match read {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        record_async_bash_chunk(sink, &buf[..n]);
+                        output.extend_from_slice(&buf[..n]);
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+}
+
+async fn run_shell_output_with_detach_config(
+    config: ShellRunConfig,
+    detach: &astra_tools::detach::DetachShellHandle,
+    command_label: &str,
+) -> Result<DetachableShellOutput, String> {
+    let mut child_cmd = configure_detachable_tokio_command(&config);
+    let mut child = child_cmd.spawn().map_err(|e| format!("Error: {e}"))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Error: failed to capture stdout".to_string())?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "Error: failed to capture stderr".to_string())?;
+
+    let mut signal_rx = detach.signal_rx.lock().await.take();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs_f64(config.timeout_secs);
+    let mut stdout_buf: Vec<u8> = Vec::new();
+    let mut stderr_buf: Vec<u8> = Vec::new();
+    let mut stdout_open = true;
+    let mut stderr_open = true;
+    let mut stdout_read_buf = [0u8; 8192];
+    let mut stderr_read_buf = [0u8; 8192];
+    let mut exit_status = None;
+    let mut detached = false;
+
+    loop {
+        if detach_signal_observed(&mut signal_rx) {
+            detached = true;
+            break;
+        }
+
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                exit_status = Some(status);
+                break;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                sigkill_process_group(&mut child).await;
+                restore_detach_signal_receiver(detach, signal_rx).await;
+                return Err(format!("Error: {e}"));
+            }
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            sigkill_process_group(&mut child).await;
+            restore_detach_signal_receiver(detach, signal_rx).await;
+            return Err(format!(
+                "Error: command timed out after {}s",
+                config.timeout_secs
+            ));
+        }
+
+        if let Some(rx) = signal_rx.as_mut() {
+            tokio::select! {
+                biased;
+                res = rx.changed() => {
+                    match res {
+                        Ok(()) if *rx.borrow_and_update() => {
+                            detached = true;
+                            break;
+                        }
+                        Ok(()) => {}
+                        Err(_) => signal_rx = None,
+                    }
+                }
+                _ = async {
+                    if let Some(token) = config.cancel_token.as_ref() {
+                        token.cancelled().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {
+                    sigkill_process_group(&mut child).await;
+                    restore_detach_signal_receiver(detach, signal_rx).await;
+                    return Err("Error: command cancelled by user".to_string());
+                }
+                read = stdout.read(&mut stdout_read_buf), if stdout_open => {
+                    match read {
+                        Ok(0) => stdout_open = false,
+                        Ok(n) => {
+                            record_async_bash_chunk(&config.progress_sink, &stdout_read_buf[..n]);
+                            stdout_buf.extend_from_slice(&stdout_read_buf[..n]);
+                        }
+                        Err(_) => stdout_open = false,
+                    }
+                }
+                read = stderr.read(&mut stderr_read_buf), if stderr_open => {
+                    match read {
+                        Ok(0) => stderr_open = false,
+                        Ok(n) => {
+                            record_async_bash_chunk(&config.progress_sink, &stderr_read_buf[..n]);
+                            stderr_buf.extend_from_slice(&stderr_read_buf[..n]);
+                        }
+                        Err(_) => stderr_open = false,
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+            }
+        } else {
+            tokio::select! {
+                biased;
+                _ = async {
+                    if let Some(token) = config.cancel_token.as_ref() {
+                        token.cancelled().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {
+                    sigkill_process_group(&mut child).await;
+                    restore_detach_signal_receiver(detach, signal_rx).await;
+                    return Err("Error: command cancelled by user".to_string());
+                }
+                read = stdout.read(&mut stdout_read_buf), if stdout_open => {
+                    match read {
+                        Ok(0) => stdout_open = false,
+                        Ok(n) => {
+                            record_async_bash_chunk(&config.progress_sink, &stdout_read_buf[..n]);
+                            stdout_buf.extend_from_slice(&stdout_read_buf[..n]);
+                        }
+                        Err(_) => stdout_open = false,
+                    }
+                }
+                read = stderr.read(&mut stderr_read_buf), if stderr_open => {
+                    match read {
+                        Ok(0) => stderr_open = false,
+                        Ok(n) => {
+                            record_async_bash_chunk(&config.progress_sink, &stderr_read_buf[..n]);
+                            stderr_buf.extend_from_slice(&stderr_read_buf[..n]);
+                        }
+                        Err(_) => stderr_open = false,
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+            }
+        }
+    }
+
+    if detached {
+        let (adoption_tx, adoption_rx) = tokio::sync::oneshot::channel();
+        let payload = Box::new(astra_tools::detach::DetachedShellPayload {
+            child,
+            stdout,
+            stderr,
+            command: command_label.to_string(),
+            partial_stdout: String::from_utf8_lossy(&stdout_buf).into_owned(),
+            partial_stderr: String::from_utf8_lossy(&stderr_buf).into_owned(),
+            adoption_tx,
+        });
+        return Ok(DetachableShellOutput::Detached {
+            payload,
+            adoption_rx,
+        });
+    }
+
+    let read_timeout = bash_pipe_read_timeout();
+    drain_tokio_stdout(
+        &mut stdout,
+        &mut stdout_buf,
+        &config.progress_sink,
+        read_timeout,
+    )
+    .await;
+    drain_tokio_stderr(
+        &mut stderr,
+        &mut stderr_buf,
+        &config.progress_sink,
+        read_timeout,
+    )
+    .await;
+
+    restore_detach_signal_receiver(detach, signal_rx).await;
+    Ok(DetachableShellOutput::Completed(std::process::Output {
+        status: exit_status.unwrap_or_else(|| {
+            child
+                .try_wait()
+                .ok()
+                .flatten()
+                .expect("bash child should have exited before normal completion")
+        }),
+        stdout: stdout_buf,
+        stderr: stderr_buf,
+    }))
 }
 
 /// Adaptive default bash timeout by command kind. Used when the caller
@@ -3432,7 +3732,7 @@ fn run_command_streaming(
                         });
                     } else {
                         // Hard kill.
-                        sigkill_process_group(&mut child);
+                        sync_sigkill_process_group(&mut child);
                         let _ = child.wait();
                         let _ = stdout_thread.join();
                         let _ = stderr_thread.join();
@@ -3448,7 +3748,7 @@ fn run_command_streaming(
                 std::thread::sleep(Duration::from_millis(50));
             }
             Err(e) => {
-                sigkill_process_group(&mut child);
+                sync_sigkill_process_group(&mut child);
                 let _ = child.wait();
                 let _ = stdout_thread.join();
                 let _ = stderr_thread.join();
@@ -3489,7 +3789,7 @@ fn size_watchdog(
             Ok(Some(_)) => break,
             Ok(None) => {}
             Err(_) => {
-                sigkill_process_group(&mut child);
+                sync_sigkill_process_group(&mut child);
                 let _ = child.wait();
                 break;
             }
@@ -3497,7 +3797,7 @@ fn size_watchdog(
 
         // Kill if running too long.
         if start.elapsed() > max_duration {
-            sigkill_process_group(&mut child);
+            sync_sigkill_process_group(&mut child);
             let _ = child.wait();
             break;
         }
@@ -3590,7 +3890,7 @@ fn run_readonly_command_with_partial(
                 if std::time::Instant::now() > deadline {
                     // Kill the entire process group (catches child processes).
                     // Fall back to direct kill so child.wait() never blocks forever.
-                    sigkill_process_group(&mut child);
+                    sync_sigkill_process_group(&mut child);
                     let _ = child.wait();
                     let _ = reader.join();
                     let _ = stderr_reader.join();
@@ -3609,7 +3909,7 @@ fn run_readonly_command_with_partial(
                 std::thread::sleep(Duration::from_millis(50));
             }
             Err(e) => {
-                sigkill_process_group(&mut child);
+                sync_sigkill_process_group(&mut child);
                 let _ = child.wait();
                 let _ = reader.join();
                 let _ = stderr_reader.join();
@@ -3826,6 +4126,7 @@ impl ToolExecutor {
             Some(c) => c,
             None => return Err("Error: missing 'command'".to_string()),
         };
+        astra_tools::shell_ops::validate_bash_background_task_contract(command)?;
 
         // Block pure sleep commands — they waste time with no useful output.
         // Only when no explicit timeout is set (explicit timeout = intentional test usage).
@@ -4040,6 +4341,107 @@ impl ToolExecutor {
             Ok(Ok(out)) => self.render_bash_output(&command, out),
             Ok(Err(error)) => error,
             Err(error) => format!("Error: bash worker failed: {error}"),
+        }
+    }
+
+    async fn restore_bash_detach_handle(
+        &self,
+        slot: astra_tools::detach::DetachShellSlot,
+        handle: astra_tools::detach::DetachShellHandle,
+    ) {
+        handle.mark_active(false);
+        if !handle.is_retired() {
+            *slot.lock().await = Some(handle);
+        }
+    }
+
+    pub(crate) async fn bash_detachable_with_metadata(
+        &self,
+        args: &Value,
+        cancel_token: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Option<super::ToolExecutionOutcome> {
+        let slot = self.bash_detach_slot.as_ref()?.clone();
+        let handle = slot.lock().await.take()?;
+
+        let (command, timeout_secs) = match self.prepare_bash_invocation(args) {
+            Ok(invocation) => invocation,
+            Err(message) => {
+                self.restore_bash_detach_handle(slot, handle).await;
+                return Some(super::ToolExecutionOutcome::error(message));
+            }
+        };
+        let config =
+            self.shell_run_config("bash", "-c", &command, timeout_secs, true, cancel_token);
+
+        handle.mark_active(true);
+        let outcome = run_shell_output_with_detach_config(config, &handle, &command).await;
+        match outcome {
+            Ok(DetachableShellOutput::Completed(out)) => {
+                self.restore_bash_detach_handle(slot, handle).await;
+                let output =
+                    self.finalize_tool_output(self.render_bash_output(&command, out), "bash");
+                self.record_output_size(output.len());
+                Some(if output.starts_with("Error") {
+                    super::ToolExecutionOutcome::error(output)
+                } else {
+                    super::ToolExecutionOutcome::ok(output)
+                })
+            }
+            Ok(DetachableShellOutput::Detached {
+                payload,
+                adoption_rx,
+            }) => {
+                handle.mark_active(false);
+                let Some(sender) = handle.payload_tx.lock().await.take() else {
+                    terminate_detached_payload(payload).await;
+                    return Some(super::ToolExecutionOutcome::error(
+                        "Error: bash detach failed: host payload channel was not available"
+                            .to_string(),
+                    ));
+                };
+                if let Err(payload) = sender.send(*payload) {
+                    terminate_detached_payload(Box::new(payload)).await;
+                    return Some(super::ToolExecutionOutcome::error(
+                        "Error: bash detach failed: host listener dropped before payload arrived"
+                            .to_string(),
+                    ));
+                }
+
+                let task_id = match await_adoption_ack(adoption_rx).await {
+                    AdoptionAckOutcome::Adopted { task_id, .. } => task_id,
+                    AdoptionAckOutcome::Refused(error) => {
+                        return Some(super::ToolExecutionOutcome::error(format!(
+                            "Error: bash detach failed: host could not adopt process: {error}"
+                        )));
+                    }
+                    AdoptionAckOutcome::SenderDropped => {
+                        return Some(super::ToolExecutionOutcome::error(
+                            "Error: bash detach failed: host dropped adoption acknowledgement"
+                                .to_string(),
+                        ));
+                    }
+                    AdoptionAckOutcome::TimedOut => {
+                        return Some(super::ToolExecutionOutcome::error(
+                            "Error: bash detach failed: host did not acknowledge adoption in time"
+                                .to_string(),
+                        ));
+                    }
+                };
+
+                let output = render_bash_detached_marker(&task_id);
+                let mut tool_result_fields = serde_json::Map::new();
+                tool_result_fields.insert("bash_detached".to_string(), Value::Bool(true));
+                tool_result_fields.insert("background_task_id".to_string(), Value::String(task_id));
+                Some(super::ToolExecutionOutcome {
+                    output,
+                    tool_result_fields: Some(tool_result_fields),
+                    is_error: false,
+                })
+            }
+            Err(error) => {
+                self.restore_bash_detach_handle(slot, handle).await;
+                Some(super::ToolExecutionOutcome::error(error))
+            }
         }
     }
 
@@ -4810,6 +5212,51 @@ mod tests {
         let executor = test_executor();
         let result = executor.bash(&serde_json::json!({"command": "echo hello"}));
         assert!(result.trim().contains("hello"), "got: {result}");
+    }
+
+    #[test]
+    fn bash_rejects_background_task_pseudo_tool_call() {
+        let executor = test_executor();
+        let result =
+            executor.bash(&serde_json::json!({"command": "task_output(task_id='bg-shell-1')"}));
+        assert!(result.contains("background-task tool"), "got: {result}");
+        assert!(result.contains("not a bash command"), "got: {result}");
+        assert!(result.contains("Do not rerun"), "got: {result}");
+        assert!(
+            !result.contains("syntax error"),
+            "pseudo task tool call must not reach bash: {result}"
+        );
+    }
+
+    /// The edge bash entry point must refuse direct disk reads of the
+    /// background-task output directory — the same denial the in-tools
+    /// `validate_execute_bash_command` enforces. Without this, the hot-path
+    /// edge bash silently bypasses the canonical validator and the model
+    /// can still `tail /tmp/astra/bg_tasks/...` to poll task output, which
+    /// is the canonical 12-LLM-round trace this contract was designed
+    /// to defeat.
+    #[test]
+    fn bash_rejects_background_task_output_dir_disk_read() {
+        let executor = test_executor();
+        for command in [
+            "tail -20 /tmp/astra/bg_tasks/default/bg-shell-1.stderr",
+            "cat /tmp/astra/bg_tasks/default/bg-shell-1.stdout",
+            "tail -f /var/folders/abc/T/astra/bg_tasks/sess/bg-shell-2.stdout",
+            "grep error /tmp/astra/bg_tasks/sess/bg-shell-3.stderr",
+        ] {
+            let result = executor.bash(&serde_json::json!({"command": command}));
+            assert!(
+                result.contains("background task output files"),
+                "{command} -> {result}"
+            );
+            assert!(result.contains("task_output"), "{command} -> {result}");
+        }
+        assert!(
+            executor
+                .bash(&serde_json::json!({"command": "echo bg_tasks is unrelated here"}))
+                .contains("bg_tasks is unrelated here"),
+            "literal word 'bg_tasks' without the astra path prefix must not trigger"
+        );
     }
 
     /// Regression for the c49bc4a3 inspection-loop deadlock: a model that
@@ -7932,7 +8379,7 @@ mod tests {
         // Process should be alive.
         assert!(child.try_wait().unwrap().is_none());
         // Kill it.
-        super::sigkill_process_group(&mut child);
+        super::sync_sigkill_process_group(&mut child);
         // Wait should complete immediately.
         let status = child.wait().expect("wait after sigkill");
         assert!(!status.success(), "process should have been killed");
