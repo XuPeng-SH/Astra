@@ -1227,6 +1227,8 @@ pub struct CachedToolResult {
     pub output: String,
     pub is_error: bool,
     pub cached_at: u64,
+    /// Optional context signature captured at cache time (for workspace version comparison).
+    pub context_signature: Option<ContextSignature>,
 }
 
 pub use astra_turn_types::{ToolIdempotency, classify_tool_idempotency};
@@ -1248,9 +1250,21 @@ pub trait IdempotencyCache {
 }
 
 /// In-memory idempotency cache (v2-v3; v4 uses MatrixOne).
-#[derive(Debug, Default)]
+///
+/// **Safety**: Capacity-bounded to prevent OOM. LRU eviction when full.
+#[derive(Debug)]
 pub struct InMemoryIdempotencyCache {
     cache: HashMap<String, CachedToolResult>,
+    max_entries: usize,
+}
+
+impl Default for InMemoryIdempotencyCache {
+    fn default() -> Self {
+        Self {
+            cache: HashMap::new(),
+            max_entries: 10_000, // ~100MB at 10KB per entry
+        }
+    }
 }
 
 impl InMemoryIdempotencyCache {
@@ -1258,14 +1272,37 @@ impl InMemoryIdempotencyCache {
         Self::default()
     }
 
+    pub fn with_capacity(max_entries: usize) -> Self {
+        Self {
+            cache: HashMap::new(),
+            max_entries,
+        }
+    }
+
     /// Check if result is cached
     pub fn check(&self, key: &IdempotencyKey) -> Option<&CachedToolResult> {
         self.cache.get(&key.cache_key())
     }
 
-    /// Record a tool result
+    /// Record a tool result. Evicts oldest entry if at capacity.
     pub fn record(&mut self, key: &IdempotencyKey, result: CachedToolResult) {
+        // Evict if at capacity (LRU: evict oldest by cached_at)
+        if self.cache.len() >= self.max_entries {
+            self.evict_oldest();
+        }
         self.cache.insert(key.cache_key(), result);
+    }
+
+    /// Evict oldest entry by cached_at timestamp
+    fn evict_oldest(&mut self) {
+        if let Some(oldest_key) = self
+            .cache
+            .iter()
+            .min_by_key(|(_, v)| v.cached_at)
+            .map(|(k, _)| k.clone())
+        {
+            self.cache.remove(&oldest_key);
+        }
     }
 
     /// Remove cached results for a tool. Used after workspace mutations to
@@ -1837,6 +1874,7 @@ mod tests {
                 output: "3 matches".into(),
                 is_error: false,
                 cached_at: 1000,
+                context_signature: None,
             }),
             retry_count: 0,
         };
@@ -1954,6 +1992,7 @@ mod tests {
                 output: "3 matches".into(),
                 is_error: false,
                 cached_at: epoch_ms(),
+                context_signature: None,
             },
         );
         assert_eq!(cache.len(), 1);
@@ -1975,6 +2014,7 @@ mod tests {
                     output: "r".into(),
                     is_error: false,
                     cached_at: 0,
+                    context_signature: None,
                 },
             );
         }
@@ -2155,6 +2195,7 @@ mod tests {
                 output: "old file".into(),
                 is_error: false,
                 cached_at: 0,
+                context_signature: None,
             },
         );
         cache.record(
@@ -2164,6 +2205,7 @@ mod tests {
                 output: "old grep".into(),
                 is_error: false,
                 cached_at: 0,
+                context_signature: None,
             },
         );
 
@@ -2189,6 +2231,7 @@ mod tests {
                 output: "3 matches".into(),
                 is_error: false,
                 cached_at: 1000,
+                context_signature: None,
             }),
             retry_count: 0,
         };
@@ -2556,6 +2599,7 @@ mod tests {
                 output: "found".into(),
                 is_error: false,
                 cached_at: 0,
+                context_signature: None,
             },
         );
         assert!(cache.check(&key).is_some());
@@ -2868,6 +2912,7 @@ mod tests {
             output: "ok".into(),
             is_error: false,
             cached_at: 0,
+            context_signature: None,
         };
         cache.record(&key_s1, result.clone());
         cache.record(&key_s10, result);

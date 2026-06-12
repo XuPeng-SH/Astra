@@ -8,8 +8,10 @@
 
 #![allow(clippy::too_many_arguments)]
 
+pub mod crash_recovery;
 pub mod engine;
 pub mod event;
+pub mod exactly_once;
 pub mod feedback_extraction;
 pub mod feedback_store;
 pub mod journal_crypto;
@@ -17,6 +19,7 @@ pub mod output_stream;
 pub mod reflection_feedback;
 pub mod routing;
 pub mod scheduling;
+pub mod skill_checkpoint;
 pub mod stages;
 pub mod state;
 pub mod step_checkpoint;
