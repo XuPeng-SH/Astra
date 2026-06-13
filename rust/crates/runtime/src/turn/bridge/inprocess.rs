@@ -1904,10 +1904,13 @@ impl InProcessChatTurnBridge {
                     user_content_for_signal,
                     latest_assistant_message_text(&messages),
                 );
-                let is_correction = matches!(signal.signal_type.as_str(), "correction" | "frustration");
-                // Store heuristic-extracted feedback only on correction/frustration signals
+                let is_correction_like = matches!(
+                    signal.signal_type.as_str(),
+                    "correction" | "frustration" | "rephrasing"
+                );
+                // Store heuristic-extracted feedback only on correction-like signals
                 // and only when we have a valid session_id (avoid cross-session leakage)
-                if !session_id.is_empty() && is_correction {
+                if !session_id.is_empty() && is_correction_like {
                     if let Some(fb) = astra_pipeline::feedback_extraction::heuristic_extract(
                         user_content_for_signal,
                         &signal.signal_type,
@@ -1948,7 +1951,7 @@ impl InProcessChatTurnBridge {
                 let hint = crate::turn::implicit_feedback::implicit_feedback_context_injection(&signal)
                     .map(|s| format!("\n\n{s}"))
                     .unwrap_or_default();
-                (hint, is_correction)
+                (hint, is_correction_like)
             };
 
             // ── Memoria client (shared across P1 anchor + compaction + P3 write) ──
@@ -2171,8 +2174,9 @@ impl InProcessChatTurnBridge {
             );
             let bridge_selection_trace = edge_profile.get("recommended_tools").cloned();
             let bridge_restricted_snapshot = HashSet::new();
-            let initial_session_memory_entry = if let Some(memoria) = memoria_client_shared.as_ref() {
-                crate::turn::wire_assembly::session_memory_entry_for_pipeline(
+            let initial_session_memory_entry = if let Some(memoria) = memoria_client_shared.as_ref()
+            {
+                crate::turn::wire_assembly::session_memory_entry_for_user_turn(
                     crate::session_memory::runner::load_current_session_memory_preferring_local(
                         memoria,
                         &session_id,
@@ -2180,6 +2184,7 @@ impl InProcessChatTurnBridge {
                     .await
                     .as_deref(),
                     trace_turn,
+                    user_content_for_signal,
                 )
             } else {
                 None
@@ -2313,10 +2318,11 @@ impl InProcessChatTurnBridge {
                 let compact_result = ctx.compact(&raw, &llm_messages, &edge_tools).await;
 
                 if let Some(rerun) =
-                    crate::turn::wire_assembly::rerun_with_distinct_session_memory_entry(
+                    crate::turn::wire_assembly::rerun_with_distinct_session_memory_entry_for_user_turn(
                         compact_result.session_memory_context.as_deref(),
                         initial_session_memory_entry.as_ref(),
                         trace_turn,
+                        user_content_for_signal,
                         |session_memory_entry| {
                             crate::turn::llm::context::assemble_bridge_context(
                                 crate::turn::llm::context::BridgeContextAssemblyInput {

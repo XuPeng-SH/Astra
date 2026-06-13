@@ -1022,6 +1022,8 @@ fn build_ws_chat_request(
         allow_skills,
         allow_skill_sources,
         allow_tools,
+        workspace_binding: None,
+        executor_binding: None,
         runtime_mcp_bindings: Vec::new(),
         mcp_binding_ids: None,
         context: merge_plan_subtask_context(context, plan_subtask_id, is_plan_subtask),
@@ -1752,6 +1754,7 @@ fn sync_conn_state_from_stream_event(
             "session_info"
                 | "run_started"
                 | "run_paused"
+                | "run_waiting"
                 | "run_resumed"
                 | "run_cancelled"
                 | "run_finished"
@@ -2763,10 +2766,12 @@ mod tests {
         assert_eq!(
             error_payloads,
             vec![serde_json::json!({
-                "type": "error",
+                "type": "run_error",
                 "message": "boom",
+                "error": "boom",
                 "code": "RUN_ERROR",
-                "index": 2
+                "index": 2,
+                "run_id": "run-123"
             })]
         );
         assert_eq!(pending_run_error.as_deref(), Some("boom"));
@@ -2803,15 +2808,20 @@ mod tests {
             "data": {},
             "index": 2
         });
+        let run_waiting = serde_json::json!({
+            "event_type": "run_waiting",
+            "data": {"reason": "waiting: executor_offline"},
+            "index": 3
+        });
         let run_resumed = serde_json::json!({
             "event_type": "run_resumed",
             "data": {},
-            "index": 3
+            "index": 4
         });
 
         let payloads = lifecycle_events_to_ws_payloads(
             "run-123",
-            vec![run_paused, run_resumed],
+            vec![run_paused, run_waiting, run_resumed],
             &mut pending_run_error,
         );
 
@@ -2824,9 +2834,15 @@ mod tests {
                     "index": 2
                 }),
                 serde_json::json!({
+                    "type": "run_waiting",
+                    "run_id": "run-123",
+                    "reason": "waiting: executor_offline",
+                    "index": 3
+                }),
+                serde_json::json!({
                     "type": "run_resumed",
                     "run_id": "run-123",
-                    "index": 3
+                    "index": 4
                 })
             ]
         );

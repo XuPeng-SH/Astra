@@ -81,6 +81,34 @@ impl WorkingMemoryState {
         self.next_action = (!next_action.trim().is_empty()).then_some(next_action);
     }
 
+    /// Clear the resume action once the work it described has settled.
+    pub fn clear_next_action(&mut self) {
+        self.next_action = None;
+    }
+
+    /// Clear transient blockers once a turn settles cleanly.
+    pub fn clear_blockers(&mut self) {
+        self.blockers.clear();
+    }
+
+    /// Apply an explicit user correction to prompt-facing continuity state.
+    ///
+    /// A correction should not let stale blockers or resume actions continue to
+    /// steer the next turn. Durable decisions are kept, but the correction is
+    /// recorded as a newer bounded decision so it takes precedence over any
+    /// conflicting older memory.
+    pub fn apply_user_correction(&mut self, correction: impl AsRef<str>) {
+        let correction = compact_line(correction.as_ref(), 240);
+        if correction.is_empty() {
+            return;
+        }
+        self.clear_blockers();
+        self.clear_next_action();
+        self.push_decision(format!(
+            "Latest user correction overrides conflicting prior working memory: {correction}"
+        ));
+    }
+
     /// Whether the working memory would render an empty prompt section.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -137,6 +165,19 @@ fn push_unique_capped(items: &mut VecDeque<String>, value: String, cap: usize) {
     while items.len() > cap {
         items.pop_front();
     }
+}
+
+fn compact_line(raw: &str, max_chars: usize) -> String {
+    let normalized = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= max_chars {
+        return normalized;
+    }
+    let mut out = normalized
+        .chars()
+        .take(max_chars.saturating_sub(3))
+        .collect::<String>();
+    out.push_str("...");
+    out
 }
 
 #[cfg(test)]
@@ -237,6 +278,42 @@ mod tests {
         wm.push_decision("ignored");
         wm.push_blocker("ignored");
         assert!(!wm.render_prompt_section().contains("ignored"));
+    }
+
+    #[test]
+    fn explicit_clearers_remove_resume_and_blocker_pressure() {
+        let mut wm = WorkingMemoryState::default();
+        wm.push_decision("keep this durable decision");
+        wm.push_blocker("temporary tool outage");
+        wm.set_next_action("resume validation");
+
+        wm.clear_next_action();
+        wm.clear_blockers();
+
+        let rendered = wm.render_prompt_section();
+        assert!(rendered.contains("keep this durable decision"));
+        assert!(!rendered.contains("temporary tool outage"));
+        assert!(!rendered.contains("Next action:"));
+    }
+
+    #[test]
+    fn user_correction_clears_transient_pressure_and_records_precedence() {
+        let mut wm = WorkingMemoryState::default();
+        wm.push_decision("keep durable architecture decision");
+        wm.push_blocker("stale tool outage");
+        wm.set_next_action("retry stale path");
+
+        wm.apply_user_correction("No, that's wrong; use the server-side path.");
+
+        let rendered = wm.render_prompt_section();
+        assert!(rendered.contains("keep durable architecture decision"));
+        assert!(!rendered.contains("stale tool outage"));
+        assert!(!rendered.contains("retry stale path"));
+        assert!(!rendered.contains("Next action:"));
+        assert!(
+            rendered.contains("Latest user correction overrides conflicting prior working memory")
+        );
+        assert!(rendered.contains("use the server-side path"));
     }
 
     #[test]

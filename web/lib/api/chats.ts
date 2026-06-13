@@ -1,6 +1,13 @@
 import { requestJson, toQuery } from "@/lib/api/request";
 import { WebApiError } from "@/lib/api/errors";
 import { mergeTextDelta, splitThinkingTags } from "@/lib/api/stream-text";
+import { projectRunWaitingState } from "@/lib/run-status-messages";
+import {
+  blockedWaitingFor,
+  eventMessage,
+  explicitEventMessage,
+  isRunBlockedEvent,
+} from "@/lib/api/stream-event-helpers";
 import type {
   ChatDetail,
   ChatMessage,
@@ -13,6 +20,8 @@ import type {
   ActiveRunMutationResponse,
   WorkSurfaceResponse,
   WorkSurfaceRunResponse,
+  EdgeStatusResponse,
+  WorkspaceSelection,
 } from "@/lib/api/types";
 
 export function listChats(params: {
@@ -50,6 +59,10 @@ export function getChatWorkSurfaceRun(chatId: string, runId: string) {
   );
 }
 
+export function getEdgeStatus() {
+  return requestJson<EdgeStatusResponse>("/api/edges/status");
+}
+
 export function archiveChat(chatId: string, archived: boolean) {
   return requestJson<ChatDetail>(`/api/chats/${encodeURIComponent(chatId)}`, {
     method: "PATCH",
@@ -61,6 +74,16 @@ export function updateChatModel(chatId: string, model: string) {
   return requestJson<ChatDetail>(`/api/chats/${encodeURIComponent(chatId)}`, {
     method: "PATCH",
     body: JSON.stringify({ model }),
+  });
+}
+
+export function updateChatWorkspaceSelection(
+  chatId: string,
+  workspaceSelection: WorkspaceSelection,
+) {
+  return requestJson<ChatDetail>(`/api/chats/${encodeURIComponent(chatId)}`, {
+    method: "PATCH",
+    body: JSON.stringify({ workspaceSelection }),
   });
 }
 
@@ -133,6 +156,7 @@ export type ChatStreamHandlers = {
     runId: string;
     status: string;
     waitingFor?: string | null;
+    nextEventIndex?: number | null;
   }) => void;
   onRunFinished?: (run: {
     runId?: string;
@@ -146,6 +170,7 @@ export type ChatStreamHandlers = {
 };
 
 type ChatStreamState = {
+  runId?: string;
   rawText: string;
   text: string;
   reasoning: string;
@@ -153,7 +178,29 @@ type ChatStreamState = {
   cancelled?: boolean;
   paused?: boolean;
   error?: string;
+  nextEventIndex?: number;
 };
+
+function normalizeEventIndex(value: unknown): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    return null;
+  }
+  return Math.trunc(value);
+}
+
+function runUpdate(
+  state: ChatStreamState,
+  run: {
+    runId: string;
+    status: string;
+    waitingFor?: string | null;
+  },
+) {
+  return {
+    ...run,
+    nextEventIndex: state.nextEventIndex ?? null,
+  };
+}
 
 export { splitThinkingTags };
 
@@ -173,6 +220,35 @@ function parseSseFrame(frame: string) {
   } catch {
     return null;
   }
+}
+
+const WORK_SURFACE_STREAM_EVENT_TYPES = new Set([
+  "task_board_snapshot",
+  "workspace_bound",
+  "executor_bound",
+  "executor_status_changed",
+  "tool_call",
+  "tool_call_start",
+  "tool_routing_decision",
+  "tool_transport_started",
+  "tool_transport_completed",
+  "tool_transport_failed",
+  "tool_call_end",
+  "agent_delegated",
+  "agent_spawned",
+  "agent_live_event",
+  "agent_progress",
+  "agent_completed",
+  "agent_failed",
+  "agent_waiting",
+  "agent_cancelled",
+  "agent_interrupted",
+  "run_waiting",
+  "run_blocked",
+]);
+
+function isWorkSurfaceStreamEvent(type: string) {
+  return WORK_SURFACE_STREAM_EVENT_TYPES.has(type) || isRunBlockedEvent(type);
 }
 
 function applyAssistantText(
@@ -203,22 +279,9 @@ function applyStreamEvent(
   handlers: ChatStreamHandlers,
 ) {
   const type = typeof event.type === "string" ? event.type : "";
-
-  if (
-    type === "task_board_snapshot" ||
-    type === "tool_call" ||
-    type === "tool_call_start" ||
-    type === "tool_call_end" ||
-    type === "agent_delegated" ||
-    type === "agent_spawned" ||
-    type === "agent_progress" ||
-    type === "agent_completed" ||
-    type === "agent_failed" ||
-    type === "agent_cancelled" ||
-    type === "agent_interrupted"
-  ) {
-    handlers.onWorkSurfaceEvent?.(event);
-    return;
+  const eventIndex = normalizeEventIndex(event.index);
+  if (eventIndex !== null) {
+    state.nextEventIndex = Math.max(state.nextEventIndex ?? 0, eventIndex + 1);
   }
 
   if (
@@ -234,15 +297,18 @@ function applyStreamEvent(
   }
 
   if (type === "session_info" && typeof event.run_id === "string") {
+    state.runId = event.run_id;
     if (typeof event.session_id === "string") {
       handlers.onSessionBound?.({ sessionId: event.session_id });
     }
     handlers.onRunStarted?.(event.run_id);
-    handlers.onRunUpdated?.({
-      runId: event.run_id,
-      status: "running",
-      waitingFor: null,
-    });
+    handlers.onRunUpdated?.(
+      runUpdate(state, {
+        runId: event.run_id,
+        status: "running",
+        waitingFor: null,
+      }),
+    );
     return;
   }
 
@@ -261,32 +327,156 @@ function applyStreamEvent(
   }
 
   if (type === "run_started" && typeof event.run_id === "string") {
+    state.runId = event.run_id;
+    handlers.onWorkSurfaceEvent?.(event);
     handlers.onRunStarted?.(event.run_id);
-    handlers.onRunUpdated?.({
-      runId: event.run_id,
-      status: "running",
-      waitingFor: null,
-    });
+    handlers.onRunUpdated?.(
+      runUpdate(state, {
+        runId: event.run_id,
+        status: "running",
+        waitingFor: null,
+      }),
+    );
+    return;
+  }
+
+  if (type === "run_input_queued" && typeof event.run_id === "string") {
+    state.runId = event.run_id;
+    handlers.onWorkSurfaceEvent?.(event);
+    handlers.onRunUpdated?.(
+      runUpdate(state, {
+        runId: event.run_id,
+        status: "input-queued",
+        waitingFor: "user_input",
+      }),
+    );
+    return;
+  }
+
+  if (isRunBlockedEvent(type)) {
+    handlers.onWorkSurfaceEvent?.(event);
+    const runId =
+      typeof event.run_id === "string" && event.run_id.trim()
+        ? event.run_id
+        : state.runId;
+    const message = eventMessage(event, "");
+    state.paused = true;
+    if (!state.rawText.trim() && message) {
+      state.rawText = message;
+      applyAssistantText(state.rawText, state, handlers);
+    }
+    if (runId) {
+      state.runId = runId;
+      handlers.onRunUpdated?.(
+        runUpdate(state, {
+          runId,
+          status: "blocked",
+          waitingFor: blockedWaitingFor(event),
+        }),
+      );
+    }
+    return;
+  }
+
+  if (type === "run_waiting") {
+    handlers.onWorkSurfaceEvent?.(event);
+    const runId =
+      typeof event.run_id === "string" && event.run_id.trim()
+        ? event.run_id
+        : state.runId;
+    const projection = projectRunWaitingState(
+      event as { waiting_for?: string; reason?: string; error_kind?: string },
+    );
+    const message = explicitEventMessage(event);
+    state.paused = true;
+    if (!state.rawText.trim() && message) {
+      state.rawText = message;
+      applyAssistantText(state.rawText, state, handlers);
+    }
+    if (runId) {
+      state.runId = runId;
+      handlers.onRunUpdated?.(
+        runUpdate(state, {
+          runId,
+          status: projection.status,
+          waitingFor: projection.waitingFor,
+        }),
+      );
+    }
+    return;
+  }
+
+  if (isWorkSurfaceStreamEvent(type)) {
+    handlers.onWorkSurfaceEvent?.(event);
     return;
   }
 
   if (type === "run_paused" && typeof event.run_id === "string") {
+    state.runId = event.run_id;
+    handlers.onWorkSurfaceEvent?.(event);
     state.paused = true;
-    handlers.onRunUpdated?.({
-      runId: event.run_id,
-      status: "paused",
-      waitingFor: null,
-    });
+    handlers.onRunUpdated?.(
+      runUpdate(state, {
+        runId: event.run_id,
+        status: "paused",
+        waitingFor: null,
+      }),
+    );
     return;
   }
 
   if (type === "run_resumed" && typeof event.run_id === "string") {
+    state.runId = event.run_id;
+    handlers.onWorkSurfaceEvent?.(event);
     state.paused = false;
-    handlers.onRunUpdated?.({
-      runId: event.run_id,
-      status: "running",
-      waitingFor: null,
-    });
+    handlers.onRunUpdated?.(
+      runUpdate(state, {
+        runId: event.run_id,
+        status: "running",
+        waitingFor: null,
+      }),
+    );
+    return;
+  }
+
+  if (type === "run_error") {
+    handlers.onWorkSurfaceEvent?.(event);
+    const message = eventMessage(event, "Astra run failed.");
+    state.error = message;
+    if (typeof event.run_id === "string") {
+      state.runId = event.run_id;
+      handlers.onRunUpdated?.(
+        runUpdate(state, {
+          runId: event.run_id,
+          status: "failed",
+          waitingFor: null,
+        }),
+      );
+    }
+    return;
+  }
+
+  if (type === "run_interrupted") {
+    handlers.onWorkSurfaceEvent?.(event);
+    state.paused = true;
+    const message = eventMessage(event, "");
+    if (!state.rawText.trim() && message) {
+      state.rawText = message;
+      applyAssistantText(state.rawText, state, handlers);
+    }
+    if (typeof event.run_id === "string") {
+      state.runId = event.run_id;
+      handlers.onRunUpdated?.(
+        runUpdate(state, {
+          runId: event.run_id,
+          status: "paused",
+          waitingFor:
+            typeof event.waiting_for === "string"
+              ? event.waiting_for
+              : "user_resume",
+        }),
+      );
+    }
     return;
   }
 
@@ -334,8 +524,28 @@ function applyStreamEvent(
   }
 
   if (type === "run_finished") {
+    handlers.onWorkSurfaceEvent?.(event);
     const status =
       typeof event.status === "string" ? event.status : "completed";
+    if (typeof event.run_id === "string") {
+      state.runId = event.run_id;
+    }
+    if (status === "paused" || status === "interrupted") {
+      state.paused = true;
+      if (typeof event.run_id === "string") {
+        handlers.onRunUpdated?.(
+          runUpdate(state, {
+            runId: event.run_id,
+            status: "paused",
+            waitingFor:
+              typeof event.waiting_for === "string"
+                ? event.waiting_for
+                : "user_resume",
+          }),
+        );
+      }
+      return;
+    }
     handlers.onRunFinished?.({
       runId: typeof event.run_id === "string" ? event.run_id : undefined,
       status,
@@ -361,16 +571,19 @@ async function consumeChatStream(
 ) {
   if (!response.ok) {
     let detail = `${response.status} ${response.statusText}`;
+    let code: string | undefined;
     try {
       const body = (await response.json()) as {
         error?: string;
         detail?: string;
+        code?: string;
       };
       detail = body.error ?? body.detail ?? detail;
+      code = typeof body.code === "string" ? body.code : undefined;
     } catch {
       // Preserve the HTTP status.
     }
-    throw new WebApiError(response.status, detail);
+    throw new WebApiError(response.status, detail, code);
   }
 
   if (!response.body) {
@@ -466,9 +679,21 @@ export async function streamExistingChatRun(
   chatId: string,
   runId: string,
   handlers: ChatStreamHandlers,
+  options?: {
+    nextEventIndex?: number | null;
+    assistantMessageId?: string | null;
+  },
 ) {
+  const params = new URLSearchParams({ runId });
+  const nextEventIndex = normalizeEventIndex(options?.nextEventIndex);
+  if (nextEventIndex !== null) {
+    params.set("last_index", String(nextEventIndex));
+  }
+  if (options?.assistantMessageId?.trim()) {
+    params.set("assistantMessageId", options.assistantMessageId.trim());
+  }
   const response = await fetch(
-    `/api/chats/${encodeURIComponent(chatId)}/stream?runId=${encodeURIComponent(runId)}`,
+    `/api/chats/${encodeURIComponent(chatId)}/stream?${params.toString()}`,
     { method: "GET", signal: handlers.signal },
   );
   return consumeChatStream(response, handlers);

@@ -35,13 +35,19 @@ pub const SCAFFOLDING_BODY_PREFIXES: &[&str] = &[
     // Task-focus manifests
     "[Active task attachment]",
     "[Self-check",
+    "[attention:v1]",
+    "[session-anchor]",
+    "[working-set:v1]",
     // Batching / parallel feedback
     "✓ Previous round:",
     "♻ Duplicate calls detected",
     // Runtime directives
     "⚠️ VERIFICATION REQUIRED",
     "🔄 ERROR BUDGET",
+    "<system-reminder>",
     // Runtime correction / warning headers
+    "## Already Fetched",
+    "## Cross-Session Project Context",
     "## ⤴",
     "## ⚠",
     "Runtime correction:",
@@ -67,16 +73,15 @@ pub const SCAFFOLDING_BODY_PREFIXES: &[&str] = &[
 /// narrowest-waist detector that works for all paths today.
 pub fn is_runtime_scaffolding_message(message: &Value) -> bool {
     let role = message.get("role").and_then(Value::as_str);
-
-    if role == Some("system") {
-        return true;
-    }
-
     let content = message
         .get("content")
         .and_then(Value::as_str)
         .unwrap_or_default();
     let trimmed = content.trim_start();
+
+    if role == Some("system") && trimmed.is_empty() {
+        return true;
+    }
 
     for prefix in SCAFFOLDING_BODY_PREFIXES {
         if trimmed.starts_with(prefix) {
@@ -99,10 +104,10 @@ mod tests {
     // ── Positive cases: scaffolding is detected ─────────────────────────
 
     #[test]
-    fn system_role_is_scaffolding() {
-        assert!(is_runtime_scaffolding_message(&msg(
+    fn system_role_with_regular_content_is_not_scaffolding() {
+        assert!(!is_runtime_scaffolding_message(&msg(
             "system",
-            "anything at all"
+            "You are a helpful assistant for this workspace."
         )));
     }
 
@@ -172,6 +177,42 @@ mod tests {
         assert!(is_runtime_scaffolding_message(&msg(
             "user",
             "[Active task attachment] Resume the active task below"
+        )));
+    }
+
+    #[test]
+    fn context_manifests_are_scaffolding() {
+        assert!(is_runtime_scaffolding_message(&msg(
+            "user",
+            "[attention:v1]\ngoal: ship auth"
+        )));
+        assert!(is_runtime_scaffolding_message(&msg(
+            "user",
+            "[working-set:v1]\ngoal: ship auth"
+        )));
+        assert!(is_runtime_scaffolding_message(&msg(
+            "user",
+            "[session-anchor]\nResume previous task state"
+        )));
+    }
+
+    #[test]
+    fn inventory_and_cross_session_context_are_scaffolding() {
+        assert!(is_runtime_scaffolding_message(&msg(
+            "user",
+            "## Already Fetched (do NOT re-read)\nfoo.rs"
+        )));
+        assert!(is_runtime_scaffolding_message(&msg(
+            "user",
+            "## Cross-Session Project Context\n- stale retrieved memory"
+        )));
+    }
+
+    #[test]
+    fn system_reminder_wrapper_is_scaffolding_across_roles() {
+        assert!(is_runtime_scaffolding_message(&msg(
+            "user",
+            "<system-reminder>\nBackground task updates"
         )));
     }
 

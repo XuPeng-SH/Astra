@@ -1022,6 +1022,9 @@ pub enum VolatileKind {
     /// repeated corrections replace each other instead of accumulating
     /// dynamic task titles in the volatile prompt suffix.
     TaskBoardCompletionGate,
+    /// Task-board start gate. Broad multi-step or delegated work should create
+    /// a durable task board before broad exploration/spawn begins.
+    TaskBoardStartGate,
     /// Plan-mode marker: a single short reminder that the current
     /// turn is read-only investigation and the model must surface
     /// its plan via `exit_plan_mode(plan="…")` for user approval.
@@ -1049,6 +1052,7 @@ impl VolatileKind {
                 | Self::Mailbox
                 | Self::CompactResume
                 | Self::TaskBoardCompletionGate
+                | Self::TaskBoardStartGate
                 | Self::PlanModeMarker,
         )
     }
@@ -1070,6 +1074,7 @@ impl VolatileKind {
             | Self::BudgetAdvisory
             | Self::CompactResume
             | Self::TaskBoardCompletionGate
+            | Self::TaskBoardStartGate
             | Self::ExecutionRetry
             | Self::ExplorationBudget
             | Self::DeferredUserInput
@@ -2885,6 +2890,7 @@ pub(crate) mod tests {
             "1 in_progress, 1 pending task(s) remain"
         );
         assert!(VolatileKind::TaskBoardCompletionGate.is_singleton());
+        assert!(VolatileKind::TaskBoardStartGate.is_singleton());
     }
 
     #[test]
@@ -3873,6 +3879,7 @@ pub(crate) mod tests {
                 5,
                 None,
             ),
+            text_result("done", 10, 5, None),
         ])
         .with_valid_tools(&["bash", "task_output"]);
         let mut state = make_state();
@@ -3882,12 +3889,12 @@ pub(crate) mod tests {
         assert!(matches!(outcome, Ok(AgenticLoopOutcome::Completed)));
         assert_eq!(
             host.turn_count(),
-            1,
-            "detached bash should end the user turn instead of letting the model poll task_output"
+            3,
+            "detached bash on turn 1, task_output on turn 2, text completes on turn 3"
         );
-        assert_eq!(state.total_tool_calls, 1);
+        assert_eq!(state.total_tool_calls, 2);
         assert!(state.telemetry.all_tools_used.contains("bash"));
-        assert!(!state.telemetry.all_tools_used.contains("task_output"));
+        assert!(state.telemetry.all_tools_used.contains("task_output"));
         assert!(
             state
                 .messages

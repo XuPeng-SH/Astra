@@ -5003,6 +5003,17 @@ fn apply_resume_recovery_state(
         .unwrap_or_default();
 }
 
+fn apply_runtime_recovery_state(
+    state: &mut SessionState,
+    pipeline_state: Option<&serde_json::Value>,
+    compaction_state: Option<&serde_json::Value>,
+    consecutive_context_window_errors: u32,
+) {
+    state.runtime_pipeline_state = pipeline_state.cloned();
+    state.runtime_compaction_state = compaction_state.cloned();
+    state.runtime_consecutive_context_window_errors = consecutive_context_window_errors;
+}
+
 /// Baseline row for a blocked tool when we have no persisted health metrics yet (same defaults as
 /// cloud preference seeding in `cloud_sync.rs`).
 fn blocked_tool_health_entry(
@@ -5468,23 +5479,85 @@ async fn apply_restored_session(
             }
             Ok(Some(astra_pipeline::crash_recovery::RecoveryOutcome::RequiresUserInput {
                 pending_decisions,
+                restored: cr_restored,
+                mut manager,
                 ..
             })) => {
-                tracing::warn!(
+                tracing::info!(
                     pending = ?pending_decisions,
-                    "crash recovery: requires user input, falling back to legacy restore"
+                    "crash recovery: requires user input, presenting options"
                 );
-                match astra_pipeline::step_restore::restore_session(&restored.session_id) {
-                    Ok(r) => r,
-                    Err(astra_pipeline::step_restore::RestoreError::IoError(error)) => {
-                        return Err(format!(
-                            "Failed to read local step checkpoint for {}: {}",
-                            restored.session_id, error
-                        ));
+
+                // Present each pending decision to the user
+                eprintln!();
+                eprintln!("  {}", "Crash Recovery Requires User Input".bold().yellow());
+                eprintln!("  {}", "The following tool calls need your decision:".dim());
+
+                for (i, (tool_name, decision)) in pending_decisions.iter().enumerate() {
+                    eprintln!();
+                    eprintln!(
+                        "    {} {}",
+                        format!("[{}]", i + 1).bold(),
+                        tool_name.clone().bold()
+                    );
+
+                    let reason = match decision {
+                        astra_pipeline::crash_recovery::ToolReplayDecision::RequireUserInput {
+                            reason,
+                        } => reason.clone(),
+                        astra_pipeline::crash_recovery::ToolReplayDecision::InFlightAtCrash {
+                            tool_name: tn,
+                        } => {
+                            format!("Tool '{}' was in-flight when crash occurred", tn)
+                        }
+                        _ => "Unknown".to_string(),
+                    };
+                    eprintln!("      Reason: {}", reason.dim());
+                }
+
+                eprintln!();
+                eprintln!("  {}", "Options:".bold());
+                eprintln!("    [r] Replay - Re-execute the tool");
+                eprintln!("    [s] Skip - Skip this tool (use cached result if available)");
+                eprintln!("    [a] Abort - Abort recovery and fail");
+                eprintln!();
+                eprint!(
+                    "  {} ",
+                    "Choose action for all pending tools (r/s/a):".bold()
+                );
+                let _ = std::io::stderr().flush();
+
+                let mut input = String::new();
+                if std::io::stdin().read_line(&mut input).is_err() {
+                    return Err("Failed to read user input for crash recovery".to_string());
+                }
+
+                let choice = input.trim().to_lowercase();
+                match choice.as_str() {
+                    "r" | "replay" | "s" | "skip" => {
+                        let label = if choice.starts_with('r') {
+                            "replay"
+                        } else {
+                            "skip"
+                        };
+                        eprintln!(
+                            "  {} User chose to {} all pending tools",
+                            "✓".green(),
+                            label
+                        );
+                        // force_complete transitions Replaying -> Recovered, bypassing pending checks
+                        if let Err(e) = manager.force_complete() {
+                            return Err(format!("Failed to apply {} decisions: {}", label, e));
+                        }
+                        Some(cr_restored)
                     }
-                    Err(error) => {
-                        step_restore_error = Some(error.to_string());
-                        None
+                    "a" | "abort" => {
+                        eprintln!("  {} User chose to abort recovery", "✗".red());
+                        return Err("User aborted crash recovery".to_string());
+                    }
+                    _ => {
+                        eprintln!("  {} Invalid choice, aborting recovery", "✗".red());
+                        return Err(format!("Invalid user choice: {}", choice));
                     }
                 }
             }
@@ -5588,9 +5661,16 @@ async fn apply_restored_session(
             step_restored.interruption.as_ref(),
             step_restored.compaction_state.as_ref(),
         );
+        apply_runtime_recovery_state(
+            state,
+            step_restored.pipeline_state.as_ref(),
+            step_restored.compaction_state.as_ref(),
+            step_restored.consecutive_context_window_errors,
+        );
         if let Some(ref ao_json) = step_restored.approval_overrides {
             state.perm_manager.merge_restored_overrides(ao_json);
         }
+        state.runtime_idempotency_cache = Some(step_restored.idempotency_cache);
         eprintln!("  {} {}", "↻".magenta(), summary.dim());
     } else if has_cloud_heavy_fallback {
         apply_restored_cloud_heavy_state(state, &restored);
@@ -5598,6 +5678,12 @@ async fn apply_restored_session(
             state,
             restored.interruption.as_ref(),
             restored.compaction_state.as_ref(),
+        );
+        apply_runtime_recovery_state(
+            state,
+            restored.pipeline_state.as_ref(),
+            restored.compaction_state.as_ref(),
+            0,
         );
         eprintln!("  {} Restored step checkpoint from cloud", "☁".magenta());
     }
@@ -6418,6 +6504,31 @@ mod resume_tests {
         crate::cli::cli_config::cli_utils::save_credentials(&creds).unwrap();
     }
 
+    fn write_completed_read_step_event(session_id: &str, turn_count: u32, created_at: u64) {
+        let args = serde_json::json!({"path": "src/lib.rs"});
+        let idem_key = astra_pipeline::step_protocol::IdempotencyKey::semantic("read_file", &args);
+        let mut event_store =
+            astra_pipeline::step_checkpoint::FileBackedEventStore::empty(session_id);
+        let _ = <astra_pipeline::step_checkpoint::FileBackedEventStore as astra_pipeline::step_protocol::StepEventStore>::append(
+            &mut event_store,
+            astra_pipeline::step_protocol::StepEvent {
+                event_id: format!("completed-read-{turn_count}"),
+                canonical_event_id: None,
+                step_id: format!("step-{turn_count}"),
+                event_type: astra_pipeline::step_protocol::StepEventType::ToolCallCompleted,
+                agent_id: None,
+                caused_by: vec![],
+                payload: Some(serde_json::json!({
+                    "tool_name": "read_file",
+                    "idempotency_key": idem_key.cache_key(),
+                    "output": "cached src/lib.rs",
+                    "is_error": false,
+                })),
+                created_at,
+            },
+        );
+    }
+
     fn write_local_step_checkpoint_with_compaction_state(session_id: &str, turn_count: u32) {
         let mut heavy = match astra_pipeline::step_protocol::StepCheckpoint::heavy(
             format!("step-{turn_count}"),
@@ -6446,12 +6557,19 @@ mod resume_tests {
             "last_tokens_freed": 4000,
             "last_was_insufficient": true,
         }));
+        heavy.pipeline_state = Some(serde_json::json!({
+            "stats": {"cache_hit_ratio_ema": 0.42},
+            "recovery": {"ptl_error_count": 2},
+        }));
+        heavy.consecutive_context_window_errors = 2;
+        let completed_event_created_at = heavy.light.created_at.saturating_add(1);
         astra_pipeline::step_checkpoint::write_step_checkpoint(
             session_id,
             turn_count,
             &astra_pipeline::step_protocol::StepCheckpoint::Heavy(Box::new(heavy)),
         )
         .unwrap();
+        write_completed_read_step_event(session_id, turn_count, completed_event_created_at);
     }
 
     fn write_invalid_local_step_checkpoint(session_id: &str, turn_count: u32) {
@@ -6541,7 +6659,7 @@ mod resume_tests {
     }
 
     #[test]
-    fn apply_resume_recovery_state_restores_resume_restricted_tools() {
+    fn apply_resume_recovery_state_ignores_stall_derived_resume_restricted_tools() {
         let mut state = SessionState::default();
         apply_resume_recovery_state(
             &mut state,
@@ -6554,7 +6672,10 @@ mod resume_tests {
             None,
         );
 
-        assert_eq!(state.resume_restricted_tools, vec!["read_file", "view"]);
+        assert!(
+            state.resume_restricted_tools.is_empty(),
+            "stall-derived resume restrictions are soft guidance, not hard tool blocks"
+        );
     }
 
     #[test]
@@ -6606,6 +6727,40 @@ mod resume_tests {
         assert!(guidance.contains("3 attempt(s)"), "{guidance}");
         assert!(guidance.contains("15000 tokens freed"), "{guidance}");
         assert!(guidance.contains("insufficient"), "{guidance}");
+        assert_eq!(
+            state.runtime_compaction_state,
+            Some(serde_json::json!({
+                "attempt_count": 3,
+                "cumulative_tokens_freed": 15000,
+                "last_tokens_freed": 4000,
+                "last_was_insufficient": true,
+            }))
+        );
+        assert_eq!(
+            state.runtime_pipeline_state,
+            Some(serde_json::json!({
+                "stats": {"cache_hit_ratio_ema": 0.42},
+                "recovery": {"ptl_error_count": 2},
+            }))
+        );
+        assert_eq!(state.runtime_consecutive_context_window_errors, 2);
+        assert!(
+            state.runtime_idempotency_cache.is_some(),
+            "step restore should carry a replay guard cache into the next turn"
+        );
+        let idem_key = astra_pipeline::step_protocol::IdempotencyKey::semantic(
+            "read_file",
+            &serde_json::json!({"path": "src/lib.rs"}),
+        );
+        assert_eq!(
+            state
+                .runtime_idempotency_cache
+                .as_ref()
+                .and_then(|cache| cache.check(&idem_key))
+                .expect("restored replay guard cache should include completed tool")
+                .output,
+            "cached src/lib.rs"
+        );
     }
 
     #[serial_test::serial]
@@ -7010,6 +7165,14 @@ mod resume_tests {
         assert_eq!(state.session_id.as_deref(), Some(session_id.as_str()));
         let guidance = state.resume_guidance.expect("resume guidance");
         assert!(guidance.contains("3 attempt(s)"), "{guidance}");
+        assert_eq!(
+            state.runtime_compaction_state,
+            Some(serde_json::json!({
+                "attempt_count": 3,
+                "cumulative_tokens_freed": 15000,
+                "last_was_insufficient": true,
+            }))
+        );
     }
 
     #[serial_test::serial]

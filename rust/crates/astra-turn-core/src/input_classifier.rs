@@ -103,39 +103,7 @@ pub fn is_low_information_followup(line: &str) -> bool {
 
 #[must_use]
 pub fn is_correction_signal(message: &str) -> bool {
-    let lower = message.to_lowercase();
-    [
-        "no,",
-        "no i",
-        "that's wrong",
-        "that's not",
-        "i meant",
-        "i mean",
-        "not that",
-        "wrong,",
-        "wrong.",
-        "incorrect",
-        "actually,",
-        "actually i",
-        "instead,",
-        "forget that",
-        "ignore that",
-        "let me clarify",
-        "to clarify",
-        "what i want",
-        "wait,",
-        "hold on",
-        "stop,",
-        "不对",
-        "错了",
-        "不是这样",
-        "我的意思是",
-        "我是说",
-        "等等",
-        "停一下",
-    ]
-    .iter()
-    .any(|pattern| lower.contains(pattern))
+    astra_turn_types::is_user_correction_signal(message)
 }
 
 #[must_use]
@@ -352,6 +320,21 @@ mod tests {
         assert!(is_correction_signal("No, that's wrong."));
         assert!(is_correction_signal("不对，我的意思是改这里"));
         assert!(!is_correction_signal("please continue with the fix"));
+    }
+
+    #[test]
+    fn correction_signal_handles_reanchor_nudges_without_chinese_question_false_positive() {
+        assert!(is_correction_signal("不是修修补补，要系统性解决"));
+        assert!(is_correction_signal("我想要的是长久健康运行，不是临时补丁"));
+        assert!(is_correction_signal(
+            "What I asked for is a durable fix, not a workaround"
+        ));
+        assert!(is_correction_signal(
+            "You misunderstood the goal; keep the session healthy long-term"
+        ));
+        assert!(!is_correction_signal(
+            "是不是可以让 web-agent 支持 taskboard?"
+        ));
     }
 
     #[test]

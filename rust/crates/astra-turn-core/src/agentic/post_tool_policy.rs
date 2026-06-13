@@ -148,7 +148,9 @@ pub fn apply_agentic_post_tool_policy(
             });
         }
 
-        append_openai_user_content_messages(messages, &verdict.injections);
+        if verdict.severity >= VerdictSeverity::Warning {
+            append_openai_user_content_messages(messages, &verdict.injections);
+        }
 
         // Inject TurnGuard avoid_tools into same-turn restricted_tools
         // so the model cannot re-use flagged tools within the current turn
@@ -193,17 +195,13 @@ pub fn apply_agentic_post_tool_policy(
             verdict.injections.len(),
         );
 
+        let checkpoint_blocked_tools = checkpoint_blocked_tools(restricted_tools);
         if let Some(sid) = current_session_id
             && let Some(heavy) = step_recorder.build_heavy_checkpoint(
                 messages,
                 0,
                 max_turns.saturating_sub(loop_turn) as u32,
-                &turn_guard
-                    .health
-                    .deprioritized_tools()
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect::<Vec<_>>(),
+                &checkpoint_blocked_tools,
                 recent_tools,
             )
         {
@@ -230,6 +228,13 @@ pub fn apply_agentic_post_tool_policy(
     }
 
     AgenticPostToolPolicyOutcome::ProceedEndTurn
+}
+
+fn checkpoint_blocked_tools(restricted_tools: &HashSet<String>) -> Vec<String> {
+    let mut blocked_tools: Vec<String> = restricted_tools.iter().cloned().collect();
+    blocked_tools.sort();
+    blocked_tools.dedup();
+    blocked_tools
 }
 
 #[cfg(test)]
@@ -347,7 +352,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_waste_warning_retries_and_restricts_tools() {
+    fn cache_waste_info_records_without_retry_or_restriction() {
         let mut intent_tool_turns = Vec::new();
         let mut messages = Vec::new();
         let mut stall_events = Vec::new();
@@ -382,13 +387,39 @@ mod tests {
             interaction_mode: TurnInteractionMode::Prompt,
         });
 
-        assert_eq!(out, AgenticPostToolPolicyOutcome::RetryLlmClearToolResults);
+        assert_eq!(out, AgenticPostToolPolicyOutcome::ProceedEndTurn);
+        assert!(
+            messages.is_empty(),
+            "info-level cache guidance must not pollute model messages"
+        );
         // read_file is read-only — the filter prevents it from entering restricted_tools.
         assert!(
             !restricted_tools.contains("read_file"),
             "read-only tools must not be added to restricted_tools"
         );
+        assert_eq!(remaining_turns, 10);
         assert_eq!(verdict_events.len(), 1);
+        assert_eq!(verdict_events[0].severity, "info");
+    }
+
+    #[test]
+    fn checkpoint_blocked_tools_uses_only_hard_restrictions() {
+        let mut restricted_tools = HashSet::new();
+        restricted_tools.insert("bash".to_string());
+        restricted_tools.insert("write_file".to_string());
+
+        let mut turn_guard = TurnGuard::new();
+        for _ in 0..3 {
+            turn_guard.health.record_failure("flaky_soft_tool");
+        }
+        assert!(turn_guard.health.is_deprioritized("flaky_soft_tool"));
+
+        let blocked = super::checkpoint_blocked_tools(&restricted_tools);
+        assert_eq!(blocked, vec!["bash".to_string(), "write_file".to_string()]);
+        assert!(
+            !blocked.contains(&"flaky_soft_tool".to_string()),
+            "soft tool-health deprioritization must not persist as hard checkpoint blocked_tools"
+        );
     }
 
     #[test]

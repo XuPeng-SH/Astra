@@ -374,6 +374,10 @@ pub struct DelegationRequest {
     pub depth: u32,
     /// Context to pass to delegated agents.
     pub context: HashMap<String, serde_json::Value>,
+    /// UI/runtime execution binding metadata inherited from the parent run.
+    /// Propagated to every child `SubRunConfig` so delegated agents resolve
+    /// workspace/executor/transport bindings correctly.
+    pub execution_metadata: Option<serde_json::Value>,
 }
 
 /// Result from a single agent's execution within a delegation.
@@ -933,6 +937,7 @@ mod tests {
             user_id: "u1".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         };
 
         assert!(reg.validate_delegation(&req, "orch-1").is_ok());
@@ -956,6 +961,7 @@ mod tests {
             user_id: "u1".into(),
             depth: 5, // exceeds max_delegation_depth=3
             context: HashMap::new(),
+            execution_metadata: None,
         };
 
         let err = reg.validate_delegation(&req, "orch-1").unwrap_err();
@@ -980,6 +986,7 @@ mod tests {
             user_id: "u1".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         };
 
         let err = reg.validate_delegation(&req, "s1").unwrap_err();
@@ -1004,6 +1011,7 @@ mod tests {
             user_id: "u1".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         };
 
         let err = reg.validate_delegation(&req, "u1").unwrap_err();
@@ -1025,6 +1033,7 @@ mod tests {
             user_id: "u1".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         };
 
         let err = reg.validate_delegation(&req, "unknown").unwrap_err();
@@ -1048,6 +1057,7 @@ mod tests {
             user_id: "u1".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         };
 
         let err = reg.validate_delegation(&req, "orch-1").unwrap_err();
@@ -1083,6 +1093,7 @@ mod tests {
             user_id: "u1".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         };
 
         assert!(reg.validate_delegation(&req, "orch-1").is_ok());
@@ -1109,6 +1120,7 @@ mod tests {
             user_id: "u1".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         };
 
         assert!(reg.validate_delegation(&req, "orch-1").is_ok());
@@ -1426,6 +1438,7 @@ mod tests {
             user_id: "u1".into(),
             depth: 1,
             context: HashMap::new(),
+            execution_metadata: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let restored: DelegationRequest = serde_json::from_str(&json).unwrap();

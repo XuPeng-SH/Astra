@@ -23,7 +23,9 @@
 //! MatrixOne. This is enforced by awaiting DB confirmation before broadcast.
 
 use serde_json::Value;
-use std::sync::Arc;
+use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, error, warn};
 
@@ -94,6 +96,42 @@ pub enum OrphanReason {
     ChannelClosed,
 }
 
+/// Forked event detected during journal/DB reconciliation.
+#[derive(Debug, Clone)]
+pub struct ForkedEvent {
+    pub event: JournalEvent,
+    pub reason: ForkReason,
+}
+
+/// Durable identity for an event as stored in the DB projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventFingerprint {
+    pub content_hash: String,
+}
+
+impl EventFingerprint {
+    pub fn from_journal_event(event: &JournalEvent) -> Self {
+        Self {
+            content_hash: journal_event_content_hash(event),
+        }
+    }
+}
+
+/// Why a journal event is missing from the DB projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForkReason {
+    /// Event exists in journal but not in DB.
+    MissingFromDb,
+    /// Event hash mismatch between journal and DB.
+    ContentMismatch,
+}
+
+fn journal_event_content_hash(event: &JournalEvent) -> String {
+    let payload = serde_json::to_vec(event).unwrap_or_else(|_| format!("{event:?}").into_bytes());
+    let digest = Sha256::digest(&payload);
+    format!("sha256:{}", crate::checkpoint_crypto::hex_encode(&digest))
+}
+
 /// Error during DB ingestion.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum IngestionError {
@@ -121,6 +159,133 @@ pub struct EventCoordinator {
     persist_timeout: std::time::Duration,
     ingestion_send_timeout: std::time::Duration,
     orphan_tx: Option<mpsc::Sender<OrphanedEvent>>,
+    broadcast_order: Arc<Mutex<BroadcastOrderState>>,
+    broadcast_order_notify: Arc<tokio::sync::Notify>,
+}
+
+#[derive(Debug, Default)]
+struct BroadcastOrderState {
+    next_sequence: u64,
+    next_to_broadcast: u64,
+    skipped: BTreeSet<u64>,
+}
+
+impl BroadcastOrderState {
+    fn reserve(&mut self) -> u64 {
+        let sequence = self.next_sequence;
+        self.next_sequence += 1;
+        sequence
+    }
+
+    fn skip(&mut self, sequence: u64) -> bool {
+        if sequence < self.next_to_broadcast {
+            return false;
+        }
+        if self.next_to_broadcast == sequence {
+            self.next_to_broadcast += 1;
+            self.advance_past_skipped();
+            true
+        } else {
+            self.skipped.insert(sequence);
+            false
+        }
+    }
+
+    fn mark_broadcasted(&mut self, sequence: u64) -> bool {
+        if self.next_to_broadcast != sequence {
+            return false;
+        }
+        self.next_to_broadcast += 1;
+        self.advance_past_skipped();
+        true
+    }
+
+    fn advance_past_skipped(&mut self) {
+        loop {
+            let next = self.next_to_broadcast;
+            if !self.skipped.remove(&next) {
+                break;
+            }
+            self.next_to_broadcast += 1;
+        }
+    }
+}
+
+struct BroadcastSequenceGuard {
+    sequence: u64,
+    state: Arc<Mutex<BroadcastOrderState>>,
+    notify: Arc<tokio::sync::Notify>,
+    active: bool,
+}
+
+impl BroadcastSequenceGuard {
+    fn new(
+        sequence: u64,
+        state: Arc<Mutex<BroadcastOrderState>>,
+        notify: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        Self {
+            sequence,
+            state,
+            notify,
+            active: true,
+        }
+    }
+
+    fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    fn skip(&mut self) {
+        if !self.active {
+            return;
+        }
+        skip_broadcast_sequence(&self.state, &self.notify, self.sequence);
+        self.active = false;
+    }
+
+    fn complete(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for BroadcastSequenceGuard {
+    fn drop(&mut self) {
+        if self.active {
+            skip_broadcast_sequence(&self.state, &self.notify, self.sequence);
+        }
+    }
+}
+
+fn lock_broadcast_order(state: &Mutex<BroadcastOrderState>) -> MutexGuard<'_, BroadcastOrderState> {
+    match state.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            // Recover the inner state from a poisoned mutex. A counter
+            // inconsistency in broadcast ordering is less damaging than
+            // a cascading crash of the entire event system.
+            warn!(
+                "broadcast order state mutex was poisoned (previous task panic); \
+                 recovering with potentially stale ordering state. \
+                 Original error: {poisoned}"
+            );
+            poisoned.into_inner()
+        }
+    }
+}
+
+fn skip_broadcast_sequence(
+    state: &Mutex<BroadcastOrderState>,
+    notify: &tokio::sync::Notify,
+    sequence: u64,
+) {
+    let advanced = {
+        let mut state = lock_broadcast_order(state);
+        state.skip(sequence)
+    };
+    if advanced {
+        notify.notify_waiters();
+    }
 }
 
 /// Trait for journal write operations (allows mocking in tests).
@@ -149,6 +314,8 @@ impl EventCoordinator {
             persist_timeout,
             ingestion_send_timeout: DEFAULT_INGESTION_SEND_TIMEOUT,
             orphan_tx: None,
+            broadcast_order: Arc::new(Mutex::new(BroadcastOrderState::default())),
+            broadcast_order_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -183,6 +350,59 @@ impl EventCoordinator {
         }
     }
 
+    fn reserve_broadcast_sequence(&self) -> BroadcastSequenceGuard {
+        let sequence = {
+            let mut state = lock_broadcast_order(&self.broadcast_order);
+            state.reserve()
+        };
+        BroadcastSequenceGuard::new(
+            sequence,
+            Arc::clone(&self.broadcast_order),
+            Arc::clone(&self.broadcast_order_notify),
+        )
+    }
+
+    async fn broadcast_in_order(&self, guard: &mut BroadcastSequenceGuard, event: &JournalEvent) {
+        loop {
+            let notified = self.broadcast_order_notify.notified();
+            {
+                let mut state = lock_broadcast_order(&self.broadcast_order);
+                if state.next_to_broadcast == guard.sequence() {
+                    let event_value = match serde_json::to_value(event) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            warn!(
+                                "failed to serialize journal event for broadcast: {e}; \
+                                 dropping event (session_id={})",
+                                event.session_id.as_deref().unwrap_or("unknown")
+                            );
+                            state.mark_broadcasted(guard.sequence());
+                            guard.complete();
+                            self.broadcast_order_notify.notify_waiters();
+                            return;
+                        }
+                    };
+                    if let Err(e) = self.broadcast_tx.send(event_value) {
+                        warn!(
+                            "broadcast channel closed or full (session_id={}): {e}; \
+                             dropping event",
+                            event.session_id.as_deref().unwrap_or("unknown")
+                        );
+                    }
+                    state.mark_broadcasted(guard.sequence());
+                    guard.complete();
+                    self.broadcast_order_notify.notify_waiters();
+                    return;
+                }
+                if state.next_to_broadcast > guard.sequence() {
+                    guard.complete();
+                    return;
+                }
+            }
+            notified.await;
+        }
+    }
+
     /// Persist event to journal + DB, then broadcast to clients.
     ///
     /// Blocks until DB confirmation received. If DB fails, event is marked
@@ -199,10 +419,13 @@ impl EventCoordinator {
     /// * `Err(EventError::Timeout)` - DB flush exceeded timeout
     /// * `Err(EventError::JournalWrite)` - Local journal write failed
     pub async fn emit_event(&self, event: JournalEvent) -> Result<(), EventError> {
+        let mut broadcast_sequence = self.reserve_broadcast_sequence();
+
         // 1. Write to journal (sync, always succeeds unless disk full)
-        self.journal_writer
-            .write(&event)
-            .map_err(EventError::JournalWrite)?;
+        if let Err(e) = self.journal_writer.write(&event) {
+            broadcast_sequence.skip();
+            return Err(EventError::JournalWrite(e));
+        }
 
         // 2. Flush journal to ensure durability before DB ingestion
         if let Err(e) = self.journal_writer.flush() {
@@ -222,6 +445,7 @@ impl EventCoordinator {
             Ok(Ok(())) => { /* send succeeded */ }
             Ok(Err(_)) => {
                 self.queue_orphan(event.clone(), OrphanReason::ChannelClosed);
+                broadcast_sequence.skip();
                 return Err(EventError::ChannelClosed);
             }
             Err(_) => {
@@ -229,6 +453,7 @@ impl EventCoordinator {
                     event.clone(),
                     OrphanReason::IngestionSendTimeout(self.ingestion_send_timeout),
                 );
+                broadcast_sequence.skip();
                 return Err(EventError::IngestionSendTimeout(
                     self.ingestion_send_timeout,
                 ));
@@ -239,9 +464,8 @@ impl EventCoordinator {
         match tokio::time::timeout(self.persist_timeout, confirm_rx).await {
             Ok(Ok(Ok(()))) => {
                 // 5. Broadcast to clients (only now!)
-                let _ = self
-                    .broadcast_tx
-                    .send(serde_json::to_value(&event).unwrap_or_default());
+                self.broadcast_in_order(&mut broadcast_sequence, &event)
+                    .await;
                 debug!(event_type = ?event.event_type, "event persisted and broadcast");
                 Ok(())
             }
@@ -250,12 +474,14 @@ impl EventCoordinator {
                 let reason = format!("{}", e);
                 warn!(event_type = ?event.event_type, error = %e, "event orphaned: DB flush failed");
                 self.queue_orphan(event.clone(), OrphanReason::DbFailed(reason));
+                broadcast_sequence.skip();
                 Err(EventError::Orphaned(format!("{:?}", event.event_type)))
             }
             Ok(Err(_)) => {
                 // Confirmation channel dropped (ingestion worker died)
                 error!(event_type = ?event.event_type, "ingestion worker dropped confirmation channel");
                 self.queue_orphan(event.clone(), OrphanReason::ChannelClosed);
+                broadcast_sequence.skip();
                 Err(EventError::ChannelClosed)
             }
             Err(_) => {
@@ -266,11 +492,107 @@ impl EventCoordinator {
                     "event orphaned: DB flush timeout"
                 );
                 self.queue_orphan(event.clone(), OrphanReason::DbTimeout(self.persist_timeout));
+                broadcast_sequence.skip();
                 Err(EventError::Timeout(
                     format!("{:?}", event.event_type),
                     self.persist_timeout,
                 ))
             }
+        }
+    }
+
+    /// Detect journal events that are missing from, or differ from, DB projection.
+    ///
+    /// Called at session startup to identify persistent journal/DB forks.
+    /// Events in the journal but not in DB, or whose durable hash differs at
+    /// the same position, are returned so a recovery process can re-ingest
+    /// or repair them.
+    pub fn detect_forked_events<'a, 'b>(
+        journal_events: impl Iterator<Item = &'a JournalEvent>,
+        db_events: impl Iterator<Item = &'b EventFingerprint>,
+    ) -> Vec<ForkedEvent> {
+        let mut forked = Vec::new();
+        let mut db_events = db_events.peekable();
+        let mut journal_count: u64 = 0;
+        let mut db_count: u64 = 0;
+
+        for event in journal_events {
+            journal_count += 1;
+            match db_events.next() {
+                Some(db_event) => {
+                    db_count += 1;
+                    if db_event.content_hash != journal_event_content_hash(event) {
+                        forked.push(ForkedEvent {
+                            event: event.clone(),
+                            reason: ForkReason::ContentMismatch,
+                        });
+                    }
+                }
+                None => {
+                    forked.push(ForkedEvent {
+                        event: event.clone(),
+                        reason: ForkReason::MissingFromDb,
+                    });
+                }
+            }
+        }
+
+        for _ in db_events {
+            db_count += 1;
+        }
+
+        if journal_count < db_count {
+            warn!(
+                journal_count,
+                db_count, "DB has more events than journal — possible journal truncation"
+            );
+        }
+
+        forked
+    }
+
+    /// Re-ingest a forked event into the DB without re-writing to the journal.
+    ///
+    /// Used at session startup to heal journal/DB forks detected by
+    /// [`detect_forked_events`]. Skips journal write (event already durable)
+    /// and sends directly to the ingestion channel with confirmation timeout.
+    pub async fn reingest_forked_event(&self, event: &JournalEvent) -> Result<(), EventError> {
+        let (confirm_tx, confirm_rx) = oneshot::channel();
+        let request = IngestionRequest {
+            event: event.clone(),
+            confirm_tx,
+        };
+
+        // Send to ingestion channel (with timeout)
+        match tokio::time::timeout(self.ingestion_send_timeout, self.ingestion_tx.send(request))
+            .await
+        {
+            Ok(Ok(())) => { /* send succeeded */ }
+            Ok(Err(_)) => {
+                return Err(EventError::ChannelClosed);
+            }
+            Err(_) => {
+                return Err(EventError::IngestionSendTimeout(
+                    self.ingestion_send_timeout,
+                ));
+            }
+        }
+
+        // Await DB confirmation (with timeout)
+        match tokio::time::timeout(self.persist_timeout, confirm_rx).await {
+            Ok(Ok(Ok(()))) => {
+                debug!(event_type = ?event.event_type, "forked event re-ingested to DB");
+                Ok(())
+            }
+            Ok(Ok(Err(e))) => {
+                warn!(event_type = ?event.event_type, error = %e, "forked event DB re-ingestion failed");
+                Err(EventError::Orphaned(format!("{:?}", event.event_type)))
+            }
+            Ok(Err(_)) => Err(EventError::ChannelClosed),
+            Err(_) => Err(EventError::Timeout(
+                format!("{:?}", event.event_type),
+                self.persist_timeout,
+            )),
         }
     }
 }
@@ -356,7 +678,7 @@ mod tests {
             budget_used: None,
             budget_pressure: None,
             stall_type: None,
-            metadata: Some(serde_json::json!({"key": "value"})),
+            metadata: Some(serde_json::json!({"key": "value", "label": event_type})),
             plan_subtask_id: None,
             ttft_ms: None,
             context_ms: None,
@@ -380,6 +702,13 @@ mod tests {
             git_head: None,
             git_branch: None,
         }
+    }
+
+    fn fingerprints_for(events: &[JournalEvent]) -> Vec<EventFingerprint> {
+        events
+            .iter()
+            .map(EventFingerprint::from_journal_event)
+            .collect()
     }
 
     fn setup_coordinator() -> (
@@ -507,6 +836,7 @@ mod tests {
     #[tokio::test]
     async fn test_concurrent_events_preserve_ordering() {
         let (coord, _journal, mut ingestion_rx, mut broadcast_rx) = setup_coordinator();
+        let coord = Arc::new(coord);
 
         let events = vec![
             make_event("test-1"),
@@ -517,12 +847,7 @@ mod tests {
         let handles: Vec<_> = events
             .into_iter()
             .map(|e| {
-                let coord = EventCoordinator::new(
-                    Arc::clone(&coord.journal_writer),
-                    coord.ingestion_tx.clone(),
-                    coord.broadcast_tx.clone(),
-                    Duration::from_secs(5),
-                );
+                let coord = Arc::clone(&coord);
                 tokio::spawn(async move { coord.emit_event(e).await })
             })
             .collect();
@@ -554,6 +879,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_pending_event_does_not_block_later_broadcast() {
+        let (coord, _journal, mut ingestion_rx, mut broadcast_rx) = setup_coordinator();
+        let coord = Arc::new(coord);
+
+        let first = {
+            let coord = Arc::clone(&coord);
+            tokio::spawn(async move { coord.emit_event(make_event("first")).await })
+        };
+        let first_request = ingestion_rx.recv().await.expect("first ingestion request");
+
+        let second = {
+            let coord = Arc::clone(&coord);
+            tokio::spawn(async move { coord.emit_event(make_event("second")).await })
+        };
+        let second_request = ingestion_rx.recv().await.expect("second ingestion request");
+
+        first.abort();
+        drop(first_request);
+
+        second_request.confirm_tx.send(Ok(())).unwrap();
+        let second_broadcast =
+            tokio::time::timeout(Duration::from_millis(100), broadcast_rx.recv())
+                .await
+                .expect("later broadcast must not be blocked by a cancelled earlier emit")
+                .expect("broadcast channel closed");
+        assert_eq!(second_broadcast["metadata"]["label"], "second");
+        second.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn skipped_sequence_does_not_make_broadcast_wait_forever() {
+        let (coord, _journal, _ingestion_rx, mut broadcast_rx) = setup_coordinator();
+        let mut guard = coord.reserve_broadcast_sequence();
+        guard.skip();
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            coord.broadcast_in_order(&mut guard, &make_event("obsolete")),
+        )
+        .await
+        .expect("broadcast_in_order must return when its sequence was already skipped");
+        assert!(
+            broadcast_rx.try_recv().is_err(),
+            "an already skipped sequence must not broadcast stale events"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_events_do_not_broadcast_later_confirm_before_earlier_event() {
+        let (coord, _journal, mut ingestion_rx, mut broadcast_rx) = setup_coordinator();
+        let coord = Arc::new(coord);
+
+        let first = {
+            let coord = Arc::clone(&coord);
+            tokio::spawn(async move { coord.emit_event(make_event("first")).await })
+        };
+        let second = {
+            let coord = Arc::clone(&coord);
+            tokio::spawn(async move { coord.emit_event(make_event("second")).await })
+        };
+
+        let first_request = ingestion_rx.recv().await.expect("first ingestion request");
+        let second_request = ingestion_rx.recv().await.expect("second ingestion request");
+        assert_eq!(
+            first_request.event.metadata.as_ref().unwrap()["label"],
+            "first"
+        );
+        assert_eq!(
+            second_request.event.metadata.as_ref().unwrap()["label"],
+            "second"
+        );
+
+        second_request.confirm_tx.send(Ok(())).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            broadcast_rx.try_recv().is_err(),
+            "later event must not broadcast while an earlier event is still unpersisted"
+        );
+
+        first_request.confirm_tx.send(Ok(())).unwrap();
+        let first_broadcast = tokio::time::timeout(Duration::from_millis(100), broadcast_rx.recv())
+            .await
+            .expect("first broadcast timeout")
+            .expect("broadcast channel closed");
+        let second_broadcast =
+            tokio::time::timeout(Duration::from_millis(100), broadcast_rx.recv())
+                .await
+                .expect("second broadcast timeout")
+                .expect("broadcast channel closed");
+        assert_eq!(first_broadcast["metadata"]["label"], "first");
+        assert_eq!(second_broadcast["metadata"]["label"], "second");
+
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn test_ingestion_channel_closed_returns_error() {
         let (coord, _journal, ingestion_rx, _broadcast_rx) = setup_coordinator();
 
@@ -564,5 +986,161 @@ mod tests {
         let result = coord.emit_event(event).await;
 
         assert!(matches!(result, Err(EventError::ChannelClosed)));
+    }
+
+    #[test]
+    fn detect_forked_events_basic() {
+        let events: Vec<JournalEvent> = (0..5)
+            .map(|i| make_event(&format!("event-{}", i)))
+            .collect();
+
+        // DB has only events 0,1,2 → events 3,4 are forked.
+        let db_events = fingerprints_for(&events[..3]);
+        let forked = EventCoordinator::detect_forked_events(events.iter(), db_events.iter());
+        assert_eq!(
+            forked.len(),
+            2,
+            "events 3 and 4 should be detected as missing from DB"
+        );
+        assert_eq!(forked[0].reason, ForkReason::MissingFromDb);
+        assert_eq!(forked[1].reason, ForkReason::MissingFromDb);
+    }
+
+    #[test]
+    fn detect_forked_events_exact_match() {
+        let events: Vec<JournalEvent> = (0..3)
+            .map(|i| make_event(&format!("event-{}", i)))
+            .collect();
+
+        // DB has exactly the same events → no fork.
+        let db_events = fingerprints_for(&events);
+        let forked = EventCoordinator::detect_forked_events(events.iter(), db_events.iter());
+        assert!(
+            forked.is_empty(),
+            "exact match should produce no forked events, got {forked:?}"
+        );
+    }
+
+    #[test]
+    fn detect_forked_events_db_has_more() {
+        let events: Vec<JournalEvent> = (0..2)
+            .map(|i| make_event(&format!("event-{}", i)))
+            .collect();
+
+        let mut db_source = events.clone();
+        db_source.extend((2..5).map(|i| make_event(&format!("db-only-{i}"))));
+        let db_events = fingerprints_for(&db_source);
+
+        // DB has more events than journal → possible truncation, but no MissingFromDb.
+        let forked = EventCoordinator::detect_forked_events(events.iter(), db_events.iter());
+        assert!(
+            forked.is_empty(),
+            "DB having more events is not a fork (possible truncation)"
+        );
+    }
+
+    #[test]
+    fn detect_forked_events_empty_journal() {
+        let events: Vec<JournalEvent> = vec![];
+        let db_events: Vec<EventFingerprint> = vec![];
+        let forked = EventCoordinator::detect_forked_events(events.iter(), db_events.iter());
+        assert!(forked.is_empty());
+    }
+
+    #[test]
+    fn detect_forked_events_content_mismatch() {
+        let journal_events: Vec<JournalEvent> =
+            (0..3).map(|i| make_event(&format!("event-{i}"))).collect();
+        let mut db_source = journal_events.clone();
+        db_source[1].metadata = Some(serde_json::json!({
+            "key": "value",
+            "label": "event-1-mutated"
+        }));
+        let db_events = fingerprints_for(&db_source);
+
+        let forked =
+            EventCoordinator::detect_forked_events(journal_events.iter(), db_events.iter());
+
+        assert_eq!(forked.len(), 1);
+        assert_eq!(forked[0].reason, ForkReason::ContentMismatch);
+        assert_eq!(
+            forked[0].event.metadata.as_ref().unwrap()["label"],
+            "event-1"
+        );
+    }
+
+    /// End-to-end: when ingestion channel closes, the event is written to journal
+    /// but not DB. detect_forked_events must identify this discrepancy so
+    /// a recovery process can re-ingest.
+    #[tokio::test]
+    async fn channel_closed_event_journaled_detectable_as_fork() {
+        let (coord, journal, ingestion_rx, _broadcast_rx) = setup_coordinator();
+
+        // Drop receiver to simulate ingestion channel closed
+        drop(ingestion_rx);
+
+        let event = make_event("orphaned-by-channel-close");
+        let result = coord.emit_event(event).await;
+        assert!(
+            matches!(result, Err(EventError::ChannelClosed)),
+            "expected ChannelClosed error, got {result:?}"
+        );
+
+        // Verify event was written to journal despite channel failure
+        let journal_events: Vec<JournalEvent> = journal.events.lock().unwrap().clone();
+        assert_eq!(
+            journal_events.len(),
+            1,
+            "event should be in journal even after channel close"
+        );
+
+        // detect_forked_events should find the mismatch (1 journal, 0 DB)
+        let db_events: Vec<EventFingerprint> = vec![];
+        let forked =
+            EventCoordinator::detect_forked_events(journal_events.iter(), db_events.iter());
+        assert_eq!(
+            forked.len(),
+            1,
+            "journal/DB fork must be detectable after channel close"
+        );
+        assert_eq!(forked[0].reason, ForkReason::MissingFromDb);
+    }
+
+    /// Verify reingest_forked_event sends to DB without re-writing journal.
+    #[tokio::test]
+    async fn reingest_forked_event_skips_journal_write() {
+        let (coord, journal, mut ingestion_rx, _broadcast_rx) = setup_coordinator();
+
+        let forked_event = make_event("reingest-test");
+
+        // Start reingest
+        let handle = tokio::spawn({
+            let coord_clone = EventCoordinator::new(
+                Arc::clone(&coord.journal_writer),
+                coord.ingestion_tx.clone(),
+                coord.broadcast_tx.clone(),
+                Duration::from_secs(5),
+            );
+            let event = forked_event.clone();
+            async move { coord_clone.reingest_forked_event(&event).await }
+        });
+
+        // Confirm DB
+        let request = ingestion_rx
+            .recv()
+            .await
+            .expect("reingest should send to ingestion channel");
+        assert_eq!(request.event.event_type, JournalEventType::Turn);
+        request.confirm_tx.send(Ok(())).unwrap();
+
+        let result = handle.await.unwrap();
+        assert!(result.is_ok(), "reingest should succeed: {result:?}");
+
+        // Journal must NOT be re-written
+        let journal_events: Vec<JournalEvent> = journal.events.lock().unwrap().clone();
+        assert!(
+            journal_events.is_empty(),
+            "reingest must NOT write to journal (event already durable)"
+        );
     }
 }

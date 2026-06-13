@@ -108,10 +108,18 @@ pub fn local_tool_schemas() -> Vec<Value> {
 /// Read-only tools (read_file, grep, glob, git_status/diff/log) and
 /// session-scoped authoring tools (`task`, memory_*) stay available so the
 /// agent can keep authoring without mutating the external world.
-pub(crate) fn is_plan_mode_blocked_tool(tool: &str, _args: &Value) -> bool {
+pub(crate) fn is_plan_mode_blocked_tool(tool: &str, args: &Value) -> bool {
+    // Legacy standalone tools are always blocked
     if tool == "task_stop" {
         return true;
     }
+
+    // Consolidated `task` tool: block only destructive actions (stop)
+    if tool == "task" {
+        let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
+        return action == "stop";
+    }
+
     matches!(
         tool,
         "bash"
@@ -477,6 +485,36 @@ pub enum BgTaskCommand {
     },
 }
 
+#[cfg(not(test))]
+const BG_TASK_COMMAND_REPLY_TIMEOUT_MS: u64 = 1_000;
+#[cfg(test)]
+const BG_TASK_COMMAND_REPLY_TIMEOUT_MS: u64 = 25;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BgTaskReplyError {
+    Closed,
+    TimedOut,
+}
+
+fn background_task_reply_timeout(timeout_ms: u64) -> Duration {
+    Duration::from_millis(timeout_ms.clamp(1, BG_TASK_COMMAND_REPLY_TIMEOUT_MS))
+}
+
+async fn await_bg_task_command_reply<T>(
+    rx: tokio::sync::oneshot::Receiver<T>,
+    timeout: Duration,
+) -> Result<T, BgTaskReplyError> {
+    match tokio::time::timeout(timeout, rx).await {
+        Ok(Ok(reply)) => Ok(reply),
+        Ok(Err(_)) => Err(BgTaskReplyError::Closed),
+        Err(_) => Err(BgTaskReplyError::TimedOut),
+    }
+}
+
+fn duration_ms_u64(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
 fn format_background_task_error(task_id: &str, error: &str) -> String {
     if error.contains("no background shell with id") || error.contains("no background task with id")
     {
@@ -584,6 +622,27 @@ fn format_background_task_output(
 
 fn format_background_task_output_timeout(task_id: &str, timeout_ms: u64) -> String {
     format!("Read shell output {task_id}\nNo output yet · still running after {timeout_ms}ms")
+}
+
+fn format_background_task_output_registry_timeout(task_id: &str, timeout: Duration) -> String {
+    format!(
+        "Read shell output {task_id}\nBackground task registry did not respond within {}ms. Output polling is unavailable for this turn; the task may still be running.",
+        duration_ms_u64(timeout)
+    )
+}
+
+fn format_background_task_stop_registry_timeout(task_id: &str, timeout: Duration) -> String {
+    format!(
+        "Background task {task_id} stop status unknown\nBackground task registry did not respond within {}ms. The task may still be running; retry task_stop or task_list.",
+        duration_ms_u64(timeout)
+    )
+}
+
+fn format_background_task_list_registry_timeout(timeout: Duration) -> String {
+    format!(
+        "Background task registry unavailable\nTimed out after {}ms waiting for the interactive session to answer. Background tasks may still be running; retry task_list later.",
+        duration_ms_u64(timeout)
+    )
 }
 
 fn format_background_task_unavailable(cloud_session: bool) -> String {
@@ -722,6 +781,11 @@ pub struct ToolExecutor {
     /// task actions fail fast with a clear error rather than pushing
     /// to a queue nobody drains (which would hang the LLM turn forever).
     pub(crate) bg_task_commands: Option<std::sync::Arc<std::sync::Mutex<Vec<BgTaskCommand>>>>,
+    /// Shared background task list cache.
+    /// When the TUI event loop is active, it writes rendered
+    /// task-list XML here every tick so [`Self::task_list_bg`] can
+    /// bypass the BG command queue.
+    pub(crate) bg_task_list_cache: Option<std::sync::Arc<tokio::sync::RwLock<String>>>,
     /// Detach slot for the bash tool. Renewed before each tool call
     /// by the TUI event loop so a fresh one-shot reply channel is
     /// available for every bash invocation. `None` outside the TUI
@@ -880,6 +944,7 @@ impl ToolExecutor {
             task_manager: std::sync::Arc::new(task_mgmt::TaskManager::in_memory()),
             task_notify_tx: None,
             bg_task_commands: None,
+            bg_task_list_cache: None,
             bash_detach_slot: None,
             spawn_context: None,
             context_cache: None,
@@ -1357,6 +1422,14 @@ impl ToolExecutor {
         self
     }
 
+    pub(crate) fn with_bg_task_list_cache(
+        mut self,
+        cache: std::sync::Arc<tokio::sync::RwLock<String>>,
+    ) -> Self {
+        self.bg_task_list_cache = Some(cache);
+        self
+    }
+
     /// Install the host-owned detach slot so the bash tool can
     /// observe Ctrl+B and transfer its child to the background
     /// registry. The slot is shared (`Arc`) — both the executor and
@@ -1491,6 +1564,8 @@ impl ToolExecutor {
                 "active_form",
                 "owner",
                 "metadata",
+                "add_blocks",
+                "add_blocked_by",
             ],
             "list" => &["action", "status_filter"],
             "get" => &["action", "task_id"],
@@ -1498,6 +1573,7 @@ impl ToolExecutor {
                 "action",
                 "task_id",
                 "new_status",
+                "status",
                 "title",
                 "description",
                 "subtask_id",
@@ -1508,12 +1584,13 @@ impl ToolExecutor {
                 "add_blocked_by",
                 "remove_blocks",
                 "remove_blocked_by",
+                "reason",
                 "error_message",
             ],
             "stop" => &["action", "task_id", "reason"],
             "list_user" => &["action", "user_status"],
             "adopt" => &["action", "source_session_id", "task_id"],
-            "archive" => &["action", "task_id", "older_than_days"],
+            "archive" => &["action", "task_id", "older_than_days", "reason"],
             _ => return Ok(()),
         };
         let Some(obj) = args.as_object() else {
@@ -1521,6 +1598,12 @@ impl ToolExecutor {
         };
         for key in obj.keys() {
             if !allowed.contains(&key.as_str()) {
+                if action == "create" && Self::is_task_dependency_removal_field(key) {
+                    return Err(format!(
+                        "unknown field '{key}' for task.create. Dependency removal fields (`remove_blocks`, `remove_blocked_by`) are update-only: first create the task, then call task(action='update', task_id='<created task_id>', {key}=[...]). Valid task.create fields: {}",
+                        allowed.join(", ")
+                    ));
+                }
                 return Err(format!(
                     "unknown field '{key}' for task.{action} (valid: {})",
                     allowed.join(", ")
@@ -1528,6 +1611,10 @@ impl ToolExecutor {
             }
         }
         Ok(())
+    }
+
+    fn is_task_dependency_removal_field(key: &str) -> bool {
+        matches!(key, "remove_blocks" | "remove_blocked_by")
     }
 
     fn task_output_json(output: &str) -> Option<Value> {
@@ -2266,6 +2353,20 @@ impl ToolExecutor {
     }
 
     async fn task_list_bg(&self) -> String {
+        // Fast path: read the latest snapshot directly from the shared
+        // cache. The TUI event loop refreshes this every tick, so we
+        // completely bypass the BG command queue and event-loop tick
+        // latency.
+        if let Some(ref cache) = self.bg_task_list_cache {
+            let cached = cache.read().await;
+            if !cached.is_empty() {
+                return cached.clone();
+            }
+            // Cache not yet populated (first call before the event
+            // loop has rendered). Fall through to the queue path so
+            // we still return a valid response.
+        }
+        // Fallback: queue path for when no cache is available
         let Some(ref bg_commands) = self.bg_task_commands else {
             return format_background_task_unavailable(self.cloud_base.is_some());
         };
@@ -2274,8 +2375,16 @@ impl ToolExecutor {
             let mut cmds = bg_commands.lock_recover();
             cmds.push(BgTaskCommand::List { reply: tx });
         }
-        rx.await
-            .unwrap_or_else(|_| "Error: background task registry not available".to_string())
+        let reply_timeout = background_task_reply_timeout(BG_TASK_COMMAND_REPLY_TIMEOUT_MS);
+        match await_bg_task_command_reply(rx, reply_timeout).await {
+            Ok(output) => output,
+            Err(BgTaskReplyError::Closed) => {
+                "Error: background task registry not available".to_string()
+            }
+            Err(BgTaskReplyError::TimedOut) => {
+                format_background_task_list_registry_timeout(reply_timeout)
+            }
+        }
     }
 
     async fn task_output(&self, args: &Value) -> String {
@@ -2287,14 +2396,6 @@ impl ToolExecutor {
             Err(error) => return error.to_string(),
             Ok(None) => return "Task id is required".to_string(),
         };
-        // Default to snapshot-now. The block-until-terminal mode is opt-in
-        // because polling-with-output-coalescing actively misleads the model:
-        // a long-running cargo build emits new bytes every few hundred ms, so
-        // a "wait for new output" loop returns immediately every iteration
-        // with status=running, training the model to keep polling instead
-        // of ending the turn and trusting the <task_notification>. block=true
-        // here means "wait for the task to TERMINATE", not "wait for the
-        // next chunk".
         let block = args.get("block").and_then(Value::as_bool).unwrap_or(false);
         let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0);
         let max_bytes = args
@@ -2306,12 +2407,16 @@ impl ToolExecutor {
             .get("timeout_ms")
             .and_then(Value::as_u64)
             .unwrap_or(30_000)
-            .min(300_000);
+            .clamp(1, 300_000);
 
         if block {
-            let deadline =
-                tokio::time::Instant::now() + tokio::time::Duration::from_millis(timeout_ms);
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
             loop {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    return format_background_task_output_timeout(&task_id, timeout_ms);
+                }
+                let reply_timeout = background_task_reply_timeout(timeout_ms).min(remaining);
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 {
                     let mut cmds = bg_commands.lock_recover();
@@ -2322,30 +2427,39 @@ impl ToolExecutor {
                         reply: tx,
                     });
                 }
-                match rx.await {
+                match await_bg_task_command_reply(rx, reply_timeout).await {
                     Ok(Ok(snapshot)) => {
-                        // Only exit on true terminal status (completed/failed/
-                        // killed/unavailable) or waiting_for_input. Non-shell
-                        // tasks (local agents) still return immediately because
-                        // they don't have streaming output. New-bytes-arrived
-                        // is NOT an exit condition any more — that was the
-                        // old reverse-incentive trap.
                         if snapshot.kind != "shell"
                             || background_task_status_should_return_immediately(&snapshot.status)
+                            || !snapshot.output.is_empty()
                             || tokio::time::Instant::now() >= deadline
                         {
                             return format_background_task_output(&task_id, offset, &snapshot);
                         }
                     }
                     Ok(Err(e)) => return format_background_task_error(&task_id, &e),
-                    Err(_) => return "Error: background task registry not available".to_string(),
+                    Err(BgTaskReplyError::Closed) => {
+                        return "Error: background task registry not available".to_string();
+                    }
+                    Err(BgTaskReplyError::TimedOut) => {
+                        return format_background_task_output_registry_timeout(
+                            &task_id,
+                            reply_timeout,
+                        );
+                    }
                 }
                 if tokio::time::Instant::now() >= deadline {
                     return format_background_task_output_timeout(&task_id, timeout_ms);
                 }
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                let sleep_for = Duration::from_millis(500)
+                    .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+                if sleep_for.is_zero() {
+                    return format_background_task_output_timeout(&task_id, timeout_ms);
+                }
+                tokio::time::sleep(sleep_for).await;
             }
         } else {
+            let reply_timeout = background_task_reply_timeout(timeout_ms);
             let (tx, rx) = tokio::sync::oneshot::channel();
             {
                 let mut cmds = bg_commands.lock_recover();
@@ -2356,10 +2470,15 @@ impl ToolExecutor {
                     reply: tx,
                 });
             }
-            match rx.await {
+            match await_bg_task_command_reply(rx, reply_timeout).await {
                 Ok(Ok(snapshot)) => format_background_task_output(&task_id, offset, &snapshot),
                 Ok(Err(e)) => format_background_task_error(&task_id, &e),
-                Err(_) => "Error: background task registry not available".to_string(),
+                Err(BgTaskReplyError::Closed) => {
+                    "Error: background task registry not available".to_string()
+                }
+                Err(BgTaskReplyError::TimedOut) => {
+                    format_background_task_output_registry_timeout(&task_id, reply_timeout)
+                }
             }
         }
     }
@@ -2381,10 +2500,16 @@ impl ToolExecutor {
                 reply: tx,
             });
         }
-        match rx.await {
+        let reply_timeout = background_task_reply_timeout(BG_TASK_COMMAND_REPLY_TIMEOUT_MS);
+        match await_bg_task_command_reply(rx, reply_timeout).await {
             Ok(Ok(())) => format!("Background task {task_id} stopped."),
             Ok(Err(e)) => format_background_task_stop_error(&task_id, &e),
-            Err(_) => "Error: background task registry not available".to_string(),
+            Err(BgTaskReplyError::Closed) => {
+                "Error: background task registry not available".to_string()
+            }
+            Err(BgTaskReplyError::TimedOut) => {
+                format_background_task_stop_registry_timeout(&task_id, reply_timeout)
+            }
         }
     }
 
@@ -3708,11 +3833,15 @@ impl ToolExecutor {
                 "rollback_session_state" => self.rollback_session_state(args).await,
                 "rollback_turn_actions" => self.rollback_turn_actions(args).await,
                 "str_replace" => {
+                    let args = match astra_tools::fs_ops::normalize_str_replace_args(args) {
+                        Ok(args) => args,
+                        Err(error) => return error,
+                    };
                     // edits array routes to multi_edit handler
                     if args.get("edits").and_then(Value::as_array).is_some() {
-                        self.multi_edit(args)
+                        self.multi_edit(&args)
                     } else {
-                        self.str_replace(args)
+                        self.str_replace(&args)
                     }
                 }
                 "list_dir" => self.list_dir(args),
@@ -4773,11 +4902,11 @@ impl ToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::{
-        BgTaskOutputSnapshot, ToolExecutor, all_tool_schemas, detect_git_remote_repos,
-        extract_github_owner_repo, file_checkpoint_dir_for, format_background_task_error,
-        format_background_task_output, format_background_task_output_timeout,
-        format_background_task_stop_error, memoria, parse_memory_search_contents,
-        utf16_col_to_char_idx,
+        BgTaskCommand, BgTaskOutputSnapshot, ToolExecutor, all_tool_schemas,
+        detect_git_remote_repos, extract_github_owner_repo, file_checkpoint_dir_for,
+        format_background_task_error, format_background_task_output,
+        format_background_task_output_timeout, format_background_task_stop_error, memoria,
+        parse_memory_search_contents, utf16_col_to_char_idx,
     };
     use crate::lock_recovery::LockRecovery;
     use std::path::PathBuf;
@@ -4894,6 +5023,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_output_nonblocking_times_out_when_registry_does_not_answer() {
+        let commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let executor = test_executor().with_bg_task_commands(commands);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            executor.task_output(&serde_json::json!({
+                "task_id": "bg-shell-1",
+                "block": false,
+                "timeout_ms": 5
+            })),
+        )
+        .await
+        .expect("registry reply timeout should bound task_output");
+
+        assert!(
+            result.contains("Background task registry did not respond within 5ms"),
+            "{result}"
+        );
+        assert!(result.contains("task may still be running"), "{result}");
+    }
+
+    #[tokio::test]
+    async fn task_output_blocking_times_out_when_registry_does_not_answer() {
+        let commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let executor = test_executor().with_bg_task_commands(commands);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            executor.task_output(&serde_json::json!({
+                "task_id": "bg-shell-1",
+                "block": true,
+                "timeout_ms": 5
+            })),
+        )
+        .await
+        .expect("registry reply timeout should bound blocking task_output");
+
+        assert!(
+            result.contains("Background task registry did not respond within"),
+            "{result}"
+        );
+        assert!(result.contains("task may still be running"), "{result}");
+    }
+
+    #[tokio::test]
+    async fn task_output_defaults_to_nonblocking_snapshot() {
+        let commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let executor = test_executor().with_bg_task_commands(commands.clone());
+        let args = serde_json::json!({
+            "task_id": "bg-shell-1",
+            "timeout_ms": 10_000
+        });
+        let output = tokio::time::timeout(std::time::Duration::from_millis(200), async {
+            let output_fut = executor.task_output(&args);
+            tokio::pin!(output_fut);
+
+            loop {
+                tokio::select! {
+                    output = &mut output_fut => break output,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {
+                        let command = commands.lock_recover().pop();
+                        if let Some(BgTaskCommand::GetOutputSince {
+                            task_id,
+                            offset,
+                            reply,
+                            ..
+                        }) = command
+                        {
+                            assert_eq!(task_id, "bg-shell-1");
+                            assert_eq!(offset, 0);
+                            let _ = reply.send(Ok(bg_snapshot(0, 0, 0, "running", "")));
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("default task_output should return the first snapshot without waiting");
+
+        assert!(output.contains("Read shell output bg-shell-1"), "{output}");
+        assert!(output.contains("No output yet"), "{output}");
+    }
+
+    #[tokio::test]
     async fn task_stop_cloud_without_edge_runner_names_missing_runner() {
         let executor = test_executor().with_cloud("https://cloud.example", "token");
         let result = tokio::time::timeout(
@@ -4909,6 +5121,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_stop_times_out_when_registry_does_not_answer() {
+        let commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let executor = test_executor().with_bg_task_commands(commands);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            executor.task_kill_bg(&serde_json::json!({"task_id": "bg-shell-1"})),
+        )
+        .await
+        .expect("registry reply timeout should bound task_stop");
+
+        assert!(
+            result.contains("Background task bg-shell-1 stop status unknown"),
+            "{result}"
+        );
+        assert!(
+            result.contains("Background task registry did not respond within"),
+            "{result}"
+        );
+    }
+
+    #[tokio::test]
     async fn task_list_cloud_without_edge_runner_names_missing_runner() {
         let executor = test_executor().with_cloud("https://cloud.example", "token");
         let result = tokio::time::timeout(
@@ -4920,6 +5153,27 @@ mod tests {
         assert_eq!(
             result,
             "Background task unavailable\nno edge runner is attached to this cloud session"
+        );
+    }
+
+    #[tokio::test]
+    async fn task_list_times_out_when_registry_does_not_answer() {
+        let commands = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let executor = test_executor().with_bg_task_commands(commands);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            executor.task_list_bg(),
+        )
+        .await
+        .expect("registry reply timeout should bound task_list");
+
+        assert!(
+            result.contains("Background task registry unavailable"),
+            "{result}"
+        );
+        assert!(
+            result.contains("Timed out after") && result.contains("retry task_list"),
+            "{result}"
         );
     }
 

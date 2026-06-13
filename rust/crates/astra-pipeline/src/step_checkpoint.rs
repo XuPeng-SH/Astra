@@ -14,18 +14,9 @@ use std::path::{Path, PathBuf};
 
 use astra_services::SessionArtifactStore;
 
-use crate::journal_crypto::JournalCrypto;
-use crate::journal_crypto::hex_decode;
-use crate::journal_crypto::hex_encode;
 use crate::step_protocol::{
     CheckpointTier, HeavyCheckpoint, LightCheckpoint, StepCheckpoint, StepEvent, StepEventStore,
 };
-use std::sync::OnceLock;
-
-fn journal_crypto() -> &'static JournalCrypto {
-    static CRYPTO: OnceLock<JournalCrypto> = OnceLock::new();
-    CRYPTO.get_or_init(JournalCrypto::from_env_or_local_key)
-}
 
 /// Directory name within session workspace for step checkpoints.
 const STEP_CHECKPOINT_DIR: &str = "step_checkpoints";
@@ -36,14 +27,13 @@ const MAX_LIGHT_CHECKPOINTS: usize = 50;
 /// Get the step checkpoint directory for a session.
 /// Decrypt checkpoint content. All checkpoints are encrypted.
 pub(crate) fn decrypt_checkpoint(content: &str) -> Option<String> {
-    let bytes = hex_decode(content.trim())?;
-    let decrypted = journal_crypto().decrypt(&bytes)?;
-    String::from_utf8(decrypted).ok()
+    astra_services::checkpoint_crypto::decrypt_text(content)
+        .ok()
+        .flatten()
 }
 
-fn encrypt_checkpoint(content: &str) -> String {
-    let encrypted = journal_crypto().encrypt(content.as_bytes());
-    hex_encode(&encrypted)
+fn encrypt_checkpoint(content: &str) -> std::io::Result<String> {
+    astra_services::checkpoint_crypto::encrypt_text(content)
 }
 
 fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
@@ -67,8 +57,16 @@ fn write_atomic_encrypted_text(path: &Path, content: &str) -> std::io::Result<()
         .ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid file name")
         })?;
-    let tmp_path = dir.join(format!(".tmp-{file_name}"));
-    let encrypted = encrypt_checkpoint(content);
+    let tmp_path = dir.join(format!(
+        ".tmp-{}-{}-{}",
+        std::process::id(),
+        file_name,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let encrypted = encrypt_checkpoint(content)?;
     {
         use std::io::Write;
         let mut file = std::fs::File::create(&tmp_path)?;
@@ -88,12 +86,16 @@ fn append_encrypted_line(path: &Path, content: &str) -> std::io::Result<()> {
     };
     std::fs::create_dir_all(dir)?;
     let existed = path.exists();
-    let encrypted = encrypt_checkpoint(content);
+    let needs_leading_newline = existed && file_needs_trailing_newline(path)?;
+    let encrypted = encrypt_checkpoint(content)?;
     use std::io::Write;
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)?;
+    if needs_leading_newline {
+        file.write_all(b"\n")?;
+    }
     writeln!(file, "{encrypted}")?;
     file.sync_data()?;
     if !existed {
@@ -102,10 +104,29 @@ fn append_encrypted_line(path: &Path, content: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-fn checkpoint_dir_for(session_id: &str) -> PathBuf {
+fn file_needs_trailing_newline(path: &Path) -> std::io::Result<bool> {
+    let metadata = std::fs::metadata(path)?;
+    if metadata.len() == 0 {
+        return Ok(false);
+    }
+
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    file.seek(SeekFrom::End(-1))?;
+    let mut last = [0_u8; 1];
+    file.read_exact(&mut last)?;
+    Ok(last[0] != b'\n')
+}
+
+fn checkpoint_dir_for(session_id: &str) -> std::io::Result<PathBuf> {
     astra_services::local_session_artifact_store()
         .session_path(session_id, STEP_CHECKPOINT_DIR)
-        .expect("validated session_id must resolve step checkpoint dir")
+        .map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid session_id for checkpoint dir: {e}"),
+            )
+        })
 }
 
 /// Write a step checkpoint to local filesystem.
@@ -115,7 +136,7 @@ pub fn write_step_checkpoint(
     number: u32,
     checkpoint: &StepCheckpoint,
 ) -> std::io::Result<PathBuf> {
-    let dir = checkpoint_dir_for(session_id);
+    let dir = checkpoint_dir_for(session_id)?;
     std::fs::create_dir_all(&dir)?;
 
     let tier = match checkpoint {
@@ -140,7 +161,7 @@ pub fn write_step_checkpoint(
 
 /// Delete a step checkpoint by number and tier.
 pub fn delete_step_checkpoint(session_id: &str, number: u32, tier: &str) -> std::io::Result<()> {
-    let dir = checkpoint_dir_for(session_id);
+    let dir = checkpoint_dir_for(session_id)?;
     let filename = format!("{:06}-{}.json", number, tier);
     let path = dir.join(&filename);
     match std::fs::remove_file(&path) {
@@ -154,7 +175,7 @@ pub fn delete_step_checkpoint(session_id: &str, number: u32, tier: &str) -> std:
 /// Read the latest heavy checkpoint for session recovery.
 /// Returns None if no heavy checkpoint exists.
 pub fn read_latest_heavy_checkpoint(session_id: &str) -> std::io::Result<Option<HeavyCheckpoint>> {
-    let dir = checkpoint_dir_for(session_id);
+    let dir = checkpoint_dir_for(session_id)?;
     if !dir.exists() {
         return Ok(None);
     }
@@ -190,7 +211,17 @@ pub fn read_latest_heavy_checkpoint(session_id: &str) -> std::io::Result<Option<
                 continue;
             }
         };
-        let decrypted = decrypt_checkpoint(&content).unwrap_or_else(|| content.to_string());
+        let decrypted = match decrypt_checkpoint(&content) {
+            Some(plain) => plain,
+            None => {
+                astra_core::agent_warn!(
+                    "checkpoint",
+                    "Skipping heavy checkpoint {:?}: decryption failed (key rotation or tampering?)",
+                    entry.file_name()
+                );
+                continue;
+            }
+        };
         let checkpoint: StepCheckpoint = match serde_json::from_str(&decrypted) {
             Ok(cp) => cp,
             Err(e) => {
@@ -213,7 +244,7 @@ pub fn read_latest_heavy_checkpoint(session_id: &str) -> std::io::Result<Option<
 
 /// Read the latest light checkpoint (for quick cursor restore).
 pub fn read_latest_light_checkpoint(session_id: &str) -> std::io::Result<Option<LightCheckpoint>> {
-    let dir = checkpoint_dir_for(session_id);
+    let dir = checkpoint_dir_for(session_id)?;
     if !dir.exists() {
         return Ok(None);
     }
@@ -249,7 +280,17 @@ pub fn read_latest_light_checkpoint(session_id: &str) -> std::io::Result<Option<
                 continue;
             }
         };
-        let decrypted = decrypt_checkpoint(&content).unwrap_or_else(|| content.to_string());
+        let decrypted = match decrypt_checkpoint(&content) {
+            Some(plain) => plain,
+            None => {
+                astra_core::agent_warn!(
+                    "checkpoint",
+                    "Skipping checkpoint {:?}: decryption failed (key rotation or tampering?)",
+                    entry.file_name()
+                );
+                continue;
+            }
+        };
         let checkpoint: StepCheckpoint = match serde_json::from_str(&decrypted) {
             Ok(cp) => cp,
             Err(e) => {
@@ -272,7 +313,7 @@ pub fn read_latest_light_checkpoint(session_id: &str) -> std::io::Result<Option<
 
 /// List all checkpoint numbers and tiers for a session.
 pub fn list_checkpoints(session_id: &str) -> std::io::Result<Vec<(u32, CheckpointTier)>> {
-    let dir = checkpoint_dir_for(session_id);
+    let dir = checkpoint_dir_for(session_id)?;
     if !dir.exists() {
         return Ok(Vec::new());
     }
@@ -347,7 +388,7 @@ fn prune_light_checkpoints(dir: &Path) -> std::io::Result<()> {
 pub fn read_breakpoint_index(
     session_id: &str,
 ) -> std::io::Result<crate::step_protocol::BreakpointIndex> {
-    let path = checkpoint_dir_for(session_id).join("breakpoints.json");
+    let path = checkpoint_dir_for(session_id)?.join("breakpoints.json");
     if !path.exists() {
         return Ok(crate::step_protocol::BreakpointIndex::default());
     }
@@ -363,7 +404,7 @@ pub fn write_composite_snapshot_index(
     session_id: &str,
     index: &astra_core::composite_snapshot::CompositeSnapshotIndex,
 ) -> std::io::Result<()> {
-    let dir = checkpoint_dir_for(session_id);
+    let dir = checkpoint_dir_for(session_id)?;
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("composite_snapshots.json");
     let json = serde_json::to_string_pretty(index)
@@ -375,12 +416,20 @@ pub fn write_composite_snapshot_index(
 pub fn read_composite_snapshot_index(
     session_id: &str,
 ) -> std::io::Result<astra_core::composite_snapshot::CompositeSnapshotIndex> {
-    let path = checkpoint_dir_for(session_id).join("composite_snapshots.json");
+    let path = checkpoint_dir_for(session_id)?.join("composite_snapshots.json");
     if !path.exists() {
         return Ok(astra_core::composite_snapshot::CompositeSnapshotIndex::default());
     }
     let content = std::fs::read_to_string(&path)?;
-    let decrypted = decrypt_checkpoint(&content).unwrap_or(content);
+    let decrypted = match decrypt_checkpoint(&content) {
+        Some(plain) => plain,
+        None => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "composite_snapshots.json decryption failed",
+            ));
+        }
+    };
     let mut index: astra_core::composite_snapshot::CompositeSnapshotIndex =
         serde_json::from_str(&decrypted)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -393,14 +442,14 @@ pub fn read_composite_snapshot_index(
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// File path for step events JSONL.
-pub(crate) fn events_path_for(session_id: &str) -> PathBuf {
-    session_dir_for(session_id).join("step_events.jsonl")
+pub(crate) fn events_path_for(session_id: &str) -> std::io::Result<PathBuf> {
+    Ok(session_dir_for(session_id)?.join("step_events.jsonl"))
 }
 
-pub(crate) fn session_dir_for(session_id: &str) -> PathBuf {
+pub(crate) fn session_dir_for(session_id: &str) -> std::io::Result<PathBuf> {
     astra_services::local_session_artifact_store()
         .session_dir(session_id)
-        .expect("validated session_id must resolve step session dir")
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
 }
 
 /// File-backed event store: in-memory DAG + append-only JSONL on disk.
@@ -413,7 +462,7 @@ pub struct FileBackedEventStore {
 impl FileBackedEventStore {
     /// Create a new store for a session, loading existing events from disk.
     pub fn new(session_id: &str) -> Self {
-        let events = Self::load_events(session_id).unwrap_or_default();
+        let events = Self::load_events_lenient(session_id);
         Self {
             session_id: session_id.to_string(),
             events,
@@ -428,38 +477,136 @@ impl FileBackedEventStore {
         }
     }
 
-    /// Load events from JSONL file.
-    fn load_events(session_id: &str) -> std::io::Result<Vec<StepEvent>> {
-        let path = events_path_for(session_id);
-        if !path.exists() {
-            return Ok(Vec::new());
+    fn parse_event_line(line: &str) -> std::io::Result<Option<StepEvent>> {
+        if line.trim().is_empty() {
+            return Ok(None);
         }
-        let content = std::fs::read_to_string(&path)?;
+        let Some(json) = decrypt_checkpoint(line) else {
+            tracing::warn!("skipping undecryptable step event JSONL line");
+            return Ok(None);
+        };
+        match serde_json::from_str::<StepEvent>(&json) {
+            Ok(event) => Ok(Some(event)),
+            Err(error)
+                if matches!(
+                    error.classify(),
+                    serde_json::error::Category::Syntax | serde_json::error::Category::Eof
+                ) =>
+            {
+                tracing::warn!(error = %error, "skipping malformed step event JSONL line");
+                Ok(None)
+            }
+            Err(error) => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+        }
+    }
+
+    fn load_events_lenient(session_id: &str) -> Vec<StepEvent> {
+        let path = match events_path_for(session_id) {
+            Ok(path) => path,
+            Err(error) => {
+                tracing::warn!(
+                    session_id,
+                    error = %error,
+                    "invalid session_id while loading step events leniently"
+                );
+                return Vec::new();
+            }
+        };
         let mut events = Vec::new();
-        for line in content.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            // Decrypt checkpoint event
-            let json = decrypt_checkpoint(line).ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "failed to decrypt checkpoint",
-                )
-            })?;
-            if let Ok(event) = serde_json::from_str::<StepEvent>(&json) {
-                events.push(event);
-            }
-            // Skip malformed lines (best-effort)
+        if !path.exists() {
+            return events;
         }
+
+        use std::io::BufRead;
+        let file = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            Err(error) => {
+                tracing::warn!(
+                    session_id,
+                    error = %error,
+                    "failed to open step events for lenient replay"
+                );
+                return events;
+            }
+        };
+        let reader = std::io::BufReader::new(file);
+        for line in reader.lines() {
+            let line = match line {
+                Ok(line) => line,
+                Err(error) => {
+                    tracing::warn!(
+                        session_id,
+                        error = %error,
+                        "failed to read step event line during lenient replay"
+                    );
+                    break;
+                }
+            };
+            match Self::parse_event_line(&line) {
+                Ok(Some(event)) => events.push(event),
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        session_id,
+                        error = %error,
+                        "skipping invalid step event during lenient replay"
+                    );
+                }
+            }
+        }
+        events
+    }
+
+    fn load_events_matching(
+        session_id: &str,
+        mut keep: impl FnMut(&StepEvent) -> bool,
+    ) -> std::io::Result<Vec<StepEvent>> {
+        let mut events = Vec::new();
+        Self::for_each_event(session_id, |event| {
+            if keep(event) {
+                events.push(event.clone());
+            }
+        })?;
         Ok(events)
+    }
+
+    /// Stream persisted events without materializing the whole journal.
+    pub fn for_each_event(
+        session_id: &str,
+        mut visit: impl FnMut(&StepEvent),
+    ) -> std::io::Result<()> {
+        let path = events_path_for(session_id)?;
+        if !path.exists() {
+            return Ok(());
+        }
+        use std::io::BufRead;
+        let file = std::fs::File::open(&path)?;
+        let reader = std::io::BufReader::new(file);
+        for line in reader.lines() {
+            let line = line?;
+            if let Some(event) = Self::parse_event_line(&line)? {
+                visit(&event);
+            }
+        }
+        Ok(())
+    }
+
+    /// Stream only events written at or after a checkpoint timestamp. Recovery
+    /// uses this instead of materializing the entire long-session journal.
+    pub fn load_events_created_at_or_after(
+        session_id: &str,
+        checkpoint_created_at: u64,
+    ) -> std::io::Result<Vec<StepEvent>> {
+        Self::load_events_matching(session_id, |event| {
+            event.created_at >= checkpoint_created_at
+        })
     }
 
     /// Append a single event to the JSONL file.
     fn persist_event(&self, event: &StepEvent) -> std::io::Result<()> {
-        let dir = session_dir_for(&self.session_id);
+        let dir = session_dir_for(&self.session_id)?;
         std::fs::create_dir_all(&dir)?;
-        let path = events_path_for(&self.session_id);
+        let path = events_path_for(&self.session_id)?;
         let json = serde_json::to_string(event)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         append_encrypted_line(&path, &json)
@@ -477,16 +624,10 @@ impl FileBackedEventStore {
 }
 
 impl StepEventStore for FileBackedEventStore {
-    fn append(&mut self, event: StepEvent) {
-        if let Err(err) = self.persist_event(&event) {
-            astra_core::agent_warn!(
-                "event_store",
-                "Failed to persist step event {}: {}",
-                event.event_id,
-                err
-            );
-        }
+    fn append(&mut self, event: StepEvent) -> std::io::Result<()> {
+        self.persist_event(&event)?;
         self.events.push(event);
+        Ok(())
     }
 
     fn events_for_step(&self, step_id: &str) -> Vec<&StepEvent> {
@@ -755,7 +896,7 @@ mod tests {
     fn write_step_checkpoint_creates_dir_and_file() {
         // Use a unique session ID with tempdir-like suffix to avoid collision
         let session_id = format!("test-step-cp-{}", std::process::id());
-        let dir = checkpoint_dir_for(&session_id);
+        let dir = checkpoint_dir_for(&session_id).unwrap();
 
         // Clean up from any previous run
         let _ = std::fs::remove_dir_all(&dir);
@@ -841,7 +982,9 @@ mod tests {
         write_composite_snapshot_index(session_id, &index).unwrap();
 
         let raw = std::fs::read_to_string(
-            checkpoint_dir_for(session_id).join("composite_snapshots.json"),
+            checkpoint_dir_for(session_id)
+                .unwrap()
+                .join("composite_snapshots.json"),
         )
         .unwrap();
         assert!(
@@ -864,6 +1007,14 @@ mod tests {
 
     use crate::step_protocol::StepEventType;
 
+    fn unique_session_id(prefix: &str) -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        format!("{prefix}-{}-{now}", std::process::id())
+    }
+
     fn make_event(id: &str, step_id: &str, event_type: StepEventType) -> StepEvent {
         StepEvent {
             event_id: id.to_string(),
@@ -882,17 +1033,30 @@ mod tests {
         let mut store = FileBackedEventStore::empty("test-events-empty");
         assert_eq!(store.event_count(), 0);
 
-        store.append(make_event("e1", "step-1", StepEventType::StepCreated));
-        store.append(make_event("e2", "step-1", StepEventType::ToolCallStarted));
+        let _ = store.append(make_event("e1", "step-1", StepEventType::StepCreated));
+        let _ = store.append(make_event("e2", "step-1", StepEventType::ToolCallStarted));
         assert_eq!(store.event_count(), 2);
+    }
+
+    #[test]
+    fn file_event_store_does_not_advance_memory_when_append_fails() {
+        let mut store = FileBackedEventStore::empty("../invalid-session-id");
+        let result = store.append(make_event("e1", "step-1", StepEventType::StepCreated));
+
+        assert!(result.is_err());
+        assert_eq!(
+            store.event_count(),
+            0,
+            "memory view must not advance ahead of durable journal"
+        );
     }
 
     #[test]
     fn file_event_store_events_for_step() {
         let mut store = FileBackedEventStore::empty("test-events-step");
-        store.append(make_event("e1", "step-1", StepEventType::StepCreated));
-        store.append(make_event("e2", "step-2", StepEventType::StepCreated));
-        store.append(make_event("e3", "step-1", StepEventType::ToolCallCompleted));
+        let _ = store.append(make_event("e1", "step-1", StepEventType::StepCreated));
+        let _ = store.append(make_event("e2", "step-2", StepEventType::StepCreated));
+        let _ = store.append(make_event("e3", "step-1", StepEventType::ToolCallCompleted));
 
         let step1_events = store.events_for_step("step-1");
         assert_eq!(step1_events.len(), 2);
@@ -903,15 +1067,15 @@ mod tests {
     #[test]
     fn file_event_store_ancestors() {
         let mut store = FileBackedEventStore::empty("test-events-ancestors");
-        store.append(make_event("root", "s1", StepEventType::StepCreated));
+        let _ = store.append(make_event("root", "s1", StepEventType::StepCreated));
 
         let mut child = make_event("child", "s1", StepEventType::ToolCallStarted);
         child.caused_by = vec!["root".to_string()];
-        store.append(child);
+        let _ = store.append(child);
 
         let mut grandchild = make_event("grandchild", "s1", StepEventType::ToolCallCompleted);
         grandchild.caused_by = vec!["child".to_string()];
-        store.append(grandchild);
+        let _ = store.append(grandchild);
 
         let ancestors = store.ancestors("grandchild");
         assert_eq!(ancestors.len(), 2);
@@ -923,11 +1087,11 @@ mod tests {
     #[test]
     fn file_event_store_descendants() {
         let mut store = FileBackedEventStore::empty("test-events-desc");
-        store.append(make_event("root", "s1", StepEventType::StepCreated));
+        let _ = store.append(make_event("root", "s1", StepEventType::StepCreated));
 
         let mut child = make_event("child", "s1", StepEventType::ToolCallStarted);
         child.caused_by = vec!["root".to_string()];
-        store.append(child);
+        let _ = store.append(child);
 
         let desc = store.descendants("root");
         assert_eq!(desc.len(), 1);
@@ -937,11 +1101,11 @@ mod tests {
     #[test]
     fn file_event_store_leaves() {
         let mut store = FileBackedEventStore::empty("test-events-leaves");
-        store.append(make_event("root", "s1", StepEventType::StepCreated));
+        let _ = store.append(make_event("root", "s1", StepEventType::StepCreated));
 
         let mut child = make_event("child", "s1", StepEventType::ToolCallCompleted);
         child.caused_by = vec!["root".to_string()];
-        store.append(child);
+        let _ = store.append(child);
 
         let leaves = store.leaves();
         assert_eq!(leaves.len(), 1);
@@ -951,15 +1115,15 @@ mod tests {
     #[test]
     fn file_event_store_persist_and_reload() {
         let session_id = format!("test-persist-events-{}", std::process::id());
-        let path = events_path_for(&session_id);
+        let path = events_path_for(&session_id).unwrap();
 
         // Clean up from previous runs
         let _ = std::fs::remove_file(&path);
 
         {
             let mut store = FileBackedEventStore::empty(&session_id);
-            store.append(make_event("e1", "s1", StepEventType::StepCreated));
-            store.append(make_event("e2", "s1", StepEventType::ToolCallCompleted));
+            let _ = store.append(make_event("e1", "s1", StepEventType::StepCreated));
+            let _ = store.append(make_event("e2", "s1", StepEventType::ToolCallCompleted));
         }
 
         // Reload from disk
@@ -970,7 +1134,162 @@ mod tests {
 
         // Clean up
         let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_dir(session_dir_for(&session_id));
+        let _ = std::fs::remove_dir(session_dir_for(&session_id).unwrap());
+    }
+
+    #[test]
+    fn file_event_store_recovers_valid_events_after_torn_encrypted_tail() {
+        let session_id = unique_session_id("test-torn-encrypted-tail");
+        let path = events_path_for(&session_id).unwrap();
+        let _ = std::fs::remove_dir_all(session_dir_for(&session_id).unwrap());
+
+        {
+            let mut store = FileBackedEventStore::empty(&session_id);
+            let _ = store.append(make_event("e1", "s1", StepEventType::StepCreated));
+            let _ = store.append(make_event("e2", "s1", StepEventType::ToolCallCompleted));
+        }
+
+        let torn_json =
+            serde_json::to_string(&make_event("torn", "s1", StepEventType::ToolCallCompleted))
+                .unwrap();
+        let torn_encrypted = encrypt_checkpoint(&torn_json).unwrap();
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            file.write_all(&torn_encrypted.as_bytes()[..17]).unwrap();
+        }
+
+        let store = FileBackedEventStore::new(&session_id);
+        let ids: Vec<_> = store
+            .all_events()
+            .iter()
+            .map(|event| event.event_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["e1", "e2"]);
+
+        let recovered = FileBackedEventStore::load_events_created_at_or_after(&session_id, 0)
+            .expect("torn encrypted tail must not fail recovery");
+        let ids: Vec<_> = recovered
+            .iter()
+            .map(|event| event.event_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["e1", "e2"]);
+
+        let _ = std::fs::remove_dir_all(session_dir_for(&session_id).unwrap());
+    }
+
+    #[test]
+    fn append_after_torn_encrypted_tail_keeps_new_events_readable() {
+        let session_id = unique_session_id("test-append-after-torn-encrypted-tail");
+        let path = events_path_for(&session_id).unwrap();
+        let _ = std::fs::remove_dir_all(session_dir_for(&session_id).unwrap());
+
+        {
+            let mut store = FileBackedEventStore::empty(&session_id);
+            let _ = store.append(make_event("e1", "s1", StepEventType::StepCreated));
+        }
+
+        let torn_json =
+            serde_json::to_string(&make_event("torn", "s1", StepEventType::ToolCallCompleted))
+                .unwrap();
+        let torn_encrypted = encrypt_checkpoint(&torn_json).unwrap();
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            file.write_all(&torn_encrypted.as_bytes()[..17]).unwrap();
+        }
+
+        {
+            let mut store = FileBackedEventStore::empty(&session_id);
+            let _ = store.append(make_event("e2", "s1", StepEventType::ToolCallCompleted));
+        }
+
+        let store = FileBackedEventStore::new(&session_id);
+        let ids: Vec<_> = store
+            .all_events()
+            .iter()
+            .map(|event| event.event_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["e1", "e2"]);
+
+        let _ = std::fs::remove_dir_all(session_dir_for(&session_id).unwrap());
+    }
+
+    #[test]
+    fn file_event_store_loads_recovery_window_without_full_store_materialization() {
+        let session_id = format!("test-recovery-window-{}", std::process::id());
+        let path = events_path_for(&session_id).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let mut store = FileBackedEventStore::empty(&session_id);
+            for idx in 0..10 {
+                let mut event =
+                    make_event(&format!("e{idx}"), "s1", StepEventType::ToolCallCompleted);
+                event.created_at = idx * 100;
+                let _ = store.append(event);
+            }
+        }
+
+        let events = FileBackedEventStore::load_events_created_at_or_after(&session_id, 500)
+            .expect("load recovery window");
+        let ids: Vec<_> = events.iter().map(|event| event.event_id.as_str()).collect();
+        assert_eq!(ids, vec!["e5", "e6", "e7", "e8", "e9"]);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(session_dir_for(&session_id).unwrap());
+    }
+
+    #[test]
+    fn file_event_store_fails_on_corrupt_event_json() {
+        let session_id = format!("test-corrupt-event-json-{}", std::process::id());
+        let path = events_path_for(&session_id).unwrap();
+        let _ = std::fs::remove_file(&path);
+        std::fs::create_dir_all(session_dir_for(&session_id).unwrap()).expect("session dir");
+        append_encrypted_line(&path, r#"{"not":"a step event"}"#).expect("append corrupt event");
+
+        let error = FileBackedEventStore::load_events_created_at_or_after(&session_id, 0)
+            .expect_err("corrupt event json should fail recovery");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(session_dir_for(&session_id).unwrap());
+    }
+
+    #[test]
+    fn file_event_store_new_skips_invalid_event_without_emptying_history() {
+        let session_id = unique_session_id("test-lenient-invalid-event");
+        let path = events_path_for(&session_id).unwrap();
+        let _ = std::fs::remove_dir_all(session_dir_for(&session_id).unwrap());
+        std::fs::create_dir_all(session_dir_for(&session_id).unwrap()).expect("session dir");
+
+        let e1 = serde_json::to_string(&make_event("e1", "s1", StepEventType::StepCreated))
+            .expect("serialize e1");
+        let e2 = serde_json::to_string(&make_event("e2", "s1", StepEventType::ToolCallCompleted))
+            .expect("serialize e2");
+        let content = format!(
+            "{}\n{}\n{}\n",
+            encrypt_checkpoint(&e1).unwrap(),
+            encrypt_checkpoint(r#"{"not":"a step event"}"#).unwrap(),
+            encrypt_checkpoint(&e2).unwrap()
+        );
+        std::fs::write(&path, content).expect("write mixed event log");
+
+        let store = FileBackedEventStore::new(&session_id);
+        let ids: Vec<_> = store
+            .all_events()
+            .iter()
+            .map(|event| event.event_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["e1", "e2"]);
+
+        let _ = std::fs::remove_dir_all(session_dir_for(&session_id).unwrap());
     }
 
     #[test]
@@ -985,15 +1304,16 @@ mod tests {
     #[test]
     fn read_heavy_skips_corrupted_json_files() {
         let session_id = format!("test-corrupt-heavy-{}", std::process::id());
-        let dir = checkpoint_dir_for(&session_id);
+        let dir = checkpoint_dir_for(&session_id).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        // Write a valid heavy checkpoint
+        // Write a valid heavy checkpoint (encrypted, as production writes)
         let heavy = make_heavy("step-ok", vec![json!({"role": "user", "content": "hello"})]);
         let cp = StepCheckpoint::Heavy(Box::new(heavy));
         let json_str = serde_json::to_string(&cp).unwrap();
-        std::fs::write(dir.join("000002-heavy.json"), &json_str).unwrap();
+        let encrypted = encrypt_checkpoint(&json_str).unwrap();
+        std::fs::write(dir.join("000002-heavy.json"), &encrypted).unwrap();
 
         // Write a corrupted heavy checkpoint with a higher number
         std::fs::write(dir.join("000003-heavy.json"), "NOT VALID JSON{{{").unwrap();
@@ -1016,15 +1336,16 @@ mod tests {
     #[test]
     fn read_light_skips_corrupted_json_files() {
         let session_id = format!("test-corrupt-light-{}", std::process::id());
-        let dir = checkpoint_dir_for(&session_id);
+        let dir = checkpoint_dir_for(&session_id).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        // Write a valid light checkpoint
+        // Write a valid light checkpoint (encrypted, as production writes)
         let light = make_light("step-ok", 0.5);
         let cp = StepCheckpoint::Light(light);
         let json_str = serde_json::to_string(&cp).unwrap();
-        std::fs::write(dir.join("000001-light.json"), &json_str).unwrap();
+        let encrypted = encrypt_checkpoint(&json_str).unwrap();
+        std::fs::write(dir.join("000001-light.json"), &encrypted).unwrap();
 
         // Write a corrupted light checkpoint with higher number
         std::fs::write(dir.join("000002-light.json"), "GARBAGE").unwrap();
@@ -1046,7 +1367,7 @@ mod tests {
     #[test]
     fn file_event_store_skips_malformed_jsonl_lines() {
         let session_id = format!("test-malformed-jsonl-{}", std::process::id());
-        let dir = session_dir_for(&session_id);
+        let dir = session_dir_for(&session_id).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -1055,15 +1376,15 @@ mod tests {
         let valid_json = serde_json::to_string(&valid_event).unwrap();
 
         // Encrypt all lines (both valid and malformed) before writing
-        let encrypted_valid = encrypt_checkpoint(&valid_json);
-        let encrypted_malformed = encrypt_checkpoint("NOT VALID JSON");
-        let encrypted_malformed2 = encrypt_checkpoint("{");
+        let encrypted_valid = encrypt_checkpoint(&valid_json).unwrap();
+        let encrypted_malformed = encrypt_checkpoint("NOT VALID JSON").unwrap();
+        let encrypted_malformed2 = encrypt_checkpoint("{").unwrap();
 
         let content = format!(
             "{}\n{}\n{}\n{}\n",
             encrypted_valid, encrypted_malformed, encrypted_malformed2, encrypted_valid
         );
-        std::fs::write(events_path_for(&session_id), &content).unwrap();
+        std::fs::write(events_path_for(&session_id).unwrap(), &content).unwrap();
 
         // Load should skip malformed lines, keep valid ones
         let store = FileBackedEventStore::new(&session_id);
@@ -1081,15 +1402,16 @@ mod tests {
         // Regression: filter_map(|e| e.ok()) was silent. Now logs warnings.
         // This test verifies the function still works when dir entries are fine.
         let session_id = format!("test-dir-ok-{}", std::process::id());
-        let dir = checkpoint_dir_for(&session_id);
+        let dir = checkpoint_dir_for(&session_id).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        // Write a valid checkpoint
+        // Write a valid checkpoint (encrypted, as production writes)
         let heavy = make_heavy("step-1", vec![]);
         let cp = StepCheckpoint::Heavy(Box::new(heavy));
         let json_str = serde_json::to_string(&cp).unwrap();
-        std::fs::write(dir.join("000001-heavy.json"), &json_str).unwrap();
+        let encrypted = encrypt_checkpoint(&json_str).unwrap();
+        std::fs::write(dir.join("000001-heavy.json"), &encrypted).unwrap();
 
         let result = read_latest_heavy_checkpoint(&session_id);
         assert!(result.is_ok());
@@ -1105,17 +1427,18 @@ mod tests {
     #[test]
     fn corrupted_latest_checkpoint_falls_back_to_previous() {
         let session_id = format!("test-corrupt-fallback-{}", std::process::id());
-        let dir = checkpoint_dir_for(&session_id);
+        let dir = checkpoint_dir_for(&session_id).unwrap();
         std::fs::create_dir_all(&dir).unwrap();
 
-        // Write a valid checkpoint as #1
+        // Write a valid checkpoint as #1 (encrypted, as production writes)
         let heavy = make_heavy(
             "step-valid",
             vec![json!({"role": "user", "content": "hello"})],
         );
         let cp = StepCheckpoint::Heavy(Box::new(heavy));
         let json_str = serde_json::to_string(&cp).unwrap();
-        std::fs::write(dir.join("000001-heavy.json"), &json_str).unwrap();
+        let encrypted = encrypt_checkpoint(&json_str).unwrap();
+        std::fs::write(dir.join("000001-heavy.json"), &encrypted).unwrap();
 
         // Write a CORRUPTED checkpoint as #2 (latest)
         std::fs::write(dir.join("000002-heavy.json"), "{{{{CORRUPTED JSON!!!!").unwrap();
@@ -1146,15 +1469,16 @@ mod tests {
     #[test]
     fn orphaned_temp_file_ignored_by_reader() {
         let session_id = format!("test-fsync-{}", std::process::id());
-        let dir = checkpoint_dir_for(&session_id);
+        let dir = checkpoint_dir_for(&session_id).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        // Write a valid checkpoint first
+        // Write a valid checkpoint first (encrypted, as production writes)
         let heavy = make_heavy("step-valid", vec![]);
         let cp = StepCheckpoint::Heavy(Box::new(heavy));
         let json_str = serde_json::to_string(&cp).unwrap();
-        std::fs::write(dir.join("000001-heavy.json"), &json_str).unwrap();
+        let encrypted = encrypt_checkpoint(&json_str).unwrap();
+        std::fs::write(dir.join("000001-heavy.json"), &encrypted).unwrap();
 
         // Simulate power loss: a corrupted temp file left behind (never renamed)
         // This represents a crash after write but before rename.
@@ -1168,6 +1492,129 @@ mod tests {
         assert_eq!(
             cp.light.step_id, "step-valid",
             "must return valid checkpoint, not be confused by orphaned temp file"
+        );
+
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    // =======================================================================
+    // Regression: checkpoint_dir_for must NOT panic on invalid session_id (C2)
+    // =======================================================================
+
+    #[test]
+    fn checkpoint_dir_for_returns_err_on_traversal_session_id() {
+        // Regression: checkpoint_dir_for used .expect() which would panic
+        // on invalid session_id (e.g. path traversal). Must return Err.
+        let result = checkpoint_dir_for("../../etc/passwd");
+        assert!(
+            result.is_err(),
+            "checkpoint_dir_for must return Err for path-traversal session_id, \
+             got Ok({:?})",
+            result
+        );
+    }
+
+    #[test]
+    fn checkpoint_dir_for_returns_err_on_empty_session_id() {
+        let result = checkpoint_dir_for("");
+        assert!(
+            result.is_err(),
+            "checkpoint_dir_for must return Err for empty session_id, got Ok({:?})",
+            result
+        );
+    }
+
+    #[test]
+    fn write_step_checkpoint_returns_err_on_invalid_session_id() {
+        let light = make_light("step-invalid-id", 1.0);
+        let cp = StepCheckpoint::Light(light);
+        let result = write_step_checkpoint("../../etc/passwd", 1, &cp);
+        assert!(
+            result.is_err(),
+            "write_step_checkpoint must return Err for invalid session_id, got Ok"
+        );
+    }
+
+    #[test]
+    fn read_latest_heavy_checkpoint_returns_err_on_invalid_session_id() {
+        let result = read_latest_heavy_checkpoint("../../etc/passwd");
+        assert!(
+            result.is_err(),
+            "read_latest_heavy_checkpoint must return Err for invalid session_id, got Ok"
+        );
+    }
+
+    // =======================================================================
+    // Regression: decrypt_checkpoint must NOT fall back to plaintext (W1)
+    // =======================================================================
+
+    #[test]
+    fn decrypt_checkpoint_returns_none_for_plaintext_json() {
+        // Plain JSON is not valid hex → hex_decode fails → returns None.
+        let plaintext = r#"{"heavy":{"turn":1}}"#;
+        assert!(
+            decrypt_checkpoint(plaintext).is_none(),
+            "decrypt_checkpoint must return None for non-encrypted content"
+        );
+    }
+
+    #[test]
+    fn read_latest_heavy_checkpoint_skips_unencrypted_file() {
+        // Write a plaintext checkpoint file (simulating an attacker-written file
+        // or a corrupted encrypted file that fails decryption).
+        let session_id = format!("test-unencrypted-heavy-{}", std::process::id());
+        let dir = checkpoint_dir_for(&session_id).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Write a plaintext JSON file (not hex-encoded, not encrypted)
+        let bad_path = dir.join("000099-heavy.json");
+        std::fs::write(&bad_path, r#"{"Light":{"step_id":"malicious"}}"#).unwrap();
+
+        // read_latest_heavy_checkpoint must skip it and return Ok(None).
+        let result = read_latest_heavy_checkpoint(&session_id).unwrap();
+        assert!(
+            result.is_none(),
+            "unencrypted heavy checkpoint file must be rejected, got {:?}",
+            result
+        );
+
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[test]
+    fn read_latest_light_checkpoint_skips_unencrypted_file() {
+        let session_id = format!("test-unencrypted-light-{}", std::process::id());
+        let dir = checkpoint_dir_for(&session_id).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let bad_path = dir.join("000099-light.json");
+        std::fs::write(&bad_path, r#"{"Light":{"step_id":"malicious"}}"#).unwrap();
+
+        let result = read_latest_light_checkpoint(&session_id).unwrap();
+        assert!(
+            result.is_none(),
+            "unencrypted light checkpoint file must be rejected, got {:?}",
+            result
+        );
+
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[test]
+    fn read_composite_snapshot_index_rejects_unencrypted_file() {
+        let session_id = format!("test-unencrypted-composite-{}", std::process::id());
+        let dir = checkpoint_dir_for(&session_id).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let bad_path = dir.join("composite_snapshots.json");
+        std::fs::write(&bad_path, r#"{"snapshots":[]}"#).unwrap();
+
+        let result = read_composite_snapshot_index(&session_id);
+        assert!(
+            matches!(result, Err(ref error) if error.kind() == std::io::ErrorKind::InvalidData),
+            "unencrypted composite snapshot must be rejected, got {result:?}"
         );
 
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());

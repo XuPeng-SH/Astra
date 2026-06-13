@@ -386,6 +386,7 @@ mod tests {
             user_id: "delegation-owner".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         }
     }
 

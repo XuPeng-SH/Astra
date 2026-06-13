@@ -10,10 +10,17 @@ export type {
   RunResumedEvent,
   RunFinishedEvent,
   RunCancelledEvent,
+  RunWaitingEvent,
+  RunErrorEvent,
+  RunInterruptedEvent,
   TextDeltaEvent,
   TextDoneEvent,
   ThinkingDeltaEvent,
   ThinkingDoneEvent,
+  WorkspaceBinding,
+  ExecutorBinding,
+  ExecutionBindingFields,
+  ToolCallEvent,
   ToolCallStartEvent,
   ToolCallEndEvent,
   UsageEvent,
@@ -25,10 +32,21 @@ export type {
   PlanRevisedEvent,
   PlanStepStartEvent,
   PlanStepDoneEvent,
+  WorkspaceBoundEvent,
+  ExecutorBoundEvent,
+  ToolRoutingDecisionEvent,
+  ToolTransportStartedEvent,
+  ToolTransportCompletedEvent,
+  ToolTransportFailedEvent,
+  RunBlockedEvent,
   AgentDelegatedEvent,
   AgentSpawnedEvent,
+  AgentWaitingEvent,
   AgentProgressEvent,
   AgentCompletedEvent,
+  AgentFailedEvent,
+  AgentCancelledEvent,
+  AgentInterruptedEvent,
   ToolApprovalRequestEvent,
   ToolExecutionStartedEvent,
   ToolOutputDeltaEvent,
@@ -108,9 +126,17 @@ export type {
   EdgeRegisterRequestBody,
   EdgeHeartbeatRequestBody,
   TaskLeaseMutationRequestBody,
-} from './types';
+} from "./types";
 
-export { AstraClient, AstraApiError, chatRequestToWire } from './client';
+export { AstraClient, AstraApiError, chatRequestToWire } from "./client";
+export {
+  EXECUTION_BOUNDARY_WAIT_REASONS,
+  isExecutionBoundaryWait,
+  extractWaitingReason,
+  extractBlockedReason,
+  projectRunWaitingState,
+  type RunWaitingProjection,
+} from "./lifecycle-utils";
 export {
   ASTRA_EDGE_ID_HEADER,
   PATH_AUTH_LOGIN,
@@ -171,14 +197,18 @@ export {
   taskLeaseClaimPath,
   taskLeaseReleasePath,
   taskLeaseRenewPath,
-} from './paths';
-export { SSEClient, parseSseDataEvents, readHttpErrorMessage } from './sse-client';
+} from "./paths";
+export {
+  SSEClient,
+  parseSseDataEvents,
+  readHttpErrorMessage,
+} from "./sse-client";
 export {
   extractJwtSubject,
   headersInitToRecord,
   isHeadersLike,
   methodCanHaveJson,
   readAstraErrorDetail,
-} from './http';
-export { AstraWebSocket } from './websocket';
-export type { AstraWebSocketOptions, ToolApproval } from './websocket';
+} from "./http";
+export { AstraWebSocket } from "./websocket";
+export type { AstraWebSocketOptions, ToolApproval } from "./websocket";

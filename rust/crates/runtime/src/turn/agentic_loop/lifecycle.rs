@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -644,6 +644,122 @@ fn apply_open_ended_exploration_budget(state: &mut AgenticLoopState) -> bool {
     true
 }
 
+const TASK_BOARD_START_GATE_MESSAGE: &str = "[task-board:start] This is broad multi-step or delegated work. Before broad analysis, file exploration, or spawning agents, create 3-7 concrete leaf tasks with task(action='create'), then mark exactly one first task in_progress with task(action='update', new_status='in_progress'). Keep the task board current as tasks complete, fail, pause, or are no longer needed.";
+
+fn message_contains_any(message: &str, terms: &[&str]) -> bool {
+    terms.iter().any(|term| message.contains(term))
+}
+
+fn message_contains_ascii_word(message: &str, word: &str) -> bool {
+    message
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .any(|token| token == word)
+}
+
+fn should_require_task_board_for_message(
+    message: &str,
+    profile: astra_turn_core::chat_turn_heuristics::TaskExecutionProfile,
+) -> bool {
+    let lower = message.to_lowercase();
+    let delegated_or_parallel = ["agent", "agents", "subagent", "spawn"]
+        .into_iter()
+        .any(|word| message_contains_ascii_word(&lower, word))
+        || message_contains_any(
+            &lower,
+            &[
+                "sub-agent",
+                "agent_fanout",
+                "fanout",
+                "multi-agent",
+                "多角度",
+                "并行",
+                "子任务",
+            ],
+        );
+    let codebase_scope = message_contains_any(
+        &lower,
+        &[
+            "branch",
+            "changes",
+            "diff",
+            "commit",
+            "repo",
+            "codebase",
+            "分支",
+            "改动",
+            "变更",
+            "代码库",
+            "当前分支",
+        ],
+    );
+    let broad_work = message_contains_any(
+        &lower,
+        &[
+            "systematic",
+            "first principles",
+            "end-to-end",
+            "all issues",
+            "everything",
+            "review again",
+            "cleanup",
+            "clean up",
+            "第一性原则",
+            "系统性",
+            "全部",
+            "所有",
+            "清理",
+            "优化",
+            "修复",
+            "重构",
+        ],
+    );
+    let review_or_repair = message_contains_any(
+        &lower,
+        &[
+            "review", "fix", "repair", "optimize", "refactor", "analyze", "审查", "评审", "分析",
+            "修复", "优化", "重构",
+        ],
+    );
+    let profile_requires_coordination = profile.mutates_workspace
+        || profile.exploratory_task
+        || profile.complexity == astra_turn_core::chat_turn_heuristics::TaskComplexity::Complex;
+
+    delegated_or_parallel
+        || (review_or_repair && codebase_scope && broad_work)
+        || (profile_requires_coordination && broad_work)
+}
+
+async fn maybe_inject_task_board_start_gate<H: AgenticLoopHost>(
+    host: &H,
+    state: &mut AgenticLoopState,
+) -> bool {
+    if !host.valid_tool_names().contains("task") {
+        return false;
+    }
+
+    state.refresh_task_board_snapshot().await;
+    if state.hooks.task_board_snapshot.has_unfinished_tasks() {
+        return false;
+    }
+
+    let inferred_profile =
+        astra_turn_core::chat_turn_heuristics::infer_task_execution_profile(&state.message);
+    let profile = if state.task_profile == Default::default() {
+        inferred_profile
+    } else {
+        state.task_profile
+    };
+    if !should_require_task_board_for_message(&state.message, profile) {
+        return false;
+    }
+
+    state.push_volatile(
+        super::host::VolatileKind::TaskBoardStartGate,
+        TASK_BOARD_START_GATE_MESSAGE,
+    );
+    true
+}
+
 fn maybe_extend_turn_budget(state: &mut AgenticLoopState) -> Option<String> {
     let budget = state.agentic_turn_budget;
     if budget.extension_turns == 0
@@ -703,62 +819,6 @@ struct StallDiagnosis {
     restricted_tools: Vec<String>,
 }
 
-fn trailing_single_tool_resume_restrictions(state: &AgenticLoopState) -> Vec<String> {
-    // Reverse-iterate tool_call_records to collect single-tool rounds
-    // from most-recent backwards, stopping at the first multi-tool round.
-    let mut restricted = BTreeSet::new();
-    let mut current_round: Option<u32> = None;
-    let mut current_tools: BTreeSet<String> = BTreeSet::new();
-
-    for record in state
-        .stall
-        .tool_call_records
-        .iter()
-        .rev()
-        .filter(|r| !r.is_synthetic_placeholder())
-    {
-        let Some(round) = record.round else {
-            continue;
-        };
-
-        match current_round {
-            None => {
-                current_round = Some(round);
-                current_tools.insert(record.name.clone());
-            }
-            Some(r) if r == round => {
-                current_tools.insert(record.name.clone());
-            }
-            Some(_) => {
-                if current_tools.len() == 1 {
-                    let Some(name) = current_tools.iter().next() else {
-                        continue; // defensive: skip malformed round
-                    };
-                    for tool in astra_turn_core::interruption::resume_tool_family_for_tool(name) {
-                        restricted.insert((*tool).to_string());
-                    }
-                    current_round = Some(round);
-                    current_tools.clear();
-                    current_tools.insert(record.name.clone());
-                } else {
-                    break;
-                }
-            }
-        }
-    }
-
-    if current_tools.len() == 1 {
-        let Some(name) = current_tools.iter().next() else {
-            return restricted.into_iter().collect(); // defensive
-        };
-        for tool in astra_turn_core::interruption::resume_tool_family_for_tool(name) {
-            restricted.insert((*tool).to_string());
-        }
-    }
-
-    restricted.into_iter().collect()
-}
-
 fn compute_stall_diagnosis(state: &AgenticLoopState) -> StallDiagnosis {
     let single_tool_streak = crate::prompts::trailing_single_tool_round_streak(&state.messages);
 
@@ -789,12 +849,7 @@ fn compute_stall_diagnosis(state: &AgenticLoopState) -> StallDiagnosis {
         return StallDiagnosis {
             signal: Some(format!("exploration_family={family};streak={streak}")),
             summary,
-            restricted_tools: astra_turn_core::interruption::resume_tool_family_for_exploration(
-                family,
-            )
-            .iter()
-            .map(|tool| (*tool).to_string())
-            .collect(),
+            restricted_tools: Vec::new(),
         };
     }
 
@@ -808,7 +863,7 @@ fn compute_stall_diagnosis(state: &AgenticLoopState) -> StallDiagnosis {
             summary: Some(format!(
                 "{redundant_reads} redundant overlapping reads on unchanged files"
             )),
-            restricted_tools: vec!["read_file".to_string(), "view".to_string()],
+            restricted_tools: Vec::new(),
         };
     }
 
@@ -819,7 +874,7 @@ fn compute_stall_diagnosis(state: &AgenticLoopState) -> StallDiagnosis {
             summary: Some(format!(
                 "a single-tool streak of {single_tool_streak} consecutive rounds"
             )),
-            restricted_tools: trailing_single_tool_resume_restrictions(state),
+            restricted_tools: Vec::new(),
         };
     }
 
@@ -941,6 +996,8 @@ pub(crate) async fn run_loop_preamble<H: AgenticLoopHost>(
     state: &mut AgenticLoopState,
 ) {
     apply_open_ended_exploration_budget(state);
+    apply_user_correction_reanchor(state);
+    maybe_inject_task_board_start_gate(host, state).await;
 
     if state
         .skills
@@ -989,6 +1046,24 @@ pub(crate) async fn run_loop_preamble<H: AgenticLoopHost>(
     // BEFORE the Session→None marker — now it participates in the cached
     // session prefix instead of being re-sent after the marker every turn.
     // See `context_pipeline_adapter::build_session_context` + `bind_project_context`.
+}
+
+fn apply_user_correction_reanchor(state: &mut AgenticLoopState) -> bool {
+    if !astra_turn_core::input_classifier::is_correction_signal(&state.message) {
+        return false;
+    }
+
+    state.turn_guard.begin_fresh_user_turn();
+    state.restricted_tools.clear();
+    state.boosted_tools.clear();
+    state.widen_selection_pending = true;
+
+    if let Some(session) = state.pipeline_session.as_mut() {
+        session
+            .working_memory_mut()
+            .apply_user_correction(&state.message);
+    }
+    true
 }
 
 /// Estimate context pressure from raw message token count.
@@ -1847,6 +1922,7 @@ mod tests {
     use crate::turn::agentic_loop::host::tests::{
         MockHost, make_hub, make_session, make_state, text_result,
     };
+    use crate::turn::agentic_loop::host::{TaskBoardSnapshot, VolatileKind};
 
     use super::*;
 
@@ -2004,6 +2080,64 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn preamble_requires_task_board_before_broad_agent_review() {
+        let mut host = MockHost::new(Vec::new()).with_valid_tools(&["task", "agent_fanout"]);
+        let mut state = make_state();
+        state.message = "3 agents review这个分支的changes. 第一性原则，不考虑兼容".to_string();
+        state.messages = vec![json!({"role": "user", "content": state.message.clone()})];
+
+        run_loop_preamble(&mut host, &mut state).await;
+
+        let gate = state
+            .volatile_pending
+            .iter()
+            .find(|entry| entry.kind == VolatileKind::TaskBoardStartGate)
+            .expect("broad delegated review should receive task-board start gate");
+        assert!(
+            gate.content.contains("Before broad analysis")
+                && gate.content.contains("task(action='create')")
+                && gate.content.contains("in_progress"),
+            "{:?}",
+            state.volatile_pending
+        );
+    }
+
+    #[tokio::test]
+    async fn preamble_does_not_require_new_task_board_when_one_is_active() {
+        let mut host = MockHost::new(Vec::new()).with_valid_tools(&["task", "agent_fanout"]);
+        let mut state = make_state();
+        state.message = "multi-agent review current branch changes from first principles".into();
+        state.hooks.task_board_snapshot = TaskBoardSnapshot {
+            pending_count: 1,
+            in_progress_count: 0,
+            blocked_count: 0,
+            active_tasks: vec!["task-1 Review branch [pending]".into()],
+        };
+
+        run_loop_preamble(&mut host, &mut state).await;
+
+        assert!(
+            !state
+                .volatile_pending
+                .iter()
+                .any(|entry| entry.kind == VolatileKind::TaskBoardStartGate),
+            "existing board should be reconciled, not duplicated: {:?}",
+            state.volatile_pending
+        );
+    }
+
+    #[test]
+    fn task_board_start_gate_does_not_treat_agentic_as_agent_delegation() {
+        let profile = astra_turn_core::chat_turn_heuristics::infer_task_execution_profile(
+            "explain the agentic loop at a high level",
+        );
+        assert!(!should_require_task_board_for_message(
+            "explain the agentic loop at a high level",
+            profile
+        ));
+    }
+
     #[test]
     fn interruption_state_summary_prefers_exploration_family_stall_signal() {
         let mut state = make_state();
@@ -2018,7 +2152,8 @@ mod tests {
         );
         assert_eq!(
             summary.resume_restricted_tools,
-            vec!["read_file".to_string(), "view".to_string()]
+            Vec::<String>::new(),
+            "read-heavy stall must preserve guidance without hard-blocking read tools"
         );
         let diagnosis = interruption_diagnosis_summary(&state).expect("diagnosis");
         assert!(
@@ -2032,7 +2167,7 @@ mod tests {
     }
 
     #[test]
-    fn interruption_state_summary_blocks_trailing_single_tool_lane() {
+    fn interruption_state_summary_records_trailing_single_tool_without_hard_block() {
         let mut state = make_state();
         state.stall.tool_call_records = (0..3)
             .map(|round| ToolCallRecord {
@@ -2056,7 +2191,11 @@ mod tests {
             summary.stall_signal.as_deref(),
             Some("single_tool_streak=3")
         );
-        assert_eq!(summary.resume_restricted_tools, vec!["bash".to_string()]);
+        assert_eq!(
+            summary.resume_restricted_tools,
+            Vec::<String>::new(),
+            "single-tool stall must not hard-block the executor needed to finish"
+        );
     }
 
     #[test]
@@ -3091,6 +3230,118 @@ mod tests {
         assert!(p100 > p50, "100 msgs > 50 msgs pressure");
         assert!(p50 > p10, "50 msgs > 10 msgs pressure");
         assert!(p100 > p10, "100 msgs > 10 msgs pressure");
+    }
+
+    #[test]
+    fn user_correction_reanchors_working_memory_before_turn() {
+        let mut state = make_state();
+        state.pipeline_session = Some(astra_turn_core::pipeline_session::PipelineSession::new(
+            astra_turn_core::pipeline_config::PipelineConfig::default(),
+        ));
+        state.message = "No, that's wrong; use the server-side executor.".into();
+        {
+            let memory = state
+                .pipeline_session
+                .as_mut()
+                .expect("pipeline session")
+                .working_memory_mut();
+            memory.push_decision("keep durable project fact");
+            memory.push_blocker("stale tool outage");
+            memory.set_next_action("retry stale path");
+        }
+
+        assert!(apply_user_correction_reanchor(&mut state));
+
+        let rendered = state
+            .pipeline_session
+            .as_ref()
+            .expect("pipeline session")
+            .working_memory()
+            .render_prompt_section();
+        assert!(rendered.contains("keep durable project fact"));
+        assert!(!rendered.contains("stale tool outage"));
+        assert!(!rendered.contains("retry stale path"));
+        assert!(
+            rendered.contains("Latest user correction overrides conflicting prior working memory")
+        );
+        assert!(rendered.contains("server-side executor"));
+    }
+
+    #[test]
+    fn ordinary_followup_does_not_reanchor_working_memory() {
+        let mut state = make_state();
+        state.pipeline_session = Some(astra_turn_core::pipeline_session::PipelineSession::new(
+            astra_turn_core::pipeline_config::PipelineConfig::default(),
+        ));
+        state.message = "continue with the implementation".into();
+        {
+            let memory = state
+                .pipeline_session
+                .as_mut()
+                .expect("pipeline session")
+                .working_memory_mut();
+            memory.push_blocker("current blocker");
+            memory.set_next_action("continue current path");
+        }
+
+        assert!(!apply_user_correction_reanchor(&mut state));
+
+        let rendered = state
+            .pipeline_session
+            .as_ref()
+            .expect("pipeline session")
+            .working_memory()
+            .render_prompt_section();
+        assert!(rendered.contains("current blocker"));
+        assert!(rendered.contains("continue current path"));
+    }
+
+    #[test]
+    fn user_correction_reanchors_transient_runtime_state_before_turn() {
+        let mut state = make_state();
+        state.pipeline_session = Some(astra_turn_core::pipeline_session::PipelineSession::new(
+            astra_turn_core::pipeline_config::PipelineConfig::default(),
+        ));
+        state.message = "不是修修补补，我要的是第一性原则系统性修复。".into();
+
+        state.turn_guard.nudge_count = 4;
+        state.turn_guard.record_tool_calls(&[
+            json!({"function": {"name": "bash", "arguments": "{\"cmd\":\"cargo test\"}"}}),
+            json!({"function": {"name": "bash", "arguments": "{\"cmd\":\"cargo test\"}"}}),
+        ]);
+        for _ in 0..3 {
+            state
+                .turn_guard
+                .record_tool_result("bash", "Error: command timed out");
+        }
+        assert!(state.turn_guard.health.is_deprioritized("bash"));
+        assert!(!state.turn_guard.tool_sigs.is_empty());
+        assert!(state.turn_guard.errors.recent_error_pressure() > 0);
+
+        state.restricted_tools.insert("bash".into());
+        state.boosted_tools.insert("grep".into());
+
+        assert!(apply_user_correction_reanchor(&mut state));
+
+        assert_eq!(state.turn_guard.nudge_count, 0);
+        assert!(state.turn_guard.tool_sigs.is_empty());
+        assert_eq!(state.turn_guard.errors.recent_error_pressure(), 0);
+        assert!(
+            state.turn_guard.health.is_deprioritized("bash"),
+            "durable tool diagnostics should remain available"
+        );
+        assert!(
+            state.restricted_tools.is_empty(),
+            "stale hard restrictions must not leak into the reanchored turn"
+        );
+        assert!(
+            state.boosted_tools.is_empty(),
+            "stale auto-reflection boosts belong to the previous episode"
+        );
+        assert!(
+            state.widen_selection_pending,
+            "the next assembly should expose the full tool catalogue once"
+        );
     }
 
     // ── Full pipeline integration test ─────────────────────────────

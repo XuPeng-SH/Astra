@@ -12,7 +12,10 @@ use astra_services::session_journal::{
 use astra_turn_core::cloud_session_memory_extract::{
     SESSION_MEMORY_TEMPLATE, build_extraction_prompt, extract_section,
 };
-use astra_turn_types::session_facts::SessionFacts;
+use astra_turn_types::{
+    has_durable_correction_directive, is_runtime_scaffolding_message,
+    is_transient_runtime_status_text, is_user_correction_signal, session_facts::SessionFacts,
+};
 
 use crate::memory_hooks::relevance::LlmConnParams;
 use crate::turn::cloud::memoria_compact::{MemoriaClient, MemoriaMemory};
@@ -241,19 +244,17 @@ impl SessionMemorySnapshot {
                 .map(|f| format!("{} {} (t{})", f.last_action, f.path, f.turn))
                 .collect()
         };
-        let corrections = if self.facts.error_state.total_errors == 0 {
-            self.narrative.corrections.clone()
-        } else {
+        let corrections = if let Some(last_error) = &self.facts.error_state.last_error {
             let mut out = self.narrative.corrections.clone();
-            if let Some(last_error) = &self.facts.error_state.last_error {
-                if !out.iter().any(|line| line.contains(last_error)) {
-                    out.push(format!(
-                        "System observed {} errors; latest: {}",
-                        self.facts.error_state.total_errors, last_error
-                    ));
-                }
+            if !out.iter().any(|line| line.contains(last_error)) {
+                out.push(format!(
+                    "System observed {} errors; latest: {}",
+                    self.facts.error_state.total_errors, last_error
+                ));
             }
             out
+        } else {
+            self.narrative.corrections.clone()
         };
         format!(
             "# Session Memory\n\n## Session Title\n{title}\n\n## Active Goals\n{active_goals}\n\n## Pending Todos\n{pending_todos}\n\n## Completed\n{completed}\n\n## Current State\n{current_state}\n\n## Task Specification\n{task_spec}\n\n## Files and Functions\n{files_and_functions}\n\n## Workflow\n{workflow}\n\n## Errors & Corrections\n{corrections}\n\n## Learnings\n{learnings}\n\n## Worklog\n{worklog}",
@@ -339,6 +340,8 @@ pub(crate) async fn run_extraction(
     llm_timeout: Duration,
     max_output_tokens: usize,
 ) -> ExtractionArtifacts {
+    let filtered_messages = session_memory_extraction_messages(messages);
+    let messages = filtered_messages.as_slice();
     let base_memory = if current_memory.trim().is_empty() {
         SESSION_MEMORY_TEMPLATE.to_string()
     } else {
@@ -473,6 +476,25 @@ pub(crate) async fn run_extraction(
             failed_candidates,
         },
     }
+}
+
+fn session_memory_extraction_messages(messages: &[Value]) -> Vec<Value> {
+    messages
+        .iter()
+        .filter(|msg| !is_ephemeral_message_for_session_memory(msg))
+        .cloned()
+        .collect()
+}
+
+fn is_ephemeral_message_for_session_memory(msg: &Value) -> bool {
+    is_runtime_scaffolding_message(msg)
+        || is_vague_reanchor_message(msg)
+        || message_text(msg).is_some_and(is_transient_runtime_status_text)
+}
+
+fn is_vague_reanchor_message(msg: &Value) -> bool {
+    msg.get("role").and_then(Value::as_str) == Some("user")
+        && message_text(msg).is_some_and(is_vague_reanchor_for_session_memory)
 }
 
 pub fn encode_session_memory_entry(session_id: &str, content: &str) -> String {
@@ -1381,6 +1403,9 @@ fn render_recent_messages(messages: &[Value], take: usize, max_len: usize) -> Ve
         .iter()
         .rev()
         .filter_map(|msg| {
+            if is_ephemeral_message_for_session_memory(msg) {
+                return None;
+            }
             let role = msg.get("role").and_then(Value::as_str)?;
             match role {
                 "user" | "assistant" | "tool" => {
@@ -1399,17 +1424,19 @@ fn render_recent_messages(messages: &[Value], take: usize, max_len: usize) -> Ve
 
 fn first_user_message(messages: &[Value]) -> Option<&str> {
     messages.iter().find_map(|msg| {
-        (msg.get("role").and_then(Value::as_str) == Some("user"))
-            .then(|| message_text(msg))
-            .flatten()
+        (msg.get("role").and_then(Value::as_str) == Some("user")
+            && !is_ephemeral_message_for_session_memory(msg))
+        .then(|| message_text(msg))
+        .flatten()
     })
 }
 
 fn last_user_message(messages: &[Value]) -> Option<&str> {
     messages.iter().rev().find_map(|msg| {
-        (msg.get("role").and_then(Value::as_str) == Some("user"))
-            .then(|| message_text(msg))
-            .flatten()
+        (msg.get("role").and_then(Value::as_str) == Some("user")
+            && !is_ephemeral_message_for_session_memory(msg))
+        .then(|| message_text(msg))
+        .flatten()
     })
 }
 
@@ -1418,10 +1445,11 @@ fn recent_user_messages(messages: &[Value], take: usize, max_len: usize) -> Vec<
         .iter()
         .rev()
         .filter_map(|msg| {
-            (msg.get("role").and_then(Value::as_str) == Some("user"))
-                .then(|| message_text(msg))
-                .flatten()
-                .map(|text| truncate(text, max_len).to_string())
+            (msg.get("role").and_then(Value::as_str) == Some("user")
+                && !is_ephemeral_message_for_session_memory(msg))
+            .then(|| message_text(msg))
+            .flatten()
+            .map(|text| truncate(text, max_len).to_string())
         })
         .take(take)
         .collect::<Vec<_>>()
@@ -1430,11 +1458,16 @@ fn recent_user_messages(messages: &[Value], take: usize, max_len: usize) -> Vec<
         .collect()
 }
 
+fn is_vague_reanchor_for_session_memory(text: &str) -> bool {
+    is_user_correction_signal(text) && !has_durable_correction_directive(text)
+}
+
 fn last_assistant_message(messages: &[Value]) -> Option<String> {
     messages.iter().rev().find_map(|msg| {
-        (msg.get("role").and_then(Value::as_str) == Some("assistant"))
-            .then(|| message_text_or_summary(msg))
-            .flatten()
+        (msg.get("role").and_then(Value::as_str) == Some("assistant")
+            && !is_ephemeral_message_for_session_memory(msg))
+        .then(|| message_text_or_summary(msg))
+        .flatten()
     })
 }
 
@@ -1442,6 +1475,9 @@ fn collect_error_lines(messages: &[Value]) -> Vec<String> {
     messages
         .iter()
         .filter_map(|msg| {
+            if is_ephemeral_message_for_session_memory(msg) {
+                return None;
+            }
             let text = message_text_or_summary(msg)?;
             let lower = text.to_ascii_lowercase();
             (lower.contains("error") || lower.contains("fail") || lower.contains("panic"))
@@ -1453,6 +1489,9 @@ fn collect_error_lines(messages: &[Value]) -> Vec<String> {
 fn detect_file_mentions(messages: &[Value]) -> String {
     let mut seen = std::collections::BTreeSet::new();
     for msg in messages {
+        if is_ephemeral_message_for_session_memory(msg) {
+            continue;
+        }
         let Some(text) = message_text_or_summary(msg) else {
             continue;
         };
@@ -1854,6 +1893,87 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rule_fallback_skips_vague_reanchor_user_messages() {
+        let messages = vec![
+            json!({"role": "user", "content": "Implement durable session memory refresh"}),
+            json!({"role": "assistant", "content": "I will patch the immediate case."}),
+            json!({"role": "user", "content": "我要的是长久健康运行，不是临时补丁"}),
+        ];
+
+        let content = build_rule_fallback_memory("", &messages, 4, 9_000);
+
+        assert!(
+            content.contains("Implement durable session memory refresh"),
+            "original task focus should remain: {content}"
+        );
+        assert!(
+            !content.contains("长久健康运行"),
+            "vague reanchor should not become L1 session memory: {content}"
+        );
+        assert!(
+            !content.contains("临时补丁"),
+            "vague reanchor should not leak through workflow/current state: {content}"
+        );
+    }
+
+    #[test]
+    fn rule_fallback_keeps_reanchor_with_concrete_directive() {
+        let messages = vec![
+            json!({"role": "user", "content": "Improve session memory"}),
+            json!({"role": "assistant", "content": "I will patch this single path."}),
+            json!({"role": "user", "content": "我重新说一次，不要用case-by-case修补"}),
+        ];
+
+        let content = build_rule_fallback_memory("", &messages, 4, 9_000);
+
+        assert!(
+            content.contains("不要用case-by-case修补"),
+            "concrete directive should remain eligible for L1 session memory: {content}"
+        );
+    }
+
+    #[test]
+    fn rule_fallback_skips_runtime_scaffolding_messages() {
+        let messages = vec![
+            json!({"role": "user", "content": "Improve stable long-running sessions"}),
+            json!({"role": "assistant", "content": "I am updating the memory path."}),
+            json!({"role": "user", "content": "[Active task attachment]\nResume hidden task board state"}),
+            json!({"role": "assistant", "content": "✓ Previous round: 3 tools executed in parallel"}),
+            json!({"role": "user", "content": "## Already Fetched (do NOT re-read)\nrust/crates/runtime/src/session_memory/runner.rs"}),
+            json!({"role": "user", "content": "Continue with the memory cleanup"}),
+        ];
+
+        let content = build_rule_fallback_memory("", &messages, 5, 11_000);
+
+        assert!(content.contains("Improve stable long-running sessions"));
+        assert!(content.contains("Continue with the memory cleanup"));
+        assert!(!content.contains("Active task attachment"));
+        assert!(!content.contains("Previous round"));
+        assert!(!content.contains("Already Fetched"));
+        assert!(!content.contains("do NOT re-read"));
+    }
+
+    #[test]
+    fn rule_fallback_skips_transient_runtime_status_messages() {
+        let messages = vec![
+            json!({"role": "user", "content": "Keep long-running sessions healthy"}),
+            json!({"role": "assistant", "content": "Read failed before returning output: Reading: .../tool-results/call.txt"}),
+            json!({"role": "assistant", "content": "Tool web_search timed out while waiting for the server"}),
+            json!({"role": "assistant", "content": "Sensitive path requires explicit opt-in in Auto mode"}),
+            json!({"role": "user", "content": "Preserve explicit durable session goals"}),
+        ];
+
+        let content = build_rule_fallback_memory("", &messages, 6, 14_000);
+
+        assert!(content.contains("Keep long-running sessions healthy"));
+        assert!(content.contains("Preserve explicit durable session goals"));
+        assert!(!content.contains("Read failed before returning output"));
+        assert!(!content.contains("web_search timed out"));
+        assert!(!content.contains("Sensitive path requires explicit opt-in"));
+        assert!(!content.contains("tool-results/call.txt"));
+    }
+
     #[tokio::test]
     async fn run_extraction_without_selector_persists_rule_fallback() {
         let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaClient>;
@@ -1929,6 +2049,220 @@ mod tests {
             } => {
                 assert_eq!(source, SessionMemoryExtractionSource::Llm);
                 assert!(content.contains("LLM Result"));
+            }
+            _ => panic!("expected llm persistence"),
+        }
+        server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_extraction_selector_prompt_filters_vague_reanchor() {
+        let (server_url, server_handle) = spawn_json_server(
+            Arc::new(|request: &str| {
+                assert!(
+                    !request.contains("durable fix, not a workaround"),
+                    "vague reanchor must not be sent to selector prompt: {request}"
+                );
+                assert!(
+                    request.contains("never use mocks in integration tests"),
+                    "concrete directive should remain visible to selector prompt: {request}"
+                );
+            }),
+            json!({
+                "choices": [{
+                    "message": {
+                        "content": "# Session Memory\n\n## Session Title\nFiltered LLM Result"
+                    }
+                }]
+            }),
+        )
+        .await;
+
+        let messages = vec![
+            json!({"role": "user", "content": "Improve long running session memory"}),
+            json!({"role": "assistant", "content": "I will patch the immediate case."}),
+            json!({"role": "user", "content": "What I asked for is a durable fix, not a workaround"}),
+            json!({"role": "user", "content": "wrong, never use mocks in integration tests"}),
+        ];
+        let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaClient>;
+        let params = LlmConnParams {
+            base_url: format!("{server_url}/v1"),
+            api_key: "test-key".to_string(),
+            model_name: "selector-openai".to_string(),
+            wire_model_name: None,
+            provider: "openai".to_string(),
+            request_body_overrides: None,
+            thinking_capability: None,
+        };
+
+        let artifacts = run_extraction(
+            &memoria,
+            "sess-filtered-selector",
+            &messages,
+            4,
+            20_000,
+            "",
+            &SessionFacts::default(),
+            std::slice::from_ref(&params),
+            Duration::from_secs(3),
+            512,
+        )
+        .await;
+
+        match artifacts {
+            ExtractionArtifacts::Persisted {
+                source, content, ..
+            } => {
+                assert_eq!(source, SessionMemoryExtractionSource::Llm);
+                assert!(content.contains("Filtered LLM Result"));
+            }
+            _ => panic!("expected llm persistence"),
+        }
+        server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_extraction_selector_prompt_filters_runtime_scaffolding() {
+        let (server_url, server_handle) = spawn_json_server(
+            Arc::new(|request: &str| {
+                assert!(
+                    !request.contains("Active task attachment"),
+                    "active task scaffolding must not reach selector prompt: {request}"
+                );
+                assert!(
+                    !request.contains("Already Fetched"),
+                    "already-fetched inventory must not reach selector prompt: {request}"
+                );
+                assert!(
+                    !request.contains("Previous round"),
+                    "parallel feedback scaffolding must not reach selector prompt: {request}"
+                );
+                assert!(
+                    request.contains("Improve long-running memory hygiene"),
+                    "real user task should remain visible to selector prompt: {request}"
+                );
+            }),
+            json!({
+                "choices": [{
+                    "message": {
+                        "content": "# Session Memory\n\n## Session Title\nScaffolding Filtered"
+                    }
+                }]
+            }),
+        )
+        .await;
+
+        let messages = vec![
+            json!({"role": "user", "content": "Improve long-running memory hygiene"}),
+            json!({"role": "user", "content": "[Active task attachment]\nResume hidden task board state"}),
+            json!({"role": "assistant", "content": "✓ Previous round: 3 tools executed in parallel"}),
+            json!({"role": "user", "content": "## Already Fetched (do NOT re-read)\nrust/crates/runtime/src/session_memory/runner.rs"}),
+        ];
+        let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaClient>;
+        let params = LlmConnParams {
+            base_url: format!("{server_url}/v1"),
+            api_key: "test-key".to_string(),
+            model_name: "selector-openai".to_string(),
+            wire_model_name: None,
+            provider: "openai".to_string(),
+            request_body_overrides: None,
+            thinking_capability: None,
+        };
+
+        let artifacts = run_extraction(
+            &memoria,
+            "sess-filtered-scaffolding",
+            &messages,
+            4,
+            20_000,
+            "",
+            &SessionFacts::default(),
+            std::slice::from_ref(&params),
+            Duration::from_secs(3),
+            512,
+        )
+        .await;
+
+        match artifacts {
+            ExtractionArtifacts::Persisted {
+                source, content, ..
+            } => {
+                assert_eq!(source, SessionMemoryExtractionSource::Llm);
+                assert!(content.contains("Scaffolding Filtered"));
+            }
+            _ => panic!("expected llm persistence"),
+        }
+        server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_extraction_selector_prompt_filters_transient_runtime_status() {
+        let (server_url, server_handle) = spawn_json_server(
+            Arc::new(|request: &str| {
+                assert!(
+                    !request.contains("Read failed before returning output"),
+                    "tool-result read failure must not reach selector prompt: {request}"
+                );
+                assert!(
+                    !request.contains("web_search timed out"),
+                    "transient search timeout must not reach selector prompt: {request}"
+                );
+                assert!(
+                    !request.contains("Sensitive path requires explicit opt-in"),
+                    "permission-status text must not reach selector prompt: {request}"
+                );
+                assert!(
+                    request.contains("Improve session cleanup nudges"),
+                    "real task should remain visible to selector prompt: {request}"
+                );
+            }),
+            json!({
+                "choices": [{
+                    "message": {
+                        "content": "# Session Memory\n\n## Session Title\nTransient Filtered"
+                    }
+                }]
+            }),
+        )
+        .await;
+
+        let messages = vec![
+            json!({"role": "user", "content": "Improve session cleanup nudges"}),
+            json!({"role": "assistant", "content": "Read failed before returning output: Reading: .../tool-results/call.txt"}),
+            json!({"role": "assistant", "content": "Tool web_search timed out while waiting for the server"}),
+            json!({"role": "assistant", "content": "Sensitive path requires explicit opt-in in Auto mode"}),
+        ];
+        let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaClient>;
+        let params = LlmConnParams {
+            base_url: format!("{server_url}/v1"),
+            api_key: "test-key".to_string(),
+            model_name: "selector-openai".to_string(),
+            wire_model_name: None,
+            provider: "openai".to_string(),
+            request_body_overrides: None,
+            thinking_capability: None,
+        };
+
+        let artifacts = run_extraction(
+            &memoria,
+            "sess-filtered-transient-status",
+            &messages,
+            4,
+            20_000,
+            "",
+            &SessionFacts::default(),
+            std::slice::from_ref(&params),
+            Duration::from_secs(3),
+            512,
+        )
+        .await;
+
+        match artifacts {
+            ExtractionArtifacts::Persisted {
+                source, content, ..
+            } => {
+                assert_eq!(source, SessionMemoryExtractionSource::Llm);
+                assert!(content.contains("Transient Filtered"));
             }
             _ => panic!("expected llm persistence"),
         }
@@ -2565,6 +2899,29 @@ mod tests {
         assert!(!canonical.contains("The user's request is complete"));
         assert!(!canonical.contains("session is idle"));
         assert!(!canonical.contains("No issues remain"));
+    }
+
+    #[test]
+    fn canonicalize_session_memory_does_not_promote_resolved_errors() {
+        let facts = SessionFacts {
+            error_state: astra_turn_types::session_facts::ErrorFact {
+                total_errors: 7,
+                last_error: None,
+                last_error_turn: None,
+            },
+            ..Default::default()
+        };
+
+        let canonical = canonicalize_session_memory_markdown(
+            "sess-42",
+            "# Session Memory\n\n## Current State\n- Continuing verified fix\n",
+            12,
+            &facts,
+        );
+
+        assert!(!canonical.contains("System observed"));
+        assert!(!canonical.contains("7 errors"));
+        assert!(canonical.contains("## Errors & Corrections\n- No corrections recorded."));
     }
 
     #[tokio::test]

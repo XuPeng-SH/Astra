@@ -897,28 +897,13 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "task",
-                "description": "Durable task list. Use this tool proactively for multi-step work.\n\
-        \n\
-        Actions: create, update, list, get, stop, list_user, adopt, archive. Checklist only; not for shell commands or agents.\n\
-        \n\
+                "description": "Durable checklist. Use this tool proactively for multi-step work; not for shell commands or agents.\n\
         ## When to Use\n\
-        - 3 or more distinct outcomes, files, or phases.\n\
-        - Approved plans or delegated work with deliverables.\n\
-        - Scope expands.\n\
-        \n\
-        1. Create one task per outcome or phase — NOT one umbrella task for the whole request.\n\
-        2. For broad work, split into 3-7 leaf tasks sized to one artifact or validation step.\n\
-        3. Mark first actionable task `in_progress` BEFORE beginning work.\n\
-        4. Keep exactly ONE task as `in_progress` at a time.\n\
-        5. Finish tasks immediately: `completed` on success, `failed` + `error_message` on failure, use `archive` when old history should leave the board.\n\
-        \n\
+        3+ distinct outcomes/files/phases, approved plans, delegated deliverables, or expanding scope.\n\
         ## When NOT to Use\n\
-        - Single edit / single command / answer.\n\
-        - Pure information request.\n\
-        - Trivial.\n\
-        \n\
-        Field notes: `title` is the concrete outcome, `description` is done criteria, `active_form` is spinner text, `metadata` null deletes a key.\n\
-        \n\
+        Single edit/command/answer, pure info, or trivial work.\n\
+        Create one task per outcome: NOT one umbrella task. Broad work -> 3-7 leaf tasks. Mark first task `in_progress` BEFORE beginning work. Keep exactly ONE task as `in_progress` at a time. Finish immediately: `completed`, `failed` + `error_message`, or use `archive` for old history.\n\
+        Field notes: `title` is the outcome; `active_form` is spinner text; `metadata` null deletes a key; `add_blocks`/`add_blocked_by` work on create or update.\n\
         <example>User: Build reimbursements. Assistant: create backend, API, UI, verify tasks; mark backend in_progress BEFORE beginning work.</example>",
                 "parameters": {
                     "type": "object",
@@ -936,10 +921,10 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "active_form": {"type": "string", "description": "(create/update) Spinner text while in_progress."},
                         "owner": {"type": "string", "description": "(create/update) Task owner."},
                         "metadata": {"type": "object", "description": "(create/update) Arbitrary key-value pairs; null deletes a key on update."},
-                        "add_blocks": {"type": "array", "items": {"type": "string"}, "description": "(update) Task ids this task blocks; edge is symmetric. Blocked tasks wait for completed blockers."},
-                        "add_blocked_by": {"type": "array", "items": {"type": "string"}, "description": "(update) Task ids blocking this task. It cannot start until every blocker is completed or removed."},
-                        "remove_blocks": {"type": "array", "items": {"type": "string"}, "description": "(update) Remove symmetric blocks edges."},
-                        "remove_blocked_by": {"type": "array", "items": {"type": "string"}, "description": "(update) Remove symmetric blocked_by edges."},
+                        "add_blocks": {"type": "array", "items": {"type": "string"}, "description": "(create/update) Task ids this task blocks; edge is symmetric. Blocked tasks wait for completed blockers."},
+                        "add_blocked_by": {"type": "array", "items": {"type": "string"}, "description": "(create/update) Task ids blocking this task. It cannot start until every blocker is completed or removed."},
+                        "remove_blocks": {"type": "array", "items": {"type": "string"}, "description": "(update only; never with create) Remove symmetric blocks edges."},
+                        "remove_blocked_by": {"type": "array", "items": {"type": "string"}, "description": "(update only; never with create) Remove symmetric blocked_by edges."},
                         "subtasks": {
                             "type": "array",
                             "description": "(create) Optional subtasks.",
@@ -956,8 +941,8 @@ fn all_tool_schemas_core() -> Vec<Value> {
                                 "required": ["id", "title"]
                             }
                         },
-                        "reason": {"type": "string", "description": "(stop) Why the task is being stopped."},
-                        "error_message": {"type": "string", "description": "(update) Failure reason to include when setting new_status='failed'."}
+                        "reason": {"type": "string", "description": "(update/stop/archive) Human reason. On failed update it is stored as error_message when error_message is omitted."},
+                        "error_message": {"type": "string", "description": "(update) Failure/cancel reason to include when setting new_status='failed' or new_status='cancelled'."}
                     },
                     "required": ["action"],
                     "x-astra-per-action-required": {
@@ -978,7 +963,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "task_output",
-                "description": "Read the CURRENT tail of a typed background task's output. Returns immediately with whatever is buffered now (task kind, status, byte offsets, total bytes, chunk) — empty output is normal for tasks that just started. Do NOT poll this tool to track progress: the runtime emits a <task_notification> when the task reaches a terminal state. If you need to wait for terminal completion before continuing, set block=true; this returns only when the task is completed, failed, or killed (or the timeout elapses). This is a tool call, not a Bash command; never invoke it through bash and never read the on-disk task output files directly. Requires the exact task_id so the model and UI refer to the same background task.",
+                "description": "Read output for a specific typed background task. Use this after a background task notification or task_list entry. Returns explicit task kind, status, byte offsets, total bytes, and the requested output chunk when available. Requires the exact task_id so the model and UI refer to the same background task.",
                 "parameters": {
                     "type": "object",
                     "additionalProperties": false,
@@ -989,7 +974,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         },
                         "block": {
                             "type": "boolean",
-                            "description": "If true, wait for the task to reach a terminal status (completed/failed/killed) before returning. Default false (snapshot-now). Only set true when the model genuinely cannot continue without the result."
+                            "description": "Wait for new output or terminal status before returning. Default false; set true only when the user explicitly asks to wait."
                         },
                         "offset": {
                             "type": "integer",
@@ -1003,7 +988,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         },
                         "timeout_ms": {
                             "type": "integer",
-                            "description": "Max ms to wait when block=true. Default 30000, max 300000."
+                            "description": "Max ms to wait when block=true, and max registry response wait when block=false. Default 30000, max 300000."
                         }
                     },
                     "required": ["task_id"]
@@ -1014,7 +999,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "task_stop",
-                "description": "Stop a running typed background task by id. This is a tool call, not a Bash command; never invoke it through bash. Use for stuck shell tasks, waiting-for-input tasks, local agents, or tasks the user explicitly wants cancelled. Requires an exact task_id; does not stop the most recent task implicitly.",
+                "description": "Stop a running typed background task by id. Use for stuck shell tasks, waiting-for-input tasks, local agents, or tasks the user explicitly wants cancelled. Requires an exact task_id; does not stop the most recent task implicitly.",
                 "parameters": {
                     "type": "object",
                     "additionalProperties": false,
@@ -1032,7 +1017,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "task_list",
-                "description": "List known typed background tasks for this session with kind, status, and ids. This is a tool call, not a Bash command; never invoke it through bash. Use when you need to discover which background task to inspect or stop.",
+                "description": "List known typed background tasks for this session with kind, status, and ids. Use when you need to discover which background task to inspect or stop.",
                 "parameters": {
                     "type": "object",
                     "additionalProperties": false,
@@ -1340,28 +1325,24 @@ mod tests {
             })
             .unwrap_or_default();
         assert!(
-            output_desc.contains("background task")
-                && output_desc.contains("not a Bash command")
-                && output_desc.contains("never read the on-disk task output files directly")
-                && output_desc.contains("Do NOT poll")
-                && !output_desc.contains("job(action"),
-            "task_output description must teach snapshot-now semantics + forbid bash polling"
+            output_desc.contains("background task") && !output_desc.contains("job(action"),
+            "task_output description must teach typed background task vocabulary"
         );
-        for tool_name in ["task_output", "task_stop", "task_list"] {
-            let description = find_schema(&schemas, tool_name)
-                .and_then(|schema| {
-                    schema
-                        .get("function")
-                        .and_then(|f| f.get("description"))
-                        .and_then(Value::as_str)
-                })
-                .unwrap_or_default();
-            assert!(
-                description.contains("not a Bash command")
-                    && description.contains("never invoke it through bash"),
-                "{tool_name} description must forbid shell pseudo-calls: {description}"
-            );
-        }
+        let output_block_desc = find_schema(&schemas, "task_output")
+            .and_then(|schema| {
+                schema
+                    .get("function")
+                    .and_then(|f| f.get("parameters"))
+                    .and_then(|p| p.get("properties"))
+                    .and_then(|p| p.get("block"))
+                    .and_then(|p| p.get("description"))
+                    .and_then(Value::as_str)
+            })
+            .unwrap_or_default();
+        assert!(
+            output_block_desc.contains("Default false"),
+            "task_output must default to snapshot reads unless the user asks to wait"
+        );
         assert!(
             find_schema(&schemas, "agent_job").is_none(),
             "agent_job must not remain in the model-facing schema"
@@ -1480,6 +1461,10 @@ mod tests {
             "error_message should be explicitly tied to failed task updates: {error_message_desc}"
         );
         assert!(
+            error_message_desc.contains("new_status='cancelled'"),
+            "error_message should also support cancelled task updates: {error_message_desc}"
+        );
+        assert!(
             properties["active_form"]["description"]
                 .as_str()
                 .unwrap_or_default()
@@ -1546,12 +1531,20 @@ mod tests {
             add_blocked_by_desc.contains("completed or removed"),
             "blocked_by should explain blockers must resolve before start: {add_blocked_by_desc}"
         );
+        assert!(
+            add_blocked_by_desc.contains("create/update"),
+            "blocked_by should expose create-time dependencies: {add_blocked_by_desc}"
+        );
         let add_blocks_desc = properties["add_blocks"]["description"]
             .as_str()
             .unwrap_or_default();
         assert!(
             add_blocks_desc.contains("edge is symmetric"),
             "blocks should explain task dependency edges are symmetric: {add_blocks_desc}"
+        );
+        assert!(
+            add_blocks_desc.contains("create/update"),
+            "blocks should expose create-time dependencies: {add_blocks_desc}"
         );
         let depends_on_desc =
             properties["subtasks"]["items"]["properties"]["depends_on"]["description"]

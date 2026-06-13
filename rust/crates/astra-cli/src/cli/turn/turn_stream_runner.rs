@@ -171,9 +171,13 @@ fn build_turn_stream_params<'a>(
         task_manager: Some(state.task_manager.clone()),
         task_notify_tx: state.task_notify_tx.clone(),
         bg_task_commands: Some(state.bg_task_commands.clone()),
+        bg_task_list_cache: Some(state.bg_task_list_cache.clone()),
         bash_detach_slot: Some(state.bash_detach_slot.clone()),
         turn_index: state.turn,
-        pipeline_state: None,
+        pipeline_state: state.runtime_pipeline_state.clone(),
+        compaction_state: state.runtime_compaction_state.clone(),
+        consecutive_context_window_errors: state.runtime_consecutive_context_window_errors,
+        idempotency_cache: state.runtime_idempotency_cache.clone(),
         pre_loaded_messages: None,
         append_system_prompt: prepared.append_system_prompt.clone(),
         session_memory_extractor: state.session_memory_extractor.clone(),
@@ -383,10 +387,35 @@ mod tests {
 
     #[test]
     fn build_turn_stream_params_respects_render_policy_and_plan_subtask() {
+        let idem_key = astra_pipeline::step_protocol::IdempotencyKey::semantic(
+            "read_file",
+            &serde_json::json!({"path": "src/lib.rs"}),
+        );
+        let mut idempotency_cache = astra_pipeline::step_protocol::InMemoryIdempotencyCache::new();
+        idempotency_cache.record(
+            &idem_key,
+            astra_pipeline::step_protocol::CachedToolResult {
+                tool_name: "read_file".into(),
+                output: "cached contents".into(),
+                is_error: false,
+                cached_at: 1,
+                context_signature: None,
+            },
+        );
         let mut state = SessionState {
             tui_render_policy: Some(crate::cli::stream::stream_render::RenderPolicy::Silent),
             current_plan_subtask_id: Some("subtask-1".into()),
             resume_restricted_tools: vec!["read_file".into()],
+            runtime_pipeline_state: Some(serde_json::json!({"stats": {"ema": 0.7}})),
+            runtime_compaction_state: Some(serde_json::json!({
+                "attempt_count": 2,
+                "cumulative_tokens_freed": 12000,
+                "last_tokens_freed": 3000,
+                "last_was_insufficient": true,
+                "consecutive_futile_attempts": 1,
+            })),
+            runtime_consecutive_context_window_errors: 2,
+            runtime_idempotency_cache: Some(idempotency_cache),
             ..SessionState::default()
         };
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
@@ -421,6 +450,32 @@ mod tests {
         assert_eq!(params.plan_subtask_id, Some("subtask-1"));
         assert_eq!(params.append_system_prompt.as_deref(), Some("task board"));
         assert_eq!(params.resume_restricted_tools, &["read_file".to_string()]);
+        assert_eq!(
+            params.pipeline_state,
+            Some(serde_json::json!({"stats": {"ema": 0.7}}))
+        );
+        assert_eq!(
+            params.compaction_state,
+            Some(serde_json::json!({
+                "attempt_count": 2,
+                "cumulative_tokens_freed": 12000,
+                "last_tokens_freed": 3000,
+                "last_was_insufficient": true,
+                "consecutive_futile_attempts": 1,
+            }))
+        );
+        assert_eq!(params.consecutive_context_window_errors, 2);
+        let restored_cache = params
+            .idempotency_cache
+            .as_ref()
+            .expect("idempotency cache");
+        assert_eq!(
+            restored_cache
+                .check(&idem_key)
+                .expect("restored cached tool")
+                .output,
+            "cached contents"
+        );
         assert!(params.cancel_token.is_some());
         assert!(params.incremental_state.is_some());
     }

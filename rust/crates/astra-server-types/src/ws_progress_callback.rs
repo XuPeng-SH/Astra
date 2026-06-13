@@ -40,11 +40,11 @@ pub enum ProgressEvent {
 /// `ToolExecutionStarted` / `ToolOutputDelta` / `ToolExecutionCompleted`
 /// messages to the client.
 pub struct WebSocketProgressCallback {
-    tx: mpsc::UnboundedSender<ProgressEvent>,
+    tx: mpsc::Sender<ProgressEvent>,
 }
 
 impl WebSocketProgressCallback {
-    pub fn new(tx: mpsc::UnboundedSender<ProgressEvent>) -> Self {
+    pub fn new(tx: mpsc::Sender<ProgressEvent>) -> Self {
         Self { tx }
     }
 }
@@ -52,7 +52,7 @@ impl WebSocketProgressCallback {
 #[async_trait]
 impl ToolProgressCallback for WebSocketProgressCallback {
     async fn tool_started(&self, call_id: &str, tool_name: &str, args: &Value) {
-        let _ = self.tx.send(ProgressEvent::Started {
+        let _ = self.tx.try_send(ProgressEvent::Started {
             call_id: call_id.to_string(),
             tool: tool_name.to_string(),
             args: args.clone(),
@@ -60,14 +60,14 @@ impl ToolProgressCallback for WebSocketProgressCallback {
     }
 
     async fn tool_output_delta(&self, call_id: &str, delta: &str) {
-        let _ = self.tx.send(ProgressEvent::Delta {
+        let _ = self.tx.try_send(ProgressEvent::Delta {
             call_id: call_id.to_string(),
             content: delta.to_string(),
         });
     }
 
     async fn tool_completed(&self, call_id: &str, _result: &str, success: bool) {
-        let _ = self.tx.send(ProgressEvent::Completed {
+        let _ = self.tx.try_send(ProgressEvent::Completed {
             call_id: call_id.to_string(),
             success,
         });
@@ -81,7 +81,7 @@ impl ToolProgressCallback for WebSocketProgressCallback {
         was_custom: Option<bool>,
         error: Option<&str>,
     ) {
-        let _ = self.tx.send(ProgressEvent::UserPromptResolved {
+        let _ = self.tx.try_send(ProgressEvent::UserPromptResolved {
             request_id: request_id.to_string(),
             outcome: outcome.to_string(),
             answers: answers.to_vec(),
@@ -98,7 +98,7 @@ mod tests {
 
     #[tokio::test]
     async fn started_event_sent() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel::<ProgressEvent>(1);
         let cb = WebSocketProgressCallback::new(tx);
 
         cb.tool_started("c1", "bash", &json!({"command": "ls"}))
@@ -121,7 +121,7 @@ mod tests {
 
     #[tokio::test]
     async fn delta_event_sent() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel::<ProgressEvent>(1);
         let cb = WebSocketProgressCallback::new(tx);
 
         cb.tool_output_delta("c1", "hello world\n").await;
@@ -138,7 +138,7 @@ mod tests {
 
     #[tokio::test]
     async fn completed_event_sent() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel::<ProgressEvent>(1);
         let cb = WebSocketProgressCallback::new(tx);
 
         cb.tool_completed("c1", "done", true).await;
@@ -155,7 +155,7 @@ mod tests {
 
     #[tokio::test]
     async fn ask_user_resolved_event_sent() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel::<ProgressEvent>(1);
         let cb = WebSocketProgressCallback::new(tx);
 
         cb.ask_user_resolved(
@@ -188,7 +188,7 @@ mod tests {
 
     #[tokio::test]
     async fn channel_closed_does_not_panic() {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel::<ProgressEvent>(1);
         drop(rx);
         let cb = WebSocketProgressCallback::new(tx);
 
@@ -200,7 +200,7 @@ mod tests {
 
     #[tokio::test]
     async fn full_lifecycle_sequence() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel::<ProgressEvent>(3);
         let cb = WebSocketProgressCallback::new(tx);
 
         cb.tool_started("c1", "write_file", &json!({"path": "a.txt"}))
@@ -221,5 +221,20 @@ mod tests {
             ProgressEvent::Completed { .. }
         ));
         assert!(rx.try_recv().is_err()); // No more events.
+    }
+
+    #[tokio::test]
+    async fn full_channel_drops_progress_instead_of_blocking() {
+        let (tx, mut rx) = mpsc::channel::<ProgressEvent>(1);
+        let cb = WebSocketProgressCallback::new(tx);
+
+        cb.tool_started("c1", "bash", &json!({})).await;
+        cb.tool_completed("c1", "done", true).await;
+
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            ProgressEvent::Started { .. }
+        ));
+        assert!(rx.try_recv().is_err());
     }
 }

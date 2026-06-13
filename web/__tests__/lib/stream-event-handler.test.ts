@@ -1,6 +1,6 @@
-jest.mock("@/lib/api/web-store", () => ({
-  setChatActiveRun: jest.fn(),
-  updateStreamingAssistantMessage: jest.fn(),
+vi.mock("@/lib/api/web-store", () => ({
+  setChatActiveRun: vi.fn(),
+  updateStreamingAssistantMessage: vi.fn(),
 }));
 
 import {
@@ -12,13 +12,8 @@ import {
   updateStreamingAssistantMessage,
 } from "@/lib/api/web-store";
 
-const mockSetChatActiveRun = setChatActiveRun as jest.MockedFunction<
-  typeof setChatActiveRun
->;
-const mockUpdateStreamingAssistantMessage =
-  updateStreamingAssistantMessage as jest.MockedFunction<
-    typeof updateStreamingAssistantMessage
-  >;
+const mockSetChatActiveRun = vi.mocked(setChatActiveRun);
+const mockUpdateStreamingAssistantMessage = vi.mocked(updateStreamingAssistantMessage);
 
 function makeState(): StreamEventState {
   return {
@@ -40,7 +35,7 @@ const ctx = {
 
 describe("applyStreamEvent", () => {
   beforeEach(() => {
-    jest.clearAllMocks();
+    vi.clearAllMocks();
   });
 
   it("clears active run before throwing on session mismatch", () => {
@@ -120,6 +115,339 @@ describe("applyStreamEvent", () => {
         reasoning: "thinking",
         reasoningStatus: undefined,
         status: "failed",
+      }),
+    );
+  });
+
+  it("projects run_error as run failure instead of a protocol disconnect", () => {
+    const state = makeState();
+
+    applyStreamEvent(
+      {
+        type: "run_error",
+        run_id: "run-1",
+        message: "loop crashed",
+        error_kind: "runtime",
+      },
+      ctx,
+      state,
+    );
+
+    expect(mockSetChatActiveRun).toHaveBeenCalledWith(
+      "user-a",
+      "chat-1",
+      undefined,
+    );
+    expect(state.lastStatus).toBe("failed");
+    expect(state.runLifecycle).toBe("finished");
+    expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith(
+      "user-a",
+      "chat-1",
+      "assistant-1",
+      expect.objectContaining({
+        content: "loop crashed",
+        status: "failed",
+      }),
+    );
+  });
+
+  it("projects blocked run events into active run state and assistant feedback", () => {
+    const state = makeState();
+
+    applyStreamEvent({ type: "run_started", run_id: "run-1" }, ctx, state);
+    applyStreamEvent(
+      {
+        type: "run_blocked",
+        session_id: "session-1",
+        reason: "transport_disconnected",
+        message: "Edge transport disconnected.",
+      },
+      ctx,
+      state,
+    );
+
+    expect(mockSetChatActiveRun).toHaveBeenLastCalledWith(
+      "user-a",
+      "chat-1",
+      expect.objectContaining({
+        runId: "run-1",
+        status: "blocked",
+        waitingFor: "transport_disconnected",
+      }),
+    );
+    expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith(
+      "user-a",
+      "chat-1",
+      "assistant-1",
+      expect.objectContaining({
+        content: "Edge transport disconnected.",
+        status: "streaming",
+      }),
+    );
+    expect(state.runLifecycle).toBe("blocked");
+  });
+
+  it("projects run_input_queued events into active run state", () => {
+    const state = makeState();
+
+    applyStreamEvent({ type: "run_input_queued", run_id: "run-1" }, ctx, state);
+
+    expect(mockSetChatActiveRun).toHaveBeenLastCalledWith(
+      "user-a",
+      "chat-1",
+      expect.objectContaining({
+        runId: "run-1",
+        status: "input-queued",
+        waitingFor: "user_input",
+        assistantMessageId: "assistant-1",
+      }),
+    );
+    expect(state.runLifecycle).toBe("running");
+  });
+
+  it("stores the next stream cursor when projecting active run state", () => {
+    const state = makeState();
+
+    applyStreamEvent(
+      { type: "run_input_queued", run_id: "run-1", index: 12 },
+      ctx,
+      state,
+    );
+
+    expect(mockSetChatActiveRun).toHaveBeenLastCalledWith(
+      "user-a",
+      "chat-1",
+      expect.objectContaining({
+        runId: "run-1",
+        status: "input-queued",
+        assistantMessageId: "assistant-1",
+        nextEventIndex: 13,
+      }),
+    );
+  });
+
+  it("keeps execution-boundary run_waiting events blocked", () => {
+    const state = makeState();
+
+    applyStreamEvent({ type: "run_started", run_id: "run-1" }, ctx, state);
+    applyStreamEvent(
+      {
+        type: "run_waiting",
+        run_id: "run-1",
+        reason: "waiting: executor_offline",
+      },
+      ctx,
+      state,
+    );
+
+    expect(mockSetChatActiveRun).toHaveBeenLastCalledWith(
+      "user-a",
+      "chat-1",
+      expect.objectContaining({
+        runId: "run-1",
+        status: "blocked",
+        waitingFor: "executor_offline",
+      }),
+    );
+    expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith(
+      "user-a",
+      "chat-1",
+      "assistant-1",
+      expect.objectContaining({
+        content:
+          "Run paused because the selected executor is offline. Reconnect it or choose another workspace.",
+        status: "streaming",
+      }),
+    );
+    expect(state.runLifecycle).toBe("blocked");
+  });
+
+  it("keeps unavailable workspace executor waits blocked", () => {
+    const state = makeState();
+
+    applyStreamEvent({ type: "run_started", run_id: "run-1" }, ctx, state);
+    applyStreamEvent(
+      {
+        type: "run_waiting",
+        run_id: "run-1",
+        reason: "waiting: workspace_executor_unavailable",
+      },
+      ctx,
+      state,
+    );
+
+    expect(mockSetChatActiveRun).toHaveBeenLastCalledWith(
+      "user-a",
+      "chat-1",
+      expect.objectContaining({
+        runId: "run-1",
+        status: "blocked",
+        waitingFor: "workspace_executor_unavailable",
+      }),
+    );
+    expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith(
+      "user-a",
+      "chat-1",
+      "assistant-1",
+      expect.objectContaining({
+        content:
+          "Run paused because the selected workspace is not connected to an available executor. Choose Server sandbox or a connected edge workspace.",
+        status: "streaming",
+      }),
+    );
+    expect(state.runLifecycle).toBe("blocked");
+  });
+
+  it("projects generic run_waiting events into waiting state", () => {
+    const state = makeState();
+
+    applyStreamEvent({ type: "run_started", run_id: "run-1" }, ctx, state);
+    applyStreamEvent(
+      {
+        type: "run_waiting",
+        run_id: "run-1",
+        reason: "waiting: tool_approval",
+      },
+      ctx,
+      state,
+    );
+
+    expect(mockSetChatActiveRun).toHaveBeenLastCalledWith(
+      "user-a",
+      "chat-1",
+      expect.objectContaining({
+        runId: "run-1",
+        status: "waiting",
+        waitingFor: "tool_approval",
+      }),
+    );
+    expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith(
+      "user-a",
+      "chat-1",
+      "assistant-1",
+      expect.objectContaining({
+        content: "Waiting for tool approval.",
+        status: "streaming",
+      }),
+    );
+    expect(state.runLifecycle).toBe("waiting");
+  });
+
+  it("uses readable fallback feedback for blocked events without leaking raw reasons", () => {
+    const state = makeState();
+
+    applyStreamEvent({ type: "run_started", run_id: "run-1" }, ctx, state);
+    applyStreamEvent(
+      {
+        type: "run_blocked",
+        run_id: "run-1",
+        reason: "fallback_disabled",
+      },
+      ctx,
+      state,
+    );
+
+    expect(mockSetChatActiveRun).toHaveBeenLastCalledWith(
+      "user-a",
+      "chat-1",
+      expect.objectContaining({
+        runId: "run-1",
+        status: "blocked",
+        waitingFor: "fallback_disabled",
+      }),
+    );
+    expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith(
+      "user-a",
+      "chat-1",
+      "assistant-1",
+      expect.objectContaining({
+        content:
+          "Run paused because server fallback is disabled for this workspace.",
+        status: "streaming",
+      }),
+    );
+  });
+
+  it("derives waitingFor from run_blocked reason fields", () => {
+    const state = makeState();
+
+    applyStreamEvent({ type: "run_started", run_id: "run-1" }, ctx, state);
+    applyStreamEvent(
+      {
+        type: "run_blocked",
+        session_id: "session-1",
+        reason: "fallback_disabled",
+        message: "Server fallback is disabled for this workspace.",
+      },
+      ctx,
+      state,
+    );
+
+    expect(mockSetChatActiveRun).toHaveBeenLastCalledWith(
+      "user-a",
+      "chat-1",
+      expect.objectContaining({
+        runId: "run-1",
+        status: "blocked",
+        waitingFor: "fallback_disabled",
+      }),
+    );
+    expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith(
+      "user-a",
+      "chat-1",
+      "assistant-1",
+      expect.objectContaining({
+        content: "Server fallback is disabled for this workspace.",
+        status: "streaming",
+      }),
+    );
+    expect(state.runLifecycle).toBe("blocked");
+  });
+
+  it("keeps interrupted runs paused through terminal usage events", () => {
+    const state = makeState();
+
+    applyStreamEvent(
+      {
+        type: "run_interrupted",
+        run_id: "run-1",
+        kind: "budget_exhausted",
+        resumable: true,
+        message: "Budget exhausted. You can continue.",
+      },
+      ctx,
+      state,
+    );
+    applyStreamEvent(
+      {
+        type: "run_finished",
+        run_id: "run-1",
+        status: "paused",
+        interrupted: true,
+        resumable: true,
+      },
+      ctx,
+      state,
+    );
+
+    expect(state.lastStatus).toBe("streaming");
+    expect(state.runLifecycle).toBe("paused");
+    expect(mockSetChatActiveRun).toHaveBeenLastCalledWith(
+      "user-a",
+      "chat-1",
+      expect.objectContaining({
+        runId: "run-1",
+        status: "paused",
+        waitingFor: "user_resume",
+      }),
+    );
+    expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith(
+      "user-a",
+      "chat-1",
+      "assistant-1",
+      expect.objectContaining({
+        content: "Budget exhausted. You can continue.",
+        status: "streaming",
       }),
     );
   });

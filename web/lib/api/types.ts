@@ -2,7 +2,13 @@ export type PlanTier = 'free' | 'pro' | 'team';
 export type Visibility = 'private' | 'team' | 'public';
 export type MessageRole = 'user' | 'assistant' | 'system';
 export type MessageStatus = 'pending' | 'streaming' | 'complete' | 'failed';
-export type FileIndexStatus = 'pending' | 'extracting' | 'chunking' | 'embedding' | 'indexed' | 'failed';
+export type FileIndexStatus =
+  | 'pending'
+  | 'extracting'
+  | 'chunking'
+  | 'embedding'
+  | 'indexed'
+  | 'failed';
 
 export type UserSummary = {
   id: string;
@@ -63,6 +69,26 @@ export type ComposerOptions = {
   style?: string;
 };
 
+export type WorkspaceSelection =
+  | {
+      kind: 'server_sandbox';
+    }
+  | {
+      kind: 'edge_workspace';
+      edgeAgentId: string;
+      displayName?: string | null;
+      cwd: string;
+    };
+
+export type EdgeStatusResponse = {
+  edges: Array<{
+    edge_agent_id: string;
+    hostname?: string | null;
+    workspace_dir?: string | null;
+    connected_secs: number;
+  }>;
+};
+
 export type ChatSummary = {
   id: string;
   title: string | null;
@@ -108,17 +134,26 @@ export type ChatDetail = {
     runId: string;
     status: string;
     waitingFor?: string | null;
+    assistantMessageId?: string | null;
+    nextEventIndex?: number | null;
   };
   pendingTurn?: {
     messageId: string;
     content: string;
     options: ComposerOptions;
   };
+  workspaceSelection?: WorkspaceSelection;
+  workspaceSelectionExplicit?: boolean;
 };
 
 export type WorkSurfaceResponse = {
   sessionId: string | null;
   runId: string | null;
+  status?: string | null;
+  workspace?: Record<string, unknown> | null;
+  executor?: Record<string, unknown> | null;
+  transport?: string | null;
+  fallbackPolicy?: string | null;
   tasks: Array<Record<string, unknown>>;
   events: Array<Record<string, unknown>>;
   generatedAt: string;
@@ -129,6 +164,10 @@ export type WorkSurfaceRunResponse = {
   runId: string;
   sessionId: string | null;
   status?: string | null;
+  workspace?: Record<string, unknown> | null;
+  executor?: Record<string, unknown> | null;
+  transport?: string | null;
+  fallbackPolicy?: string | null;
   events: Array<Record<string, unknown>>;
   generatedAt: string;
 };
@@ -156,6 +195,7 @@ export type SendMessageRequest = {
   attachments?: AttachmentRef[];
   options?: ComposerOptions;
   pendingMessageId?: string;
+  workspace?: WorkspaceSelection;
 };
 
 export type SendMessageResponse = {
@@ -165,10 +205,13 @@ export type SendMessageResponse = {
 
 export type QueueRunInputResponse = {
   userMessage: ChatMessage;
+  assistantMessage: ChatMessage;
   activeRun: {
     runId: string;
     status: string;
     waitingFor?: string | null;
+    assistantMessageId?: string | null;
+    nextEventIndex?: number | null;
   };
 };
 
@@ -177,7 +220,10 @@ export type ActiveRunMutationResponse = {
     runId: string;
     status: string;
     waitingFor?: string | null;
+    assistantMessageId?: string | null;
+    nextEventIndex?: number | null;
   };
+  cancelPending?: boolean;
 };
 
 export type ProjectSummary = {
@@ -223,7 +269,12 @@ export type CreateProjectRequest = {
 
 export type SearchResponse = {
   projects: Array<{ id: string; name: string; updatedAt: string }>;
-  chats: Array<{ id: string; title: string | null; projectId: string | null; updatedAt: string }>;
+  chats: Array<{
+    id: string;
+    title: string | null;
+    projectId: string | null;
+    updatedAt: string;
+  }>;
 };
 
 export type ModelSummary = {

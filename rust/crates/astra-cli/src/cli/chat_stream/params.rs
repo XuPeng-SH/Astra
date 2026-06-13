@@ -443,6 +443,11 @@ pub(crate) struct ChatTurnParams<'a> {
     /// When present, tool executor pushes spawn/kill/output commands here.
     pub(crate) bg_task_commands:
         Option<std::sync::Arc<std::sync::Mutex<Vec<crate::edge_tools::BgTaskCommand>>>>,
+    /// Shared background task list cache.
+    /// When the TUI is active the event loop refreshes this every tick.
+    /// [`ToolExecutor::task_list_bg`] reads it directly, bypassing the
+    /// BG command queue and avoiding event-loop tick latency.
+    pub(crate) bg_task_list_cache: Option<std::sync::Arc<tokio::sync::RwLock<String>>>,
     /// Detach slot for bash Ctrl+B promotion. When present, the
     /// executor pulls a fresh handle from this slot per tool call;
     /// the TUI refills between calls.
@@ -452,6 +457,12 @@ pub(crate) struct ChatTurnParams<'a> {
     /// Pre-loaded CSL messages (from CslManager.load() in chat_turn).
     /// Restored pipeline state from a checkpoint (enables warm-start on resume).
     pub(crate) pipeline_state: Option<serde_json::Value>,
+    /// Restored compaction-effectiveness tracker from a checkpoint.
+    pub(crate) compaction_state: Option<serde_json::Value>,
+    /// Restored consecutive context-window failures from a checkpoint.
+    pub(crate) consecutive_context_window_errors: u32,
+    /// Restored tool replay guard rebuilt from step events on resume.
+    pub(crate) idempotency_cache: Option<astra_pipeline::step_protocol::InMemoryIdempotencyCache>,
     /// When present, these are used instead of converting history pairs.
     pub(crate) pre_loaded_messages: Option<Vec<serde_json::Value>>,
     /// Extra context appended to the system prompt (gateway injects cron/session context here).
@@ -513,6 +524,8 @@ pub(crate) struct BasicCliChatContext<'a> {
     /// Shared command queue for the TUI's BackgroundTaskRegistry.
     pub bg_task_commands:
         Option<std::sync::Arc<std::sync::Mutex<Vec<crate::edge_tools::BgTaskCommand>>>>,
+    /// Shared background task list cache for direct reads.
+    pub bg_task_list_cache: Option<std::sync::Arc<tokio::sync::RwLock<String>>>,
     /// Shared detach slot for bash Ctrl+B promotion. The TUI refills
     /// this between tool calls; the bash runner takes from it on
     /// entry. `None` for headless paths.
@@ -598,9 +611,13 @@ impl<'a> ChatTurnParams<'a> {
             task_manager: ctx.task_manager.clone(),
             task_notify_tx: ctx.task_notify_tx.clone(),
             bg_task_commands: ctx.bg_task_commands.clone(),
+            bg_task_list_cache: ctx.bg_task_list_cache.clone(),
             bash_detach_slot: ctx.bash_detach_slot.clone(),
             turn_index: 0,
             pipeline_state: None,
+            compaction_state: None,
+            consecutive_context_window_errors: 0,
+            idempotency_cache: None,
             pre_loaded_messages: None,
             append_system_prompt: None,
             session_memory_extractor: None,

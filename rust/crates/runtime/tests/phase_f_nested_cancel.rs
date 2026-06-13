@@ -66,6 +66,7 @@ fn fan_out(delegation_id: &str, agents: Vec<&str>) -> DelegationRequest {
         user_id: "user-1".into(),
         depth: 0,
         context: HashMap::new(),
+        execution_metadata: None,
     }
 }
 

@@ -79,6 +79,7 @@ fn take_plan_context(
         session_state_journal: state.session_state_journal.clone(),
         task_manager: state.task_manager.clone(),
         bg_task_commands: Some(state.bg_task_commands.clone()),
+        bg_task_list_cache: Some(state.bg_task_list_cache.clone()),
         bash_detach_slot: Some(state.bash_detach_slot.clone()),
         #[cfg(feature = "harness")]
         harness_sink: Some(state.harness_sink.clone()),
@@ -316,6 +317,7 @@ mod tests {
             user_id: "user-1".to_string(),
             depth: 0,
             context: std::collections::HashMap::new(),
+            execution_metadata: None,
         };
 
         assert!(engine.validate(&request, "main").await.is_ok());

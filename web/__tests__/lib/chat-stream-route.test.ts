@@ -1,24 +1,33 @@
-/**
- * @jest-environment node
- */
+// @vitest-environment node
 
-jest.mock("@/lib/api/auth-guard", () => ({
-  requireRuntimeUser: jest.fn(),
+vi.mock("@/lib/api/auth-guard", () => ({
+  requireRuntimeUser: vi.fn(),
 }));
 
-jest.mock("@/lib/api/web-store", () => ({
-  beginStreamingMessage: jest.fn(),
-  ensureChatBackendSession: jest.fn(),
-  getChat: jest.fn(),
-  resolveBackendModelName: jest.fn(),
-  setChatActiveRun: jest.fn(),
-  updateStreamingAssistantMessage: jest.fn(),
+vi.mock("@/lib/api/web-store", () => ({
+  beginStreamingMessage: vi.fn(),
+  ensureChatBackendSession: vi.fn(),
+  getChat: vi.fn(),
+  resolveBackendModelName: vi.fn(),
+  setChatActiveRun: vi.fn(),
+  updateChatWorkspaceSelection: vi.fn(),
+  updateStreamingAssistantMessage: vi.fn(),
 }));
 
-jest.mock("@/lib/runtime-client", () => ({
+vi.mock("@/lib/runtime-client", () => ({
+  RuntimeClientError: class RuntimeClientError extends Error {
+    status?: number;
+    detail: string;
+
+    constructor({ status, detail }: { status?: number; detail: string }) {
+      super(detail);
+      this.status = status;
+      this.detail = detail;
+    }
+  },
   WebRuntimeClient: class WebRuntimeClient {},
-  readRuntimeErrorDetail: jest.fn(),
-  requireRuntimeClient: jest.fn(),
+  readRuntimeErrorDetail: vi.fn(),
+  requireRuntimeClient: vi.fn(),
 }));
 
 import { requireRuntimeUser } from "@/lib/api/auth-guard";
@@ -28,44 +37,30 @@ import {
   getChat,
   resolveBackendModelName,
   setChatActiveRun,
+  updateChatWorkspaceSelection,
   updateStreamingAssistantMessage,
 } from "@/lib/api/web-store";
 import { requireRuntimeClient } from "@/lib/runtime-client";
+import { PATH_EDGES_STATUS } from "@astra/sdk";
 
-const mockRequireRuntimeUser = requireRuntimeUser as jest.MockedFunction<
-  typeof requireRuntimeUser
->;
-const mockGetChat = getChat as jest.MockedFunction<typeof getChat>;
-const mockResolveBackendModelName =
-  resolveBackendModelName as jest.MockedFunction<
-    typeof resolveBackendModelName
-  >;
-const mockBeginStreamingMessage = beginStreamingMessage as jest.MockedFunction<
-  typeof beginStreamingMessage
->;
-const mockEnsureChatBackendSession =
-  ensureChatBackendSession as jest.MockedFunction<
-    typeof ensureChatBackendSession
-  >;
-const mockSetChatActiveRun = setChatActiveRun as jest.MockedFunction<
-  typeof setChatActiveRun
->;
-const mockUpdateStreamingAssistantMessage =
-  updateStreamingAssistantMessage as jest.MockedFunction<
-    typeof updateStreamingAssistantMessage
-  >;
-const mockRequireRuntimeClient = requireRuntimeClient as jest.MockedFunction<
-  typeof requireRuntimeClient
->;
+const mockRequireRuntimeUser = vi.mocked(requireRuntimeUser);
+const mockGetChat = vi.mocked(getChat);
+const mockResolveBackendModelName = vi.mocked(resolveBackendModelName);
+const mockBeginStreamingMessage = vi.mocked(beginStreamingMessage);
+const mockEnsureChatBackendSession = vi.mocked(ensureChatBackendSession);
+const mockSetChatActiveRun = vi.mocked(setChatActiveRun);
+const mockUpdateChatWorkspaceSelection = vi.mocked(updateChatWorkspaceSelection);
+const mockUpdateStreamingAssistantMessage = vi.mocked(updateStreamingAssistantMessage);
+const mockRequireRuntimeClient = vi.mocked(requireRuntimeClient);
 
 function makeBackendStream() {
   let releasePendingRead: (() => void) | null = null;
-  const cancel = jest.fn(() => {
+  const cancel = vi.fn(() => {
     releasePendingRead?.();
     return Promise.resolve();
   });
-  const releaseLock = jest.fn();
-  const read = jest.fn(
+  const releaseLock = vi.fn();
+  const read = vi.fn(
     () =>
       new Promise<{ value?: Uint8Array; done: boolean }>((resolve) => {
         releasePendingRead = () => resolve({ value: undefined, done: true });
@@ -89,8 +84,8 @@ function makeBackendFrameStream(frames: string[]) {
   const encoder = new TextEncoder();
   const chunks = frames.map((frame) => encoder.encode(frame));
   let index = 0;
-  const releaseLock = jest.fn();
-  const cancel = jest.fn();
+  const releaseLock = vi.fn();
+  const cancel = vi.fn();
 
   return {
     body: {
@@ -116,9 +111,43 @@ function waitForStreamWork(ms = 0) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function waitUntil(predicate: () => boolean) {
+  for (let index = 0; index < 20; index += 1) {
+    if (predicate()) {
+      return;
+    }
+    await waitForStreamWork(0);
+  }
+  throw new Error("condition was not met");
+}
+
+const connectedEdge = {
+  edge_agent_id: "edge-1",
+  hostname: "MacBook Pro",
+  workspace_dir: "/Users/xupeng/github/astra",
+  connected_secs: 12,
+};
+
+function makeRuntimeWithEdgeStatus(
+  backend: ReturnType<typeof makeBackendStream>,
+  edges: Array<Record<string, unknown>> = [connectedEdge],
+) {
+  return {
+    sdk: {
+      getRuntimeSession: vi.fn().mockResolvedValue({}),
+      listSessionArtifacts: vi.fn().mockResolvedValue({ artifacts: [] }),
+    },
+    get: vi.fn().mockResolvedValue({ edges }),
+    fetchResponse: vi.fn().mockResolvedValue({
+      ok: true,
+      body: backend.body,
+    }),
+  };
+}
+
 describe("chat stream route proxy cancellation", () => {
   beforeEach(() => {
-    jest.clearAllMocks();
+    vi.clearAllMocks();
     mockRequireRuntimeUser.mockResolvedValue({
       user: { user_id: "user-a" },
       response: null,
@@ -137,6 +166,19 @@ describe("chat stream route proxy cancellation", () => {
     });
     mockResolveBackendModelName.mockResolvedValue("backend-model");
     mockEnsureChatBackendSession.mockResolvedValue("chat-1");
+    mockUpdateChatWorkspaceSelection.mockResolvedValue({
+      chat: {
+        id: "chat-1",
+        title: "Chat",
+        projectId: null,
+        createdAt: "2026-06-07T00:00:00.000Z",
+        updatedAt: "2026-06-07T00:00:00.000Z",
+        archivedAt: null,
+        model: "sonnet-4.6-adaptive",
+      },
+      messages: [],
+      workspaceSelection: { kind: "server_sandbox" },
+    });
     mockBeginStreamingMessage.mockReturnValue({
       userMessage: {
         id: "user-1",
@@ -161,10 +203,10 @@ describe("chat stream route proxy cancellation", () => {
     const backend = makeBackendStream();
     const runtime = {
       sdk: {
-        getRuntimeSession: jest.fn().mockResolvedValue({}),
-        listSessionArtifacts: jest.fn().mockResolvedValue({ artifacts: [] }),
+        getRuntimeSession: vi.fn().mockResolvedValue({}),
+        listSessionArtifacts: vi.fn().mockResolvedValue({ artifacts: [] }),
       },
-      fetchResponse: jest.fn().mockResolvedValue({
+      fetchResponse: vi.fn().mockResolvedValue({
         ok: true,
         body: backend.body,
       }),
@@ -216,10 +258,10 @@ describe("chat stream route proxy cancellation", () => {
     ]);
     mockRequireRuntimeClient.mockResolvedValue({
       sdk: {
-        getRuntimeSession: jest.fn().mockResolvedValue({}),
-        listSessionArtifacts: jest.fn().mockResolvedValue({ artifacts: [] }),
+        getRuntimeSession: vi.fn().mockResolvedValue({}),
+        listSessionArtifacts: vi.fn().mockResolvedValue({ artifacts: [] }),
       },
-      fetchResponse: jest.fn().mockResolvedValue({
+      fetchResponse: vi.fn().mockResolvedValue({
         ok: true,
         body: backend.body,
       }),
@@ -272,14 +314,82 @@ describe("chat stream route proxy cancellation", () => {
     );
   });
 
+  it("persists blocked backend events as visible non-terminal feedback", async () => {
+    const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
+    const backend = makeBackendFrameStream([
+      'data: {"type":"run_started","run_id":"run-blocked"}\n\n',
+      'data: {"type":"run_blocked","session_id":"chat-1","reason":"executor_offline","message":"Edge executor MacBook Pro is offline."}\n\n',
+    ]);
+    mockRequireRuntimeClient.mockResolvedValue({
+      sdk: {
+        getRuntimeSession: vi.fn().mockResolvedValue({}),
+        listSessionArtifacts: vi.fn().mockResolvedValue({ artifacts: [] }),
+      },
+      fetchResponse: vi.fn().mockResolvedValue({
+        ok: true,
+        body: backend.body,
+      }),
+    } as never);
+
+    const response = await POST(
+      new Request("http://web.test/api/chats/chat-1/stream", {
+        method: "POST",
+        body: JSON.stringify({
+          content: "hello",
+          options: {
+            model: "sonnet-4.6-adaptive",
+            webSearch: false,
+            thinking: true,
+            activeSkills: [],
+          },
+        }),
+      }) as never,
+      { params: Promise.resolve({ chatId: "chat-1" }) },
+    );
+
+    const reader = response.body?.getReader();
+    expect(reader).toBeDefined();
+    for (;;) {
+      const { done } = await reader!.read();
+      if (done) {
+        break;
+      }
+    }
+
+    expect(mockSetChatActiveRun).toHaveBeenLastCalledWith(
+      "user-a",
+      "chat-1",
+      expect.objectContaining({
+        runId: "run-blocked",
+        status: "blocked",
+        waitingFor: "executor_offline",
+      }),
+    );
+    expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith(
+      "user-a",
+      "chat-1",
+      "assistant-1",
+      expect.objectContaining({
+        content: "Edge executor MacBook Pro is offline.",
+        status: "streaming",
+      }),
+    );
+    expect(mockUpdateStreamingAssistantMessage).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+      expect.objectContaining({ status: "failed" }),
+    );
+  });
+
   it("returns local SSE messages before the backend stream connection resolves", async () => {
     const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
     let resolveFetch: (value: {
       ok: boolean;
       body: ReturnType<typeof makeBackendStream>["body"];
     }) => void = () => {};
-    const fetchResponse = jest.fn(
-      () =>
+    const fetchResponse = vi.fn(
+      (_path: string, init: { signal?: AbortSignal }) =>
         new Promise<{
           ok: boolean;
           body: ReturnType<typeof makeBackendStream>["body"];
@@ -289,8 +399,8 @@ describe("chat stream route proxy cancellation", () => {
     );
     const runtime = {
       sdk: {
-        getRuntimeSession: jest.fn().mockResolvedValue({}),
-        listSessionArtifacts: jest.fn().mockResolvedValue({ artifacts: [] }),
+        getRuntimeSession: vi.fn().mockResolvedValue({}),
+        listSessionArtifacts: vi.fn().mockResolvedValue({ artifacts: [] }),
       },
       fetchResponse,
     };
@@ -317,11 +427,353 @@ describe("chat stream route proxy cancellation", () => {
     const first = await reader!.read();
     const text = new TextDecoder().decode(first.value);
     expect(text).toContain('"type":"local_messages"');
-    expect(fetchResponse).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(fetchResponse).toHaveBeenCalledTimes(1));
 
     const backend = makeBackendStream();
     resolveFetch({ ok: true, body: backend.body });
     await reader?.cancel();
+  });
+
+  it("resumes an existing run from cursor into the requested assistant message", async () => {
+    const { GET } = await import("@/app/api/chats/[chatId]/stream/route");
+    const backend = makeBackendFrameStream([
+      'data: {"type":"text_done","full_text":"resumed output","index":9}\n\n',
+    ]);
+    const runtime = {
+      sdk: {
+        listSessionArtifacts: vi.fn().mockResolvedValue({ artifacts: [] }),
+      },
+      fetchResponse: vi.fn().mockResolvedValue({
+        ok: true,
+        body: backend.body,
+      }),
+    };
+    mockRequireRuntimeClient.mockResolvedValue(runtime as never);
+    mockGetChat.mockReturnValue({
+      chat: {
+        id: "chat-1",
+        title: "Chat",
+        projectId: null,
+        createdAt: "2026-06-07T00:00:00.000Z",
+        updatedAt: "2026-06-07T00:00:00.000Z",
+        archivedAt: null,
+        model: "sonnet-4.6-adaptive",
+      },
+      session: {
+        chatId: "chat-1",
+        backendSessionId: "runtime-session-1",
+        persisted: true,
+        messageCount: 3,
+      },
+      messages: [
+        {
+          id: "assistant-old",
+          role: "assistant",
+          content: "old",
+          createdAt: "2026-06-07T00:00:00.000Z",
+          status: "complete",
+        },
+        {
+          id: "assistant-queued",
+          role: "assistant",
+          content: "",
+          createdAt: "2026-06-07T00:00:01.000Z",
+          status: "streaming",
+        },
+      ],
+      activeRun: {
+        runId: "run-1",
+        status: "input-queued",
+        waitingFor: "user_input",
+        assistantMessageId: "assistant-queued",
+        nextEventIndex: 9,
+      },
+    } as never);
+
+    const url = new URL(
+      "http://web.test/api/chats/chat-1/stream?runId=run-1&last_index=9&assistantMessageId=assistant-queued",
+    );
+    const response = await GET({ nextUrl: url } as never, {
+      params: Promise.resolve({ chatId: "chat-1" }),
+    });
+    const reader = response.body?.getReader();
+    expect(reader).toBeDefined();
+    for (;;) {
+      const { done } = await reader!.read();
+      if (done) {
+        break;
+      }
+    }
+
+    expect(runtime.fetchResponse).toHaveBeenCalledWith(
+      expect.stringContaining("/runs/run-1/stream?last_index=9"),
+      expect.objectContaining({ method: "GET" }),
+    );
+    expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith(
+      "user-a",
+      "chat-1",
+      "assistant-queued",
+      expect.objectContaining({ content: "resumed output" }),
+    );
+  });
+
+  it("returns an existing-run SSE response before the backend stream connection resolves", async () => {
+    const { GET } = await import("@/app/api/chats/[chatId]/stream/route");
+    let fetchResolved = false;
+    let resolveFetch: (
+      value: {
+        ok: boolean;
+        body: ReturnType<typeof makeBackendStream>["body"];
+      },
+    ) => void = () => {};
+    const fetchResponse = vi.fn(
+      (_path: string, _init: { signal?: AbortSignal }) =>
+        new Promise<{
+          ok: boolean;
+          body: ReturnType<typeof makeBackendStream>["body"];
+        }>((resolve) => {
+          resolveFetch = (value) => {
+            fetchResolved = true;
+            resolve(value);
+          };
+        }),
+    );
+    const runtime = {
+      sdk: {
+        listSessionArtifacts: vi.fn().mockResolvedValue({ artifacts: [] }),
+      },
+      fetchResponse,
+    };
+    mockRequireRuntimeClient.mockResolvedValue(runtime as never);
+    mockGetChat.mockReturnValue({
+      chat: {
+        id: "chat-1",
+        title: "Chat",
+        projectId: null,
+        createdAt: "2026-06-07T00:00:00.000Z",
+        updatedAt: "2026-06-07T00:00:00.000Z",
+        archivedAt: null,
+        model: "sonnet-4.6-adaptive",
+      },
+      session: {
+        chatId: "chat-1",
+        backendSessionId: "runtime-session-1",
+        persisted: true,
+        messageCount: 2,
+      },
+      messages: [
+        {
+          id: "assistant-queued",
+          role: "assistant",
+          content: "",
+          createdAt: "2026-06-07T00:00:01.000Z",
+          status: "streaming",
+        },
+      ],
+      activeRun: {
+        runId: "run-1",
+        status: "running",
+        waitingFor: null,
+        assistantMessageId: "assistant-queued",
+      },
+    } as never);
+
+    const url = new URL("http://web.test/api/chats/chat-1/stream?runId=run-1");
+    const response = await GET({ nextUrl: url } as never, {
+      params: Promise.resolve({ chatId: "chat-1" }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(fetchResponse).toHaveBeenCalledTimes(1);
+    expect(fetchResolved).toBe(false);
+    const signal = fetchResponse.mock.calls[0]?.[1]?.signal as
+      | AbortSignal
+      | undefined;
+    expect(signal?.aborted).toBe(false);
+
+    const reader = response.body?.getReader();
+    await reader?.cancel();
+    expect(signal?.aborted).toBe(true);
+    resolveFetch({ ok: true, body: makeBackendStream().body });
+  });
+
+  it("rejects local code prompts without workspace authority before creating stream messages", async () => {
+    const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
+
+    const response = await POST(
+      new Request("http://web.test/api/chats/chat-1/stream", {
+        method: "POST",
+        body: JSON.stringify({
+          content: "review ~/github/astra",
+          options: {
+            model: "sonnet-4.6-adaptive",
+            webSearch: false,
+            thinking: true,
+            activeSkills: [],
+          },
+        }),
+      }) as never,
+      { params: Promise.resolve({ chatId: "chat-1" }) },
+    );
+
+    expect(response.status).toBe(409);
+    await expect(response.json()).resolves.toEqual({
+      code: "workspace_required",
+      error: expect.stringContaining("Select a connected edge workspace"),
+    });
+    expect(mockBeginStreamingMessage).not.toHaveBeenCalled();
+    expect(mockRequireRuntimeClient).not.toHaveBeenCalled();
+  });
+
+  it("rejects local code prompts when server sandbox is explicitly selected", async () => {
+    const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
+
+    const response = await POST(
+      new Request("http://web.test/api/chats/chat-1/stream", {
+        method: "POST",
+        body: JSON.stringify({
+          content: "多角度 review 这个分支的 changes",
+          workspace: { kind: "server_sandbox" },
+          options: {
+            model: "sonnet-4.6-adaptive",
+            webSearch: false,
+            thinking: true,
+            activeSkills: [],
+          },
+        }),
+      }) as never,
+      { params: Promise.resolve({ chatId: "chat-1" }) },
+    );
+
+    expect(response.status).toBe(409);
+    await expect(response.json()).resolves.toEqual({
+      code: "workspace_local_code_on_server_sandbox",
+      error: expect.stringContaining("Server sandbox cannot access"),
+    });
+    expect(mockBeginStreamingMessage).not.toHaveBeenCalled();
+    expect(mockRequireRuntimeClient).not.toHaveBeenCalled();
+  });
+
+  it("forwards selected edge workspace bindings after returning local SSE", async () => {
+    const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
+    const backend = makeBackendStream();
+    const runtime = makeRuntimeWithEdgeStatus(backend);
+    mockRequireRuntimeClient.mockResolvedValue(runtime as never);
+
+    const response = await POST(
+      new Request("http://web.test/api/chats/chat-1/stream", {
+        method: "POST",
+        body: JSON.stringify({
+          content: "review /Users/xupeng/github/astra/src/lib.rs",
+          workspace: {
+            kind: "edge_workspace",
+            edgeAgentId: "edge-1",
+            displayName: "MacBook Pro",
+            cwd: "/Users/xupeng/github/astra",
+          },
+          options: {
+            model: "sonnet-4.6-adaptive",
+            webSearch: false,
+            thinking: true,
+            activeSkills: ["rust"],
+          },
+        }),
+      }) as never,
+      { params: Promise.resolve({ chatId: "chat-1" }) },
+    );
+
+    const reader = response.body?.getReader();
+    expect(reader).toBeDefined();
+    const first = await reader!.read();
+    const text = new TextDecoder().decode(first.value);
+    expect(text).toContain('"type":"local_messages"');
+
+    await waitUntil(() => runtime.fetchResponse.mock.calls.length > 0);
+    const fetchCalls = runtime.fetchResponse.mock.calls as unknown as Array<
+      [unknown, { json?: Record<string, unknown> }]
+    >;
+    expect(fetchCalls[0]?.[1].json).toEqual(
+      expect.objectContaining({
+        workspace_binding: {
+          kind: "edge_workspace",
+          display_name: "MacBook Pro",
+          cwd: "/Users/xupeng/github/astra",
+          authority: "read_write",
+          fallback_policy: "disabled",
+        },
+        executor_binding: {
+          kind: "edge_agent",
+          executor_id: "edge-1",
+          display_name: "MacBook Pro",
+          transport: "edge_ws",
+          status: "online",
+        },
+        context: expect.objectContaining({
+          edge_profile: {
+            cwd: "/Users/xupeng/github/astra",
+            edge_agent_id: "edge-1",
+            active_skills: ["rust"],
+          },
+        }),
+      }),
+    );
+    expect(runtime.get).toHaveBeenCalledWith(PATH_EDGES_STATUS, {
+      auth: "required",
+      operation: "verify edge workspace binding",
+    });
+
+    await reader?.cancel();
+  });
+
+  it("streams an error after local SSE when the selected edge workspace is offline", async () => {
+    const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
+    const backend = makeBackendStream();
+    const runtime = makeRuntimeWithEdgeStatus(backend, []);
+    mockRequireRuntimeClient.mockResolvedValue(runtime as never);
+
+    const response = await POST(
+      new Request("http://web.test/api/chats/chat-1/stream", {
+        method: "POST",
+        body: JSON.stringify({
+          content: "review /Users/xupeng/github/astra/src/lib.rs",
+          workspace: {
+            kind: "edge_workspace",
+            edgeAgentId: "edge-1",
+            displayName: "MacBook Pro",
+            cwd: "/Users/xupeng/github/astra",
+          },
+          options: {
+            model: "sonnet-4.6-adaptive",
+            webSearch: false,
+            thinking: true,
+            activeSkills: [],
+          },
+        }),
+      }) as never,
+      { params: Promise.resolve({ chatId: "chat-1" }) },
+    );
+
+    expect(response.status).toBe(200);
+    const reader = response.body?.getReader();
+    expect(reader).toBeDefined();
+    const first = await reader!.read();
+    expect(new TextDecoder().decode(first.value)).toContain(
+      '"type":"local_messages"',
+    );
+    const second = await reader!.read();
+    const secondText = new TextDecoder().decode(second.value);
+    expect(secondText).toContain('"type":"error"');
+    expect(secondText).toContain("Server fallback is disabled");
+    expect(runtime.fetchResponse).not.toHaveBeenCalled();
+    expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith(
+      "user-a",
+      "chat-1",
+      "assistant-1",
+      expect.objectContaining({
+        content: expect.stringContaining("Server fallback is disabled"),
+        status: "failed",
+      }),
+    );
   });
 
   it("returns local SSE messages before backend session creation and model resolution finish", async () => {
@@ -332,9 +784,9 @@ describe("chat stream route proxy cancellation", () => {
     mockResolveBackendModelName.mockImplementation(() => new Promise(() => {}));
     const runtime = {
       sdk: {
-        listSessionArtifacts: jest.fn().mockResolvedValue({ artifacts: [] }),
+        listSessionArtifacts: vi.fn().mockResolvedValue({ artifacts: [] }),
       },
-      fetchResponse: jest.fn(),
+      fetchResponse: vi.fn(),
     };
     mockRequireRuntimeClient.mockResolvedValue(runtime as never);
 
@@ -434,10 +886,10 @@ describe("chat stream route proxy cancellation", () => {
     const backend = makeBackendStream();
     mockRequireRuntimeClient.mockResolvedValue({
       sdk: {
-        getRuntimeSession: jest.fn().mockResolvedValue({}),
-        listSessionArtifacts: jest.fn().mockResolvedValue({ artifacts: [] }),
+        getRuntimeSession: vi.fn().mockResolvedValue({}),
+        listSessionArtifacts: vi.fn().mockResolvedValue({ artifacts: [] }),
       },
-      fetchResponse: jest.fn().mockResolvedValue({
+      fetchResponse: vi.fn().mockResolvedValue({
         ok: true,
         body: backend.body,
       }),
@@ -466,6 +918,87 @@ describe("chat stream route proxy cancellation", () => {
     await reader?.cancel();
   });
 
+  it("inherits chat workspace selection when recovering an empty pending turn request", async () => {
+    const edgeWorkspace = {
+      kind: "edge_workspace" as const,
+      edgeAgentId: "edge-1",
+      displayName: "MacBook Pro",
+      cwd: "/Users/xupeng/github/astra",
+    };
+    mockGetChat.mockReturnValue({
+      chat: {
+        id: "chat-1",
+        title: "Chat",
+        projectId: null,
+        createdAt: "2026-06-07T00:00:00.000Z",
+        updatedAt: "2026-06-07T00:00:00.000Z",
+        archivedAt: null,
+        model: "sonnet-4.6-adaptive",
+      },
+      messages: [
+        {
+          id: "pending-user-1",
+          role: "user" as const,
+          content: "review this repo",
+          createdAt: "2026-06-07T00:00:00.000Z",
+          status: "complete" as const,
+        },
+      ],
+      pendingTurn: {
+        messageId: "pending-user-1",
+        content: "review this repo",
+        options: {
+          model: "sonnet-4.6-adaptive",
+          webSearch: false,
+          thinking: true,
+          activeSkills: [],
+        },
+      },
+      workspaceSelection: edgeWorkspace,
+    });
+    const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
+    const backend = makeBackendStream();
+    const runtime = makeRuntimeWithEdgeStatus(backend);
+    mockRequireRuntimeClient.mockResolvedValue(runtime as never);
+
+    const response = await POST(
+      new Request("http://web.test/api/chats/chat-1/stream", {
+        method: "POST",
+      }) as never,
+      { params: Promise.resolve({ chatId: "chat-1" }) },
+    );
+
+    expect(response.status).toBe(200);
+    expect(mockUpdateChatWorkspaceSelection).not.toHaveBeenCalled();
+    expect(mockBeginStreamingMessage).toHaveBeenCalledWith(
+      "user-a",
+      "chat-1",
+      expect.objectContaining({
+        workspaceSelection: edgeWorkspace,
+      }),
+    );
+
+    const reader = response.body?.getReader();
+    await reader?.read();
+    await waitUntil(() => runtime.fetchResponse.mock.calls.length > 0);
+    const fetchCalls = runtime.fetchResponse.mock.calls as unknown as Array<
+      [unknown, { json?: Record<string, unknown> }]
+    >;
+    expect(fetchCalls[0]?.[1].json).toEqual(
+      expect.objectContaining({
+        workspace_binding: expect.objectContaining({
+          kind: "edge_workspace",
+          cwd: "/Users/xupeng/github/astra",
+        }),
+        executor_binding: expect.objectContaining({
+          kind: "edge_agent",
+          executor_id: "edge-1",
+        }),
+      }),
+    );
+    await reader?.cancel();
+  });
+
   it("rejects malformed stream request JSON without crashing", async () => {
     const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
 
@@ -487,7 +1020,7 @@ describe("chat stream route proxy cancellation", () => {
 
 describe("chat stream route artifact fetch optimization", () => {
   beforeEach(() => {
-    jest.clearAllMocks();
+    vi.clearAllMocks();
     mockRequireRuntimeUser.mockResolvedValue({
       user: { user_id: "user-a" },
       response: null,
@@ -529,13 +1062,13 @@ describe("chat stream route artifact fetch optimization", () => {
 
     const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
     const backend = makeBackendStream();
-    const listSessionArtifacts = jest.fn().mockResolvedValue({ artifacts: [] });
+    const listSessionArtifacts = vi.fn().mockResolvedValue({ artifacts: [] });
     const runtime = {
       sdk: {
-        getRuntimeSession: jest.fn().mockResolvedValue({}),
+        getRuntimeSession: vi.fn().mockResolvedValue({}),
         listSessionArtifacts,
       },
-      fetchResponse: jest.fn().mockResolvedValue({
+      fetchResponse: vi.fn().mockResolvedValue({
         ok: true,
         body: backend.body,
       }),
@@ -595,13 +1128,13 @@ describe("chat stream route artifact fetch optimization", () => {
 
     const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
     const backend = makeBackendStream();
-    const listSessionArtifacts = jest.fn().mockResolvedValue({ artifacts: [] });
+    const listSessionArtifacts = vi.fn().mockResolvedValue({ artifacts: [] });
     const runtime = {
       sdk: {
-        getRuntimeSession: jest.fn().mockResolvedValue({}),
+        getRuntimeSession: vi.fn().mockResolvedValue({}),
         listSessionArtifacts,
       },
-      fetchResponse: jest.fn().mockResolvedValue({
+      fetchResponse: vi.fn().mockResolvedValue({
         ok: true,
         body: backend.body,
       }),
@@ -652,13 +1185,13 @@ describe("chat stream route artifact fetch optimization", () => {
 
     const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
     const backend = makeBackendStream();
-    const listSessionArtifacts = jest.fn().mockResolvedValue({ artifacts: [] });
+    const listSessionArtifacts = vi.fn().mockResolvedValue({ artifacts: [] });
     const runtime = {
       sdk: {
-        getRuntimeSession: jest.fn().mockResolvedValue({}),
+        getRuntimeSession: vi.fn().mockResolvedValue({}),
         listSessionArtifacts,
       },
-      fetchResponse: jest.fn().mockResolvedValue({
+      fetchResponse: vi.fn().mockResolvedValue({
         ok: true,
         body: backend.body,
       }),
@@ -726,9 +1259,9 @@ describe("chat stream route artifact fetch optimization", () => {
 
     const runtime = {
       sdk: {
-        listSessionArtifacts: jest.fn().mockResolvedValue({ artifacts: [] }),
+        listSessionArtifacts: vi.fn().mockResolvedValue({ artifacts: [] }),
       },
-      fetchResponse: jest.fn().mockResolvedValue({
+      fetchResponse: vi.fn().mockResolvedValue({
         ok: true,
         body: backend.body,
       }),
@@ -777,7 +1310,7 @@ describe("chat stream route artifact fetch optimization", () => {
 
 describe("chat existing run stream route", () => {
   beforeEach(() => {
-    jest.clearAllMocks();
+    vi.clearAllMocks();
     mockRequireRuntimeUser.mockResolvedValue({
       user: { user_id: "user-a" },
       response: null,
@@ -824,12 +1357,12 @@ describe("chat existing run stream route", () => {
       'data: {"type":"text_delta","content":"reply"}\n\n',
       'data: {"type":"run_finished","run_id":"run-1","status":"completed"}\n\n',
     ]);
-    const listSessionArtifacts = jest.fn().mockResolvedValue({ artifacts: [] });
+    const listSessionArtifacts = vi.fn().mockResolvedValue({ artifacts: [] });
     mockRequireRuntimeClient.mockResolvedValue({
       sdk: {
         listSessionArtifacts,
       },
-      fetchResponse: jest.fn().mockResolvedValue({
+      fetchResponse: vi.fn().mockResolvedValue({
         ok: true,
         body: backend.body,
       }),
@@ -888,9 +1421,9 @@ describe("chat existing run stream route", () => {
     ]);
     mockRequireRuntimeClient.mockResolvedValue({
       sdk: {
-        listSessionArtifacts: jest.fn().mockResolvedValue({ artifacts: [] }),
+        listSessionArtifacts: vi.fn().mockResolvedValue({ artifacts: [] }),
       },
-      fetchResponse: jest.fn().mockResolvedValue({
+      fetchResponse: vi.fn().mockResolvedValue({
         ok: true,
         body: backend.body,
       }),

@@ -84,6 +84,10 @@ struct TurnSuccessLiveSnapshot {
     latest_turn_quality_feedback: Option<astra_runtime::self_model::TurnQualityFeedback>,
     latest_context_assembly_trace:
         Option<astra_turn_core::context_assembly_trace::ContextAssemblyTrace>,
+    runtime_pipeline_state: Option<serde_json::Value>,
+    runtime_compaction_state: Option<serde_json::Value>,
+    runtime_consecutive_context_window_errors: u32,
+    runtime_idempotency_cache: Option<astra_pipeline::step_protocol::InMemoryIdempotencyCache>,
     last_turn_event: Option<session_journal::JournalEvent>,
     observability_session: Option<
         std::sync::Arc<std::sync::RwLock<astra_runtime::observability::ObservabilitySession>>,
@@ -115,6 +119,11 @@ impl TurnSuccessLiveSnapshot {
             tool_health_entries: state.tool_health_entries.clone(),
             latest_turn_quality_feedback: state.latest_turn_quality_feedback.clone(),
             latest_context_assembly_trace: state.latest_context_assembly_trace.clone(),
+            runtime_pipeline_state: state.runtime_pipeline_state.clone(),
+            runtime_compaction_state: state.runtime_compaction_state.clone(),
+            runtime_consecutive_context_window_errors: state
+                .runtime_consecutive_context_window_errors,
+            runtime_idempotency_cache: state.runtime_idempotency_cache.clone(),
             last_turn_event: state.last_turn_event.clone(),
             observability_session: state.observability_session.clone(),
             pending_adaptive_state: state.pending_adaptive_state.clone(),
@@ -151,6 +160,11 @@ impl TurnSuccessLiveSnapshot {
         state.tool_health_entries = self.tool_health_entries;
         state.latest_turn_quality_feedback = self.latest_turn_quality_feedback;
         state.latest_context_assembly_trace = self.latest_context_assembly_trace;
+        state.runtime_pipeline_state = self.runtime_pipeline_state;
+        state.runtime_compaction_state = self.runtime_compaction_state;
+        state.runtime_consecutive_context_window_errors =
+            self.runtime_consecutive_context_window_errors;
+        state.runtime_idempotency_cache = self.runtime_idempotency_cache;
         state.last_turn_event = self.last_turn_event;
         state.observability_session = self.observability_session;
         state.pending_adaptive_state = self.pending_adaptive_state;
@@ -247,6 +261,7 @@ fn apply_turn_success_sync(
         .as_ref()
         .map(astra_turn_core::interruption::resume_restricted_tools_from_interruption_json)
         .unwrap_or_default();
+    super::turn_runtime_state::update_from_stream_result(state, &result);
 
     if !result.tool_health_export.is_empty() {
         state.tool_health_entries = result.tool_health_export.clone();
@@ -321,6 +336,7 @@ mod tests {
     use super::{apply_turn_success, apply_turn_success_async, apply_turn_success_sync};
     use crate::cli::session::session_state::PersistedAdaptiveState;
     use crate::cli::session::session_state::SessionState;
+    use crate::tests::heavy_checkpoint_with_runtime_state;
     use astra_services::session_journal;
     use std::time::Instant;
 
@@ -361,6 +377,77 @@ mod tests {
         apply_turn_success(&mut state, None, "continue", result, Instant::now());
 
         assert!(state.pending_followup_suggestion.is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn apply_turn_success_updates_runtime_recovery_state_from_heavy_checkpoint() {
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
+        let sid = format!("turn-runtime-state-{}", uuid::Uuid::new_v4());
+        let mut state = SessionState {
+            runtime_pipeline_state: Some(serde_json::json!({"old": true})),
+            runtime_compaction_state: Some(serde_json::json!({"old": true})),
+            runtime_consecutive_context_window_errors: 9,
+            runtime_idempotency_cache: Some(
+                astra_pipeline::step_protocol::InMemoryIdempotencyCache::new(),
+            ),
+            ..Default::default()
+        };
+        let mut result = crate::tests::stub_stream_result("done");
+        result.session_id = Some(sid);
+        result.last_heavy_checkpoint = Some(heavy_checkpoint_with_runtime_state(
+            serde_json::json!({"stats": {"ema": 0.8}}),
+            serde_json::json!({
+                "attempt_count": 3,
+                "cumulative_tokens_freed": 15000,
+                "last_tokens_freed": 4000,
+                "last_was_insufficient": true,
+            }),
+            2,
+        ));
+
+        apply_turn_success(&mut state, None, "continue", result, Instant::now());
+
+        assert_eq!(
+            state.runtime_pipeline_state,
+            Some(serde_json::json!({"stats": {"ema": 0.8}}))
+        );
+        assert_eq!(
+            state.runtime_compaction_state,
+            Some(serde_json::json!({
+                "attempt_count": 3,
+                "cumulative_tokens_freed": 15000,
+                "last_tokens_freed": 4000,
+                "last_was_insufficient": true,
+            }))
+        );
+        assert_eq!(state.runtime_consecutive_context_window_errors, 2);
+        assert!(state.runtime_idempotency_cache.is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn apply_turn_success_clears_runtime_recovery_state_without_checkpoint() {
+        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
+        let sid = format!("turn-runtime-state-clear-{}", uuid::Uuid::new_v4());
+        let mut state = SessionState {
+            runtime_pipeline_state: Some(serde_json::json!({"old": true})),
+            runtime_compaction_state: Some(serde_json::json!({"old": true})),
+            runtime_consecutive_context_window_errors: 9,
+            runtime_idempotency_cache: Some(
+                astra_pipeline::step_protocol::InMemoryIdempotencyCache::new(),
+            ),
+            ..Default::default()
+        };
+        let mut result = crate::tests::stub_stream_result("done");
+        result.session_id = Some(sid);
+
+        apply_turn_success(&mut state, None, "continue", result, Instant::now());
+
+        assert!(state.runtime_pipeline_state.is_none());
+        assert!(state.runtime_compaction_state.is_none());
+        assert_eq!(state.runtime_consecutive_context_window_errors, 0);
+        assert!(state.runtime_idempotency_cache.is_none());
     }
 
     #[test]

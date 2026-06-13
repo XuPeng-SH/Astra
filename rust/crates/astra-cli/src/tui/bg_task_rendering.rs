@@ -97,31 +97,6 @@ pub(crate) fn background_task_rows(
         .collect()
 }
 
-pub(crate) const PENDING_BASH_HANDOFF_TASK_ID: &str = "bg-shell-handoff";
-
-pub(crate) fn pending_bash_handoff_row(
-    title: &str,
-    elapsed_ms: u64,
-) -> super::bottom_pane::background_task_view::BackgroundTaskRow {
-    let title = title.trim();
-    let title = if title.is_empty() {
-        "Bash handoff"
-    } else {
-        title
-    };
-    let tail = "Waiting for foreground Bash to hand off its process.".to_string();
-    super::bottom_pane::background_task_view::BackgroundTaskRow::shell(
-        PENDING_BASH_HANDOFF_TASK_ID,
-        "pending",
-        elapsed_ms,
-        title,
-        None,
-        Some(tail.clone()),
-        Some(tail.len() as u64),
-    )
-    .with_output_stats(None, Some(1))
-}
-
 pub(crate) fn background_task_fanout_membership(
     slot: &astra_turn_core::orchestration_fanout_group::AgentFanoutSlotIdentity,
     group_title: Option<&str>,
@@ -270,6 +245,11 @@ pub(crate) fn background_task_row_for_local_agent_with_fanout_title(
         AgentStatus::Idle => (
             BackgroundTaskStatus::WaitingForInput,
             Some("Agent is waiting for input.".to_string()),
+            None,
+        ),
+        AgentStatus::Waiting { reason } => (
+            BackgroundTaskStatus::WaitingForInput,
+            Some(format!("Agent is waiting: {reason}")),
             None,
         ),
         AgentStatus::Completed {
@@ -448,6 +428,44 @@ pub(crate) async fn render_background_task_list_xml_with_agents(
     render_background_task_rows_xml(&rows)
 }
 
+pub(crate) fn background_task_live_control_state(
+    live_control: super::background_tasks::BgTaskLiveControl,
+) -> super::bottom_pane::background_task_view::LiveControlState {
+    match live_control {
+        super::background_tasks::BgTaskLiveControl::Available => {
+            super::bottom_pane::background_task_view::LiveControlState::Available
+        }
+        super::background_tasks::BgTaskLiveControl::StaleHandle => {
+            super::bottom_pane::background_task_view::LiveControlState::StaleHandle
+        }
+    }
+}
+
+pub(crate) const PENDING_BASH_HANDOFF_TASK_ID: &str = "bg-shell-handoff";
+
+pub(crate) fn pending_bash_handoff_row(
+    title: &str,
+    elapsed_ms: u64,
+) -> super::bottom_pane::background_task_view::BackgroundTaskRow {
+    let title = title.trim();
+    let title = if title.is_empty() {
+        "Bash handoff"
+    } else {
+        title
+    };
+    let tail = "Waiting for foreground Bash to hand off its process.".to_string();
+    super::bottom_pane::background_task_view::BackgroundTaskRow::shell(
+        PENDING_BASH_HANDOFF_TASK_ID,
+        "pending",
+        elapsed_ms,
+        title,
+        None,
+        Some(tail.clone()),
+        Some(tail.len() as u64),
+    )
+    .with_output_stats(None, Some(1))
+}
+
 pub(crate) fn sync_background_task_footer_from_rows(
     bottom_pane: &mut BottomPane,
     rows: &[super::bottom_pane::background_task_view::BackgroundTaskRow],
@@ -460,19 +478,6 @@ pub(crate) fn sync_background_task_footer_from_rows(
     };
     bottom_pane.footer.bg_fanout_summaries =
         super::status_line::BackgroundTaskFanoutSummary::from_rows(rows);
-}
-
-pub(crate) fn background_task_live_control_state(
-    live_control: super::background_tasks::BgTaskLiveControl,
-) -> super::bottom_pane::background_task_view::LiveControlState {
-    match live_control {
-        super::background_tasks::BgTaskLiveControl::Available => {
-            super::bottom_pane::background_task_view::LiveControlState::Available
-        }
-        super::background_tasks::BgTaskLiveControl::StaleHandle => {
-            super::bottom_pane::background_task_view::LiveControlState::StaleHandle
-        }
-    }
 }
 
 pub(crate) async fn open_background_task_view(
@@ -501,47 +506,7 @@ pub(crate) async fn reveal_background_task_view(
     frame_requester: &FrameRequester,
     selected_id: Option<&str>,
 ) -> bool {
-    reveal_background_task_view_with_selected(
-        background_registry,
-        agent_spawner,
-        restored_local_agents,
-        bottom_pane,
-        frame_requester,
-        selected_id,
-    )
-    .await
-}
-
-pub(crate) async fn reveal_background_task_view_with_extra_rows(
-    background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
-    agent_spawner: Option<&Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
-    restored_local_agents: &[astra_services::session_workspace::BackgroundLocalAgentTaskProjection],
-    bottom_pane: &mut BottomPane,
-    frame_requester: &FrameRequester,
-    extra_rows: Vec<super::bottom_pane::background_task_view::BackgroundTaskRow>,
-    selected_id: Option<&str>,
-) -> bool {
-    reveal_background_task_view_rows(
-        background_registry,
-        agent_spawner,
-        restored_local_agents,
-        bottom_pane,
-        frame_requester,
-        extra_rows,
-        selected_id,
-    )
-    .await
-}
-
-async fn reveal_background_task_view_with_selected(
-    background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
-    agent_spawner: Option<&Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
-    restored_local_agents: &[astra_services::session_workspace::BackgroundLocalAgentTaskProjection],
-    bottom_pane: &mut BottomPane,
-    frame_requester: &FrameRequester,
-    selected_id: Option<&str>,
-) -> bool {
-    reveal_background_task_view_rows(
+    reveal_background_task_view_rows_inner(
         background_registry,
         agent_spawner,
         restored_local_agents,
@@ -549,11 +514,12 @@ async fn reveal_background_task_view_with_selected(
         frame_requester,
         Vec::new(),
         selected_id,
+        false,
     )
     .await
 }
 
-async fn reveal_background_task_view_rows(
+pub(crate) async fn reveal_background_task_view_with_extra_rows(
     background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
     agent_spawner: Option<&Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
     restored_local_agents: &[astra_services::session_workspace::BackgroundLocalAgentTaskProjection],
@@ -577,8 +543,7 @@ async fn reveal_background_task_view_rows(
 
 /// Always open the background task panel, even if the registry is empty.
 /// Used by Ctrl+B so the user always lands in a panel they can navigate or
-/// dismiss. Empty-state rendering ("No background tasks.") lives in
-/// [`BackgroundTaskView::render_list`].
+/// dismiss. Empty-state rendering lives in `BackgroundTaskView`.
 pub(crate) async fn force_open_background_task_view(
     background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
     agent_spawner: Option<&Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
@@ -615,19 +580,12 @@ async fn reveal_background_task_view_rows_inner(
             .await;
     rows.extend(extra_rows);
     sync_background_task_footer_from_rows(bottom_pane, &rows);
-    use super::bottom_pane::background_task_view::BackgroundTaskView;
     if bottom_pane.accepts_background_task_rows() {
         bottom_pane.refresh_background_task_rows_selecting(rows, selected_id);
         bottom_pane.sync_popups();
         frame_requester.schedule_frame();
         return true;
     }
-    // Non-force callers (Ctrl+T, Shift+Down) only want to surface the panel
-    // when there's something actionable: running, waiting-for-input, or
-    // failed tasks. Completed-only or empty registries fall through so the
-    // caller can route the key elsewhere (Ctrl+T toggles task board, etc.).
-    // Ctrl+B forces open regardless: it's the user's "show me background
-    // state" verb, and they get a panel to navigate or dismiss.
     if !force_open {
         let counts = super::status_line::BackgroundTaskCounts::from_rows(&rows);
         if counts.is_empty() {
@@ -636,6 +594,7 @@ async fn reveal_background_task_view_rows_inner(
             return false;
         }
     }
+    use super::bottom_pane::background_task_view::BackgroundTaskView;
     bottom_pane.push_view(Box::new(BackgroundTaskView::new_with_selected(
         rows,
         selected_id,
@@ -831,7 +790,6 @@ pub(crate) async fn try_dispatch_background_task_output_sentinel(
         restored_local_agents,
     )
     .await;
-    sync_background_task_footer_from_rows(bottom_pane, &rows);
     bottom_pane.refresh_background_task_rows(rows);
     bottom_pane.sync_popups();
     frame_requester.schedule_frame();
@@ -884,71 +842,6 @@ pub(crate) async fn background_task_output_snapshot_with_agents(
             Err(format!("no background task with id '{task_id}'"))
         }
         Err(error) => Err(error),
-    }
-}
-
-/// Drain pending [`crate::edge_tools::BgTaskCommand`] entries posted by the
-/// tool-side `task_output` / `task_list` / `task_stop` calls and reply
-/// synchronously. **Must be invoked from any tick that holds the
-/// [`super::background_tasks::BackgroundTaskRegistry`]**, including the
-/// inner per-turn select loop — otherwise a tool calling `task_output` with
-/// `block=true` deadlocks against the outer-tick drainer (the turn future
-/// owns `&mut state`, the outer loop is parked on it, no one drains).
-///
-/// Replies use synchronous `oneshot::Sender::send` so the tool side wakes
-/// on the next poll. Errors during a snapshot/list/stop are propagated to
-/// the tool caller, never silently swallowed.
-pub(crate) async fn drain_bg_task_commands(
-    bg_task_commands: &std::sync::Arc<std::sync::Mutex<Vec<crate::edge_tools::BgTaskCommand>>>,
-    background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
-    agent_spawner: Option<&Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
-    restored_local_agents: &[astra_services::session_workspace::BackgroundLocalAgentTaskProjection],
-) {
-    let cmds: Vec<_> = astra_core::sync_poison::recover_mutex_lock(bg_task_commands)
-        .drain(..)
-        .collect();
-    for cmd in cmds {
-        match cmd {
-            crate::edge_tools::BgTaskCommand::Kill { task_id, reply } => {
-                let _ = reply.send(
-                    stop_background_task_with_agents(
-                        background_registry,
-                        agent_spawner,
-                        restored_local_agents,
-                        &task_id,
-                    )
-                    .await,
-                );
-            }
-            crate::edge_tools::BgTaskCommand::GetOutputSince {
-                task_id,
-                offset,
-                max_bytes,
-                reply,
-            } => {
-                let _ = reply.send(
-                    background_task_output_snapshot_with_agents(
-                        background_registry,
-                        agent_spawner,
-                        restored_local_agents,
-                        &task_id,
-                        offset,
-                        max_bytes,
-                    )
-                    .await,
-                );
-            }
-            crate::edge_tools::BgTaskCommand::List { reply } => {
-                let _ = reply.send(
-                    render_background_task_list_xml_with_agents(
-                        background_registry,
-                        agent_spawner,
-                        restored_local_agents,
-                    )
-                    .await,
-                );
-            }
-        }
     }
 }
 

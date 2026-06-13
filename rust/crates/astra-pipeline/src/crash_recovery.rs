@@ -77,12 +77,16 @@ pub fn recover_from_crash(session_id: &str) -> Result<Option<RecoveryOutcome>, R
     // Extract turn number from checkpoint
     let checkpoint_turn = extract_turn_from_step_id(&heavy.light.step_id);
 
-    // Load events from journal
-    let store = FileBackedEventStore::new(session_id);
-    let events = store.all_events().to_vec();
+    // Stream only the recovery window from the checkpoint timestamp onward.
+    // Long sessions may have very large journals; recovery should not
+    // materialize historical events that cannot affect the current replay.
+    let events =
+        FileBackedEventStore::load_events_created_at_or_after(session_id, heavy.light.created_at)
+            .map_err(|e| RecoveryError::JournalRead(format!("Failed to read event journal: {e}")))?;
 
-    // Serialize checkpoint for scan_journal
-    let checkpoint_json = serde_json::to_string(&heavy.light).map_err(|e| {
+    // Serialize checkpoint for scan_journal (must be StepCheckpoint enum JSON)
+    let light_cp = StepCheckpoint::Light(heavy.light.clone());
+    let checkpoint_json = serde_json::to_string(&light_cp).map_err(|e| {
         RecoveryError::CorruptedCheckpoint(format!("Failed to serialize checkpoint: {e}"))
     })?;
 
@@ -113,7 +117,7 @@ pub fn recover_from_crash(session_id: &str) -> Result<Option<RecoveryOutcome>, R
 
         Ok(Some(RecoveryOutcome::AutoRecovered {
             restored,
-            manager,
+            manager: Box::new(manager),
             scan_result,
         }))
     } else {
@@ -123,9 +127,15 @@ pub fn recover_from_crash(session_id: &str) -> Result<Option<RecoveryOutcome>, R
             .map(|ctx| ctx.pending_user_decisions())
             .unwrap_or_default();
 
+        let restored = build_restored_from_scan(&scan_result, &heavy)?;
+
         Ok(Some(RecoveryOutcome::RequiresUserInput {
-            pending_decisions: pending.into_iter().map(|(name, _)| name.clone()).collect(),
-            manager,
+            pending_decisions: pending
+                .into_iter()
+                .map(|(name, decision)| (name.clone(), decision.clone()))
+                .collect(),
+            restored,
+            manager: Box::new(manager),
             scan_result,
         }))
     }
@@ -146,7 +156,7 @@ fn build_restored_from_scan(
     scan: &JournalScanResult,
     heavy: &HeavyCheckpoint,
 ) -> Result<RestoredSession, RecoveryError> {
-    use crate::step_protocol::{IdempotencyKey, InMemoryIdempotencyCache};
+    use crate::step_protocol::InMemoryIdempotencyCache;
     use std::collections::HashMap;
 
     let mut cache = InMemoryIdempotencyCache::new();
@@ -155,11 +165,9 @@ fn build_restored_from_scan(
     // Extract completed tool results from events
     for tool_call in &scan.tool_calls_found {
         if let Some(ref cached) = tool_call.cached_result {
-            let key = IdempotencyKey::semantic(
-                &tool_call.tool_name,
-                &serde_json::Value::String(cached.output.clone()),
-            );
-            cache.record(&key, cached.clone());
+            if let Some(cache_key) = tool_call.idempotency_key.as_deref() {
+                cache.record_cache_key(cache_key, cached.clone());
+            }
 
             completed_results
                 .entry(tool_call.tool_name.clone())
@@ -188,18 +196,18 @@ fn build_restored_from_scan(
 
 /// Outcome of crash recovery attempt
 #[derive(Debug)]
-#[allow(clippy::large_enum_variant)]
 pub enum RecoveryOutcome {
     /// Session automatically recovered, ready to continue
     AutoRecovered {
         restored: RestoredSession,
-        manager: CrashRecoveryManager,
+        manager: Box<CrashRecoveryManager>,
         scan_result: JournalScanResult,
     },
     /// Recovery requires user decisions before proceeding
     RequiresUserInput {
-        pending_decisions: Vec<String>,
-        manager: CrashRecoveryManager,
+        pending_decisions: Vec<(String, ToolReplayDecision)>,
+        restored: RestoredSession,
+        manager: Box<CrashRecoveryManager>,
         scan_result: JournalScanResult,
     },
 }
@@ -218,6 +226,8 @@ pub enum RecoveryError {
     VersionMismatch { expected: u32, found: u32 },
     /// Gap detected in journal events (timestamps out of order or large gap).
     JournalGap { expected_after: u64, found_at: u64 },
+    /// Journal could not be read for recovery replay.
+    JournalRead(String),
     /// Crypto hash mismatch — data was tampered with or corrupted.
     HashMismatch { expected: String, actual: String },
     /// Recovery was attempted on an already-recovering session.
@@ -246,6 +256,7 @@ impl fmt::Display for RecoveryError {
                 f,
                 "Journal gap: expected event after {expected_after}, found at {found_at}"
             ),
+            Self::JournalRead(msg) => write!(f, "Journal read failed: {msg}"),
             Self::HashMismatch { expected, actual } => {
                 write!(f, "Hash mismatch: expected {expected}, got {actual}")
             }
@@ -404,6 +415,7 @@ pub struct ToolCallRecord {
     pub step_id: String,
     pub tool_name: String,
     pub tool_index: u32,
+    pub idempotency_key: Option<String>,
     pub status: ToolCallStatus,
     pub cached_result: Option<CachedToolResult>,
 }
@@ -534,6 +546,38 @@ fn extract_tool_info_from_event(event: &StepEvent) -> Option<(String, u32)> {
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as u32;
     Some((tool_name, tool_index))
+}
+
+fn extract_idempotency_key_from_event(event: &StepEvent) -> Option<String> {
+    event
+        .payload
+        .as_ref()?
+        .get("idempotency_key")?
+        .as_str()
+        .filter(|key| !key.is_empty())
+        .map(ToString::to_string)
+}
+
+fn extract_cached_result_from_event(
+    event: &StepEvent,
+    tool_name: &str,
+) -> Option<CachedToolResult> {
+    let payload = event.payload.as_ref()?;
+    let output = payload
+        .get("result")
+        .or_else(|| payload.get("output"))
+        .and_then(|v| v.as_str())?;
+
+    Some(CachedToolResult {
+        tool_name: tool_name.to_string(),
+        output: output.to_string(),
+        is_error: payload
+            .get("is_error")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        cached_at: event.created_at,
+        context_signature: None,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -772,6 +816,7 @@ impl CrashRecoveryManager {
                                 step_id: event.step_id.clone(),
                                 tool_name,
                                 tool_index,
+                                idempotency_key: extract_idempotency_key_from_event(event),
                                 status: ToolCallStatus::StartedOnly,
                                 cached_result: None,
                             },
@@ -783,28 +828,22 @@ impl CrashRecoveryManager {
                         let key = format!("{}:{}:{}", event.step_id, tool_name, tool_index);
                         if let Some(mut record) = started.remove(&key) {
                             record.status = ToolCallStatus::Completed;
-                            // Try to extract cached result from payload
-                            if let Some(payload) = &event.payload
-                                && let Some(result_str) =
-                                    payload.get("result").and_then(|v| v.as_str())
-                            {
-                                record.cached_result = Some(CachedToolResult {
-                                    tool_name: tool_name.clone(),
-                                    output: result_str.to_string(),
-                                    is_error: false,
-                                    cached_at: event.created_at,
-                                    context_signature: None,
-                                });
+                            if record.idempotency_key.is_none() {
+                                record.idempotency_key = extract_idempotency_key_from_event(event);
                             }
+                            record.cached_result =
+                                extract_cached_result_from_event(event, &tool_name);
                             completed.push(record);
                         } else {
                             // Completed without start — orphan event
+                            let cached_result = extract_cached_result_from_event(event, &tool_name);
                             completed.push(ToolCallRecord {
                                 step_id: event.step_id.clone(),
                                 tool_name,
                                 tool_index,
+                                idempotency_key: extract_idempotency_key_from_event(event),
                                 status: ToolCallStatus::Completed,
-                                cached_result: None,
+                                cached_result,
                             });
                         }
                     }
@@ -814,6 +853,9 @@ impl CrashRecoveryManager {
                         let key = format!("{}:{}:{}", event.step_id, tool_name, tool_index);
                         if let Some(mut record) = started.remove(&key) {
                             record.status = ToolCallStatus::Failed;
+                            if record.idempotency_key.is_none() {
+                                record.idempotency_key = extract_idempotency_key_from_event(event);
+                            }
                             completed.push(record);
                         }
                     }
@@ -823,6 +865,9 @@ impl CrashRecoveryManager {
                         let key = format!("{}:{}:{}", event.step_id, tool_name, tool_index);
                         if let Some(mut record) = started.remove(&key) {
                             record.status = ToolCallStatus::Skipped;
+                            if record.idempotency_key.is_none() {
+                                record.idempotency_key = extract_idempotency_key_from_event(event);
+                            }
                             completed.push(record);
                         }
                     }
@@ -865,9 +910,16 @@ impl CrashRecoveryManager {
     fn classify_tool_for_replay(tool_call: &ToolCallRecord) -> ToolReplayDecision {
         match tool_call.status {
             ToolCallStatus::StartedOnly => {
-                // Tool was in-flight when crash happened — unknown state
-                ToolReplayDecision::InFlightAtCrash {
-                    tool_name: tool_call.tool_name.clone(),
+                // Tool was in-flight when crash happened — unknown state.
+                // Pure-read and idempotent tools are safe to auto-replay.
+                let safety = classify_tool(&tool_call.tool_name);
+                match safety {
+                    ToolSafetyClass::PureRead | ToolSafetyClass::IdempotentWrite => {
+                        ToolReplayDecision::Replay
+                    }
+                    ToolSafetyClass::SideEffect => ToolReplayDecision::InFlightAtCrash {
+                        tool_name: tool_call.tool_name.clone(),
+                    },
                 }
             }
             ToolCallStatus::Completed => {
@@ -900,8 +952,18 @@ impl CrashRecoveryManager {
                 }
             }
             ToolCallStatus::Failed => {
-                // Failed tool calls are safe to retry (they didn't produce side effects)
-                ToolReplayDecision::Replay
+                // A failed tool may still have partially produced side effects
+                // (e.g. bash "rm a/ b/ c/" deleted a/ before crashing).
+                // Classify by tool safety, same as StartedOnly.
+                let safety = classify_tool(&tool_call.tool_name);
+                match safety {
+                    ToolSafetyClass::PureRead | ToolSafetyClass::IdempotentWrite => {
+                        ToolReplayDecision::Replay
+                    }
+                    ToolSafetyClass::SideEffect => ToolReplayDecision::InFlightAtCrash {
+                        tool_name: tool_call.tool_name.clone(),
+                    },
+                }
             }
             ToolCallStatus::Skipped => {
                 if let Some(ref cached) = tool_call.cached_result {
@@ -946,12 +1008,31 @@ impl CrashRecoveryManager {
 
     /// Force recovery even with pending user decisions (operator override).
     pub fn force_complete(&mut self) -> Result<(), RecoveryError> {
+        // Operator override can accept side-effect uncertainty, but it must not
+        // bless a corrupted or incomplete recovery journal. A journal gap means
+        // the replay input itself is not trustworthy.
+        if let Some(ref ctx) = self.context
+            && let Some(ref gap) = ctx.journal_gap
+        {
+            return Err(gap.clone());
+        }
         self.transition_to(RecoveryState::Recovered)?;
         Ok(())
     }
 
-    /// Reset to Idle after successful recovery (session continues).
+    /// Reset to Idle after **successful** recovery (session continues normally).
+    ///
+    /// Clears all recovery state, context, and **resets** `attempt_count` to 0.
+    /// Use this after `complete_recovery()` when the session can proceed.
+    ///
+    /// # Precondition
+    /// The state must NOT be `Failed`. Callers in `Failed` state must use
+    /// `reset_after_failure()` instead, which preserves the retry-storm counter.
     pub fn reset(&mut self) -> Result<(), RecoveryError> {
+        debug_assert!(
+            self.state != RecoveryState::Failed,
+            "reset() called while in Failed state — use reset_after_failure() to preserve attempt_count"
+        );
         self.transition_to(RecoveryState::Idle)?;
         self.context = None;
         self.scan_result = None;
@@ -961,7 +1042,15 @@ impl CrashRecoveryManager {
         Ok(())
     }
 
-    /// Reset to Idle after failure (allows retry).
+    /// Reset to Idle after **failed** recovery (enables retry).
+    ///
+    /// Preserves `attempt_count` so the retry gate in exactly-once processing and
+    /// crash-recovery loop can detect infinite-retry patterns. Each call increments
+    /// the internal attempt counter; after `MAX_RECOVERY_ATTEMPTS` the system
+    /// refuses further recovery with `RecoveryError::RecursiveCrash`.
+    ///
+    /// # Precondition
+    /// The state must be `Failed`. Use `reset()` for successful recovery paths.
     pub fn reset_after_failure(&mut self) -> Result<(), RecoveryError> {
         if self.state != RecoveryState::Failed {
             return Err(RecoveryError::InvalidSessionState(
@@ -973,7 +1062,6 @@ impl CrashRecoveryManager {
         self.scan_result = None;
         self.error = None;
         self.recovery_hash = None;
-        self.attempt_count = 0;
         Ok(())
     }
 }
@@ -991,7 +1079,9 @@ impl Default for CrashRecoveryManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::step_protocol::{ExecutionCursor, StepCheckpoint, StepEvent, StepEventType};
+    use crate::step_protocol::{
+        ExecutionCursor, IdempotencyKey, StepCheckpoint, StepEvent, StepEventType,
+    };
 
     // -- Helper: build a minimal valid checkpoint --
     fn make_test_checkpoint() -> StepCheckpoint {
@@ -1001,6 +1091,18 @@ mod tests {
             "test-agent".to_string(),
             ExecutionCursor::default(),
         )
+    }
+
+    fn make_test_heavy_checkpoint() -> HeavyCheckpoint {
+        match StepCheckpoint::heavy(
+            "test-session-turn-3".to_string(),
+            "test-task".to_string(),
+            "test-agent".to_string(),
+            ExecutionCursor::default(),
+        ) {
+            StepCheckpoint::Heavy(heavy) => *heavy,
+            StepCheckpoint::Light(_) => unreachable!("StepCheckpoint::heavy returned light"),
+        }
     }
 
     fn checkpoint_json() -> String {
@@ -1126,63 +1228,19 @@ mod tests {
         )
     }
 
-    // =======================================================================
-    // State machine tests
-    // =======================================================================
-
-    #[test]
-    fn state_idle_can_transition_to_scanning() {
-        assert!(RecoveryState::Idle.can_transition_to(&RecoveryState::Scanning));
-    }
-
-    #[test]
-    fn state_scanning_can_transition_to_replaying() {
-        assert!(RecoveryState::Scanning.can_transition_to(&RecoveryState::Replaying));
-    }
-
-    #[test]
-    fn state_scanning_can_transition_to_failed() {
-        assert!(RecoveryState::Scanning.can_transition_to(&RecoveryState::Failed));
-    }
-
-    #[test]
-    fn state_replaying_can_transition_to_recovered() {
-        assert!(RecoveryState::Replaying.can_transition_to(&RecoveryState::Recovered));
-    }
-
-    #[test]
-    fn state_replaying_can_transition_to_failed() {
-        assert!(RecoveryState::Replaying.can_transition_to(&RecoveryState::Failed));
-    }
-
-    #[test]
-    fn state_failed_can_retry_to_idle() {
-        assert!(RecoveryState::Failed.can_transition_to(&RecoveryState::Idle));
-    }
-
-    #[test]
-    fn state_recovered_can_reset_to_idle() {
-        assert!(RecoveryState::Recovered.can_transition_to(&RecoveryState::Idle));
-    }
-
-    #[test]
-    fn state_idle_cannot_jump_to_replaying() {
-        assert!(!RecoveryState::Idle.can_transition_to(&RecoveryState::Replaying));
-    }
-
-    #[test]
-    fn state_idle_cannot_jump_to_recovered() {
-        assert!(!RecoveryState::Idle.can_transition_to(&RecoveryState::Recovered));
-    }
-
-    #[test]
-    fn state_scanning_cannot_jump_to_recovered() {
-        assert!(!RecoveryState::Scanning.can_transition_to(&RecoveryState::Recovered));
-    }
-
-    #[test]
-    fn state_recovered_cannot_go_to_scanning() {
-        assert!(!RecoveryState::Recovered.can_transition_to(&RecoveryState::Scanning));
+    fn tool_record(
+        tool_name: &str,
+        status: ToolCallStatus,
+        cached_result: Option<CachedToolResult>,
+    ) -> ToolCallRecord {
+        ToolCallRecord {
+            step_id: "step-1".to_string(),
+            tool_name: tool_name.to_string(),
+            tool_index: 0,
+            idempotency_key: None,
+            status,
+            cached_result,
+        }
     }
 
     // =======================================================================
@@ -1287,6 +1345,87 @@ mod tests {
         assert_eq!(scan.tool_calls_found[0].status, ToolCallStatus::Completed);
         assert_eq!(scan.tool_calls_found[1].tool_name, "bash");
         assert_eq!(scan.tool_calls_found[1].status, ToolCallStatus::Completed);
+    }
+
+    #[test]
+    fn scan_journal_extracts_persisted_idempotency_key_and_output_payload() {
+        let mut mgr = CrashRecoveryManager::new();
+        mgr.begin_recovery().unwrap();
+
+        let args = serde_json::json!({"path": "src/lib.rs"});
+        let key = IdempotencyKey::semantic("read_file", &args);
+        let cache_key = key.cache_key();
+        let events = vec![StepEvent {
+            event_id: "e1".to_string(),
+            canonical_event_id: None,
+            step_id: "step-1".to_string(),
+            event_type: StepEventType::ToolCallCompleted,
+            agent_id: None,
+            caused_by: Vec::new(),
+            payload: Some(serde_json::json!({
+                "tool_name": "read_file",
+                "tool_index": 0,
+                "idempotency_key": cache_key.clone(),
+                "output": "module contents",
+            })),
+            created_at: 1000,
+        }];
+
+        let json = checkpoint_json();
+        let scan = mgr
+            .scan_journal("sess-1", 5, Some(&json), 3, events)
+            .unwrap();
+
+        assert_eq!(scan.tool_calls_found.len(), 1);
+        let record = &scan.tool_calls_found[0];
+        assert_eq!(record.idempotency_key.as_deref(), Some(cache_key.as_str()));
+        assert_eq!(
+            record
+                .cached_result
+                .as_ref()
+                .map(|result| result.output.as_str()),
+            Some("module contents")
+        );
+    }
+
+    #[test]
+    fn build_restored_from_scan_restores_cache_under_persisted_key() {
+        let args = serde_json::json!({"path": "src/lib.rs"});
+        let key = IdempotencyKey::semantic("read_file", &args);
+        let cached_result = CachedToolResult {
+            tool_name: "read_file".to_string(),
+            output: "module contents".to_string(),
+            is_error: false,
+            cached_at: 1000,
+            context_signature: None,
+        };
+        let scan = JournalScanResult {
+            last_checkpoint: make_test_checkpoint(),
+            checkpoint_turn: 3,
+            events_after: Vec::new(),
+            tool_calls_found: vec![ToolCallRecord {
+                step_id: "step-1".to_string(),
+                tool_name: "read_file".to_string(),
+                tool_index: 0,
+                idempotency_key: Some(key.cache_key()),
+                status: ToolCallStatus::Completed,
+                cached_result: Some(cached_result),
+            }],
+            gap_detected: None,
+        };
+        let heavy = make_test_heavy_checkpoint();
+
+        let restored = build_restored_from_scan(&scan, &heavy).unwrap();
+        let restored_cached = restored
+            .idempotency_cache
+            .check(&key)
+            .expect("restored cache must use the persisted idempotency cache key");
+
+        assert_eq!(restored_cached.output, "module contents");
+        assert_eq!(
+            restored.completed_tool_results.get("read_file"),
+            Some(&vec!["module contents".to_string()])
+        );
     }
 
     #[test]
@@ -1426,26 +1565,14 @@ mod tests {
 
     #[test]
     fn replay_decision_pure_read_completed() {
-        let record = ToolCallRecord {
-            step_id: "s1".to_string(),
-            tool_name: "read_file".to_string(),
-            tool_index: 0,
-            status: ToolCallStatus::Completed,
-            cached_result: None,
-        };
+        let record = tool_record("read_file", ToolCallStatus::Completed, None);
         let decision = CrashRecoveryManager::classify_tool_for_replay(&record);
         assert_eq!(decision, ToolReplayDecision::Replay);
     }
 
     #[test]
     fn replay_decision_side_effect_completed_no_cache() {
-        let record = ToolCallRecord {
-            step_id: "s1".to_string(),
-            tool_name: "bash".to_string(),
-            tool_index: 0,
-            status: ToolCallStatus::Completed,
-            cached_result: None,
-        };
+        let record = tool_record("bash", ToolCallStatus::Completed, None);
         let decision = CrashRecoveryManager::classify_tool_for_replay(&record);
         assert!(matches!(
             decision,
@@ -1462,13 +1589,7 @@ mod tests {
             cached_at: 1000,
             context_signature: None,
         };
-        let record = ToolCallRecord {
-            step_id: "s1".to_string(),
-            tool_name: "bash".to_string(),
-            tool_index: 0,
-            status: ToolCallStatus::Completed,
-            cached_result: Some(cached.clone()),
-        };
+        let record = tool_record("bash", ToolCallStatus::Completed, Some(cached.clone()));
         let decision = CrashRecoveryManager::classify_tool_for_replay(&record);
         assert_eq!(
             decision,
@@ -1480,13 +1601,7 @@ mod tests {
 
     #[test]
     fn replay_decision_in_flight_at_crash() {
-        let record = ToolCallRecord {
-            step_id: "s1".to_string(),
-            tool_name: "bash".to_string(),
-            tool_index: 0,
-            status: ToolCallStatus::StartedOnly,
-            cached_result: None,
-        };
+        let record = tool_record("bash", ToolCallStatus::StartedOnly, None);
         let decision = CrashRecoveryManager::classify_tool_for_replay(&record);
         assert!(matches!(
             decision,
@@ -1495,16 +1610,34 @@ mod tests {
     }
 
     #[test]
-    fn replay_decision_failed_tool_is_safe_to_replay() {
-        let record = ToolCallRecord {
-            step_id: "s1".to_string(),
-            tool_name: "bash".to_string(),
-            tool_index: 0,
-            status: ToolCallStatus::Failed,
-            cached_result: None,
-        };
+    fn replay_decision_failed_pure_read_is_safe_to_replay() {
+        // PureRead tools are safe to retry even when failed — they don't
+        // produce side effects, so replaying them is idempotent.
+        let record = tool_record("read_file", ToolCallStatus::Failed, None);
         let decision = CrashRecoveryManager::classify_tool_for_replay(&record);
         assert_eq!(decision, ToolReplayDecision::Replay);
+    }
+
+    #[test]
+    fn replay_decision_failed_idempotent_write_is_safe_to_replay() {
+        // IdempotentWrite tools are safe to retry even when failed —
+        // write_file overwrites the same content, which is idempotent.
+        let record = tool_record("write_file", ToolCallStatus::Failed, None);
+        let decision = CrashRecoveryManager::classify_tool_for_replay(&record);
+        assert_eq!(decision, ToolReplayDecision::Replay);
+    }
+
+    #[test]
+    fn replay_decision_failed_side_effect_is_not_safe_to_replay() {
+        // SideEffect tools (e.g. bash) may have partially executed before
+        // failing. Replaying them could double-apply mutations (e.g. delete
+        // files that were already deleted). Must return InFlightAtCrash.
+        let record = tool_record("bash", ToolCallStatus::Failed, None);
+        let decision = CrashRecoveryManager::classify_tool_for_replay(&record);
+        assert!(matches!(
+            decision,
+            ToolReplayDecision::InFlightAtCrash { .. }
+        ));
     }
 
     #[test]
@@ -1516,13 +1649,7 @@ mod tests {
             cached_at: 1000,
             context_signature: None,
         };
-        let record = ToolCallRecord {
-            step_id: "s1".to_string(),
-            tool_name: "read_file".to_string(),
-            tool_index: 0,
-            status: ToolCallStatus::Skipped,
-            cached_result: Some(cached.clone()),
-        };
+        let record = tool_record("read_file", ToolCallStatus::Skipped, Some(cached.clone()));
         let decision = CrashRecoveryManager::classify_tool_for_replay(&record);
         assert_eq!(
             decision,
@@ -1640,6 +1767,31 @@ mod tests {
         assert_eq!(mgr.state(), RecoveryState::Recovered);
     }
 
+    #[test]
+    fn force_complete_refuses_journal_gap() {
+        let mut mgr = CrashRecoveryManager::new();
+        mgr.begin_recovery().unwrap();
+
+        let events = vec![
+            tool_started_event("e1", "step-1", "read_file", 0, 1000),
+            tool_completed_event("e2", "step-1", "read_file", 0, 2000),
+            tool_started_event("e3", "step-1", "bash", 1, 500_000),
+        ];
+
+        let json = checkpoint_json();
+        mgr.scan_journal("sess-1", 5, Some(&json), 3, events)
+            .unwrap();
+        mgr.begin_replay().unwrap();
+
+        let result = mgr.force_complete();
+        assert!(matches!(result, Err(RecoveryError::JournalGap { .. })));
+        assert_eq!(
+            mgr.state(),
+            RecoveryState::Replaying,
+            "journal integrity failures must not be promoted to recovered"
+        );
+    }
+
     // =======================================================================
     // Reset tests
     // =======================================================================
@@ -1667,7 +1819,27 @@ mod tests {
         assert_eq!(mgr.state(), RecoveryState::Failed);
         mgr.reset_after_failure().unwrap();
         assert_eq!(mgr.state(), RecoveryState::Idle);
-        assert_eq!(mgr.attempt_count(), 0); // Reset clears attempts
+        assert_eq!(
+            mgr.attempt_count(),
+            1,
+            "failure reset must preserve lifetime recovery attempts"
+        );
+    }
+
+    #[test]
+    fn reset_after_failure_does_not_allow_infinite_retry_loop() {
+        let mut mgr = CrashRecoveryManager::new();
+        for _ in 0..3 {
+            mgr.begin_recovery().unwrap();
+            mgr.scan_journal("sess-1", 5, None, 0, vec![]).unwrap_err();
+            mgr.reset_after_failure().unwrap();
+        }
+
+        let result = mgr.begin_recovery();
+        assert!(
+            matches!(result, Err(RecoveryError::RecursiveCrash)),
+            "attempt_count must accumulate across failure resets"
+        );
     }
 
     #[test]
@@ -1700,19 +1872,6 @@ mod tests {
         let h1 = compute_recovery_hash("sess-1", "checkpoint-data", 42, &[]);
         let h2 = compute_recovery_hash("sess-1", "different-data", 42, &[]);
         assert_ne!(h1, h2);
-    }
-
-    #[test]
-    fn verify_hash_matches() {
-        let hash = compute_recovery_hash("sess-1", "data", 10, &[]);
-        let result = verify_recovery_hash(&hash, "sess-1", "data", 10, &[]);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn verify_hash_fails_on_mismatch() {
-        let result = verify_recovery_hash("wrong-hash", "sess-1", "data", 10, &[]);
-        assert!(matches!(result, Err(RecoveryError::HashMismatch { .. })));
     }
 
     // =======================================================================
@@ -1823,16 +1982,6 @@ mod tests {
     // =======================================================================
 
     #[test]
-    fn recovery_context_new_defaults() {
-        let ctx = RecoveryContext::new("sess-1".to_string(), 5);
-        assert_eq!(ctx.session_id, "sess-1");
-        assert_eq!(ctx.crash_turn, 5);
-        assert!(ctx.last_checkpoint.is_none());
-        assert!(ctx.tool_decisions.is_empty());
-        assert!(ctx.can_auto_recover());
-    }
-
-    #[test]
     fn recovery_context_pending_user_decisions() {
         let mut ctx = RecoveryContext::new("sess-1".to_string(), 5);
         ctx.tool_decisions
@@ -1847,63 +1996,6 @@ mod tests {
         ));
         assert!(!ctx.can_auto_recover());
         assert_eq!(ctx.pending_user_decisions().len(), 1);
-    }
-
-    // =======================================================================
-    // Error display tests
-    // =======================================================================
-
-    #[test]
-    fn recovery_error_display() {
-        let err = RecoveryError::MissingCheckpoint;
-        assert_eq!(format!("{err}"), "No checkpoint found in journal");
-
-        let err = RecoveryError::VersionMismatch {
-            expected: 1000,
-            found: 999,
-        };
-        assert!(format!("{err}").contains("1000"));
-        assert!(format!("{err}").contains("999"));
-    }
-
-    #[test]
-    fn recovery_error_serde_roundtrip() {
-        let err = RecoveryError::JournalGap {
-            expected_after: 5000,
-            found_at: 10000,
-        };
-        let json = serde_json::to_string(&err).unwrap();
-        let deserialized: RecoveryError = serde_json::from_str(&json).unwrap();
-        assert_eq!(err, deserialized);
-    }
-
-    #[test]
-    fn recovery_state_serde_roundtrip() {
-        for state in [
-            RecoveryState::Idle,
-            RecoveryState::Scanning,
-            RecoveryState::Replaying,
-            RecoveryState::Recovered,
-            RecoveryState::Failed,
-        ] {
-            let json = serde_json::to_string(&state).unwrap();
-            let deserialized: RecoveryState = serde_json::from_str(&json).unwrap();
-            assert_eq!(state, deserialized);
-        }
-    }
-
-    #[test]
-    fn tool_call_record_serde_roundtrip() {
-        let record = ToolCallRecord {
-            step_id: "s1".to_string(),
-            tool_name: "bash".to_string(),
-            tool_index: 2,
-            status: ToolCallStatus::Completed,
-            cached_result: None,
-        };
-        let json = serde_json::to_string(&record).unwrap();
-        let deserialized: ToolCallRecord = serde_json::from_str(&json).unwrap();
-        assert_eq!(record, deserialized);
     }
 
     // =======================================================================

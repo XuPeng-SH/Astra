@@ -242,6 +242,9 @@ pub struct StepRecorder {
     checkpoint_count: u32,
     /// Optional file-backed persistence (JSONL) for events
     file_store: Option<FileBackedEventStore>,
+    persistence_required: bool,
+    persisted_tail_event_id: Option<String>,
+    persistence_error: Option<String>,
 }
 
 impl StepRecorder {
@@ -260,6 +263,9 @@ impl StepRecorder {
             phase_log: Vec::new(),
             checkpoint_count: 0,
             file_store: None,
+            persistence_required: false,
+            persisted_tail_event_id: None,
+            persistence_error: None,
         }
     }
 
@@ -268,9 +274,8 @@ impl StepRecorder {
     /// Scans existing checkpoints so `checkpoint_count` starts after the
     /// highest existing file number, preventing cross-turn overwrites.
     pub fn with_persistence(session_id: &str, task_id: &str) -> Self {
-        let file_store = FileBackedEventStore::new(session_id);
-        let events = file_store.all_events().to_vec();
-        let step_sequence = next_step_sequence(&events);
+        let file_store = FileBackedEventStore::empty(session_id);
+        let persisted_summary = persisted_event_summary(session_id);
         let existing_max = crate::step_checkpoint::list_checkpoints(session_id)
             .unwrap_or_default()
             .iter()
@@ -279,9 +284,11 @@ impl StepRecorder {
             .unwrap_or(0);
         Self {
             file_store: Some(file_store),
-            events,
-            step_sequence,
+            persistence_required: true,
+            events: Vec::new(),
+            step_sequence: persisted_summary.next_step_sequence,
             checkpoint_count: existing_max.saturating_add(1),
+            persisted_tail_event_id: persisted_summary.tail_event_id,
             ..Self::new(session_id, task_id)
         }
     }
@@ -305,9 +312,24 @@ impl StepRecorder {
             .unwrap_or(0);
         self.checkpoint_count = self.checkpoint_count.max(existing_max.saturating_add(1));
 
-        let mut file_store = FileBackedEventStore::new(session_id);
+        let persisted_summary = persisted_event_summary(session_id);
+        self.step_sequence = self.step_sequence.max(persisted_summary.next_step_sequence);
+        self.persisted_tail_event_id = if self.events.is_empty() {
+            persisted_summary.tail_event_id
+        } else {
+            None
+        };
+        let mut file_store = FileBackedEventStore::empty(session_id);
+        self.persistence_required = true;
         for event in &self.events {
-            file_store.append(event.clone());
+            if let Err(error) = file_store.append(event.clone()) {
+                self.record_persistence_error(format!(
+                    "failed to attach step-event persistence for {}: {}",
+                    event.event_id, error
+                ));
+                self.file_store = None;
+                return;
+            }
         }
         self.file_store = Some(file_store);
     }
@@ -992,6 +1014,11 @@ impl StepRecorder {
         &self.events
     }
 
+    /// Last durable event persistence error, if any.
+    pub fn persistence_error(&self) -> Option<&str> {
+        self.persistence_error.as_deref()
+    }
+
     /// Get current step reference.
     pub fn current_step(&self) -> Option<&Step> {
         self.current_step.as_ref()
@@ -1096,6 +1123,16 @@ impl StepRecorder {
         }
     }
 
+    fn caused_by_for_next_event(&self) -> Vec<String> {
+        if let Some(event) = self.events.last() {
+            return vec![event.event_id.clone()];
+        }
+        self.persisted_tail_event_id
+            .as_ref()
+            .map(|event_id| vec![event_id.clone()])
+            .unwrap_or_default()
+    }
+
     fn emit(&mut self, step_id: &str, event_type: StepEventType) {
         let event = StepEvent {
             event_id: format!("evt-{}-{}", self.events.len(), epoch_ms()),
@@ -1103,24 +1140,11 @@ impl StepRecorder {
             step_id: step_id.to_string(),
             event_type,
             agent_id: None,
-            caused_by: if self.events.is_empty() {
-                vec![]
-            } else {
-                vec![
-                    self.events
-                        .last()
-                        .expect("events non-empty")
-                        .event_id
-                        .clone(),
-                ]
-            },
+            caused_by: self.caused_by_for_next_event(),
             payload: Some(self.trace_context_payload()),
             created_at: epoch_ms(),
         };
-        if let Some(ref mut fs) = self.file_store {
-            fs.append(event.clone());
-        }
-        self.events.push(event);
+        self.append_recorded_event(event);
     }
 
     fn emit_with_payload(&mut self, event_type: StepEventType, payload: serde_json::Value) {
@@ -1128,17 +1152,7 @@ impl StepRecorder {
             .current_step
             .as_ref()
             .map_or("unknown".to_string(), |s| s.step_id().to_string());
-        let caused_by = if self.events.is_empty() {
-            vec![]
-        } else {
-            vec![
-                self.events
-                    .last()
-                    .expect("events non-empty")
-                    .event_id
-                    .clone(),
-            ]
-        };
+        let caused_by = self.caused_by_for_next_event();
         let event = StepEvent {
             event_id: format!("evt-{}-{}", self.events.len(), epoch_ms()),
             canonical_event_id: None,
@@ -1149,10 +1163,33 @@ impl StepRecorder {
             payload: Some(self.with_trace_context(payload)),
             created_at: epoch_ms(),
         };
+        self.append_recorded_event(event);
+    }
+
+    fn append_recorded_event(&mut self, event: StepEvent) {
         if let Some(ref mut fs) = self.file_store {
-            fs.append(event.clone());
+            if let Err(error) = fs.append(event.clone()) {
+                self.record_persistence_error(format!(
+                    "failed to persist step event {}: {}",
+                    event.event_id, error
+                ));
+                if self.persistence_required {
+                    return;
+                }
+            }
+        } else if self.persistence_required {
+            self.record_persistence_error(format!(
+                "step-event persistence unavailable; dropping event {}",
+                event.event_id
+            ));
+            return;
         }
         self.events.push(event);
+    }
+
+    fn record_persistence_error(&mut self, message: String) {
+        astra_core::agent_warn!("event_store", "{}", message);
+        self.persistence_error = Some(message);
     }
 
     fn trace_context_payload(&self) -> serde_json::Value {
@@ -1223,27 +1260,49 @@ fn rebind_step_id(step_id: &mut String, previous_session_id: &str, session_id: &
     }
 }
 
-fn next_step_sequence(events: &[StepEvent]) -> u32 {
-    events
-        .iter()
-        .filter_map(|event| {
+#[derive(Default)]
+struct PersistedEventSummary {
+    next_step_sequence: u32,
+    tail_event_id: Option<String>,
+}
+
+fn persisted_event_summary(session_id: &str) -> PersistedEventSummary {
+    let mut max_sequence = None;
+    let mut tail_event_id = None;
+    if let Err(error) = FileBackedEventStore::for_each_event(session_id, |event| {
+        if let Some(sequence) = step_sequence_from_event(event) {
+            max_sequence = Some(max_sequence.map_or(sequence, |max: u32| max.max(sequence)));
+        }
+        tail_event_id = Some(event.event_id.clone());
+    }) {
+        astra_core::agent_warn!(
+            "step_recorder",
+            "Failed to scan persisted step sequence for session {}: {}",
+            session_id,
+            error
+        );
+    }
+    PersistedEventSummary {
+        next_step_sequence: max_sequence.map_or(0, |seq| seq.saturating_add(1)),
+        tail_event_id,
+    }
+}
+
+fn step_sequence_from_event(event: &StepEvent) -> Option<u32> {
+    event
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.get("trace_context"))
+        .and_then(|ctx| ctx.get("step_sequence"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|seq| u32::try_from(seq).ok())
+        .or_else(|| {
             event
-                .payload
-                .as_ref()
-                .and_then(|payload| payload.get("trace_context"))
-                .and_then(|ctx| ctx.get("step_sequence"))
-                .and_then(serde_json::Value::as_u64)
-                .and_then(|seq| u32::try_from(seq).ok())
-                .or_else(|| {
-                    event
-                        .step_id
-                        .rsplit("-step-")
-                        .next()
-                        .and_then(|seq| seq.parse::<u32>().ok())
-                })
+                .step_id
+                .rsplit("-step-")
+                .next()
+                .and_then(|seq| seq.parse::<u32>().ok())
         })
-        .max()
-        .map_or(0, |seq| seq.saturating_add(1))
 }
 
 /// Summary of a recorded session for debugging/audit.
@@ -1845,6 +1904,23 @@ mod tests {
     }
 
     #[test]
+    fn required_persistence_drops_new_events_after_attach_failure() {
+        let mut rec = StepRecorder::new("ephemeral", "task-1");
+        rec.begin_turn(0);
+        rec.attach_persistence("../invalid-session-id");
+        let events_after_failed_attach = rec.events().len();
+
+        rec.record_plan(&["bash".into()], 0.9, 0.0, 4000);
+
+        assert!(rec.persistence_error().is_some());
+        assert_eq!(
+            rec.events().len(),
+            events_after_failed_attach,
+            "required persistence must fail closed instead of reverting to memory-only events"
+        );
+    }
+
+    #[test]
     fn with_persistence_continues_step_sequence_and_causal_chain_across_recorders() {
         let tmp = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
@@ -1857,6 +1933,10 @@ mod tests {
         drop(first);
 
         let mut second = StepRecorder::with_persistence(sid, "task-2");
+        assert!(
+            second.events().is_empty(),
+            "persistent recorder must not materialize historical journals into memory"
+        );
         second.begin_turn_with_context(1, 0);
 
         assert_eq!(

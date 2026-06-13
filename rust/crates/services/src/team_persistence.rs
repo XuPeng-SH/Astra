@@ -379,6 +379,7 @@ pub fn resolve_team(
         user_id: team.user_id.clone(),
         depth: 0,
         context,
+        execution_metadata: None,
     };
 
     Ok((request, profiles))

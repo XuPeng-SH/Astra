@@ -6,8 +6,7 @@ use crate::cli::workspace_trust::{
     evaluate_workspace_trust, project_permissions_hash,
 };
 use astra_runtime::tool_sandbox::{
-    CommandRisk, GitSafetyViolation, analyze_command_risks, is_dangerous_file_path,
-    validate_git_command,
+    CommandRisk, GitSafetyViolation, analyze_command_risks, validate_git_command,
 };
 use astra_thin_client::ApprovalKind;
 use astra_turn_core::cloud_approval_policy::{
@@ -22,6 +21,7 @@ use astra_turn_core::permission::match_target::{
     AllowMatchTarget, default_match_target, fingerprint_for_match_target,
 };
 use astra_turn_core::permission::memory_profile::resolved_write_path;
+use astra_turn_core::permission::path_sensitivity::sensitive_path_token_for_tool_args;
 use astra_turn_core::tool_argument_hints::{
     command_hint_from_args, path_hint_from_args, permission_prompt_display_label,
 };
@@ -514,10 +514,10 @@ fn push_unique_fingerprint(
 fn cloud_detail_is_sensitive(tool: &str, detail: Option<&str>) -> bool {
     match (cloud_gated_tool_kind(tool), detail) {
         (Some(CloudGatedToolKind::Execute), Some(cmd)) => {
-            sensitive_path_match(&serde_json::json!({ "command": cmd })).is_some()
+            sensitive_path_match_for_request(tool, &serde_json::json!({ "command": cmd })).is_some()
         }
         (Some(CloudGatedToolKind::Write), Some(path)) => {
-            sensitive_path_match(&serde_json::json!({ "path": path })).is_some()
+            sensitive_path_match_for_request(tool, &serde_json::json!({ "path": path })).is_some()
         }
         _ => false,
     }
@@ -565,21 +565,11 @@ fn stored_override_allows_sensitive_path(
 }
 
 fn sensitive_path_match(args: &serde_json::Value) -> Option<String> {
-    if let Some(path) = path_hint_from_args(args)
-        && !path.is_empty()
-        && (is_dangerous_file_path(&path)
-            || astra_turn_core::permission::redact::matches_sensitive_path(&path))
-    {
-        return Some(path);
-    }
-    if let Some(cmd) = command_hint_from_args(args)
-        && !cmd.is_empty()
-        && (is_dangerous_file_path(cmd)
-            || astra_turn_core::permission::redact::matches_sensitive_path(cmd))
-    {
-        return Some(cmd.to_string());
-    }
-    None
+    sensitive_path_match_for_request("__unknown_mutating_tool__", args)
+}
+
+fn sensitive_path_match_for_request(tool_name: &str, args: &serde_json::Value) -> Option<String> {
+    sensitive_path_token_for_tool_args(tool_name, args)
 }
 
 // ─── Permission types: re-exports from astra-turn-core ──────────────
@@ -2347,17 +2337,17 @@ impl PermissionManager {
     }
 
     /// Check if a file path targets a dangerous location.
-    fn check_dangerous_path(_name: &str, args: &serde_json::Value) -> Option<&'static str> {
+    fn check_dangerous_path(name: &str, args: &serde_json::Value) -> Option<&'static str> {
         if let Some(ref path) = path_hint_from_args(args)
             && !path.is_empty()
-            && is_dangerous_file_path(path)
+            && sensitive_path_match_for_request(name, args).is_some()
         {
             return Some("⚠️ Targets a sensitive file path — requires manual approval");
         }
         // Also check command arguments for file write tools.
         if let Some(cmd) = command_hint_from_args(args)
             && !cmd.is_empty()
-            && is_dangerous_file_path(cmd)
+            && sensitive_path_match_for_request(name, args).is_some()
         {
             return Some("⚠️ Command references a sensitive file path");
         }
@@ -2599,7 +2589,7 @@ impl PermissionManager {
                 let remember_preview = astra_turn_core::permission::match_target::remember_preview(
                     tool, &rule_args, location,
                 );
-                if sensitive_path_match(&rule_args).is_some() {
+                if sensitive_path_match_for_request(tool, &rule_args).is_some() {
                     eprintln!(
                         "{}",
                         cloud_always_feedback_message(
@@ -6848,6 +6838,64 @@ mod tests {
         assert!(
             matches!(d3, PermissionDecision::Allow),
             "allow_sensitive_path_writes opt-in should let Auto mode proceed, got {d3:?}"
+        );
+    }
+
+    #[test]
+    fn sensitive_path_gate_ignores_internal_tool_result_pipeline() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_root = dir.path().join("sessions");
+        let _guard = astra_services::session_journal::JournalDirGuard::new(&sessions_root);
+        let artifact_path = sessions_root.join("session-1/tool-results/call_abc.txt");
+        std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
+        std::fs::write(&artifact_path, "{\"ok\":true}").unwrap();
+        let artifact_path = artifact_path.to_string_lossy().to_string();
+        let args = serde_json::json!({
+            "command": format!("cat {artifact_path} | python3 -c 'import sys, json; print(json.load(sys.stdin))'")
+        });
+
+        assert_eq!(
+            super::sensitive_path_match_for_request("bash", &args),
+            None,
+            "agent-generated tool-result artifacts must not trip the sensitive-path opt-in gate"
+        );
+    }
+
+    #[test]
+    fn sensitive_path_gate_rejects_internal_artifact_mixed_with_secret_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_root = dir.path().join("sessions");
+        let _guard = astra_services::session_journal::JournalDirGuard::new(&sessions_root);
+        let artifact_path = sessions_root.join("session-1/tool-results/call_abc.txt");
+        std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
+        std::fs::write(&artifact_path, "child output").unwrap();
+        let artifact_path = artifact_path.to_string_lossy().to_string();
+        let args = serde_json::json!({
+            "command": format!("cat {artifact_path} ~/.ssh/id_rsa")
+        });
+
+        assert!(
+            super::sensitive_path_match_for_request("bash", &args).is_some(),
+            "a safe internal artifact must not mask a separate sensitive path"
+        );
+    }
+
+    #[test]
+    fn sensitive_path_gate_rejects_arbitrary_astra_tool_result_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let artifact_path = dir
+            .path()
+            .join(".astra/sessions/session-1/tool-results/call_abc.txt");
+        std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
+        std::fs::write(&artifact_path, "{\"ok\":true}").unwrap();
+        let artifact_path = artifact_path.to_string_lossy().to_string();
+        let args = serde_json::json!({
+            "command": format!("cat {artifact_path}")
+        });
+
+        assert!(
+            super::sensitive_path_match_for_request("bash", &args).is_some(),
+            "only artifacts under the configured sessions root may bypass the sensitive-path gate"
         );
     }
 

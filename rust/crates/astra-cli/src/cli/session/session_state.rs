@@ -338,6 +338,14 @@ pub(crate) struct SessionState {
     /// Full context-assembly trace from the last successfully committed turn.
     pub latest_context_assembly_trace:
         Option<astra_turn_core::context_assembly_trace::ContextAssemblyTrace>,
+    /// Serialized context-pipeline state restored from the latest heavy checkpoint.
+    pub runtime_pipeline_state: Option<serde_json::Value>,
+    /// Serialized compaction effectiveness tracker restored from the latest heavy checkpoint.
+    pub runtime_compaction_state: Option<serde_json::Value>,
+    /// Consecutive context-window failures restored from the latest heavy checkpoint.
+    pub runtime_consecutive_context_window_errors: u32,
+    /// Tool replay guard rebuilt from step events on resume.
+    pub runtime_idempotency_cache: Option<astra_pipeline::step_protocol::InMemoryIdempotencyCache>,
     /// Unified skill registry (single source of truth for all skill resolution).
     pub unified_skill_registry: std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
     /// Session-scoped skill quality tracker for learning loop.
@@ -535,6 +543,12 @@ pub(crate) struct SessionState {
     /// Shared command queue for background task operations.
     /// The tool executor pushes spawn/kill/output commands; the TUI drains them.
     pub bg_task_commands: std::sync::Arc<std::sync::Mutex<Vec<crate::edge_tools::BgTaskCommand>>>,
+    /// Shared background task list cache.
+    /// The TUI event loop writes the rendered task-list XML here every tick
+    /// (not just on-demand) so [`ToolExecutor::task_list_bg`] can read the
+    /// latest snapshot directly without serializing through the BG command
+    /// queue, completely avoiding event-loop tick latency.
+    pub bg_task_list_cache: std::sync::Arc<tokio::sync::RwLock<String>>,
     /// Shared detach slot for bash Ctrl+B promotion. Always present
     /// (cheap to construct); when the TUI is attached it's wired
     /// into the executor's ToolContext so each bash invocation can
@@ -637,6 +651,10 @@ impl Default for SessionState {
             last_turn_event: None,
             session_persistence_error: None,
             latest_context_assembly_trace: None,
+            runtime_pipeline_state: None,
+            runtime_compaction_state: None,
+            runtime_consecutive_context_window_errors: 0,
+            runtime_idempotency_cache: None,
             unified_skill_registry: astra_runtime::skills::default_unified_registry().clone(),
             skill_quality_tracker: astra_skills::quality::SkillQualityTracker::new(),
             skill_search: astra_core::SkillSearchSettings::default(),
@@ -709,6 +727,7 @@ impl Default for SessionState {
             turns_since_task_use: 0,
             turns_since_task_reminder: 0,
             bg_task_commands: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            bg_task_list_cache: std::sync::Arc::new(tokio::sync::RwLock::new(String::new())),
             bash_detach_slot: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             #[cfg(feature = "harness")]
             harness_sink: astra_harness::InMemorySnapshotSink::arc(),
@@ -739,6 +758,13 @@ impl SessionState {
         self.resume_restricted_tools.clear();
     }
 
+    fn clear_runtime_recovery_state(&mut self) {
+        self.runtime_pipeline_state = None;
+        self.runtime_compaction_state = None;
+        self.runtime_consecutive_context_window_errors = 0;
+        self.runtime_idempotency_cache = None;
+    }
+
     /// Set the current session id and keep the Tier 1 task manager in sync
     /// (so `session_todos` reads/writes hit the correct session). Prefer
     /// this over `self.session_id = Some(...)` at any path that rebinds
@@ -757,6 +783,7 @@ impl SessionState {
         self.perm_manager.clear_active_session_id();
         self.session_id = None;
         self.clear_resume_recovery_state();
+        self.clear_runtime_recovery_state();
         self.session_persistence_error = None;
     }
 
@@ -796,6 +823,7 @@ impl SessionState {
         self.last_turn_event = None;
         self.session_persistence_error = None;
         self.latest_context_assembly_trace = None;
+        self.clear_runtime_recovery_state();
         self.durable_task_state = None;
         self.last_delivery_report = None;
         self.plan_execution_last_error = None;
@@ -1027,12 +1055,31 @@ mod default_tests {
 
     #[test]
     fn clear_session_id_clears_resume_recovery_fields() {
+        let mut idempotency_cache = astra_pipeline::step_protocol::InMemoryIdempotencyCache::new();
+        let idem_key = astra_pipeline::step_protocol::IdempotencyKey::semantic(
+            "read_file",
+            &serde_json::json!({"path": "src/lib.rs"}),
+        );
+        idempotency_cache.record(
+            &idem_key,
+            astra_pipeline::step_protocol::CachedToolResult {
+                tool_name: "read_file".into(),
+                output: "old session contents".into(),
+                is_error: false,
+                cached_at: 1,
+                context_signature: None,
+            },
+        );
         let mut state = SessionState {
             session_id: Some("sess-1".into()),
             resume_guidance: Some("resume".into()),
             resume_restricted_tools: vec!["read_file".into()],
             plan_mode_sync_error: Some("sync".into()),
             session_persistence_error: Some("journal append failed".into()),
+            runtime_pipeline_state: Some(serde_json::json!({"old_session": true})),
+            runtime_compaction_state: Some(serde_json::json!({"attempt_count": 3})),
+            runtime_consecutive_context_window_errors: 2,
+            runtime_idempotency_cache: Some(idempotency_cache),
             ..Default::default()
         };
 
@@ -1043,6 +1090,10 @@ mod default_tests {
         assert!(state.resume_restricted_tools.is_empty());
         assert!(state.plan_mode_sync_error.is_none());
         assert!(state.session_persistence_error.is_none());
+        assert!(state.runtime_pipeline_state.is_none());
+        assert!(state.runtime_compaction_state.is_none());
+        assert_eq!(state.runtime_consecutive_context_window_errors, 0);
+        assert!(state.runtime_idempotency_cache.is_none());
     }
 
     #[test]

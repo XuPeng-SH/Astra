@@ -17,7 +17,6 @@ use std::time::Instant;
 
 use astra_core::RuntimeLimits;
 use astra_runtime::{
-    pipeline::step_protocol::InMemoryIdempotencyCache,
     pipeline::step_recorder::StepRecorder,
     semantic_dedup::SemanticDedup,
     tool_registry::ToolRegistry,
@@ -112,6 +111,16 @@ fn circuit_breaker_config_from_tool_selection(
             "circuit_breaker_absolute_max_rounds"
         ),
     }
+}
+
+fn restored_compaction_effectiveness(
+    compaction_state: Option<&serde_json::Value>,
+) -> astra_runtime::turn::compaction_replay::CompactionEffectivenessTracker {
+    compaction_state
+        .map(
+            astra_runtime::turn::compaction_replay::CompactionEffectivenessTracker::from_json_lossy,
+        )
+        .unwrap_or_default()
 }
 
 async fn finalize_root_mailbox(
@@ -253,6 +262,11 @@ pub(crate) async fn stream_chat_sse(
         } else {
             ex
         };
+        let ex = if let Some(ref cache) = p.bg_task_list_cache {
+            ex.with_bg_task_list_cache(cache.clone())
+        } else {
+            ex
+        };
         let ex = if let Some(ref slot) = p.bash_detach_slot {
             ex.with_bash_detach_slot(slot.clone())
         } else {
@@ -288,6 +302,7 @@ pub(crate) async fn stream_chat_sse(
                 active_skills: Vec::new(), // root agent — no inherited skills
                 live_event_sink: p.agent_live_event_sink.clone(),
                 trace_context: None,
+                execution_metadata: None,
             };
             ex.with_spawn_context(spawn_ctx)
         } else {
@@ -655,7 +670,7 @@ pub(crate) async fn stream_chat_sse(
         boosted_tools: HashSet::new(),
         widen_selection_pending: false,
         step_recorder,
-        idempotency_cache: InMemoryIdempotencyCache::new(),
+        idempotency_cache: p.idempotency_cache.unwrap_or_default(),
         semantic_dedup: SemanticDedup::new(
             astra_runtime::semantic_dedup::DEFAULT_SIMILARITY_THRESHOLD,
         ),
@@ -784,8 +799,8 @@ pub(crate) async fn stream_chat_sse(
         data_snapshot_provider: None,
         last_composite_snapshot: None,
         last_measured_prompt_tokens: None,
-        consecutive_context_window_errors: 0,
-        compaction_effectiveness: Default::default(),
+        consecutive_context_window_errors: p.consecutive_context_window_errors,
+        compaction_effectiveness: restored_compaction_effectiveness(p.compaction_state.as_ref()),
         pinned_tool_schema_tokens: pinned_schema_tokens,
         sticky_tool_schemas: Vec::new(),
         max_turn_input_tokens: RuntimeLimits::global().effective_max_turn_input_tokens(p.model),
@@ -1054,9 +1069,11 @@ mod tests {
     use super::{
         circuit_breaker_config_from_tool_selection, detect_turn_hook_sets,
         extend_restricted_with_blocked_tools, normalize_turn_model,
+        restored_compaction_effectiveness,
     };
     use astra_runtime::observability::ObservabilityHub;
     use astra_turn_core::chat_turn_heuristics::infer_task_execution_profile;
+    use serde_json::json;
     use std::collections::HashSet;
     use std::path::Path;
     use std::sync::Arc;
@@ -1075,6 +1092,23 @@ mod tests {
         assert_eq!(cfg.max_introspect_emissions, 3);
         assert_eq!(cfg.half_open_patience, 2);
         assert_eq!(cfg.absolute_max_rounds, 200);
+    }
+
+    #[test]
+    fn restored_compaction_effectiveness_decodes_checkpoint_tracker() {
+        let tracker = restored_compaction_effectiveness(Some(&json!({
+            "last_tokens_freed": 4000,
+            "last_was_insufficient": true,
+            "cumulative_tokens_freed": 15000,
+            "attempt_count": 3,
+            "consecutive_futile_attempts": 2,
+        })));
+
+        assert_eq!(tracker.last_tokens_freed, 4000);
+        assert!(tracker.last_was_insufficient);
+        assert_eq!(tracker.cumulative_tokens_freed, 15000);
+        assert_eq!(tracker.attempt_count, 3);
+        assert_eq!(tracker.consecutive_futile_attempts, 2);
     }
 
     #[test]

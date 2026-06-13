@@ -175,16 +175,12 @@ export const MessageBubble = memo(function MessageBubble({
     isLikelyOrphanStreamingReasoning(rawContent);
   const content = orphanStreamingReasoning ? "" : rawContent;
   const reasoning = orphanStreamingReasoning ? rawContent : rawReasoning;
+  const hasReasoning = Boolean(reasoning.trim());
   const reasoningStreaming =
-    message.reasoningStatus === "streaming" ||
+    (message.reasoningStatus === "streaming" && hasReasoning) ||
     splitContent.reasoningOpen ||
     orphanStreamingReasoning;
-  const hasReasoning = Boolean(reasoning.trim());
-  const showReasoning =
-    !isUser &&
-    (hasReasoning ||
-      message.reasoningStatus === "streaming" ||
-      (message.status === "streaming" && reasoningStreaming));
+  const showReasoning = !isUser && (hasReasoning || reasoningStreaming);
   const isStreamingEmpty =
     message.status === "streaming" && !content.trim() && !hasReasoning;
   if (isUser) {
@@ -252,20 +248,22 @@ export const MessageBubble = memo(function MessageBubble({
 function AssistantTypingIndicator() {
   return (
     <div
-      className="mb-2 inline-flex items-center gap-1.5 rounded-[18px] rounded-bl-md bg-surface-muted px-4 py-3"
+      className="mb-2 inline-flex items-center rounded-[18px] rounded-bl-md bg-surface-muted px-4 py-3 text-text-muted"
       aria-label="Astra is responding"
       role="status"
       aria-live="polite"
     >
-      <span className="size-2 animate-bounce rounded-full bg-text-muted" />
-      <span
-        className="size-2 animate-bounce rounded-full bg-text-muted"
-        style={{ animationDelay: "120ms" }}
-      />
-      <span
-        className="size-2 animate-bounce rounded-full bg-text-muted"
-        style={{ animationDelay: "240ms" }}
-      />
+      <span className="inline-flex items-center gap-1.5" aria-hidden="true">
+        <span className="size-1.5 animate-bounce rounded-full bg-text-muted" />
+        <span
+          className="size-1.5 animate-bounce rounded-full bg-text-muted"
+          style={{ animationDelay: "120ms" }}
+        />
+        <span
+          className="size-1.5 animate-bounce rounded-full bg-text-muted"
+          style={{ animationDelay: "240ms" }}
+        />
+      </span>
     </div>
   );
 }

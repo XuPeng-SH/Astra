@@ -189,6 +189,10 @@ pub struct SubRunConfig {
     pub checkpoint_gate: Option<Arc<dyn CheckpointGate>>,
     /// Optional mailbox for inter-agent messaging during the sub-run.
     pub mailbox: Option<astra_messaging::router::AgentMailbox>,
+    /// Optional progress emitter for broadcasting child turn events.
+    pub progress_emitter: Option<crate::orchestration::AgentProgressEmitter>,
+    /// Optional live-event sink for child token/tool/status mirroring.
+    pub live_event_sink: Option<astra_turn_core::agent_live_event::SharedAgentLiveEventSink>,
     /// Cancellation token — when cancelled, the sub-run should stop gracefully.
     pub cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
     /// Resolved parent prefix for prompt-cache inheritance on the
@@ -199,6 +203,8 @@ pub struct SubRunConfig {
     /// `ServerAgenticLoopHost`) can ignore this field — the child
     /// runs fresh, same behavior as pre-fork-prefix.
     pub inherited_prefix: Option<crate::orchestration::InheritedChildPrefix>,
+    /// UI/runtime execution binding metadata inherited by this sub-run.
+    pub execution_metadata: Option<serde_json::Value>,
     /// Parent session's harness snapshot sink for observe-only sub-run
     /// observation. When set, the sub-run creates a sink-only HarnessSlot
     /// so sub-run snapshots appear in the parent's history.
@@ -223,6 +229,8 @@ impl std::fmt::Debug for SubRunConfig {
             .field("pause_flag", &self.pause_flag.is_some())
             .field("checkpoint_gate", &self.checkpoint_gate.is_some())
             .field("mailbox", &self.mailbox.is_some())
+            .field("progress_emitter", &self.progress_emitter.is_some())
+            .field("live_event_sink", &self.live_event_sink.is_some())
             .finish()
     }
 }
@@ -669,6 +677,7 @@ impl DelegationTracker {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis() as u64,
+                metadata: None,
             });
         }
 
@@ -1147,6 +1156,7 @@ impl DelegationTracker {
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_millis() as u64,
+                        metadata: None,
                     });
                 }
             }
@@ -2248,8 +2258,11 @@ impl DelegationEngine {
                 pause_flag: Some(pause_flag),
                 checkpoint_gate: None,
                 mailbox,
+                progress_emitter: None,
+                live_event_sink: None,
                 cancel_token: Some(child_cancel),
                 inherited_prefix,
+                execution_metadata: request.execution_metadata.clone(),
                 #[cfg(feature = "harness")]
                 harness_sink: None,
             });
@@ -2533,8 +2546,11 @@ impl DelegationEngine {
                                 pause_flag: None,
                                 checkpoint_gate: None,
                                 mailbox: None,
+                                progress_emitter: None,
+                                live_event_sink: None,
                                 cancel_token: cancel_for_retry.clone(),
                                 inherited_prefix,
+                                execution_metadata: request.execution_metadata.clone(),
                                 #[cfg(feature = "harness")]
                                 harness_sink: None,
                             }
@@ -2711,8 +2727,11 @@ impl DelegationEngine {
                 pause_flag: Some(pause_flag),
                 checkpoint_gate: None,
                 mailbox,
+                progress_emitter: None,
+                live_event_sink: None,
                 cancel_token: Some(child_cancel),
                 inherited_prefix: None,
+                execution_metadata: request.execution_metadata.clone(),
                 #[cfg(feature = "harness")]
                 harness_sink: None,
             };
@@ -2821,8 +2840,11 @@ impl DelegationEngine {
                         pause_flag: None,
                         checkpoint_gate: None,
                         mailbox: None,
+                        progress_emitter: None,
+                        live_event_sink: None,
                         cancel_token: cancel_for_retry.clone(),
                         inherited_prefix: None,
+                        execution_metadata: request.execution_metadata.clone(),
                         #[cfg(feature = "harness")]
                         harness_sink: None,
                     },
@@ -3007,8 +3029,11 @@ impl DelegationEngine {
                 pause_flag: Some(prod_pause.clone()),
                 checkpoint_gate: None,
                 mailbox: prod_mailbox,
+                progress_emitter: None,
+                live_event_sink: None,
                 cancel_token: cancel_token.cloned(),
                 inherited_prefix: None,
+                execution_metadata: request.execution_metadata.clone(),
                 #[cfg(feature = "harness")]
                 harness_sink: None,
             };
@@ -3111,8 +3136,11 @@ impl DelegationEngine {
                         pause_flag: None,
                         checkpoint_gate: None,
                         mailbox: None,
+                        progress_emitter: None,
+                        live_event_sink: None,
                         cancel_token: cancel_for_retry.clone(),
                         inherited_prefix: None,
+                        execution_metadata: request.execution_metadata.clone(),
                         #[cfg(feature = "harness")]
                         harness_sink: None,
                     },
@@ -3218,8 +3246,11 @@ impl DelegationEngine {
                 pause_flag: Some(rev_pause),
                 checkpoint_gate: None,
                 mailbox: rev_mailbox,
+                progress_emitter: None,
+                live_event_sink: None,
                 cancel_token: cancel_token.cloned(),
                 inherited_prefix: None,
+                execution_metadata: request.execution_metadata.clone(),
                 #[cfg(feature = "harness")]
                 harness_sink: None,
             };
@@ -3454,8 +3485,11 @@ impl DelegationEngine {
                 pause_flag: Some(pause_flag),
                 checkpoint_gate: None,
                 mailbox: fork_mailbox,
+                progress_emitter: None,
+                live_event_sink: None,
                 cancel_token: cancel_token.cloned(),
                 inherited_prefix: None,
+                execution_metadata: request.execution_metadata.clone(),
                 #[cfg(feature = "harness")]
                 harness_sink: None,
             };
@@ -3892,6 +3926,7 @@ mod tests {
             user_id: "user-1".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         }
     }
 
@@ -4006,6 +4041,7 @@ mod tests {
             user_id: "user-1".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         };
 
         let result = de.execute(req, "orch", None).await.unwrap();
@@ -4039,6 +4075,7 @@ mod tests {
             user_id: "user-1".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         };
 
         let result = de.execute(req, "orch", None).await.unwrap();
@@ -4067,6 +4104,7 @@ mod tests {
             user_id: "user-1".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         };
 
         let result = de.execute(req, "orch", None).await.unwrap();
@@ -4101,6 +4139,7 @@ mod tests {
             user_id: "u".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         };
 
         assert!(de.execute(req, "writer", None).await.is_err());
@@ -4124,6 +4163,7 @@ mod tests {
             user_id: "u".into(),
             depth: 5,
             context: HashMap::new(),
+            execution_metadata: None,
         };
 
         let err = de.execute(req, "orch", None).await.unwrap_err();
@@ -4147,6 +4187,7 @@ mod tests {
             user_id: "u".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         };
         let req2 = DelegationRequest {
             delegation_id: "del-B".into(),
@@ -4160,6 +4201,7 @@ mod tests {
             user_id: "u".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         };
 
         de.execute(req1, "orch", None).await.unwrap();
@@ -4353,6 +4395,7 @@ mod tests {
             user_id: "u".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         };
 
         let result = de.execute(req, "orch", None).await.unwrap();
@@ -4386,6 +4429,7 @@ mod tests {
             user_id: "u".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         };
 
         let result = de.execute(req, "orch", None).await.unwrap();
@@ -4442,6 +4486,7 @@ mod tests {
             user_id: "u".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         };
 
         let result = de.execute(req, "orch", None).await.unwrap();
@@ -4538,6 +4583,7 @@ mod tests {
             user_id: "u".into(),
             depth: 0,
             context: ctx,
+            execution_metadata: None,
         };
 
         let result = de.execute(req, "orch", None).await.unwrap();
@@ -4593,6 +4639,7 @@ mod tests {
             user_id: "u".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         };
 
         let result = de
@@ -4659,6 +4706,7 @@ mod tests {
             user_id: "u".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         };
 
         let result = de
@@ -4731,6 +4779,7 @@ mod tests {
                     .to_string(),
                 serde_json::json!({"authorization": "Bearer evil", "x-workspace-id": "ws-001"}),
             )]),
+            execution_metadata: None,
         };
 
         let result = de.execute(req, "orch", None).await.unwrap();
@@ -4882,6 +4931,7 @@ mod tests {
             user_id: "u".into(),
             depth: 0,
             context: ctx,
+            execution_metadata: None,
         };
 
         let result = de.execute(req, "orch", None).await.unwrap();
@@ -4918,8 +4968,11 @@ mod tests {
             pause_flag: None,
             checkpoint_gate: None,
             mailbox: None,
+            progress_emitter: None,
+            live_event_sink: None,
             cancel_token: None,
             inherited_prefix: None,
+            execution_metadata: None,
             #[cfg(feature = "harness")]
             harness_sink: None,
         };
@@ -5157,6 +5210,7 @@ mod tests {
             user_id: "user-1".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         };
         let result = de.execute(req, "orch", None).await.unwrap();
 
@@ -5184,6 +5238,7 @@ mod tests {
             user_id: "user-1".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         };
         let result = de.execute(req, "orch", None).await.unwrap();
 
@@ -5213,6 +5268,7 @@ mod tests {
             user_id: "user-1".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         };
         let result = de.execute(req, "orch", None).await.unwrap();
 
@@ -5452,6 +5508,7 @@ mod tests {
             user_id: "user-1".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         };
         let result = de.execute(req, "orch", None).await.unwrap();
 
@@ -5841,6 +5898,7 @@ mod tests {
             user_id: "user-1".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         }
     }
 
@@ -6140,6 +6198,7 @@ mod tests {
             user_id: "u".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         };
 
         let result = de.execute(req, "orch", None).await.unwrap();
@@ -6594,6 +6653,7 @@ mod tests {
             user_id: "u".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         };
 
         let result = de.execute(req, "orch", None).await.unwrap();
@@ -6634,6 +6694,7 @@ mod tests {
             user_id: "u".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         };
 
         let result = de.execute(req, "orch", None).await.unwrap();
@@ -6694,6 +6755,7 @@ mod tests {
             user_id: "u".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         };
 
         let result = de.execute(req, "orch", None).await.unwrap();
@@ -6730,6 +6792,7 @@ mod tests {
             user_id: "u".into(),
             depth: 0,
             context: HashMap::new(),
+            execution_metadata: None,
         };
 
         let result = de.execute(req, "orch", None).await.unwrap();

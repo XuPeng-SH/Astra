@@ -730,28 +730,36 @@ impl HybridRestoreService {
 
 /// Reads `composite_snapshots.json` from the session step-checkpoint directory.
 ///
-/// Must stay aligned with `astra_runtime::pipeline::step_checkpoint::read_composite_snapshot_index`
-/// (same path on disk). The services crate cannot depend on runtime due to a dependency cycle.
+/// Must stay aligned with `astra_pipeline::step_checkpoint::read_composite_snapshot_index`
+/// (same path and at-rest encryption).
 fn read_composite_snapshot_index_local(
     session_id: &str,
 ) -> Result<astra_core::composite_snapshot::CompositeSnapshotIndex, String> {
-    let path = composite_snapshots_json_path(session_id);
+    let path = composite_snapshots_json_path(session_id)?;
     if !path.exists() {
         return Ok(astra_core::composite_snapshot::CompositeSnapshotIndex::default());
     }
     let content = std::fs::read_to_string(&path)
         .map_err(|e| format!("read composite_snapshots.json: {e}"))?;
+    let Some(decrypted) = crate::checkpoint_crypto::decrypt_text(&content)
+        .map_err(|e| format!("decrypt composite_snapshots.json: {e}"))?
+    else {
+        return Err(format!(
+            "composite snapshot index decryption failed for {}",
+            path.display()
+        ));
+    };
     let mut index: astra_core::composite_snapshot::CompositeSnapshotIndex =
-        serde_json::from_str(&content)
+        serde_json::from_str(&decrypted)
             .map_err(|e| format!("parse composite_snapshots.json: {e}"))?;
     index.normalize_versions();
     Ok(index)
 }
 
-fn composite_snapshots_json_path(session_id: &str) -> PathBuf {
+fn composite_snapshots_json_path(session_id: &str) -> Result<PathBuf, String> {
     crate::local_session_artifact_store()
         .session_path(session_id, "step_checkpoints/composite_snapshots.json")
-        .expect("validated session_id must resolve composite snapshot path")
+        .map_err(|error| format!("invalid session_id: {error}"))
 }
 
 fn composite_snapshot_index_to_remote_artifact_record(
@@ -2520,6 +2528,50 @@ mod tests {
         let merged = merge_composite_snapshot_indexes(local, remote);
         assert_eq!(merged.snapshots.len(), 1);
         assert_eq!(merged.snapshots[0].label.as_deref(), Some("remote"));
+    }
+
+    #[test]
+    fn local_composite_snapshot_index_reads_encrypted_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = uuid::Uuid::new_v4().to_string();
+        let mut snapshot = astra_core::composite_snapshot::CompositeSnapshotBuilder::new(&sid, 3)
+            .session_state("000003-heavy.json")
+            .build();
+        snapshot.snapshot_id = "snap-encrypted".into();
+        let index = astra_core::composite_snapshot::CompositeSnapshotIndex {
+            snapshots: vec![snapshot],
+        };
+        let path = composite_snapshots_json_path(&sid).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let json = serde_json::to_string(&index).unwrap();
+        std::fs::write(
+            &path,
+            crate::checkpoint_crypto::encrypt_text(&json).unwrap(),
+        )
+        .unwrap();
+
+        let restored = read_composite_snapshot_index_local(&sid).unwrap();
+
+        assert_eq!(restored.snapshots.len(), 1);
+        assert_eq!(restored.snapshots[0].snapshot_id, "snap-encrypted");
+    }
+
+    #[test]
+    fn local_composite_snapshot_index_rejects_undecryptable_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = uuid::Uuid::new_v4().to_string();
+        let path = composite_snapshots_json_path(&sid).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "not-encrypted-json").unwrap();
+
+        let error = read_composite_snapshot_index_local(&sid).unwrap_err();
+
+        assert!(
+            error.contains("decryption failed"),
+            "corrupt local index must surface as restore error: {error}"
+        );
     }
 
     #[tokio::test]
