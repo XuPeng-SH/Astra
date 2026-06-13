@@ -5,9 +5,10 @@ use super::ToolExecutor;
 // ── expand_sandbox_path ──────────────────────────────────────────────────
 
 #[test]
-fn expand_sandbox_path_adds_directory() {
+fn expand_sandbox_path_adds_and_resolves() {
     let dir = tempfile::tempdir().unwrap();
     let exe = ToolExecutor::new(dir.path());
+
     // Before expansion: /etc is not allowed
     assert!(
         !exe.sandbox_policy
@@ -17,9 +18,12 @@ fn expand_sandbox_path_adds_directory() {
             .unwrap()
             .is_path_allowed(std::path::Path::new("/etc/passwd"))
     );
+    assert!(exe.resolve_checked("/etc/passwd").is_err());
+
     // Expand
     exe.expand_sandbox_path(PathBuf::from("/etc"));
-    // After expansion: /etc is allowed
+
+    // After expansion: /etc is allowed via both APIs
     assert!(
         exe.sandbox_policy
             .read()
@@ -28,6 +32,7 @@ fn expand_sandbox_path_adds_directory() {
             .unwrap()
             .is_path_allowed(std::path::Path::new("/etc/passwd"))
     );
+    assert!(exe.resolve_checked("/etc/passwd").is_ok());
 }
 
 #[test]
@@ -37,18 +42,6 @@ fn expand_sandbox_path_noop_without_policy() {
     *exe.sandbox_policy.write().unwrap() = None;
     // Should not panic
     exe.expand_sandbox_path(PathBuf::from("/etc"));
-}
-
-#[test]
-fn expand_sandbox_then_resolve_checked_succeeds() {
-    let dir = tempfile::tempdir().unwrap();
-    let exe = ToolExecutor::new(dir.path());
-    // Before: /etc/passwd is blocked
-    assert!(exe.resolve_checked("/etc/passwd").is_err());
-    // Expand to /etc
-    exe.expand_sandbox_path(PathBuf::from("/etc"));
-    // After: /etc/passwd is allowed
-    assert!(exe.resolve_checked("/etc/passwd").is_ok());
 }
 
 #[test]

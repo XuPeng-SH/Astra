@@ -4849,19 +4849,13 @@ mod tests {
     // ── Dangerous file paths ──────────────────────────────────────────────────
 
     #[test]
-    fn dangerous_path_detected_for_git_internal() {
+    fn dangerous_path_detection() {
         let args = serde_json::json!({"path": ".git/config"});
         assert!(PermissionManager::check_dangerous_path("write_file", &args).is_some());
-    }
 
-    #[test]
-    fn dangerous_path_detected_for_shell_config() {
         let args = serde_json::json!({"path": "/home/user/.bashrc"});
         assert!(PermissionManager::check_dangerous_path("write_file", &args).is_some());
-    }
 
-    #[test]
-    fn normal_path_not_flagged() {
         let args = serde_json::json!({"path": "src/main.rs"});
         assert!(PermissionManager::check_dangerous_path("write_file", &args).is_none());
     }
@@ -4869,24 +4863,15 @@ mod tests {
     // ── Git safety ────────────────────────────────────────────────────────────
 
     #[test]
-    fn git_safety_detects_force_push() {
+    fn git_safety_checks() {
         let args = serde_json::json!({"command": "git push --force origin main"});
-        let violations = PermissionManager::check_git_safety(&args);
-        assert!(!violations.is_empty());
-    }
+        assert!(!PermissionManager::check_git_safety(&args).is_empty());
 
-    #[test]
-    fn git_safety_allows_normal_push() {
         let args = serde_json::json!({"command": "git push origin main"});
-        let violations = PermissionManager::check_git_safety(&args);
-        assert!(violations.is_empty());
-    }
+        assert!(PermissionManager::check_git_safety(&args).is_empty());
 
-    #[test]
-    fn git_safety_detects_no_verify() {
         let args = serde_json::json!({"command": "git commit --no-verify -m 'skip hooks'"});
-        let violations = PermissionManager::check_git_safety(&args);
-        assert!(!violations.is_empty());
+        assert!(!PermissionManager::check_git_safety(&args).is_empty());
     }
 
     // ── Permission mode ──────────────────────────────────────────────────────
@@ -5212,206 +5197,56 @@ mod tests {
         );
     }
 
+    /// Data-driven: covers explicit user path trust for affirmative phrasing
+    /// (Chinese quoted/unquoted, English, ASCII brackets, full-width punctuation),
+    /// negation (Chinese/English), and substring false positives.
     #[test]
-    fn explicit_user_path_trust_allows_named_outside_file() {
+    fn explicit_user_path_trust_respects_intent_and_punctuation() {
+        let cases: Vec<(&str, &str, bool)> = vec![
+            // ── affirmative (Allow) ──
+            ("请读取 '{}', 然后修复问题", "notes.txt", true),
+            ("分析和修复: {}", "evidence.jsonl", true),
+            ("please read {}", "evidence.jsonl", true),
+            ("please read [{}]", "notes.txt", true),
+            ("分析和修复：{}", "evidence.jsonl", true),
+            // ── negated / false-positive (NeedApproval) ──
+            ("already {}", "notes.txt", false),
+            ("不要碰 {}", "passwd", false),
+            ("don't touch {}", "passwd", false),
+        ];
+
         let project = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        let target = outside.path().join("notes.txt");
-        std::fs::write(&target, "hello").unwrap();
 
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, project.path());
-        pm.trust_explicit_user_paths(&format!("请读取 '{}', 然后修复问题", target.display()));
+        for (idx, (template, filename, expect_allow)) in cases.iter().enumerate() {
+            let target = outside.path().join(filename);
+            std::fs::write(&target, "test").unwrap();
 
-        let args = serde_json::json!({
-            "reason": format!(
-                "Path '{}' is outside the project directory '{}'.",
-                target.display(),
-                project.path().display()
-            ),
-        });
-        let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
-        assert!(
-            matches!(decision, PermissionDecision::Allow),
-            "user-explicit file path should be trusted for this session; got {decision:?}"
-        );
-    }
+            let mut pm =
+                PermissionManager::with_project_mode(PermissionMode::Prompt, project.path());
+            pm.trust_explicit_user_paths(&template.replace("{}", &target.display().to_string()));
 
-    #[test]
-    fn explicit_user_path_trust_accepts_unquoted_action_target() {
-        let project = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let target = outside.path().join("evidence.jsonl");
-        std::fs::write(&target, "hello").unwrap();
+            let args = serde_json::json!({
+                "reason": format!(
+                    "Path '{}' is outside the project directory '{}'.",
+                    target.display(),
+                    project.path().display()
+                ),
+            });
+            let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
 
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, project.path());
-        pm.trust_explicit_user_paths(&format!("分析和修复: {}", target.display()));
-
-        let args = serde_json::json!({
-            "reason": format!(
-                "Path '{}' is outside the project directory '{}'.",
-                target.display(),
-                project.path().display()
-            ),
-        });
-        let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
-        assert!(
-            matches!(decision, PermissionDecision::Allow),
-            "affirmative action request should trust the named path; got {decision:?}"
-        );
-    }
-
-    #[test]
-    fn explicit_user_path_trust_accepts_english_action_target() {
-        let project = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let target = outside.path().join("evidence.jsonl");
-        std::fs::write(&target, "hello").unwrap();
-
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, project.path());
-        pm.trust_explicit_user_paths(&format!("please read {}", target.display()));
-
-        let args = serde_json::json!({
-            "reason": format!(
-                "Path '{}' is outside the project directory '{}'.",
-                target.display(),
-                project.path().display()
-            ),
-        });
-        let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
-        assert!(
-            matches!(decision, PermissionDecision::Allow),
-            "english affirmative request should trust the named path; got {decision:?}"
-        );
-    }
-
-    #[test]
-    fn explicit_user_path_trust_rejects_ascii_substring_false_positive() {
-        let project = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let target = outside.path().join("notes.txt");
-        std::fs::write(&target, "hello").unwrap();
-
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, project.path());
-        pm.trust_explicit_user_paths(&format!("already {}", target.display()));
-
-        let args = serde_json::json!({
-            "reason": format!(
-                "Path '{}' is outside the project directory '{}'.",
-                target.display(),
-                project.path().display()
-            ),
-        });
-        let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
-        assert!(
-            matches!(decision, PermissionDecision::NeedApproval { .. }),
-            "substring overlap like 'already' must not count as 'read'; got {decision:?}"
-        );
-    }
-
-    #[test]
-    fn explicit_user_path_trust_rejects_negated_mentions() {
-        let project = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let target = outside.path().join("passwd");
-        std::fs::write(&target, "root:x:0:0").unwrap();
-
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, project.path());
-        pm.trust_explicit_user_paths(&format!("不要碰 {}", target.display()));
-
-        let args = serde_json::json!({
-            "reason": format!(
-                "Path '{}' is outside the project directory '{}'.",
-                target.display(),
-                project.path().display()
-            ),
-        });
-        let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
-        assert!(
-            matches!(decision, PermissionDecision::NeedApproval { .. }),
-            "negated path mention must not auto-trust; got {decision:?}"
-        );
-    }
-
-    #[test]
-    fn explicit_user_path_trust_rejects_english_negation() {
-        let project = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let target = outside.path().join("passwd");
-        std::fs::write(&target, "root:x:0:0").unwrap();
-
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, project.path());
-        pm.trust_explicit_user_paths(&format!("don't touch {}", target.display()));
-
-        let args = serde_json::json!({
-            "reason": format!(
-                "Path '{}' is outside the project directory '{}'.",
-                target.display(),
-                project.path().display()
-            ),
-        });
-        let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
-        assert!(
-            matches!(decision, PermissionDecision::NeedApproval { .. }),
-            "english negation must not auto-trust; got {decision:?}"
-        );
-    }
-
-    #[test]
-    fn explicit_user_path_trust_handles_ascii_brackets() {
-        // Real user phrasing wraps paths in ASCII brackets when quoting
-        // them inside commentary — e.g. "please look at (/tmp/x) carefully".
-        // Tokenizing on whitespace alone leaves the bracket characters
-        // attached to the path and the trust path never matches.
-        let project = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let target = outside.path().join("notes.txt");
-        std::fs::write(&target, "hello").unwrap();
-
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, project.path());
-        pm.trust_explicit_user_paths(&format!("please read [{}]", target.display()));
-
-        let args = serde_json::json!({
-            "reason": format!(
-                "Path '{}' is outside the project directory '{}'.",
-                target.display(),
-                project.path().display()
-            ),
-        });
-        let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
-        assert!(
-            matches!(decision, PermissionDecision::Allow),
-            "ASCII square brackets must split off the path; got {decision:?}",
-        );
-    }
-
-    #[test]
-    fn explicit_user_path_trust_handles_fullwidth_punctuation() {
-        // Real-world Chinese input often uses full-width punctuation
-        // (`：`, `，`, `。`).  `str::split_whitespace` does NOT split on
-        // these characters, so a naive tokenizer collapses
-        // `"修复：/tmp/x"` into a single token and never recognizes the
-        // path. Trust must still kick in for affirmative phrasing using
-        // full-width punctuation.
-        let project = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let target = outside.path().join("evidence.jsonl");
-        std::fs::write(&target, "hello").unwrap();
-
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, project.path());
-        pm.trust_explicit_user_paths(&format!("分析和修复：{}", target.display()));
-
-        let args = serde_json::json!({
-            "reason": format!(
-                "Path '{}' is outside the project directory '{}'.",
-                target.display(),
-                project.path().display()
-            ),
-        });
-        let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
-        assert!(
-            matches!(decision, PermissionDecision::Allow),
-            "full-width colon must not block tokenization of the path; got {decision:?}",
-        );
+            if *expect_allow {
+                assert!(
+                    matches!(decision, PermissionDecision::Allow),
+                    "[{idx}] '{template}' — expected Allow, got {decision:?}"
+                );
+            } else {
+                assert!(
+                    matches!(decision, PermissionDecision::NeedApproval { .. }),
+                    "[{idx}] '{template}' — expected NeedApproval, got {decision:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -6447,7 +6282,8 @@ mod tests {
     // ── resolve_cloud_approval_async: early-return parity with sync version ──
 
     #[tokio::test]
-    async fn cloud_approval_async_quiet_denies_without_auto() {
+    async fn cloud_approval_async_quiet() {
+        // quiet without auto mode → deny
         let mut pm = PermissionManager::new(false);
         let decision = pm
             .resolve_cloud_approval_async(
@@ -6459,10 +6295,8 @@ mod tests {
             )
             .await;
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Deny);
-    }
 
-    #[tokio::test]
-    async fn cloud_approval_async_quiet_allows_when_auto() {
+        // quiet with auto mode → allow
         let mut pm = PermissionManager::new(true);
         let decision = pm
             .resolve_cloud_approval_async(
@@ -6477,18 +6311,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cloud_approval_async_auto_mode_allows() {
+    async fn cloud_approval_async_standard_routing() {
         let dir = tempfile::tempdir().unwrap();
+
+        // Auto mode → allow
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
         let decision = pm
             .resolve_cloud_approval_async("bash", Some("/tmp"), None, ApprovalKind::Standard, false)
             .await;
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Allow);
-    }
 
-    #[tokio::test]
-    async fn cloud_approval_async_deny_mode_denies() {
-        let dir = tempfile::tempdir().unwrap();
+        // Deny mode → deny
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Deny, dir.path());
         let decision = pm
             .resolve_cloud_approval_async("bash", Some("/tmp"), None, ApprovalKind::Standard, false)
@@ -6496,10 +6329,12 @@ mod tests {
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Deny);
     }
 
-    /// Regression: async Explicit + Auto must auto-allow without prompting.
+    /// Regression: async Explicit + Auto must auto-allow without prompting;
+    /// Explicit + Deny must deny without prompting.
     #[tokio::test]
-    async fn cloud_approval_async_explicit_auto_allows() {
+    async fn cloud_approval_async_explicit_routing() {
         let dir = tempfile::tempdir().unwrap();
+
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
         let decision = pm
             .resolve_cloud_approval_async(
@@ -6511,12 +6346,7 @@ mod tests {
             )
             .await;
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Allow);
-    }
 
-    /// Regression: async Explicit + Deny must deny without prompting.
-    #[tokio::test]
-    async fn cloud_approval_async_explicit_deny_denies() {
-        let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Deny, dir.path());
         let decision = pm
             .resolve_cloud_approval_async(
@@ -6531,19 +6361,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cloud_approval_async_session_override_allows() {
+    async fn cloud_approval_async_session_overrides() {
         let dir = tempfile::tempdir().unwrap();
+
+        // positive override → allow
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
         pm.session_overrides.insert(bare_fp("bash"), true);
         let decision = pm
             .resolve_cloud_approval_async("bash", Some("/tmp"), None, ApprovalKind::Standard, false)
             .await;
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Allow);
-    }
 
-    #[tokio::test]
-    async fn cloud_approval_async_session_override_denies() {
-        let dir = tempfile::tempdir().unwrap();
+        // negative override → deny
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
         pm.session_overrides.insert(bare_fp("bash"), false);
         let decision = pm
@@ -6882,75 +6711,68 @@ mod tests {
 
     // ── explicit cloud approval + Auto-run ────────────────────────────────────
 
+    /// Data-driven: explicit cloud approval respects auto-run / deny / quiet combos.
     #[test]
-    fn explicit_cloud_approval_auto_mode_allows() {
-        let mut pm = PermissionManager::new(true);
-        let decision = pm.resolve_cloud_approval(
-            "bash",
-            Some("echo hello"),
-            None,
-            ApprovalKind::Explicit,
-            false,
-        );
-        assert!(
-            matches!(decision, astra_thin_client::ApprovalDecision::Allow),
-            "explicit approval should be allowed in Auto mode"
-        );
-    }
+    fn explicit_cloud_approval_respects_mode_and_quiet() {
+        #[allow(clippy::type_complexity)]
+        let cases: Vec<(
+            &str,
+            fn() -> PermissionManager,
+            bool,
+            astra_thin_client::ApprovalDecision,
+        )> = vec![
+            (
+                "Auto",
+                || PermissionManager::new(true),
+                false,
+                astra_thin_client::ApprovalDecision::Allow,
+            ),
+            (
+                "Deny",
+                || {
+                    let mut pm = PermissionManager::new(false);
+                    pm.set_mode(PermissionMode::Deny);
+                    pm
+                },
+                false,
+                astra_thin_client::ApprovalDecision::Deny,
+            ),
+            (
+                "quiet+Auto",
+                || PermissionManager::new(true),
+                true,
+                astra_thin_client::ApprovalDecision::Allow,
+            ),
+            (
+                "quiet+Prompt",
+                || PermissionManager::new(false),
+                true,
+                astra_thin_client::ApprovalDecision::Deny,
+            ),
+        ];
 
-    #[test]
-    fn explicit_cloud_approval_deny_mode_denies() {
-        let mut pm = PermissionManager::new(false);
-        pm.set_mode(PermissionMode::Deny);
-        let decision = pm.resolve_cloud_approval(
-            "bash",
-            Some("echo hello"),
-            None,
-            ApprovalKind::Explicit,
-            false,
-        );
-        assert!(
-            matches!(decision, astra_thin_client::ApprovalDecision::Deny),
-            "explicit approval should be denied in Deny mode"
-        );
-    }
-
-    #[test]
-    fn explicit_cloud_approval_quiet_auto_allows() {
-        let mut pm = PermissionManager::new(true);
-        let decision = pm.resolve_cloud_approval(
-            "bash",
-            Some("echo hello"),
-            None,
-            ApprovalKind::Explicit,
-            true,
-        );
-        assert!(
-            matches!(decision, astra_thin_client::ApprovalDecision::Allow),
-            "quiet + Auto should allow explicit"
-        );
-    }
-
-    #[test]
-    fn explicit_cloud_approval_quiet_prompt_denies() {
-        let mut pm = PermissionManager::new(false);
-        let decision = pm.resolve_cloud_approval(
-            "bash",
-            Some("echo hello"),
-            None,
-            ApprovalKind::Explicit,
-            true,
-        );
-        assert!(
-            matches!(decision, astra_thin_client::ApprovalDecision::Deny),
-            "quiet + Prompt should deny explicit"
-        );
+        for (label, setup, quiet, expected) in &cases {
+            let mut pm = setup();
+            let decision = pm.resolve_cloud_approval(
+                "bash",
+                Some("echo hello"),
+                None,
+                ApprovalKind::Explicit,
+                *quiet,
+            );
+            let expected_dbg = format!("{expected:?}");
+            assert!(
+                format!("{decision:?}") == expected_dbg,
+                "[{label}] expected {expected:?}, got {decision:?}"
+            );
+        }
     }
 
     // ── apply_cloud_approval_choice ────────────────────────────────────────────
 
     #[test]
-    fn cloud_approval_auto_run_sets_auto_mode() {
+    fn cloud_approval_choice_modes_and_overrides() {
+        // '!' auto-run: sets mode to Auto
         let mut pm = PermissionManager::new(false);
         assert_eq!(pm.mode, PermissionMode::Prompt);
         let decision = pm.apply_cloud_approval_choice("str_replace", Some("src/foo.rs"), '!');
@@ -6959,22 +6781,17 @@ mod tests {
             astra_thin_client::ApprovalDecision::Allow
         ));
         assert_eq!(pm.mode, PermissionMode::Auto);
-    }
 
-    #[test]
-    fn cloud_approval_allow_session_records_override() {
+        // 'a' allow session: records override
         let mut pm = PermissionManager::new(false);
         let decision = pm.apply_cloud_approval_choice("str_replace", Some("src/foo.rs"), 'a');
         assert!(matches!(
             decision,
             astra_thin_client::ApprovalDecision::AllowSession
         ));
-        // The fingerprint should be recorded as a session override.
         assert!(!pm.session_overrides.is_empty());
-    }
 
-    #[test]
-    fn cloud_approval_skip_records_denial() {
+        // 's' skip: records denial
         let mut pm = PermissionManager::new(false);
         let decision = pm.apply_cloud_approval_choice("str_replace", Some("src/foo.rs"), 's');
         assert!(matches!(
@@ -7905,7 +7722,8 @@ mod tests {
     // directions of the contract.
 
     #[test]
-    fn mode_mirror_encode_decode_covers_all_modes_without_collisions() {
+    fn mode_mirror_encode_and_current() {
+        // All modes encode/decode without collisions
         let all_modes = [
             PermissionMode::Prompt,
             PermissionMode::Auto,
@@ -7914,7 +7732,6 @@ mod tests {
             PermissionMode::Deny,
         ];
         let mut seen = std::collections::HashSet::new();
-
         for mode in all_modes {
             let encoded = encode_mode_for_mirror(mode);
             assert!(
@@ -7927,66 +7744,44 @@ mod tests {
                 "mode mirror encoding must round-trip for {mode:?}"
             );
         }
-    }
 
-    #[test]
-    fn mode_mirror_reflects_set_mode() {
+        // mirror.current() reflects live mode after set_mode
         let mut pm = PermissionManager::new(false);
         let mirror = pm.mode_mirror_handle();
         assert_eq!(mirror.current(), PermissionMode::Prompt);
-
         pm.set_mode(PermissionMode::Plan);
-        assert_eq!(
-            mirror.current(),
-            PermissionMode::Plan,
-            "set_mode must publish to the mirror so chip readers see it instantly"
-        );
-
+        assert_eq!(mirror.current(), PermissionMode::Plan);
         pm.set_mode(PermissionMode::Auto);
         assert_eq!(mirror.current(), PermissionMode::Auto);
     }
 
     #[test]
-    fn mode_mirror_stage_then_pull_round_trips() {
-        // Mid-turn Shift+Tab path: TUI calls stage() while the
-        // agentic loop holds &mut state. The host calls
-        // pull_mode_from_mirror() at the next turn boundary, and
-        // self.mode catches up.
+    fn mode_mirror_stage_pull_lifecycle() {
         let mut pm = PermissionManager::new(false);
         let mirror = pm.mode_mirror_handle();
-        assert_eq!(pm.mode(), PermissionMode::Prompt);
 
+        // stage() does NOT mutate pm.mode(); only pull does
+        assert_eq!(pm.mode(), PermissionMode::Prompt);
         mirror.stage(PermissionMode::Plan);
-        // pm.mode() hasn't been pulled yet — the field still holds Prompt.
         assert_eq!(
             pm.mode(),
             PermissionMode::Prompt,
             "stage alone must not mutate self.mode; the host must pull explicitly"
         );
-
         pm.pull_mode_from_mirror();
         assert_eq!(
             pm.mode(),
             PermissionMode::Plan,
             "pull_mode_from_mirror must adopt the staged mode"
         );
-    }
 
-    #[test]
-    fn mode_mirror_pull_is_noop_when_already_in_sync() {
-        let mut pm = PermissionManager::new(false);
-        // Without any stage(), pull is a no-op and leaves state
-        // untouched. Idempotent.
+        // pull is a no-op when nothing was staged (idempotent)
         pm.pull_mode_from_mirror();
-        assert_eq!(pm.mode(), PermissionMode::Prompt);
-    }
+        assert_eq!(pm.mode(), PermissionMode::Plan);
 
-    #[test]
-    fn mode_mirror_handle_is_clonable_and_independent() {
-        let pm = PermissionManager::new(false);
+        // handles are clonable and share the same mirror
         let h1 = pm.mode_mirror_handle();
         let h2 = pm.mode_mirror_handle();
-        // Both handles see the same mirror.
         h1.stage(PermissionMode::Auto);
         assert_eq!(h2.current(), PermissionMode::Auto);
     }
