@@ -6,7 +6,7 @@ use super::{
     SANDBOX_DENIED_PREFIX, ToolExecutor, apply_env_overlay, build_test, code_intel,
     sandbox_command, validate_path, wrap_command_with_limits,
 };
-use astra_runtime::tool_sandbox::{SandboxMode, SandboxPolicy, filter_environment};
+use astra_runtime::tool_sandbox::{IsolationLevel, SandboxPolicy, filter_environment};
 use astra_tools::detach::{
     AdoptionAckOutcome, await_adoption_ack, detach_signal_observed, render_bash_detached_marker,
     restore_detach_signal_receiver, sigkill_process_group, terminate_detached_payload,
@@ -36,85 +36,33 @@ struct CommandResult {
 /// Interpret exit code based on the command that produced it.
 /// Extracts the *last* command in a pipeline (that's what determines the exit code).
 fn interpret_exit_code(command: &str, code: i32) -> CommandResult {
-    let base = last_pipeline_command(command);
-    match base {
-        // grep/rg: 0=matches, 1=no matches, 2+=error
-        "grep" | "rg" | "ag" | "ack" => match code {
-            0 => CommandResult {
-                is_error: false,
-                note: None,
-            },
-            1 => CommandResult {
-                is_error: false,
-                note: Some("No matches found"),
-            },
-            _ => CommandResult {
-                is_error: true,
-                note: None,
-            },
+    match astra_tools::exit_semantics::classify_exit(command, code) {
+        astra_tools::exit_semantics::ExitSemantics::Success
+        | astra_tools::exit_semantics::ExitSemantics::DomainNegative => CommandResult {
+            is_error: false,
+            note: None,
         },
-        // diff: 0=identical, 1=differences, 2+=error
-        "diff" => match code {
-            0 | 1 => CommandResult {
-                is_error: false,
-                note: None,
-            },
-            _ => CommandResult {
-                is_error: true,
-                note: None,
-            },
+        astra_tools::exit_semantics::ExitSemantics::InformationalFailure => CommandResult {
+            is_error: false,
+            note: Some(informational_failure_note(command)),
         },
-        // test/[: 0=true, 1=false, 2+=error
-        "test" | "[" => match code {
-            0 | 1 => CommandResult {
-                is_error: false,
-                note: None,
-            },
-            _ => CommandResult {
-                is_error: true,
-                note: None,
-            },
-        },
-        // find: 0=ok, 1=partial (some dirs inaccessible), 2+=error
-        "find" | "fd" => match code {
-            0 | 1 => CommandResult {
-                is_error: false,
-                note: None,
-            },
-            _ => CommandResult {
-                is_error: true,
-                note: None,
-            },
-        },
-        // pkill/pgrep/killall: 0=matched, 1=no match, 2=syntax error, 3=fatal
-        "pkill" | "pgrep" | "killall" => match code {
-            0 => CommandResult {
-                is_error: false,
-                note: None,
-            },
-            1 => CommandResult {
-                is_error: false,
-                note: Some("No processes matched"),
-            },
-            _ => CommandResult {
-                is_error: true,
-                note: None,
-            },
-        },
-        // Default: only 0 is success
-        _ => CommandResult {
-            is_error: code != 0,
+        astra_tools::exit_semantics::ExitSemantics::TimedOut
+        | astra_tools::exit_semantics::ExitSemantics::Cancelled
+        | astra_tools::exit_semantics::ExitSemantics::Signaled
+        | astra_tools::exit_semantics::ExitSemantics::ExecutionError => CommandResult {
+            is_error: true,
             note: None,
         },
     }
 }
 
-/// Extract the base command name from the last segment of a pipeline.
-fn last_pipeline_command(command: &str) -> &str {
-    astra_tools::exit_semantics::last_pipeline_segment(command)
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
+fn informational_failure_note(command: &str) -> &'static str {
+    let family = astra_tools::exit_semantics::command_family(command);
+    if matches!(family.as_deref(), Some("pgrep" | "pkill" | "killall")) {
+        "No processes matched"
+    } else {
+        "No matches found"
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1462,7 +1410,7 @@ fn check_redirection_path_boundary(
                 if !target_in_single_quote
                     && !target_in_double_quote
                     && (target_ch.is_whitespace()
-                        || matches!(target_ch, '|' | ';' | '&' | '\n' | '\r' | '<' | '>'))
+                        || matches!(target_ch, '|' | ';' | '&' | '\n' | '\r' | '<' | '>' | ')'))
                 {
                     let raw_target = command[target_start..byte_idx].trim();
                     if let Some(target) = shell_tokenize_like_bash(raw_target).first()
@@ -1990,9 +1938,6 @@ fn check_shell_loop_path_boundary(
             }
             return Some(msg);
         }
-        if let Some((kind, subcommand)) = fanout_subcommand {
-            return Some(shell_loop_fanout_review_message(policy, kind, &subcommand));
-        }
         idx = done_idx + 1;
     }
     None
@@ -2033,11 +1978,21 @@ fn shell_loop_body_subcommand_requires_boundary_review(body: &str) -> Option<Str
         let Some(base) = first_segment_subcommand(&parts) else {
             continue;
         };
-        if subcommand_requires_boundary_review(base) {
+        if shell_loop_segment_requires_boundary_review(base, &parts) {
             return Some(base.to_string());
         }
     }
     None
+}
+
+fn shell_loop_segment_requires_boundary_review(base: &str, parts: &[String]) -> bool {
+    if is_shell_interpreter_command(base) {
+        return true;
+    }
+    if !is_boundary_sensitive_file_access_command(base) {
+        return false;
+    }
+    parts.iter().skip(1).any(|part| !part.starts_with('-'))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2958,11 +2913,7 @@ enum DetachableShellOutput {
 fn effective_shell_command(config: &ShellRunConfig) -> String {
     if config.harden_command {
         if let Some(ref policy) = config.sandbox_policy {
-            if !matches!(policy.mode, SandboxMode::Permissive) {
-                wrap_command_with_limits(policy, &config.command)
-            } else {
-                config.command.clone()
-            }
+            wrap_command_with_limits(policy, &config.command)
         } else {
             config.command.clone()
         }
@@ -2993,9 +2944,8 @@ fn run_shell_output_with_config(config: ShellRunConfig) -> Result<std::process::
         child_cmd.process_group(0); // child becomes its own process group leader
     }
 
-    // Apply sandbox environment filtering.
+    // Apply sandbox environment filtering (all isolation levels).
     if let Some(ref policy) = config.sandbox_policy
-        && !matches!(policy.mode, SandboxMode::Permissive)
         && let Err(e) = sandbox_command(policy, &mut child_cmd)
     {
         eprintln!("[sandbox] failed to apply policy: {e}");
@@ -3107,9 +3057,7 @@ fn configure_detachable_tokio_command(config: &ShellRunConfig) -> TokioCommand {
     #[cfg(unix)]
     child_cmd.process_group(0);
 
-    if let Some(ref policy) = config.sandbox_policy
-        && !matches!(policy.mode, SandboxMode::Permissive)
-    {
+    if let Some(ref policy) = config.sandbox_policy {
         child_cmd.current_dir(&policy.project_root);
         child_cmd.env_clear();
         for (key, value) in filter_environment(policy) {
@@ -4123,8 +4071,13 @@ impl ToolExecutor {
 
     fn prepare_bash_invocation(&self, args: &Value) -> Result<(String, f64), String> {
         let command = match args.get("command").and_then(Value::as_str) {
-            Some(c) => c,
-            None => return Err("Error: missing 'command'".to_string()),
+            Some(c) if !c.trim().is_empty() => c,
+            _ => {
+                return Err("Error: missing required field `command` for bash. \
+                     Origin: model_argument_error; no command was run. \
+                     Next: retry with a JSON object like {\"command\":\"pwd\"}."
+                    .to_string());
+            }
         };
         astra_tools::shell_ops::validate_bash_background_task_contract(command)?;
 
@@ -4157,7 +4110,7 @@ impl ToolExecutor {
                 .unwrap_or_else(|e| e.into_inner());
             let is_restrictive = sp_guard
                 .as_ref()
-                .is_some_and(|p| !matches!(p.mode, SandboxMode::Permissive));
+                .is_some_and(|p| !matches!(p.isolation, IsolationLevel::Permissive));
             drop(sp_guard);
             if is_restrictive {
                 return Err(warning);
@@ -4205,7 +4158,7 @@ impl ToolExecutor {
                 .read()
                 .unwrap_or_else(|e| e.into_inner());
             if let Some(ref policy) = *sp_guard
-                && !matches!(policy.mode, SandboxMode::Permissive)
+                && !matches!(policy.isolation, IsolationLevel::Permissive)
             {
                 if let Some(msg) = check_bash_path_boundary(policy, &command) {
                     return Err(msg);
@@ -4474,8 +4427,13 @@ impl ToolExecutor {
         cancel_token: Option<&tokio_util::sync::CancellationToken>,
     ) -> String {
         let command = match args.get("command").and_then(Value::as_str) {
-            Some(c) => c,
-            None => return "Error: missing 'command'".to_string(),
+            Some(c) if !c.trim().is_empty() => c,
+            _ => {
+                return "Error: missing required field `command` for powershell. \
+                        Origin: model_argument_error; no command was run. \
+                        Next: retry with a JSON object like {\"command\":\"Get-Location\"}."
+                    .to_string();
+            }
         };
         let timeout_secs = args.get("timeout").and_then(Value::as_f64).unwrap_or(30.0);
 
@@ -4485,7 +4443,7 @@ impl ToolExecutor {
                 .read()
                 .unwrap_or_else(|e| e.into_inner());
             if let Some(ref policy) = *sp_guard
-                && !matches!(policy.mode, SandboxMode::Permissive)
+                && !matches!(policy.isolation, IsolationLevel::Permissive)
             {
                 if let Some(msg) = check_powershell_path_boundary(policy, command) {
                     return msg;
@@ -5154,6 +5112,23 @@ mod tests {
         let executor = test_executor();
         let result = executor.bash(&serde_json::json!({}));
         assert!(result.contains("Error"), "got: {result}");
+        assert!(
+            result.contains("Origin: model_argument_error"),
+            "got: {result}"
+        );
+        assert!(result.contains("no command was run"), "got: {result}");
+    }
+
+    #[test]
+    fn bash_blank_command_returns_model_argument_error() {
+        let executor = test_executor();
+        let result = executor.bash(&serde_json::json!({"command": " \n\t "}));
+        assert!(result.contains("Error"), "got: {result}");
+        assert!(
+            result.contains("Origin: model_argument_error"),
+            "got: {result}"
+        );
+        assert!(result.contains("no command was run"), "got: {result}");
     }
 
     #[test]
@@ -5499,6 +5474,11 @@ mod tests {
         let executor = test_executor();
         let result = executor.powershell(&serde_json::json!({}));
         assert!(result.contains("Error"), "got: {result}");
+        assert!(
+            result.contains("Origin: model_argument_error"),
+            "got: {result}"
+        );
+        assert!(result.contains("no command was run"), "got: {result}");
     }
 
     #[test]
@@ -5788,7 +5768,9 @@ mod tests {
             result.is_ok(),
             "relative path inside project should succeed: {result:?}"
         );
-        assert!(result.unwrap().starts_with(dir.path()));
+        let resolved = astra_sandbox::canonicalize_parent_and_append(&result.unwrap()).unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        assert!(resolved.starts_with(root));
     }
 
     #[test]
@@ -5905,6 +5887,27 @@ mod tests {
         assert!(check_bash_path_boundary(&policy, "echo $(cat /etc/passwd)").is_none());
         // >&2 is fd duplication, not path
         assert!(check_bash_path_boundary(&policy, "echo hi >&2").is_none());
+    }
+
+    #[test]
+    fn redirection_to_dev_null_inside_command_substitution_is_allowed() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(
+            &policy,
+            r#"hits=$(grep -cE "ask_user|approval" "$f" 2>/dev/null)"#,
+        );
+        assert!(
+            result.is_none(),
+            "device redirection inside command substitution should not be treated as a project file escape: {result:?}"
+        );
+    }
+
+    #[test]
+    fn redirection_to_dev_null_is_allowed() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        assert!(check_bash_path_boundary(&policy, "echo hi >/dev/null").is_none());
     }
 
     #[test]
@@ -6694,6 +6697,20 @@ mod tests {
         assert!(
             result.is_none(),
             "for-loops should stay allowed for non-file-access subcommands"
+        );
+    }
+
+    #[test]
+    fn for_loop_pipeline_head_without_path_operand_is_allowed() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(
+            &policy,
+            r#"for f in *.rs; do echo "=== $f ==="; grep -nE "ask_user|approval" "$f" 2>/dev/null | head -8; done"#,
+        );
+        assert!(
+            result.is_none(),
+            "loop fan-out review should require an unsafe path operand, not just a stdin consumer like head: {result:?}"
         );
     }
 
@@ -7896,6 +7913,24 @@ mod tests {
                 1,
                 false,
                 Some("No matches found"),
+            ),
+            (
+                "cd /work/repo && grep -n missing src/main.rs",
+                1,
+                false,
+                Some("No matches found"),
+            ),
+            (
+                "pgrep missing-process-name",
+                1,
+                false,
+                Some("No processes matched"),
+            ),
+            (
+                "cd /work/repo && pgrep missing-process-name",
+                1,
+                false,
+                Some("No processes matched"),
             ),
             ("cargo build", 1, true, None),
         ];

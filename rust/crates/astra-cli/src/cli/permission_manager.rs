@@ -5456,8 +5456,8 @@ mod tests {
     #[test]
     fn explicit_irreversible_actions_auto_allowed_in_auto_mode() {
         let mut pm = PermissionManager::new(true); // auto mode
-        let args = serde_json::json!({"message": "ship it"});
-        let decision = pm.check_nonblocking("git_commit", &args);
+        let args = serde_json::json!({"action": "commit", "message": "ship it"});
+        let decision = pm.check_nonblocking("git", &args);
         assert!(
             matches!(decision, PermissionDecision::Allow),
             "Auto mode should auto-allow explicit tools, got: {decision:?}"
@@ -5467,8 +5467,8 @@ mod tests {
     #[test]
     fn explicit_irreversible_actions_need_approval_in_prompt_mode() {
         let mut pm = PermissionManager::new(false); // prompt mode
-        let args = serde_json::json!({"message": "ship it"});
-        let decision = pm.check_nonblocking("git_commit", &args);
+        let args = serde_json::json!({"action": "commit", "message": "ship it"});
+        let decision = pm.check_nonblocking("git", &args);
         assert!(
             matches!(decision, PermissionDecision::NeedApproval { .. }),
             "Prompt mode should require approval for explicit tools, got: {decision:?}"
@@ -5512,8 +5512,8 @@ mod tests {
     #[test]
     fn need_approval_does_not_record_rejection() {
         let mut pm = PermissionManager::new(false);
-        let args = serde_json::json!({"message": "ship it"});
-        let decision = pm.check_nonblocking("git_commit", &args);
+        let args = serde_json::json!({"action": "commit", "message": "ship it"});
+        let decision = pm.check_nonblocking("git", &args);
         assert!(matches!(decision, PermissionDecision::NeedApproval { .. }));
         assert!(pm.recent_rejections().is_empty());
     }
@@ -6858,6 +6858,56 @@ mod tests {
             super::sensitive_path_match_for_request("bash", &args),
             None,
             "agent-generated tool-result artifacts must not trip the sensitive-path opt-in gate"
+        );
+    }
+
+    #[test]
+    fn auto_mode_allows_searching_current_session_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_root = dir.path().join(".astra/sessions");
+        let _guard = astra_services::session_journal::JournalDirGuard::new(&sessions_root);
+        std::fs::create_dir_all(&sessions_root).unwrap();
+        let journal_path = sessions_root.join("550e8400-e29b-41d4-a716-446655440000.jsonl");
+        std::fs::write(&journal_path, "{}\n").unwrap();
+        let journal_path = journal_path.to_string_lossy().to_string();
+
+        let args = serde_json::json!({
+            "pattern": "str_replace|str replace",
+            "path": journal_path
+        });
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
+
+        assert_eq!(
+            super::sensitive_path_match_for_request("grep", &args),
+            None,
+            "current session journals are internal read-only diagnostics"
+        );
+        let decision = pm.check_nonblocking("grep", &args);
+        assert!(
+            matches!(decision, PermissionDecision::Allow),
+            "Auto mode should allow read-only session journal search without an opt-in prompt: {decision:?}"
+        );
+    }
+
+    #[test]
+    fn auto_mode_still_denies_writing_current_session_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_root = dir.path().join(".astra/sessions");
+        let _guard = astra_services::session_journal::JournalDirGuard::new(&sessions_root);
+        std::fs::create_dir_all(&sessions_root).unwrap();
+        let journal_path = sessions_root.join("550e8400-e29b-41d4-a716-446655440000.jsonl");
+        std::fs::write(&journal_path, "{}\n").unwrap();
+
+        let args = serde_json::json!({
+            "path": journal_path.to_string_lossy().to_string(),
+            "content": "tamper"
+        });
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
+
+        let decision = pm.check_nonblocking("write_file", &args);
+        assert!(
+            matches!(decision, PermissionDecision::Deny(_)),
+            "session journals are internal read-only diagnostics, not writable state: {decision:?}"
         );
     }
 

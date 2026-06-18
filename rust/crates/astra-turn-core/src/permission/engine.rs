@@ -777,6 +777,8 @@ pub fn evaluate_permission(
     if explicit_approval_reason(tool_name, args).is_none()
         && is_read_only_tool_with_args(tool_name, Some(args))
         && ctx.mode() != PermissionMode::Deny
+        && !(ctx.mode() == PermissionMode::Plan
+            && is_plan_mode_unstructured_execute_tool(tool_name))
         && ctx.inherited.is_tool_allowed_by_allowlist(tool_name)
     {
         let decision = HardDecision::Allow;
@@ -1162,6 +1164,10 @@ pub fn evaluate_permission(
     )
 }
 
+fn is_plan_mode_unstructured_execute_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "bash" | "background_shell" | "powershell")
+}
+
 /// Preview the rule that an "Always allow" action would persist for this call.
 #[must_use]
 pub fn allow_rule_preview(tool_name: &str, args: &Value) -> String {
@@ -1483,6 +1489,20 @@ mod tests {
         (temp, guard, artifact_path)
     }
 
+    fn create_current_session_journal() -> (
+        tempfile::TempDir,
+        astra_services::session_journal::JournalDirGuard,
+        std::path::PathBuf,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions_root = temp.path().join("sessions");
+        let guard = astra_services::session_journal::JournalDirGuard::new(&sessions_root);
+        std::fs::create_dir_all(&sessions_root).unwrap();
+        let journal_path = sessions_root.join("550e8400-e29b-41d4-a716-446655440000.jsonl");
+        std::fs::write(&journal_path, "{}\n").unwrap();
+        (temp, guard, journal_path)
+    }
+
     /// **Pinning test** — Plan v3 §P2 requires a fixed evaluation
     /// order to make rule precedence auditable. Any reorder must
     /// be deliberate and update this test.
@@ -1713,6 +1733,22 @@ mod tests {
             &ctx,
         );
         assert!(matches!(mutating_bash.decision, HardDecision::Deny { .. }));
+
+        let read_only_bash = evaluate_permission(
+            "bash",
+            &serde_json::json!({"command": "git status --short"}),
+            &ctx,
+        );
+        assert!(
+            matches!(read_only_bash.decision, HardDecision::Deny { .. }),
+            "plan mode must deny shell execution even when args look read-only: {read_only_bash:?}"
+        );
+        assert_eq!(
+            read_only_bash.source,
+            DecisionSource::Mode {
+                mode: "plan".to_string()
+            }
+        );
     }
 
     #[test]
@@ -1825,15 +1861,13 @@ mod tests {
         let ctx = crate::permission::types::PermissionSyncContext::new(
             crate::permission::types::InheritedPermissions {
                 mode: crate::permission::types::PermissionMode::Prompt,
-                allow_rules: vec![crate::permission::types::PermissionRule::parse(
-                    "git_commit",
-                )],
+                allow_rules: vec![crate::permission::types::PermissionRule::parse("git")],
                 ..Default::default()
             },
         );
         let envelope = evaluate_permission(
-            "git_commit",
-            &serde_json::json!({"message": "ship it"}),
+            "git",
+            &serde_json::json!({"action": "commit", "message": "ship it"}),
             &ctx,
         );
         assert!(matches!(
@@ -1892,6 +1926,38 @@ mod tests {
         assert!(
             matches!(bash_read.decision, HardDecision::Allow),
             "read-only processing of tool result artifacts must not require manual approval: {bash_read:?}"
+        );
+    }
+
+    #[test]
+    fn evaluate_reading_session_journal_is_allowed_in_auto_mode() {
+        let ctx = crate::permission::types::PermissionSyncContext::root(
+            crate::permission::types::PermissionMode::Auto,
+        );
+        let (_temp, _guard, journal_path) = create_current_session_journal();
+        let journal_path = journal_path.to_string_lossy().to_string();
+
+        let grep = evaluate_permission(
+            "grep",
+            &serde_json::json!({
+                "pattern": "str_replace|str replace",
+                "path": journal_path.clone()
+            }),
+            &ctx,
+        );
+        assert!(
+            matches!(grep.decision, HardDecision::Allow),
+            "session journals are first-party diagnostic artifacts and must be searchable in Auto mode: {grep:?}"
+        );
+
+        let bash_read = evaluate_permission(
+            "bash",
+            &serde_json::json!({"command": format!("grep 'str_replace' {journal_path}")}),
+            &ctx,
+        );
+        assert!(
+            matches!(bash_read.decision, HardDecision::Allow),
+            "read-only shell searches of session journals must not require manual approval: {bash_read:?}"
         );
     }
 
@@ -1987,6 +2053,35 @@ mod tests {
     }
 
     #[test]
+    fn evaluate_writing_session_journal_still_requires_approval() {
+        let ctx = crate::permission::types::PermissionSyncContext::root(
+            crate::permission::types::PermissionMode::Auto,
+        );
+        let (_temp, _guard, journal_path) = create_current_session_journal();
+        let journal_path = journal_path.to_string_lossy().to_string();
+
+        let write_file = evaluate_permission(
+            "write_file",
+            &serde_json::json!({"path": journal_path.clone(), "content": "tamper"}),
+            &ctx,
+        );
+        assert!(
+            !matches!(write_file.decision, HardDecision::Allow),
+            "session journals are read-only diagnostic state"
+        );
+
+        let bash_rm = evaluate_permission(
+            "bash",
+            &serde_json::json!({"command": format!("rm -f {journal_path}")}),
+            &ctx,
+        );
+        assert!(
+            !matches!(bash_rm.decision, HardDecision::Allow),
+            "destructive shell operations on session journals must remain gated"
+        );
+    }
+
+    #[test]
     fn evaluate_execute_hard_deny_stays_denied_in_auto_mode() {
         let ctx = crate::permission::types::PermissionSyncContext::root(
             crate::permission::types::PermissionMode::Auto,
@@ -2045,6 +2140,31 @@ mod tests {
             HardDecision::NeedExternal { .. }
         ));
         assert!(matches!(envelope.source, DecisionSource::GitSafety { .. }));
+        assert!(envelope.risk_tags.contains(&RiskTag::GitDestructive));
+    }
+
+    #[test]
+    fn git_worktree_destructive_bash_requires_approval_in_auto_mode() {
+        let ctx = crate::permission::types::PermissionSyncContext::root(
+            crate::permission::types::PermissionMode::Auto,
+        );
+        let envelope = evaluate_permission(
+            "bash",
+            &serde_json::json!({
+                "command": "git restore --staged --worktree rust/crates/foo/src/lib.rs"
+            }),
+            &ctx,
+        );
+
+        assert!(matches!(
+            envelope.decision,
+            HardDecision::NeedExternal { .. }
+        ));
+        assert!(
+            matches!(envelope.source, DecisionSource::GitSafety { ref violation } if violation.contains("git restore")),
+            "{:?}",
+            envelope.source
+        );
         assert!(envelope.risk_tags.contains(&RiskTag::GitDestructive));
     }
 

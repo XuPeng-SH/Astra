@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::{Value, json};
 
+use crate::tool::categories::is_file_mutation_tool;
 use crate::tool::result::semantics::tool_dedup_signature;
 
 /// One tool slot to execute in a headless round: either a server `tool_calls[i]` or synthetic edge row `i`.
@@ -367,6 +368,20 @@ fn no_matching_edge_execution_message(name: &str) -> String {
         );
     }
 
+    if is_file_mutation_tool(name) {
+        return format!(
+            "Error: headless edge protocol — tool `{name}` has no matching \
+             edge execution in this turn.\n\n\
+             This is a transport binding failure for a dedicated file mutation \
+             tool. Do NOT retry `{name}` in this round and do NOT replace it \
+             with bash, python, shell redirection, or heredocs; those bypass \
+             file-edit guards and may be blocked by workspace policy. Ask the \
+             user to retry in a mode with file-edit transport, or use another \
+             visible dedicated file-edit tool only if it is actually executable \
+             in this turn."
+        );
+    }
+
     format!(
         "Error: headless edge protocol — tool `{name}` has no matching \
          edge execution in this turn.\n\n\
@@ -683,6 +698,40 @@ mod tests {
     }
 
     #[test]
+    fn no_edge_execution_for_file_mutation_does_not_suggest_shell_fallback() {
+        let rows: Vec<Row> = vec![];
+        let mut consumed = vec![];
+        let by_sig = HashMap::new();
+        let out = take_edge_output_for_tool_call_with_duration(
+            "write_file",
+            &json!({"path": "index.html", "content": "<main></main>"}),
+            &rows,
+            &mut consumed,
+            &by_sig,
+        );
+
+        let lower = out.output.to_ascii_lowercase();
+        assert!(
+            lower.contains("transport binding failure"),
+            "{}",
+            out.output
+        );
+        assert!(
+            lower.contains("do not retry `write_file`"),
+            "{}",
+            out.output
+        );
+        assert!(lower.contains("do not replace"), "{}", out.output);
+        assert!(lower.contains("bash"), "{}", out.output);
+        assert!(lower.contains("shell redirection"), "{}", out.output);
+        assert!(
+            !out.output.contains("Workaround: use `bash`"),
+            "{}",
+            out.output
+        );
+    }
+
+    #[test]
     fn take_edge_output_preserves_tool_result_fields() {
         let rows = vec![RowWithResultFields {
             tool: "mo_query".into(),
@@ -972,10 +1021,9 @@ mod tests {
             "str_replace",
             "delete_file",
             "multi_edit",
-            "git_commit",
-            "git_stash",
+            "git",
             "git_checkout_file",
-            "github_create_issue",
+            "github",
             "mo_query",
             "mo_snapshot",
             "mo_branch",
@@ -991,18 +1039,7 @@ mod tests {
 
     #[test]
     fn read_only_tools_covers_git_and_github_reads() {
-        for expected in &[
-            "git_status",
-            "git_diff",
-            "git_log",
-            "git_blame",
-            "read_file",
-            "grep",
-            "glob",
-            "list_dir",
-            "github_list_prs",
-            "github_get_pr",
-        ] {
+        for expected in &["read_file", "grep", "glob", "list_dir"] {
             assert!(
                 READ_ONLY_TOOLS.contains(expected),
                 "missing cacheable tool: {expected}"
@@ -1132,14 +1169,6 @@ mod tests {
         assert_eq!(tr["name"], "mo_query");
         assert_eq!(tr["result"], "OK (no results)");
         assert_eq!(tr["pre_state_snapshot_id"], "moq_snap_2");
-    }
-
-    #[test]
-    fn read_only_tools_includes_git_show() {
-        assert!(
-            READ_ONLY_TOOLS.contains(&"git_show"),
-            "git_show should be cacheable (idempotent read of committed content)"
-        );
     }
 
     #[test]
@@ -1339,7 +1368,7 @@ mod tests {
 
     #[test]
     fn non_plan_no_matching_edge_error_keeps_direct_workaround() {
-        let message = no_matching_edge_execution_message("github_create_issue");
+        let message = no_matching_edge_execution_message("github");
 
         assert!(message.contains("Workaround: use `bash`"), "{message}");
     }

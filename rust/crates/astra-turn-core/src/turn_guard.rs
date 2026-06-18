@@ -131,15 +131,20 @@ pub fn is_read_only_never_restrict(tool: &str) -> bool {
 }
 
 /// Insert deprioritized tool names from [`TurnGuard`] into the selector
-/// restriction set (CLI parity). Read-only tools are excluded — they must
-/// stay visible to the model.
+/// restriction set (CLI parity). Read-only *category* tools are excluded —
+/// they must stay visible to the model. Non-read-only tools flagged
+/// `TASK_MGMT` are NOT exempt: a broken task tool must be quarantinable by
+/// the health tracker rather than blanket-immune (otherwise a hard
+/// circuit-breaker trip on `task`/`task_stop` can never take effect).
 pub fn merge_deprioritized_tools_into_restricted(
     turn_guard: &TurnGuard,
     restricted: &mut HashSet<String>,
 ) {
     let reg = crate::tool::categories::registry();
     for t in turn_guard.health.deprioritized_tools() {
-        if reg.is_never_restrict(t) {
+        // Category-only check: ReadOnly observation tools stay visible, but
+        // the TASK_MGMT flag does NOT grant immunity here.
+        if reg.is_read_only(t) {
             continue;
         }
         restricted.insert(t.to_string());
@@ -594,9 +599,9 @@ impl TurnGuard {
                              outline=true, grep, or glob instead of rereading the same file."
                                 .to_string(),
                         ),
-                        "git_diff" => injections.push(
-                            "For repeated git_diff cache hits, reuse the earlier diff until the \
-                             worktree changes, or narrow the diff to a specific path or commit."
+                        "git" => injections.push(
+                            "For repeated git cache hits, reuse the earlier output until the \
+                             worktree changes, or narrow with a specific path or commit."
                                 .to_string(),
                         ),
                         _ => {}
@@ -995,6 +1000,36 @@ mod tests {
         // Single "command not found" → immediate deprioritize (no consecutive threshold)
         guard.record_tool_result("mo_query", "Error: command not found");
         assert!(guard.health.is_deprioritized("mo_query"));
+    }
+
+    #[test]
+    fn tool_contract_errors_do_not_deprioritize_tool() {
+        let mut guard = TurnGuard::new();
+        let errors = [
+            "Error: field 'subtask_id' only supports new_status updates; unsupported with subtask_id: reason",
+            "Error: Tool 'task' is not available in this turn. Call only tools visible in this turn's `tools[]`.",
+            "Error: unsupported output_mode 'xml'. Use 'content', 'files_with_matches', or 'count'.",
+        ];
+
+        for error in errors {
+            let quality = guard.record_tool_result("task", error);
+            assert_eq!(quality, super::result_quality::ResultQuality::Error);
+        }
+
+        let health = guard
+            .health
+            .get("task")
+            .expect("task health should be tracked");
+        assert_eq!(health.total_calls, errors.len());
+        assert_eq!(health.total_failures, errors.len());
+        assert_eq!(
+            health.consecutive_failures, 0,
+            "caller-fixable contract errors must not count toward tool quarantine"
+        );
+        assert!(
+            !guard.health.is_deprioritized("task"),
+            "bad tool-call shape must not hide a healthy task tool"
+        );
     }
 
     #[test]

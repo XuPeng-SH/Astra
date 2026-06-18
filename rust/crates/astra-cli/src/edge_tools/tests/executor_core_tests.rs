@@ -41,6 +41,65 @@ async fn execute_unknown_tool_returns_error() {
     );
 }
 
+#[tokio::test]
+async fn retired_git_github_helper_aliases_are_unknown_on_cli_edge_executor() {
+    let executor = test_executor();
+
+    for name in [
+        "git_status",
+        "git_diff",
+        "git_log",
+        "git_show",
+        "git_blame",
+        "git_file_history",
+        "git_log_search",
+        "git_contributors",
+        "git_commit",
+        "git_revert_commit",
+        "git_stash",
+        "git_checkout_file",
+        "git_worktree",
+        "github_list_prs",
+        "github_get_pr",
+        "github_ci_status",
+        "github_list_issues",
+        "github_get_issue",
+        "github_repo_stats",
+        "github_create_issue",
+    ] {
+        let result = executor.execute(name, &json!({})).await;
+        assert!(result.starts_with("Error:"), "{name}: {result}");
+        assert!(result.contains("not available"), "{name}: {result}");
+    }
+}
+
+#[tokio::test]
+async fn consolidated_github_create_issue_error_does_not_leak_retired_alias() {
+    let executor = test_executor();
+
+    let result = executor
+        .execute(
+            "github",
+            &json!({
+                "action": "create_issue",
+                "repo": "not-owner-repo",
+                "title": "Fix it"
+            }),
+        )
+        .await;
+
+    assert!(!result.contains("github_create_issue"), "{result}");
+    let parsed: serde_json::Value = serde_json::from_str(&result).expect("github error json");
+    assert_eq!(parsed["ok"], false);
+    assert_eq!(parsed["tool"], "github");
+    assert!(
+        parsed["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("create_issue")
+    );
+}
+
 /// Standalone `delegate` tool (the engine-managed delegation flow).
 /// In server mode the runtime intercepts this call upstream in
 /// `agentic_delegate_interception.rs` and runs real sub-agents — the
@@ -56,6 +115,40 @@ async fn execute_delegate_tool_returns_deferred_acknowledgment_for_interception_
     assert!(
         result.contains("Delegation request acknowledged"),
         "got: {result}"
+    );
+}
+
+#[tokio::test]
+async fn execute_with_metadata_marks_structured_str_replace_failure_as_error() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("f.txt"), "let current = 1;\n").unwrap();
+    let executor = ToolExecutor::new(temp.path().to_path_buf());
+
+    let read = executor
+        .execute("read_file", &json!({"path": "f.txt"}))
+        .await;
+    assert!(read.contains("let current = 1;"), "{read}");
+
+    let outcome = executor
+        .execute_with_metadata(
+            "str_replace",
+            &json!({
+                "path": "f.txt",
+                "old_str": "let stale = 1;",
+                "new_str": "let stale = 2;"
+            }),
+        )
+        .await;
+
+    assert!(outcome.is_error, "{outcome:?}");
+    assert!(
+        outcome.output.contains("STR_REPLACE FAILED"),
+        "{}",
+        outcome.output
+    );
+    assert_eq!(
+        astra_turn_core::tool_result_semantics::cloud_tool_result_status_label(&outcome.output),
+        "error"
     );
 }
 
@@ -748,6 +841,41 @@ fn plan_mode_background_task_guard_blocks_stop_but_allows_reads() {
     assert!(!crate::edge_tools::is_plan_mode_blocked_tool(
         "task_list",
         &json!({})
+    ));
+}
+
+#[test]
+fn plan_mode_guard_is_action_aware_for_git_github_and_memory() {
+    for action in ["commit", "revert_commit", "stash", "push"] {
+        assert!(
+            crate::edge_tools::is_plan_mode_blocked_tool("git", &json!({"action": action})),
+            "git(action={action}) must be blocked during plan authoring"
+        );
+    }
+
+    for action in ["status", "diff", "log", "show", "blame"] {
+        assert!(
+            !crate::edge_tools::is_plan_mode_blocked_tool("git", &json!({"action": action})),
+            "git(action={action}) must stay available during plan authoring"
+        );
+    }
+
+    assert!(crate::edge_tools::is_plan_mode_blocked_tool(
+        "github",
+        &json!({"action": "create_issue"})
+    ));
+    assert!(!crate::edge_tools::is_plan_mode_blocked_tool(
+        "github",
+        &json!({"action": "list_prs"})
+    ));
+
+    assert!(!crate::edge_tools::is_plan_mode_blocked_tool(
+        "memory",
+        &json!({"action": "recall", "query": "release notes"})
+    ));
+    assert!(!crate::edge_tools::is_plan_mode_blocked_tool(
+        "memory",
+        &json!({"action": "remember", "content": "draft plan context"})
     ));
 }
 

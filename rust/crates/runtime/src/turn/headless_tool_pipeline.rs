@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use astra_services::session_journal::ToolCallRecord;
 use astra_thin_client::ThinClient;
@@ -9,10 +9,11 @@ use super::agentic::headless_round::{HeadlessRoundTerminal, PermissionSyncHandle
 use astra_pipeline::step_protocol::{IdempotencyKey, InMemoryIdempotencyCache};
 use astra_pipeline::step_recorder::StepRecorder;
 use astra_text_utils::semantic_dedup::SemanticDedup;
+use astra_turn_core::edge_prompt_context::make_args_preview;
 use astra_turn_core::guardrails::turn_guard::TurnGuard;
 use astra_turn_core::headless_tool_assembly::{
-    EdgeToolRoundRow, HeadlessResolvedToolSlot, HeadlessRoundToolIdx, resolve_headless_tool_slot,
-    take_edge_output_for_tool_call_with_duration,
+    EdgeToolRoundRow, HeadlessResolvedToolSlot, HeadlessRoundToolIdx, READ_ONLY_TOOLS,
+    resolve_headless_tool_slot, take_edge_output_for_tool_call_with_duration,
 };
 
 mod execute;
@@ -21,33 +22,24 @@ mod record;
 
 /// Compute the set of tool names the validator should admit.
 ///
-/// Pre-phase-4 the validator gated strictly on `visible` (the names in the
-/// LLM request's `tools[]` array). That blocks the deferred-activation flow:
-/// the model calls `tool_search(select:WebFetch)`, learns the schema, and on
-/// the next turn tries to call `WebFetch` — which is not in `tools[]`
-/// because the whole point of deferred is to keep `tools[]` byte-stable.
-///
-/// New rule: admit anything in `visible` **or** in the full catalog. The
-/// executor already dispatches by name; if a name is dispatchable, a legit
-/// tool call with that name should proceed regardless of `tools[]` contents.
-/// Hallucinated names (neither visible nor cataloged) stay rejected.
+/// `visible` is the set advertised in the current request's `tools[]`.
+/// `activated` is the set of names that crossed an explicit activation
+/// boundary, e.g. `tool_search(query="select:NAME")`, or were injected by
+/// the runtime with a concrete schema/transport binding.
 pub fn admissible_tool_names(
     visible: &HashSet<String>,
-    full_catalog: &HashSet<String>,
+    activated: &HashSet<String>,
 ) -> HashSet<String> {
-    let mut out = HashSet::with_capacity(visible.len() + full_catalog.len());
+    let mut out = HashSet::with_capacity(visible.len() + activated.len());
     out.extend(visible.iter().cloned());
-    out.extend(full_catalog.iter().cloned());
+    out.extend(activated.iter().cloned());
     out
 }
 
 /// Production-facing wrapper: the validator caller typically has the
 /// turn's visible tool schemas (slice of JSON values) and needs the final
-/// admitted name set. Folds in the static `TOOL_CATALOG` so every
-/// dispatchable name is accepted, not just visible ones.
-///
-/// Wire this at `server_loop_host::sync_valid_tools_to_visible` (and any
-/// equivalent CLI-side path). The deferred-activation flow depends on it.
+/// admitted name set. This intentionally admits only visible schemas unless
+/// explicit extras are supplied.
 pub fn admissible_tool_names_from_visible(
     visible_schemas: &[serde_json::Value],
 ) -> HashSet<String> {
@@ -55,42 +47,17 @@ pub fn admissible_tool_names_from_visible(
 }
 
 /// Like [`admissible_tool_names_from_visible`] but also admits names from
-/// an `extras` list — used to surface runtime-injected schemas (`skill`,
-/// `web_search`, `task`, `notify`, `ask_user`) and
-/// plugin-registered MCP tools that don't live in the static
-/// `TOOL_CATALOG`. Without this escape hatch the validator would reject
-/// tool calls for names the executor can dispatch.
+/// an `extras` list. Extras are names with an explicit execution grant:
+/// runtime-injected schemas, plugin/MCP tools installed into the session, or
+/// deferred tools already activated by `tool_search(select:NAME)`.
 pub fn admissible_tool_names_from_visible_and_extras(
     visible_schemas: &[serde_json::Value],
     extras: &[String],
 ) -> HashSet<String> {
-    let visible: HashSet<String> = visible_schemas
-        .iter()
-        .filter_map(|s| {
-            s.get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(serde_json::Value::as_str)
-                .map(String::from)
-        })
-        .collect();
-    let catalog: HashSet<String> = catalog_names_static().iter().cloned().collect();
-    let mut out = admissible_tool_names(&visible, &catalog);
-    out.extend(extras.iter().cloned());
-    out
-}
-
-/// Cached `TOOL_CATALOG` names as owned Strings. Built once per process
-/// so `admissible_tool_names_from_visible` doesn't re-allocate 19+ Strings
-/// per tool round.
-fn catalog_names_static() -> &'static [String] {
-    use std::sync::OnceLock;
-    static CACHE: OnceLock<Vec<String>> = OnceLock::new();
-    CACHE.get_or_init(|| {
-        astra_turn_core::tool_registry_meta::TOOL_CATALOG
-            .iter()
-            .map(|t| t.name.to_string())
-            .collect()
-    })
+    let visible =
+        astra_turn_core::tool::deferred_activation::tool_names_from_schemas(visible_schemas);
+    let extras: HashSet<String> = extras.iter().cloned().collect();
+    admissible_tool_names(&visible, &extras)
 }
 
 pub(crate) struct HeadlessResolvedExecution {
@@ -102,6 +69,65 @@ pub(crate) struct HeadlessResolvedExecution {
     edge_duration_ms: u64,
     is_edge_tool: bool,
     early_exit_ms: u64,
+}
+
+const EDGE_RESULT_RUNTIME_ENVIRONMENT_ADVERTISEMENT_FIELD: &str =
+    "runtime_environment_advertisement";
+const EDGE_RESULT_RUNTIME_ENVIRONMENT_FIELD: &str = "runtime_environment";
+
+fn edge_result_runtime_environment_denial(execution: &HeadlessResolvedExecution) -> Option<String> {
+    if !execution.is_edge_tool {
+        return None;
+    }
+    let Some(fields) = execution.tool_result_fields.as_ref() else {
+        return Some(format!(
+            "Error: edge runtime capability denied for tool '{}': runtime_environment_advertisement_required",
+            execution.name
+        ));
+    };
+    let Some(advertisement_value) = fields
+        .get(EDGE_RESULT_RUNTIME_ENVIRONMENT_ADVERTISEMENT_FIELD)
+        .or_else(|| fields.get(EDGE_RESULT_RUNTIME_ENVIRONMENT_FIELD))
+    else {
+        return Some(format!(
+            "Error: edge runtime capability denied for tool '{}': runtime_environment_advertisement_required",
+            execution.name
+        ));
+    };
+    let advertisement = match serde_json::from_value::<
+        astra_runtime_env::RuntimeEnvironmentAdvertisement,
+    >(advertisement_value.clone())
+    {
+        Ok(advertisement) => advertisement,
+        Err(_) => {
+            return Some(format!(
+                "Error: edge runtime capability denied for tool '{}': invalid_runtime_environment_advertisement",
+                execution.name
+            ));
+        }
+    };
+    let registry = astra_runtime_env::ToolRegistry::builtins();
+    if !advertisement.binding.policy.allows_tool(&execution.name) {
+        return Some(format!(
+            "Error: edge runtime capability denied for tool '{}': {}",
+            execution.name,
+            astra_runtime_env::PolicyIntent::disallowed_tool_reason(&execution.name)
+        ));
+    }
+    astra_runtime_env::CapabilityResolver
+        .check_tool_call(
+            &registry,
+            &execution.name,
+            &execution.args,
+            &advertisement.binding.capabilities,
+        )
+        .err()
+        .map(|reason| {
+            format!(
+                "Error: edge runtime capability denied for tool '{}': {reason}",
+                execution.name
+            )
+        })
 }
 
 struct HeadlessBlockedTool<'a> {
@@ -156,6 +182,12 @@ pub(crate) struct HeadlessToolExecutionCtx<'a, E: EdgeToolRoundRow> {
     pub messages: &'a mut Vec<Value>,
     pub tool_results: &'a mut Vec<Value>,
     pub valid_tool_names: &'a HashSet<String>,
+    /// Names listed in this turn's `<deferred_tools>` manifest. Used by the
+    /// validator to differentiate "unknown" denials (truly hallucinated) from
+    /// "not yet activated" denials (deferred but reachable via
+    /// `tool_search(query="select:NAME")`). When empty, every denial falls
+    /// back to the generic unknown-tool message.
+    pub deferred_tool_names: &'a HashSet<String>,
     pub restricted_tools: &'a mut HashSet<String>,
     pub turn_guard: &'a mut TurnGuard,
     pub step_recorder: &'a mut StepRecorder,
@@ -283,6 +315,29 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         self.ctx.turn_guard.record_step_abort(aborted_tools);
     }
 
+    fn begin_execution_trace(
+        &mut self,
+        execution: &HeadlessResolvedExecution,
+        idem_key: &IdempotencyKey,
+    ) {
+        let tool_idem_key = if READ_ONLY_TOOLS.contains(&execution.name.as_str()) {
+            Some(idem_key.cache_key())
+        } else {
+            None
+        };
+        let args_preview = make_args_preview(&execution.name, &execution.args);
+        self.ctx.step_recorder.begin_tool_with_key_and_args_preview(
+            &execution.name,
+            &execution.id,
+            tool_idem_key.as_deref(),
+            args_preview.as_deref(),
+        );
+
+        if let Some(emitter) = self.ctx.progress_emitter {
+            emitter.tool_executing(&execution.name, self.ctx.turn_index as u32);
+        }
+    }
+
     fn resolve_slot(&self, item: HeadlessRoundToolIdx) -> HeadlessResolvedToolSlot {
         resolve_headless_tool_slot(item, self.ctx.tool_calls, |i| {
             let edge = &self.ctx.edge_tool_round[i];
@@ -311,7 +366,9 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
     /// Execute a batch of read-only tools concurrently.
     /// Returns false if the round should be aborted.
     pub(crate) async fn run_batch_concurrent(&mut self, items: &[HeadlessRoundToolIdx]) -> bool {
-        use super::headless_tool_pipeline::execute::execute_tool_pure;
+        use super::headless_tool_pipeline::execute::{
+            execute_tool_pure, execution_result_is_error,
+        };
 
         // Phase 1: validate + permit serially (fast, needs &mut self).
         let mut permitted_batch: Vec<PermittedExecution> = Vec::with_capacity(items.len());
@@ -344,6 +401,14 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         let session_id = self.ctx.current_session_id;
         let turn_index = self.ctx.turn_index;
 
+        let started_at: Vec<Instant> = executions
+            .iter()
+            .map(|(execution, idem_key)| {
+                self.begin_execution_trace(execution, idem_key);
+                Instant::now()
+            })
+            .collect();
+
         let futs: Vec<_> = executions
             .iter_mut()
             .map(|(exec, _)| {
@@ -353,18 +418,16 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         futures_util::future::join_all(futs).await;
 
         // Phase 3: post-process + record serially (fast, needs &mut self).
-        for (execution, idem_key) in executions {
-            let is_err = matches!(
-                astra_turn_core::tool_result_semantics::classify_tool_error(
-                    &execution.name,
-                    &execution.result_str,
-                ),
-                astra_turn_core::tool_result_semantics::ToolErrorSeverity::HardError
+        for ((execution, idem_key), started) in executions.into_iter().zip(started_at) {
+            let is_err = execution_result_is_error(
+                &execution.name,
+                &execution.result_str,
+                execution.tool_result_fields.as_ref(),
             );
             let executed_ms = if execution.is_edge_tool && execution.edge_duration_ms > 0 {
                 execution.edge_duration_ms
             } else {
-                0
+                started.elapsed().as_millis() as u64
             };
             let executed = ExecutedExecution {
                 execution,
@@ -465,6 +528,17 @@ mod tests {
             .collect()
     }
 
+    fn edge_runtime_environment_fields() -> Map<String, Value> {
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        let advertisement = astra_runtime_env::RuntimeEnvironmentAdvertisement::new(
+            astra_runtime_env::RunBinding::edge_developer("/workspace/project", &registry),
+        );
+        Map::from_iter([(
+            EDGE_RESULT_RUNTIME_ENVIRONMENT_ADVERTISEMENT_FIELD.to_string(),
+            serde_json::to_value(advertisement).expect("serialize advertisement"),
+        )])
+    }
+
     struct PipelineHarness {
         api: ThinClient,
         tool_calls: Vec<Value>,
@@ -474,6 +548,7 @@ mod tests {
         messages: Vec<Value>,
         tool_results: Vec<Value>,
         valid_tool_names: HashSet<String>,
+        deferred_tool_names: HashSet<String>,
         restricted_tools: HashSet<String>,
         turn_guard: TurnGuard,
         step_recorder: StepRecorder,
@@ -497,7 +572,7 @@ mod tests {
                     tool: "grep".to_string(),
                     args: json!({ "pattern": "headless" }),
                     output: "found result".to_string(),
-                    tool_result_fields: None,
+                    tool_result_fields: Some(edge_runtime_environment_fields()),
                     status: "ok".to_string(),
                     duration_ms: 12,
                 }],
@@ -506,6 +581,7 @@ mod tests {
                 messages: Vec::new(),
                 tool_results: Vec::new(),
                 valid_tool_names: HashSet::from(["grep".to_string()]),
+                deferred_tool_names: HashSet::new(),
                 restricted_tools: HashSet::new(),
                 turn_guard: TurnGuard::new(),
                 step_recorder: StepRecorder::new("test-session", "test-task"),
@@ -547,6 +623,7 @@ mod tests {
                     messages: &mut self.messages,
                     tool_results: &mut self.tool_results,
                     valid_tool_names: &self.valid_tool_names,
+                    deferred_tool_names: &self.deferred_tool_names,
                     restricted_tools: &mut self.restricted_tools,
                     turn_guard: &mut self.turn_guard,
                     step_recorder: &mut self.step_recorder,
@@ -610,6 +687,202 @@ mod tests {
             }
             _ => panic!("expected permitted execution"),
         }
+    }
+
+    #[tokio::test]
+    async fn concurrent_batch_records_tool_starts_before_terminal_events() {
+        let mut harness = PipelineHarness::new();
+        harness.edge_tool_round.push(EdgeToolExecResult {
+            request_id: String::new(),
+            tool: "grep".to_string(),
+            args: json!({ "pattern": "pipeline" }),
+            output: "second result".to_string(),
+            tool_result_fields: Some(edge_runtime_environment_fields()),
+            status: "ok".to_string(),
+            duration_ms: 7,
+        });
+        begin_recorded_turn(&mut harness, 2);
+
+        {
+            let mut pipeline = harness.pipeline();
+            assert!(
+                pipeline
+                    .run_batch_concurrent(&[
+                        HeadlessRoundToolIdx::SyntheticEdge(0),
+                        HeadlessRoundToolIdx::SyntheticEdge(1),
+                    ])
+                    .await,
+                "concurrent read-only batch should complete"
+            );
+        }
+
+        let tool_events = tool_trace_events(&harness);
+        assert_eq!(
+            tool_events.len(),
+            4,
+            "each concurrently executed tool should emit started+terminal trace events"
+        );
+        assert!(matches!(
+            tool_events[0].0,
+            astra_pipeline::step_protocol::StepEventType::ToolCallStarted
+        ));
+        assert!(matches!(
+            tool_events[1].0,
+            astra_pipeline::step_protocol::StepEventType::ToolCallStarted
+        ));
+        assert!(matches!(
+            tool_events[2].0,
+            astra_pipeline::step_protocol::StepEventType::ToolCallCompleted
+        ));
+        assert!(matches!(
+            tool_events[3].0,
+            astra_pipeline::step_protocol::StepEventType::ToolCallCompleted
+        ));
+        assert_eq!(
+            tool_events[2]
+                .1
+                .as_ref()
+                .and_then(|payload| payload.get("elapsed_ms"))
+                .and_then(Value::as_u64),
+            Some(12)
+        );
+        assert_eq!(
+            tool_events[3]
+                .1
+                .as_ref()
+                .and_then(|payload| payload.get("elapsed_ms"))
+                .and_then(Value::as_u64),
+            Some(7)
+        );
+    }
+
+    #[tokio::test]
+    async fn permit_execution_blocks_edge_result_missing_runtime_environment_advertisement() {
+        let mut harness = PipelineHarness::new();
+        harness.edge_tool_round[0].tool_result_fields = None;
+        begin_recorded_turn(&mut harness, 1);
+
+        let mut pipeline = harness.pipeline();
+        let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::SyntheticEdge(0)) {
+            HeadlessPipelineStage::Continue(validated) => validated,
+            _ => panic!("expected validated execution"),
+        };
+
+        match pipeline.permit_execution(validated).await {
+            HeadlessPipelineStage::ShortCircuit => {}
+            _ => panic!("expected missing edge runtime advertisement denial"),
+        }
+        assert_eq!(pipeline.ctx.tool_results.len(), 1);
+        assert!(
+            pipeline.ctx.tool_results[0]
+                .to_string()
+                .contains("runtime_environment_advertisement_required"),
+            "got: {}",
+            pipeline.ctx.tool_results[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn permit_execution_blocks_edge_result_with_invalid_runtime_environment_advertisement() {
+        let mut harness = PipelineHarness::new();
+        harness.edge_tool_round[0].tool_result_fields = Some(Map::from_iter([(
+            EDGE_RESULT_RUNTIME_ENVIRONMENT_ADVERTISEMENT_FIELD.to_string(),
+            json!({"schema_version": 1, "binding": {"invalid": true}}),
+        )]));
+        begin_recorded_turn(&mut harness, 1);
+
+        let mut pipeline = harness.pipeline();
+        let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::SyntheticEdge(0)) {
+            HeadlessPipelineStage::Continue(validated) => validated,
+            _ => panic!("expected validated execution"),
+        };
+
+        match pipeline.permit_execution(validated).await {
+            HeadlessPipelineStage::ShortCircuit => {}
+            _ => panic!("expected edge runtime advertisement denial"),
+        }
+        assert_eq!(pipeline.ctx.tool_results.len(), 1);
+        assert!(
+            pipeline.ctx.tool_results[0]
+                .to_string()
+                .contains("invalid_runtime_environment_advertisement"),
+            "got: {}",
+            pipeline.ctx.tool_results[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn permit_execution_blocks_edge_result_when_advertised_runtime_lacks_tool_capability() {
+        let mut harness = PipelineHarness::new();
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        let advertisement = astra_runtime_env::RuntimeEnvironmentAdvertisement::new(
+            astra_runtime_env::RunBinding::cloud_control_plane(&registry),
+        );
+        harness.edge_tool_round[0].tool_result_fields = Some(Map::from_iter([(
+            EDGE_RESULT_RUNTIME_ENVIRONMENT_ADVERTISEMENT_FIELD.to_string(),
+            serde_json::to_value(advertisement).expect("serialize advertisement"),
+        )]));
+        begin_recorded_turn(&mut harness, 1);
+
+        let mut pipeline = harness.pipeline();
+        let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::SyntheticEdge(0)) {
+            HeadlessPipelineStage::Continue(validated) => validated,
+            _ => panic!("expected validated execution"),
+        };
+
+        match pipeline.permit_execution(validated).await {
+            HeadlessPipelineStage::ShortCircuit => {}
+            _ => panic!("expected edge runtime capability denial"),
+        }
+        assert_eq!(pipeline.ctx.tool_results.len(), 1);
+        assert!(
+            pipeline.ctx.tool_results[0]
+                .to_string()
+                .contains("edge runtime capability denied"),
+            "got: {}",
+            pipeline.ctx.tool_results[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn permit_execution_blocks_edge_result_when_advertised_policy_disallows_tool() {
+        let mut harness = PipelineHarness::new();
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        let advertisement = astra_runtime_env::RuntimeEnvironmentAdvertisement::new(
+            astra_runtime_env::RunBinding::resolve(
+                astra_runtime_env::WorkspaceBinding::edge_workspace(
+                    "/workspace/project",
+                    astra_runtime_env::WorkspaceAuthority::ReadWrite,
+                ),
+                astra_runtime_env::ExecutorBinding::edge_agent("edge-agent"),
+                astra_runtime_env::RuntimeBinding::host_process("edge-host"),
+                astra_runtime_env::PolicyIntent::local_developer()
+                    .with_allowed_tools(["read_file"]),
+                &registry,
+            ),
+        );
+        harness.edge_tool_round[0].tool_result_fields = Some(Map::from_iter([(
+            EDGE_RESULT_RUNTIME_ENVIRONMENT_ADVERTISEMENT_FIELD.to_string(),
+            serde_json::to_value(advertisement).expect("serialize advertisement"),
+        )]));
+        begin_recorded_turn(&mut harness, 1);
+
+        let mut pipeline = harness.pipeline();
+        let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::SyntheticEdge(0)) {
+            HeadlessPipelineStage::Continue(validated) => validated,
+            _ => panic!("expected validated execution"),
+        };
+
+        match pipeline.permit_execution(validated).await {
+            HeadlessPipelineStage::ShortCircuit => {}
+            _ => panic!("expected edge runtime policy denial"),
+        }
+        assert_eq!(pipeline.ctx.tool_results.len(), 1);
+        let result = pipeline.ctx.tool_results[0].to_string();
+        assert!(
+            result.contains("tool 'grep' is not in allowed_tools"),
+            "got: {result}"
+        );
     }
 
     #[tokio::test]
@@ -823,7 +1096,7 @@ mod tests {
         assert_eq!(
             tool_events.len(),
             2,
-            "cached cross-turn short-circuit should emit started+skipped trace events"
+            "cached cross-turn short-circuit should emit started+completed trace events"
         );
         assert!(matches!(
             tool_events[0].0,
@@ -848,23 +1121,38 @@ mod tests {
 
         assert!(matches!(
             tool_events[1].0,
-            astra_pipeline::step_protocol::StepEventType::ToolCallSkipped
+            astra_pipeline::step_protocol::StepEventType::ToolCallCompleted
         ));
-        let skipped_payload = tool_events[1].1.as_ref().expect("skipped payload");
+        let completed_payload = tool_events[1].1.as_ref().expect("completed payload");
         assert_eq!(
-            skipped_payload.get("reason").and_then(Value::as_str),
+            completed_payload.get("reason").and_then(Value::as_str),
             Some("cached_cross_turn")
         );
         assert_eq!(
-            skipped_payload.get("cached").and_then(Value::as_bool),
+            completed_payload.get("cached").and_then(Value::as_bool),
             Some(true)
         );
+        assert_eq!(
+            completed_payload.get("is_error").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            completed_payload.get("call_id").and_then(Value::as_str),
+            Some("call-read-a-1")
+        );
         assert!(
-            skipped_payload
+            completed_payload
                 .get("args_preview")
                 .and_then(Value::as_str)
                 .is_some_and(|preview| preview.contains("a.txt")),
-            "skipped trace should include args preview, got: {skipped_payload:?}"
+            "completed trace should include args preview, got: {completed_payload:?}"
+        );
+        assert!(
+            completed_payload
+                .get("output")
+                .and_then(Value::as_str)
+                .is_some_and(|output| output.contains("cached a.txt")),
+            "completed cache-hit trace should carry cached output, got: {completed_payload:?}"
         );
     }
 
@@ -884,8 +1172,8 @@ mod tests {
                 true,
             ),
             (
-                "git_commit",
-                json!({ "message": "save changes" }),
+                "git",
+                json!({ "action": "commit", "message": "save changes" }),
                 false,
                 true,
             ),
@@ -1024,16 +1312,16 @@ mod tests {
         let mut harness = PipelineHarness::new();
         harness.edge_tool_round[0].output = "permission denied".to_string();
         harness.edge_tool_round[0].status = "partial_failure".to_string();
-        harness.edge_tool_round[0].tool_result_fields = Some(Map::from_iter([
-            (
-                "status".to_string(),
-                Value::String("partial_failure".to_string()),
-            ),
-            (
-                "output".to_string(),
-                Value::String("permission denied".to_string()),
-            ),
-        ]));
+        let mut fields = edge_runtime_environment_fields();
+        fields.insert(
+            "status".to_string(),
+            Value::String("partial_failure".to_string()),
+        );
+        fields.insert(
+            "output".to_string(),
+            Value::String("permission denied".to_string()),
+        );
+        harness.edge_tool_round[0].tool_result_fields = Some(fields);
 
         let mut pipeline = harness.pipeline();
         let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::SyntheticEdge(0)) {
@@ -1047,6 +1335,56 @@ mod tests {
 
         let executed = pipeline.execute_execution(permitted).await;
         assert!(executed.is_err, "got: {}", executed.execution.result_str);
+    }
+
+    #[tokio::test]
+    async fn explicit_success_output_overrides_stale_failed_edge_status() {
+        let mut harness = PipelineHarness::new();
+        let args = json!({
+            "path": "src/lib.rs",
+            "old_str": "before",
+            "new_str": "after"
+        });
+        harness.edge_tool_round[0].tool = "str_replace".to_string();
+        harness.edge_tool_round[0].args = args;
+        harness.edge_tool_round[0].output =
+            "Replaced successfully\n<<<ASTRA_UNIFIED_DIFF>>>\n-old\n+new\n<<<END_ASTRA_UNIFIED_DIFF>>>"
+                .to_string();
+        harness.edge_tool_round[0].status = "error".to_string();
+        let mut fields = edge_runtime_environment_fields();
+        fields.insert("status".to_string(), Value::String("error".to_string()));
+        harness.edge_tool_round[0].tool_result_fields = Some(fields);
+        harness.valid_tool_names = HashSet::from(["str_replace".to_string()]);
+
+        let mut pipeline = harness.pipeline();
+        let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::SyntheticEdge(0)) {
+            HeadlessPipelineStage::Continue(validated) => validated,
+            _ => panic!("expected validated execution"),
+        };
+        let permitted = match pipeline.permit_execution(validated).await {
+            HeadlessPipelineStage::Continue(permitted) => permitted,
+            _ => panic!("expected permitted execution"),
+        };
+
+        let executed = pipeline.execute_execution(permitted).await;
+        assert!(!executed.is_err, "got: {}", executed.execution.result_str);
+        assert!(
+            !executed.execution.result_str.contains("returned an error"),
+            "successful edit must not receive error feedback: {}",
+            executed.execution.result_str
+        );
+
+        pipeline.record_execution(executed).await;
+        assert_eq!(pipeline.ctx.tool_call_records.len(), 1);
+        let record = &pipeline.ctx.tool_call_records[0];
+        assert!(record.ok);
+        assert!(record.error.is_none());
+        assert!(
+            record
+                .result_preview
+                .as_deref()
+                .is_some_and(|preview| preview.starts_with("Replaced successfully"))
+        );
     }
 
     #[tokio::test]
@@ -1116,11 +1454,11 @@ mod tests {
             None,
         );
         let mut pipeline = harness.pipeline_with_server_executor(3, Some(&server_exec));
-        let args = json!({"message": "initial"});
+        let args = json!({"action": "commit", "message": "initial"});
         let permitted = PermittedExecution {
             execution: HeadlessResolvedExecution {
-                id: "call-git-commit".into(),
-                name: "git_commit".into(),
+                id: "call-git".into(),
+                name: "git".into(),
                 args: args.clone(),
                 result_str: "Error: headless edge protocol: no matching edge result".into(),
                 tool_result_fields: None,
@@ -1128,7 +1466,7 @@ mod tests {
                 is_edge_tool: false,
                 early_exit_ms: 0,
             },
-            idem_key: IdempotencyKey::semantic("git_commit", &args),
+            idem_key: IdempotencyKey::semantic("git", &args),
         };
 
         let executed = pipeline.execute_execution(permitted).await;
@@ -1308,37 +1646,29 @@ mod tests {
         );
     }
 
-    /// P0-T contract: the real validator must admit a deferred catalog
-    /// tool even when it's NOT in `valid_tool_names` from visible. This
-    /// simulates turn N+1 of the activation flow — where `github` was
-    /// just selected via `tool_search(select:github)` and the model is
-    /// invoking it, but visible tools[] still reflects the pinned slice.
+    /// Deferred tools are not executable from the catalog alone. They become
+    /// admissible only after an explicit activation boundary supplies the
+    /// name through `extras`.
     #[tokio::test]
     async fn validator_admits_deferred_catalog_tool_via_extras() {
         let mut harness = PipelineHarness::new();
         push_unknown_server_tool_call(&mut harness, "github");
         begin_recorded_turn(&mut harness, 1);
 
-        // Build valid_tool_names the way production does: union of
-        // visible + catalog via the public helper. 'grep' is visible,
-        // 'github' is NOT visible but IS in TOOL_CATALOG → must be
-        // admitted.
         let visible = vec![json!({"type": "function", "function": {"name": "grep"}})];
-        harness.valid_tool_names = super::admissible_tool_names_from_visible(&visible);
+        harness.valid_tool_names =
+            super::admissible_tool_names_from_visible_and_extras(&visible, &["github".to_string()]);
         assert!(
             harness.valid_tool_names.contains("github"),
-            "precondition: admissible set must include github"
+            "precondition: activated deferred name must be admissible"
         );
 
         let mut pipeline = harness.pipeline();
         let result = pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0));
 
-        // Before this fix: ShortCircuit (rejected as unknown).
-        // After: ValidatedExecution because the helper union includes
-        // 'github' from the catalog.
         match result {
             HeadlessPipelineStage::ShortCircuit => {
-                panic!("validator rejected deferred github — deferred activation flow is broken")
+                panic!("validator rejected activated deferred github")
             }
             HeadlessPipelineStage::Continue(_) => {
                 // ok — admitted for execution.
@@ -1347,6 +1677,118 @@ mod tests {
                 panic!("validator aborted round on deferred github — unexpected")
             }
         }
+    }
+
+    /// Denial copy contract: when the model calls a deferred-but-not-activated
+    /// tool, the validator must emit the activation hint, not the bare
+    /// "Unknown tool" message. Deferred names live in the prompt's
+    /// `<deferred_tools>` manifest; we mirror that set into the validator
+    /// context so the denial branch can pick the right copy.
+    #[tokio::test]
+    async fn validator_denial_body_for_deferred_uses_activation_hint() {
+        let mut harness = PipelineHarness::new();
+        push_unknown_server_tool_call(&mut harness, "agent_fanout");
+        begin_recorded_turn(&mut harness, 1);
+
+        let visible = vec![json!({"type": "function", "function": {"name": "grep"}})];
+        harness.valid_tool_names = super::admissible_tool_names_from_visible(&visible);
+        harness.deferred_tool_names = HashSet::from(["agent_fanout".to_string()]);
+
+        let mut pipeline = harness.pipeline();
+        let result = pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0));
+        assert!(matches!(result, HeadlessPipelineStage::ShortCircuit));
+        drop(pipeline);
+
+        let last_tr = harness
+            .tool_results
+            .last()
+            .expect("denial should record a tool_result");
+        let body = last_tr
+            .get("result")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            body.contains("tool_search") && body.contains("select:agent_fanout"),
+            "deferred denial must guide the model to activate via tool_search; got: {body}"
+        );
+        assert!(
+            !body.starts_with("Unknown tool"),
+            "deferred denial must not reuse the bare unknown-tool copy; got: {body}"
+        );
+        let record = harness
+            .tool_call_records
+            .last()
+            .expect("deferred denial should record a journal placeholder");
+        assert_eq!(record.name, "agent_fanout");
+        assert!(record.ok);
+        assert_eq!(record.error.as_deref(), Some("tool_not_admitted"));
+        assert!(record.is_synthetic_placeholder());
+        assert!(
+            record
+                .result_preview
+                .as_deref()
+                .is_some_and(|preview| preview.starts_with("Deferred:"))
+        );
+        let tool_events = tool_trace_events(&harness);
+        assert_eq!(
+            tool_events[1]
+                .1
+                .as_ref()
+                .and_then(|payload| payload.get("reason"))
+                .and_then(Value::as_str),
+            Some("tool_not_admitted")
+        );
+
+        // Hallucinated names still get the Unknown-tool body.
+        let mut h2 = PipelineHarness::new();
+        push_unknown_server_tool_call(&mut h2, "definitely_not_a_tool");
+        begin_recorded_turn(&mut h2, 1);
+        h2.valid_tool_names = super::admissible_tool_names_from_visible(&visible);
+        let mut p2 = h2.pipeline();
+        let _ = p2.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0));
+        drop(p2);
+        let halluc_body = h2
+            .tool_results
+            .last()
+            .and_then(|tr| tr.get("result"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            halluc_body.starts_with("Unknown tool"),
+            "hallucinated names must still get the bare unknown-tool copy; got: {halluc_body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validator_denial_body_with_empty_deferred_set_points_to_tool_search_when_visible() {
+        let mut harness = PipelineHarness::new();
+        push_unknown_server_tool_call(&mut harness, "agent_fanout");
+        begin_recorded_turn(&mut harness, 1);
+
+        let visible = vec![json!({"type": "function", "function": {"name": "tool_search"}})];
+        harness.valid_tool_names = super::admissible_tool_names_from_visible(&visible);
+        harness.deferred_tool_names = HashSet::new();
+
+        let mut pipeline = harness.pipeline();
+        let result = pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0));
+        assert!(matches!(result, HeadlessPipelineStage::ShortCircuit));
+        drop(pipeline);
+
+        let body = harness
+            .tool_results
+            .last()
+            .and_then(|tr| tr.get("result"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            body.contains("tool_search") && body.contains("select:agent_fanout"),
+            "empty deferred set with visible tool_search should be recoverable; got: {body}"
+        );
+        assert!(
+            !body.starts_with("Unknown tool"),
+            "empty deferred set with visible tool_search should not dead-end as bare unknown; got: {body}"
+        );
     }
 
     /// Symmetric: a truly hallucinated name must still short-circuit.
@@ -1758,9 +2200,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn semantic_dedup_does_not_block_git_diff_path_after_stat_only() {
+    async fn semantic_dedup_does_not_block_git_action_diff_path_after_stat_only() {
         let mut harness = PipelineHarness::new();
-        harness.valid_tool_names.insert("git_diff".to_string());
+        harness.valid_tool_names.insert("git".to_string());
 
         let dir = tempfile::TempDir::new().unwrap();
         init_git_repo(dir.path());
@@ -1787,17 +2229,17 @@ mod tests {
 
         harness.tool_calls.push(json!({
             "id": "call-git-diff-stat",
-            "function": { "name": "git_diff", "arguments": "{\"stat_only\":true}" }
+            "function": { "name": "git", "arguments": "{\"action\":\"diff\",\"stat_only\":true}" }
         }));
         {
             let mut pipeline = harness.pipeline_with_server_executor(0, Some(&server_exec));
             let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)) {
                 HeadlessPipelineStage::Continue(v) => v,
-                _ => panic!("expected stat_only git_diff to validate"),
+                _ => panic!("expected stat_only git diff to validate"),
             };
             let permitted = match pipeline.permit_execution(validated).await {
                 HeadlessPipelineStage::Continue(p) => p,
-                _ => panic!("expected stat_only git_diff to execute"),
+                _ => panic!("expected stat_only git diff to execute"),
             };
             let executed = pipeline.execute_execution(permitted).await;
             assert!(!executed.is_err, "got: {}", executed.execution.result_str);
@@ -1807,17 +2249,17 @@ mod tests {
         harness.tool_calls.clear();
         harness.tool_calls.push(json!({
             "id": "call-git-diff-path",
-            "function": { "name": "git_diff", "arguments": "{\"path\":\"tracked.txt\"}" }
+            "function": { "name": "git", "arguments": "{\"action\":\"diff\",\"path\":\"tracked.txt\"}" }
         }));
         let mut pipeline = harness.pipeline_with_server_executor(1, Some(&server_exec));
         let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)) {
             HeadlessPipelineStage::Continue(v) => v,
-            _ => panic!("expected path-scoped git_diff to validate"),
+            _ => panic!("expected path-scoped git diff to validate"),
         };
         let permitted = match pipeline.permit_execution(validated).await {
             HeadlessPipelineStage::Continue(p) => p,
             HeadlessPipelineStage::ShortCircuit => {
-                panic!("path-scoped git_diff must not be semantically blocked by earlier stat_only")
+                panic!("path-scoped git diff must not be semantically blocked by earlier stat_only")
             }
             HeadlessPipelineStage::AbortRound => panic!("unexpected abort"),
         };
@@ -1825,7 +2267,7 @@ mod tests {
         assert!(!executed.is_err, "got: {}", executed.execution.result_str);
         assert!(
             executed.execution.result_str.contains("@@"),
-            "path-scoped git_diff should execute and return patch hunks, got: {}",
+            "path-scoped git diff should execute and return patch hunks, got: {}",
             executed.execution.result_str
         );
     }

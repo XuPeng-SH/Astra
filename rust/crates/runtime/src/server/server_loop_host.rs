@@ -14,6 +14,7 @@
 //! ```
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,7 +26,12 @@ use tokio::sync::Mutex as TokioMutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::server::tool_transport::{
-    projected_tool_end_event_fields, projected_tool_start_event_fields,
+    ExecutionBindingSnapshot, ExecutorBinding, ExecutorBindingKind, ExecutorStatus, FallbackPolicy,
+    ToolExecutionRequest, ToolPolicySnapshot, WorkspaceAuthority, WorkspaceBinding,
+    WorkspaceBindingKind, binding_event_fields,
+    capability_filter_edge_provided_tool_schemas_for_binding,
+    capability_filtered_server_tool_schemas, projected_tool_end_event_fields,
+    projected_tool_start_event_fields, tool_schema_name,
 };
 use crate::turn::agentic::headless_round::HeadlessStderrStyle;
 use crate::turn::agentic_loop::host::{
@@ -813,7 +819,7 @@ pub struct ServerAgenticLoopHost {
     capabilities: astra_turn_core::capability::CapabilitySet,
     edge_profile: Map<String, Value>,
     valid_tools: HashSet<String>,
-    /// Names the validator should admit beyond the static catalog.
+    /// Names the validator should admit beyond the current visible schemas.
     ///
     /// Covers runtime-surface tools (`skill`, `agent`, `web_search`,
     /// etc.) plus plugin/MCP tool names. Populated by the host's init
@@ -842,6 +848,9 @@ pub struct ServerAgenticLoopHost {
     edge_callback_ledger: Arc<TokioMutex<HashMap<String, Value>>>,
     user_id: String,
     session_id: String,
+    workspace_binding: WorkspaceBinding,
+    executor_binding: ExecutorBinding,
+    runtime_binding: Option<astra_runtime_env::RuntimeBinding>,
     /// Session-scoped cache for dedup of identical read-only tool invocations
     /// within a short window. Gated by concurrency_safety classification.
     tool_result_cache: astra_turn_core::tool_result_dedup::SharedResultCache,
@@ -916,6 +925,9 @@ pub struct ServerAgenticLoopHost {
     /// `CaptureRequest.tool_schemas` for per-tool drift attribution.
     /// Updated by `execute_turn` each round.
     last_turn_tool_schemas: Vec<Value>,
+    /// Shared handle to the runtime-disabled tools (admin API). Used to
+    /// exclude admin-disabled tools from the LLM tool surface.
+    disabled_tools: Arc<tokio::sync::RwLock<HashSet<String>>>,
     /// Optional LLM-based turn intent judge. When set, every turn first asks
     /// the judge to classify the user's message; on judge failure the host
     /// falls back to the deterministic keyword classifier so a transient LLM
@@ -939,6 +951,7 @@ pub struct ServerAgenticLoopHostBuilder {
     llm_token_service: Option<LlmTokenServiceConfig>,
     edge_tools: Vec<Value>,
     edge_profile: Map<String, Value>,
+    execution_bindings: Option<ExecutionBindingSnapshot>,
     selection_confidence: f64,
     edge_callback_ledger: Arc<TokioMutex<HashMap<String, Value>>>,
     user_id: String,
@@ -968,6 +981,8 @@ pub struct ServerAgenticLoopHostBuilder {
     shared_dedup_state: Option<std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>>,
     /// Optional fork-prefix store for parent-turn capture (G2).
     prefix_store: Option<std::sync::Arc<dyn astra_turn_core::fork_prefix_store::PrefixCaptureSink>>,
+    /// Shared handle to the runtime-disabled tools (admin API).
+    disabled_tools: Option<Arc<tokio::sync::RwLock<HashSet<String>>>>,
 }
 
 impl ServerAgenticLoopHostBuilder {
@@ -985,6 +1000,7 @@ impl ServerAgenticLoopHostBuilder {
             llm_token_service: None,
             edge_tools: Vec::new(),
             edge_profile: Map::new(),
+            execution_bindings: None,
             selection_confidence: 1.0,
             edge_callback_ledger: Arc::new(TokioMutex::new(HashMap::new())),
             user_id,
@@ -1009,6 +1025,7 @@ impl ServerAgenticLoopHostBuilder {
             #[cfg(feature = "bridge-e2e-hooks")]
             shared_dedup_state: None,
             prefix_store: None,
+            disabled_tools: None,
         }
     }
 
@@ -1076,6 +1093,28 @@ impl ServerAgenticLoopHostBuilder {
 
     pub fn with_edge_profile(mut self, profile: Map<String, Value>) -> Self {
         self.edge_profile = profile;
+        self
+    }
+
+    pub fn with_execution_bindings(
+        mut self,
+        workspace: WorkspaceBinding,
+        executor: ExecutorBinding,
+    ) -> Self {
+        self.execution_bindings = Some(ExecutionBindingSnapshot::inferred(workspace, executor));
+        self
+    }
+
+    pub fn with_execution_binding_snapshot(mut self, snapshot: ExecutionBindingSnapshot) -> Self {
+        self.execution_bindings = Some(snapshot);
+        self
+    }
+
+    pub fn with_server_sandbox_workspace(mut self, root: impl AsRef<Path>) -> Self {
+        self.execution_bindings = Some(ExecutionBindingSnapshot::inferred(
+            WorkspaceBinding::server_sandbox(root),
+            ExecutorBinding::server_local(),
+        ));
         self
     }
 
@@ -1162,13 +1201,38 @@ impl ServerAgenticLoopHostBuilder {
         // When no edge tools are provided (web-only mode), populate with
         // server-side tool schemas from astra-tools so the LLM knows what's available.
         let server_side_tools = self.edge_tools.is_empty();
+        let binding_snapshot = self.execution_bindings.clone().unwrap_or_else(|| {
+            ExecutionBindingSnapshot::inferred(
+                WorkspaceBinding {
+                    kind: WorkspaceBindingKind::None,
+                    display_name: "No workspace".to_string(),
+                    cwd: None,
+                    authority: WorkspaceAuthority::None,
+                    fallback_policy: FallbackPolicy::Disabled,
+                },
+                ExecutorBinding::server_control_plane(),
+            )
+        });
+        let schema_workspace = binding_snapshot.workspace.clone();
+        let schema_executor = binding_snapshot.executor.clone();
+        let schema_runtime = binding_snapshot.runtime.clone();
         let edge_tools = if server_side_tools {
-            crate::capabilities::server_runtime_tool_schemas(&self.capabilities)
+            capability_filtered_server_tool_schemas(
+                &self.capabilities,
+                &schema_workspace,
+                &schema_executor,
+                schema_runtime.as_ref(),
+            )
         } else {
-            self.edge_tools
+            capability_filter_edge_provided_tool_schemas_for_binding(
+                self.edge_tools,
+                &schema_workspace,
+                &schema_executor,
+                schema_runtime.as_ref(),
+            )
         };
 
-        let valid_tools = edge_tools
+        let mut valid_tools: HashSet<String> = edge_tools
             .iter()
             .filter_map(|t| {
                 t.get("function")
@@ -1177,6 +1241,16 @@ impl ServerAgenticLoopHostBuilder {
                     .map(String::from)
             })
             .collect();
+        let admissible_extras = if server_side_tools
+            && matches!(schema_workspace.kind, WorkspaceBindingKind::EdgeWorkspace)
+            && matches!(schema_executor.kind, ExecutorBindingKind::EdgeAgent)
+            && !matches!(schema_executor.status, ExecutorStatus::Online)
+        {
+            hidden_execution_boundary_tool_names(&edge_tools)
+        } else {
+            Vec::new()
+        };
+        valid_tools.extend(admissible_extras.iter().cloned());
 
         let progress_rx = self.progress_broadcaster.as_ref().map(|b| b.subscribe());
         let progress_filter = self
@@ -1195,7 +1269,7 @@ impl ServerAgenticLoopHostBuilder {
             capabilities: self.capabilities,
             edge_profile: self.edge_profile,
             valid_tools,
-            admissible_extras: Vec::new(),
+            admissible_extras,
             selection_confidence: self.selection_confidence,
             server_side_tools,
             interactive_client: self.interactive_client,
@@ -1204,6 +1278,9 @@ impl ServerAgenticLoopHostBuilder {
             edge_callback_ledger: self.edge_callback_ledger,
             user_id: self.user_id,
             session_id: self.session_id,
+            workspace_binding: schema_workspace.clone(),
+            executor_binding: schema_executor.clone(),
+            runtime_binding: schema_runtime.clone(),
             tool_result_cache: astra_turn_core::tool_result_dedup::new_shared_cache(
                 128,
                 Some(std::time::Duration::from_secs(30)),
@@ -1216,7 +1293,12 @@ impl ServerAgenticLoopHostBuilder {
             progress_filter,
             turn_start_lifecycle_summary: None,
             turn_start_plan_resume_hint: None,
-            execution_metadata: None,
+            execution_metadata: self.execution_bindings.as_ref().map(|snapshot| {
+                Value::Object(binding_event_fields(
+                    &snapshot.workspace,
+                    &snapshot.executor,
+                ))
+            }),
             agent_live_mirror: None,
             plan_resume_hint: Arc::new(std::sync::RwLock::new(self.plan_resume_hint)),
             task_board_resume_hint: self.task_board_resume_hint,
@@ -1234,6 +1316,9 @@ impl ServerAgenticLoopHostBuilder {
             }),
             prefix_store: self.prefix_store,
             last_turn_tool_schemas: Vec::new(),
+            disabled_tools: self
+                .disabled_tools
+                .unwrap_or_else(|| Arc::new(tokio::sync::RwLock::new(HashSet::new()))),
             turn_intent_judge: None,
         }
     }
@@ -1243,6 +1328,16 @@ impl ServerAgenticLoopHostBuilder {
         capabilities: astra_turn_core::capability::CapabilitySet,
     ) -> Self {
         self.capabilities = capabilities;
+        self
+    }
+
+    /// Share the runtime-disabled-tools set with the host so the LLM tool
+    /// surface excludes admin-disabled tools.
+    pub fn with_disabled_tools(
+        mut self,
+        handle: Arc<tokio::sync::RwLock<HashSet<String>>>,
+    ) -> Self {
+        self.disabled_tools = Some(handle);
         self
     }
 }
@@ -2064,14 +2159,54 @@ impl ServerAgenticLoopHost {
         use astra_turn_core::sse_stream_host::EdgeToolExecResult;
         use astra_turn_core::stream_events::{
             ApprovalBatchRequestEvent, build_approval_batch_required_event,
-            build_approval_required_event,
+            build_approval_required_event, build_tool_call_end_event,
         };
         use std::collections::HashMap;
 
-        let tool_calls = ensure_tool_call_ids(tool_calls);
         // 5-minute timeout: web clients may execute long-running tools.
         let ledger_wait = std::time::Duration::from_secs(300);
         let mut results_by_id: HashMap<String, EdgeToolExecResult> = HashMap::new();
+        let ordered_tool_calls = ensure_tool_call_ids(tool_calls);
+        let mut tool_calls = Vec::with_capacity(ordered_tool_calls.len());
+
+        for tc in ordered_tool_calls.iter() {
+            if !tc.is_object() {
+                continue;
+            }
+            let (request_id, tool_name, args) = parse_flat_tool_call_event(tc);
+            if self.valid_tools.contains(&tool_name) {
+                tool_calls.push(tc.clone());
+                continue;
+            }
+
+            let output = astra_turn_core::tool::deferred_activation::tool_not_admitted_message(
+                &tool_name, false,
+            );
+            self.emit_event(Value::Object(build_tool_call_end_event(
+                &request_id,
+                json!({
+                    "status": "error",
+                    "output": output,
+                }),
+            )));
+            results_by_id.insert(
+                request_id.clone(),
+                EdgeToolExecResult {
+                    request_id: request_id.clone(),
+                    tool: tool_name.clone(),
+                    args: args.clone(),
+                    output,
+                    tool_result_fields: Some(self.edge_result_fields_with_runtime(
+                        &request_id,
+                        &tool_name,
+                        &args,
+                        None,
+                    )),
+                    status: "error".to_string(),
+                    duration_ms: 0,
+                },
+            );
+        }
 
         for batch in collect_approval_batches(&tool_calls) {
             if batch.items.len() == 1 {
@@ -2138,11 +2273,16 @@ impl ServerAgenticLoopHost {
                         results_by_id.insert(
                             request_id.clone(),
                             EdgeToolExecResult {
+                                tool_result_fields: Some(self.edge_result_fields_with_runtime(
+                                    &request_id,
+                                    &tool_name,
+                                    &args,
+                                    None,
+                                )),
                                 request_id,
                                 tool: tool_name,
                                 args,
                                 output: "Tool execution denied or timed out".to_string(),
-                                tool_result_fields: None,
                                 status: "error".to_string(),
                                 duration_ms: 0,
                             },
@@ -2212,9 +2352,15 @@ impl ServerAgenticLoopHost {
                     Vec<Map<String, Value>>,
                     u64,
                     String,
-                    Option<Map<String, Value>>,
+                    Map<String, Value>,
                 ) = if let Some(cached_output) = cached {
-                    (cached_output, Vec::new(), 0, "ok".to_string(), None)
+                    (
+                        cached_output,
+                        Vec::new(),
+                        0,
+                        "ok".to_string(),
+                        self.edge_result_fields_with_runtime(&id, &tool_name, &args, None),
+                    )
                 } else {
                     let delivery = wait_tool_result_ledger_for_tool(
                         &self.edge_callback_ledger,
@@ -2255,7 +2401,12 @@ impl ServerAgenticLoopHost {
                         sse_maps,
                         duration_ms,
                         status,
-                        tool_result.and_then(|result| result.tool_result_fields),
+                        self.edge_result_fields_with_runtime(
+                            &id,
+                            &tool_name,
+                            &args,
+                            tool_result.and_then(|result| result.tool_result_fields),
+                        ),
                     )
                 };
 
@@ -2272,7 +2423,7 @@ impl ServerAgenticLoopHost {
                         tool: tool_name,
                         args,
                         output,
-                        tool_result_fields,
+                        tool_result_fields: Some(tool_result_fields),
                         status,
                         duration_ms,
                     },
@@ -2282,8 +2433,8 @@ impl ServerAgenticLoopHost {
             block_start = block_end;
         }
 
-        let mut results = Vec::with_capacity(tool_calls.len());
-        for tc in tool_calls.iter() {
+        let mut results = Vec::with_capacity(ordered_tool_calls.len());
+        for tc in ordered_tool_calls.iter() {
             let Some(tc_map) = tc.as_object() else {
                 continue;
             };
@@ -2298,6 +2449,40 @@ impl ServerAgenticLoopHost {
         }
 
         results
+    }
+
+    fn edge_result_fields_with_runtime(
+        &self,
+        tool_call_id: &str,
+        tool_name: &str,
+        args: &Value,
+        fields: Option<Map<String, Value>>,
+    ) -> Map<String, Value> {
+        let mut fields = fields.unwrap_or_default();
+        fields
+            .entry("runtime_environment_advertisement".to_string())
+            .or_insert_with(|| {
+                let registry = astra_runtime_env::ToolRegistry::builtins();
+                let request = ToolExecutionRequest {
+                    user_id: self.user_id.clone(),
+                    run_id: String::new(),
+                    session_id: self.session_id.clone(),
+                    tool_call_id: tool_call_id.to_string(),
+                    tool_name: tool_name.to_string(),
+                    args: args.clone(),
+                    workspace: self.workspace_binding.clone(),
+                    workspace_record: None,
+                    executor: self.executor_binding.clone(),
+                    runtime: self.runtime_binding.clone(),
+                    policy: ToolPolicySnapshot::default(),
+                };
+                let binding = request.runtime_environment_binding(&registry);
+                serde_json::to_value(astra_runtime_env::RuntimeEnvironmentAdvertisement::new(
+                    binding,
+                ))
+                .expect("runtime environment advertisement serializes")
+            });
+        fields
     }
 
     fn emit_context_meta(
@@ -2323,6 +2508,11 @@ impl ServerAgenticLoopHost {
     }
 
     fn runtime_allowlist_restrictions(&self, state: &AgenticLoopState) -> HashSet<String> {
+        let disabled: HashSet<String> = self
+            .disabled_tools
+            .try_read()
+            .map(|g| g.clone())
+            .unwrap_or_default();
         self.edge_tools
             .iter()
             .filter_map(|tool| {
@@ -2333,22 +2523,41 @@ impl ServerAgenticLoopHost {
             })
             .filter(|name| {
                 !crate::turn::agentic::tool_interception::runtime_allows_tool(state, name)
+                    || disabled.contains(name)
             })
             .collect()
     }
 
-    fn sync_valid_tools_to_visible(&mut self, visible_tools: &[Value]) {
-        // Post-Phase-4/6: the validator's admitted set is the union of
-        // currently-visible names, every name in the static catalog, AND
-        // the session's runtime-injected + plugin names. Without the
-        // `admissible_extras` piece, calling an MCP tool after
-        // `tool_search(select:mcp__X)` would be rejected as unknown
-        // even though the executor can dispatch it.
+    fn sync_valid_tools_to_visible_for_state(
+        &mut self,
+        visible_tools: &[Value],
+        state: &AgenticLoopState,
+    ) {
+        let mut extras = self.admissible_extras.clone();
+        let deferred_tool_names = self.deferred_tool_names_from_edge_profile();
+        if let Some(executor) = state.server_tool_executor.as_deref() {
+            executor.set_current_activatable_tool_names(deferred_tool_names);
+            executor.set_current_searchable_tool_schemas(visible_tools);
+            extras.extend(executor.activated_deferred_tool_names());
+        }
         self.valid_tools =
             crate::turn::headless_tool_pipeline::admissible_tool_names_from_visible_and_extras(
                 visible_tools,
-                &self.admissible_extras,
+                &extras,
             );
+    }
+
+    fn deferred_tool_names_from_edge_profile(&self) -> HashSet<String> {
+        self.edge_profile
+            .get(astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .collect()
     }
 
     /// Set the extras list (runtime-injected names + plugin names) so
@@ -2358,29 +2567,73 @@ impl ServerAgenticLoopHost {
         self.admissible_extras = extras;
     }
 
-    /// Compute the tool schemas visible for the current turn after applying
-    /// health-based restrictions. This is the server-path equivalent of the
-    /// CLI's deny-at-assembly behavior.
-    #[cfg(test)]
-    fn visible_turn_tools(&mut self, state: &mut AgenticLoopState) -> Vec<Value> {
-        if std::mem::take(&mut state.widen_selection_pending) {
-            // Pipeline-requested widen: skip health-based deprioritization
-            // merge for this turn so the full catalogue is re-exposed.
+    /// Compute the effective restricted-tool set for a turn by running the
+    /// full restriction pipeline:
+    ///
+    /// 1. widen check + deprioritized-tool merge
+    /// 2. runtime allowlist restrictions
+    /// 3. interaction-scoped restrictions (always applied)
+    /// 4. boost rescue
+    /// 5. activated-deferred-tool rescue (health-gated)
+    ///
+    /// `consume_widen` controls whether the `widen_selection_pending` flag is
+    /// consumed (authoritative path: main turn / test helper) or merely
+    /// peeked (preview path: pre-turn summary, which must not steal the flag
+    /// from the main turn that follows it). This is the only legitimate
+    /// caller-policy divergence; every other step is identical across sites.
+    ///
+    /// Single source of truth shared by `visible_turn_tools`, `execute_turn`,
+    /// and the summary path so the recipe cannot drift between call sites.
+    fn compute_effective_restricted(
+        &self,
+        state: &mut AgenticLoopState,
+        consume_widen: bool,
+    ) -> HashSet<String> {
+        // 1. widen + merge deprioritized tools into the persistent set.
+        let widen = if consume_widen {
+            std::mem::take(&mut state.widen_selection_pending)
         } else {
+            state.widen_selection_pending
+        };
+        if !widen {
             merge_deprioritized_tools_into_restricted(
                 &state.turn_guard,
                 &mut state.restricted_tools,
             );
         }
-        let mut effective_restricted = state.restricted_tools.clone();
-        effective_restricted.extend(self.runtime_allowlist_restrictions(state));
+        // 2-5. layered restrictions from the merged base.
+        let mut effective = state.restricted_tools.clone();
+        effective.extend(self.runtime_allowlist_restrictions(state));
+        effective.extend(interaction_scoped_tool_restrictions(
+            self.turn_interaction_mode(),
+        ));
         // Boosted tools are never hidden, even if they landed in the restricted
         // set earlier (e.g., via stall-based deprioritization).
         for boosted in &state.boosted_tools {
-            effective_restricted.remove(boosted);
+            effective.remove(boosted);
         }
+        if let Some(executor) = state.server_tool_executor.as_deref() {
+            for name in executor.activated_deferred_tool_names() {
+                // Rescue activated deferred tools so they're visible this turn,
+                // but NOT if the health tracker has hard-deprioritized them —
+                // a broken-but-activated tool must stay restricted so it can be
+                // quarantined rather than silently rescued every turn.
+                if !state.turn_guard.health.is_deprioritized(name.as_str()) {
+                    effective.remove(&name);
+                }
+            }
+        }
+        effective
+    }
+
+    /// Compute the tool schemas visible for the current turn after applying
+    /// health-based restrictions. This is the server-path equivalent of the
+    /// CLI's deny-at-assembly behavior.
+    #[cfg(test)]
+    fn visible_turn_tools(&mut self, state: &mut AgenticLoopState) -> Vec<Value> {
+        let effective_restricted = self.compute_effective_restricted(state, true);
         let visible = self.filtered_turn_tools(&effective_restricted);
-        self.sync_valid_tools_to_visible(&visible);
+        self.sync_valid_tools_to_visible_for_state(&visible, state);
         visible
     }
 
@@ -2841,23 +3094,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             .unwrap_or("")
             .to_string();
 
-        if std::mem::take(&mut state.widen_selection_pending) {
-            // Pipeline-requested widen: skip deprioritized-merge for this turn.
-        } else {
-            merge_deprioritized_tools_into_restricted(
-                &state.turn_guard,
-                &mut state.restricted_tools,
-            );
-        }
-        let mut effective_restricted = state.restricted_tools.clone();
-        effective_restricted.extend(self.runtime_allowlist_restrictions(state));
-        let interaction_mode = self.turn_interaction_mode();
-        effective_restricted.extend(interaction_scoped_tool_restrictions(interaction_mode));
-        for boosted in &state.boosted_tools {
-            effective_restricted.remove(boosted);
-        }
+        let effective_restricted = self.compute_effective_restricted(state, true);
         let visible_tools = self.filtered_turn_tools(&effective_restricted);
-        self.sync_valid_tools_to_visible(&visible_tools);
+        self.sync_valid_tools_to_visible_for_state(&visible_tools, state);
 
         // Latch prompt cache config from provider info (once per turn is fine;
         // provider doesn't change within a turn).
@@ -3020,7 +3259,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         );
         state.pinned_tool_schema_tokens = estimate_tool_schema_tokens(&final_tools);
         state.last_turn_policy =
-            TurnInteractionPolicy::from_tool_schemas(interaction_mode, &final_tools);
+            TurnInteractionPolicy::from_tool_schemas(self.turn_interaction_mode(), &final_tools);
 
         // Output token escalation: if finish_reason is "length", retry once
         // with a higher max_output_tokens (up to 4× the initial budget).
@@ -3510,16 +3749,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             .unwrap_or("")
             .to_string();
 
-        let mut effective_restricted = state.restricted_tools.clone();
-        if !state.widen_selection_pending {
-            merge_deprioritized_tools_into_restricted(&state.turn_guard, &mut effective_restricted);
-        }
-        effective_restricted.extend(self.runtime_allowlist_restrictions(state));
-        let interaction_mode = self.turn_interaction_mode();
-        effective_restricted.extend(interaction_scoped_tool_restrictions(interaction_mode));
-        for boosted in &state.boosted_tools {
-            effective_restricted.remove(boosted);
-        }
+        let effective_restricted = self.compute_effective_restricted(state, false);
         let visible_tools = self.filtered_turn_tools(&effective_restricted);
         // We only need the system messages here — the inline summary call
         // reuses the main turn's system prefix, not its tools.
@@ -3618,6 +3848,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
 
     fn valid_tool_names(&self) -> &HashSet<String> {
         &self.valid_tools
+    }
+
+    fn deferred_tool_names(&self) -> HashSet<String> {
+        self.deferred_tool_names_from_edge_profile()
     }
 
     fn capabilities(&self) -> astra_turn_core::capability::CapabilitySet {
@@ -4167,6 +4401,28 @@ fn normalize_usage_to_canonical(
     raw.clone()
 }
 
+fn hidden_execution_boundary_tool_names(visible_tools: &[Value]) -> Vec<String> {
+    let visible: HashSet<String> = visible_tools
+        .iter()
+        .filter_map(tool_schema_name)
+        .map(str::to_string)
+        .collect();
+    astra_runtime_env::ToolRegistry::builtins()
+        .iter()
+        .filter(|spec| {
+            matches!(
+                spec.required.executor,
+                astra_runtime_env::RequiredExecutor::RuntimeExecutor
+            ) || !matches!(
+                spec.required.workspace,
+                astra_runtime_env::RequiredWorkspace::None
+            )
+        })
+        .map(|spec| spec.name.clone())
+        .filter(|name| !visible.contains(name))
+        .collect()
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -4221,6 +4477,31 @@ mod tests {
             }
         }));
         tools
+    }
+
+    fn schema_names(tools: &[Value]) -> HashSet<String> {
+        tools
+            .iter()
+            .filter_map(tool_schema_name)
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn edge_runtime_snapshot() -> ExecutionBindingSnapshot {
+        ExecutionBindingSnapshot::new(
+            WorkspaceBinding::edge_workspace(
+                "MacBook Pro",
+                "/Users/test/project",
+                WorkspaceAuthority::ReadWrite,
+            ),
+            ExecutorBinding::edge_agent(
+                "edge-1",
+                "MacBook Pro",
+                crate::server::tool_transport::ToolTransportKind::EdgeWs,
+                crate::server::tool_transport::ExecutorStatus::Online,
+            ),
+            astra_runtime_env::RuntimeBinding::host_process("edge-host"),
+        )
     }
 
     fn message_text(message: &Value) -> String {
@@ -4564,11 +4845,254 @@ mod tests {
             "sess1".to_string(),
         )
         .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
 
         assert!(host.valid_tool_names().contains("bash"));
         assert!(host.valid_tool_names().contains("read_file"));
         assert_eq!(host.valid_tool_names().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn server_host_syncs_deferred_manifest_to_executor_activation() {
+        let mut edge_profile = Map::new();
+        edge_profile.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES
+                .to_string(),
+            json!(["agent_fanout", " "]),
+        );
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_edge_profile(edge_profile)
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let executor = Arc::new(
+            crate::server::server_tool_executor::ServerToolExecutor::new(
+                dir.path().to_path_buf(),
+                "user1".into(),
+                "sess1".into(),
+                None,
+                None,
+            ),
+        );
+        let mut state = create_test_state();
+        state.server_tool_executor = Some(Arc::clone(&executor));
+
+        let _visible = host.visible_turn_tools(&mut state);
+
+        assert!(
+            executor
+                .current_activatable_tool_names_snapshot()
+                .contains("agent_fanout"),
+            "executor must mirror edge-profile deferred names"
+        );
+        assert!(
+            <ServerAgenticLoopHost as AgenticLoopHost>::deferred_tool_names(&host)
+                .contains("agent_fanout"),
+            "validator must see the same deferred manifest"
+        );
+
+        let result = executor
+            .execute_with_metadata("tool_search", &json!({"query": "Select:agent_fanout"}))
+            .await;
+        let parsed: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(
+            parsed["matches"][0]["name"].as_str(),
+            Some("agent_fanout"),
+            "server tool_search must resolve names advertised in the deferred manifest: {}",
+            result.output
+        );
+    }
+
+    #[test]
+    fn builder_filters_edge_tools_through_runtime_binding() {
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .build();
+
+        let names = schema_names(&host.edge_tools);
+        assert!(!names.contains("bash"));
+        assert!(!names.contains("read_file"));
+        assert!(!host.valid_tool_names().contains("bash"));
+        assert!(!host.valid_tool_names().contains("read_file"));
+    }
+
+    #[test]
+    fn builder_default_server_side_tools_hide_project_tools_without_runtime() {
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .build();
+
+        let names = schema_names(&host.edge_tools);
+        assert!(names.contains("ask_user"));
+        assert!(names.contains("tool_search"));
+        assert!(names.contains("web_search"));
+        for hidden in [
+            "bash",
+            "read_file",
+            "write_file",
+            "git",
+            "symbols",
+            "run_script",
+        ] {
+            assert!(
+                !names.contains(hidden),
+                "{hidden} must not be advertised without a workspace runtime"
+            );
+            assert!(
+                !host.valid_tool_names().contains(hidden),
+                "{hidden} must not be admitted without a workspace runtime"
+            );
+        }
+    }
+
+    #[test]
+    fn builder_server_side_tools_follow_server_sandbox_binding() {
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .with_execution_bindings(
+            WorkspaceBinding::server_sandbox("/tmp/astra-workspace"),
+            ExecutorBinding::server_local(),
+        )
+        .build();
+
+        let names = schema_names(&host.edge_tools);
+        for visible in [
+            "ask_user",
+            "tool_search",
+            "bash",
+            "read_file",
+            "write_file",
+            "git",
+        ] {
+            assert!(
+                names.contains(visible),
+                "{visible} should be advertised for a server sandbox runtime"
+            );
+            assert!(
+                host.valid_tool_names().contains(visible),
+                "{visible} should be admitted for a server sandbox runtime"
+            );
+        }
+    }
+
+    #[test]
+    fn builder_server_side_tools_hide_project_tools_when_edge_offline() {
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .with_execution_bindings(
+            WorkspaceBinding::edge_workspace(
+                "MacBook Pro",
+                "/Users/test/project",
+                WorkspaceAuthority::ReadWrite,
+            ),
+            ExecutorBinding::edge_agent(
+                "edge-1",
+                "MacBook Pro",
+                crate::server::tool_transport::ToolTransportKind::EdgeWs,
+                crate::server::tool_transport::ExecutorStatus::Offline,
+            ),
+        )
+        .build();
+
+        let names = schema_names(&host.edge_tools);
+        for visible in ["agent", "tool_search", "web_search", "memory"] {
+            assert!(
+                names.contains(visible),
+                "{visible} should remain visible because it runs on the server"
+            );
+        }
+        for hidden in [
+            "bash",
+            "read_file",
+            "write_file",
+            "git",
+            "symbols",
+            "run_script",
+        ] {
+            assert!(
+                !names.contains(hidden),
+                "{hidden} must be hidden while the edge runtime is offline"
+            );
+            assert!(
+                host.valid_tool_names().contains(hidden),
+                "{hidden} should be admitted while hidden so stale calls can report executor_offline"
+            );
+            assert!(
+                host.admissible_extras.contains(&hidden.to_string()),
+                "{hidden} should remain boundary-admissible so stale calls can report executor_offline"
+            );
+        }
+    }
+
+    #[test]
+    fn builder_server_side_tools_follow_orchestrator_read_only_binding() {
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .with_execution_binding_snapshot(ExecutionBindingSnapshot::new(
+            WorkspaceBinding {
+                kind: WorkspaceBindingKind::CloudWorkspace,
+                display_name: "Snapshot".to_string(),
+                cwd: Some("/snapshot".to_string()),
+                authority: WorkspaceAuthority::ReadOnly,
+                fallback_policy: FallbackPolicy::Disabled,
+            },
+            ExecutorBinding {
+                kind: ExecutorBindingKind::OrchestratorManaged,
+                executor_id: "orchestrator:snapshot".to_string(),
+                display_name: "Orchestrator-managed executor".to_string(),
+                transport: crate::server::tool_transport::ToolTransportKind::SandboxResidentAgent,
+                status: crate::server::tool_transport::ExecutorStatus::Online,
+            },
+            astra_runtime_env::RuntimeBinding::oci_container("snapshot-runtime"),
+        ))
+        .build();
+
+        let names = schema_names(&host.edge_tools);
+        for visible in ["read_file", "grep", "glob", "git"] {
+            assert!(
+                names.contains(visible),
+                "{visible} should be advertised for an online read-only orchestrator-managed executor"
+            );
+            assert!(
+                host.valid_tool_names().contains(visible),
+                "{visible} should be admitted for an online read-only orchestrator-managed executor"
+            );
+        }
+        for hidden in ["write_file", "str_replace", "run_script"] {
+            assert!(
+                !names.contains(hidden),
+                "{hidden} must be hidden for a read-only orchestrator-managed executor"
+            );
+        }
     }
 
     #[test]
@@ -4609,6 +5133,7 @@ mod tests {
             "s1".to_string(),
         )
         .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
         let mut state = crate::turn::agentic_loop::host::tests::make_state();
         state.current_session_id = Some("sid-abort".into());
@@ -4769,6 +5294,7 @@ mod tests {
             "s".to_string(),
         )
         .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
 
         let mut state = create_test_state();
@@ -4833,6 +5359,7 @@ mod tests {
                 }
             }
         })])
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
 
         let mut state = create_test_state();
@@ -5027,6 +5554,7 @@ mod tests {
             "s-edge".to_string(),
         )
         .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
         .with_edge_profile(edge_profile)
         .with_interactive_client(true)
         .build();
@@ -5124,6 +5652,7 @@ mod tests {
                 "parameters": {"type": "object", "properties": {}}
             }
         })])
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
         let mut state = create_test_state();
         state.current_session_id = Some("s-minimax".into());
@@ -5322,6 +5851,7 @@ mod tests {
                 }
             }
         })])
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
 
         let mut state = create_test_state();
@@ -5363,6 +5893,15 @@ mod tests {
             "s-batch".to_string(),
         )
         .build();
+        // Register write_file as a valid tool so the edge ledger delivery path admits it.
+        host.install_runtime_tool_schemas(vec![json!({
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "description": "Write file contents",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        })]);
         let ledger = host.edge_callback_ledger.clone();
         let tool_calls = vec![
             json!({
@@ -5450,6 +5989,15 @@ mod tests {
             "s-edge-meta".to_string(),
         )
         .build();
+        // Register read_file as a valid tool so the edge ledger delivery path admits it.
+        host.install_runtime_tool_schemas(vec![json!({
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read file contents",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        })]);
         host.set_execution_metadata(json!({
             "workspace": {
                 "kind": "edge_workspace",
@@ -5507,6 +6055,25 @@ mod tests {
             "s-mixed".to_string(),
         )
         .build();
+        // Register read_file and write_file as valid tools so the edge ledger delivery path admits them.
+        host.install_runtime_tool_schemas(vec![
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read file contents",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            }),
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "description": "Write file contents",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            }),
+        ]);
         let ledger = host.edge_callback_ledger.clone();
         let tool_calls = vec![
             json!({
@@ -5918,6 +6485,7 @@ mod tests {
             "s".to_string(),
         )
         .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
 
         let mut state = create_test_state();
@@ -5943,6 +6511,7 @@ mod tests {
             "s".to_string(),
         )
         .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
 
         let mut state = create_test_state();
@@ -5984,6 +6553,57 @@ mod tests {
     }
 
     #[test]
+    fn visible_turn_tools_excludes_disabled_tools() {
+        let edge_tools = vec![
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "description": "Execute a bash command",
+                    "parameters": { "type": "object", "properties": {} }
+                }
+            }),
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read a file",
+                    "parameters": { "type": "object", "properties": {} }
+                }
+            }),
+        ];
+
+        let disabled: HashSet<String> = ["bash".to_string()].into_iter().collect();
+        let disabled_handle = Arc::new(tokio::sync::RwLock::new(disabled));
+
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u".to_string(),
+            "s".to_string(),
+        )
+        .with_edge_tools(edge_tools)
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .with_disabled_tools(disabled_handle)
+        .build();
+
+        let mut state = create_test_state();
+        let visible = host.visible_turn_tools(&mut state);
+        let visible_names: HashSet<&str> = visible
+            .iter()
+            .filter_map(|tool| {
+                tool.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(Value::as_str)
+            })
+            .collect();
+
+        assert!(visible_names.contains("read_file"));
+        assert!(!visible_names.contains("bash"));
+        assert_eq!(visible_names.len(), 1);
+    }
+
+    #[test]
     fn headless_turn_policy_excludes_ask_user_from_final_tools() {
         let host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
@@ -5992,6 +6612,7 @@ mod tests {
             "s".to_string(),
         )
         .with_edge_tools(sample_edge_tools_with_ask_user())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
 
         let mut state = create_test_state();
@@ -6025,6 +6646,7 @@ mod tests {
             "s".to_string(),
         )
         .with_edge_tools(sample_edge_tools_with_ask_user())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
         .with_interactive_client(true)
         .build();
 
@@ -6197,6 +6819,7 @@ mod tests {
             "sess1".to_string(),
         )
         .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
 
         assert!(!host.valid_tool_names().contains("delegate"));
@@ -6220,6 +6843,7 @@ mod tests {
             "sess1".to_string(),
         )
         .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
 
         use crate::turn::agentic_loop::host::delegate_tool_schema;
@@ -6241,6 +6865,7 @@ mod tests {
             "sess1".to_string(),
         )
         .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
 
         let initial_count = host.edge_tools.len();
@@ -6362,6 +6987,7 @@ mod tests {
             session_id.to_string(),
         )
         .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
         .with_full_llm_capture(true)
         .with_test_llm_rounds(vec![json!({
             "full_text": "captured reply",
@@ -6417,6 +7043,7 @@ mod tests {
             session_id.to_string(),
         )
         .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
         .with_full_llm_capture(true)
         .with_llm_token_service(Some(LlmTokenServiceConfig {
             url: gateway_url,
@@ -6532,6 +7159,7 @@ mod tests {
             session_id.to_string(),
         )
         .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
         .with_full_llm_capture(true)
         .with_llm_token_service(Some(LlmTokenServiceConfig {
             url: gateway_url,
@@ -6627,6 +7255,7 @@ mod tests {
             session_id.to_string(),
         )
         .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
         .with_llm_token_service(Some(LlmTokenServiceConfig {
             url: gateway_url,
             timeout_ms: Some(2000),
@@ -6684,6 +7313,7 @@ mod tests {
             "".to_string(),
         )
         .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
         .with_test_llm_rounds(vec![json!({
             "error": {
                 "message": "synthetic streamed failure",
@@ -6850,6 +7480,7 @@ mod tests {
             "session-inline".to_string(),
         )
         .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
         host.resolved_llm_params = Some(astra_turn_core::cloud_summary::LlmConnParams {
             model_name: "gpt-4o-mini".to_string(),
@@ -7681,6 +8312,7 @@ mod tests {
             "s".to_string(),
         )
         .with_edge_tools(sample_edge_tools_full())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
 
         let mut state = create_test_state();
@@ -7745,6 +8377,7 @@ mod tests {
             "s".to_string(),
         )
         .with_edge_tools(sample_edge_tools_full())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
 
         let mut state = create_test_state();
@@ -7801,6 +8434,7 @@ mod tests {
             "s".to_string(),
         )
         .with_edge_tools(sample_edge_tools_full())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
 
         let mut state = create_test_state();
@@ -7847,6 +8481,7 @@ mod tests {
             "s".to_string(),
         )
         .with_edge_tools(sample_edge_tools_full())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
 
         let mut state = create_test_state();
