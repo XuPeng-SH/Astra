@@ -364,6 +364,8 @@ pub enum SpawnAgentOutput {
     Cancelled {
         agent_id: String,
         reason: String,
+        finish_reason: String,
+        cancelled_by_user: bool,
         tool_calls: u32,
         duration_ms: u64,
     },
@@ -381,7 +383,12 @@ pub enum SpawnAgentOutput {
         messaging_address: Option<String>,
     },
     /// Failed to spawn.
-    Failed { error: String, duration_ms: u64 },
+    Failed {
+        agent_id: String,
+        error: String,
+        finish_reason: String,
+        duration_ms: u64,
+    },
 }
 
 impl SpawnAgentOutput {

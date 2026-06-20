@@ -527,6 +527,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             current_session_id: state.current_session_id.as_deref(),
             tool_results: state.tool_results.as_slice(),
             all_schemas: &self.all_schemas,
+            valid_tool_names: &mut self.valid_tool_names,
             turn_guard: &state.turn_guard,
             restricted_tools: &mut state.restricted_tools,
             widen_selection_pending: &mut state.widen_selection_pending,
@@ -763,6 +764,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
                         .stall
                         .forced_redundant_reads_corrective,
                     forced_cache_waste_corrective: state.stall.forced_cache_waste_corrective,
+                    forced_search_fanout_corrective: state.stall.forced_search_fanout_corrective,
                     forced_exploration_family_phase2: state.stall.forced_exploration_family_phase2,
                     forced_exploration_family_corrective: state
                         .stall

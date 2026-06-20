@@ -74,8 +74,6 @@ use astra_turn_core::sse_stream_host::EdgeToolExecResult;
 use astra_turn_core::tool_registry_report::SelectionReport;
 use tokio_util::sync::CancellationToken;
 
-use crate::turn::agentic::turn_intent::infer_turn_intent;
-
 /// Anchors journal wall-clock timestamps to a single process-local epoch so
 /// later reads stay monotonic even if `SystemTime` jumps backwards.
 ///
@@ -171,11 +169,12 @@ pub trait AgenticLoopHost: Send {
 
     /// Optional semantic judge for the current user turn.
     ///
-    /// The default implementation provides a deterministic baseline from the
-    /// current message plus `TaskExecutionProfile`; hosts can override it with a
-    /// higher-fidelity classifier if they have one.
-    async fn judge_turn_intent(&mut self, state: &AgenticLoopState) -> Option<TurnIntent> {
-        infer_turn_intent(&state.message, state.task_profile)
+    /// Hosts with an LLM-backed intent judge should override this. The default
+    /// does not infer semantic continuation from text; continuing the current
+    /// objective is a high-impact decision and should come from a structured
+    /// judge result, not phrase matching.
+    async fn judge_turn_intent(&mut self, _state: &AgenticLoopState) -> Option<TurnIntent> {
+        None
     }
 
     /// Whether the host already injects round budget guidance into the system
@@ -638,6 +637,11 @@ pub struct StallTrackingState {
     /// identical tool calls that are served from cache instead of reusing
     /// the earlier result. One-shot per turn.
     pub forced_cache_waste_corrective: bool,
+    /// Whether broad search fanout has already triggered a convergence
+    /// corrective this turn. This is intentionally advisory and one-shot: it
+    /// catches implementation tasks that keep widening search instead of
+    /// synthesizing, editing, verifying, or finishing.
+    pub forced_search_fanout_corrective: bool,
     /// Whether a broad exploration-family corrective injected a guidance
     /// message and restricted the dominant low-yield family this loop. Fires
     /// when consecutive multi-call rounds stay inside the same exploratory
@@ -996,11 +1000,10 @@ pub enum VolatileKind {
     BudgetAdvisory,
     /// Tactical adaptation hint.
     TacticalAdaptation,
-    /// "Context was just compacted — continue working, do not
-    /// summarize." Injected by `handle_token_budget` after a
-    /// successful compact+spill pass so the model resumes the task
-    /// instead of misreading the smaller context as an interruption
-    /// (session 0e37eb46 regression).
+    /// Neutral compaction context note. Injected after a successful
+    /// compact+spill pass so the model understands the smaller context
+    /// without treating the note itself as a new user request or automatic
+    /// resume authorization.
     CompactResume,
     /// Circuit-breaker intermediate / soft-stop messages.
     CircuitBreaker,
@@ -1178,10 +1181,9 @@ pub struct AgenticLoopState {
     /// cleared; the bridge prunes it naturally when a later diagnosis drops the
     /// tool from its recommendation.
     pub boosted_tools: HashSet<String>,
-    /// One-shot flag set by pipeline `widen_selection` strategy. When true,
-    /// the upcoming tool-visibility assembly skips the deprioritized → restricted
-    /// merge for this turn so the LLM sees the full catalogue again. The flag
-    /// is consumed (reset to false) on use.
+    /// One-shot flag set by pipeline `widen_selection` strategy. The flag is
+    /// consumed (reset to false) on the next authoritative tool-visibility
+    /// assembly; soft health diagnostics no longer hide tools from the schema.
     pub widen_selection_pending: bool,
     pub step_recorder: StepRecorder,
 
@@ -1247,6 +1249,13 @@ pub struct AgenticLoopState {
     /// runaway delegation loops where the parent agent keeps delegating
     /// without synthesizing results.
     pub delegations_this_turn: u32,
+    /// Chain of agent_ids that led to this delegation (for circular detection).
+    /// Inherited from parent delegation and appended with parent agent_id.
+    /// Format: ["orchestrator", "coder", "reviewer"] means orchestrator→coder→reviewer.
+    pub delegation_chain: Vec<String>,
+    /// Agent ID of this agent itself. Set from delegation config for sub-agents;
+    /// falls back to "orchestrator" for the root agent.
+    pub self_agent_id: String,
 
     // ── Composite Snapshot ──
     /// Optional data snapshot provider for building composite snapshots.
@@ -2364,6 +2373,8 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         api_token: String::new(),
         delegation_engine: None,
         delegations_this_turn: 0,
+        delegation_chain: Vec::new(),
+        self_agent_id: "orchestrator".to_string(),
         run_control: None,
         project_context: None,
         checkpoint_gate: None,
@@ -2516,10 +2527,8 @@ pub(crate) mod tests {
             Ok(result)
         }
 
-        async fn judge_turn_intent(&mut self, state: &AgenticLoopState) -> Option<TurnIntent> {
-            self.turn_intent
-                .clone()
-                .or_else(|| infer_turn_intent(&state.message, state.task_profile))
+        async fn judge_turn_intent(&mut self, _state: &AgenticLoopState) -> Option<TurnIntent> {
+            self.turn_intent.clone()
         }
 
         fn emit_headless_line(&mut self, _style: HeadlessStderrStyle, line: String) {
@@ -2800,6 +2809,8 @@ pub(crate) mod tests {
             api_token: String::new(),
             delegation_engine: None,
             delegations_this_turn: 0,
+            delegation_chain: Vec::new(),
+            self_agent_id: "orchestrator".to_string(),
             run_control: None,
             project_context: None,
             checkpoint_gate: None,
@@ -6129,7 +6140,7 @@ pub(crate) mod tests {
     // directive rides the volatile lane (not `state.messages[]`) so
     // it doesn't pollute history.
     #[tokio::test]
-    async fn compaction_injects_resume_directive_on_volatile_lane() {
+    async fn compaction_injects_context_note_on_volatile_lane() {
         let session_id = format!(
             "resume-directive-{}",
             std::time::SystemTime::now()
@@ -6172,18 +6183,19 @@ pub(crate) mod tests {
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok(), "loop must complete");
 
-        // The resume directive must ride the volatile lane. We inspect
+        // The compaction context note must ride the volatile lane. We inspect
         // the lane AFTER the loop; MockHost's execute_turn never
         // drains it, so fires accumulate there for tests to observe.
-        let has_resume_directive = state.volatile_pending.iter().any(|inj| {
+        let has_context_note = state.volatile_pending.iter().any(|inj| {
             inj.content.contains("Context compacted")
-                && inj.content.to_lowercase().contains("continue")
+                && inj.content.contains("not a new user request")
+                && !inj.content.contains("Continue the task")
+                && !inj.content.contains("keep working")
         });
         assert!(
-            has_resume_directive,
-            "after compaction fires, a volatile Resume directive must be \
-             queued so the model continues instead of producing a \
-             progress summary (session 0e37eb46 regression). \
+            has_context_note,
+            "after compaction fires, a volatile context note must be \
+             queued without acting as resume authorization. \
              Current volatile_pending: {:#?}",
             state
                 .volatile_pending
@@ -9647,12 +9659,17 @@ mod parallel_execution_tests {
     use serde_json::json;
 
     fn tool_call_json_named(name: &str, id: &str) -> Value {
+        let arguments = if name == "bash" {
+            json!({"command": "true"})
+        } else {
+            json!({"path": format!("/tmp/{name}.txt")})
+        };
         json!({
             "id": id,
             "type": "function",
             "function": {
                 "name": name,
-                "arguments": json!({"path": format!("/tmp/{name}.txt")}).to_string()
+                "arguments": arguments.to_string()
             }
         })
     }

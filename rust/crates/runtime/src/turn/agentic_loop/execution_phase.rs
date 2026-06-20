@@ -524,36 +524,62 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         resolved_tool_policy.parallel_batching_force_streak as usize;
     let redundant_reads_threshold = tool_cfg.effective_redundant_reads_midloop_threshold() as usize;
     let cache_waste_threshold = tool_cfg.effective_cache_waste_midloop_threshold() as usize;
+    let search_fanout_threshold = tool_cfg.effective_search_fanout_eval_threshold() as usize;
     let exploration_family_threshold =
         tool_cfg.effective_exploration_family_churn_midloop_threshold() as usize;
 
-    // Third-tier guard: parallel-batching force. Independent of the mutating-
-    // task escalation above — fires whenever the model has produced a long
-    // streak of trailing single-tool rounds despite the prompt-layer nudge,
-    // regardless of task type. Catches the "exploratory churn" failure mode
-    // (sessions 6566d6a8, bbae8641, 6da9cf8f). One-shot per turn.
-    if !suppress_nudges && should_force_parallel_batching(state, parallel_batching_force_threshold)
-    {
-        let streak = crate::prompts::trailing_single_tool_round_streak(&state.messages);
-        state.stall.forced_parallel_batching = true;
-        let msg = parallel_batching_force_message(streak, &state.message);
-        state.push_volatile(super::host::VolatileKind::ParallelBatchingForce, msg);
-        tracing::warn!(
-            target: "astra::loop_guard",
-            tier = "parallel_batching_force",
-            streak,
-            round = state.llm_rounds_completed,
-            "loop guard fired"
-        );
-        if !prep.quiet {
-            host.emit_headless_line(
-                HeadlessStderrStyle::Yellow,
-                format!(
-                    "↻ {streak} consecutive single-tool rounds; forcing parallel-batching corrective…"
-                ),
-            );
-        }
-    }
+    // ── Composable guard pipeline ────────────────────────────────────────
+    // Each guard is defined in the `guards` module. The pipeline evaluates
+    // them in order, injects corrections, and propagates aborts. Guards are
+    // independently testable — see guards.rs for individual unit tests.
+    //
+    // Previously each guard was inlined as ~30-line blocks below; the
+    // pipeline reduces this section from ~80 lines to ~15.
+    let pipeline_corrective_fired = {
+        let guard_cfg = super::guards::GuardConfig {
+            suppress_nudges,
+            parallel_batching_force_streak: parallel_batching_force_threshold,
+            redundant_reads_threshold,
+            cache_waste_threshold,
+        };
+        let guards = super::guards::default_guards();
+        let pipeline_corrections = match super::guards::evaluate_guards(&guards, state, &guard_cfg)
+        {
+            Ok(corrections) => corrections,
+            Err(abort_reason) => {
+                // Guard pipeline requested abort — terminate the turn.
+                //
+                // Record a structured InterruptionRecord so resumption surfaces
+                // *why* the guard pipeline halted the turn. Without this, the
+                // abort reason lives only in `final_text` (an opaque string),
+                // and a resumed session cannot tell a guard abort apart from a
+                // normal completion. The journal/checkpoint consumer relies on
+                // `state.interruption` for machine-readable recovery context.
+                state.final_text = abort_reason.clone();
+                state.interruption = Some(InterruptionRecord::new(
+                    InterruptionKind::GuardAbort,
+                    ResumeAction::ContinueImmediately,
+                    interruption_state_summary(state, Some(abort_reason)),
+                ));
+                tracing::warn!(
+                    target: "astra::loop_guard",
+                    tier = "guard_pipeline_abort",
+                    round = state.llm_rounds_completed,
+                    "guard pipeline abort — turn terminated by guard"
+                );
+                state.step_recorder.end_turn(false);
+                finalize_and_render(host, state).await;
+                return Ok(TurnExecutionControl::Return(AgenticLoopOutcome::Completed));
+            }
+        };
+        // First-corrective-wins extends to the inline guards below: if the
+        // composable pipeline already fired a corrective this turn, skip all
+        // inline guard blocks. A turn receives at most one corrective volatile
+        // message, regardless of whether it originates from the composable
+        // pipeline or the inline blocks. (0619_job2 review: stacked
+        // correctives overload the model with contradictory directives.)
+        !pipeline_corrections.is_empty()
+    };
 
     // ── Circuit breaker observation ──────────────────────────────────────
     // Feed the previous round's signal to the circuit breaker. On the first
@@ -720,6 +746,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     }
 
     if !suppress_nudges
+        && !pipeline_corrective_fired
         && !state.stall.forced_round_budget_phase1
         && !state.stall.forced_completion_soft_stop
         && let Some((family, blocked_tools)) = exploration_family_phase2_candidate(state)
@@ -753,6 +780,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     // phase-1 is the harder finalization push — if both would fire on the
     // same round we prefer phase-1's narrower "stop calling tools" message.
     if !suppress_nudges
+        && !pipeline_corrective_fired
         && !state.stall.forced_round_budget_phase1
         && !state.stall.forced_completion_soft_stop
         && !state.stall.forced_exploration_family_phase2
@@ -782,6 +810,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         }
     }
     if !suppress_nudges
+        && !pipeline_corrective_fired
         && !state.stall.forced_round_budget_phase1
         && !state.stall.forced_completion_soft_stop
         && !state.stall.forced_exploration_family_phase2
@@ -813,11 +842,47 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         }
     }
     if !suppress_nudges
+        && !pipeline_corrective_fired
         && !state.stall.forced_round_budget_phase1
         && !state.stall.forced_completion_soft_stop
         && !state.stall.forced_exploration_family_phase2
         && !state.stall.forced_redundant_reads_corrective
         && !state.stall.forced_cache_waste_corrective
+        && should_inject_search_fanout_corrective(state, search_fanout_threshold)
+    {
+        let count =
+            astra_turn_core::evaluation::count_search_fanout(&state.stall.tool_call_records);
+        state.stall.forced_search_fanout_corrective = true;
+        for tool in ["glob", "grep", "rg"] {
+            state.restricted_tools.insert(tool.to_string());
+        }
+        let msg = search_fanout_corrective_message(count, &state.message);
+        state.push_volatile(super::host::VolatileKind::Corrective, msg);
+        tracing::warn!(
+            target: "astra::loop_guard",
+            tier = "search_fanout_corrective",
+            round = state.llm_rounds_completed,
+            count = count,
+            threshold = search_fanout_threshold,
+            "loop guard fired"
+        );
+        if !prep.quiet {
+            host.emit_headless_line(
+                HeadlessStderrStyle::Yellow,
+                format!(
+                    "↻ {count} search calls in this turn; forcing synthesis before more search…"
+                ),
+            );
+        }
+    }
+    if !suppress_nudges
+        && !pipeline_corrective_fired
+        && !state.stall.forced_round_budget_phase1
+        && !state.stall.forced_completion_soft_stop
+        && !state.stall.forced_exploration_family_phase2
+        && !state.stall.forced_redundant_reads_corrective
+        && !state.stall.forced_cache_waste_corrective
+        && !state.stall.forced_search_fanout_corrective
         && let Some((family, streak)) =
             exploration_family_corrective_candidate(state, exploration_family_threshold)
     {
@@ -1364,7 +1429,15 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 return Ok(TurnExecutionControl::ContinueLoop);
             }
 
-            if state.hooks.stop_hook_runs == 0
+            if state.hooks.stop_hook_runs == 0 && should_skip_auto_verify_stop_hooks(state) {
+                state.hooks.stop_hook_runs = 1;
+                if !prep.quiet {
+                    host.emit_headless_line(
+                        HeadlessStderrStyle::Green,
+                        "✓ Verification already observed after latest change; skipping duplicate auto hook.".to_string(),
+                    );
+                }
+            } else if state.hooks.stop_hook_runs == 0
                 && let Some(prompt) =
                     astra_turn_core::stop_hooks::build_stop_hook_prompt(&state.hooks.stop_hooks)
             {
@@ -1501,6 +1574,7 @@ fn execution_retry_reason(state: &AgenticLoopState) -> Option<ExecutionRetryReas
     if state.stall.forced_round_budget_phase1
         || state.stall.forced_redundant_reads_corrective
         || state.stall.forced_cache_waste_corrective
+        || state.stall.forced_search_fanout_corrective
         || state.stall.forced_exploration_family_corrective
     {
         return None;
@@ -1527,9 +1601,7 @@ fn execution_retry_reason(state: &AgenticLoopState) -> Option<ExecutionRetryReas
         return (attempted_work_without_mutation || defers)
             .then_some(ExecutionRetryReason::MissingMutation);
     }
-    (user_confirmed_execution_from_recent_context(state)
-        && (attempted_work_without_mutation || defers))
-        .then_some(ExecutionRetryReason::MissingMutation)
+    None
 }
 
 fn missing_browser_verification_evidence(state: &AgenticLoopState) -> bool {
@@ -1715,89 +1787,138 @@ fn has_concrete_workspace_mutation(state: &AgenticLoopState) -> bool {
         .any(tool_record_is_workspace_mutation)
 }
 
-fn user_confirmed_execution_from_recent_context(state: &AgenticLoopState) -> bool {
-    if !looks_like_execution_confirmation(&state.message) {
+fn should_skip_auto_verify_stop_hooks(state: &AgenticLoopState) -> bool {
+    if state.hooks.stop_hooks.is_empty() {
         return false;
     }
+    if !state
+        .hooks
+        .stop_hooks
+        .iter()
+        .all(is_auto_verify_changes_hook)
+    {
+        return false;
+    }
+    has_successful_verification_after_latest_mutation(state)
+}
+
+fn is_auto_verify_changes_hook(hook: &astra_turn_core::stop_hooks::StopHook) -> bool {
+    hook.label == "verify-changes"
+        && hook
+            .command
+            .contains("Based on the files you actually modified")
+}
+
+fn has_successful_verification_after_latest_mutation(state: &AgenticLoopState) -> bool {
+    let Some(last_mutation_index) = state.stall.tool_call_records.iter().rposition(|record| {
+        record.ok && !record.is_synthetic_placeholder() && tool_record_is_workspace_mutation(record)
+    }) else {
+        return false;
+    };
 
     state
-        .messages
+        .stall
+        .tool_call_records
         .iter()
-        .rev()
-        .take(8)
-        .filter(|message| message.get("role").and_then(|role| role.as_str()) == Some("assistant"))
-        .filter_map(|message| message.get("content").and_then(|content| content.as_str()))
-        .any(assistant_text_offered_execution)
+        .skip(last_mutation_index + 1)
+        .any(tool_record_is_successful_verification)
 }
 
-fn looks_like_execution_confirmation(message: &str) -> bool {
-    let normalized = message
-        .trim()
-        .trim_matches(|c: char| {
-            c.is_ascii_punctuation()
-                || c.is_whitespace()
-                || matches!(c, '。' | '，' | '！' | '？' | '；' | '：')
-        })
-        .to_lowercase();
-    if normalized.is_empty() || normalized.chars().count() > 24 {
+fn tool_record_is_successful_verification(
+    record: &astra_services::session_journal::ToolCallRecord,
+) -> bool {
+    if !record.ok
+        || record.is_synthetic_placeholder()
+        || !tool_record_result_looks_successful(record)
+    {
         return false;
     }
-
-    matches!(
-        normalized.as_str(),
-        "yes"
-            | "y"
-            | "ok"
-            | "okay"
-            | "go ahead"
-            | "do it"
-            | "proceed"
-            | "continue"
-            | "sure"
-            | "当然"
-            | "当然了"
-            | "好"
-            | "好的"
-            | "可以"
-            | "没问题"
-            | "继续"
-            | "继续吧"
-            | "执行"
-            | "直接执行"
-            | "开始"
-            | "做吧"
-    ) || normalized.contains("继续")
-        || normalized.contains("执行")
+    if record.name == "bash" {
+        let command = super::lifecycle::extract_bash_command(record.args_full.as_deref())
+            .or_else(|| super::lifecycle::extract_bash_command(record.args_preview.as_deref()));
+        return command
+            .as_deref()
+            .is_some_and(command_looks_like_verification);
+    }
+    tool_name_looks_like_verification(&record.name)
 }
 
-fn assistant_text_offered_execution(text: &str) -> bool {
-    let lower = text.to_lowercase();
-    let offered = [
-        "需要我",
-        "我可以",
-        "要继续吗",
-        "即可执行",
-        "shall i",
-        "should i",
-        "want me to",
-        "i can",
-        "go ahead",
+fn tool_record_result_looks_successful(
+    record: &astra_services::session_journal::ToolCallRecord,
+) -> bool {
+    if record.result_class.as_deref().is_some_and(|class| {
+        matches!(
+            class,
+            "error" | "failure" | "failed" | "tool_error" | "command_error"
+        )
+    }) {
+        return false;
+    }
+    [
+        record.error.as_deref(),
+        record.result_full.as_deref(),
+        record.result_preview.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::to_lowercase)
+    .all(|text| {
+        let trimmed = text.trim_start();
+        !trimmed.starts_with('✗')
+            && !text.contains("(exit 1)")
+            && !text.contains("exit status 1")
+            && !text.contains("test result: failed")
+            && !text.contains("error: unexpected argument")
+            && !text.contains("\nerror:")
+            && !trimmed.starts_with("error:")
+    })
+}
+
+fn tool_name_looks_like_verification(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    [
+        "test",
+        "check",
+        "lint",
+        "clippy",
+        "pytest",
+        "playwright",
+        "cypress",
     ]
     .iter()
-    .any(|needle| lower.contains(needle));
-    let action = [
-        "执行",
-        "修改",
-        "修复",
-        "apply",
-        "patch",
-        "edit",
-        "change",
-        "implement",
+    .any(|needle| lower.contains(needle))
+}
+
+fn command_looks_like_verification(command: &str) -> bool {
+    let lower = command.to_lowercase();
+    [
+        "cargo test",
+        "cargo check",
+        "cargo clippy",
+        "npm test",
+        "npm run test",
+        "npm run build",
+        "pnpm test",
+        "pnpm build",
+        "yarn test",
+        "yarn build",
+        "pytest",
+        "python -m pytest",
+        "ruff check",
+        "mypy",
+        "go test",
+        "go vet",
+        "swift test",
+        "gradle test",
+        "mvn test",
+        "make test",
+        "make check",
+        "just test",
+        "just check",
+        "git diff --check",
     ]
     .iter()
-    .any(|needle| lower.contains(needle));
-    offered && action
+    .any(|needle| lower.contains(needle))
 }
 
 fn final_text_defers_execution(text: &str) -> bool {
@@ -1924,6 +2045,7 @@ pub(crate) fn is_execution_corrective_message(m: &serde_json::Value) -> bool {
         || is_completion_soft_stop(m)
         || is_redundant_reads_corrective(m)
         || is_cache_waste_corrective(m)
+        || is_search_fanout_corrective(m)
         || is_exploration_family_corrective(m)
         || is_exploration_family_phase2(m)
 }
@@ -1972,6 +2094,7 @@ pub(crate) fn should_force_parallel_batching(state: &AgenticLoopState, threshold
     if state.stall.forced_round_budget_phase1
         || state.stall.forced_redundant_reads_corrective
         || state.stall.forced_cache_waste_corrective
+        || state.stall.forced_search_fanout_corrective
         || state.stall.forced_exploration_family_corrective
         || state.stall.forced_exploration_family_phase2
     {
@@ -2154,6 +2277,7 @@ pub(crate) fn round_budget_phase1_message(round_index: u32, original_query: &str
 
 pub(crate) const REDUNDANT_READS_MARKER: &str = "## ⤴ Redundant Reads Detected";
 pub(crate) const CACHE_WASTE_MARKER: &str = "## ⤴ Repeated Cached Tool Calls Detected";
+pub(crate) const SEARCH_FANOUT_MARKER: &str = "## ⤴ Search Fanout Detected";
 pub(crate) const EXPLORATION_FAMILY_MARKER: &str = "## ⤴ Exploration Family Churn Detected";
 pub(crate) const EXPLORATION_FAMILY_PHASE2_MARKER: &str =
     "## ⤴ Exploration Family Convergence Required";
@@ -2183,7 +2307,10 @@ pub(crate) fn is_redundant_reads_corrective(m: &serde_json::Value) -> bool {
         .is_some_and(|s| s.starts_with(REDUNDANT_READS_MARKER))
 }
 
-fn cache_wasteful_tools(state: &AgenticLoopState, threshold: usize) -> Vec<(String, usize)> {
+pub(crate) fn cache_wasteful_tools(
+    state: &AgenticLoopState,
+    threshold: usize,
+) -> Vec<(String, usize)> {
     let mut tools: Vec<(String, usize)> = state
         .turn_guard
         .health
@@ -2202,6 +2329,15 @@ pub(crate) fn is_cache_waste_corrective(m: &serde_json::Value) -> bool {
     m.get("content")
         .and_then(|c| c.as_str())
         .is_some_and(|s| s.starts_with(CACHE_WASTE_MARKER))
+}
+
+pub(crate) fn is_search_fanout_corrective(m: &serde_json::Value) -> bool {
+    if m.get("role").and_then(|r| r.as_str()) != Some("user") {
+        return false;
+    }
+    m.get("content")
+        .and_then(|c| c.as_str())
+        .is_some_and(|s| s.starts_with(SEARCH_FANOUT_MARKER))
 }
 
 pub(crate) fn is_exploration_family_corrective(m: &serde_json::Value) -> bool {
@@ -2345,6 +2481,16 @@ pub(crate) fn should_inject_cache_waste_corrective(
     !cache_wasteful_tools(state, threshold).is_empty()
 }
 
+pub(crate) fn should_inject_search_fanout_corrective(
+    state: &AgenticLoopState,
+    threshold: usize,
+) -> bool {
+    if state.stall.forced_search_fanout_corrective {
+        return false;
+    }
+    astra_turn_core::evaluation::count_search_fanout(&state.stall.tool_call_records) >= threshold
+}
+
 pub(crate) fn cache_waste_corrective_message(
     tools: &[(impl AsRef<str>, usize)],
     original_query: &str,
@@ -2364,6 +2510,22 @@ pub(crate) fn cache_waste_corrective_message(
          - If you already have enough evidence, write the final answer now.\n\
          - If you still need more evidence, explain the ONE specific missing fact and use a different tool or different arguments to get it.\n\n\
          Anti-hallucination: do NOT pretend a repeated cached call produced new information.\n\n\
+         Original user query: {original_query}"
+    )
+}
+
+pub(crate) fn search_fanout_corrective_message(count: usize, original_query: &str) -> String {
+    format!(
+        "{SEARCH_FANOUT_MARKER}\n\
+         Runtime correction: you have made {count} grep/rg/find-like search calls in this turn. \
+         Broad search has crossed the low-yield threshold: more search is likely to expand context instead of finishing the task.\n\n\
+         REQUIRED next-step behavior:\n\
+         - Synthesize the evidence already gathered before doing anything else.\n\
+         - Do NOT run another broad search (`grep`, `rg`, `glob`, or `find`) in the next round.\n\
+         - If a change is still needed, edit the specific file already identified.\n\
+         - If validation is needed, run the narrow relevant test/check instead of more discovery.\n\
+         - If one fact is still missing, read the exact file/range that contains it.\n\
+         - If you already have enough evidence, write the final answer now.\n\n\
          Original user query: {original_query}"
     )
 }
@@ -2590,7 +2752,7 @@ async fn handle_token_budget<H: AgenticLoopHost>(
         return Some(TurnExecutionControl::Return(AgenticLoopOutcome::Completed));
     }
 
-    // First attempt: compact-and-continue instead of hard-stopping.
+    // First attempt: compact before hard-stopping.
     // Two-tier strategy:
     //   1. Aggressive compression pipeline (clear tool results)
     //   2. If still over: spill old messages to disk, keep reference in context
@@ -2654,17 +2816,16 @@ async fn handle_token_budget<H: AgenticLoopHost>(
                 .record_compaction(total_freed);
             // Session 0e37eb46 regression: after compaction shreds the
             // history, the model sees a much-shorter context and often
-            // misreads it as "I've been interrupted" → produces a
-            // progress summary instead of continuing. Inject a short
-            // directive that reframes it as "the runtime compressed
-            // your history; CONTINUE the task — do NOT summarize."
+            // misreads it as "I've been interrupted" and produces a
+            // panic summary. Inject a short factual note that reframes it
+            // as runtime housekeeping without authorizing resume by itself.
             //
             // Observable: stderr line above ("♻ Context pressure…")
             // shows the compaction fired; this push_volatile adds the
-            // behavioural counter-directive to the volatile lane.
+            // runtime context note to the volatile lane.
             // Recoverable: if a future user wants the old behaviour,
             // the volatile is singleton per turn and never persisted.
-            // Correctable: `compaction_injects_resume_directive_on_volatile_lane`
+            // Correctable: `compaction_injects_context_note_on_volatile_lane`
             // test locks the contract.
             state.push_volatile(
                 super::host::VolatileKind::CompactResume,
@@ -3224,12 +3385,6 @@ mod tests {
     }
 
     #[test]
-    fn confirmation_detector_ignores_keyi_in_descriptive_sentence() {
-        // "可以看到这里有问题" is description, not a confirmation.
-        assert!(!looks_like_execution_confirmation("可以看到这里有问题"));
-    }
-
-    #[test]
     fn bash_mutation_detects_compound_and_sudo_commands() {
         use crate::turn::agentic_loop::lifecycle::tool_record_is_workspace_mutation;
         let record = ToolCallRecord {
@@ -3264,7 +3419,7 @@ mod tests {
     }
 
     #[test]
-    fn execution_retry_recognizes_affirmative_followup_context() {
+    fn execution_retry_does_not_infer_execution_from_chinese_affirmation_followup() {
         let mut state = make_state();
         state.message = "当然了".into();
         state.final_text = "我可以继续执行，确认后开始。".into();
@@ -3280,11 +3435,11 @@ mod tests {
             ..Default::default()
         });
 
-        assert!(should_force_execution_retry(&state));
+        assert!(!should_force_execution_retry(&state));
     }
 
     #[test]
-    fn execution_retry_recognizes_english_affirmative_followup_context() {
+    fn execution_retry_does_not_infer_execution_from_english_affirmation_followup() {
         let mut state = make_state();
         state.message = "go ahead".into();
         state.final_text = "I can apply the patch now.".into();
@@ -3293,7 +3448,7 @@ mod tests {
             "content": "Should I apply this patch?"
         }));
 
-        assert!(should_force_execution_retry(&state));
+        assert!(!should_force_execution_retry(&state));
     }
 
     #[test]
@@ -3443,6 +3598,95 @@ mod tests {
         assert!(!should_force_execution_retry(&state));
     }
 
+    fn auto_verify_hook() -> astra_turn_core::stop_hooks::StopHook {
+        astra_turn_core::stop_hooks::StopHook {
+            label: "verify-changes".into(),
+            command: "Based on the files you actually modified, run ONLY the relevant checks."
+                .into(),
+            working_dir: None,
+            depends_on: Vec::new(),
+            timeout_secs: None,
+            cache_key: None,
+        }
+    }
+
+    #[test]
+    fn auto_verify_stop_hook_skips_after_latest_mutation_was_verified() {
+        let mut state = make_state();
+        state.hooks.stop_hooks = vec![auto_verify_hook()];
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "str_replace".into(),
+            ok: true,
+            args_full: Some(r#"{"path":"src/lib.rs","old_str":"a","new_str":"b"}"#.into()),
+            ..Default::default()
+        });
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "bash".into(),
+            ok: true,
+            args_full: Some(
+                r#"{"command":"cd rust && cargo test -p astra-cli --lib edge_tools::tests"}"#
+                    .into(),
+            ),
+            result_preview: Some("✓ cargo | 426 passed, 0 failed".into()),
+            ..Default::default()
+        });
+
+        assert!(should_skip_auto_verify_stop_hooks(&state));
+    }
+
+    #[test]
+    fn auto_verify_stop_hook_does_not_skip_declarative_hook() {
+        let mut state = make_state();
+        state.hooks.stop_hooks = vec![astra_turn_core::stop_hooks::StopHook {
+            label: "project-contract".into(),
+            command: "make verify".into(),
+            working_dir: None,
+            depends_on: Vec::new(),
+            timeout_secs: None,
+            cache_key: None,
+        }];
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "str_replace".into(),
+            ok: true,
+            args_full: Some(r#"{"path":"src/lib.rs","old_str":"a","new_str":"b"}"#.into()),
+            ..Default::default()
+        });
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "bash".into(),
+            ok: true,
+            args_full: Some(r#"{"command":"cargo check"}"#.into()),
+            result_preview: Some("✓ cargo | finished".into()),
+            ..Default::default()
+        });
+
+        assert!(!should_skip_auto_verify_stop_hooks(&state));
+    }
+
+    #[test]
+    fn auto_verify_stop_hook_does_not_count_failed_cargo_pipeline() {
+        let mut state = make_state();
+        state.hooks.stop_hooks = vec![auto_verify_hook()];
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "str_replace".into(),
+            ok: true,
+            args_full: Some(r#"{"path":"src/lib.rs","old_str":"a","new_str":"b"}"#.into()),
+            ..Default::default()
+        });
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "bash".into(),
+            ok: true,
+            args_full: Some(
+                r#"{"command":"cargo test -p astra-cli test_a test_b 2>&1 | tail -30"}"#.into(),
+            ),
+            result_preview: Some(
+                "✗ unknown | 1 error(s) (exit 1)\nerror: unexpected argument 'test_b' found".into(),
+            ),
+            ..Default::default()
+        });
+
+        assert!(!should_skip_auto_verify_stop_hooks(&state));
+    }
+
     #[test]
     fn execution_retry_suppressed_when_round_budget_corrective_already_fired() {
         let mut state = make_state();
@@ -3473,6 +3717,17 @@ mod tests {
         state.total_tool_calls = 0;
         state.task_profile.mutates_workspace = true;
         state.stall.forced_exploration_family_corrective = true;
+        assert_eq!(execution_retry_reason(&state), None);
+    }
+
+    #[test]
+    fn execution_retry_suppressed_when_search_fanout_corrective_already_fired() {
+        let mut state = make_state();
+        state.message = "implement the feature".into();
+        state.final_text = "I'll implement that for you.".into();
+        state.total_tool_calls = 0;
+        state.task_profile.mutates_workspace = true;
+        state.stall.forced_search_fanout_corrective = true;
         assert_eq!(execution_retry_reason(&state), None);
     }
 
@@ -3893,7 +4148,7 @@ mod tests {
                 .volatile_pending
                 .iter()
                 .any(|entry| entry.kind == VolatileKind::CompactResume),
-            "successful reactive compaction should inject the continue-after-compact directive"
+            "successful reactive compaction should inject the compact context note"
         );
     }
 
@@ -4234,6 +4489,7 @@ mod tests {
             Box::new(|s| s.stall.forced_round_budget_phase1 = true),
             Box::new(|s| s.stall.forced_redundant_reads_corrective = true),
             Box::new(|s| s.stall.forced_cache_waste_corrective = true),
+            Box::new(|s| s.stall.forced_search_fanout_corrective = true),
             Box::new(|s| s.stall.forced_exploration_family_corrective = true),
             Box::new(|s| s.stall.forced_exploration_family_phase2 = true),
         ];
@@ -5043,6 +5299,64 @@ mod tests {
         assert!(is_cache_waste_corrective(&msg));
         let unrelated = serde_json::json!({"role": "user", "content": "hello"});
         assert!(!is_cache_waste_corrective(&unrelated));
+    }
+
+    fn push_search_call(state: &mut AgenticLoopState, idx: usize) {
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "grep".into(),
+            ok: true,
+            args_full: Some(format!(r#"{{"pattern":"needle_{idx}","path":"rust"}}"#)),
+            ..Default::default()
+        });
+    }
+
+    #[test]
+    fn search_fanout_corrective_fires_for_mutating_task() {
+        let mut state = make_state();
+        state.message = "fix the bug".into();
+        state.task_profile.mutates_workspace = true;
+        for idx in 0..8 {
+            push_search_call(&mut state, idx);
+        }
+
+        assert!(should_inject_search_fanout_corrective(&state, 8));
+    }
+
+    #[test]
+    fn search_fanout_corrective_fires_for_read_only_review() {
+        let mut state = make_state();
+        state.message = "review the branch".into();
+        state.task_profile.mutates_workspace = false;
+        for idx in 0..12 {
+            push_search_call(&mut state, idx);
+        }
+
+        assert!(should_inject_search_fanout_corrective(&state, 8));
+    }
+
+    #[test]
+    fn search_fanout_corrective_is_one_shot_per_turn() {
+        let mut state = make_state();
+        state.message = "fix the bug".into();
+        state.task_profile.mutates_workspace = true;
+        for idx in 0..10 {
+            push_search_call(&mut state, idx);
+        }
+        assert!(should_inject_search_fanout_corrective(&state, 8));
+        state.stall.forced_search_fanout_corrective = true;
+        assert!(!should_inject_search_fanout_corrective(&state, 8));
+    }
+
+    #[test]
+    fn search_fanout_corrective_marker_recognized() {
+        let msg = serde_json::json!({
+            "role": "user",
+            "content": search_fanout_corrective_message(8, "fix the bug"),
+        });
+        assert!(is_search_fanout_corrective(&msg));
+        assert!(is_execution_corrective_message(&msg));
+        let unrelated = serde_json::json!({"role": "user", "content": "hello"});
+        assert!(!is_search_fanout_corrective(&unrelated));
     }
 
     fn push_diff_round(state: &mut AgenticLoopState, round: u32) {

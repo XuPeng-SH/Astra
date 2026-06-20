@@ -121,9 +121,10 @@ fn trace_short_circuit_tool_skip(
 impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
     pub(super) fn emit_turn_budget_stub(&mut self, slot: &HeadlessResolvedToolSlot) {
         let body = format!(
-            "⛔ Per-turn tool budget exhausted ({max_tools_per_turn} tools). \
-             Skipping this call. Prioritize the most important remaining \
-             tools in your next response — do not repeat all skipped calls.",
+            "⛔ Current-turn tool budget exhausted ({max_tools_per_turn} tools for the \
+             latest user request). Skipping this call. Do not repeat skipped calls \
+             in this turn; answer with the current state unless the user sends a \
+             new request.",
             max_tools_per_turn = self.ctx.max_tools_per_turn,
         );
         trace_short_circuit_tool_skip(
@@ -247,7 +248,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 let body = if prior_cache_hits >= self.ctx.repeated_cache_hit_suppression as usize {
                     skip_reason = REASON_REPEATED_CACHE_HIT_SUPPRESSED;
                     format!(
-                        "⛔ Repeated cached read suppressed: this exact {} request has already \
+                        "Repeated cached read skipped: this exact {} request has already \
                          been served from cache {} time(s). Use the earlier cached result in the \
                          conversation instead of calling again; if you need different evidence, \
                          change the arguments.",
@@ -255,7 +256,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     )
                 } else {
                     format!(
-                        "⛔ Cached repeat (call #{} for identical args, limit: {}). \
+                        "Cached repeat skipped (call #{} for identical args, limit: {}). \
                          The result is already in this conversation from an earlier call. \
                          Do NOT call this tool again with the same arguments.",
                         *count, self.ctx.max_identical_calls

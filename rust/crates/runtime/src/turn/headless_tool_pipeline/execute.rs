@@ -4,7 +4,7 @@ use super::super::agentic::headless_round::HeadlessStderrStyle;
 use super::*;
 use crate::turn::agentic_loop::tool_support::edge_tool_status_exit_code;
 use astra_turn_core::headless_tool_postprocess::{
-    HeadlessOutputEnrichSignal, append_headless_result_quality_feedback,
+    HeadlessOutputEnrichCtx, HeadlessOutputEnrichSignal, append_headless_result_quality_feedback,
     enrich_headless_tool_output_for_errors_and_limits,
 };
 use astra_turn_core::headless_tool_stderr_lines::{
@@ -47,6 +47,18 @@ pub(crate) async fn execute_tool_pure(
             execution.result_str = result.output;
         }
     }
+    if execution.result_str.starts_with(EDGE_PROTOCOL_ERROR_PREFIX) {
+        let fields = execution.tool_result_fields.get_or_insert_with(Map::new);
+        fields.insert("status".to_string(), Value::String("failed".to_string()));
+        fields.insert(
+            "error_kind".to_string(),
+            Value::String(astra_core::ErrorKind::ToolBinding.as_str().to_string()),
+        );
+        fields.insert(
+            "finish_reason".to_string(),
+            Value::String("tool_binding".to_string()),
+        );
+    }
 
     execution.result_str = hydrate_reflect_placeholder_if_needed(
         api,
@@ -72,6 +84,7 @@ pub(super) fn execution_result_is_error(
 
     match classify_tool_error(name, result_str) {
         ToolErrorSeverity::HardError => true,
+        ToolErrorSeverity::InfrastructureError => true,
         ToolErrorSeverity::SoftError => false,
         // Success arm — body-wins reconciliation contract:
         //
@@ -91,6 +104,15 @@ pub(super) fn execution_result_is_error(
             metadata_failed && !tool_output_has_explicit_success_signal(result_str)
         }
     }
+}
+
+fn execution_error_kind(
+    tool_result_fields: Option<&Map<String, Value>>,
+) -> Option<astra_core::ErrorKind> {
+    tool_result_fields
+        .and_then(|fields| fields.get("error_kind"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(astra_core::ErrorKind::parse_tag)
 }
 
 impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
@@ -128,16 +150,21 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             &execution.result_str,
             execution.tool_result_fields.as_ref(),
         );
+        let source_error_kind = execution_error_kind(execution.tool_result_fields.as_ref());
         let tool_already_restricted = self.ctx.restricted_tools.contains(&execution.name);
         let quiet = self.ctx.quiet;
         let term = &mut self.ctx.term;
+        let mut enrich_ctx = HeadlessOutputEnrichCtx {
+            turn_guard: self.ctx.turn_guard,
+            restricted_tools: self.ctx.restricted_tools,
+        };
         let resource_limit_recorded = enrich_headless_tool_output_for_errors_and_limits(
             &execution.name,
             &mut execution.result_str,
             &mut is_err,
+            source_error_kind,
             tool_already_restricted,
-            self.ctx.turn_guard,
-            self.ctx.restricted_tools,
+            &mut enrich_ctx,
             |sig| {
                 if quiet {
                     return;
@@ -167,6 +194,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         let result_quality = append_headless_result_quality_feedback(
             &execution.name,
             &mut execution.result_str,
+            source_error_kind,
             resource_limit_recorded,
             self.ctx.turn_guard,
         );

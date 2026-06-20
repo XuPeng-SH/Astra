@@ -2600,31 +2600,40 @@ impl InProcessChatTurnBridge {
                         })
                         .unwrap_or_default();
                 let memory_injections: Vec<astra_turn_core::context_assembly_trace::MemoryInjection> =
-                    memory_preview
+                    memoria_prefetch_entries
                         .iter()
                         .enumerate()
-                        .map(|(i, line)| {
+                        .map(|(i, entry)| {
                             astra_turn_core::context_assembly_trace::MemoryInjection {
-                                memory_id: format!("prefetch-{i}"),
-                                memory_type: "hybrid_retrieval".into(),
-                                tokens: prompts::estimate_str_tokens(line) as u32,
-                                relevance_score: 0.0,
+                                memory_id: format!("prefetch-{i}-{:016x}", entry.content_hash),
+                                memory_type: entry
+                                    .source
+                                    .clone()
+                                    .unwrap_or_else(|| "hybrid_retrieval".into()),
+                                tokens: entry.token_estimate,
+                                relevance_score: entry.relevance_score,
                                 content_preview:
                                     astra_turn_core::context_assembly_trace::preview_snippet(
-                                        line, 100,
+                                        &entry.content,
+                                        100,
                                     ),
                             }
                         })
                         .collect();
                 let session_memory_injection = initial_session_memory_entry.as_ref().map(|entry| {
+                    let memory_type = entry
+                        .source
+                        .clone()
+                        .unwrap_or_else(|| "session_memory".into());
                     astra_turn_core::context_assembly_trace::MemoryInjection {
                         memory_id: "session-memory".into(),
-                        memory_type: entry
-                            .source
-                            .clone()
-                            .unwrap_or_else(|| "session_memory".into()),
+                        memory_type: memory_type.clone(),
                         tokens: prompts::estimate_str_tokens(&entry.content) as u32,
-                        relevance_score: 1.0,
+                        relevance_score: if memory_type == "session_memory.reanchor" {
+                            1.0
+                        } else {
+                            0.35
+                        },
                         content_preview: astra_turn_core::context_assembly_trace::preview_snippet(
                             &entry.content,
                             100,
@@ -2672,9 +2681,9 @@ impl InProcessChatTurnBridge {
                             max_output_tokens: Some(max_output_tokens),
                         })
                     {
-                        crate::turn::llm::exchange_capture::persist_prompt_request_plan_or_log(
+                        crate::turn::llm::exchange_capture::spawn_prompt_request_plan_persist_or_log(
                             "bridge_inprocess e2e capture",
-                            shared_pool.as_ref(),
+                            shared_pool.clone(),
                             astra_services::PromptRequestPersistInput {
                                 session_id: session_id.clone(),
                                 user_id: user_id.clone(),
@@ -2689,9 +2698,8 @@ impl InProcessChatTurnBridge {
                                 model: request_capture_model.clone(),
                                 provider: provider.clone(),
                             },
-                            &prompt_request_plan,
-                        )
-                        .await;
+                            prompt_request_plan,
+                        );
                     }
                     yield render_sse(&crate::turn::llm::context::context_meta_event(
                         &breakdown,
@@ -2699,8 +2707,11 @@ impl InProcessChatTurnBridge {
                     ));
                     #[cfg(feature = "bridge-e2e-hooks")]
                     {
-                        let (t, r, tc, u_delta) =
+                        let (t, r, tc, u_delta, delay_ms) =
                             astra_turn_core::bridge_e2e_hooks::parse_llm_round(round_val);
+                        if delay_ms > 0 {
+                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        }
                         loop_text = t;
                         loop_reasoning = r;
                         loop_tool_calls = tc;
@@ -2755,9 +2766,9 @@ impl InProcessChatTurnBridge {
                             max_output_tokens: Some(max_output_tokens),
                         })
                     {
-                        crate::turn::llm::exchange_capture::persist_prompt_request_plan_or_log(
+                        crate::turn::llm::exchange_capture::spawn_prompt_request_plan_persist_or_log(
                             "bridge_inprocess live capture",
-                            shared_pool.as_ref(),
+                            shared_pool.clone(),
                             astra_services::PromptRequestPersistInput {
                                 session_id: session_id.clone(),
                                 user_id: user_id.clone(),
@@ -2772,9 +2783,8 @@ impl InProcessChatTurnBridge {
                                 model: request_capture_model.clone(),
                                 provider: provider.clone(),
                             },
-                            &prompt_request_plan,
-                        )
-                        .await;
+                            prompt_request_plan,
+                        );
                     }
 
                     // wip-7: emit per-channel fingerprints ONLY — no raw
@@ -3052,9 +3062,9 @@ impl InProcessChatTurnBridge {
                                     max_output_tokens: Some(max_output_tokens / 2),
                                 })
                             {
-                                crate::turn::llm::exchange_capture::persist_prompt_request_plan_or_log(
+                                crate::turn::llm::exchange_capture::spawn_prompt_request_plan_persist_or_log(
                                     "bridge_inprocess retry capture",
-                                    shared_pool.as_ref(),
+                                    shared_pool.clone(),
                                     astra_services::PromptRequestPersistInput {
                                         session_id: session_id.clone(),
                                         user_id: user_id.clone(),
@@ -3069,9 +3079,8 @@ impl InProcessChatTurnBridge {
                                         model: request_capture_model.clone(),
                                         provider: provider.clone(),
                                     },
-                                    &prompt_request_plan,
-                                )
-                                .await;
+                                    prompt_request_plan,
+                                );
                             }
 
                             // Retry LLM call
@@ -6363,7 +6372,7 @@ mod tests {
     }
 
     #[test]
-    fn turn_complete_event_includes_followup_suggestion_from_last_user() {
+    fn turn_complete_event_does_not_suggest_continuation_from_last_user_text() {
         let messages = vec![
             json!({"role": "user", "content": "first prompt"}),
             json!({"role": "assistant", "content": "intermediate"}),
@@ -6373,7 +6382,7 @@ mod tests {
         assert_eq!(event["type"], "turn_complete");
         assert_eq!(event["has_tool_calls"], false);
         assert_eq!(event["assistant_text"], "Should I continue?");
-        assert_eq!(event["followup_suggestion"], "继续");
+        assert!(event.get("followup_suggestion").is_none(), "{event}");
     }
 
     #[test]
@@ -6410,6 +6419,10 @@ mod tests {
             );
             messages.push(json!({"role": "user", "content": format!("Next {}", i + 1)}));
         }
+        messages.push(json!({
+            "role": "assistant",
+            "content": "Still working through the remaining steps."
+        }));
 
         let config = MemoriaCompactConfig::default();
         let params = MemoriaCompactParams {
@@ -6429,26 +6442,24 @@ mod tests {
                 &messages, None, &config, &params, None, None, None,
             ));
 
-        // Compaction happened (boundary present), so we simulate what the turn loop does
+        // Compaction happened (boundary present), so we simulate what the turn loop does.
         assert!(
             result.boundary.is_some(),
             "compaction should have triggered"
         );
 
         let mut msgs = result.messages;
-        if result.boundary.is_some() && msgs.len() >= 2 {
-            msgs.push(json!({
-                "role": "user",
-                "content": "Continue the conversation from where it left off. \
-                            Do not ask the user any further questions — \
-                            pick up the current task and keep going."
-            }));
-        }
+        crate::turn::wire_assembly::maybe_append_continuation_prompt(
+            &mut msgs,
+            result.boundary.is_some(),
+        );
 
         let last = msgs.last().unwrap();
         assert_eq!(last["role"], "user");
-        assert!(last["content"].as_str().unwrap().contains("Continue"));
-        assert!(last["content"].as_str().unwrap().contains("keep going"));
+        let note = last["content"].as_str().unwrap();
+        assert!(note.contains("Context was compacted"));
+        assert!(note.contains("not a new user request"));
+        assert!(!note.contains("keep going"));
     }
 
     #[test]
@@ -6483,7 +6494,7 @@ mod tests {
             ));
 
         assert!(result.boundary.is_none(), "no compaction should happen");
-        // No continuation prompt should be added
+        // No compaction note should be added.
         assert_eq!(result.messages.len(), 3);
         assert_eq!(result.messages.last().unwrap()["role"], "assistant");
     }
@@ -7333,7 +7344,7 @@ mod tests {
         assert!(signals_done("I can't believe we completed successfully!"));
     }
 
-    // ── Fix #11: CJK detection for bilingual continuation prompt ────────
+    // ── Fix #11: CJK detection for bilingual compaction note ────────────
 
     #[test]
     fn p2_cjk_detection_chinese_content() {

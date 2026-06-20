@@ -496,6 +496,7 @@ mod tests {
             },
         );
 
+        harness.call_counts.clear();
         let mut pipeline = harness.pipeline_with_server_executor(turn_index, None);
         match pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)) {
             HeadlessPipelineStage::ShortCircuit => {}
@@ -2146,11 +2147,12 @@ mod tests {
         // Simulates the DefaultToolExecutor "not available" path:
         // tool passes valid_tool_names but executor returns error.
         let mut harness = PipelineHarness::new();
-        // Add "outline" to valid_tool_names so it passes validation.
-        harness.valid_tool_names.insert("outline".to_string());
+        let missing_tool = "definitely_missing_server_tool";
+        // Add the missing tool to valid_tool_names so it passes validation.
+        harness.valid_tool_names.insert(missing_tool.to_string());
         harness.tool_calls.push(json!({
-            "id": "call-outline-0",
-            "function": { "name": "outline", "arguments": "{}" }
+            "id": "call-missing-0",
+            "function": { "name": missing_tool, "arguments": "{}" }
         }));
         let dir = tempfile::TempDir::new().unwrap();
         let server_exec = crate::server::server_tool_executor::ServerToolExecutor::new(
@@ -2174,8 +2176,8 @@ mod tests {
             _ => panic!("expected Continue"),
         };
 
-        // execute_execution: ServerToolExecutor doesn't know "outline",
-        // returns "Error: Tool 'outline' not available..."
+        // execute_execution: ServerToolExecutor doesn't know the tool,
+        // returns an explicit not-available error.
         let executed = pipeline.execute_execution(permitted).await;
         assert!(
             executed.is_err,
@@ -2186,10 +2188,10 @@ mod tests {
         // → turn_guard.record_tool_result → health.record_failure
         pipeline.record_execution(executed).await;
 
-        let health = pipeline.ctx.turn_guard.health.get("outline");
+        let health = pipeline.ctx.turn_guard.health.get(missing_tool);
         assert!(
             health.is_some(),
-            "outline should be tracked after server fallback error"
+            "missing tool should be tracked after server fallback error"
         );
         let h = health.unwrap();
         assert_eq!(
@@ -2197,6 +2199,75 @@ mod tests {
             "server fallback error should count as failure"
         );
         assert_eq!(h.consecutive_failures, 1);
+    }
+
+    #[tokio::test]
+    async fn no_matching_edge_execution_is_failed_tool_binding_without_rollback_class() {
+        let mut harness = PipelineHarness::new();
+        harness.valid_tool_names.insert("agent_fanout".to_string());
+        harness.tool_calls.push(json!({
+            "id": "call-agent-fanout-0",
+            "function": {
+                "name": "agent_fanout",
+                "arguments": serde_json::to_string(&json!({
+                    "action": "start",
+                    "target_count": 1,
+                    "slots": [{
+                        "id": "review",
+                        "description": "Review",
+                        "prompt": "Review this change."
+                    }]
+                })).unwrap()
+            }
+        }));
+        let mut pipeline = harness.pipeline();
+
+        let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)) {
+            HeadlessPipelineStage::Continue(v) => v,
+            _ => panic!("expected validation to pass"),
+        };
+        let permitted = match pipeline.permit_execution(validated).await {
+            HeadlessPipelineStage::Continue(p) => p,
+            _ => panic!("expected permission to pass"),
+        };
+        let executed = pipeline.execute_execution(permitted).await;
+
+        assert!(
+            executed.is_err,
+            "executor-missing must be a failed tool call"
+        );
+        let fields = executed
+            .execution
+            .tool_result_fields
+            .as_ref()
+            .expect("headless protocol failure must carry structured metadata");
+        assert_eq!(fields.get("status").and_then(Value::as_str), Some("failed"));
+        assert_eq!(
+            fields.get("error_kind").and_then(Value::as_str),
+            Some(astra_core::ErrorKind::ToolBinding.as_str())
+        );
+        assert!(
+            !astra_turn_core::tool_result_semantics::tool_error_triggers_rollback(
+                "agent_fanout",
+                &executed.execution.result_str,
+            ),
+            "no executor means no tool implementation ran, so rollback is wrong"
+        );
+
+        pipeline.record_execution(executed).await;
+        let record = pipeline
+            .ctx
+            .tool_call_records
+            .last()
+            .expect("recorded tool call");
+        assert!(!record.ok, "journal must not mark executor-missing as ok");
+        assert!(
+            record
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("headless edge protocol")),
+            "journal error should preserve the executor-missing body, got {record:?}"
+        );
     }
 
     #[tokio::test]
@@ -2297,10 +2368,11 @@ mod tests {
     #[tokio::test]
     async fn execute_populates_outcome_cache_under_canonical_signature() {
         let mut harness = PipelineHarness::new();
-        harness.valid_tool_names.insert("outline".to_string());
+        let missing_tool = "definitely_missing_server_tool";
+        harness.valid_tool_names.insert(missing_tool.to_string());
         harness.tool_calls.push(json!({
-            "id": "call-outline-0",
-            "function": { "name": "outline", "arguments": "{}" }
+            "id": "call-missing-0",
+            "function": { "name": missing_tool, "arguments": "{}" }
         }));
         let dir = tempfile::TempDir::new().unwrap();
         let server_exec = crate::server::server_tool_executor::ServerToolExecutor::new(
