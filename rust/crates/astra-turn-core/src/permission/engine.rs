@@ -368,29 +368,7 @@ pub struct DecisionEnvelope {
     pub risk_tags: Vec<RiskTag>,
 }
 
-fn legacy_plan_mode_tool_alias(tool_name: &str, args: &Value) -> Option<&'static str> {
-    let action = args.get("action").and_then(Value::as_str).map(str::trim);
-    match tool_name {
-        "session" => match action {
-            Some("enter_plan_mode") => Some("enter_plan_mode"),
-            Some("exit_plan_mode") => Some("exit_plan_mode"),
-            _ => None,
-        },
-        "agent" if action == Some("run_chain") => match args.get("chain").and_then(Value::as_str) {
-            Some("enter_plan_mode") => Some("enter_plan_mode"),
-            Some("exit_plan_mode") => Some("exit_plan_mode"),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-pub(crate) fn plan_mode_denial_reason(tool_name: &str, args: &Value) -> String {
-    if let Some(canonical_tool) = legacy_plan_mode_tool_alias(tool_name, args) {
-        return format!(
-            "Tool '{tool_name}' denied by permission mode. Use `{canonical_tool}` directly — plan mode no longer routes through `{tool_name}`."
-        );
-    }
+pub(crate) fn plan_mode_denial_reason(tool_name: &str) -> String {
     format!(
         "Tool '{tool_name}' denied by permission mode. Plan mode allows read-only tools plus `enter_plan_mode` / `exit_plan_mode`; author the plan, then call `exit_plan_mode(plan=...)`."
     )
@@ -881,7 +859,7 @@ pub fn evaluate_permission(
             );
         }
         let decision = HardDecision::Deny {
-            reason: plan_mode_denial_reason(tool_name, args),
+            reason: plan_mode_denial_reason(tool_name),
         };
         push_matched(&mut trace, EvaluationStep::Mode, &decision, &mode_label);
         return envelope(
@@ -1354,7 +1332,22 @@ fn fingerprinted_override(
     ctx: &PermissionSyncContext,
 ) -> Option<bool> {
     let json = ctx.inherited.fingerprinted_overrides.as_ref()?;
-    let overrides = serde_json::from_value::<FingerprintedOverrides>(json.clone()).ok()?;
+    // Fail-closed: a corrupt overrides blob must NOT silently fall through
+    // to broader (potentially permissive) rules. Distinguish "no overrides
+    // present" (None → caller falls through normally) from "overrides present
+    // but undecodable" (Some(false) → deny). The latter is a security signal,
+    // not a recoverable state.
+    let overrides = match serde_json::from_value::<FingerprintedOverrides>(json.clone()) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "fingerprinted_overrides blob is present but undecodable; denying tool {} as fail-closed",
+                tool_name,
+            );
+            return Some(false);
+        }
+    };
     content_aware_fingerprint_candidates(tool_name, args)
         .into_iter()
         .find_map(|fp| overrides.check(&fp))
@@ -1563,6 +1556,51 @@ mod tests {
         assert!(
             deny_idx < sandbox_idx,
             "DenyRules ({deny_idx}) must run before SandboxExpand ({sandbox_idx})"
+        );
+    }
+
+    /// Fail-closed pinning: a corrupt `fingerprinted_overrides` blob must
+    /// resolve to an explicit deny (`Some(false)`), NOT fall through to
+    /// broader rules via `None`. The old `.ok()?` path silently downgraded
+    /// to whatever the caller did next — the exact bug class this module
+    /// is supposed to prevent.
+    #[test]
+    fn fingerprinted_override_corrupt_json_denies() {
+        let ctx = crate::permission::types::PermissionSyncContext::new(
+            crate::permission::types::InheritedPermissions {
+                mode: crate::permission::types::PermissionMode::AcceptEdits,
+                fingerprinted_overrides: Some(serde_json::json!({"not": "a valid shape"})),
+                ..Default::default()
+            },
+        );
+        // Call the private fn directly — we're inside the module.
+        let result =
+            fingerprinted_override("bash", &serde_json::json!({"command": "echo hi"}), &ctx);
+        assert_eq!(
+            result,
+            Some(false),
+            "corrupt fingerprinted_overrides blob must fail-closed to Some(false), not fall through as None"
+        );
+    }
+
+    /// Positive pinning: a well-formed empty overrides blob must still
+    /// return `None` (no override matched) so the caller falls through
+    /// normally. This guards against the fail-closed change accidentally
+    /// treating "no overrides" the same as "corrupt overrides".
+    #[test]
+    fn fingerprinted_override_empty_blob_falls_through() {
+        let ctx = crate::permission::types::PermissionSyncContext::new(
+            crate::permission::types::InheritedPermissions {
+                mode: crate::permission::types::PermissionMode::AcceptEdits,
+                fingerprinted_overrides: None,
+                ..Default::default()
+            },
+        );
+        let result =
+            fingerprinted_override("bash", &serde_json::json!({"command": "echo hi"}), &ctx);
+        assert_eq!(
+            result, None,
+            "missing fingerprinted_overrides blob must fall through as None"
         );
     }
 
@@ -1866,24 +1904,19 @@ mod tests {
     }
 
     #[test]
-    fn plan_mode_denial_reason_guides_legacy_plan_tool_aliases() {
-        let session_reason =
-            plan_mode_denial_reason("session", &serde_json::json!({"action": "exit_plan_mode"}));
-        assert!(session_reason.contains("Use `exit_plan_mode` directly"));
-        assert!(session_reason.contains("no longer routes through `session`"));
-
-        let agent_reason = plan_mode_denial_reason(
-            "agent",
-            &serde_json::json!({"action": "run_chain", "chain": "exit_plan_mode"}),
-        );
-        assert!(agent_reason.contains("Use `exit_plan_mode` directly"));
-        assert!(agent_reason.contains("no longer routes through `agent`"));
+    fn plan_mode_denial_reason_does_not_special_case_unsupported_plan_tool_shapes() {
+        for tool_name in ["session", "agent"] {
+            let reason = plan_mode_denial_reason(tool_name);
+            assert!(reason.contains("Plan mode allows read-only tools"));
+            assert!(reason.contains("exit_plan_mode(plan=...)"));
+            assert!(!reason.contains("no longer routes through"));
+            assert!(!reason.contains("Use `exit_plan_mode` directly"));
+        }
     }
 
     #[test]
     fn generic_plan_mode_denial_reason_points_to_exit_tool() {
-        let reason =
-            plan_mode_denial_reason("bash", &serde_json::json!({"command": "touch plan.txt"}));
+        let reason = plan_mode_denial_reason("bash");
         assert!(reason.contains("Plan mode allows read-only tools"));
         assert!(reason.contains("exit_plan_mode(plan=...)"));
     }
