@@ -6,7 +6,7 @@ use super::{
     SANDBOX_DENIED_PREFIX, ToolExecutor, code_intel, fuzzy_replacer, tool_output_limit,
     truncate_output,
 };
-use astra_runtime::tool_sandbox::{IsolationLevel, validate_path};
+use astra_runtime::tool_sandbox::validate_path;
 use astra_sandbox::is_internal_safe_path;
 use astra_tools::fs_ops::{
     check_anchor_vs_replacement_size, read_to_string_lossy, str_replace_fail,
@@ -19,6 +19,17 @@ use serde_json::{Value, json};
 /// Check if a path is a UNC path (Windows network path that could leak NTLM credentials).
 fn is_unc_path(path: &str) -> bool {
     path.starts_with("\\\\") || path.starts_with("//")
+}
+
+fn expand_home_path_arg(path: &str) -> Option<PathBuf> {
+    let home = dirs::home_dir()?;
+    if matches!(path, "~" | "$HOME" | "${HOME}") {
+        return Some(home);
+    }
+    path.strip_prefix("~/")
+        .or_else(|| path.strip_prefix("$HOME/"))
+        .or_else(|| path.strip_prefix("${HOME}/"))
+        .map(|suffix| home.join(suffix))
 }
 
 /// Append the stable [`TOOL_SUCCESS_SENTINEL`] to a human-readable success body.
@@ -115,7 +126,14 @@ impl ToolExecutor {
         if is_unc_path(path) {
             return Err("Error: UNC/network paths are not supported (security risk)".to_string());
         }
-        let p = Path::new(path);
+        let expanded_home_path = expand_home_path_arg(path);
+        let path_for_validation = expanded_home_path
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned());
+        let validation_path = path_for_validation.as_deref().unwrap_or(path);
+        let p = expanded_home_path
+            .as_deref()
+            .unwrap_or_else(|| Path::new(path));
         let resolved = if p.is_absolute() {
             p.to_path_buf()
         } else {
@@ -142,19 +160,17 @@ impl ToolExecutor {
                 .sandbox_policy
                 .read()
                 .unwrap_or_else(|e| e.into_inner());
-            if let Some(ref policy) = *sp_guard
-                && !matches!(policy.isolation, IsolationLevel::Permissive)
-            {
-                return validate_path(policy, path).map_err(|e| {
+            if let Some(ref policy) = *sp_guard {
+                return validate_path(policy, validation_path).map_err(|e| {
                     if e.is_boundary_violation() {
                         // Use structured prefix so the agentic loop can detect sandbox
                         // denials and prompt the user for authorization instead of
                         // letting the model silently fall back to bash.
                         format!(
-                            "{}Path '{}' is outside the project directory '{}'. \
-                             Ask the user for permission before accessing files outside the project.",
+                            "{}Path '{}' is outside the project directory '{}'; \
+                             sandbox approval is required for this external path.",
                             SANDBOX_DENIED_PREFIX,
-                            path,
+                            validation_path,
                             policy.project_root.display(),
                         )
                     } else {
@@ -828,11 +844,11 @@ impl ToolExecutor {
         // symlink swaps (TOCTOU) between the initial resolve_checked and now.
         if path.exists() {
             if let Ok(canonical) = path.canonicalize() {
-                if !self.is_within_project_root(&canonical) {
+                if !self.is_within_sandbox_boundary(&canonical) {
                     return json!({
                         "success": false,
                         "error": format!(
-                            "Security: path '{}' was replaced with a symlink pointing outside the project",
+                            "Security: path '{}' was replaced with a symlink pointing outside the approved sandbox boundary",
                             path.display()
                         )
                     }).to_string();

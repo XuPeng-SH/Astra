@@ -5,7 +5,8 @@ use astra_services::session_journal::ToolCallRecord;
 use astra_thin_client::ThinClient;
 use serde_json::{Map, Value};
 
-use super::agentic::headless_round::{HeadlessRoundTerminal, PermissionSyncHandle};
+use super::agentic::headless_round::HeadlessRoundTerminal;
+use crate::orchestration::PermissionSyncHandle;
 use astra_pipeline::step_protocol::{IdempotencyKey, InMemoryIdempotencyCache};
 use astra_pipeline::step_recorder::StepRecorder;
 use astra_text_utils::semantic_dedup::SemanticDedup;
@@ -448,6 +449,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    use crate::orchestration::{PermissionMode, PermissionSyncContext, PermissionSyncHandle};
     use crate::skills::hooks::{HookAction, ToolEventHook, ToolEventHookRegistry, ToolEventKind};
     use crate::turn::agentic::headless_round::NoopHeadlessTerminal;
     use astra_pipeline::step_protocol::CachedToolResult;
@@ -558,6 +560,7 @@ mod tests {
         call_counts: HashMap<String, u32>,
         tool_call_records: Vec<ToolCallRecord>,
         tool_event_hooks: ToolEventHookRegistry,
+        permission_context: Option<PermissionSyncHandle>,
         term: NoopHeadlessTerminal,
         repeated_cache_hit_suppression: u32,
         max_consecutive_empty_name: u32,
@@ -591,6 +594,7 @@ mod tests {
                 call_counts: HashMap::new(),
                 tool_call_records: Vec::new(),
                 tool_event_hooks: ToolEventHookRegistry::default(),
+                permission_context: Some(PermissionSyncContext::shared_root(PermissionMode::Auto)),
                 term: NoopHeadlessTerminal,
                 // Tests assume the legacy threshold of 2 unless they override.
                 // Production runs derive these from the per-model policy.
@@ -639,7 +643,7 @@ mod tests {
                     tool_event_hooks: &self.tool_event_hooks,
                     term: &mut self.term,
                     mailbox: None,
-                    permission_context: None,
+                    permission_context: self.permission_context.as_ref(),
                     progress_emitter: None,
                     effective_permission_timeout: Duration::from_secs(30),
                     server_tool_executor,
@@ -688,6 +692,32 @@ mod tests {
             }
             _ => panic!("expected permitted execution"),
         }
+    }
+
+    #[tokio::test]
+    async fn permit_execution_without_permission_context_denies() {
+        let mut harness = PipelineHarness::new();
+        harness.permission_context = None;
+        let mut pipeline = harness.pipeline();
+        let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::SyntheticEdge(0)) {
+            HeadlessPipelineStage::Continue(validated) => validated,
+            _ => panic!("expected validated execution"),
+        };
+
+        match pipeline.permit_execution(validated).await {
+            HeadlessPipelineStage::ShortCircuit => {}
+            _ => panic!("missing permission context must fail closed"),
+        }
+
+        let error = harness
+            .tool_call_records
+            .last()
+            .and_then(|record| record.error.as_deref())
+            .unwrap_or("");
+        assert!(
+            error.contains("no permission context configured"),
+            "expected actionable missing-context denial, got {error:?}"
+        );
     }
 
     #[tokio::test]

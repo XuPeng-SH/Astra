@@ -102,7 +102,7 @@ fn maybe_wire_delegation_engine(
         token.to_string(),
         state.model.clone(),
         project_root.clone(),
-        state.perm_manager.mode(),
+        state.perm_manager.inherited_permissions_for_child(true),
         None,
     );
     let mut registry = astra_services::AgentProfileRegistry::new();
@@ -486,7 +486,6 @@ async fn execute_headless_task_body(
         api,
         token.clone(),
         pipeline_modules.unified_skill_registry.clone(),
-        pm.mode(),
         skill_search.clone(),
         session_id.clone(),
         effective_model.clone(),
@@ -1037,11 +1036,10 @@ fn handle_permission_command(arg: &str, state: &mut SessionState) {
     match arg {
         "" => {
             let next = match state.perm_manager.mode() {
-                PermissionMode::Prompt => PermissionMode::Plan,
-                PermissionMode::Plan => PermissionMode::AcceptEdits,
-                PermissionMode::AcceptEdits => PermissionMode::Auto,
-                PermissionMode::Auto => PermissionMode::Deny,
-                PermissionMode::Deny => PermissionMode::Prompt,
+                PermissionMode::Prompt | PermissionMode::Deny => PermissionMode::AcceptEdits,
+                PermissionMode::AcceptEdits => PermissionMode::Plan,
+                PermissionMode::Plan => PermissionMode::Auto,
+                PermissionMode::Auto => PermissionMode::Prompt,
             };
             state.perm_manager.set_mode(next);
             eprintln!(
@@ -1146,13 +1144,7 @@ fn handle_permission_command(arg: &str, state: &mut SessionState) {
 }
 
 pub(crate) fn permission_mode_display_label(mode: PermissionMode) -> &'static str {
-    match mode {
-        PermissionMode::Prompt => "Ask",
-        PermissionMode::Auto => "Auto",
-        PermissionMode::AcceptEdits => "Edits",
-        PermissionMode::Plan => "Plan",
-        PermissionMode::Deny => "Deny",
-    }
+    mode.chip_text()
 }
 
 #[cfg(test)]
@@ -1166,7 +1158,7 @@ mod permission_mode_display_tests {
         assert_eq!(permission_mode_display_label(PermissionMode::Auto), "Auto");
         assert_eq!(
             permission_mode_display_label(PermissionMode::AcceptEdits),
-            "Edits"
+            "Accept"
         );
         assert_eq!(permission_mode_display_label(PermissionMode::Plan), "Plan");
         assert_eq!(permission_mode_display_label(PermissionMode::Deny), "Deny");
@@ -1811,7 +1803,6 @@ async fn execute_cli_command_impl(
                 api,
                 token.clone(),
                 astra_runtime::skills::default_unified_registry().clone(),
-                pm.mode(),
                 skill_search.clone(),
                 session_id.clone(),
                 effective_model.clone(),
