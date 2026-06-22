@@ -24,16 +24,17 @@ mod record;
 /// Compute the set of tool names the validator should admit.
 ///
 /// `visible` is the set advertised in the current request's `tools[]`.
-/// `activated` is the set of names that crossed an explicit activation
-/// boundary, e.g. `tool_search(query="select:NAME")`, or were injected by
-/// the runtime with a concrete schema/transport binding.
+/// `extras` is an explicit execution grant from the caller, e.g. a runtime
+/// or plugin transport that is installed out-of-band. Deferred-tool selection
+/// should normally be consumed by the next surface assembly so the selected
+/// tool becomes visible instead of lingering here as long-lived state.
 pub fn admissible_tool_names(
     visible: &HashSet<String>,
-    activated: &HashSet<String>,
+    extras: &HashSet<String>,
 ) -> HashSet<String> {
-    let mut out = HashSet::with_capacity(visible.len() + activated.len());
+    let mut out = HashSet::with_capacity(visible.len() + extras.len());
     out.extend(visible.iter().cloned());
-    out.extend(activated.iter().cloned());
+    out.extend(extras.iter().cloned());
     out
 }
 
@@ -49,14 +50,12 @@ pub fn admissible_tool_names_from_visible(
 
 /// Like [`admissible_tool_names_from_visible`] but also admits names from
 /// an `extras` list. Extras are names with an explicit execution grant:
-/// runtime-injected schemas, plugin/MCP tools installed into the session, or
-/// deferred tools already activated by `tool_search(select:NAME)`.
+/// runtime-injected schemas or plugin/MCP tools installed into the session.
 pub fn admissible_tool_names_from_visible_and_extras(
     visible_schemas: &[serde_json::Value],
     extras: &[String],
 ) -> HashSet<String> {
-    let visible =
-        astra_turn_core::tool::deferred_activation::tool_names_from_schemas(visible_schemas);
+    let visible = astra_turn_core::tool::schema::tool_names_from_schemas(visible_schemas);
     let extras: HashSet<String> = extras.iter().cloned().collect();
     admissible_tool_names(&visible, &extras)
 }
@@ -70,8 +69,7 @@ pub fn admissible_tool_names_from_visible_and_extras_strict(
     visible_schemas: &[serde_json::Value],
     extras: &[String],
 ) -> HashSet<String> {
-    let mut out =
-        astra_turn_core::tool::deferred_activation::tool_names_from_schemas(visible_schemas);
+    let mut out = astra_turn_core::tool::schema::tool_names_from_schemas(visible_schemas);
     out.extend(extras.iter().cloned());
     out
 }
@@ -198,11 +196,11 @@ pub(crate) struct HeadlessToolExecutionCtx<'a, E: EdgeToolRoundRow> {
     pub messages: &'a mut Vec<Value>,
     pub tool_results: &'a mut Vec<Value>,
     pub valid_tool_names: &'a HashSet<String>,
-    /// Names listed in this turn's `<deferred_tools>` manifest. Used by the
-    /// validator to differentiate "unknown" denials (truly hallucinated) from
-    /// "not yet activated" denials (deferred but reachable via
-    /// `tool_search(query="select:NAME")`). When empty, every denial falls
-    /// back to the generic unknown-tool message.
+    /// Names listed in this turn's rendered `<deferred_tools>` manifest.
+    /// Used by the validator to differentiate "unknown" denials (truly
+    /// hallucinated) from prompt-advertised names whose activation may still
+    /// be blocked by runtime binding or fail-closed surface policy. When
+    /// empty, every denial falls back to the generic unknown-tool message.
     pub deferred_tool_names: &'a HashSet<String>,
     pub restricted_tools: &'a mut HashSet<String>,
     pub turn_guard: &'a mut TurnGuard,
@@ -1692,55 +1690,29 @@ mod tests {
         );
     }
 
-    /// Deferred tools are not executable from the catalog alone. They become
-    /// admissible only after an explicit activation boundary supplies the
-    /// name through `extras`.
+    /// Direct-call recovery contract: when the model calls a deferred tool
+    /// that the current runtime can activate, the validator records the
+    /// activation intent instead of emitting the bare "Unknown tool" message.
     #[tokio::test]
-    async fn validator_admits_deferred_catalog_tool_via_extras() {
+    async fn validator_direct_deferred_call_records_activation_hint() {
         let mut harness = PipelineHarness::new();
         push_unknown_server_tool_call(&mut harness, "github");
         begin_recorded_turn(&mut harness, 1);
 
         let visible = vec![json!({"type": "function", "function": {"name": "grep"}})];
-        harness.valid_tool_names =
-            super::admissible_tool_names_from_visible_and_extras(&visible, &["github".to_string()]);
-        assert!(
-            harness.valid_tool_names.contains("github"),
-            "precondition: activated deferred name must be admissible"
-        );
-
-        let mut pipeline = harness.pipeline();
-        let result = pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0));
-
-        match result {
-            HeadlessPipelineStage::ShortCircuit => {
-                panic!("validator rejected activated deferred github")
-            }
-            HeadlessPipelineStage::Continue(_) => {
-                // ok — admitted for execution.
-            }
-            HeadlessPipelineStage::AbortRound => {
-                panic!("validator aborted round on deferred github — unexpected")
-            }
-        }
-    }
-
-    /// Denial copy contract: when the model calls a deferred-but-not-activated
-    /// tool, the validator must emit the activation hint, not the bare
-    /// "Unknown tool" message. Deferred names live in the prompt's
-    /// `<deferred_tools>` manifest; we mirror that set into the validator
-    /// context so the denial branch can pick the right copy.
-    #[tokio::test]
-    async fn validator_denial_body_for_deferred_uses_activation_hint() {
-        let mut harness = PipelineHarness::new();
-        push_unknown_server_tool_call(&mut harness, "agent_fanout");
-        begin_recorded_turn(&mut harness, 1);
-
-        let visible = vec![json!({"type": "function", "function": {"name": "grep"}})];
         harness.valid_tool_names = super::admissible_tool_names_from_visible(&visible);
-        harness.deferred_tool_names = HashSet::from(["agent_fanout".to_string()]);
+        harness.deferred_tool_names = HashSet::from(["github".to_string()]);
+        let dir = tempfile::TempDir::new().unwrap();
+        let server_exec = crate::server::server_tool_executor::ServerToolExecutor::new(
+            dir.path().to_path_buf(),
+            "test-user".into(),
+            "test-session".into(),
+            None,
+            None,
+        );
+        server_exec.set_current_activatable_tool_names(HashSet::from(["github".to_string()]));
 
-        let mut pipeline = harness.pipeline();
+        let mut pipeline = harness.pipeline_with_server_executor(1, Some(&server_exec));
         let result = pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0));
         assert!(matches!(result, HeadlessPipelineStage::ShortCircuit));
         drop(pipeline);
@@ -1754,18 +1726,25 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap_or_default();
         assert!(
-            body.contains("tool_search") && body.contains("select:agent_fanout"),
-            "deferred denial must guide the model to activate via tool_search; got: {body}"
+            body.contains("called directly")
+                && body.contains("select:github")
+                && body.contains("not executed"),
+            "direct deferred call must become a non-executing activation hint; got: {body}"
         );
         assert!(
             !body.starts_with("Unknown tool"),
-            "deferred denial must not reuse the bare unknown-tool copy; got: {body}"
+            "direct deferred call must not reuse the bare unknown-tool copy; got: {body}"
+        );
+        assert_eq!(
+            server_exec.activated_deferred_tool_names(),
+            vec!["github".to_string()],
+            "validator path must record activation for the next model request"
         );
         let record = harness
             .tool_call_records
             .last()
-            .expect("deferred denial should record a journal placeholder");
-        assert_eq!(record.name, "agent_fanout");
+            .expect("direct deferred activation should record a journal placeholder");
+        assert_eq!(record.name, "github");
         assert!(record.ok);
         assert_eq!(record.error.as_deref(), Some("tool_not_admitted"));
         assert!(record.is_synthetic_placeholder());
@@ -1782,7 +1761,7 @@ mod tests {
                 .as_ref()
                 .and_then(|payload| payload.get("reason"))
                 .and_then(Value::as_str),
-            Some("tool_not_admitted")
+            Some("direct_deferred_call_activated")
         );
 
         // Hallucinated names still get the Unknown-tool body.
@@ -1807,7 +1786,82 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validator_denial_body_with_empty_deferred_set_points_to_tool_search_when_visible() {
+    async fn validator_prompt_deferred_without_runtime_binding_reports_runtime_not_search() {
+        let mut harness = PipelineHarness::new();
+        push_unknown_server_tool_call(&mut harness, "agent_fanout");
+        begin_recorded_turn(&mut harness, 1);
+
+        let visible = vec![json!({"type": "function", "function": {"name": "grep"}})];
+        harness.valid_tool_names = super::admissible_tool_names_from_visible(&visible);
+        harness.deferred_tool_names = HashSet::from(["agent_fanout".to_string()]);
+
+        let mut pipeline = harness.pipeline();
+        let result = pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0));
+        assert!(matches!(result, HeadlessPipelineStage::ShortCircuit));
+        drop(pipeline);
+
+        let body = harness
+            .tool_results
+            .last()
+            .and_then(|tr| tr.get("result"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            body.contains("multi-agent runtime is not connected"),
+            "prompt-deferred but unbound tool must report the missing runtime: {body}"
+        );
+        assert!(
+            body.contains("tool_search") && !body.contains("select:agent_fanout"),
+            "runtime-binding denial must not claim select can make the tool executable: {body}"
+        );
+        assert!(
+            !body.starts_with("Unknown tool"),
+            "the name was prompt-advertised, so it is unavailable, not hallucinated: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validator_prompt_deferred_but_not_activatable_avoids_select_retry_loop() {
+        let mut harness = PipelineHarness::new();
+        push_unknown_server_tool_call(&mut harness, "github");
+        begin_recorded_turn(&mut harness, 1);
+
+        let visible = vec![json!({"type": "function", "function": {"name": "grep"}})];
+        harness.valid_tool_names = super::admissible_tool_names_from_visible(&visible);
+        harness.deferred_tool_names = HashSet::from(["github".to_string()]);
+        let dir = tempfile::TempDir::new().unwrap();
+        let server_exec = crate::server::server_tool_executor::ServerToolExecutor::new(
+            dir.path().to_path_buf(),
+            "test-user".into(),
+            "test-session".into(),
+            None,
+            None,
+        );
+        server_exec.set_current_activatable_tool_names(HashSet::new());
+
+        let mut pipeline = harness.pipeline_with_server_executor(1, Some(&server_exec));
+        let result = pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0));
+        assert!(matches!(result, HeadlessPipelineStage::ShortCircuit));
+        drop(pipeline);
+
+        let body = harness
+            .tool_results
+            .last()
+            .and_then(|tr| tr.get("result"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            body.contains("not activatable") && body.contains("Do not retry"),
+            "prompt-deferred but fail-closed activation must avoid a search retry loop: {body}"
+        );
+        assert!(
+            !body.starts_with("Unknown tool"),
+            "the name was prompt-advertised, so it is unavailable, not hallucinated: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validator_denial_empty_deferred_set_stays_unknown_with_tool_search_visible() {
         let mut harness = PipelineHarness::new();
         push_unknown_server_tool_call(&mut harness, "agent_fanout");
         begin_recorded_turn(&mut harness, 1);
@@ -1828,12 +1882,12 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap_or_default();
         assert!(
-            body.contains("tool_search") && body.contains("select:agent_fanout"),
-            "empty deferred set with visible tool_search should be recoverable; got: {body}"
+            body.starts_with("Unknown tool"),
+            "empty deferred set means no deferred manifest was advertised; got: {body}"
         );
         assert!(
-            !body.starts_with("Unknown tool"),
-            "empty deferred set with visible tool_search should not dead-end as bare unknown; got: {body}"
+            !body.contains("select:agent_fanout"),
+            "validator must not invent deferred activation guidance without a manifest; got: {body}"
         );
     }
 

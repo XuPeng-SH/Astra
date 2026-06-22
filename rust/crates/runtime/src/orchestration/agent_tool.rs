@@ -80,16 +80,11 @@ fn render_spawn_agent_output(output: SpawnAgentOutput) -> String {
 }
 
 pub fn render_agent_runtime_binding_error(tool_name: &str, action: &str) -> String {
-    render_agent_tool_error_with_kind(
-        None,
-        &format!(
-            "tool `{tool_name}` action `{action}` cannot execute in the current turn: \
-             the multi-agent executor was not attached to this turn's visible tool set. \
-             Retrying this call or substituting another tool will not attach that executor. \
-             Continue with tools that are visible and executable in the current turn."
-        ),
-        Some(astra_core::ErrorKind::ToolBinding),
-    )
+    let error = astra_turn_core::tool::runtime_binding::runtime_binding_denial_message(
+        tool_name,
+        Some(action),
+    );
+    render_agent_tool_error_with_kind(None, &error, Some(astra_core::ErrorKind::ToolBinding))
 }
 
 #[derive(Default)]
@@ -274,7 +269,13 @@ pub async fn handle_agent_fanout_tool(args: &Value, ctx: Option<&AgentToolContex
         "stop_slot" => handle_agent_fanout_stop_slot_action(args, ctx).await,
         "" => render_agent_tool_error(
             None,
-            "Missing required field: action. Use one of: start, get_results, stop_slot",
+            &format!(
+                "Missing required field: action. Do not retry with empty args {{}}. \
+                 Choose one of three canonical shapes:\n\
+                 {FANOUT_START_SHAPE}\n\
+                 {FANOUT_GET_RESULTS_SHAPE}\n\
+                 {FANOUT_STOP_SLOT_SHAPE}"
+            ),
         ),
         other => render_agent_tool_error(
             None,
@@ -986,6 +987,7 @@ async fn render_agent_fanout_results(
         "group_id": group_id,
         "title": updated.title,
         "target_count": updated.target_count,
+        "delivery_contract": "Results are in results[].result. When this output is persisted, read the persisted JSON without line ranges or parse it structurally, then present the substantive findings instead of only reporting the artifact path.",
         "results": results,
     });
     let obj = response.as_object_mut().unwrap();
@@ -1031,7 +1033,7 @@ async fn render_agent_fanout_results(
         ),
         );
     }
-    response.to_string()
+    serde_json::to_string_pretty(&response).unwrap_or_else(|_| response.to_string())
 }
 
 async fn handle_agent_fanout_stop_slot_action(
@@ -1873,7 +1875,11 @@ mod tests {
             "prompt": "Test prompt"
         });
         let result = handle_agent_spawn_action(&args, None).await;
-        assert!(result.contains("will not attach that executor"), "{result}");
+        assert!(
+            result.contains("multi-agent runtime is not connected"),
+            "{result}"
+        );
+        assert!(result.contains("tool_search"), "{result}");
         assert!(result.contains("\"status\":\"failed\""), "{result}");
     }
 
@@ -2489,7 +2495,8 @@ mod tests {
             Some(&ctx),
         )
         .await;
-        assert!(start.contains("\"status\":\"completed\""), "{start}");
+        let start_value: Value = serde_json::from_str(&start).unwrap();
+        assert_eq!(start_value["status"], "completed");
 
         let result = handle_agent_fanout_tool(
             &json!({
@@ -2506,6 +2513,16 @@ mod tests {
         assert_eq!(value["results"].as_array().unwrap().len(), 1);
         assert_eq!(value["results"][0]["result"]["status"], "completed");
         assert_eq!(value["completed"], 1);
+        assert!(
+            value["delivery_contract"]
+                .as_str()
+                .is_some_and(|text| text.contains("results[].result")),
+            "{result}"
+        );
+        assert!(
+            result.contains('\n'),
+            "fanout aggregate results must be readable when persisted: {result}"
+        );
     }
 
     #[tokio::test]
@@ -2701,7 +2718,8 @@ mod tests {
             Some(&ctx),
         )
         .await;
-        assert!(start.contains("\"status\":\"completed\""), "{start}");
+        let start_value: Value = serde_json::from_str(&start).unwrap();
+        assert_eq!(start_value["status"], "completed");
 
         let result = handle_agent_fanout_tool(
             &json!({
@@ -2912,6 +2930,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_fanout_empty_args_returns_executable_canonical_shapes() {
+        let result = handle_agent_fanout_tool(&json!({}), None).await;
+        assert!(
+            result.contains("Missing required field: action"),
+            "{result}"
+        );
+        assert!(result.contains("Do not retry with empty args"), "{result}");
+        // Error recovery must surface all three executable shapes, not just
+        // "missing action" — otherwise the model is left to guess the form.
+        assert!(result.contains("action='start'"), "{result}");
+        assert!(result.contains("action='get_results'"), "{result}");
+        assert!(result.contains("action='stop_slot'"), "{result}");
+        assert!(result.contains("target_count=N"), "{result}");
+        assert!(result.contains("slots=["), "{result}");
+        assert!(result.contains("group_id="), "{result}");
+        assert!(result.contains("slot_index="), "{result}");
+        assert!(result.contains("\"status\":\"failed\""), "{result}");
+    }
+
+    #[tokio::test]
     async fn handle_spawn_agent_tool_marks_executor_dropped_non_retryable() {
         let spawner = test_spawner(Arc::new(ExecutorDroppedExecutor));
         let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
@@ -3083,7 +3121,11 @@ mod tests {
     #[tokio::test]
     async fn get_agent_result_no_context() {
         let result = handle_agent_get_result_action(&json!({"agent_id": "child-1"}), None).await;
-        assert!(result.contains("will not attach that executor"), "{result}");
+        assert!(
+            result.contains("multi-agent runtime is not connected"),
+            "{result}"
+        );
+        assert!(result.contains("tool_search"), "{result}");
         assert!(result.contains(astra_core::ErrorKind::ToolBinding.as_str()));
         assert!(result.contains("\"status\":\"failed\""), "{result}");
     }
@@ -3156,7 +3198,7 @@ mod tests {
         assert_eq!(value["status"], "failed");
         let error = value["error"].as_str().unwrap_or("");
         assert!(
-            error.contains("multi-agent executor was not attached"),
+            error.contains("multi-agent runtime is not connected"),
             "{result}"
         );
         assert_eq!(
@@ -3179,7 +3221,7 @@ mod tests {
         let value: Value = serde_json::from_str(&result).unwrap();
         let error = value["error"].as_str().unwrap_or("");
         assert!(
-            error.contains("multi-agent executor was not attached"),
+            error.contains("multi-agent runtime is not connected"),
             "{result}"
         );
         assert_eq!(

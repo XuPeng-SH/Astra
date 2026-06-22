@@ -13,7 +13,7 @@
 //! `server_tool_executor` field. When present, the headless round
 //! calls it directly instead of waiting for edge POST callbacks.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -32,6 +32,7 @@ use astra_tools::task_mgmt::{
 };
 use astra_tools::tool_engine::ToolEngine;
 use astra_tools::{AskUserGate, ToolExecutor};
+use astra_turn_core::capability::Capability;
 use astra_turn_core::sync_utils::{rwlock_read_clone_or_default, rwlock_write_reset_on_poison};
 use async_trait::async_trait;
 
@@ -66,13 +67,15 @@ use crate::server::tool_transport::{
     TOOL_ERROR_KIND_TOOL_TIMEOUT, TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED,
     TOOL_ERROR_KIND_WORKSPACE_PATH_MISMATCH, ToolExecutionRequest, ToolExecutionService,
     WorkspaceAuthority, WorkspaceBinding, WorkspaceBindingKind, binding_event_fields,
-    capability_filtered_server_tool_schemas, tool_schema_name,
+    capability_filtered_server_tool_schemas,
 };
 use crate::server::tool_work_surface_events::{
     WorkSurfaceEventEmitter, binding_snapshot_events, task_board_snapshot_event,
 };
 use crate::tool_sandbox::SandboxPolicy;
 use astra_turn_core::file_edit_journal::FileEditJournal;
+use astra_turn_core::tool::deferred_activation::ToolSurfaceNames;
+use astra_turn_core::tool::schema::tool_schema_name;
 
 use astra_tools::plan_task_mirror;
 
@@ -232,16 +235,15 @@ pub struct ServerToolExecutor {
     /// loop host once MCP servers have been refreshed.
     plugin_schemas: Arc<std::sync::RwLock<Vec<Value>>>,
     /// Deferred tool names whose full schema has been fetched via
-    /// `tool_search(query="select:NAME")` in this session.
+    /// `tool_search(query="select:NAME")` or direct-call recovery. This is
+    /// pending schema-visibility state, not an execution allowlist.
     activated_deferred_tools: Arc<std::sync::RwLock<HashSet<String>>>,
-    /// Tool names searchable/admissible in the current server-host turn.
-    /// `None` keeps direct unit-test executor calls permissive.
-    current_searchable_tool_names: Arc<std::sync::RwLock<Option<HashSet<String>>>>,
-    /// Tool names listed in the current turn's `<deferred_tools>` manifest.
-    /// Mirrors the CLI executor's `current_activatable_tool_names`. Populated
-    /// from `ToolSurface::deferred()` per turn so the validator can emit the
-    /// activation hint and `tool_search` can resolve `select:NAME` for these.
-    current_activatable_tool_names: Arc<std::sync::RwLock<Option<HashSet<String>>>>,
+    /// Atomic snapshot of the current visible/deferred execution surface.
+    ///
+    /// Visible and activatable names must be observed together by tool_search,
+    /// direct-call recovery, and activation draining. A single lock avoids
+    /// mixed snapshots from two setter calls.
+    current_tool_surface: Arc<std::sync::RwLock<ToolSurfaceNames>>,
     /// Shared dynamic-agent tool context for `agent(action='spawn'|'get_result')`.
     agent_tool_context: Option<AgentToolContext>,
     /// When enabled, server-local execution rejects names outside the current
@@ -330,8 +332,7 @@ impl ServerToolExecutor {
             plan_resume_hint_handle: None,
             plugin_schemas: Arc::new(std::sync::RwLock::new(Vec::new())),
             activated_deferred_tools: Arc::new(std::sync::RwLock::new(HashSet::new())),
-            current_searchable_tool_names: Arc::new(std::sync::RwLock::new(None)),
-            current_activatable_tool_names: Arc::new(std::sync::RwLock::new(None)),
+            current_tool_surface: Arc::new(std::sync::RwLock::new(ToolSurfaceNames::default())),
             mcp_manager: None,
             agent_binding_mcp: None,
             agent_tool_context: None,
@@ -517,95 +518,172 @@ impl ServerToolExecutor {
         *guard = schemas;
     }
 
-    pub fn set_current_searchable_tool_schemas(&self, schemas: &[Value]) {
-        let names = astra_turn_core::tool::deferred_activation::tool_names_from_schemas(schemas);
-        let mut guard = rwlock_write_reset_on_poison(
-            &self.current_searchable_tool_names,
-            "current_searchable_tool_names",
-        );
-        *guard = Some(names);
+    /// Install the names from this turn's final wire `tools[]`.
+    pub fn set_current_visible_tool_schemas(&self, schemas: &[Value]) {
+        let names = astra_turn_core::tool::schema::tool_names_from_schemas(schemas);
+        let mut guard =
+            rwlock_write_reset_on_poison(&self.current_tool_surface, "current_tool_surface");
+        let activatable = guard.activatable().cloned().unwrap_or_default();
+        *guard = ToolSurfaceNames::installed(names, activatable);
     }
 
     pub fn set_current_activatable_tool_names(&self, names: HashSet<String>) {
-        let mut guard = rwlock_write_reset_on_poison(
-            &self.current_activatable_tool_names,
-            "current_activatable_tool_names",
-        );
-        *guard = Some(names);
+        let requested = names.len();
+        let names = self.runtime_bound_tool_names(names);
+        let dropped = requested.saturating_sub(names.len());
+        if dropped > 0 {
+            tracing::warn!(
+                dropped,
+                kept = names.len(),
+                "set_current_activatable_tool_names: filtered out tools without runtime binding"
+            );
+        }
+        let mut guard =
+            rwlock_write_reset_on_poison(&self.current_tool_surface, "current_tool_surface");
+        let visible = guard.visible().cloned().unwrap_or_default();
+        *guard = ToolSurfaceNames::installed(visible, names);
+    }
+
+    /// Install the exact current surface in one write.
+    ///
+    /// Use this when both visible and activatable names are derived from the
+    /// same wire payload. It prevents readers from observing a half-updated
+    /// surface between two setter calls.
+    pub fn set_current_tool_surface(
+        &self,
+        visible_schemas: &[Value],
+        activatable_names: HashSet<String>,
+    ) -> HashSet<String> {
+        let requested = activatable_names.len();
+        let activatable = self.runtime_bound_tool_names(activatable_names);
+        let dropped = requested.saturating_sub(activatable.len());
+        if dropped > 0 {
+            tracing::warn!(
+                dropped,
+                kept = activatable.len(),
+                "set_current_tool_surface: filtered out tools without runtime binding"
+            );
+        }
+        let visible = astra_turn_core::tool::schema::tool_names_from_schemas(visible_schemas);
+        let retained_activatable = activatable.clone();
+        let mut guard =
+            rwlock_write_reset_on_poison(&self.current_tool_surface, "current_tool_surface");
+        *guard = ToolSurfaceNames::installed(visible, activatable);
+        retained_activatable
     }
 
     pub fn current_activatable_tool_names_snapshot(&self) -> HashSet<String> {
-        rwlock_read_clone_or_default(
-            &self.current_activatable_tool_names,
-            "current_activatable_tool_names_snapshot",
-        )
-        .unwrap_or_default()
+        self.current_tool_surface_snapshot("current_tool_surface_snapshot")
+            .activatable()
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub(crate) fn current_searchable_tool_names(&self) -> Option<HashSet<String>> {
-        rwlock_read_clone_or_default(
-            &self.current_searchable_tool_names,
-            "current_searchable_tool_names",
+        let surface = self.current_tool_surface_snapshot("current_tool_surface_search_pool");
+        astra_turn_core::tool::deferred_activation::searchable_runtime_bound_tool_names(
+            &surface,
+            |name| self.tool_has_runtime_binding(name),
         )
     }
 
-    pub fn activated_deferred_tool_names(&self) -> Vec<String> {
-        let allowed = self.current_activatable_tool_names_snapshot();
+    pub(crate) fn runtime_bound_tool_names(&self, names: HashSet<String>) -> HashSet<String> {
+        astra_turn_core::tool::deferred_activation::runtime_bound_tool_names(names, |name| {
+            self.tool_has_runtime_binding(name)
+        })
+    }
 
-        // Use zero-clone filter path to avoid cloning the entire HashSet
-        let mut result = Vec::new();
-        match self.activated_deferred_tools.read() {
-            Ok(guard) => {
-                for name in guard.iter() {
-                    if allowed.is_empty() || allowed.contains(name) {
-                        result.push(name.clone());
-                    }
-                }
-            }
-            Err(poisoned) => {
-                tracing::error!(
-                    cache = "activated_deferred_tools",
-                    "RwLock poisoned on read; resetting cached state to default"
-                );
-                drop(poisoned);
-                // Clear poison BEFORE acquiring write lock — if write() panics
-                // (e.g. during reset), the flag would otherwise remain stuck.
-                self.activated_deferred_tools.clear_poison();
-                let mut guard = match self.activated_deferred_tools.write() {
-                    Ok(g) => g,
-                    Err(p) => p.into_inner(),
-                };
-                *guard = HashSet::new();
-            }
+    pub(crate) fn runtime_bound_tool_schemas(&self, schemas: Vec<Value>) -> Vec<Value> {
+        schemas
+            .into_iter()
+            .filter(|schema| {
+                tool_schema_name(schema).is_some_and(|name| self.tool_has_runtime_binding(name))
+            })
+            .collect()
+    }
+
+    pub fn activated_deferred_tool_names(&self) -> Vec<String> {
+        let surface =
+            self.current_tool_surface_snapshot("current_tool_surface_activation_retention");
+        if matches!(surface, ToolSurfaceNames::Uninstalled) {
+            return Vec::new();
         }
-        result
+
+        // Atomically compute the retained set and prune stale entries under a
+        // single write lock. A read→drop→write sequence opens a TOCTOU window
+        // in which a concurrent `record_*_activation` extends the set after
+        // `retained` is computed but before the pruned snapshot is written back
+        // — silently dropping the freshly recorded activation. Holding the
+        // write lock across compute+store makes the prune atomic.
+        let mut guard = rwlock_write_reset_on_poison(
+            &self.activated_deferred_tools,
+            "activated_deferred_tools_prune",
+        );
+        let retained =
+            astra_turn_core::tool::deferred_activation::retained_runtime_bound_activated_tool_names(
+                &guard,
+                &surface,
+                |name| self.tool_has_runtime_binding(name),
+            );
+        // Prune stale entries that are no longer in the visible or
+        // activatable window. This bounds the set's growth across turns
+        // — without this, the set accumulates every deferred tool ever
+        // activated for the entire session. Done under the same write lock
+        // so concurrent activations cannot be lost between compute and store.
+        //
+        // Use set-based comparison, not length comparison: same-count with
+        // different names (e.g., {a,b} → {c,d}) must also trigger pruning.
+        let retained_set: HashSet<&str> = retained.iter().map(String::as_str).collect();
+        guard.retain(|name| retained_set.contains(name.as_str()));
+        tracing::debug!(
+            before = guard.len(),
+            after = guard.len(),
+            "pruning stale activated_deferred_tools entries"
+        );
+        retained
+    }
+
+    /// Return activated deferred tools for the next schema-selection round.
+    ///
+    /// Activation is consumed only when the tool is actually called from a
+    /// visible schema surface. Merely including the schema in `tools[]` must
+    /// not drop other selected tools from a long `select:a,b,c` chain.
+    pub fn activated_deferred_tool_names_for_schema_injection(&self) -> Vec<String> {
+        let surface = self.current_tool_surface_snapshot("current_tool_surface_activation_take");
+        if matches!(surface, ToolSurfaceNames::Uninstalled) {
+            return Vec::new();
+        }
+
+        let mut guard = rwlock_write_reset_on_poison(
+            &self.activated_deferred_tools,
+            "activated_deferred_tools_take",
+        );
+        let before = guard.len();
+        let retained =
+            astra_turn_core::tool::deferred_activation::activated_tool_names_for_schema_injection(
+                &mut guard,
+                &surface,
+                |name| self.tool_has_runtime_binding(name),
+            );
+        let after = guard.len();
+        if before > 0 {
+            tracing::debug!(
+                before,
+                after,
+                returned = retained.len(),
+                "resolved server activated_deferred_tools for schema injection"
+            );
+        }
+        retained
     }
 
     fn record_tool_search_activation_output(&self, output: &str) {
-        let names =
-            astra_turn_core::tool::deferred_activation::activated_tool_names_from_tool_search_output(
-                output,
-            );
-        if names.is_empty() {
-            return;
-        }
-        // Gate activation recording against the activatable set (deferred
-        // manifest), not the searchable set (visible). The model was told it
-        // could activate these names via `<deferred_tools>`; mirroring the
-        // CLI's `tool_admission_denial` contract. `None` (not yet configured)
-        // means no restriction — symmetric with the CLI executor.
-        let allowed: Option<HashSet<String>> = rwlock_read_clone_or_default(
-            &self.current_activatable_tool_names,
-            "current_activatable_tool_names_activation",
+        let surface = self.current_tool_surface_snapshot("current_tool_surface_activation");
+        let names = astra_turn_core::tool::deferred_activation::recordable_activated_tool_names(
+            output,
+            &surface,
+            |name| self.tool_has_runtime_binding(name),
         );
-        let names: Vec<String> = names
-            .into_iter()
-            .filter(|name| {
-                allowed
-                    .as_ref()
-                    .is_none_or(|allowed| allowed.contains(name))
-            })
-            .collect();
         if names.is_empty() {
             return;
         }
@@ -613,7 +691,54 @@ impl ServerToolExecutor {
             &self.activated_deferred_tools,
             "activated_deferred_tools",
         );
-        guard.extend(names);
+        astra_turn_core::tool::deferred_activation::refresh_activated_tool_names(&mut guard, names);
+    }
+
+    fn current_tool_surface_snapshot(&self, label: &str) -> ToolSurfaceNames {
+        rwlock_read_clone_or_default(&self.current_tool_surface, label)
+    }
+
+    /// Record a direct deferred call as an activation intent. Called when the
+    /// model invokes a deferred tool directly (without `tool_search(select:)`)
+    /// — the args are untrusted because the schema was not visible, so we do
+    /// NOT execute; we just record the name so next turn's `tools[]` includes
+    /// the full schema.
+    pub(crate) fn record_direct_deferred_call_activation(&self, name: &str) {
+        if name.is_empty() {
+            return;
+        }
+        let mut guard = rwlock_write_reset_on_poison(
+            &self.activated_deferred_tools,
+            "activated_deferred_tools",
+        );
+        astra_turn_core::tool::deferred_activation::refresh_activated_tool_names(
+            &mut guard,
+            [name.to_string()],
+        );
+    }
+
+    fn consume_activated_deferred_tool_if_called(&self, name: &str) {
+        let surface = self.current_tool_surface_snapshot("current_tool_surface_consume_call");
+        if !surface.visible_contains(name) {
+            return;
+        }
+        let mut guard = rwlock_write_reset_on_poison(
+            &self.activated_deferred_tools,
+            "activated_deferred_tools_consume_call",
+        );
+        if astra_turn_core::tool::deferred_activation::consume_activated_tool_name(&mut guard, name)
+        {
+            tracing::debug!(
+                tool = name,
+                "consumed server deferred activation after visible tool call"
+            );
+        }
+    }
+
+    /// Public wrapper for runtime-binding check, used by admission sites to
+    /// classify direct deferred calls.
+    pub(crate) fn has_runtime_binding(&self, name: &str) -> bool {
+        self.tool_has_runtime_binding(name)
     }
 
     pub(crate) fn plugin_schemas_snapshot(&self, label: &str) -> Vec<Value> {
@@ -633,9 +758,7 @@ impl ServerToolExecutor {
             };
         }
         let Some(mgr) = &self.mcp_manager else {
-            return astra_tools::ToolResult::error(format!(
-                "Error: Tool '{name}' is not available — no MCP manager configured."
-            ));
+            return self.runtime_binding_error_result(name, args);
         };
         match mgr
             .read()
@@ -654,25 +777,112 @@ impl ServerToolExecutor {
         if !self.server_builtin_tools_enabled {
             return false;
         }
-        resolved_server_tool_names(
+        let supported_names = resolved_server_tool_names(
             &self.capabilities,
             self.execution_binding.workspace(),
             self.execution_binding.executor(),
             self.execution_binding.runtime(),
-        )
-        .contains(tool)
+        );
+        supported_names.contains(tool) && self.tool_has_runtime_binding(tool)
     }
 
     fn capability_filtered_server_tool_schemas(&self) -> Vec<Value> {
         if !self.server_builtin_tools_enabled {
             return Vec::new();
         }
-        capability_filtered_server_tool_schemas(
+        let mut schemas = capability_filtered_server_tool_schemas(
             &self.capabilities,
             self.execution_binding.workspace(),
             self.execution_binding.executor(),
             self.execution_binding.runtime(),
+        );
+        schemas.retain(|schema| {
+            tool_schema_name(schema).is_some_and(|name| self.tool_has_runtime_binding(name))
+        });
+        schemas
+    }
+
+    fn tool_has_runtime_binding(&self, name: &str) -> bool {
+        if name.starts_with("mcp__") {
+            return self.mcp_tool_has_runtime_binding(name);
+        }
+        let Some(meta) = astra_turn_core::tool::registry::meta::tool_meta(name) else {
+            return self.tool_engine.contains(name) || self.plugin_schema_has_name(name);
+        };
+        meta.requires
+            .iter()
+            .all(|capability| self.capability_has_runtime_binding(*capability))
+    }
+
+    fn plugin_schema_has_name(&self, name: &str) -> bool {
+        self.plugin_schemas_snapshot("plugin_schemas_runtime_binding")
+            .iter()
+            .any(|schema| tool_schema_name(schema).is_some_and(|schema_name| schema_name == name))
+    }
+
+    fn mcp_tool_has_runtime_binding(&self, name: &str) -> bool {
+        let Some(manager) = &self.mcp_manager else {
+            return false;
+        };
+        manager
+            .try_read()
+            .is_ok_and(|manager| manager.find_tool_by_mcp_name(name).is_some())
+    }
+
+    fn capability_has_runtime_binding(&self, capability: Capability) -> bool {
+        if !capability.is_executor_gated() {
+            return true;
+        }
+        match capability {
+            Capability::AgentSpawner => self.agent_tool_context.is_some(),
+            // Future executor-gated capabilities must opt into denial only
+            // when this executor genuinely lacks the binding. Otherwise a new
+            // capability would silently hide unrelated tools on older nodes.
+            _ => true,
+        }
+    }
+
+    fn tool_can_validate_without_runtime_binding(&self, name: &str, args: &Value) -> bool {
+        let action = args.get("action").and_then(Value::as_str);
+        astra_turn_core::tool::registry::meta::tool_allows_validation_without_runtime_binding(
+            name, action,
         )
+    }
+
+    fn runtime_binding_error_result(&self, name: &str, args: &Value) -> astra_tools::ToolResult {
+        let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+        if astra_turn_core::tool::registry::meta::tool_meta(name)
+            .is_some_and(|meta| meta.requires.contains(&Capability::AgentSpawner))
+        {
+            return tool_result_from_output(
+                crate::orchestration::render_agent_runtime_binding_error(name, action),
+            );
+        }
+
+        let error =
+            astra_turn_core::tool::runtime_binding::runtime_binding_denial_message(name, None);
+        tool_result_from_output(
+            json!({
+                "status": "failed",
+                "error": error,
+                "error_kind": astra_core::ErrorKind::ToolBinding.as_str(),
+                "retryable": false,
+            })
+            .to_string(),
+        )
+    }
+
+    fn tool_binding_preflight_result(
+        &self,
+        name: &str,
+        args: &Value,
+    ) -> Option<astra_tools::ToolResult> {
+        if self.tool_has_runtime_binding(name)
+            || self.tool_can_validate_without_runtime_binding(name, args)
+        {
+            return None;
+        }
+        Some(self.runtime_binding_error_result(name, args))
     }
 
     /// Inject the plan repository so plan-mode tools and the write-tool guard
@@ -913,6 +1123,8 @@ impl ServerToolExecutor {
             }
         }
 
+        self.consume_activated_deferred_tool_if_called(name);
+
         execute_tool_route_with_events(
             ToolRouteRuntimeContext {
                 execution_service: &self.tool_execution_service,
@@ -984,6 +1196,10 @@ impl ServerToolExecutor {
     }
 
     async fn run_local_tool_preflight(&self, name: &str, args: &Value) -> LocalToolPreflight {
+        if let Some(result) = self.tool_binding_preflight_result(name, args) {
+            return LocalToolPreflight::ShortCircuit(result);
+        }
+
         let plan_mode_authoring_active = if is_plan_mode_blocked_tool(name, args) {
             plan_mode_authoring_active(
                 self.plan_repo.as_ref(),
@@ -1210,6 +1426,24 @@ mod tests {
             !exec.supports_server_tool_name("bash"),
             "project tools must not remain supported after binding changes to no-runtime"
         );
+    }
+
+    #[test]
+    fn server_surface_hides_agent_tools_without_agent_runtime_binding() {
+        let (exec, _dir) = test_executor();
+
+        let names = schema_name_set(exec.tool_schemas());
+
+        for unbound in ["agent", "agent_fanout"] {
+            assert!(
+                !names.contains(unbound),
+                "{unbound} must not be advertised without an AgentToolContext runtime binding: {names:?}"
+            );
+            assert!(
+                !exec.supports_server_tool_name(unbound),
+                "{unbound} must not be admitted without an AgentToolContext runtime binding"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1707,10 +1941,17 @@ mod tests {
 
         for handler_name in exec.tool_engine.handler_names() {
             if !(handler_name == "run_script" && cfg!(not(unix))) {
-                assert!(
-                    schema_names.contains(handler_name),
-                    "ToolEngine handler `{handler_name}` must have a model-visible schema"
-                );
+                if exec.tool_has_runtime_binding(handler_name) {
+                    assert!(
+                        schema_names.contains(handler_name),
+                        "ToolEngine handler `{handler_name}` must have a model-visible schema"
+                    );
+                } else {
+                    assert!(
+                        !schema_names.contains(handler_name),
+                        "ToolEngine handler `{handler_name}` must stay hidden until its runtime binding exists"
+                    );
+                }
             }
             assert!(
                 registry.get(handler_name).is_some(),
@@ -1770,6 +2011,7 @@ mod tests {
             .iter()
             .filter(|n| {
                 !schema_names.contains(*n) && !n.starts_with("mcp__") // dynamic prefix handler
+                    && exec.tool_has_runtime_binding(n)
             })
             .cloned()
             .collect();
@@ -1868,10 +2110,16 @@ mod tests {
 
         let names = schema_name_set(exec.tool_schemas());
 
-        for visible in ["agent", "tool_search", "web_search", "memory"] {
+        for visible in ["tool_search", "web_search", "memory"] {
             assert!(
                 names.contains(visible),
                 "{visible} should remain visible because it runs on the server"
+            );
+        }
+        for hidden_until_bound in ["agent", "agent_fanout"] {
+            assert!(
+                !names.contains(hidden_until_bound),
+                "{hidden_until_bound} must stay hidden until an AgentToolContext runtime binding exists"
             );
         }
         for hidden in [
@@ -2089,6 +2337,33 @@ esac
             None,
         );
         (exec, dir)
+    }
+
+    #[test]
+    fn runtime_bound_tool_schemas_keep_only_bound_catalog_or_registered_plugin_tools() {
+        let (exec, _dir) = test_executor();
+        let plugin_schema = json!({"type": "function", "function": {"name": "plugin_registered"}});
+        let candidate_schemas = || {
+            vec![
+                json!({"type": "function", "function": {"name": "tool_search"}}),
+                json!({"type": "function", "function": {"name": "agent_fanout"}}),
+                json!({"type": "function", "function": {"name": "not_registered"}}),
+                plugin_schema.clone(),
+                json!({"function": {"name": "missing_type"}}),
+                json!({"type": "custom", "function": {"name": "custom_shape"}}),
+                json!({"bad": "schema"}),
+            ]
+        };
+
+        let names = schema_name_set(exec.runtime_bound_tool_schemas(candidate_schemas()));
+        assert_eq!(names, HashSet::from(["tool_search".to_string()]));
+
+        exec.set_plugin_schemas(vec![plugin_schema.clone()]);
+        let names = schema_name_set(exec.runtime_bound_tool_schemas(candidate_schemas()));
+        assert_eq!(
+            names,
+            HashSet::from(["tool_search".to_string(), "plugin_registered".to_string()])
+        );
     }
 
     #[tokio::test]
@@ -2857,7 +3132,7 @@ esac
     }
 
     #[tokio::test]
-    async fn mcp_tools_bypass_edge_dispatch() {
+    async fn mcp_tools_fail_closed_without_runtime_binding_before_edge_dispatch() {
         let (mut exec, _dir) = test_executor();
         exec = exec.with_tool_execution_service(
             ToolExecutionService::builder()
@@ -2876,9 +3151,79 @@ esac
 
         assert!(result.is_error, "{result:?}");
         assert!(
-            result.output.contains("no MCP manager configured"),
+            result.output.contains("no connected MCP server"),
             "{}",
             result.output
+        );
+        assert_eq!(
+            result
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("error_kind"))
+                .and_then(Value::as_str),
+            Some(astra_core::ErrorKind::ToolBinding.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_mcp_call_without_runtime_binding_names_recovery_path() {
+        let (exec, _dir) = test_executor();
+        exec.set_current_visible_tool_schemas(&[json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__weather",
+                "description": "Get weather for a city.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"]
+                }
+            }
+        })]);
+
+        let result = exec
+            .execute_with_metadata("mcp__weather", &json!({"city": "Shanghai"}))
+            .await;
+
+        assert!(result.is_error, "{result:?}");
+        assert!(
+            result.output.contains("no connected MCP server")
+                && result.output.contains("connect or enable the MCP server"),
+            "direct MCP call should explain the real recovery path, got: {}",
+            result.output
+        );
+        assert_eq!(
+            result
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("error_kind"))
+                .and_then(Value::as_str),
+            Some(astra_core::ErrorKind::ToolBinding.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_fallback_without_manager_uses_runtime_binding_message() {
+        let (exec, _dir) = test_executor();
+
+        let result = exec
+            .execute_mcp_tool("mcp__weather", &json!({"city": "Shanghai"}))
+            .await;
+
+        assert!(result.is_error, "{result:?}");
+        assert!(
+            result.output.contains("no connected MCP server")
+                && result.output.contains("connect or enable the MCP server"),
+            "MCP fallback should share the direct-call recovery path, got: {}",
+            result.output
+        );
+        assert_eq!(
+            result
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("error_kind"))
+                .and_then(Value::as_str),
+            Some(astra_core::ErrorKind::ToolBinding.as_str())
         );
     }
 
@@ -2902,7 +3247,8 @@ esac
             .await;
         assert!(mcp.is_error, "{mcp:?}");
         assert!(
-            mcp.output.contains("no MCP manager configured"),
+            mcp.output.contains("no connected MCP server")
+                && mcp.output.contains("connect or enable the MCP server"),
             "{}",
             mcp.output
         );
@@ -2939,11 +3285,15 @@ esac
 
         assert!(result.is_error, "{result:?}");
         assert!(
-            result.output.contains("no MCP manager configured"),
+            result.output.contains("no connected MCP server"),
             "{}",
             result.output
         );
         let metadata = result.metadata.as_ref().expect("mcp metadata");
+        assert_eq!(
+            metadata["error_kind"],
+            astra_core::ErrorKind::ToolBinding.as_str()
+        );
         assert_eq!(metadata["workspace"]["kind"], "edge_workspace");
         assert_eq!(metadata["executor"]["kind"], "mcp");
         assert_eq!(metadata["executor"]["display_name"], "MCP server");
@@ -3701,7 +4051,7 @@ esac
         assert_eq!(value["status"], "failed");
         let error = value["error"].as_str().unwrap_or("");
         assert!(
-            error.contains("multi-agent executor was not attached"),
+            error.contains("multi-agent runtime is not connected"),
             "{}",
             result.output
         );
@@ -3776,8 +4126,18 @@ esac
         let fanout = exec.execute_with_metadata("agent_fanout", &json!({})).await;
         assert!(fanout.is_error, "{fanout:?}");
         assert!(
-            fanout.output.contains("Missing required field: action"),
+            fanout
+                .output
+                .contains("multi-agent runtime is not connected"),
             "{fanout:?}"
+        );
+        assert_eq!(
+            fanout
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("error_kind"))
+                .and_then(Value::as_str),
+            Some(astra_core::ErrorKind::ToolBinding.as_str())
         );
         assert!(
             fanout
@@ -3885,11 +4245,69 @@ esac
         }
     }
 
+    fn parse_tool_search_output(output: &str) -> Value {
+        serde_json::from_str(output)
+            .unwrap_or_else(|error| panic!("tool_search must return JSON, got {error}: {output}"))
+    }
+
+    fn tool_search_match_names(parsed: &Value) -> Vec<String> {
+        parsed["matches"]
+            .as_array()
+            .unwrap_or_else(|| panic!("matches must be an array in {parsed}"))
+            .iter()
+            .map(|entry| {
+                entry["name"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("match entry must have a string name in {entry}"))
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn tool_search_string_array(parsed: &Value, field: &str) -> Vec<String> {
+        parsed[field]
+            .as_array()
+            .unwrap_or_else(|| panic!("{field} must be an array in {parsed}"))
+            .iter()
+            .map(|entry| {
+                entry
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{field} entries must be strings in {parsed}"))
+                    .to_string()
+            })
+            .collect()
+    }
+
     // ── Path traversal security ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn server_tool_search_falls_back_to_global_catalog_without_installed_surface() {
+        let (exec, _dir) = test_executor();
+
+        let result = exec
+            .execute_with_metadata("tool_search", &json!({"query": "select:github"}))
+            .await;
+
+        let parsed = parse_tool_search_output(&result.output);
+        assert_eq!(parsed["mode"].as_str(), Some("select"));
+        // When surface is not installed, tool_search falls back to the
+        // full global catalog so callers that depend on tool_search without
+        // a surface aren't silently broken.
+        assert!(parsed["status"].as_str() != Some("empty_surface"));
+        assert!(parsed["total_tools"].as_u64().is_some_and(|n| n > 0));
+        assert!(
+            !tool_search_match_names(&parsed).is_empty(),
+            "must find github in global fallback catalog"
+        );
+    }
 
     #[tokio::test]
     async fn server_tool_search_finds_catalog_tool() {
         let (exec, _dir) = test_executor();
+        exec.set_current_visible_tool_schemas(&[
+            json!({"type": "function", "function": {"name": "github"}}),
+            json!({"type": "function", "function": {"name": "tool_search"}}),
+        ]);
         assert!(
             exec.tool_engine.contains("tool_search"),
             "tool_search should be registered in ToolEngine as a context-aware handler"
@@ -3901,18 +4319,17 @@ esac
             !result.is_error,
             "tool_search must succeed for select:github"
         );
-        let parsed: Value = serde_json::from_str(&result.output).unwrap();
-        assert!(
-            parsed["missing"].as_array().unwrap().is_empty(),
-            "select:github must resolve on server path; got: {}",
-            result.output
-        );
+        let parsed = parse_tool_search_output(&result.output);
+        assert_eq!(parsed["mode"].as_str(), Some("select"));
+        assert!(tool_search_string_array(&parsed, "missing").is_empty());
+        assert_eq!(tool_search_match_names(&parsed), vec!["github".to_string()]);
+        assert!(parsed["matches"][0].get("parameters").is_some());
     }
 
     #[tokio::test]
     async fn server_tool_search_does_not_resolve_hidden_ask_user() {
         let (exec, _dir) = test_executor();
-        exec.set_current_searchable_tool_schemas(&[
+        exec.set_current_visible_tool_schemas(&[
             json!({"type": "function", "function": {"name": "bash"}}),
             json!({"type": "function", "function": {"name": "tool_search"}}),
         ]);
@@ -3920,21 +4337,13 @@ esac
         let result = exec
             .execute_with_metadata("tool_search", &json!({"query": "select:ask_user"}))
             .await;
-        let parsed: Value = serde_json::from_str(&result.output).unwrap();
-        assert!(
-            parsed["matches"].as_array().unwrap().is_empty(),
-            "hidden ask_user must not resolve on server path; got: {}",
-            result.output
+        let parsed = parse_tool_search_output(&result.output);
+        assert_eq!(tool_search_match_names(&parsed), Vec::<String>::new());
+        assert_eq!(
+            tool_search_string_array(&parsed, "missing"),
+            vec!["ask_user".to_string()]
         );
-        assert!(
-            parsed["missing"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|value| value.as_str() == Some("ask_user")),
-            "hidden ask_user must be reported missing from current search pool; got: {}",
-            result.output
-        );
+        assert_eq!(parsed["total_tools"].as_u64(), Some(2));
     }
 
     /// Deferred tools must still be discoverable via `tool_search(select:NAME)`
@@ -3945,41 +4354,277 @@ esac
     #[tokio::test]
     async fn server_tool_search_resolves_deferred_via_activatable_set() {
         let (exec, _dir) = test_executor();
-        exec.set_current_searchable_tool_schemas(&[
+        exec.set_current_visible_tool_schemas(&[
             json!({"type": "function", "function": {"name": "bash"}}),
             json!({"type": "function", "function": {"name": "tool_search"}}),
         ]);
-        // The deferred manifest advertises agent_fanout for this turn.
-        exec.set_current_activatable_tool_names(HashSet::from(["agent_fanout".to_string()]));
+        // The deferred manifest advertises github for this turn.
+        exec.set_current_activatable_tool_names(HashSet::from(["github".to_string()]));
 
         let result = exec
-            .execute_with_metadata("tool_search", &json!({"query": "select:agent_fanout"}))
+            .execute_with_metadata("tool_search", &json!({"query": "select:github"}))
             .await;
-        let parsed: Value = serde_json::from_str(&result.output).unwrap();
-        let matched_names: Vec<String> = parsed["matches"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|m| m["name"].as_str().map(String::from))
-            .collect();
-        assert!(
-            matched_names.iter().any(|n| n == "agent_fanout"),
-            "deferred name from the activatable set must resolve through tool_search; got: {}",
-            result.output
-        );
+        let parsed = parse_tool_search_output(&result.output);
+        assert_eq!(tool_search_match_names(&parsed), vec!["github".to_string()]);
+        assert!(tool_search_string_array(&parsed, "missing").is_empty());
+        assert_eq!(parsed["total_tools"].as_u64(), Some(3));
         // Activation must be recorded against the activatable (deferred manifest)
         // set, not the visible set.
         let activated = exec.activated_deferred_tool_names();
         assert!(
-            activated.contains(&"agent_fanout".to_string()),
-            "activated_deferred_tool_names must include agent_fanout after select: activation; got: {:?}",
+            activated.contains(&"github".to_string()),
+            "activated_deferred_tool_names must include github after select: activation; got: {:?}",
             activated
         );
     }
 
     #[tokio::test]
-    async fn server_tool_search_resolves_plugin_after_install() {
+    async fn server_tool_search_does_not_activate_deferred_tool_without_runtime_binding() {
         let (exec, _dir) = test_executor();
+        exec.set_current_visible_tool_schemas(&[
+            json!({"type": "function", "function": {"name": "bash"}}),
+            json!({"type": "function", "function": {"name": "tool_search"}}),
+        ]);
+        exec.set_current_activatable_tool_names(HashSet::from(["agent_fanout".to_string()]));
+
+        assert!(
+            exec.current_activatable_tool_names_snapshot().is_empty(),
+            "activatable snapshot must drop deferred tools whose runtime binding is absent"
+        );
+
+        let searchable = exec
+            .current_searchable_tool_names()
+            .expect("configured visible surface should produce a search pool");
+        assert!(
+            !searchable.contains("agent_fanout"),
+            "search pool must not advertise deferred tools whose runtime binding is absent"
+        );
+
+        let result = exec
+            .execute_with_metadata("tool_search", &json!({"query": "select:agent_fanout"}))
+            .await;
+        let parsed = parse_tool_search_output(&result.output);
+        assert_eq!(tool_search_match_names(&parsed), Vec::<String>::new());
+        assert_eq!(
+            tool_search_string_array(&parsed, "missing"),
+            vec!["agent_fanout".to_string()]
+        );
+        assert_eq!(
+            exec.activated_deferred_tool_names(),
+            Vec::<String>::new(),
+            "tool_search must not record activation for a tool that lacks its runtime binding"
+        );
+    }
+
+    #[test]
+    fn server_search_pool_names_are_visible_union_activatable() {
+        let (exec, _dir) = test_executor();
+        exec.set_current_visible_tool_schemas(&[
+            json!({"type": "function", "function": {"name": "bash"}}),
+            json!({"type": "function", "function": {"name": "tool_search"}}),
+        ]);
+        exec.set_current_activatable_tool_names(HashSet::from(["github".to_string()]));
+
+        let names = exec
+            .current_searchable_tool_names()
+            .expect("configured surface should produce a search pool");
+
+        assert!(names.contains("bash"));
+        assert!(names.contains("tool_search"));
+        assert!(names.contains("github"));
+        assert_eq!(
+            names.len(),
+            3,
+            "search pool must be exactly visible tools plus current deferred manifest names"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_tool_search_select_visible_tool_does_not_record_deferred_activation() {
+        let (exec, _dir) = test_executor();
+        exec.set_current_visible_tool_schemas(&[
+            json!({"type": "function", "function": {"name": "bash"}}),
+            json!({"type": "function", "function": {"name": "tool_search"}}),
+        ]);
+
+        let result = exec
+            .execute_with_metadata("tool_search", &json!({"query": "select:bash"}))
+            .await;
+        let parsed = parse_tool_search_output(&result.output);
+
+        assert_eq!(tool_search_match_names(&parsed), vec!["bash".to_string()]);
+        assert_eq!(
+            exec.activated_deferred_tool_names(),
+            Vec::<String>::new(),
+            "visible tools are already callable; selecting them must not create deferred activation state"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_activated_deferred_tool_remains_until_called_after_schema_injection() {
+        let (exec, _dir) = test_executor();
+        exec.set_current_visible_tool_schemas(&[
+            json!({"type": "function", "function": {"name": "bash"}}),
+            json!({"type": "function", "function": {"name": "tool_search"}}),
+        ]);
+        exec.set_current_activatable_tool_names(HashSet::from(["github".to_string()]));
+
+        let result = exec
+            .execute_with_metadata("tool_search", &json!({"query": "select:github"}))
+            .await;
+        let parsed = parse_tool_search_output(&result.output);
+        assert_eq!(tool_search_match_names(&parsed), vec!["github".to_string()]);
+        assert_eq!(
+            exec.activated_deferred_tool_names(),
+            vec!["github".to_string()]
+        );
+
+        let _ = exec.execute_with_metadata("github", &json!({})).await;
+        assert_eq!(
+            exec.activated_deferred_tool_names(),
+            vec!["github".to_string()],
+            "a direct internal call before the schema is visible must not consume activation"
+        );
+
+        exec.set_current_visible_tool_schemas(&[
+            json!({"type": "function", "function": {"name": "bash"}}),
+            json!({"type": "function", "function": {"name": "tool_search"}}),
+            json!({"type": "function", "function": {"name": "github"}}),
+        ]);
+        exec.set_current_activatable_tool_names(HashSet::new());
+
+        assert_eq!(
+            exec.activated_deferred_tool_names_for_schema_injection(),
+            vec!["github".to_string()],
+            "schema assembly should surface the selected deferred tool"
+        );
+        assert_eq!(
+            exec.activated_deferred_tool_names(),
+            vec!["github".to_string()],
+            "schema assembly must not consume activation before the tool is called"
+        );
+        assert_eq!(
+            exec.activated_deferred_tool_names_for_schema_injection(),
+            vec!["github".to_string()],
+            "repeated schema assembly must keep the selected tool available"
+        );
+
+        let _ = exec.execute_with_metadata("github", &json!({})).await;
+        assert_eq!(
+            exec.activated_deferred_tool_names(),
+            Vec::<String>::new(),
+            "accepted visible tool calls consume the matching deferred activation"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_activated_deferred_tool_is_pruned_when_no_longer_visible_or_activatable() {
+        let (exec, _dir) = test_executor();
+        exec.set_current_visible_tool_schemas(&[
+            json!({"type": "function", "function": {"name": "bash"}}),
+            json!({"type": "function", "function": {"name": "tool_search"}}),
+        ]);
+        exec.set_current_activatable_tool_names(HashSet::from(["github".to_string()]));
+
+        let result = exec
+            .execute_with_metadata("tool_search", &json!({"query": "select:github"}))
+            .await;
+        let parsed = parse_tool_search_output(&result.output);
+        assert_eq!(tool_search_match_names(&parsed), vec!["github".to_string()]);
+        assert_eq!(
+            exec.activated_deferred_tool_names(),
+            vec!["github".to_string()]
+        );
+
+        exec.set_current_visible_tool_schemas(&[
+            json!({"type": "function", "function": {"name": "bash"}}),
+            json!({"type": "function", "function": {"name": "tool_search"}}),
+        ]);
+        exec.set_current_activatable_tool_names(HashSet::new());
+
+        assert_eq!(
+            exec.activated_deferred_tool_names(),
+            Vec::<String>::new(),
+            "activation must be scoped to the current surface and disappear when the tool is neither visible nor activatable"
+        );
+    }
+
+    #[test]
+    fn server_activated_deferred_tool_is_pruned_when_runtime_binding_disappears() {
+        let (exec, _dir) = test_executor();
+        exec.set_current_visible_tool_schemas(&[
+            json!({"type": "function", "function": {"name": "tool_search"}}),
+            json!({"type": "function", "function": {"name": "mcp__calculator"}}),
+        ]);
+        exec.activated_deferred_tools
+            .write()
+            .unwrap()
+            .insert("mcp__calculator".to_string());
+
+        assert_eq!(
+            exec.activated_deferred_tool_names(),
+            Vec::<String>::new(),
+            "stale visible MCP schemas must not retain activation after runtime binding disappears"
+        );
+    }
+
+    #[test]
+    fn server_activated_deferred_prune_retains_valid_activation_alongside_stale_entries() {
+        // Regression guard for the TOCTOU fix: the prune path (triggered when
+        // the activated set contains at least one stale entry) must not drop a
+        // concurrently-recorded activation for a tool that is still in the
+        // visible surface and still runtime-bound. The retained set and the
+        // pruned store must be computed atomically under a single write lock.
+        let (exec, _dir) = test_executor();
+        exec.set_plugin_schemas(vec![
+            json!({"type":"function","function":{"name":"my_plugin_tool"}}),
+        ]);
+        exec.set_current_visible_tool_schemas(&[
+            json!({"type":"function","function":{"name":"tool_search"}}),
+            json!({"type":"function","function":{"name":"my_plugin_tool"}}),
+        ]);
+        // Seed one stale entry (triggers the prune branch) and one valid
+        // entry that must survive the prune.
+        exec.activated_deferred_tools
+            .write()
+            .unwrap()
+            .insert("stale_gone_tool".to_string());
+        exec.activated_deferred_tools
+            .write()
+            .unwrap()
+            .insert("my_plugin_tool".to_string());
+
+        let retained = exec.activated_deferred_tool_names();
+        assert!(
+            retained.iter().any(|n| n == "my_plugin_tool"),
+            "valid activation must be retained through the prune path: got {retained:?}"
+        );
+        assert!(
+            !retained.iter().any(|n| n == "stale_gone_tool"),
+            "stale entry must be pruned: got {retained:?}"
+        );
+        // The store must reflect the pruned snapshot, not a stale superset.
+        let stored: HashSet<String> = exec
+            .activated_deferred_tools
+            .read()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect();
+        assert_eq!(
+            stored,
+            HashSet::from(["my_plugin_tool".to_string()]),
+            "activated_deferred_tools store must equal the retained set after prune"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_tool_search_rejects_mcp_plugin_without_runtime_binding() {
+        let (exec, _dir) = test_executor();
+        exec.set_current_visible_tool_schemas(&[
+            json!({"type": "function", "function": {"name": "bash"}}),
+            json!({"type": "function", "function": {"name": "tool_search"}}),
+        ]);
         let plugin = json!({
             "type": "function",
             "function": {
@@ -3997,15 +4642,68 @@ esac
         let result = exec
             .execute_with_metadata("tool_search", &json!({"query": "select:mcp__calculator"}))
             .await;
-        let parsed: Value = serde_json::from_str(&result.output).unwrap();
+        let parsed = parse_tool_search_output(&result.output);
+        assert_eq!(tool_search_match_names(&parsed), Vec::<String>::new());
+        assert_eq!(
+            tool_search_string_array(&parsed, "missing"),
+            vec!["mcp__calculator".to_string()]
+        );
+        assert_eq!(parsed["total_tools"].as_u64(), Some(2));
+
+        exec.set_current_activatable_tool_names(HashSet::from(["mcp__calculator".to_string()]));
         assert!(
-            parsed["missing"].as_array().unwrap().is_empty(),
-            "plugin must resolve after set_plugin_schemas on server path; got: {}",
-            result.output
+            exec.current_activatable_tool_names_snapshot().is_empty(),
+            "MCP activatable names must be dropped when no MCP manager owns the tool"
+        );
+        let result = exec
+            .execute_with_metadata("tool_search", &json!({"query": "select:mcp__calculator"}))
+            .await;
+        let parsed = parse_tool_search_output(&result.output);
+        assert_eq!(tool_search_match_names(&parsed), Vec::<String>::new());
+        assert_eq!(
+            tool_search_string_array(&parsed, "missing"),
+            vec!["mcp__calculator".to_string()]
+        );
+        assert_eq!(parsed["total_tools"].as_u64(), Some(2));
+    }
+
+    #[tokio::test]
+    async fn server_tool_search_rejects_stale_mcp_plugin_schema_not_owned_by_manager() {
+        let (mut exec, _dir) = test_executor();
+        exec.set_mcp_manager(Arc::new(tokio::sync::RwLock::new(
+            astra_mcp::McpClientManager::new(),
+        )));
+        exec.set_current_visible_tool_schemas(&[
+            json!({"type": "function", "function": {"name": "bash"}}),
+            json!({"type": "function", "function": {"name": "tool_search"}}),
+        ]);
+        exec.set_plugin_schemas(vec![json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__calculator",
+                "description": "Evaluate arithmetic expression.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"expr": {"type": "string"}},
+                    "required": ["expr"]
+                }
+            }
+        })]);
+        exec.set_current_activatable_tool_names(HashSet::from(["mcp__calculator".to_string()]));
+
+        let result = exec
+            .execute_with_metadata("tool_search", &json!({"query": "select:mcp__calculator"}))
+            .await;
+        let parsed = parse_tool_search_output(&result.output);
+        assert_eq!(tool_search_match_names(&parsed), Vec::<String>::new());
+        assert_eq!(
+            tool_search_string_array(&parsed, "missing"),
+            vec!["mcp__calculator".to_string()]
         );
         assert_eq!(
-            parsed["matches"][0]["name"].as_str(),
-            Some("mcp__calculator")
+            exec.activated_deferred_tool_names(),
+            Vec::<String>::new(),
+            "stale MCP schemas must not create deferred activation state"
         );
     }
 

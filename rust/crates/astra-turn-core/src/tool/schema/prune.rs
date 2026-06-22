@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 
 use crate::compaction_types::CompactionTier;
 use crate::tool::registry::report::SelectionReport;
+use crate::tool::schema::tool_schema_name;
 
 /// Prune tool schemas under token pressure to reduce context size.
 /// - `TrimSchemas` tier: truncate descriptions to first sentence
@@ -79,22 +80,15 @@ where
 {
     schemas
         .iter()
-        .filter_map(schema_function_name)
+        .filter_map(|s| tool_schema_name(s).map(String::from))
         .filter(|name| {
             !PLAN_MODE_REQUIRED_TOOLS.contains(&name.as_str()) && !is_read_only(name.as_str())
         })
         .collect()
 }
 
-fn schema_function_name(schema: &Value) -> Option<String> {
-    schema
-        .get("function")
-        .and_then(|f| f.get("name"))
-        .and_then(|n| n.as_str())
-        .map(str::to_string)
-}
-
-/// Drop OpenAI-style tool definitions whose `function.name` is in `excluded` (e.g. stall-restricted tools).
+/// Drop OpenAI-style tool definitions whose valid function-tool name is in `excluded`
+/// (e.g. stall-restricted tools). Malformed schemas fail closed and are dropped.
 pub fn filter_tool_schemas_by_excluded_names(
     schemas: Vec<Value>,
     excluded: &HashSet<String>,
@@ -104,14 +98,7 @@ pub fn filter_tool_schemas_by_excluded_names(
     }
     schemas
         .into_iter()
-        .filter(|s| {
-            let name = s
-                .get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(|n| n.as_str())
-                .unwrap_or("");
-            !excluded.contains(name)
-        })
+        .filter(|s| tool_schema_name(s).is_some_and(|name| !excluded.contains(name)))
         .collect()
 }
 
@@ -211,23 +198,6 @@ fn strip_property_descriptions(func: &mut Value) {
     }
 }
 
-/// Extract the function name from a tool schema `{"function":{"name":"…"}}`.
-fn schema_tool_name(schema: &Value) -> Option<&str> {
-    schema
-        .get("function")
-        .and_then(|f| f.get("name"))
-        .and_then(|n| n.as_str())
-}
-
-/// Unique `function.name` values from an OpenAI-style tools list (e.g. edge registry export).
-#[must_use]
-pub fn openai_tool_names_from_schemas(schemas: &[Value]) -> HashSet<String> {
-    schemas
-        .iter()
-        .filter_map(|s| schema_tool_name(s).map(String::from))
-        .collect()
-}
-
 /// Ensure tool schemas for previously-invoked tools remain available in follow-up turns.
 ///
 /// When the selector picks a fresh set of tools for the next LLM round it may drop
@@ -242,7 +212,7 @@ pub fn pin_invoked_tool_schemas(
 ) -> u32 {
     let mut selected_names: HashSet<String> = selected
         .iter()
-        .filter_map(|s| schema_tool_name(s).map(String::from))
+        .filter_map(|s| tool_schema_name(s).map(String::from))
         .collect();
 
     let mut pinned = 0u32;
@@ -251,7 +221,7 @@ pub fn pin_invoked_tool_schemas(
             && !selected_names.contains(name)
             && let Some(schema) = all_schemas
                 .iter()
-                .find(|s| schema_tool_name(s) == Some(name))
+                .find(|s| tool_schema_name(s) == Some(name))
         {
             selected_names.insert(name.to_string());
             selected.push(schema.clone());
@@ -282,7 +252,7 @@ fn inject_tool_names_inner(
         if selected_names.insert(name.to_owned()) {
             if let Some(schema) = all_schemas
                 .iter()
-                .find(|s| schema_tool_name(s) == Some(name))
+                .find(|s| tool_schema_name(s) == Some(name))
             {
                 selected.push(schema.clone());
                 report.tools_selected.push(name.to_owned());
@@ -322,7 +292,7 @@ mod tests {
     use serde_json::json;
 
     fn name_only_schema(name: &str) -> Value {
-        json!({"function": {"name": name}})
+        json!({"type": "function", "function": {"name": name}})
     }
 
     #[test]
@@ -355,6 +325,48 @@ mod tests {
         assert!(restricted.contains("custom_tool"));
     }
 
+    #[test]
+    fn plan_mode_restrictions_rejects_non_function_schemas_but_accepts_function_shorthand() {
+        // Fail-closed for explicit non-function and malformed names; accept the
+        // provider shorthand `{function:{name}}` as a real function tool.
+        let schemas = vec![
+            json!({"type": "custom", "function": {"name": "custom_shape"}}),
+            json!({"function": {"name": "missing_type"}}),
+            json!({"type": "function", "function": {"name": ""}}),
+            json!({"type": "function", "function": {"name": "   "}}),
+            json!({"type": "function"}),
+            json!({"type": "function", "function": {}}),
+        ];
+        let restricted = plan_mode_restrictions(&schemas, |_| false);
+        assert!(
+            restricted.contains("missing_type") && restricted.len() == 1,
+            "only valid function shorthand should enter plan-mode restrictions: {restricted:?}"
+        );
+    }
+
+    #[test]
+    fn filter_excluded_names_drops_malformed_schemas_and_keeps_function_shorthand() {
+        // Fail-closed: malformed schemas are dropped even when not in excluded.
+        let tools = vec![
+            json!({"type": "custom", "function": {"name": "custom_shape"}}),
+            json!({"function": {"name": "missing_type"}}),
+            json!({"type": "function", "function": {"name": ""}}),
+            json!({"type": "function", "function": {"name": "   "}}),
+            json!({"type": "function"}),
+            json!({"type": "function", "function": {}}),
+            make_tool_schema("keep", "x", false),
+        ];
+        let mut ex = HashSet::new();
+        ex.insert("nonexistent".to_string());
+        let out = filter_tool_schemas_by_excluded_names(tools, &ex);
+        assert_eq!(
+            out.iter()
+                .filter_map(crate::tool::schema::tool_schema_name)
+                .collect::<Vec<_>>(),
+            vec!["missing_type", "keep"]
+        );
+    }
+
     fn make_tool_schema(name: &str, desc: &str, optional_param: bool) -> Value {
         let mut props = serde_json::Map::new();
         props.insert("command".to_string(), json!({"type": "string"}));
@@ -373,16 +385,6 @@ mod tests {
                 }
             }
         })
-    }
-
-    #[test]
-    fn openai_tool_names_from_schemas_dedupes() {
-        let a = make_tool_schema("bash", "x", false);
-        let b = make_tool_schema("read_file", "y", false);
-        let names = openai_tool_names_from_schemas(&[a.clone(), b, a]);
-        assert_eq!(names.len(), 2);
-        assert!(names.contains("bash"));
-        assert!(names.contains("read_file"));
     }
 
     #[test]
@@ -572,6 +574,7 @@ mod tests {
         let mut selected = vec![make_tool_schema("bash", "run", false)];
         let mut report = SelectionReport {
             tools_selected: vec!["bash".into()],
+            dynamic_tools_selected: Vec::new(),
             selected_count: 1,
             budget_used: 0,
             budget_total: 100,
@@ -593,6 +596,7 @@ mod tests {
         let mut selected = vec![make_tool_schema("bash", "run", false)];
         let mut report = SelectionReport {
             tools_selected: vec!["bash".into()],
+            dynamic_tools_selected: Vec::new(),
             selected_count: 1,
             budget_used: 0,
             budget_total: 100,
@@ -611,6 +615,7 @@ mod tests {
         let mut selected = vec![];
         let mut report = SelectionReport {
             tools_selected: vec![],
+            dynamic_tools_selected: Vec::new(),
             selected_count: 0,
             budget_used: 0,
             budget_total: 100,
@@ -629,6 +634,7 @@ mod tests {
         let mut selected = vec![make_tool_schema("bash", "run", false)];
         let mut report = SelectionReport {
             tools_selected: vec!["bash".into()],
+            dynamic_tools_selected: Vec::new(),
             selected_count: 1,
             budget_used: 0,
             budget_total: 100,
@@ -653,6 +659,7 @@ mod tests {
         let mut selected = vec![make_tool_schema("bash", "run", false)];
         let mut report = SelectionReport {
             tools_selected: vec!["bash".into()],
+            dynamic_tools_selected: Vec::new(),
             selected_count: 1,
             budget_used: 0,
             budget_total: 100,
@@ -687,6 +694,7 @@ mod tests {
         let mut selected = vec![make_tool_schema("bash", "run", false)];
         let mut report = SelectionReport {
             tools_selected: vec!["bash".into()],
+            dynamic_tools_selected: Vec::new(),
             selected_count: 1,
             budget_used: 0,
             budget_total: 100,
@@ -724,6 +732,7 @@ mod tests {
         let mut selected = vec![make_tool_schema("bash", "run", false)];
         let mut report = SelectionReport {
             tools_selected: vec!["bash".into()],
+            dynamic_tools_selected: Vec::new(),
             selected_count: 1,
             budget_used: 0,
             budget_total: 100,
@@ -745,6 +754,7 @@ mod tests {
         let mut selected = vec![make_tool_schema("bash", "run", false)];
         let mut report = SelectionReport {
             tools_selected: vec!["bash".into()],
+            dynamic_tools_selected: Vec::new(),
             selected_count: 1,
             budget_used: 0,
             budget_total: 100,
@@ -772,6 +782,7 @@ mod tests {
         let mut selected = vec![make_tool_schema("bash", "run", false)];
         let mut report = SelectionReport {
             tools_selected: vec!["bash".into()],
+            dynamic_tools_selected: Vec::new(),
             selected_count: 1,
             budget_used: 0,
             budget_total: 100,
@@ -802,6 +813,7 @@ mod tests {
         let mut selected = vec![make_tool_schema("read_file", "read", false)];
         let mut report = SelectionReport {
             tools_selected: vec!["read_file".into()],
+            dynamic_tools_selected: Vec::new(),
             selected_count: 1,
             budget_used: 0,
             budget_total: 100,
@@ -847,6 +859,7 @@ mod tests {
         let mut selected = vec![make_tool_schema("exit_plan_mode", "exit", false)];
         let mut report = SelectionReport {
             tools_selected: vec!["exit_plan_mode".into()],
+            dynamic_tools_selected: Vec::new(),
             selected_count: 1,
             budget_used: 0,
             budget_total: 100,
@@ -877,6 +890,7 @@ mod tests {
         let mut selected = vec![make_tool_schema("read_file", "read", false)];
         let mut report = SelectionReport {
             tools_selected: vec!["read_file".into()],
+            dynamic_tools_selected: Vec::new(),
             selected_count: 1,
             budget_used: 0,
             budget_total: 100,
@@ -908,6 +922,7 @@ mod tests {
         let mut selected = vec![make_tool_schema("read_file", "read", false)];
         let mut report = SelectionReport {
             tools_selected: vec!["read_file".into()],
+            dynamic_tools_selected: Vec::new(),
             selected_count: 1,
             budget_used: 0,
             budget_total: 100,

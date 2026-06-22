@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 use astra_text_utils::text_tokenize::tokenize;
@@ -485,229 +485,69 @@ fn tool_relevance_score(
     }
 }
 
-/// Pre-filter: rank dynamic tools by relevance and filter by minimum score threshold.
-/// Returns (catalog_index, score) pairs for dynamic tools, sorted by descending score.
-pub fn pre_filter_dynamic(state: &ConversationState, query: &str) -> Vec<(usize, f64)> {
-    pre_filter_dynamic_core(
-        state,
-        query,
-        None,
-        None,
-        &[],
-        &HashMap::new(),
-        &[],
-        &HashMap::new(),
-    )
-}
-
-/// Like [`pre_filter_dynamic`] but accepts an optional quality tracker to boost/penalize
-/// tools based on historical effectiveness.
-pub fn pre_filter_dynamic_with_quality(
-    state: &ConversationState,
-    query: &str,
-    quality_tracker: Option<&ToolQualityTracker>,
-) -> Vec<(usize, f64)> {
-    pre_filter_dynamic_core(
-        state,
-        query,
-        quality_tracker,
-        None,
-        &[],
-        &HashMap::new(),
-        &[],
-        &HashMap::new(),
-    )
-}
-
-/// Full-featured pre-filter with both quality tracking and confidence calibration.
-/// Use this from production paths where session-scoped state is available.
-pub fn pre_filter_dynamic_calibrated(
-    state: &ConversationState,
-    query: &str,
-    quality_tracker: Option<&ToolQualityTracker>,
-    calibrator: Option<&ConfidenceCalibrator>,
-) -> Vec<(usize, f64)> {
-    pre_filter_dynamic_core(
-        state,
-        query,
-        quality_tracker,
-        calibrator,
-        &[],
-        &HashMap::new(),
-        &[],
-        &HashMap::new(),
-    )
-}
-
-/// Full pre-filter with memory domain hints for gate softening.
-/// When memory provides domain hints (e.g., user tracks GitHub entities),
-/// tools in those domains get a score boost and softened content gate.
-pub fn pre_filter_dynamic_with_memory(
-    state: &ConversationState,
-    query: &str,
-    quality_tracker: Option<&ToolQualityTracker>,
-    calibrator: Option<&ConfidenceCalibrator>,
-    memory_domain_hints: &[crate::pipeline::routing::DomainHint],
-) -> Vec<(usize, f64)> {
-    pre_filter_dynamic_core(
-        state,
-        query,
-        quality_tracker,
-        calibrator,
-        memory_domain_hints,
-        &HashMap::new(),
-        &[],
-        &HashMap::new(),
-    )
-}
-
-/// Pressure-aware pre-filter: applies an additional minimum-score floor that
-/// rises with budget pressure, excluding marginally-relevant tools when token
-/// headroom is scarce.
+/// Pre-filter configuration for dynamic tool selection.
 ///
-/// | pressure | floor   | effect                               |
-/// |----------|---------|--------------------------------------|
-/// | 0.0      | 0.00    | no extra filtering                   |
-/// | 0.3      | 0.05    | exclude noise                        |
-/// | 0.6      | 0.10    | keep only clearly relevant tools     |
-/// | 0.9      | 0.18    | keep only strongly relevant tools    |
+/// All fields are optional and default to `None`/`&[]`/`0.0`.
+/// Use struct literal syntax for construction:
 ///
-/// Also reduces `min_recall` ceiling so fewer low-scoring tools are force-
-/// included under high pressure.
-pub fn pre_filter_dynamic_with_pressure(
-    state: &ConversationState,
-    query: &str,
-    quality_tracker: Option<&ToolQualityTracker>,
-    calibrator: Option<&ConfidenceCalibrator>,
-    memory_domain_hints: &[crate::pipeline::routing::DomainHint],
-    budget_pressure: f64,
-) -> Vec<(usize, f64)> {
-    pre_filter_dynamic_with_pressure_and_cooccurrence(
-        state,
-        query,
-        quality_tracker,
-        calibrator,
-        memory_domain_hints,
-        budget_pressure,
-        &HashMap::new(),
-        &[],
-        &HashMap::new(),
-    )
+/// ```ignore
+/// let filter = FilterOptions {
+///     pinned_names: Some(&pinned_set),
+///     budget_pressure: 0.5,
+///     ..Default::default()
+/// };
+/// let ranked = pre_filter_dynamic(&state, query, &filter);
+/// ```
+#[derive(Clone, Default)]
+pub struct FilterOptions<'a> {
+    pub pinned_names: Option<&'a HashSet<String>>,
+    pub quality_tracker: Option<&'a ToolQualityTracker>,
+    pub calibrator: Option<&'a ConfidenceCalibrator>,
+    pub memory_domain_hints: &'a [crate::pipeline::routing::DomainHint],
+    pub budget_pressure: f64,
+    pub co_occurrence: Option<&'a HashMap<String, f64>>,
+    pub file_context: Option<&'a [String]>,
+    pub outcome_bias: Option<&'a HashMap<String, f64>>,
 }
 
-/// Full pre-filter with pressure, memory hints, AND tool co-occurrence boost.
-/// Callers pass the co-occurrence score map directly; tools with a positive
-/// score are nudged up to favour historically-paired tool chains.
-pub fn pre_filter_dynamic_with_cooccurrence(
+/// Pre-filter: rank dynamic tools by relevance and filter by minimum score.
+///
+/// Returns `(catalog_index, score)` pairs for dynamic tools, sorted by
+/// descending score. All optional scoring inputs are provided via `filter`.
+///
+/// When `filter.budget_pressure > 0.01`, applies a rising minimum-score floor
+/// that excludes marginally relevant tools under token pressure.
+pub fn pre_filter_dynamic(
     state: &ConversationState,
     query: &str,
-    quality_tracker: Option<&ToolQualityTracker>,
-    calibrator: Option<&ConfidenceCalibrator>,
-    memory_domain_hints: &[crate::pipeline::routing::DomainHint],
-    budget_pressure: f64,
-    co_occurrence: &HashMap<String, f64>,
+    filter: &FilterOptions<'_>,
 ) -> Vec<(usize, f64)> {
-    pre_filter_dynamic_with_pressure_and_cooccurrence(
-        state,
-        query,
-        quality_tracker,
-        calibrator,
-        memory_domain_hints,
-        budget_pressure,
-        co_occurrence,
-        &[],
-        &HashMap::new(),
-    )
-}
+    let empty_map = HashMap::new();
+    let co_occurrence = filter.co_occurrence.unwrap_or(&empty_map);
+    let outcome_bias = filter.outcome_bias.unwrap_or(&empty_map);
+    let file_context: &[String] = filter.file_context.unwrap_or(&[]);
 
-/// Full pre-filter with pressure, co-occurrence, AND file-context scoring.
-/// This is the most complete scoring path for production use.
-#[allow(clippy::too_many_arguments)]
-pub fn pre_filter_dynamic_with_file_context(
-    state: &ConversationState,
-    query: &str,
-    quality_tracker: Option<&ToolQualityTracker>,
-    calibrator: Option<&ConfidenceCalibrator>,
-    memory_domain_hints: &[crate::pipeline::routing::DomainHint],
-    budget_pressure: f64,
-    co_occurrence: &HashMap<String, f64>,
-    file_context: &[String],
-) -> Vec<(usize, f64)> {
-    pre_filter_dynamic_with_pressure_and_cooccurrence(
-        state,
-        query,
-        quality_tracker,
-        calibrator,
-        memory_domain_hints,
-        budget_pressure,
-        co_occurrence,
-        file_context,
-        &HashMap::new(),
-    )
-}
-
-/// Pre-filter including outcome-memory bias. When `outcome_bias` is non-empty,
-/// each catalog tool gets an additive score adjustment (±0.10) derived from
-/// recent per-signature success/failure evidence (see
-/// [`astra_turn_core::tool_health::ToolHealthTracker::outcome_bias_by_tool`]).
-#[allow(clippy::too_many_arguments)]
-pub fn pre_filter_dynamic_with_outcome_bias(
-    state: &ConversationState,
-    query: &str,
-    quality_tracker: Option<&ToolQualityTracker>,
-    calibrator: Option<&ConfidenceCalibrator>,
-    memory_domain_hints: &[crate::pipeline::routing::DomainHint],
-    budget_pressure: f64,
-    co_occurrence: &HashMap<String, f64>,
-    file_context: &[String],
-    outcome_bias: &HashMap<String, f64>,
-) -> Vec<(usize, f64)> {
-    pre_filter_dynamic_with_pressure_and_cooccurrence(
-        state,
-        query,
-        quality_tracker,
-        calibrator,
-        memory_domain_hints,
-        budget_pressure,
-        co_occurrence,
-        file_context,
-        outcome_bias,
-    )
-}
-
-/// Internal: pressure + co-occurrence + file-context + outcome bias.
-#[allow(clippy::too_many_arguments)]
-fn pre_filter_dynamic_with_pressure_and_cooccurrence(
-    state: &ConversationState,
-    query: &str,
-    quality_tracker: Option<&ToolQualityTracker>,
-    calibrator: Option<&ConfidenceCalibrator>,
-    memory_domain_hints: &[crate::pipeline::routing::DomainHint],
-    budget_pressure: f64,
-    co_occurrence: &HashMap<String, f64>,
-    file_context: &[String],
-    outcome_bias: &HashMap<String, f64>,
-) -> Vec<(usize, f64)> {
     let mut result = pre_filter_dynamic_core(
         state,
         query,
-        quality_tracker,
-        calibrator,
-        memory_domain_hints,
+        filter.pinned_names,
+        filter.quality_tracker,
+        filter.calibrator,
+        filter.memory_domain_hints,
         co_occurrence,
         file_context,
         outcome_bias,
     );
 
-    if budget_pressure > 0.01 {
+    if filter.budget_pressure > 0.01 {
         // Pressure floor: quadratic ramp so Normal is unaffected and
         // AggressivePrune (0.9) is aggressive.
-        let pressure_floor = budget_pressure * budget_pressure * 0.22;
+        let pressure_floor = filter.budget_pressure * filter.budget_pressure * 0.22;
         result.retain(|&(_, score)| score >= pressure_floor);
 
         // Under high pressure, also cap the minimum recall guarantee.
         // At 0.9 pressure we allow as few as 1 forced tool; at 0.3, still 3.
-        let max_recall = ((1.0 - budget_pressure) * 5.0).ceil() as usize;
+        let max_recall = ((1.0 - filter.budget_pressure) * 5.0).ceil() as usize;
         let max_recall = max_recall.max(1);
         if result.len() > max_recall {
             result.truncate(max_recall);
@@ -755,6 +595,7 @@ fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {
 fn pre_filter_dynamic_core(
     state: &ConversationState,
     query: &str,
+    pinned_names: Option<&HashSet<String>>,
     quality_tracker: Option<&ToolQualityTracker>,
     calibrator: Option<&ConfidenceCalibrator>,
     memory_domain_hints: &[crate::pipeline::routing::DomainHint],
@@ -783,7 +624,11 @@ fn pre_filter_dynamic_core(
     let mut scored: Vec<(usize, f64)> = TOOL_CATALOG
         .iter()
         .enumerate()
-        .filter(|(_, t)| !t.pinned)
+        .filter(|(_, t)| {
+            pinned_names
+                .map(|pinned| !pinned.contains(t.name))
+                .unwrap_or(!t.pinned)
+        })
         .map(|(idx, tool)| {
             let mut score = tool_relevance_score(
                 tool,
@@ -1220,7 +1065,7 @@ mod tests {
     #[test]
     fn pre_filter_empty_query() {
         let state = state_at_turn(1);
-        let results = pre_filter_dynamic(&state, "");
+        let results = pre_filter_dynamic(&state, "", &FilterOptions::default());
         // Empty query may still return tools due to cold-start logic
         // Just verify it doesn't panic
         let _ = results;
@@ -1229,7 +1074,14 @@ mod tests {
     #[test]
     fn pre_filter_with_pressure_max() {
         let state = state_at_turn(1);
-        let results = pre_filter_dynamic_with_pressure(&state, "read file", None, None, &[], 1.0);
+        let results = pre_filter_dynamic(
+            &state,
+            "read file",
+            &FilterOptions {
+                budget_pressure: 1.0,
+                ..Default::default()
+            },
+        );
         // High pressure = stricter filter, but shouldn't panic
         let _ = results;
     }
@@ -1299,7 +1151,7 @@ mod tests {
     #[test]
     fn pre_filter_punctuation_only_query() {
         let state = state_at_turn(1);
-        let results = pre_filter_dynamic(&state, "!!!???");
+        let results = pre_filter_dynamic(&state, "!!!???", &FilterOptions::default());
         // Should not panic — may return empty or few results
         for (_, score) in &results {
             assert!(*score >= 0.0);
@@ -1314,7 +1166,7 @@ mod tests {
         // in every tool re-split the full haystack.
         let state = state_at_turn(1);
         let long_query = "read ".repeat(2000);
-        let results = pre_filter_dynamic(&state, &long_query);
+        let results = pre_filter_dynamic(&state, &long_query, &FilterOptions::default());
         for (_, score) in &results {
             assert!(*score >= 0.0 && *score <= 10.0);
         }
@@ -1345,7 +1197,7 @@ mod tests {
         let state = state_at_turn(1);
         // "查询代码 " = 13 bytes (3×3-byte CJK + 1×ASCII space).
         let long_cjk = "查询代码 ".repeat(2000);
-        let results = pre_filter_dynamic(&state, &long_cjk);
+        let results = pre_filter_dynamic(&state, &long_cjk, &FilterOptions::default());
         for (_, score) in &results {
             assert!(*score >= 0.0 && *score <= 10.0);
         }
@@ -1357,7 +1209,7 @@ mod tests {
             is_conversational: true,
             ..Default::default()
         };
-        let results = pre_filter_dynamic(&state, "hello how are you");
+        let results = pre_filter_dynamic(&state, "hello how are you", &FilterOptions::default());
         assert!(
             results.is_empty(),
             "conversational queries should return empty dynamic tools"

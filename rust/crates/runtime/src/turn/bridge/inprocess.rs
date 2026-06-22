@@ -172,25 +172,31 @@ fn deferred_tools_block_for_bridge_model(
     edge_profile: &Map<String, Value>,
     resolved_model_name: &str,
 ) -> String {
-    let Some(source_budget) = edge_profile
-        .get(
-            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW,
-        )
-        .and_then(Value::as_u64)
-        .and_then(|value| usize::try_from(value).ok())
-    else {
-        return String::new();
-    };
-    let resolved_budget = crate::prompts::budget_for_model(Some(resolved_model_name)).model_limit;
-    if source_budget != resolved_budget {
-        return String::new();
-    }
-    edge_profile
-        .get(astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT)
-        .and_then(Value::as_str)
-        .and_then(|text| deferred_tools_section_for_edge_profile(Some(text)))
+    crate::turn::deferred_tools_edge_profile::block_for_model(edge_profile, resolved_model_name)
+        .and_then(|text| deferred_tools_section_for_edge_profile(Some(&text)))
         .map(|section| section.text)
         .unwrap_or_default()
+}
+
+/// Extract the pinned (T1) tool names from the CLI-built `edge_profile`.
+///
+/// When the key is present, the names reflect the resolved `ToolSurface` pinned
+/// set (user TOML overrides included). When absent (test-only path or
+/// server-side tools), falls back to the compile-time default so cache_control
+/// markers still land somewhere reasonable.
+fn pinned_tool_names_for_bridge(
+    edge_profile: &Map<String, Value>,
+) -> std::collections::HashSet<String> {
+    edge_profile
+        .get(astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_PINNED_TOOL_NAMES)
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_else(crate::turn::prompt_cache::default_pinned_tool_names)
 }
 
 /// Decide whether the bridge should run its own `prefetch_memories` call.
@@ -2507,6 +2513,7 @@ impl InProcessChatTurnBridge {
                 crate::turn::llm::context::annotate_tool_schemas_for_cache(
                     &mut pruned_tools,
                     &cache_cfg,
+                    &pinned_tool_names_for_bridge(&edge_profile),
                 );
 
                 let loop_started = Instant::now();
@@ -3022,6 +3029,7 @@ impl InProcessChatTurnBridge {
                             crate::turn::llm::context::annotate_tool_schemas_for_cache(
                                 &mut pruned_tools,
                                 &cache_cfg,
+                                &pinned_tool_names_for_bridge(&edge_profile),
                             );
                             crate::turn::llm::context::augment_manifest_trace_with_wire(
                                 &mut bridge_manifest_trace_json,
@@ -4624,6 +4632,7 @@ pub mod bridge_inprocess_test_helpers {
 mod tests {
     use super::*;
     use crate::turn::bridge::sse_helpers::apply_forward_llm_sse_event;
+    use crate::turn::prompt_cache::default_pinned_tool_names;
     use astra_services::SessionArtifactStore;
     use astra_services::{
         SessionArtifactJsonRecord, SessionArtifactJsonStore, StoredSessionArtifact,
@@ -5170,6 +5179,22 @@ mod tests {
     use crate::turn::prompt_cache::CACHE_ENV_MUTEX;
 
     #[test]
+    fn pinned_tool_names_for_bridge_uses_edge_profile_override_or_default_fallback() {
+        let mut edge_profile = Map::new();
+        edge_profile.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_PINNED_TOOL_NAMES.to_string(),
+            json!(["bash"]),
+        );
+
+        let overridden = pinned_tool_names_for_bridge(&edge_profile);
+        assert!(overridden.contains("bash"));
+        assert!(!overridden.contains("read_file"));
+
+        let fallback = pinned_tool_names_for_bridge(&Map::new());
+        assert_eq!(fallback, default_pinned_tool_names());
+    }
+
+    #[test]
     fn self_awareness_section_is_post_cache_volatile() {
         let section = self_awareness_volatile_section(
             "\n\n## Self-Awareness\nTurn: 37 | Tokens: 26899/80000",
@@ -5357,6 +5382,7 @@ mod tests {
         annotate_tool_schemas_for_caching(
             &mut tools,
             &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
+            &default_pinned_tool_names(),
         );
 
         // Only last tool should have cache_control
@@ -5378,7 +5404,11 @@ mod tests {
     #[test]
     fn annotate_tool_schemas_noop_for_openai() {
         let mut tools = vec![json!({"function": {"name": "bash"}})];
-        annotate_tool_schemas_for_caching(&mut tools, &PromptCacheConfig::latch("openai", "gpt-4"));
+        annotate_tool_schemas_for_caching(
+            &mut tools,
+            &PromptCacheConfig::latch("openai", "gpt-4"),
+            &default_pinned_tool_names(),
+        );
         assert!(
             tools[0].get("cache_control").is_none(),
             "OpenAI tools should not get cache_control"
@@ -5403,6 +5433,7 @@ mod tests {
         annotate_tool_schemas_for_caching(
             &mut tools,
             &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
+            &default_pinned_tool_names(),
         );
 
         assert!(
@@ -5569,7 +5600,7 @@ mod tests {
             json!({"function": {"name": "bash"}}),
             json!({"function": {"name": "read_file"}}),
         ];
-        annotate_tool_schemas_for_caching(&mut tools, &cfg);
+        annotate_tool_schemas_for_caching(&mut tools, &cfg, &default_pinned_tool_names());
 
         for (i, tool) in tools.iter().enumerate() {
             assert!(
@@ -5790,6 +5821,7 @@ mod tests {
         annotate_tool_schemas_for_caching(
             &mut tools,
             &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
+            &default_pinned_tool_names(),
         );
         assert!(tools.is_empty());
     }
@@ -7751,11 +7783,43 @@ mod tests {
                     .into(),
             ),
         );
+        ep.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES
+                .to_string(),
+            serde_json::json!(["github"]),
+        );
 
         let block = deferred_tools_block_for_bridge_model(&ep, "gpt-4o-2024-08-06");
         assert!(
             block.contains("<deferred_tools>"),
             "same effective context budget should preserve the CLI-rendered deferred block"
+        );
+    }
+
+    #[test]
+    fn deferred_tools_block_drops_text_without_names_manifest() {
+        let mut ep: Map<String, Value> = Map::new();
+        ep.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT
+                .to_string(),
+            Value::String(
+                "<deferred_tools><tool><name>github</name></tool></deferred_tools>".to_string(),
+            ),
+        );
+        ep.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW
+                .to_string(),
+            Value::Number(
+                crate::prompts::budget_for_model(Some("gpt-4o"))
+                    .model_limit
+                    .into(),
+            ),
+        );
+
+        let block = deferred_tools_block_for_bridge_model(&ep, "gpt-4o");
+        assert!(
+            block.is_empty(),
+            "bridge must not render deferred prompt text without the paired names manifest used by validator/tool_search"
         );
     }
 

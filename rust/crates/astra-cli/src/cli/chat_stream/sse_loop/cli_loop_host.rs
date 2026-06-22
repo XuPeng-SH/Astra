@@ -908,25 +908,13 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
     }
 
     fn inject_tool_schema(&mut self, schema: Value) {
-        if let Some(name) = schema
-            .get("function")
-            .and_then(|f| f.get("name"))
-            .and_then(Value::as_str)
-        {
-            let name_owned = name.to_string();
-            self.valid_tool_names.insert(name_owned.clone());
-            self.registry.upsert_schema(schema.clone());
-            if let Some(existing) = self.all_schemas.iter_mut().find(|tool| {
-                tool.get("function")
-                    .and_then(|f| f.get("name"))
-                    .and_then(Value::as_str)
-                    == Some(name_owned.as_str())
-            }) {
-                *existing = schema;
-            } else {
-                self.all_schemas.push(schema);
-            }
-        }
+        crate::cli::tool_surface_injection::install_injected_tool_schema(
+            self.executor.as_ref(),
+            schema,
+            &mut self.all_schemas,
+            &mut self.valid_tool_names,
+            Some(&mut self.registry),
+        );
     }
 
     fn render_final_text(&mut self, text: &str) {
@@ -1570,7 +1558,7 @@ mod tests {
     // ends. Same shape as `interaction_scoped_tool_restrictions`.
 
     fn schema(name: &str) -> serde_json::Value {
-        serde_json::json!({"function": {"name": name}})
+        serde_json::json!({"type": "function", "function": {"name": name}})
     }
 
     #[test]
