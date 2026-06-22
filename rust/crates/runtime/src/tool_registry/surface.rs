@@ -12,7 +12,7 @@
 //!   schema visible in upcoming `tools[]` payloads until the model actually
 //!   calls that tool once.
 //!
-//! The default T1 set is the 13-member coding core (see `DEFAULT_PINNED`).
+//! The default T1 set is the coding core (see `DEFAULT_PINNED`).
 //! Users override via `runtime.tool_surface.pinned_tools` in TOML. A name
 //! prefixed with `-` removes a default (e.g. `"-grep"`).
 //!
@@ -214,6 +214,19 @@ impl ToolSurface {
     /// mutating the surface.
     pub fn pinned_schemas(&self) -> Vec<Value> {
         self.pinned.clone()
+    }
+
+    /// Resolved pinned names in the same stable order as [`pinned_schemas`].
+    ///
+    /// This is the single runtime answer to "which tools are T1 for this
+    /// surface?". Callers that need cache markers, edge metadata, or diagnostics
+    /// should derive from the resolved surface instead of rebuilding the
+    /// DEFAULT_PINNED + TOML override rules locally.
+    pub fn pinned_names(&self) -> Vec<String> {
+        self.pinned
+            .iter()
+            .filter_map(|schema| tool_schema_name(schema).map(str::to_string))
+            .collect()
     }
 
     /// The deferred manifest — one `name + short_desc` entry per non-pinned
