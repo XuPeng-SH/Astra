@@ -274,6 +274,7 @@ pub(crate) struct LlmContextManifestTrace {
     pub volatile_preamble_count: usize,
     pub tool_schema_count: usize,
     pub selection_trace: Option<Value>,
+    pub runtime_manifest: Option<Value>,
 }
 
 impl LlmContextManifestTrace {
@@ -288,6 +289,7 @@ impl LlmContextManifestTrace {
             "volatile_preamble_count": self.volatile_preamble_count,
             "tool_schema_count": self.tool_schema_count,
             "selection_trace": self.selection_trace.clone(),
+            "runtime_manifest": self.runtime_manifest.clone(),
         })
     }
 }
@@ -736,6 +738,7 @@ pub(crate) fn assemble_bridge_context(
             volatile_preamble_count,
             tool_schema_count,
             selection_trace: input.tool_surface.selection_trace.clone(),
+            runtime_manifest: None,
         },
     }
 }
@@ -956,6 +959,7 @@ pub(crate) fn assemble_context_pipeline(
             volatile_preamble_count,
             tool_schema_count,
             selection_trace: input.tool_surface.selection_trace.clone(),
+            runtime_manifest: state.runtime_manifest.clone(),
         },
     })
 }

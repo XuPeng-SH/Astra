@@ -1125,6 +1125,7 @@ pub struct AgenticLoopState {
     pub context_manifest_pool: Option<astra_core::SharedPool>,
     pub context_manifest_user_id: Option<String>,
     pub context_manifest_model_name: Option<String>,
+    pub runtime_manifest: Option<serde_json::Value>,
     /// Current nested agent/sub-run depth. Root loops start at 0.
     pub recursion_depth: u8,
 
@@ -2318,6 +2319,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         context_manifest_pool: None,
         context_manifest_user_id: None,
         context_manifest_model_name: None,
+        runtime_manifest: None,
         recursion_depth: 0,
         final_text: String::new(),
         final_text_streamed: false,
@@ -2755,6 +2757,7 @@ pub(crate) mod tests {
             context_manifest_pool: None,
             context_manifest_user_id: None,
             context_manifest_model_name: None,
+            runtime_manifest: None,
             recursion_depth: 0,
             final_text: String::new(),
             final_text_streamed: false,

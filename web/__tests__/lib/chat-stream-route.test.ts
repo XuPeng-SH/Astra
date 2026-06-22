@@ -9,6 +9,10 @@ vi.mock("@/lib/api/web-store", () => ({
   ensureChatBackendSession: vi.fn(),
   getChat: vi.fn(),
   resolveBackendModelName: vi.fn(),
+  selectedWebModel: vi.fn((model?: string | null) => {
+    const normalized = model?.trim();
+    return normalized || "sonnet-4.6-adaptive";
+  }),
   setChatActiveRun: vi.fn(),
   updateChatWorkspaceSelection: vi.fn(),
   updateStreamingAssistantMessage: vi.fn(),
@@ -694,6 +698,9 @@ describe("chat stream route proxy cancellation", () => {
     >;
     expect(fetchCalls[0]?.[1].json).toEqual(
       expect.objectContaining({
+        parts: [],
+        attachments: [],
+        selected_model: { model: "backend-model" },
         workspace_binding: {
           kind: "edge_workspace",
           display_name: "MacBook Pro",
@@ -986,6 +993,9 @@ describe("chat stream route proxy cancellation", () => {
     >;
     expect(fetchCalls[0]?.[1].json).toEqual(
       expect.objectContaining({
+        parts: [],
+        attachments: [],
+        selected_model: { model: "backend-model" },
         workspace_binding: expect.objectContaining({
           kind: "edge_workspace",
           cwd: "/Users/xupeng/github/astra",

@@ -61,6 +61,21 @@ pub fn admissible_tool_names_from_visible_and_extras(
     admissible_tool_names(&visible, &extras)
 }
 
+/// Strict variant for externally-owned capability surfaces.
+///
+/// Agent Binding mode must not admit static Astra catalog tools unless they
+/// are actually present in the loop's visible schemas. This keeps request
+/// validation aligned with the binding-discovered tool surface.
+pub fn admissible_tool_names_from_visible_and_extras_strict(
+    visible_schemas: &[serde_json::Value],
+    extras: &[String],
+) -> HashSet<String> {
+    let mut out =
+        astra_turn_core::tool::deferred_activation::tool_names_from_schemas(visible_schemas);
+    out.extend(extras.iter().cloned());
+    out
+}
+
 pub(crate) struct HeadlessResolvedExecution {
     id: String,
     name: String,

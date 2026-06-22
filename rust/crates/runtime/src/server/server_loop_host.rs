@@ -833,6 +833,9 @@ pub struct ServerAgenticLoopHost {
     interaction_mode: Option<RequestedTurnInteractionMode>,
     /// `true` when this session explicitly requests full LLM request/response capture.
     full_llm_capture: bool,
+    /// Whether tool-call validation should admit Astra's static tool catalog
+    /// even when those tools are not visible in the current loop.
+    static_tool_catalog_admissible: bool,
     /// System-prompt section reminding the LLM that a plan is in-flight.
     /// Shared mutable so mid-run tool executions (enter_plan_mode /
     /// exit_plan_mode) can refresh it. `None` means no active plan; reads
@@ -957,9 +960,11 @@ pub struct ServerAgenticLoopHostBuilder {
     interactive_client: bool,
     interaction_mode: Option<RequestedTurnInteractionMode>,
     full_llm_capture: bool,
+    static_tool_catalog_admissible: bool,
     event_tx: Option<tokio::sync::mpsc::Sender<Value>>,
     plan_resume_hint: Option<String>,
     task_board_resume_hint: Option<String>,
+    server_tool_catalog_enabled: bool,
     #[cfg(feature = "bridge-e2e-hooks")]
     test_llm_rounds: Vec<Value>,
     #[cfg(feature = "bridge-e2e-hooks")]
@@ -1006,9 +1011,11 @@ impl ServerAgenticLoopHostBuilder {
             interactive_client: false,
             interaction_mode: None,
             full_llm_capture: false,
+            static_tool_catalog_admissible: true,
             event_tx: None,
             plan_resume_hint: None,
             task_board_resume_hint: None,
+            server_tool_catalog_enabled: true,
             #[cfg(feature = "bridge-e2e-hooks")]
             test_llm_rounds: Vec::new(),
             #[cfg(feature = "bridge-e2e-hooks")]
@@ -1087,6 +1094,11 @@ impl ServerAgenticLoopHostBuilder {
         self
     }
 
+    pub fn with_server_tool_catalog_enabled(mut self, enabled: bool) -> Self {
+        self.server_tool_catalog_enabled = enabled;
+        self
+    }
+
     pub fn with_edge_profile(mut self, profile: Map<String, Value>) -> Self {
         self.edge_profile = profile;
         self
@@ -1157,6 +1169,12 @@ impl ServerAgenticLoopHostBuilder {
         self.full_llm_capture = full_llm_capture;
         self
     }
+
+    pub fn with_static_tool_catalog_admissible(mut self, admissible: bool) -> Self {
+        self.static_tool_catalog_admissible = admissible;
+        self
+    }
+
     #[cfg(feature = "bridge-e2e-hooks")]
     pub fn with_test_llm_rounds(mut self, rounds: Vec<Value>) -> Self {
         self.test_llm_rounds_wired = true;
@@ -1196,7 +1214,7 @@ impl ServerAgenticLoopHostBuilder {
     pub fn build(self) -> ServerAgenticLoopHost {
         // When no edge tools are provided (web-only mode), populate with
         // server-side tool schemas from astra-tools so the LLM knows what's available.
-        let server_side_tools = self.edge_tools.is_empty();
+        let server_side_tools = self.server_tool_catalog_enabled && self.edge_tools.is_empty();
         let binding_snapshot = self.execution_bindings.clone().unwrap_or_else(|| {
             ExecutionBindingSnapshot::inferred(
                 WorkspaceBinding {
@@ -1271,6 +1289,7 @@ impl ServerAgenticLoopHostBuilder {
             interactive_client: self.interactive_client,
             interaction_mode: self.interaction_mode,
             full_llm_capture: self.full_llm_capture,
+            static_tool_catalog_admissible: self.static_tool_catalog_admissible,
             edge_callback_ledger: self.edge_callback_ledger,
             user_id: self.user_id,
             session_id: self.session_id,
@@ -1380,6 +1399,8 @@ impl ServerAgenticLoopHost {
     /// Updates `edge_tools`, `valid_tools`, and `admissible_extras`
     /// so the LLM sees MCP tools and the validator admits them.
     pub fn install_runtime_tool_schemas(&mut self, schemas: Vec<Value>) {
+        let runtime_tools_are_the_only_tool_surface =
+            !schemas.is_empty() && self.edge_tools.is_empty();
         for schema in &schemas {
             if let Some(name) = schema
                 .get("function")
@@ -1391,6 +1412,9 @@ impl ServerAgenticLoopHost {
             }
         }
         self.edge_tools.extend(schemas);
+        if runtime_tools_are_the_only_tool_surface {
+            self.server_side_tools = true;
+        }
     }
 
     fn read_plan_resume_hint(&self) -> Option<String> {
@@ -2527,6 +2551,12 @@ impl ServerAgenticLoopHost {
             .collect()
     }
 
+    #[cfg(test)]
+    fn sync_valid_tools_to_visible(&mut self, visible_tools: &[Value]) {
+        self.valid_tools =
+            self.admissible_tool_names_for_surface(visible_tools, &self.admissible_extras);
+    }
+
     fn sync_valid_tools_to_wire_surface_for_state(
         &mut self,
         wire_tools: &[Value],
@@ -2539,10 +2569,23 @@ impl ServerAgenticLoopHost {
             executor.set_current_searchable_tool_schemas(wire_tools);
             extras.extend(executor.activated_deferred_tool_names());
         }
-        self.valid_tools =
+        self.valid_tools = self.admissible_tool_names_for_surface(wire_tools, &extras);
+    }
+
+    fn admissible_tool_names_for_surface(
+        &self,
+        wire_tools: &[Value],
+        extras: &[String],
+    ) -> HashSet<String> {
+        if self.static_tool_catalog_admissible {
             crate::turn::headless_tool_pipeline::admissible_tool_names_from_visible_and_extras(
-                wire_tools, &extras,
-            );
+                wire_tools, extras,
+            )
+        } else {
+            crate::turn::headless_tool_pipeline::admissible_tool_names_from_visible_and_extras_strict(
+                wire_tools, extras,
+            )
+        }
     }
 
     fn deferred_tool_names_from_edge_profile(&self) -> HashSet<String> {
@@ -4452,6 +4495,133 @@ mod tests {
         tools
     }
 
+    #[test]
+    fn builder_populates_server_tools_by_default_when_edge_tools_empty() {
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u1".to_string(),
+            "s1".to_string(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(false))
+        .build();
+
+        assert!(host.server_side_tools);
+        assert!(
+            !host.edge_tools.is_empty(),
+            "web/default mode should expose server runtime tool schemas"
+        );
+    }
+
+    #[test]
+    fn builder_can_disable_server_tool_catalog_for_registry_runtime() {
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u1".to_string(),
+            "s1".to_string(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(false))
+        .with_server_tool_catalog_enabled(false)
+        .build();
+
+        assert!(!host.server_side_tools);
+        assert!(
+            host.edge_tools.is_empty(),
+            "Agent Binding mode starts with no local/request tool schemas"
+        );
+    }
+
+    #[test]
+    fn registry_runtime_strict_admissible_tools_excludes_static_catalog() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u1".to_string(),
+            "s1".to_string(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(false))
+        .with_server_tool_catalog_enabled(false)
+        .with_static_tool_catalog_admissible(false)
+        .build();
+        let visible = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__tools__query",
+                "description": "Binding-discovered MCP tool",
+                "parameters": { "type": "object", "properties": {} }
+            }
+        })];
+
+        host.sync_valid_tools_to_visible(&visible);
+
+        assert!(host.valid_tool_names().contains("mcp__tools__query"));
+        assert!(!host.valid_tool_names().contains("bash"));
+        assert!(!host.valid_tool_names().contains("tool_search"));
+    }
+
+    #[test]
+    fn registry_runtime_mcp_tools_switch_empty_host_to_server_side_execution() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u1".to_string(),
+            "s1".to_string(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(false))
+        .with_server_tool_catalog_enabled(false)
+        .with_static_tool_catalog_admissible(false)
+        .build();
+
+        assert!(!host.server_side_tools);
+
+        host.install_runtime_tool_schemas(vec![json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__tools__query",
+                "description": "Binding-discovered MCP tool",
+                "parameters": { "type": "object", "properties": {} }
+            }
+        })]);
+
+        assert!(
+            host.server_side_tools,
+            "registry runtime MCP tools are executed by ServerToolExecutor, not edge ledger"
+        );
+        assert!(host.valid_tool_names().contains("mcp__tools__query"));
+    }
+
+    #[test]
+    fn runtime_mcp_install_does_not_reclassify_existing_edge_tool_surface() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u1".to_string(),
+            "s1".to_string(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(false))
+        .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+
+        assert!(!host.server_side_tools);
+
+        host.install_runtime_tool_schemas(vec![json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__tools__query",
+                "description": "Binding-discovered MCP tool",
+                "parameters": { "type": "object", "properties": {} }
+            }
+        })]);
+
+        assert!(
+            !host.server_side_tools,
+            "existing edge/client tool surfaces must keep edge-ledger execution"
+        );
+        assert!(host.valid_tool_names().contains("mcp__tools__query"));
+    }
+
     fn schema_names(tools: &[Value]) -> HashSet<String> {
         tools
             .iter()
@@ -6291,6 +6461,7 @@ mod tests {
             context_manifest_pool: None,
             context_manifest_user_id: None,
             context_manifest_model_name: None,
+            runtime_manifest: None,
             recursion_depth: 0,
             final_text: String::new(),
             final_text_streamed: false,
