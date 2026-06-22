@@ -21,7 +21,9 @@ use astra_turn_core::permission::match_target::{
     AllowMatchTarget, default_match_target, fingerprint_for_match_target,
 };
 use astra_turn_core::permission::memory_profile::resolved_write_path;
-use astra_turn_core::permission::path_sensitivity::sensitive_path_token_for_tool_args;
+use astra_turn_core::permission::path_sensitivity::{
+    PathSensitivity, classify_path_sensitivity, sensitive_path_token_for_tool_args,
+};
 use astra_turn_core::tool_argument_hints::{
     command_hint_from_args, path_hint_from_args, permission_prompt_display_label,
 };
@@ -40,7 +42,17 @@ use std::{
 /// applies (caller renders the bare reason).
 pub(crate) fn safe_alternative_for(reason: &str) -> Option<&'static str> {
     let lower = reason.to_lowercase();
-    if lower.contains("sensitive path") {
+    if lower.contains("credential") || lower.contains("sensitive credential") {
+        Some(
+            "Use environment variables or a secrets manager instead of reading credential files directly. \
+             If you need to configure a tool, use its CLI command (e.g., `aws configure`, `gcloud auth login`) instead.",
+        )
+    } else if lower.contains("internal artifact") || lower.contains("session artifact") {
+        Some(
+            "Session artifacts are managed by the runtime. Use the appropriate tool (read_file, list_dir) \
+             to inspect workspace files instead of reading internal session state directly.",
+        )
+    } else if lower.contains("sensitive path") {
         Some(
             "Write to a workspace-local path instead (e.g. under the current project tree), \
              or set allow_sensitive_path_writes=true in .astra/permissions.json to opt in.",
@@ -70,6 +82,38 @@ pub(crate) fn safe_alternative_for(reason: &str) -> Option<&'static str> {
         )
     } else {
         None
+    }
+}
+
+fn auto_mode_sensitive_path_denial_reason(path: &str) -> String {
+    match classify_path_sensitivity(path) {
+        PathSensitivity::Sensitive => {
+            format!(
+                "Sandbox: Path '{}' is blocked as a sensitive credential path. \
+                 To allow: add an allow rule in .astra/permissions.json or switch to Prompt mode.",
+                path
+            )
+        }
+        PathSensitivity::WriteSensitive => {
+            format!(
+                "Sandbox: Path '{}' is blocked as write-sensitive app/runtime state. \
+                 To allow: add an allow rule in .astra/permissions.json or switch to Prompt mode.",
+                path
+            )
+        }
+        PathSensitivity::InternalArtifactReadOnly(_) => {
+            format!(
+                "Sandbox: Path '{}' is blocked as an internal runtime artifact path and requires explicit approval to modify",
+                path
+            )
+        }
+        PathSensitivity::Normal => {
+            format!(
+                "Sandbox: Path '{}' is blocked in Auto mode. \
+                 To allow: add an allow rule in .astra/permissions.json or switch to Prompt mode.",
+                path
+            )
+        }
     }
 }
 
@@ -3200,7 +3244,7 @@ impl PermissionManager {
             }
         }
 
-        if matches!(envelope.source, DecisionSource::SensitivePath { .. })
+        if let DecisionSource::SensitivePath { path } = &envelope.source
             && matches!(envelope.decision, HardDecision::NeedExternal { .. })
         {
             if let Some(allowed) = self.check_overrides_for_request(
@@ -3224,9 +3268,7 @@ impl PermissionManager {
                 return GateOutcome::Allow;
             }
             if self.mode == PermissionMode::Auto {
-                return GateOutcome::Deny(
-                    "Sensitive path requires explicit opt-in in Auto mode".to_string(),
-                );
+                return GateOutcome::Deny(auto_mode_sensitive_path_denial_reason(path));
             }
         }
 
@@ -6834,6 +6876,104 @@ mod tests {
     }
 
     #[test]
+    fn auto_mode_allows_listing_session_diagnostic_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_root = dir.path().join(".astra/sessions");
+        let _guard = astra_services::session_journal::JournalDirGuard::new(&sessions_root);
+        std::fs::create_dir_all(&sessions_root).unwrap();
+        std::fs::write(
+            sessions_root.join("550e8400-e29b-41d4-a716-446655440000.jsonl"),
+            "{}\n",
+        )
+        .unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
+
+        let list_args = serde_json::json!({"path": sessions_root.to_string_lossy().to_string()});
+        let list_decision = pm.check_nonblocking("list_dir", &list_args);
+        assert!(
+            matches!(list_decision, GateOutcome::Allow),
+            "Auto mode must allow read-only diagnostic directory listing: {list_decision:?}"
+        );
+
+        let bash_args = serde_json::json!({"command": format!("ls -lt {} | head -20", sessions_root.display())});
+        let bash_decision = pm.check_nonblocking("bash", &bash_args);
+        assert!(
+            matches!(bash_decision, GateOutcome::Allow),
+            "Auto mode must allow read-only shell listing of diagnostic directories: {bash_decision:?}"
+        );
+
+        let session_dir = sessions_root.join("550e8400-e29b-41d4-a716-446655440000");
+        let checkpoint_dir = session_dir.join("step_checkpoints");
+        std::fs::create_dir_all(&checkpoint_dir).unwrap();
+        std::fs::write(checkpoint_dir.join("000001-heavy.json"), "{}\n").unwrap();
+
+        let session_glob_args = serde_json::json!({
+            "command": format!("ls -d {}/*/ | tail -10", sessions_root.display())
+        });
+        let session_glob_decision = pm.check_nonblocking("bash", &session_glob_args);
+        assert!(
+            matches!(session_glob_decision, GateOutcome::Allow),
+            "Auto mode must allow discovering session directories: {session_glob_decision:?}"
+        );
+
+        let checkpoint_glob_args = serde_json::json!({
+            "command": format!("ls -lt {}/*-heavy.json | head -3", checkpoint_dir.display())
+        });
+        let checkpoint_glob_decision = pm.check_nonblocking("bash", &checkpoint_glob_args);
+        assert!(
+            matches!(checkpoint_glob_decision, GateOutcome::Allow),
+            "Auto mode must allow listing session checkpoint diagnostics: {checkpoint_glob_decision:?}"
+        );
+    }
+
+    #[test]
+    fn auto_mode_allows_hidden_home_logs_but_blocks_writes_and_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = "~/.xxx/logs/session.log";
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
+
+        let read_args = serde_json::json!({"path": log_path});
+        let read_decision = pm.check_nonblocking("read_file", &read_args);
+        assert!(
+            matches!(read_decision, GateOutcome::Allow),
+            "Auto mode should not special-case hidden app log reads by directory name: {read_decision:?}"
+        );
+
+        let write_args = serde_json::json!({
+            "path": log_path,
+            "content": "tamper"
+        });
+        let write_decision = pm.check_nonblocking("write_file", &write_args);
+        assert!(
+            matches!(
+                &write_decision,
+                GateOutcome::Deny(reason) if reason.contains("write-sensitive app/runtime state")
+            ),
+            "hidden home app state remains write-sensitive in Auto mode: {write_decision:?}"
+        );
+
+        let secret_args = serde_json::json!({"path": "~/.xxx/.env"});
+        let secret_decision = pm.check_nonblocking("read_file", &secret_args);
+        assert!(
+            matches!(
+                &secret_decision,
+                GateOutcome::Deny(reason) if reason.contains("sensitive credential")
+            ),
+            "credential-shaped files under hidden home app state must still gate: {secret_decision:?}"
+        );
+
+        let bash_secret_args = serde_json::json!({"command": "cat ~/.xxx/.env"});
+        let bash_secret_decision = pm.check_nonblocking("bash", &bash_secret_args);
+        assert!(
+            matches!(
+                &bash_secret_decision,
+                GateOutcome::Deny(reason) if reason.contains("sensitive credential")
+            ),
+            "shell reads of hidden-home credentials must still gate: {bash_secret_decision:?}"
+        );
+    }
+
+    #[test]
     fn auto_mode_still_denies_writing_current_session_journal() {
         let dir = tempfile::tempdir().unwrap();
         let sessions_root = dir.path().join(".astra/sessions");
@@ -6881,7 +7021,7 @@ mod tests {
     }
 
     #[test]
-    fn sensitive_path_gate_rejects_arbitrary_astra_tool_result_shape() {
+    fn sensitive_path_gate_allows_reading_write_sensitive_hidden_app_state() {
         let dir = tempfile::tempdir().unwrap();
         let artifact_path = dir
             .path()
@@ -6891,11 +7031,19 @@ mod tests {
         let artifact_str = artifact_path.to_string_lossy().to_string();
 
         // This .astra/sessions/ path is NOT under the configured sessions root,
-        // so it must be treated as a sensitive path, not an internal artifact.
-        let args = serde_json::json!({ "path": &artifact_str });
+        // so it is not an internal artifact. It is still only write-sensitive:
+        // read-only diagnostics should not need explicit opt-in just because
+        // the parent directory is a hidden app state directory.
+        let read_args = serde_json::json!({ "path": &artifact_str });
         assert!(
-            super::sensitive_path_match_for_request("read_file", &args).is_some(),
-            "only artifacts under the configured sessions root may bypass the sensitive-path gate"
+            super::sensitive_path_match_for_request("read_file", &read_args).is_none(),
+            "write-sensitive hidden app state should remain readable in Auto mode"
+        );
+
+        let write_args = serde_json::json!({ "path": &artifact_str, "content": "tamper" });
+        assert!(
+            super::sensitive_path_match_for_request("write_file", &write_args).is_some(),
+            "write-sensitive hidden app state must still gate mutations"
         );
     }
 
