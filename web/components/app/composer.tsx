@@ -207,6 +207,7 @@ export function Composer({
   const [webSearch, setWebSearch] = useState(false);
   const [thinking, setThinking] = useState(true);
   const [model, setModel] = useState(initialModel ?? 'sonnet-4.6-adaptive');
+  const [modelAvailable, setModelAvailable] = useState(false);
   const [activeSkills, setActiveSkills] = useState<string[]>([]);
   const [slashQuery, setSlashQuery] = useState<string | null>(null);
   const [activeSlashIndex, setActiveSlashIndex] = useState(0);
@@ -222,7 +223,8 @@ export function Composer({
   const lastRangeRef = useRef<Range | null>(null);
   const slashRangeRef = useRef<Range | null>(null);
   const wasDisabledRef = useRef(Boolean(disabled));
-  const canSubmit = text.trim().length > 0 && !submitting && !disabled;
+  const canSubmit =
+    text.trim().length > 0 && !submitting && !disabled && modelAvailable;
   const visualPlaceholder = compactComposerPlaceholder(placeholder);
   const slashCommands = useMemo(() => {
     if (slashQuery === null) {
@@ -264,6 +266,7 @@ export function Composer({
   }, [model, persistModelPreference]);
 
   function handleModelChange(nextModel: string) {
+    setModelAvailable(true);
     setModel(nextModel);
     onModelChange?.(nextModel);
   }
@@ -433,7 +436,7 @@ export function Composer({
 
   async function submit() {
     const trimmed = text.trim();
-    if (!trimmed || submitting || disabled) {
+    if (!trimmed || submitting || disabled || !modelAvailable) {
       return;
     }
     const editor = editorRef.current;
@@ -561,7 +564,13 @@ export function Composer({
           )}
           aria-label={submitting ? 'Streaming' : 'Ready'}
         />
-        <ModelSwitcher value={model} onChange={handleModelChange} thinking={thinking} onThinkingChange={setThinking} />
+        <ModelSwitcher
+          value={model}
+          onChange={handleModelChange}
+          onModelAvailabilityChange={setModelAvailable}
+          thinking={thinking}
+          onThinkingChange={setThinking}
+        />
         {showStop ? (
           <IconButton
             icon={Square}

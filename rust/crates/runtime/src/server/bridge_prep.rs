@@ -1,4 +1,5 @@
 use super::*;
+use astra_services::runs::SelectedModelRequest;
 
 // ─── Typed request body ──────────────────────────────────────────────────────
 
@@ -25,6 +26,8 @@ pub(super) struct ChatTurnRequestBody {
     edge_profile: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     project_rules: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    selected_model: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     model: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -88,8 +91,18 @@ impl ChatTurnRequestBody {
         self.session_id = Some(serde_json::Value::String(id.to_string()));
     }
 
-    fn model_str(&self) -> Option<&str> {
-        self.model.as_ref()?.as_str()
+    fn selected_model_obj(&self) -> Option<&serde_json::Map<String, serde_json::Value>> {
+        self.selected_model.as_ref()?.as_object()
+    }
+
+    fn selected_model_name(&self) -> Option<&str> {
+        self.selected_model_obj()?.get("model")?.as_str()
+    }
+
+    fn selected_model_gateway(&self) -> Option<&str> {
+        self.selected_model_obj()?
+            .get("gateway")
+            .and_then(serde_json::Value::as_str)
     }
 
     fn execution_state_obj(&self) -> Option<&serde_json::Map<String, serde_json::Value>> {
@@ -204,6 +217,81 @@ fn validate_session_id_shape(
     Ok(())
 }
 
+fn validate_exact_bridge_string(
+    field: &'static str,
+    value: &str,
+    code: &'static str,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if value.is_empty() || value.trim() != value || value.chars().any(char::is_control) {
+        return Err(error_response_coded(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "{field} must be a non-empty exact string without leading/trailing whitespace or control characters"
+            ),
+            code,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_selected_model_shape(
+    request: &ChatTurnRequestBody,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if request.model.is_some() {
+        return Err(error_response_coded(
+            StatusCode::BAD_REQUEST,
+            "legacy top-level model is not accepted on /chat/turn; use selected_model.model",
+            "selected_model_invalid",
+        ));
+    }
+    let Some(selected_model) = request.selected_model.as_ref() else {
+        tracing::warn!(
+            target: "astra_runtime::server::chat_turn_bridge",
+            reason = "missing_model_selection",
+            "selected_model.model is required before /chat/turn can create or bind a session"
+        );
+        return Err(error_response_coded(
+            StatusCode::BAD_REQUEST,
+            astra_core::model_override::MISSING_MODEL_SELECTION_MESSAGE,
+            "missing_model_selection",
+        ));
+    };
+    let Some(obj) = selected_model.as_object() else {
+        return Err(error_response_coded(
+            StatusCode::BAD_REQUEST,
+            "selected_model must be an object",
+            "selected_model_invalid",
+        ));
+    };
+    // Delegate field whitelist to SelectedModelRequest's deny_unknown_fields.
+    if serde_json::from_value::<SelectedModelRequest>(selected_model.clone()).is_err() {
+        return Err(error_response_coded(
+            StatusCode::BAD_REQUEST,
+            "selected_model must match {model: string, gateway?: string}",
+            "selected_model_invalid",
+        ));
+    }
+    let Some(model) = request.selected_model_name() else {
+        return Err(error_response_coded(
+            StatusCode::BAD_REQUEST,
+            "selected_model.model is required",
+            "selected_model_invalid",
+        ));
+    };
+    validate_exact_bridge_string("selected_model.model", model, "selected_model_invalid")?;
+    if obj.get("gateway").is_some_and(|value| !value.is_null()) {
+        let Some(gateway) = request.selected_model_gateway() else {
+            return Err(error_response_coded(
+                StatusCode::BAD_REQUEST,
+                "selected_model.gateway must be a string when provided",
+                "selected_model_invalid",
+            ));
+        };
+        validate_exact_bridge_string("selected_model.gateway", gateway, "selected_model_invalid")?;
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 struct ExplicitBridgeTurnIdentity {
     session_turn: u32,
@@ -254,6 +342,7 @@ pub(super) async fn prepare_chat_turn_bridge_body(
     let Ok(mut request) = serde_json::from_slice::<ChatTurnRequestBody>(&body) else {
         return Ok(PreparedChatTurnBridgeRequest::passthrough(body));
     };
+    validate_selected_model_shape(&request)?;
     validate_session_id_shape(&request)?;
     let explicit_turn_identity = validate_explicit_turn_identity(&request)?;
 
@@ -349,8 +438,8 @@ pub(super) async fn prepare_chat_turn_bridge_body(
     // ── Metadata extraction ─────────────────────────────────────────────
     let task_hint = request.classify_task();
     let user_query_b64 = Some(URL_SAFE.encode(user_query.as_bytes()));
-    let routing_meta_b64 = request.model_str().map(|_| {
-        let meta = serde_json::Value::Object(build_skipped_routing_metadata("model_override"));
+    let routing_meta_b64 = request.selected_model_name().map(|_| {
+        let meta = serde_json::Value::Object(build_skipped_routing_metadata("selected_model"));
         URL_SAFE.encode(serde_json::to_string(&meta).unwrap_or_default().as_bytes())
     });
     let force_intent = detect_correction(&user_query).then_some("question".to_string());
@@ -689,6 +778,10 @@ mod tests {
         json!({ "type": "function", "function": { "name": name } })
     }
 
+    fn selected_model() -> serde_json::Value {
+        json!({"model": "deepseek-v4-pro-official"})
+    }
+
     #[derive(Clone)]
     struct CaptureEnabledSessionService;
 
@@ -864,6 +957,7 @@ mod tests {
         let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker));
         let body = Bytes::from(
             serde_json::to_vec(&json!({
+                "selected_model": selected_model(),
                 "messages": [{"role": "user", "content": "hello"}]
             }))
             .expect("body should serialize"),
@@ -884,6 +978,65 @@ mod tests {
         let payload: serde_json::Value =
             serde_json::from_slice(&prepared.body).expect("prepared body should be valid json");
         assert_eq!(payload["session_id"], "bound-session");
+        assert_eq!(
+            payload["selected_model"]["model"],
+            "deepseek-v4-pro-official"
+        );
+        assert!(payload.get("model").is_none());
+    }
+
+    #[tokio::test]
+    async fn prepare_body_rejects_missing_selected_model_before_session_side_effects() {
+        let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker));
+        let body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "messages": [{"role": "user", "content": "hello"}]
+            }))
+            .expect("body should serialize"),
+        );
+
+        let (status, body) =
+            match prepare_chat_turn_bridge_body(&state, &test_user(), body, Some("bound-session"))
+                .await
+            {
+                Ok(_) => panic!("missing selected_model must fail before session preparation"),
+                Err(error) => error,
+            };
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body.0.error_code.as_deref(),
+            Some("missing_model_selection")
+        );
+        assert!(
+            body.0.detail.contains("Model selection is required"),
+            "{}",
+            body.0.detail
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_body_rejects_legacy_top_level_model() {
+        let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker));
+        let body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "model": "deepseek-v4-pro-official",
+                "messages": [{"role": "user", "content": "hello"}]
+            }))
+            .expect("body should serialize"),
+        );
+
+        let (status, body) =
+            match prepare_chat_turn_bridge_body(&state, &test_user(), body, Some("bound-session"))
+                .await
+            {
+                Ok(_) => panic!("legacy model must not be accepted as selected_model"),
+                Err(error) => error,
+            };
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.0.error_code.as_deref(), Some("selected_model_invalid"));
+        assert!(body.0.detail.contains("legacy top-level model"));
     }
 
     #[tokio::test]
@@ -900,6 +1053,7 @@ mod tests {
         }
         let body = Bytes::from(
             serde_json::to_vec(&json!({
+                "selected_model": selected_model(),
                 "messages": [
                     {"role": "assistant", "content": null, "tool_calls": [{"id": "call-1"}]},
                     {"role": "tool", "tool_call_id": "call-1", "content": "done"}
@@ -933,6 +1087,7 @@ mod tests {
         }
         let body = Bytes::from(
             serde_json::to_vec(&json!({
+                "selected_model": selected_model(),
                 "session_turn": 2,
                 "turn_chain_id": "root-chain",
                 "user_query_event_id": "root-query",
@@ -956,6 +1111,7 @@ mod tests {
         let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker));
         let body = Bytes::from(
             serde_json::to_vec(&json!({
+                "selected_model": selected_model(),
                 "session_turn": 2,
                 "messages": [{"role": "user", "content": "review local changes"}]
             }))
@@ -978,6 +1134,7 @@ mod tests {
             .with_session_service(Arc::new(CaptureEnabledSessionService));
         let body = Bytes::from(
             serde_json::to_vec(&json!({
+                "selected_model": selected_model(),
                 "session_id": "capture-session",
                 "messages": [{"role": "user", "content": "hello"}]
             }))
@@ -998,191 +1155,99 @@ mod tests {
     // ── same_tool_names ─────────────────────────────────────────────
 
     #[test]
-    fn same_tools_same_order() {
-        let left = vec![tool_value("bash")];
-        let right = vec![tool_value("bash")];
-        assert!(same_tool_names(&left, &right));
-    }
-
-    #[test]
-    fn same_tools_different_order() {
-        let left = vec![tool_value("bash"), tool_value("grep")];
-        let right = vec![tool_value("grep"), tool_value("bash")];
-        assert!(same_tool_names(&left, &right));
-    }
-
-    #[test]
-    fn different_tools() {
-        let left = vec![tool_value("bash")];
-        let right = vec![tool_value("grep")];
-        assert!(!same_tool_names(&left, &right));
-    }
-
-    #[test]
-    fn extra_tool_means_not_same() {
-        let left = vec![tool_value("bash"), tool_value("grep")];
-        let right = vec![tool_value("bash")];
-        assert!(!same_tool_names(&left, &right));
-    }
-
-    #[test]
-    fn both_empty_arrays() {
-        assert!(same_tool_names(&[], &[]));
-    }
-
-    #[test]
-    fn duplicates_are_deduped() {
-        let left = vec![tool_value("bash"), tool_value("bash")];
-        let right = vec![tool_value("bash")];
-        assert!(same_tool_names(&left, &right));
-    }
-
-    #[test]
-    fn missing_function_field_both_sides() {
-        let left = vec![json!({})];
-        let right = vec![json!({})];
-        assert!(same_tool_names(&left, &right));
-    }
-
-    #[test]
-    fn only_named_tools_count() {
-        let left = vec![json!({}), tool_value("bash")];
-        let right = vec![tool_value("bash")];
-        assert!(same_tool_names(&left, &right));
-    }
-
-    #[test]
-    fn missing_name_in_function() {
-        let left = vec![json!({ "function": {} })];
-        let right = vec![json!({ "function": {} })];
-        assert!(same_tool_names(&left, &right));
+    fn same_tool_names_compares_sets_not_order_or_count() {
+        for (left, right, expected) in [
+            (vec![], vec![], true),
+            (vec!["bash"], vec!["bash"], true),
+            (vec!["bash", "grep"], vec!["grep", "bash"], true),
+            (vec!["bash", "bash"], vec!["bash"], true),
+            (vec!["bash"], vec!["grep"], false),
+            (vec!["bash", "grep"], vec!["bash"], false),
+        ] {
+            let left_tools = left.into_iter().map(tool_value).collect::<Vec<_>>();
+            let right_tools = right.into_iter().map(tool_value).collect::<Vec<_>>();
+            assert_eq!(
+                same_tool_names(&left_tools, &right_tools),
+                expected,
+                "left={left_tools:?} right={right_tools:?}"
+            );
+        }
+        for (left, right) in [
+            (vec![json!({})], vec![json!({})]),
+            (
+                vec![json!({}), tool_value("bash")],
+                vec![tool_value("bash")],
+            ),
+            (
+                vec![json!({ "function": {} })],
+                vec![json!({ "function": {} })],
+            ),
+        ] {
+            assert!(
+                same_tool_names(&left, &right),
+                "unnamed schemas must be ignored: left={left:?} right={right:?}"
+            );
+        }
     }
 
     // ── sync_cached_bridge_field ────────────────────────────────────
 
     #[test]
-    fn sync_object_has_field_entry_does_not() {
-        let mut entry = serde_json::Map::new();
-        let mut object = serde_json::Map::new();
-        object.insert("project_rules".to_string(), json!("rule-value"));
-
-        sync_cached_bridge_field(&mut entry, &mut object, "project_rules");
-
-        assert_eq!(entry.get("project_rules"), Some(&json!("rule-value")));
-        assert_eq!(object.get("project_rules"), Some(&json!("rule-value")));
-    }
-
-    #[test]
-    fn sync_entry_has_field_object_does_not() {
-        let mut entry = serde_json::Map::new();
-        entry.insert("project_rules".to_string(), json!("cached-value"));
-        let mut object = serde_json::Map::new();
-
-        sync_cached_bridge_field(&mut entry, &mut object, "project_rules");
-
-        assert_eq!(entry.get("project_rules"), Some(&json!("cached-value")));
-        assert_eq!(object.get("project_rules"), Some(&json!("cached-value")));
-    }
-
-    #[test]
-    fn sync_both_have_field_object_wins() {
-        let mut entry = serde_json::Map::new();
-        entry.insert("project_rules".to_string(), json!("old-cached"));
-        let mut object = serde_json::Map::new();
-        object.insert("project_rules".to_string(), json!("new-incoming"));
-
-        sync_cached_bridge_field(&mut entry, &mut object, "project_rules");
-
-        assert_eq!(entry.get("project_rules"), Some(&json!("new-incoming")));
-        assert_eq!(object.get("project_rules"), Some(&json!("new-incoming")));
-    }
-
-    #[test]
-    fn sync_object_has_null_treated_as_absent() {
-        let mut entry = serde_json::Map::new();
-        entry.insert("project_rules".to_string(), json!("cached-value"));
-        let mut object = serde_json::Map::new();
-        object.insert("project_rules".to_string(), serde_json::Value::Null);
-
-        sync_cached_bridge_field(&mut entry, &mut object, "project_rules");
-
-        // null is treated as absent, so entry's cached value is used
-        assert_eq!(entry.get("project_rules"), Some(&json!("cached-value")));
-        assert_eq!(object.get("project_rules"), Some(&json!("cached-value")));
-    }
-
-    #[test]
-    fn sync_neither_has_field() {
-        let mut entry = serde_json::Map::new();
-        let mut object = serde_json::Map::new();
-
-        sync_cached_bridge_field(&mut entry, &mut object, "project_rules");
-
-        assert!(entry.get("project_rules").is_none());
-        assert!(object.get("project_rules").is_none());
-    }
-
-    #[test]
-    fn sync_complex_nested_value_preserved() {
+    fn sync_cached_bridge_field_prefers_incoming_else_cached_non_null_value() {
         let complex = json!({
             "rules": [{"id": 1, "text": "do this"}, {"id": 2, "text": "do that"}],
             "meta": {"version": 3}
         });
-        let mut entry = serde_json::Map::new();
-        let mut object = serde_json::Map::new();
-        object.insert("project_rules".to_string(), complex.clone());
+        for (cached, incoming, expected) in [
+            (None, Some(json!("rule-value")), Some(json!("rule-value"))),
+            (
+                Some(json!("cached-value")),
+                None,
+                Some(json!("cached-value")),
+            ),
+            (
+                Some(json!("old-cached")),
+                Some(json!("new-incoming")),
+                Some(json!("new-incoming")),
+            ),
+            (
+                Some(json!("cached-value")),
+                Some(serde_json::Value::Null),
+                Some(json!("cached-value")),
+            ),
+            (None, None, None),
+            (None, Some(complex.clone()), Some(complex.clone())),
+        ] {
+            let mut entry = serde_json::Map::new();
+            if let Some(value) = cached {
+                entry.insert("project_rules".to_string(), value);
+            }
+            let mut object = serde_json::Map::new();
+            if let Some(value) = incoming {
+                object.insert("project_rules".to_string(), value);
+            }
 
-        sync_cached_bridge_field(&mut entry, &mut object, "project_rules");
+            sync_cached_bridge_field(&mut entry, &mut object, "project_rules");
 
-        assert_eq!(entry.get("project_rules"), Some(&complex));
+            assert_eq!(entry.get("project_rules"), expected.as_ref());
+            assert_eq!(object.get("project_rules"), expected.as_ref());
+        }
     }
 
     // ── inject_bridge_cache_state ───────────────────────────────────
 
     #[test]
-    fn inject_empty_entry_does_nothing() {
-        let entry = serde_json::Map::new();
-        let mut object = serde_json::Map::new();
+    fn inject_bridge_cache_state_contract() {
+        let mut empty_object = serde_json::Map::new();
+        inject_bridge_cache_state(&serde_json::Map::new(), &mut empty_object);
+        assert!(empty_object.get("bridge_cache_state").is_none());
 
-        inject_bridge_cache_state(&entry, &mut object);
-
-        assert!(object.get("bridge_cache_state").is_none());
-    }
-
-    #[test]
-    fn inject_entry_with_seed_state_injects() {
         let mut entry = serde_json::Map::new();
         entry.insert("created_at".to_string(), json!("2024-01-15T10:30:00Z"));
-
-        let mut object = serde_json::Map::new();
-        inject_bridge_cache_state(&entry, &mut object);
-
-        let state = object.get("bridge_cache_state");
-        assert!(state.is_some());
-        let state_obj = state.unwrap().as_object().unwrap();
-        assert!(state_obj.contains_key("created_at"));
-    }
-
-    #[test]
-    fn inject_overwrites_existing_bridge_cache_state() {
-        let mut entry = serde_json::Map::new();
-        entry.insert("created_at".to_string(), json!("2024-01-15T10:30:00Z"));
-
+        entry.insert("history".to_string(), json!(["turn1", "turn2"]));
         let mut object = serde_json::Map::new();
         object.insert("bridge_cache_state".to_string(), json!("old-stuff"));
 
-        inject_bridge_cache_state(&entry, &mut object);
-
-        let state = object.get("bridge_cache_state").unwrap();
-        assert!(state.is_object()); // replaced with the normalized object
-    }
-
-    #[test]
-    fn inject_entry_with_history_seed() {
-        let mut entry = serde_json::Map::new();
-        entry.insert("history".to_string(), json!(["turn1", "turn2"]));
-
-        let mut object = serde_json::Map::new();
         inject_bridge_cache_state(&entry, &mut object);
 
         let state = object
@@ -1190,6 +1255,10 @@ mod tests {
             .unwrap()
             .as_object()
             .unwrap();
+        assert_eq!(
+            state.get("created_at"),
+            Some(&json!("2024-01-15T10:30:00Z"))
+        );
         assert_eq!(state.get("history"), Some(&json!(["turn1", "turn2"])));
         assert_eq!(state.get("turn_count"), Some(&json!(0)));
     }
@@ -1202,90 +1271,61 @@ mod tests {
     }
 
     #[test]
-    fn trim_no_tool_results_returns_early() {
-        let mut map = serde_json::Map::new();
-        map.insert("edge_tools".to_string(), json!([tool_value("bash")]));
-        let mut request = request_from_map(map);
-        let original_tools = request.edge_tools_vec().cloned();
+    fn trim_edge_tools_for_result_turn_contract() {
+        let mut empty = ChatTurnRequestBody::default();
+        trim_edge_tools_for_result_turn(&mut empty, "some query");
+        assert!(empty.edge_tools_vec().is_none());
 
-        trim_edge_tools_for_result_turn(&mut request, "");
+        for (tool_results, edge_tools, user_query, expected_names) in [
+            (None, Some(vec![tool_value("bash")]), "", Some(vec!["bash"])),
+            (
+                Some(json!([{"name": "bash", "output": "ok"}])),
+                None,
+                "",
+                None,
+            ),
+            (
+                Some(json!([{"name": "bash", "output": "ok"}])),
+                Some(vec![tool_value("bash"), tool_value("grep")]),
+                "what happened?",
+                Some(vec!["bash", "grep"]),
+            ),
+            (
+                Some(json!([{"name": "bash", "output": "ok"}])),
+                Some(vec![
+                    tool_value("bash"),
+                    tool_value("grep"),
+                    tool_value("view"),
+                ]),
+                "",
+                Some(vec!["bash"]),
+            ),
+            (
+                Some(json!([])),
+                Some(vec![tool_value("bash"), tool_value("grep")]),
+                "",
+                Some(vec!["bash", "grep"]),
+            ),
+        ] {
+            let mut map = serde_json::Map::new();
+            if let Some(results) = tool_results {
+                map.insert("tool_results".to_string(), results);
+            }
+            if let Some(tools) = edge_tools {
+                map.insert("edge_tools".to_string(), serde_json::Value::Array(tools));
+            }
+            let mut request = request_from_map(map);
 
-        assert_eq!(request.edge_tools_vec().cloned(), original_tools);
-    }
+            trim_edge_tools_for_result_turn(&mut request, user_query);
 
-    #[test]
-    fn trim_no_edge_tools_returns_early() {
-        let mut map = serde_json::Map::new();
-        map.insert(
-            "tool_results".to_string(),
-            json!([{"name": "bash", "output": "ok"}]),
-        );
-        let mut request = request_from_map(map);
-
-        trim_edge_tools_for_result_turn(&mut request, "");
-
-        assert!(request.edge_tools_vec().is_none());
-    }
-
-    #[test]
-    fn trim_does_not_panic_on_empty_request() {
-        let mut request = ChatTurnRequestBody::default();
-        trim_edge_tools_for_result_turn(&mut request, "some query");
-    }
-
-    #[test]
-    fn trim_with_user_query_skips_filtering() {
-        let mut map = serde_json::Map::new();
-        map.insert(
-            "tool_results".to_string(),
-            json!([{"name": "bash", "output": "ok"}]),
-        );
-        map.insert(
-            "edge_tools".to_string(),
-            json!([tool_value("bash"), tool_value("grep")]),
-        );
-        let mut request = request_from_map(map);
-
-        trim_edge_tools_for_result_turn(&mut request, "what happened?");
-
-        let tools = request.edge_tools_vec().unwrap();
-        assert_eq!(tools.len(), 2);
-    }
-
-    #[test]
-    fn trim_filters_to_used_tools() {
-        let mut map = serde_json::Map::new();
-        map.insert(
-            "tool_results".to_string(),
-            json!([{"name": "bash", "output": "ok"}]),
-        );
-        map.insert(
-            "edge_tools".to_string(),
-            json!([tool_value("bash"), tool_value("grep"), tool_value("view")]),
-        );
-        let mut request = request_from_map(map);
-
-        trim_edge_tools_for_result_turn(&mut request, "");
-
-        let tools = request.edge_tools_vec().unwrap();
-        assert_eq!(tools.len(), 1);
-        assert_eq!(extract_tool_name(&tools[0]), Some("bash"));
-    }
-
-    #[test]
-    fn trim_empty_tool_results_array_is_no_op() {
-        let mut map = serde_json::Map::new();
-        map.insert("tool_results".to_string(), json!([]));
-        map.insert(
-            "edge_tools".to_string(),
-            json!([tool_value("bash"), tool_value("grep")]),
-        );
-        let original_count = 2;
-        let mut request = request_from_map(map);
-
-        trim_edge_tools_for_result_turn(&mut request, "");
-
-        assert_eq!(request.edge_tools_vec().unwrap().len(), original_count);
+            let actual_names = request.edge_tools_vec().map(|tools| {
+                tools
+                    .iter()
+                    .filter_map(extract_tool_name)
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(actual_names, expected_names);
+        }
     }
 
     // ── ChatTurnRequestBody typed deserialization ────────────────────
@@ -1300,7 +1340,7 @@ mod tests {
             "edge_tools": [tool_value("bash"), tool_value("grep")],
             "edge_profile": {"cwd": "/tmp"},
             "project_rules": {"max_tokens": 1000},
-            "model": "gpt-4",
+            "selected_model": {"model": "gpt-4", "gateway": null},
             "execution_state": {"pending_tools": []},
             "custom_field": "preserved"
         });
@@ -1313,7 +1353,8 @@ mod tests {
         assert_eq!(request.messages_slice().len(), 1);
         assert!(request.has_tool_results());
         assert_eq!(request.edge_tools_vec().unwrap().len(), 2);
-        assert_eq!(request.model_str(), Some("gpt-4"));
+        assert_eq!(request.selected_model_name(), Some("gpt-4"));
+        assert!(serialized.get("model").is_none());
         assert!(request.execution_state_obj().is_some());
 
         // Forward-compat: unknown fields preserved
@@ -1321,74 +1362,95 @@ mod tests {
     }
 
     #[test]
-    fn typed_request_empty_json_object() {
-        let request: ChatTurnRequestBody = serde_json::from_str("{}").unwrap();
-        assert!(request.session_id_str().is_none());
-        assert!(!request.has_non_null_session_id());
-        assert!(request.messages_slice().is_empty());
-        assert!(!request.has_tool_results());
-        assert!(request.edge_tools_vec().is_none());
-        assert!(request.model_str().is_none());
-    }
-
-    #[test]
-    fn typed_request_null_session_id() {
-        let request: ChatTurnRequestBody = serde_json::from_str(r#"{"session_id": null}"#).unwrap();
-        assert!(request.session_id_str().is_none());
-        assert!(!request.has_non_null_session_id());
-    }
-
-    #[test]
-    fn typed_request_numeric_session_id_handled() {
-        let request: ChatTurnRequestBody = serde_json::from_str(r#"{"session_id": 42}"#).unwrap();
-        assert!(request.session_id_str().is_none());
-        assert!(request.has_non_null_session_id());
-    }
-
-    #[test]
-    fn validate_session_id_shape_rejects_non_string_values() {
-        let request: ChatTurnRequestBody = serde_json::from_str(r#"{"session_id": 42}"#).unwrap();
-        let (status, body) = validate_session_id_shape(&request).unwrap_err();
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(body.0.detail, "session_id must be a string");
-    }
-
-    #[test]
-    fn validate_session_id_shape_allows_absent_or_string_values() {
-        let absent: ChatTurnRequestBody = serde_json::from_str(r#"{"messages":[]}"#).unwrap();
-        let stringy: ChatTurnRequestBody =
-            serde_json::from_str(r#"{"session_id":"sess-1"}"#).unwrap();
-        assert!(validate_session_id_shape(&absent).is_ok());
-        assert!(validate_session_id_shape(&stringy).is_ok());
-    }
-
-    #[test]
-    fn validate_session_id_shape_rejects_empty_strings() {
-        for raw in [r#"{"session_id":""}"#, r#"{"session_id":"   "}"#] {
+    fn session_id_shape_validation_contract() {
+        for (raw, expected) in [
+            (r#"{"messages":[]}"#, None),
+            (r#"{"session_id":null}"#, None),
+            (r#"{"session_id":"sess-1"}"#, None),
+            (r#"{"session_id":42}"#, Some("session_id must be a string")),
+            (r#"{"session_id":""}"#, Some("session_id must not be empty")),
+            (
+                r#"{"session_id":"   "}"#,
+                Some("session_id must not be empty"),
+            ),
+        ] {
             let request: ChatTurnRequestBody = serde_json::from_str(raw).unwrap();
-            let (status, body) = validate_session_id_shape(&request).unwrap_err();
-            assert_eq!(status, StatusCode::BAD_REQUEST);
-            assert_eq!(body.0.detail, "session_id must not be empty");
+            match expected {
+                Some(message) => {
+                    let (status, body) = validate_session_id_shape(&request).unwrap_err();
+                    assert_eq!(status, StatusCode::BAD_REQUEST, "{raw}");
+                    assert_eq!(body.0.detail, message, "{raw}");
+                }
+                None => validate_session_id_shape(&request).unwrap_or_else(|err| {
+                    panic!("{raw} should be valid, got {:?}", err.1.0.detail)
+                }),
+            }
         }
     }
 
     #[test]
-    fn typed_request_wrong_type_for_messages() {
-        let request: ChatTurnRequestBody =
-            serde_json::from_str(r#"{"messages": "not-an-array"}"#).unwrap();
-        assert!(request.messages_slice().is_empty());
+    fn selected_model_shape_validation_contract() {
+        for (raw, expected_code) in [
+            (r#"{}"#, Some("missing_model_selection")),
+            (
+                r#"{"selected_model":"gpt-4"}"#,
+                Some("selected_model_invalid"),
+            ),
+            (r#"{"selected_model":{}}"#, Some("selected_model_invalid")),
+            (
+                r#"{"selected_model":{"model":""}}"#,
+                Some("selected_model_invalid"),
+            ),
+            (
+                r#"{"selected_model":{"model":" gpt-4"}}"#,
+                Some("selected_model_invalid"),
+            ),
+            (
+                "{\"selected_model\":{\"model\":\"gpt\\n4\"}}",
+                Some("selected_model_invalid"),
+            ),
+            (
+                r#"{"selected_model":{"model":"gpt-4","gateway":42}}"#,
+                Some("selected_model_invalid"),
+            ),
+            (
+                r#"{"selected_model":{"model":"gpt-4","provider":"openai"}}"#,
+                Some("selected_model_invalid"),
+            ),
+            (
+                r#"{"selected_model":{"model":"gpt-4"},"model":"gpt-4"}"#,
+                Some("selected_model_invalid"),
+            ),
+            (r#"{"selected_model":{"model":"gpt-4"}}"#, None),
+            (
+                r#"{"selected_model":{"model":"gpt-4","gateway":null}}"#,
+                None,
+            ),
+            (
+                r#"{"selected_model":{"model":"gpt-4","gateway":"gw-1"}}"#,
+                None,
+            ),
+        ] {
+            let request: ChatTurnRequestBody = serde_json::from_str(raw).unwrap();
+            match expected_code {
+                Some(code) => {
+                    let (status, body) = validate_selected_model_shape(&request).unwrap_err();
+                    assert_eq!(status, StatusCode::BAD_REQUEST, "{raw}");
+                    assert_eq!(body.0.error_code.as_deref(), Some(code), "{raw}");
+                }
+                None => validate_selected_model_shape(&request).unwrap_or_else(|err| {
+                    panic!("{raw} should be valid, got {:?}", err.1.0.detail)
+                }),
+            }
+        }
     }
 
     #[test]
-    fn typed_request_set_session_id() {
+    fn typed_request_mutators_only_touch_their_fields() {
         let mut request = ChatTurnRequestBody::default();
         request.set_session_id("new-sess");
         assert_eq!(request.session_id_str(), Some("new-sess"));
-    }
 
-    #[test]
-    fn typed_request_set_edge_tools() {
-        let mut request = ChatTurnRequestBody::default();
         assert!(request.edge_tools_vec().is_none());
         request.set_edge_tools(vec![tool_value("bash")]);
         assert_eq!(request.edge_tools_vec().unwrap().len(), 1);
@@ -1405,81 +1467,54 @@ mod tests {
     // ── extract_tool_name ───────────────────────────────────────────
 
     #[test]
-    fn extract_tool_name_standard_format() {
-        assert_eq!(extract_tool_name(&tool_value("bash")), Some("bash"));
-    }
-
-    #[test]
-    fn extract_tool_name_missing_function() {
-        assert_eq!(extract_tool_name(&json!({"type": "custom"})), None);
-    }
-
-    #[test]
-    fn extract_tool_name_missing_name() {
-        assert_eq!(extract_tool_name(&json!({"function": {}})), None);
-    }
-
-    #[test]
-    fn extract_tool_name_non_string_name() {
-        assert_eq!(extract_tool_name(&json!({"function": {"name": 42}})), None);
-    }
-
-    /// Fail-closed contract: a non-`function` type must not leak its name,
-    /// even when `function.name` is present and valid. This is the core
-    /// guarantee of the single-source admission contract (`tool_schema_name`).
-    #[test]
-    fn extract_tool_name_rejects_custom_type_and_accepts_missing_type_function_shorthand() {
-        let custom_with_name = json!({"type": "custom", "function": {"name": "leaked"}});
-        assert_eq!(extract_tool_name(&custom_with_name), None);
-
-        let missing_type_with_name = json!({"function": {"name": "leaked"}});
-        assert_eq!(extract_tool_name(&missing_type_with_name), Some("leaked"));
+    fn extract_tool_name_fail_closed_contract() {
+        for (schema, expected) in [
+            (tool_value("bash"), Some("bash")),
+            (json!({"type": "custom"}), None),
+            (json!({"function": {}}), None),
+            (json!({"function": {"name": 42}}), None),
+            (
+                json!({"type": "custom", "function": {"name": "leaked"}}),
+                None,
+            ),
+            (
+                json!({"function": {"name": "shorthand"}}),
+                Some("shorthand"),
+            ),
+        ] {
+            assert_eq!(extract_tool_name(&schema), expected, "schema={schema}");
+        }
     }
 
     // ── sync_opt_field_with_cache ───────────────────────────────────
 
     #[test]
-    fn sync_opt_field_writes_to_cache() {
-        let mut entry = serde_json::Map::new();
-        let mut field = Some(json!("rule-value"));
+    fn sync_opt_field_with_cache_contract() {
+        for (cached, field_value, expected) in [
+            (None, Some(json!("rule-value")), Some(json!("rule-value"))),
+            (
+                Some(json!("cached-value")),
+                None,
+                Some(json!("cached-value")),
+            ),
+            (
+                Some(json!("cached-value")),
+                Some(serde_json::Value::Null),
+                Some(json!("cached-value")),
+            ),
+            (None, None, None),
+        ] {
+            let mut entry = serde_json::Map::new();
+            if let Some(value) = cached {
+                entry.insert("rules".to_string(), value);
+            }
+            let mut field = field_value;
 
-        sync_opt_field_with_cache(&mut entry, "rules", &mut field);
+            sync_opt_field_with_cache(&mut entry, "rules", &mut field);
 
-        assert_eq!(entry.get("rules"), Some(&json!("rule-value")));
-        assert_eq!(field, Some(json!("rule-value")));
-    }
-
-    #[test]
-    fn sync_opt_field_restores_from_cache() {
-        let mut entry = serde_json::Map::new();
-        entry.insert("rules".to_string(), json!("cached-value"));
-        let mut field: Option<serde_json::Value> = None;
-
-        sync_opt_field_with_cache(&mut entry, "rules", &mut field);
-
-        assert_eq!(field, Some(json!("cached-value")));
-    }
-
-    #[test]
-    fn sync_opt_field_null_treated_as_absent() {
-        let mut entry = serde_json::Map::new();
-        entry.insert("rules".to_string(), json!("cached-value"));
-        let mut field = Some(serde_json::Value::Null);
-
-        sync_opt_field_with_cache(&mut entry, "rules", &mut field);
-
-        assert_eq!(field, Some(json!("cached-value")));
-    }
-
-    #[test]
-    fn sync_opt_field_neither_has_value() {
-        let mut entry = serde_json::Map::new();
-        let mut field: Option<serde_json::Value> = None;
-
-        sync_opt_field_with_cache(&mut entry, "rules", &mut field);
-
-        assert!(entry.get("rules").is_none());
-        assert!(field.is_none());
+            assert_eq!(entry.get("rules"), expected.as_ref());
+            assert_eq!(field, expected);
+        }
     }
 
     // ── inject_bridge_cache_state_into ──────────────────────────────

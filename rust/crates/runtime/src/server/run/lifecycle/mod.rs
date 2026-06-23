@@ -74,6 +74,7 @@ use crate::turn::agentic_loop::host::{
     AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, CancellationState,
     ContextTracePersistenceContext, EvaluationPersistenceContext, MessagingState,
     RequestConstraints, SkillState, StopHookState, run_agentic_loop_with_host,
+    runtime_manifest_for_model,
 };
 use crate::{
     DatabaseEvaluationService, DatabaseEventService, DatabaseTraceEventWriter,
@@ -2482,8 +2483,8 @@ impl AgenticRunLifecycleService {
         let selected_model = selected_model.ok_or_else(|| {
             error_response_coded(
                 StatusCode::BAD_REQUEST,
-                "selected_model is required for /chat/stream",
-                "selected_model_missing",
+                astra_core::model_override::MISSING_MODEL_SELECTION_MESSAGE,
+                "missing_model_selection",
             )
         })?;
         exact_runtime_string(
@@ -7150,7 +7151,11 @@ impl SubRunExecutor for ServerSubRunExecutor {
             context_manifest_pool: self.shared_pool.clone(),
             context_manifest_user_id: Some(config.user_id.clone()),
             context_manifest_model_name: config.agent_profile.model_override.clone(),
-            runtime_manifest: None,
+            runtime_manifest: runtime_manifest_for_model(
+                "server_agent_subrun",
+                "server_agent_subrun",
+                config.agent_profile.model_override.as_deref(),
+            ),
             recursion_depth: config.recursion_depth,
             final_text: String::new(),
             final_text_streamed: false,
@@ -10357,7 +10362,7 @@ mod tests {
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert_eq!(
             err.1.0.error_code.as_deref(),
-            Some("selected_model_missing")
+            Some("missing_model_selection")
         );
     }
 

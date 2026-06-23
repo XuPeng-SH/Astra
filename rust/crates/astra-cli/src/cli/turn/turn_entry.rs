@@ -9,6 +9,7 @@ use crate::cli::session::session_adaptation::{finalize_turn_adaptation, prepare_
 use crate::cli::session::session_input::{
     build_effective_line, clear_pending_recovery_for_ordinary_chat_input, finalize_effective_line,
 };
+use crate::cli::session::session_runtime;
 use crate::cli::session::session_state::SessionState;
 
 /// Decision returned by `classify_shell_passthrough`.
@@ -145,6 +146,14 @@ async fn run_chat_turn(
     session_id: Option<&str>,
     semantic_query_override: Option<&str>,
 ) -> TurnAttempt {
+    ensure_default_turn_model(state, api, token).await;
+    if let Some(failure) = model_selection_preflight_failure(
+        state.model.as_deref(),
+        session_id,
+        state.turn.saturating_add(1),
+    ) {
+        return TurnAttempt::Completed(Box::new(Err(failure)));
+    }
     prepare_turn_adaptation(state, api, token, message).await;
     let attempt = execute_stream_turn(
         state,
@@ -158,6 +167,48 @@ async fn run_chat_turn(
     .await;
     finalize_turn_adaptation(state, matches!(attempt, TurnAttempt::Interrupted(_))).await;
     attempt
+}
+
+async fn ensure_default_turn_model(
+    state: &mut SessionState,
+    api: &astra_thin_client::ThinClient,
+    token: &str,
+) {
+    let had_model =
+        astra_core::model_override::normalize_model_override(state.model.as_deref()).is_some();
+    if let Some(model) = session_runtime::ensure_state_default_model(api, token, state).await
+        && !had_model
+    {
+        tracing::info!(
+            target: "astra_cli::model_selection",
+            model = %model,
+            "selected default model from server model list for CLI turn"
+        );
+    }
+}
+
+fn model_selection_preflight_failure(
+    model: Option<&str>,
+    session_id: Option<&str>,
+    turn_index: u32,
+) -> Option<crate::TurnFailure> {
+    if astra_core::model_override::normalize_model_override(model).is_some() {
+        return None;
+    }
+    tracing::warn!(
+        target: "astra_cli::model_selection",
+        reason = "missing_model_selection",
+        session_id = ?session_id,
+        turn_index,
+        "missing concrete model selection; refusing turn before session adaptation or bridge POST"
+    );
+    Some(crate::TurnFailure {
+        error: astra_core::model_override::missing_model_selection_error().to_string(),
+        partial: crate::PartialTurnData {
+            session_id: session_id.map(str::to_string),
+            ..Default::default()
+        },
+    })
 }
 
 fn run_chat_turn_boxed<'a>(
@@ -298,12 +349,60 @@ pub(crate) async fn handle_chat_input_with_ui(
 
 #[cfg(test)]
 mod tests {
-    use super::{ShellPassthroughDecision, classify_shell_passthrough};
+    use super::{
+        ShellPassthroughDecision, classify_shell_passthrough, model_selection_preflight_failure,
+    };
 
     #[test]
     fn shell_passthrough_returns_none_for_ordinary_input() {
         assert!(classify_shell_passthrough("hello world").is_none());
         assert!(classify_shell_passthrough("/help").is_none());
+    }
+
+    #[test]
+    fn model_preflight_blocks_missing_selection_before_turn_side_effects() {
+        for missing in [None, Some(""), Some(" default ")] {
+            let failure = model_selection_preflight_failure(missing, Some("sess-missing-model"), 2)
+                .expect("missing model must fail before turn side effects");
+            let classified = astra_core::ClassifiedError::from(failure.error.clone());
+            assert_eq!(
+                classified.kind,
+                astra_core::ErrorKind::MissingModelSelection
+            );
+            assert_eq!(
+                failure.partial.session_id.as_deref(),
+                Some("sess-missing-model")
+            );
+        }
+
+        assert!(
+            model_selection_preflight_failure(
+                Some("deepseek-v4-pro-official(thinking:high)"),
+                Some("sess-ok"),
+                2,
+            )
+            .is_none(),
+            "thinking selectors are concrete model choices and must reach payload assembly"
+        );
+    }
+
+    #[test]
+    fn run_chat_turn_resolves_default_model_before_missing_model_preflight() {
+        let source = include_str!("turn_entry.rs");
+        let fn_start = source
+            .find("async fn run_chat_turn")
+            .expect("run_chat_turn should exist");
+        let default_idx = source[fn_start..]
+            .find("ensure_default_turn_model")
+            .expect("run_chat_turn should resolve default turn model");
+        let preflight_idx = source[fn_start..]
+            .find("model_selection_preflight_failure")
+            .expect("run_chat_turn should keep missing-model preflight");
+
+        assert!(
+            default_idx < preflight_idx,
+            "default model must be resolved before missing-model preflight"
+        );
     }
 
     #[test]

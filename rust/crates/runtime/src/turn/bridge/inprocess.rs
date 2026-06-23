@@ -69,6 +69,52 @@ use astra_turn_core::tool_schema_prune::prune_tool_schemas;
 const TOOL_RESULT_AUDIT_CHARS: usize = 4000;
 const ROOT_TURN_JOURNAL_HEADER: &str = "x-mo-root-turn-journal";
 
+fn selected_model_name_from_payload(payload: &Value) -> Option<String> {
+    payload
+        .get("selected_model")
+        .and_then(Value::as_object)
+        .and_then(|selected_model| selected_model.get("model"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+}
+
+fn rewrite_bridge_runtime_manifest_model_resolution(
+    trace: &mut Value,
+    requested_model: Option<&str>,
+    resolved_model: &str,
+    provider: &str,
+    fallback_trace: Option<&Value>,
+) {
+    let Some(trace_obj) = trace.as_object_mut() else {
+        return;
+    };
+    let manifest = trace_obj
+        .entry("runtime_manifest")
+        .or_insert_with(|| json!({}));
+    if !manifest.is_object() {
+        *manifest = json!({});
+    }
+    let selected_model = requested_model.unwrap_or(resolved_model);
+    let source = if fallback_trace.is_some() {
+        "rate_limit_fallback"
+    } else {
+        "bridge_request"
+    };
+    manifest["schema_version"] = json!("astra_runtime_manifest.v1");
+    manifest["selected_model"] = json!({
+        "model": selected_model,
+    });
+    manifest["model_resolution"] = json!({
+        "source": source,
+        "requested_model": requested_model,
+        "model": resolved_model,
+        "provider": provider,
+        "resolved": true,
+        "fallback": fallback_trace,
+    });
+    manifest["runtime_profile"] = json!("bridge_inprocess");
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct CachedSessionStartMemory {
     stable_memory_section: Option<String>,
@@ -1290,10 +1336,7 @@ impl InProcessChatTurnBridge {
             .cloned()
             .unwrap_or_default();
         let explain = explain_requested(&payload);
-        let model_override = payload
-            .get("model")
-            .and_then(Value::as_str)
-            .map(ToString::to_string);
+        let selected_model_name = selected_model_name_from_payload(&payload);
         let round_index = payload
             .get("round_index")
             .and_then(Value::as_i64)
@@ -1463,6 +1506,21 @@ impl InProcessChatTurnBridge {
             // Resolve LLM model (skipped when `test_llm_rounds` drives the turn — feature `bridge-e2e-hooks`).
             // Also capture fallback_chain for rate-limit-triggered fallback.
             let pool_ref = shared_pool.as_ref().map(SharedPool::get);
+            let requested_model_override =
+                astra_core::model_override::normalize_model_override(selected_model_name.as_deref());
+            let requested_model_name = requested_model_override.map(str::to_string);
+            let mut rate_limit_fallback_trace: Option<Value> = None;
+            if !use_e2e_llm && requested_model_override.is_none() {
+                tracing::warn!(
+                    target: "astra_runtime::bridge_inprocess",
+                    session_id = %session_id,
+                    run_id = %run_id,
+                    turn = trace_turn,
+                    round = round_index,
+                    reason = "missing_model_selection",
+                    "missing selected_model.model; refusing implicit model fallback"
+                );
+            }
             let (mut model_name, mut wire_model_name, mut api_key, mut base_url, mut provider, mut request_body_overrides, mut cache_capability, fallback_chain) = if use_e2e_llm {
                 (
                     "bridge-e2e-mock".to_string(),
@@ -1478,7 +1536,7 @@ impl InProcessChatTurnBridge {
                 match astra_services::resolve_active_llm_model(
                     &matrixone,
                     encryptor.as_ref(),
-                    model_override.as_deref(),
+                    requested_model_override,
                     pool_ref,
                 )
                 .await
@@ -1496,7 +1554,12 @@ impl InProcessChatTurnBridge {
                         m.fallback_chain,
                     ),
                     Err(e) => {
-                        yield render_sse_map(&build_stream_error_event(&e, "MODEL_NOT_AVAILABLE", false));
+                        let error_code = if requested_model_override.is_none() {
+                            astra_core::ErrorKind::MissingModelSelection.as_str()
+                        } else {
+                            "MODEL_NOT_AVAILABLE"
+                        };
+                        yield render_sse_map(&build_stream_error_event(&e, error_code, false));
                         mark_disconnect_capture_finalized(&disconnect_capture_state);
                         return;
                     }
@@ -1554,6 +1617,20 @@ impl InProcessChatTurnBridge {
                     .await
                     {
                         FallbackOutcome::Resolved(fb) => {
+                            let from_model = model_name.clone();
+                            let to_model = fb.model_name.clone();
+                            astra_core::agent_warn!(
+                                "llm",
+                                "rate-limit fallback: {} -> {} ({})",
+                                from_model,
+                                to_model,
+                                reason.as_str()
+                            );
+                            rate_limit_fallback_trace = Some(json!({
+                                "from_model": from_model,
+                                "to_model": to_model,
+                                "reason": reason.as_str(),
+                            }));
                             model_name = fb.model_name;
                             wire_model_name = fb.wire_model_name;
                             api_key = fb.api_key;
@@ -1641,9 +1718,10 @@ impl InProcessChatTurnBridge {
             //   it never invalidates the cached prefix.
             //
             // The `# Project Profile` wrapper with cwd/git_branch is
-            // dropped: `bind_runtime_identity` already emits typed
-            // `Model: / CWD: / Branch:` lines from `SessionContext`, so
-            // repeating them as a Markdown block was pure duplicate.
+            // dropped: runtime assembly emits provider-aware `Model:` and
+            // `bind_runtime_identity` emits typed `CWD: / Branch:` lines from
+            // `SessionContext`, so repeating them as a Markdown block was pure
+            // duplicate.
             let env_static = edge_profile
                 .get("environment_static")
                 .and_then(Value::as_str)
@@ -2257,6 +2335,13 @@ impl InProcessChatTurnBridge {
             let mut pipeline_tool_schemas = pipeline_outcome.tool_schemas;
             let mut bridge_manifest_trace = pipeline_outcome.manifest_trace;
             let mut bridge_manifest_trace_json = bridge_manifest_trace.to_json();
+            rewrite_bridge_runtime_manifest_model_resolution(
+                &mut bridge_manifest_trace_json,
+                requested_model_name.as_deref(),
+                &model_name,
+                &provider,
+                rate_limit_fallback_trace.as_ref(),
+            );
             // Debug: dump system prompt for cache analysis (env-gated).
             // Enable with ASTRA_PIPELINE_DUMP_SYSTEM_PROMPT=1. Writes to
             // $TMPDIR/astra-bridge-prompt-<sid>-<ts>.json so `diff` between
@@ -2396,6 +2481,13 @@ impl InProcessChatTurnBridge {
                     pipeline_tool_schemas = rerun.tool_schemas;
                     bridge_manifest_trace = rerun.manifest_trace;
                     bridge_manifest_trace_json = bridge_manifest_trace.to_json();
+                    rewrite_bridge_runtime_manifest_model_resolution(
+                        &mut bridge_manifest_trace_json,
+                        requested_model_name.as_deref(),
+                        &model_name,
+                        &provider,
+                        rate_limit_fallback_trace.as_ref(),
+                    );
                     llm_messages.clear();
                     llm_messages.push(system_msg.clone());
                     bridge_volatile_text = dynamic_msg
@@ -4399,8 +4491,8 @@ impl InProcessChatTurnBridge {
                     "tier": 0,
                     "latency_ms": 0,
                     "estimated_tokens": final_usage.total_tokens() as i64,
-                    "skipped": model_override.is_some(),
-                    "reason": model_override.as_ref().map(|_| "model_override").unwrap_or(""),
+                    "skipped": selected_model_name.is_some(),
+                    "reason": selected_model_name.as_ref().map(|_| "selected_model").unwrap_or(""),
                     "cloud_loop_turns": cloud_loop_turns,
                 }));
                 let explain_event = build_explain_event(
@@ -4649,6 +4741,62 @@ mod tests {
         crate::turn::prompt_cache::resolve_pinned_tool_names_for_config(
             &astra_config::ToolSurfaceConfig::default(),
         )
+    }
+
+    #[test]
+    fn selected_model_name_from_payload_ignores_legacy_top_level_model() {
+        assert_eq!(
+            selected_model_name_from_payload(&json!({
+                "selected_model": {"model": "deepseek-v4-pro-official"},
+                "model": "deepseek-v4-flash",
+            }))
+            .as_deref(),
+            Some("deepseek-v4-pro-official")
+        );
+        assert_eq!(
+            selected_model_name_from_payload(&json!({
+                "model": "deepseek-v4-flash",
+            })),
+            None
+        );
+    }
+
+    #[test]
+    fn bridge_runtime_manifest_distinguishes_requested_and_fallback_model() {
+        let mut trace = json!({
+            "source": "llm_context_bridge",
+            "runtime_manifest": {
+                "schema_version": "astra_runtime_manifest.v1"
+            }
+        });
+        let fallback = json!({
+            "from_model": "deepseek-v4-pro-official",
+            "to_model": "deepseek-v4-flash",
+            "reason": "rate_limit",
+        });
+
+        rewrite_bridge_runtime_manifest_model_resolution(
+            &mut trace,
+            Some("deepseek-v4-pro-official"),
+            "deepseek-v4-flash",
+            "openai",
+            Some(&fallback),
+        );
+
+        let manifest = &trace["runtime_manifest"];
+        assert_eq!(
+            manifest["selected_model"]["model"],
+            "deepseek-v4-pro-official"
+        );
+        assert_eq!(
+            manifest["model_resolution"]["source"],
+            "rate_limit_fallback"
+        );
+        assert_eq!(manifest["model_resolution"]["model"], "deepseek-v4-flash");
+        assert_eq!(
+            manifest["model_resolution"]["fallback"]["from_model"],
+            "deepseek-v4-pro-official"
+        );
     }
 
     /// RAII guard that restores an environment variable on drop (panic-safe).

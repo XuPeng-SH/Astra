@@ -12,15 +12,18 @@ const fallbackModels: ModelSummary[] = [
   { id: 'opus-4.7', name: 'Opus 4.7', subtitle: 'Most capable for ambitious work', tier: 'upgrade' },
   { id: 'haiku-4.5', name: 'Haiku 4.5', subtitle: 'Fastest and most efficient', tier: 'included' },
 ];
+const fallbackModelIds = new Set(fallbackModels.map((model) => model.id));
 
 export function ModelSwitcher({
   value,
   onChange,
+  onModelAvailabilityChange,
   thinking,
   onThinkingChange,
 }: {
   value: string;
   onChange: (value: string) => void;
+  onModelAvailabilityChange?: (available: boolean) => void;
   thinking: boolean;
   onThinkingChange: (value: boolean) => void;
 }) {
@@ -39,13 +42,24 @@ export function ModelSwitcher({
       });
   }, []);
 
-  useEffect(() => {
-    if (loadedModels && models.length > 0 && !models.some((model) => model.id === value)) {
-      onChange(models[0].id);
-    }
-  }, [loadedModels, models, onChange, value]);
-
   const selected = models.find((model) => model.id === value);
+  const defaultModel = loadedModels ? models[0] : undefined;
+  const shouldSelectDefault =
+    Boolean(defaultModel) &&
+    (!value || (!selected && fallbackModelIds.has(value)));
+  const visibleSelected = selected ?? (shouldSelectDefault ? defaultModel : undefined);
+  const modelUnavailable = loadedModels && Boolean(value) && !visibleSelected;
+
+  useEffect(() => {
+    if (!defaultModel || !shouldSelectDefault || value === defaultModel.id) {
+      return;
+    }
+    onChange(defaultModel.id);
+  }, [defaultModel, onChange, shouldSelectDefault, value]);
+
+  useEffect(() => {
+    onModelAvailabilityChange?.(loadedModels && Boolean(visibleSelected) && !modelUnavailable);
+  }, [loadedModels, modelUnavailable, onModelAvailabilityChange, visibleSelected]);
 
   return (
     <Popover
@@ -53,9 +67,14 @@ export function ModelSwitcher({
       trigger={
         <button
           type="button"
+          aria-invalid={modelUnavailable || undefined}
+          title={modelUnavailable ? value : undefined}
           className="flex max-w-56 items-center gap-2 rounded-control px-2 py-1 text-sm text-text-secondary hover:bg-surface-muted hover:text-text"
         >
-          <span className="truncate">{selected?.name ?? value ?? 'Model'}</span>
+          <span className="truncate">
+            {visibleSelected?.name ??
+              (modelUnavailable ? 'Unavailable model' : value || 'Model')}
+          </span>
           <ChevronDown className="size-4" />
         </button>
       }
@@ -64,7 +83,7 @@ export function ModelSwitcher({
       <div className="flex flex-col">
         <div className="max-h-[25vh] min-h-0 space-y-1 overflow-y-auto overscroll-contain p-2 pr-1">
           {models.map((model) => {
-            const checked = model.id === value;
+            const checked = model.id === (visibleSelected?.id ?? value);
             return (
               <button
                 key={model.id}
