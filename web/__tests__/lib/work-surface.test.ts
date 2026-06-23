@@ -230,6 +230,66 @@ describe('work surface reducer', () => {
     });
   });
 
+  it('keeps skipped tool calls distinct from success and failure', () => {
+    let state = applyWorkSurfaceEvent(createEmptyWorkSurface('session-1'), {
+      type: 'tool_call_start',
+      call_id: 'call-skip',
+      tool: 'read_file',
+      arguments: { path: 'README.md' },
+    });
+    state = applyWorkSurfaceEvent(state, {
+      type: 'tool_call_end',
+      call_id: 'call-skip',
+      tool: 'read_file',
+      status: 'skipped',
+      skipped: true,
+      success: true,
+      result: 'Duplicate call skipped.',
+    });
+
+    expect(state.tools[0]).toMatchObject({
+      callId: 'call-skip',
+      tool: 'read_file',
+      status: 'skipped',
+      result: 'Duplicate call skipped.',
+    });
+  });
+
+  it('does not treat blank error_kind as a tool failure', () => {
+    const state = applyWorkSurfaceEvent(createEmptyWorkSurface('session-1'), {
+      type: 'tool_call_end',
+      call_id: 'call-blank-kind',
+      tool: 'bash',
+      status: 'done',
+      error_kind: '',
+      result: 'ok',
+    });
+
+    expect(state.tools[0]).toMatchObject({
+      callId: 'call-blank-kind',
+      status: 'done',
+      errorKind: undefined,
+      result: 'ok',
+    });
+  });
+
+  it('does not let skipped hint override explicit done status', () => {
+    const state = applyWorkSurfaceEvent(createEmptyWorkSurface('session-1'), {
+      type: 'tool_call_end',
+      call_id: 'call-done',
+      tool: 'bash',
+      status: 'done',
+      skipped: true,
+      result: 'ok',
+    });
+
+    expect(state.tools[0]).toMatchObject({
+      callId: 'call-done',
+      status: 'done',
+      result: 'ok',
+    });
+  });
+
   it('projects workspace and executor bindings onto live tool cards', () => {
     let state = applyWorkSurfaceEvent(createEmptyWorkSurface('session-1'), {
       type: 'workspace_bound',
@@ -1143,6 +1203,29 @@ describe('work surface reducer', () => {
       executor: { kind: 'edge_agent' },
       transport: 'edge_ws',
       fallbackPolicy: 'disabled',
+    });
+  });
+
+  it('does not project cancelled transport hints as blocked run state', () => {
+    const state = applyWorkSurfaceEvent(createEmptyWorkSurface('session-1'), {
+      type: 'tool_transport_failed',
+      call_id: 'call-cancelled-blocked',
+      tool: 'bash',
+      success: false,
+      error: "Tool 'bash' cancelled before completion",
+      error_kind: 'cancelled',
+      reason: 'cancelled',
+      cancelled: true,
+      blocked: true,
+    });
+
+    expect(state.runStatus).toBeNull();
+    expect(state.blocked).toBeNull();
+    expect(state.tools[0]).toMatchObject({
+      callId: 'call-cancelled-blocked',
+      status: 'cancelled',
+      errorKind: 'cancelled',
+      blocked: true,
     });
   });
 

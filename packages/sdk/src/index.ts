@@ -54,6 +54,7 @@ export type {
   // Chat types
   ChatRole,
   ToolCall,
+  ToolStatus,
   ThinkingBlock,
   PlanSubtask,
   PlanState,
@@ -147,11 +148,17 @@ export { AstraClient, AstraApiError, chatRequestToWire } from "./client";
 export {
   EXECUTION_BOUNDARY_WAIT_REASONS,
   isExecutionBoundaryWait,
+  normalizeToolStatus,
+  toolEventIsCancelled,
+  toolTerminalStatus,
+  planStepResultStatus,
   extractWaitingReason,
   extractBlockedReason,
   projectRunWaitingState,
+  type ToolTerminalStatusEvent,
   type RunWaitingProjection,
 } from "./lifecycle-utils";
+
 export {
   ASTRA_EDGE_ID_HEADER,
   PATH_AUTH_LOGIN,

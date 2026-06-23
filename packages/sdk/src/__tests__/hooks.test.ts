@@ -268,6 +268,36 @@ describe("useAstraChat", () => {
     expect(result.current.toolCalls[0].result).toBe("file1\nfile2");
   });
 
+  test("preserves skipped tool_call_end status", () => {
+    const { client, streamChatMock } = createMockClient();
+    mockStreamEvents(streamChatMock, [
+      {
+        type: "tool_call_start",
+        call_id: "tc-skip",
+        tool: "read_file",
+        arguments: '{"path":"README.md"}',
+      } as StreamEvent,
+      {
+        type: "tool_call_end",
+        call_id: "tc-skip",
+        status: "skipped",
+        skipped: true,
+        success: true,
+        result: "Duplicate call skipped.",
+      } as StreamEvent,
+    ]);
+
+    const { result } = renderHook(() => useAstraChat({ client, model: "test-model" }));
+
+    act(() => {
+      result.current.sendMessage("read twice");
+    });
+
+    expect(result.current.toolCalls).toHaveLength(1);
+    expect(result.current.toolCalls[0].status).toBe("skipped");
+    expect(result.current.toolCalls[0].result).toBe("Duplicate call skipped.");
+  });
+
   test("projects raw tool_call and transport lifecycle into one bound tool card", () => {
     const { client, streamChatMock } = createMockClient();
     mockStreamEvents(streamChatMock, [
@@ -621,6 +651,12 @@ describe("useAstraChat", () => {
     // Don't fire run_finished so we stay in streaming state
     mockStreamEvents(streamChatMock, [
       { type: "text_delta", content: "partial" } as StreamEvent,
+      {
+        type: "tool_call_start",
+        call_id: "tc-running",
+        tool: "bash",
+        arguments: '{"command":"sleep 30"}',
+      } as StreamEvent,
     ]);
 
     const { result } = renderHook(() => useAstraChat({ client, model: "test-model" }));
@@ -638,6 +674,10 @@ describe("useAstraChat", () => {
 
     expect(result.current.isStreaming).toBe(false);
     expect(result.current.connectionState).toBe("idle");
+    expect(result.current.toolCalls[0]).toMatchObject({
+      callId: "tc-running",
+      status: "cancelled",
+    });
   });
 
   test("reset() clears all state", () => {
@@ -826,6 +866,36 @@ describe("useAstraChat", () => {
     expect(result.current.plan?.subtasks).toHaveLength(2);
     expect(result.current.plan?.subtasks[0].status).toBe("done");
     expect(result.current.plan?.subtasks[1].status).toBe("pending");
+  });
+
+  test("plan_step_done failed aliases mark the step as error", () => {
+    const { client, streamChatMock } = createMockClient();
+    mockStreamEvents(streamChatMock, [
+      {
+        type: "plan_created",
+        plan: {
+          plan_id: "p1",
+          title: "Test Plan",
+          subtasks: [{ id: "s1", title: "Step 1" }],
+        },
+      } as unknown as StreamEvent,
+      {
+        type: "plan_step_done",
+        subtask_id: "s1",
+        step: "s1",
+        result: "timed_out",
+      } as StreamEvent,
+    ]);
+
+    const { result } = renderHook(() =>
+      useAstraChat({ client, model: "test-model" }),
+    );
+
+    act(() => {
+      result.current.sendMessage("Hi");
+    });
+
+    expect(result.current.plan?.subtasks[0].status).toBe("error");
   });
 });
 

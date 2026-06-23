@@ -1,4 +1,10 @@
-import type { WorkspaceBinding, ExecutorBinding } from "@astra/sdk";
+import type {
+  WorkspaceBinding,
+  ExecutorBinding,
+  ToolStatus,
+  ToolTerminalStatusEvent,
+} from "@astra/sdk";
+import { toolEventIsCancelled, toolTerminalStatus } from "@astra/sdk";
 import {
   blockedRunMessage,
   runWaitingStatusMessage,
@@ -40,7 +46,7 @@ export type ToolSurfaceItem = {
   tool: string;
   arguments?: string;
   result?: string;
-  status: "running" | "done" | "error" | "cancelled";
+  status: ToolStatus;
   errorKind?: string;
   blocked?: boolean;
   workspace?: WorkspaceBinding;
@@ -608,17 +614,10 @@ function finishToolTransport(
 ): WorkSurfaceState {
   const callId = stringField(event, "call_id");
   if (!callId) return state;
-  const isFailure =
-    event.type === "tool_transport_failed" || event.success === false;
-  const cancelled = eventIsCancelled(event);
   const result = stringifyMaybe(event.error ?? event.result);
   const durationMs = numberField(event, "duration_ms");
   const timestamp = timestampFromEvent(event);
-  const status: ToolSurfaceItem["status"] = cancelled
-    ? "cancelled"
-    : isFailure
-      ? "error"
-      : "done";
+  const status = toolTerminalStatus(terminalStatusEvent(event));
   const tools = capToolSurfaceItems(
     upsertList(state.tools, callId, "callId", (existing) => ({
       ...existing,
@@ -652,11 +651,7 @@ function finishToolCall(
   const callId = stringField(event, "call_id");
   if (!callId) return state;
   const result = stringifyMaybe(event.result);
-  const status: ToolSurfaceItem["status"] = eventIsCancelled(event)
-    ? "cancelled"
-    : event.success === false
-      ? "error"
-      : "done";
+  const status = toolTerminalStatus(terminalStatusEvent(event));
   const durationMs = numberField(event, "duration_ms");
   const tools = capToolSurfaceItems(
     upsertList(state.tools, callId, "callId", (existing) => ({
@@ -1170,11 +1165,21 @@ function defaultRunFinishedToolMessage(runStatus: string) {
 }
 
 function eventIsCancelled(event: Record<string, unknown>) {
-  return (
-    booleanField(event, "cancelled") === true ||
-    stringField(event, "error_kind") === "cancelled" ||
-    stringField(event, "reason") === "cancelled"
-  );
+  return toolEventIsCancelled(terminalStatusEvent(event));
+}
+
+function terminalStatusEvent(
+  event: Record<string, unknown>,
+): ToolTerminalStatusEvent {
+  return {
+    type: stringField(event, "type"),
+    status: stringField(event, "status"),
+    success: booleanField(event, "success"),
+    error_kind: stringField(event, "error_kind") ?? null,
+    reason: stringField(event, "reason") ?? null,
+    cancelled: booleanField(event, "cancelled"),
+    skipped: booleanField(event, "skipped"),
+  };
 }
 
 function isTerminalRunStatus(status: string) {
@@ -1219,6 +1224,10 @@ function applyMaybeBlockedToolFailure(
   state: WorkSurfaceState,
   event: Record<string, unknown>,
 ): WorkSurfaceState {
+  if (eventIsCancelled(event)) {
+    return state;
+  }
+
   const reason = blockedReasonFromEvent(event);
   if (!reason) {
     return state;
