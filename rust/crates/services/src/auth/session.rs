@@ -124,10 +124,11 @@ impl DatabaseSessionService {
         }
     }
 
-    async fn fetch_session_by_id(
+    async fn fetch_session_for_user(
         &self,
         pool: &sqlx::Pool<MySql>,
         session_id: &str,
+        user_id: &str,
     ) -> Result<Option<SessionRecord>, (StatusCode, Json<ErrorResponse>)> {
         query(
             "SELECT session_id, user_id, agent_id, title, status, event_count, \
@@ -135,9 +136,10 @@ impl DatabaseSessionService {
              DATE_FORMAT(updated_at, '%Y-%m-%dT%H:%i:%s') AS updated_at, \
              DATE_FORMAT(ended_at, '%Y-%m-%dT%H:%i:%s') AS ended_at, \
              IFNULL(CAST(`metadata` AS CHAR), '{}') AS metadata_json \
-             FROM agent_sessions WHERE session_id = ? LIMIT 1",
+             FROM agent_sessions WHERE session_id = ? AND user_id = ? LIMIT 1",
         )
         .bind(session_id)
+        .bind(user_id)
         .fetch_optional(pool)
         .await
         .map_err(internal_error)?
@@ -187,7 +189,7 @@ impl SessionService for DatabaseSessionService {
         .map_err(internal_error)?;
 
         let record = self
-            .fetch_session_by_id(&pool, &session_id)
+            .fetch_session_for_user(&pool, &session_id, &user_id)
             .await?
             .ok_or_else(|| internal_error("failed to read created session"))?;
         let details = serde_json::json!({
@@ -273,7 +275,7 @@ impl SessionService for DatabaseSessionService {
     ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
         let session = self
-            .fetch_session_by_id(&pool, &session_id)
+            .fetch_session_for_user(&pool, &session_id, &user_id)
             .await?
             .ok_or_else(|| {
                 error_response(
@@ -281,13 +283,6 @@ impl SessionService for DatabaseSessionService {
                     format!("Session {session_id} 不存在"),
                 )
             })?;
-
-        if session.user_id != user_id {
-            return Err(error_response(
-                StatusCode::NOT_FOUND,
-                format!("无权限访问 Session {session_id}"),
-            ));
-        }
 
         Ok(session)
     }
@@ -300,7 +295,7 @@ impl SessionService for DatabaseSessionService {
     ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
         let existing = self
-            .fetch_session_by_id(&pool, &session_id)
+            .fetch_session_for_user(&pool, &session_id, &user_id)
             .await?
             .ok_or_else(|| {
                 error_response(
@@ -308,13 +303,6 @@ impl SessionService for DatabaseSessionService {
                     format!("Session {session_id} 不存在"),
                 )
             })?;
-
-        if existing.user_id != user_id {
-            return Err(error_response(
-                StatusCode::NOT_FOUND,
-                format!("无权限修改 Session {session_id}"),
-            ));
-        }
 
         let SessionUpdateRequestData {
             title,
@@ -345,15 +333,24 @@ impl SessionService for DatabaseSessionService {
         }
         update_query.push(" WHERE session_id = ");
         update_query.push_bind(&session_id);
+        update_query.push(" AND user_id = ");
+        update_query.push_bind(&user_id);
 
-        update_query
+        let rows_affected = update_query
             .build()
             .execute(&pool)
             .await
-            .map_err(internal_error)?;
+            .map_err(internal_error)?
+            .rows_affected();
+        if rows_affected == 0 {
+            return Err(error_response(
+                StatusCode::NOT_FOUND,
+                format!("Session {session_id} 不存在"),
+            ));
+        }
 
         let updated = self
-            .fetch_session_by_id(&pool, &session_id)
+            .fetch_session_for_user(&pool, &session_id, &user_id)
             .await?
             .ok_or_else(|| internal_error("failed to read updated session"))?;
         let details = serde_json::json!({
@@ -372,7 +369,7 @@ impl SessionService for DatabaseSessionService {
     ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
         let existing = self
-            .fetch_session_by_id(&pool, &session_id)
+            .fetch_session_for_user(&pool, &session_id, &user_id)
             .await?
             .ok_or_else(|| {
                 error_response(
@@ -381,15 +378,8 @@ impl SessionService for DatabaseSessionService {
                 )
             })?;
 
-        if existing.user_id != user_id {
-            return Err(error_response(
-                StatusCode::NOT_FOUND,
-                format!("无权限删除 Session {session_id}"),
-            ));
-        }
-
         let mut tx = pool.begin().await.map_err(internal_error)?;
-        hard_delete_session_rows(&mut tx, &session_id)
+        hard_delete_session_rows(&mut tx, &session_id, &user_id)
             .await
             .map_err(internal_error)?;
         tx.commit().await.map_err(internal_error)?;
@@ -407,8 +397,7 @@ impl SessionService for DatabaseSessionService {
         offset: u32,
     ) -> Result<SessionActivityRecord, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
-        let existing = self
-            .fetch_session_by_id(&pool, &session_id)
+        self.fetch_session_for_user(&pool, &session_id, &user_id)
             .await?
             .ok_or_else(|| {
                 error_response(
@@ -416,19 +405,14 @@ impl SessionService for DatabaseSessionService {
                     format!("Session {session_id} 不存在"),
                 )
             })?;
-        if existing.user_id != user_id {
-            return Err(error_response(
-                StatusCode::NOT_FOUND,
-                format!("无权限查看 Session {session_id}"),
-            ));
-        }
         let limit = limit.min(MAX_SESSION_ACTIVITY_ROWS);
         let offset = offset.min(MAX_API_LIST_OFFSET);
 
         let count_row = query(
             "SELECT COUNT(*) as cnt FROM auth_audit_logs \
-             WHERE resource_type = 'session' AND resource_id = ?",
+             WHERE user_id = ? AND resource_type = 'session' AND resource_id = ?",
         )
+        .bind(&user_id)
         .bind(&session_id)
         .fetch_one(&pool)
         .await
@@ -437,9 +421,10 @@ impl SessionService for DatabaseSessionService {
 
         let rows = query(
             "SELECT log_id, action, details, created_at FROM auth_audit_logs \
-             WHERE resource_type = 'session' AND resource_id = ? \
+             WHERE user_id = ? AND resource_type = 'session' AND resource_id = ? \
              ORDER BY created_at DESC LIMIT ? OFFSET ?",
         )
+        .bind(&user_id)
         .bind(&session_id)
         .bind(limit)
         .bind(offset)
@@ -469,29 +454,34 @@ impl SessionService for DatabaseSessionService {
     }
 }
 
-async fn delete_session_rows_1(
+async fn delete_session_rows_session_user(
     tx: &mut sqlx::Transaction<'_, MySql>,
     label: &'static str,
     statement: &'static str,
     session_id: &str,
+    user_id: &str,
 ) -> Result<u64, String> {
     query(statement)
         .bind(session_id)
+        .bind(user_id)
         .execute(&mut **tx)
         .await
         .map(|result| result.rows_affected())
         .map_err(|source| format!("delete_session.{label}: {source}"))
 }
 
-async fn delete_session_rows_2(
+async fn delete_session_rows_session_user_twice(
     tx: &mut sqlx::Transaction<'_, MySql>,
     label: &'static str,
     statement: &'static str,
     session_id: &str,
+    user_id: &str,
 ) -> Result<u64, String> {
     query(statement)
         .bind(session_id)
+        .bind(user_id)
         .bind(session_id)
+        .bind(user_id)
         .execute(&mut **tx)
         .await
         .map(|result| result.rows_affected())
@@ -501,128 +491,179 @@ async fn delete_session_rows_2(
 async fn hard_delete_session_rows(
     tx: &mut sqlx::Transaction<'_, MySql>,
     session_id: &str,
+    user_id: &str,
 ) -> Result<u64, String> {
     let mut deleted = 0_u64;
 
     for (label, statement) in [(
         "user_skill_evaluations",
         "DELETE FROM user_skill_evaluations
-             WHERE run_id IN (SELECT run_id FROM agent_runs WHERE session_id = ?)",
+             WHERE run_id IN (SELECT run_id FROM agent_runs WHERE session_id = ? AND user_id = ?)",
     )] {
-        deleted += delete_session_rows_1(tx, label, statement, session_id).await?;
+        deleted +=
+            delete_session_rows_session_user(tx, label, statement, session_id, user_id).await?;
     }
 
-    deleted += delete_session_rows_2(
-        tx,
-        "agent_event_edges",
+    deleted += query(
         "DELETE FROM agent_event_edges
-         WHERE child_event_id IN (SELECT event_id FROM agent_events WHERE session_id = ?)
-            OR parent_event_id IN (SELECT event_id FROM agent_events WHERE session_id = ?)",
-        session_id,
+         WHERE child_event_id IN (SELECT event_id FROM agent_events WHERE session_id = ? AND user_id = ?)
+            OR parent_event_id IN (SELECT event_id FROM agent_events WHERE session_id = ? AND user_id = ?)",
     )
-    .await?;
+    .bind(session_id)
+    .bind(user_id)
+    .bind(session_id)
+    .bind(user_id)
+    .execute(&mut **tx)
+    .await
+    .map(|result| result.rows_affected())
+    .map_err(|source| format!("delete_session.agent_event_edges: {source}"))?;
 
     for (label, statement) in [
         (
             "session_state_item_events",
             "DELETE FROM session_state_item_events
-             WHERE session_id = ?
-                OR item_id IN (SELECT item_id FROM session_state_items WHERE origin_session_id = ?)",
+             WHERE (session_id = ? AND user_id = ?)
+                OR item_id IN (
+                    SELECT item_id FROM session_state_items
+                    WHERE origin_session_id = ? AND user_id = ?
+                )",
         ),
         (
             "session_state_items",
             "DELETE FROM session_state_items
-             WHERE session_id = ? OR origin_session_id = ?",
+             WHERE (session_id = ? AND user_id = ?)
+                OR (origin_session_id = ? AND user_id = ?)",
         ),
         (
             "session_history_chunks",
             "DELETE FROM session_history_chunks
-             WHERE session_id = ? OR source_session_id = ?",
+             WHERE (session_id = ? AND user_id = ?)
+                OR (source_session_id = ? AND user_id = ?)",
         ),
     ] {
-        deleted += delete_session_rows_2(tx, label, statement, session_id).await?;
+        deleted +=
+            delete_session_rows_session_user_twice(tx, label, statement, session_id, user_id)
+                .await?;
     }
 
     for (label, statement) in [
         (
             "context_manifest_items",
-            "DELETE FROM context_manifest_items WHERE session_id = ?",
-        ),
-        (
-            "context_manifests",
-            "DELETE FROM context_manifests WHERE session_id = ?",
-        ),
-        (
-            "session_artifacts_grants",
-            "DELETE FROM session_artifacts_grants WHERE session_id = ?",
-        ),
-        (
-            "session_artifacts",
-            "DELETE FROM session_artifacts WHERE session_id = ?",
-        ),
-        (
-            "session_tool_outputs",
-            "DELETE FROM session_tool_outputs WHERE session_id = ?",
-        ),
-        (
-            "session_tool_output_batches",
-            "DELETE FROM session_tool_output_batches WHERE session_id = ?",
-        ),
-        (
-            "session_device_lease_events",
-            "DELETE FROM session_device_lease_events WHERE session_id = ?",
-        ),
-        (
-            "session_device_leases",
-            "DELETE FROM session_device_leases WHERE session_id = ?",
-        ),
-        (
-            "session_transcript_items",
-            "DELETE FROM session_transcript_items WHERE session_id = ?",
-        ),
-        (
-            "transcript_pages",
-            "DELETE FROM transcript_pages WHERE session_id = ?",
+            "DELETE FROM context_manifest_items
+             WHERE manifest_id IN (
+                 SELECT manifest_id FROM context_manifests
+                 WHERE session_id = ? AND user_id = ?
+             )",
         ),
         (
             "prompt_deltas",
-            "DELETE FROM prompt_deltas WHERE request_id IN (SELECT request_id FROM prompt_request_records WHERE session_id = ?)",
+            "DELETE FROM prompt_deltas
+             WHERE request_id IN (
+                 SELECT request_id FROM prompt_request_records
+                 WHERE session_id = ? AND user_id = ?
+             )",
         ),
         (
-            "prompt_request_records",
-            "DELETE FROM prompt_request_records WHERE session_id = ?",
+            "plan_step_runs",
+            "DELETE FROM plan_step_runs
+             WHERE plan_id IN (
+                 SELECT plan_id FROM plans
+                 WHERE session_id = ? AND user_id = ?
+             )",
         ),
         (
-            "session_state_revisions",
-            "DELETE FROM session_state_revisions WHERE session_id = ?",
+            "task_verification_results",
+            "DELETE FROM task_verification_results
+             WHERE contract_id IN (
+                 SELECT contract_id FROM task_contracts
+                 WHERE session_id = ? AND user_id = ?
+             )",
+        ),
+    ] {
+        deleted +=
+            delete_session_rows_session_user(tx, label, statement, session_id, user_id).await?;
+    }
+
+    for (label, statement) in [
+        (
+            "context_manifests",
+            "DELETE FROM context_manifests WHERE session_id = ? AND user_id = ?",
         ),
         (
-            "session_delegations",
-            "DELETE FROM session_delegations WHERE session_id = ?",
+            "session_artifacts_grants",
+            "DELETE FROM session_artifacts_grants WHERE session_id = ? AND user_id = ?",
         ),
         (
-            "session_todos",
-            "DELETE FROM session_todos WHERE session_id = ?",
+            "session_artifacts",
+            "DELETE FROM session_artifacts WHERE session_id = ? AND user_id = ?",
         ),
         (
-            "session_plan_todos",
-            "DELETE FROM session_plan_todos WHERE session_id = ?",
+            "session_tool_outputs",
+            "DELETE FROM session_tool_outputs WHERE session_id = ? AND user_id = ?",
         ),
         (
-            "harness_snapshots",
-            "DELETE FROM harness_snapshots WHERE session_id = ?",
+            "session_tool_output_batches",
+            "DELETE FROM session_tool_output_batches WHERE session_id = ? AND user_id = ?",
+        ),
+        (
+            "session_device_lease_events",
+            "DELETE FROM session_device_lease_events WHERE session_id = ? AND user_id = ?",
+        ),
+        (
+            "session_device_leases",
+            "DELETE FROM session_device_leases WHERE session_id = ? AND user_id = ?",
+        ),
+        (
+            "session_transcript_items",
+            "DELETE FROM session_transcript_items WHERE session_id = ? AND user_id = ?",
+        ),
+        (
+            "transcript_pages",
+            "DELETE FROM transcript_pages WHERE session_id = ? AND user_id = ?",
+        ),
+        (
+            "conversation_log",
+            "DELETE FROM conversation_log WHERE session_id = ? AND user_id = ?",
         ),
         (
             "ctx_snapshots",
-            "DELETE FROM ctx_snapshots WHERE session_id = ?",
+            "DELETE FROM ctx_snapshots WHERE session_id = ? AND user_id = ?",
         ),
         (
             "ctx_decision_audits",
-            "DELETE FROM ctx_decision_audits WHERE session_id = ?",
+            "DELETE FROM ctx_decision_audits WHERE session_id = ? AND user_id = ?",
+        ),
+        (
+            "prompt_request_records",
+            "DELETE FROM prompt_request_records WHERE session_id = ? AND user_id = ?",
+        ),
+        (
+            "session_state_revisions",
+            "DELETE FROM session_state_revisions WHERE session_id = ? AND user_id = ?",
+        ),
+        (
+            "session_delegations",
+            "DELETE FROM session_delegations WHERE session_id = ? AND user_id = ?",
+        ),
+        (
+            "session_todos",
+            "DELETE FROM session_todos WHERE session_id = ? AND user_id = ?",
+        ),
+        (
+            "session_todo_counters",
+            "DELETE FROM session_todo_counters WHERE session_id = ? AND user_id = ?",
+        ),
+        (
+            "session_plan_todos",
+            "DELETE FROM session_plan_todos WHERE session_id = ? AND user_id = ?",
+        ),
+        (
+            "harness_snapshots",
+            "DELETE FROM harness_snapshots WHERE session_id = ? AND user_id = ?",
         ),
         (
             "skill_selection_events",
-            "DELETE FROM skill_selection_events WHERE session_id = ?",
+            "DELETE FROM skill_selection_events WHERE session_id = ? AND user_id = ?",
         ),
         // skill_selector_turn_metrics — table was removed in PR #337
         // (tool selector subsystem deletion); the cleanup statement
@@ -631,72 +672,77 @@ async fn hard_delete_session_rows(
         // stale cleanup entry.
         (
             "session_sync_log",
-            "DELETE FROM session_sync_log WHERE session_id = ?",
+            "DELETE FROM session_sync_log WHERE session_id = ? AND user_id = ?",
         ),
         (
             "agent_tasks",
-            "DELETE FROM agent_tasks WHERE session_id = ?",
+            "DELETE FROM agent_tasks WHERE session_id = ? AND user_id = ?",
         ),
-        ("plans", "DELETE FROM plans WHERE session_id = ?"),
         (
-            "plan_step_runs",
-            "DELETE FROM plan_step_runs WHERE session_id = ?",
+            "plans",
+            "DELETE FROM plans WHERE session_id = ? AND user_id = ?",
         ),
         (
             "session_checkpoints",
-            "DELETE FROM session_checkpoints WHERE session_id = ?",
+            "DELETE FROM session_checkpoints WHERE session_id = ? AND user_id = ?",
         ),
         (
             "task_contracts",
-            "DELETE FROM task_contracts WHERE session_id = ?",
-        ),
-        (
-            "task_verification_results",
-            "DELETE FROM task_verification_results WHERE session_id = ?",
+            "DELETE FROM task_contracts WHERE session_id = ? AND user_id = ?",
         ),
         (
             "skill_installations",
-            "DELETE FROM skill_installations WHERE session_id = ?",
+            "DELETE FROM skill_installations WHERE session_id = ? AND user_id = ?",
         ),
         (
             "wf_triggers",
-            "DELETE FROM wf_triggers WHERE session_id = ?",
+            "DELETE FROM wf_triggers WHERE session_id = ? AND user_id = ?",
         ),
         (
             "eval_user_feedback",
-            "DELETE FROM eval_user_feedback WHERE session_id = ?",
+            "DELETE FROM eval_user_feedback WHERE session_id = ? AND user_id = ?",
         ),
         (
             "team_snapshots",
-            "DELETE FROM team_snapshots WHERE session_id = ?",
+            "DELETE FROM team_snapshots WHERE session_id = ? AND user_id = ?",
         ),
         (
-            "conversation_log",
-            "DELETE FROM conversation_log WHERE session_id = ?",
+            "tool_exactly_once_results",
+            "DELETE FROM tool_exactly_once_results WHERE session_id = ? AND user_id = ?",
         ),
+    ] {
+        deleted +=
+            delete_session_rows_session_user(tx, label, statement, session_id, user_id).await?;
+    }
+
+    for (label, statement) in [
         (
             "agent_run_events",
-            "DELETE FROM agent_run_events WHERE session_id = ?",
+            "DELETE FROM agent_run_events WHERE session_id = ? AND user_id = ?",
         ),
         (
             "run_checkpoints",
-            "DELETE FROM run_checkpoints WHERE session_id = ?",
+            "DELETE FROM run_checkpoints WHERE session_id = ? AND user_id = ?",
         ),
         (
             "run_display_projections",
-            "DELETE FROM run_display_projections WHERE session_id = ?",
+            "DELETE FROM run_display_projections WHERE session_id = ? AND user_id = ?",
         ),
-        ("agent_runs", "DELETE FROM agent_runs WHERE session_id = ?"),
+        (
+            "agent_runs",
+            "DELETE FROM agent_runs WHERE session_id = ? AND user_id = ?",
+        ),
         (
             "agent_events",
-            "DELETE FROM agent_events WHERE session_id = ?",
+            "DELETE FROM agent_events WHERE session_id = ? AND user_id = ?",
         ),
         (
             "agent_sessions",
-            "DELETE FROM agent_sessions WHERE session_id = ?",
+            "DELETE FROM agent_sessions WHERE session_id = ? AND user_id = ?",
         ),
     ] {
-        deleted += delete_session_rows_1(tx, label, statement, session_id).await?;
+        deleted +=
+            delete_session_rows_session_user(tx, label, statement, session_id, user_id).await?;
     }
 
     Ok(deleted)

@@ -823,6 +823,7 @@ fn build_bridge_tool_call_records(
 fn record_full_llm_request_event(
     turn_event_buffer: &mut Option<TurnEventBuffer>,
     full_llm_capture: bool,
+    user_id: &str,
     session_id: &str,
     turn: u32,
     trace: &BridgeTraceCorrelation,
@@ -843,6 +844,7 @@ fn record_full_llm_request_event(
     let round = buf.current_round();
     let prompt_request_plan =
         astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
+            user_id,
             session_id,
             turn,
             round,
@@ -1064,20 +1066,6 @@ fn turn_count_from_messages(messages: &[Value]) -> i64 {
         .iter()
         .filter(|message| message.get("role").and_then(Value::as_str) == Some("user"))
         .count() as i64
-}
-
-async fn infer_bridge_session_turn(shared_pool: Option<&SharedPool>, session_id: &str) -> u32 {
-    let Some(shared_pool) = shared_pool else {
-        return 1;
-    };
-    let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM agent_events WHERE session_id = ? AND event_type = 'user_query'",
-    )
-    .bind(session_id)
-    .fetch_one(shared_pool.get())
-    .await
-    .unwrap_or(0);
-    (count.max(0) as u32).saturating_add(1)
 }
 
 fn bridge_root_turn_journal_owned(
@@ -1359,7 +1347,12 @@ impl InProcessChatTurnBridge {
             (turn, "header")
         } else if !session_id.is_empty() {
             (
-                infer_bridge_session_turn(shared_pool.as_ref(), &session_id).await,
+                crate::server::session_turn::infer_session_turn(
+                    shared_pool.as_ref(),
+                    &user_id,
+                    &session_id,
+                )
+                .await,
                 "inferred_agent_events",
             )
         } else {
@@ -2658,6 +2651,7 @@ impl InProcessChatTurnBridge {
                     record_full_llm_request_event(
                         buf,
                         full_llm_capture,
+                        &user_id,
                         &session_id,
                         trace_turn,
                         &trace_correlation,
@@ -2767,6 +2761,7 @@ impl InProcessChatTurnBridge {
                     capture_request(&mut turn_event_buffer, &llm_messages, attempt_in_round);
                     if let Ok(prompt_request_plan) =
                         astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
+                            user_id: &user_id,
                             session_id: &session_id,
                             turn: trace_turn,
                             round: turn_event_buffer
@@ -2852,6 +2847,7 @@ impl InProcessChatTurnBridge {
                     capture_request(&mut turn_event_buffer, &llm_messages, attempt_in_round);
                     if let Ok(prompt_request_plan) =
                         astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
+                            user_id: &user_id,
                             session_id: &session_id,
                             turn: trace_turn,
                             round: turn_event_buffer
@@ -3136,6 +3132,7 @@ impl InProcessChatTurnBridge {
                             record_full_llm_request_event(
                                 &mut turn_event_buffer,
                                 full_llm_capture,
+                                &user_id,
                                 &session_id,
                                 trace_turn,
                                 &trace_correlation,
@@ -3149,6 +3146,7 @@ impl InProcessChatTurnBridge {
                             );
                             if let Ok(prompt_request_plan) =
                                 astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
+                                    user_id: &user_id,
                                     session_id: &session_id,
                                     turn: trace_turn,
                                     round: turn_event_buffer
@@ -4157,6 +4155,7 @@ impl InProcessChatTurnBridge {
             let tool_writer = turn_tool_event_writer.clone();
             let sa_writer = turn_session_activity_writer.clone();
             let sid = session_id.clone();
+            let activity_user_id = user_id.clone();
             let user_query_event_id_for_activity = user_query_event_id.clone();
             let core_event_count = usize::from(user_content.is_some()) + usize::from(should_persist_llm);
             let tool_event_count = tool_event_plan
@@ -4224,7 +4223,10 @@ impl InProcessChatTurnBridge {
                     event_count_increment: persisted_event_count,
                     last_event_id,
                 };
-                if let Err(e) = sa_writer.update_session_activity(&sid, plan).await {
+                if let Err(e) = sa_writer
+                    .update_session_activity(&sid, &activity_user_id, plan)
+                    .await
+                {
                     astra_core::agent_persist_fail!("bridge",
                         session = sid,
                         stage = "activity",
@@ -5046,6 +5048,8 @@ mod tests {
 
         async fn load_json_artifact(
             &self,
+            _user_id: &str,
+            _session_id: &str,
             _artifact_id: &str,
         ) -> Result<Option<StoredSessionArtifact>, astra_services::SessionArtifactStoreError>
         {
@@ -5054,6 +5058,7 @@ mod tests {
 
         async fn load_latest_json_artifact(
             &self,
+            _user_id: &str,
             _session_id: &str,
             _artifact_kind: &str,
         ) -> Result<Option<StoredSessionArtifact>, astra_services::SessionArtifactStoreError>
@@ -5063,6 +5068,7 @@ mod tests {
 
         async fn list_json_artifacts(
             &self,
+            _user_id: &str,
             _session_id: &str,
             _artifact_kind: Option<&str>,
             _limit: usize,
@@ -7725,6 +7731,7 @@ mod tests {
         record_full_llm_request_event(
             &mut turn_event_buffer,
             true,
+            "root",
             &session_id,
             7,
             &trace,

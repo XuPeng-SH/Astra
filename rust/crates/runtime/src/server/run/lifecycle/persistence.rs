@@ -372,8 +372,9 @@ async fn persist_server_loop_projection_state(
 
     let post_compaction_count = sqlx::query(
         "SELECT COUNT(*) AS count FROM context_manifests \
-         WHERE session_id = ? AND run_id = ? AND reason = 'post_compaction'",
+         WHERE user_id = ? AND session_id = ? AND run_id = ? AND reason = 'post_compaction'",
     )
+    .bind(user_id)
     .bind(session_id)
     .bind(run_id)
     .fetch_one(pool.get())
@@ -382,7 +383,10 @@ async fn persist_server_loop_projection_state(
     .and_then(|row| row.try_get::<i64, _>("count").ok())
     .unwrap_or(0);
     if post_compaction_count > 0 {
-        match store.run_compaction_assertions(session_id, run_id).await {
+        match store
+            .run_compaction_assertions(user_id, session_id, run_id)
+            .await
+        {
             Ok(results) if results.iter().all(|(_, violations)| *violations == 0) => {
                 let result = store
                     .upsert_state_item(StateItemUpsert {
@@ -674,20 +678,6 @@ async fn persist_trace_degraded_event(
             error
         );
     }
-}
-
-pub(crate) async fn infer_session_turn(shared_pool: Option<&SharedPool>, session_id: &str) -> u32 {
-    let Some(shared_pool) = shared_pool else {
-        return 1;
-    };
-    let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM agent_events WHERE session_id = ? AND event_type = 'user_query'",
-    )
-    .bind(session_id)
-    .fetch_one(shared_pool.get())
-    .await
-    .unwrap_or(0);
-    (count.max(0) as u32).saturating_add(1)
 }
 
 /// Persist `user_query` + `llm_response` core events to `agent_events` after
@@ -1440,12 +1430,27 @@ pub(crate) async fn persist_session_transcript_items_inner_in_tx(
     session_id: &str,
     items: &[TranscriptPersistItem],
 ) -> Result<(), sqlx::Error> {
+    let owned_session = sqlx::query(
+        "SELECT 1 AS owned
+         FROM agent_sessions
+         WHERE session_id = ? AND user_id = ?
+         LIMIT 1",
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if owned_session.is_none() {
+        return Err(sqlx::Error::RowNotFound);
+    }
+
     let row = sqlx::query(
         "SELECT COALESCE(MAX(item_seq), 0) + 1 AS next_seq
          FROM session_transcript_items
-         WHERE session_id = ?",
+         WHERE session_id = ? AND user_id = ?",
     )
     .bind(session_id)
+    .bind(user_id)
     .fetch_one(&mut **tx)
     .await?;
     let mut next_seq = row.try_get::<i64, _>("next_seq")?;
@@ -1455,9 +1460,10 @@ pub(crate) async fn persist_session_transcript_items_inner_in_tx(
         let existing = sqlx::query(
             "SELECT COUNT(*) AS count
              FROM session_transcript_items
-             WHERE session_id = ? AND run_id = ? AND role = ?",
+             WHERE session_id = ? AND user_id = ? AND run_id = ? AND role = ?",
         )
         .bind(session_id)
+        .bind(user_id)
         .bind(&item.run_id)
         .bind(item.role)
         .fetch_one(&mut **tx)
@@ -1489,7 +1495,7 @@ pub(crate) async fn persist_session_transcript_items_inner_in_tx(
     }
 
     for page_seq in dirty_pages {
-        sync_transcript_page_inner(tx, session_id, page_seq).await?;
+        sync_transcript_page_inner(tx, user_id, session_id, page_seq).await?;
     }
 
     Ok(())
@@ -1510,6 +1516,7 @@ pub(crate) fn transcript_page_bounds(page_seq: i64) -> (i64, i64) {
 
 async fn sync_transcript_page_inner(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    user_id: &str,
     session_id: &str,
     page_seq: i64,
 ) -> Result<(), sqlx::Error> {
@@ -1517,20 +1524,24 @@ async fn sync_transcript_page_inner(
     let rows = sqlx::query(
         "SELECT item_seq, role, content_hash
          FROM session_transcript_items
-         WHERE session_id = ? AND item_seq BETWEEN ? AND ?
+         WHERE session_id = ? AND user_id = ? AND item_seq BETWEEN ? AND ?
          ORDER BY item_seq ASC",
     )
     .bind(session_id)
+    .bind(user_id)
     .bind(start_item_seq)
     .bind(end_item_seq)
     .fetch_all(&mut **tx)
     .await?;
     if rows.is_empty() {
-        sqlx::query("DELETE FROM transcript_pages WHERE session_id = ? AND page_seq = ?")
-            .bind(session_id)
-            .bind(page_seq)
-            .execute(&mut **tx)
-            .await?;
+        sqlx::query(
+            "DELETE FROM transcript_pages WHERE session_id = ? AND user_id = ? AND page_seq = ?",
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .bind(page_seq)
+        .execute(&mut **tx)
+        .await?;
         return Ok(());
     }
 
@@ -1554,15 +1565,17 @@ async fn sync_transcript_page_inner(
     let page_hash = format!("{:x}", hasher.finalize());
     sqlx::query(
         "INSERT INTO transcript_pages
-         (session_id, page_seq, start_item_seq, end_item_seq, item_count, page_hash, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, NOW(6), NOW(6))
+         (user_id, session_id, page_seq, start_item_seq, end_item_seq, item_count, page_hash, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))
          ON DUPLICATE KEY UPDATE
+           user_id = VALUES(user_id),
            start_item_seq = VALUES(start_item_seq),
            end_item_seq = VALUES(end_item_seq),
            item_count = VALUES(item_count),
            page_hash = VALUES(page_hash),
            updated_at = NOW(6)",
     )
+    .bind(user_id)
     .bind(session_id)
     .bind(page_seq)
     .bind(first_item_seq)
@@ -1651,6 +1664,7 @@ async fn persist_server_loop_hook_events(
 
     let decision_audit = Some(TurnDecisionAuditRecord {
         decision_id: Uuid::now_v7().to_string(),
+        user_id: user_id.to_string(),
         session_id: session_id.to_string(),
         event_id: event_id.clone(),
         decision_type: if tool_call_names.is_empty() {
@@ -1828,4 +1842,159 @@ pub(crate) fn build_run_turn_complete_event_with_interruption(
         execution_state,
         (!final_text.is_empty()).then_some(final_text),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::Row;
+    use uuid::Uuid;
+
+    static SHARED_BOOTSTRAP: tokio::sync::OnceCell<astra_core::SharedPool> =
+        tokio::sync::OnceCell::const_new();
+
+    async fn setup_pool() -> astra_core::SharedPool {
+        assert_eq!(
+            std::env::var("ASTRA_TEST_DB_IT").as_deref(),
+            Ok("1"),
+            "set ASTRA_TEST_DB_IT=1 for ignored integration tests"
+        );
+        SHARED_BOOTSTRAP
+            .get_or_init(|| async {
+                let settings = astra_core::MatrixOneSettings::from_env();
+                let catalog = std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG")
+                    .unwrap_or_else(|_| "mysql".to_string());
+                astra_services::ensure_core_schema(&settings, &catalog)
+                    .await
+                    .expect("ensure_core_schema");
+                astra_core::SharedPool::new(&settings)
+                    .await
+                    .expect("SharedPool::new")
+            })
+            .await
+            .clone()
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
+    async fn transcript_persistence_writes_owner_scoped_pages_and_rejects_wrong_owner() {
+        let pool = setup_pool().await;
+        let db = pool.get().clone();
+        let session_id = Uuid::new_v4().to_string();
+        let owner_user_id = Uuid::new_v4().to_string();
+        let other_user_id = Uuid::new_v4().to_string();
+        let run_id = Uuid::new_v4().to_string();
+
+        let _ = sqlx::query("DELETE FROM transcript_pages WHERE session_id = ?")
+            .bind(&session_id)
+            .execute(&db)
+            .await;
+        let _ = sqlx::query("DELETE FROM session_transcript_items WHERE session_id = ?")
+            .bind(&session_id)
+            .execute(&db)
+            .await;
+        let _ = sqlx::query("DELETE FROM agent_sessions WHERE session_id = ?")
+            .bind(&session_id)
+            .execute(&db)
+            .await;
+
+        sqlx::query(
+            "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count)
+             VALUES (?, ?, 'transcript-persist-it', 'active', 0)",
+        )
+        .bind(&session_id)
+        .bind(&owner_user_id)
+        .execute(&db)
+        .await
+        .expect("insert owner session");
+
+        let items = [
+            TranscriptPersistItem {
+                run_id: run_id.clone(),
+                role: "user",
+                content: "hello".to_string(),
+                source_event_id: Uuid::new_v4().to_string(),
+            },
+            TranscriptPersistItem {
+                run_id: run_id.clone(),
+                role: "assistant",
+                content: "world".to_string(),
+                source_event_id: Uuid::new_v4().to_string(),
+            },
+        ];
+        let mut owner_tx = db.begin().await.expect("begin owner transcript tx");
+        persist_session_transcript_items_inner_in_tx(
+            &mut owner_tx,
+            &owner_user_id,
+            &session_id,
+            &items,
+        )
+        .await
+        .expect("owner transcript persist");
+        owner_tx.commit().await.expect("commit owner transcript tx");
+
+        let page = sqlx::query(
+            "SELECT user_id, start_item_seq, end_item_seq, item_count
+             FROM transcript_pages
+             WHERE session_id = ? AND page_seq = 1",
+        )
+        .bind(&session_id)
+        .fetch_one(&db)
+        .await
+        .expect("owner transcript page");
+        assert_eq!(page.try_get::<String, _>("user_id").unwrap(), owner_user_id);
+        assert_eq!(page.try_get::<i64, _>("start_item_seq").unwrap(), 1);
+        assert_eq!(page.try_get::<i64, _>("end_item_seq").unwrap(), 2);
+        assert_eq!(page.try_get::<i64, _>("item_count").unwrap(), 2);
+
+        let mut wrong_owner_tx = db.begin().await.expect("begin wrong-owner transcript tx");
+        let wrong_owner = persist_session_transcript_items_inner_in_tx(
+            &mut wrong_owner_tx,
+            &other_user_id,
+            &session_id,
+            &[TranscriptPersistItem {
+                run_id,
+                role: "assistant",
+                content: "wrong owner".to_string(),
+                source_event_id: Uuid::new_v4().to_string(),
+            }],
+        )
+        .await
+        .expect_err("wrong owner must not persist transcript rows");
+        wrong_owner_tx
+            .rollback()
+            .await
+            .expect("rollback wrong-owner transcript tx");
+        assert!(
+            matches!(&wrong_owner, sqlx::Error::RowNotFound),
+            "wrong owner should fail closed before writing, got {wrong_owner}"
+        );
+
+        let wrong_owner_rows = sqlx::query(
+            "SELECT COUNT(*) AS c
+             FROM session_transcript_items
+             WHERE session_id = ? AND user_id = ?",
+        )
+        .bind(&session_id)
+        .bind(&other_user_id)
+        .fetch_one(&db)
+        .await
+        .expect("count wrong owner rows")
+        .try_get::<i64, _>("c")
+        .expect("decode wrong owner count");
+        assert_eq!(wrong_owner_rows, 0);
+
+        let _ = sqlx::query("DELETE FROM transcript_pages WHERE session_id = ?")
+            .bind(&session_id)
+            .execute(&db)
+            .await;
+        let _ = sqlx::query("DELETE FROM session_transcript_items WHERE session_id = ?")
+            .bind(&session_id)
+            .execute(&db)
+            .await;
+        let _ = sqlx::query("DELETE FROM agent_sessions WHERE session_id = ?")
+            .bind(&session_id)
+            .execute(&db)
+            .await;
+    }
 }

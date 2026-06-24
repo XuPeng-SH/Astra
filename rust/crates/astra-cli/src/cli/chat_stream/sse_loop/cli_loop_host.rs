@@ -9,17 +9,20 @@ use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use astra_runtime::{
     tool_registry::ToolRegistry,
     turn::agentic::headless_round::HeadlessStderrStyle,
     turn::agentic_loop::host::{
-        AgenticLoopHost, AgenticLoopState, HostTurnResult, TurnInteractionMode,
-        interaction_scoped_tool_restrictions,
+        AgenticLoopHost, AgenticLoopState, ControlToolRecovery, HostTurnResult,
+        TurnInteractionMode, interaction_scoped_tool_restrictions,
     },
 };
-use astra_turn_core::compaction_types::CompactionEvent;
+use astra_turn_core::{
+    compaction_types::CompactionEvent, orchestration::agent_result_wire::render_agent_tool_error,
+    sse_stream_host::EdgeToolExecResult, tool_result_semantics::cloud_tool_result_status_label,
+};
 use async_trait::async_trait;
 use crossterm::style::Stylize;
 use serde_json::Value;
@@ -37,6 +40,52 @@ use crate::cli::chat_stream::sse_loop::agentic_loop_turn::{
 use crate::cli::chat_stream::sse_loop::refresh_root_permission_context;
 
 use astra_runtime::tool_sandbox::SandboxPolicy;
+
+const AGENT_FANOUT_RECOVERY_TIMEOUT: Duration = Duration::from_secs(3);
+
+fn control_tool_recovery_fields(outcome: &str) -> serde_json::Map<String, Value> {
+    serde_json::Map::from_iter([(
+        "recovery".to_string(),
+        serde_json::json!({
+            "attempted": true,
+            "source": "host_state",
+            "outcome": outcome,
+        }),
+    )])
+}
+
+fn render_control_tool_recovery_error(message: &str) -> String {
+    let mut value: Value = serde_json::from_str(&render_agent_tool_error(None, message))
+        .unwrap_or_else(|_| serde_json::json!({"status": "failed", "error": message}));
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "recovery".to_string(),
+            serde_json::json!({
+                "attempted": true,
+                "source": "host_state",
+                "outcome": "failed",
+            }),
+        );
+    }
+    value.to_string()
+}
+
+fn failed_control_tool_recovery_result(
+    tool_call_id: &str,
+    tool_name: &str,
+    args: &Value,
+    message: &str,
+) -> EdgeToolExecResult {
+    EdgeToolExecResult {
+        request_id: tool_call_id.to_string(),
+        tool: tool_name.to_string(),
+        args: args.clone(),
+        output: render_control_tool_recovery_error(message),
+        tool_result_fields: Some(control_tool_recovery_fields("failed")),
+        status: "failed".to_string(),
+        duration_ms: 0,
+    }
+}
 
 /// RAII guard for the executor's sandbox policy slot.
 ///
@@ -895,6 +944,81 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         self.capabilities.clone()
     }
 
+    async fn recover_missing_control_tool_result(
+        &mut self,
+        parent_run_id: Option<&str>,
+        tool_call_id: &str,
+        tool_name: &str,
+        args: &Value,
+    ) -> ControlToolRecovery {
+        if tool_name != "agent_fanout" {
+            return ControlToolRecovery::Unsupported;
+        }
+        let Some(spawn_context) = self.executor.spawn_context.as_ref() else {
+            return ControlToolRecovery::Missing;
+        };
+        let Some(parent_run_id) = parent_run_id else {
+            tracing::warn!(
+                target: "astra_cli::agentic_loop_host",
+                spawn_context_run_id = %spawn_context.run_id,
+                tool_call_id,
+                "agent_fanout recovery failed: missing parent run id"
+            );
+            return ControlToolRecovery::Recovered(failed_control_tool_recovery_result(
+                tool_call_id,
+                tool_name,
+                args,
+                "Cannot recover missing agent_fanout edge result: parent_run_id is missing, so the host cannot prove which parent turn owns the fanout group.",
+            ));
+        };
+        if parent_run_id != spawn_context.run_id {
+            tracing::warn!(
+                target: "astra_cli::agentic_loop_host",
+                parent_run_id,
+                spawn_context_run_id = %spawn_context.run_id,
+                tool_call_id,
+                "agent_fanout recovery failed: parent run id does not match spawn context"
+            );
+            return ControlToolRecovery::Recovered(failed_control_tool_recovery_result(
+                tool_call_id,
+                tool_name,
+                args,
+                "Cannot recover missing agent_fanout edge result: parent_run_id does not match the active spawn context.",
+            ));
+        }
+
+        let output = match tokio::time::timeout(
+            AGENT_FANOUT_RECOVERY_TIMEOUT,
+            astra_runtime::orchestration::recover_agent_fanout_tool_result(
+                args,
+                Some(tool_call_id),
+                Some(spawn_context),
+            ),
+        )
+        .await
+        {
+            Ok(output) => output,
+            Err(_) => render_control_tool_recovery_error(
+                "Cannot recover missing agent_fanout edge result: recovery timed out before the host could render the registered fanout group.",
+            ),
+        };
+        let status = cloud_tool_result_status_label(&output).to_string();
+        let recovery_outcome = if status == "completed" {
+            "recovered"
+        } else {
+            "failed"
+        };
+        ControlToolRecovery::Recovered(EdgeToolExecResult {
+            request_id: tool_call_id.to_string(),
+            tool: tool_name.to_string(),
+            args: args.clone(),
+            output,
+            tool_result_fields: Some(control_tool_recovery_fields(recovery_outcome)),
+            status,
+            duration_ms: 0,
+        })
+    }
+
     async fn cancel_child_agents(&mut self, agent_ids: &[String], reason: &str) -> Vec<String> {
         let Some(spawn_context) = self.executor.spawn_context.as_ref() else {
             return Vec::new();
@@ -1205,14 +1329,37 @@ fn looks_plan_shaped(text: &str) -> bool {
 mod tests {
     use super::{
         deferred_input_status_line, derive_turn_interaction_mode,
-        permission_mode_change_audit_event, plan_mode_missed_exit_reminder,
-        plan_mode_restriction_names, request_allowlist_restriction_names,
+        failed_control_tool_recovery_result, permission_mode_change_audit_event,
+        plan_mode_missed_exit_reminder, plan_mode_restriction_names,
+        request_allowlist_restriction_names,
     };
     use crate::cli::permission_manager::PermissionMode;
     use astra_runtime::turn::agentic_loop::host::TurnInteractionMode;
     use astra_services::session_journal::JournalEventType;
     use serde_json::json;
     use std::collections::HashSet;
+
+    #[test]
+    fn failed_control_tool_recovery_result_is_explicitly_marked_as_recovery_failure() {
+        let result = failed_control_tool_recovery_result(
+            "call-fanout",
+            "agent_fanout",
+            &json!({"action": "start"}),
+            "Cannot recover missing agent_fanout edge result",
+        );
+
+        assert_eq!(result.status, "failed");
+        let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output["status"], "failed");
+        assert_eq!(output["recovery"]["attempted"], true);
+        assert_eq!(output["recovery"]["source"], "host_state");
+        assert_eq!(output["recovery"]["outcome"], "failed");
+
+        let fields = result.tool_result_fields.expect("recovery metadata");
+        assert_eq!(fields["recovery"]["attempted"], true);
+        assert_eq!(fields["recovery"]["source"], "host_state");
+        assert_eq!(fields["recovery"]["outcome"], "failed");
+    }
 
     #[test]
     fn permission_mode_change_audit_event_carries_source_and_modes() {

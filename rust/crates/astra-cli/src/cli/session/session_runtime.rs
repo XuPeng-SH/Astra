@@ -414,6 +414,8 @@ fn model_list_entry_name(entry: &serde_json::Value) -> Option<&str> {
     entry
         .get("name")
         .or_else(|| entry.get("model_name"))
+        .or_else(|| entry.get("model_id"))
+        .or_else(|| entry.get("id"))
         .and_then(|value| value.as_str())
         .map(str::trim)
         .filter(|name| !name.is_empty())
@@ -707,7 +709,8 @@ pub(crate) async fn fresh_access_token(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
 ) -> Option<String> {
-    if let Some(token) = active_env_access_token(chrono::Utc::now().timestamp()) {
+    let now = chrono::Utc::now().timestamp();
+    if let Some(token) = active_env_access_token(now) {
         return Some(token);
     }
 
@@ -719,20 +722,23 @@ pub(crate) async fn fresh_access_token(
     drop(creds);
 
     if let Some(token) = access {
-        if !has_refresh {
+        if !access_token_needs_refresh(&token, now) {
             return Some(token);
         }
-        if !access_token_needs_refresh(&token, chrono::Utc::now().timestamp()) {
-            return Some(token);
+        if !has_refresh {
+            return None;
         }
         if attempt_token_refresh(api, profile).await {
-            return current_access_token(profile).or(Some(token));
+            return current_access_token(profile).filter(|fresh| {
+                !access_token_needs_refresh(fresh, chrono::Utc::now().timestamp())
+            });
         }
-        return Some(token);
+        return None;
     }
 
     if has_refresh && attempt_token_refresh(api, profile).await {
-        return current_access_token(profile);
+        return current_access_token(profile)
+            .filter(|fresh| !access_token_needs_refresh(fresh, chrono::Utc::now().timestamp()));
     }
 
     None
@@ -1438,12 +1444,12 @@ mod tests {
 
         assert_eq!(
             default_model_from_models_response(&body).as_deref(),
-            Some("items-active-model")
+            Some("row-without-name")
         );
     }
 
     #[test]
-    fn default_model_from_models_response_returns_none_without_active_names() {
+    fn default_model_from_models_response_uses_model_id_when_name_is_missing() {
         let body = serde_json::json!({
             "models": [
                 {"name": "inactive", "is_active": false},
@@ -1451,7 +1457,10 @@ mod tests {
             ]
         });
 
-        assert_eq!(default_model_from_models_response(&body), None);
+        assert_eq!(
+            default_model_from_models_response(&body).as_deref(),
+            Some("row-without-name")
+        );
     }
 
     #[test]
@@ -2633,6 +2642,74 @@ mod tests {
         let profile = creds.profiles.get("default").unwrap();
         assert_eq!(profile.access_token.as_deref(), Some(token.as_str()));
         assert_eq!(profile.refresh_token.as_deref(), Some("refresh-old"));
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn fresh_access_token_fails_closed_when_expired_saved_token_refresh_fails() {
+        let _g = isolate_credentials();
+        let stale = jwt_with_exp(1);
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".into(),
+            Profile {
+                access_token: Some(stale.clone()),
+                refresh_token: Some("refresh-old".to_string()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth/refresh"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&mock.uri(), None).unwrap();
+
+        let fresh = fresh_access_token(&api, None).await;
+
+        assert_eq!(
+            fresh, None,
+            "expired credentials must not be reported as fresh when refresh fails"
+        );
+        let creds = load_credentials();
+        let profile = creds.profiles.get("default").unwrap();
+        assert_eq!(
+            profile.access_token.as_deref(),
+            Some(stale.as_str()),
+            "transient refresh failure should preserve saved credentials for a later retry"
+        );
+        assert_eq!(profile.refresh_token.as_deref(), Some("refresh-old"));
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn fresh_access_token_fails_closed_when_expired_saved_token_has_no_refresh_token() {
+        let _g = isolate_credentials();
+        let stale = jwt_with_exp(1);
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".into(),
+            Profile {
+                access_token: Some(stale.clone()),
+                refresh_token: None,
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        let mock = MockServer::start().await;
+        let api = astra_thin_client::ThinClient::new(&mock.uri(), None).unwrap();
+
+        let fresh = fresh_access_token(&api, None).await;
+
+        assert_eq!(
+            fresh, None,
+            "an expired token without refresh credentials is not usable auth"
+        );
+        assert!(mock.received_requests().await.unwrap().is_empty());
     }
 
     #[serial_test::serial]

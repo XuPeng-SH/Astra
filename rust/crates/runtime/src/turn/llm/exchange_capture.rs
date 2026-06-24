@@ -503,6 +503,8 @@ mod tests {
 
         async fn load_json_artifact(
             &self,
+            _user_id: &str,
+            _session_id: &str,
             _artifact_id: &str,
         ) -> Result<Option<StoredSessionArtifact>, astra_services::SessionArtifactStoreError>
         {
@@ -511,6 +513,7 @@ mod tests {
 
         async fn load_latest_json_artifact(
             &self,
+            _user_id: &str,
             _session_id: &str,
             _artifact_kind: &str,
         ) -> Result<Option<StoredSessionArtifact>, astra_services::SessionArtifactStoreError>
@@ -520,6 +523,7 @@ mod tests {
 
         async fn list_json_artifacts(
             &self,
+            _user_id: &str,
             _session_id: &str,
             _artifact_kind: Option<&str>,
             _limit: usize,
@@ -829,6 +833,8 @@ mod tests {
         let session_dir = astra_services::local_session_artifact_store()
             .session_dir(session_id)
             .expect("session dir");
+        std::fs::create_dir_all(session_dir.parent().expect("session dir parent"))
+            .expect("create owner sessions root");
         std::fs::write(&session_dir, "block dir creation").expect("block session dir");
 
         let error = persist_configured_capture(

@@ -12,6 +12,7 @@ use sqlx::{Row, query};
 
 use crate::cost_ledger::{CostLedger, CostLedgerEntry};
 use crate::models::PricingData;
+use crate::storage::agent_session_exists_for_user;
 use astra_core::{ErrorResponse, MatrixOneSettings, SharedPool, error_response, internal_error};
 
 fn normalize_tool_name(name: String) -> String {
@@ -778,22 +779,13 @@ impl DatabaseSessionAuditService {
         session_id: &str,
         user_id: &str,
     ) -> AuditResult<()> {
-        let row = query("SELECT user_id FROM agent_sessions WHERE session_id = ?")
-            .bind(session_id)
-            .fetch_optional(pool)
+        if agent_session_exists_for_user(pool, session_id, user_id)
             .await
-            .map_err(internal_error)?;
-
-        match row {
-            Some(r) => {
-                let owner: String = r.try_get("user_id").map_err(internal_error)?;
-                if owner != user_id {
-                    Err(error_response(StatusCode::NOT_FOUND, "Session not found"))
-                } else {
-                    Ok(())
-                }
-            }
-            None => Err(error_response(StatusCode::NOT_FOUND, "Session not found")),
+            .map_err(internal_error)?
+        {
+            Ok(())
+        } else {
+            Err(error_response(StatusCode::NOT_FOUND, "Session not found"))
         }
     }
 
@@ -844,22 +836,18 @@ impl SessionAuditService for DatabaseSessionAuditService {
     ) -> AuditResult<SessionAuditSummary> {
         let pool = self.get_pool().await.map_err(internal_error)?;
 
-        // Single round-trip: session row + owner check (replaces verify_session_owner + session SELECT).
         let sess_row = query(
-            "SELECT user_id, status, created_at, ended_at FROM agent_sessions WHERE session_id = ?",
+            "SELECT status, created_at, ended_at \
+             FROM agent_sessions WHERE session_id = ? AND user_id = ?",
         )
         .bind(session_id)
+        .bind(user_id)
         .fetch_optional(&pool)
         .await
         .map_err(internal_error)?;
 
         let sess_row =
             sess_row.ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Session not found"))?;
-        let owner: String = sess_row.try_get("user_id").map_err(internal_error)?;
-        if owner != user_id {
-            return Err(error_response(StatusCode::NOT_FOUND, "Session not found"));
-        }
-
         let status: String = sess_row.try_get("status").unwrap_or_default();
         let created_at: String = sess_row
             .try_get::<String, _>("created_at")

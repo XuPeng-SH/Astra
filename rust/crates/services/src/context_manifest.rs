@@ -105,7 +105,6 @@ pub const BASELINE_PREVIEW_TEMPLATES: &[(&str, u32, &str)] = &[
     ("cargo", 1200, "rust_v1"),
     ("rustc", 1200, "rust_v1"),
     ("clippy", 1200, "rust_v1"),
-    ("sql_compat_scan", 1200, "sql_v1"),
     ("pg_schema_structurize", 1200, "sql_v1"),
     ("slow_query_analyzer", 1200, "sql_v1"),
     ("curl", 1000, "text_v1"),
@@ -611,11 +610,12 @@ impl DatabaseContextManifestStore {
             if let Some(artifact_id) = referenced_artifact_id {
                 sqlx::query(
                     "UPDATE session_artifacts
-                     SET referenced_by_manifest_count = referenced_by_manifest_count + 1,
-                         updated_at = NOW(6)
-                     WHERE artifact_id = ?",
+	                     SET referenced_by_manifest_count = referenced_by_manifest_count + 1,
+	                         updated_at = NOW(6)
+	                     WHERE artifact_id = ? AND user_id = ?",
                 )
                 .bind(&artifact_id)
+                .bind(&manifest.user_id)
                 .execute(&mut *tx)
                 .await
                 .map_err(|source| ContextManifestError::Database {

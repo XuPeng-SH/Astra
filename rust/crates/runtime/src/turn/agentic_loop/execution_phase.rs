@@ -1025,6 +1025,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         prep.quiet,
         AgenticTurnIngestMut {
             task_profile: state.task_profile,
+            step_persistence_enabled: state.context_manifest_user_id.is_some(),
             first_ttft_ms: &mut state.telemetry.first_ttft_ms,
             current_session_id: &mut state.current_session_id,
             current_run_id: &mut state.current_run_id,
@@ -5792,7 +5793,9 @@ fn spill_old_messages_to_disk(
     let tokens_freed = (spill_json.len() / 4) as u64;
 
     // Write full transcript to session dir.
-    let spill_dir = astra_services::session_journal::local_sessions_dir().join(session_id);
+    let store = astra_services::local_session_artifact_store();
+    let spill_dir = astra_services::SessionArtifactStore::session_dir(&store, session_id)
+        .expect("session id must resolve owner-bound spill directory");
     let _ = std::fs::create_dir_all(&spill_dir);
     let spill_path = spill_dir.join(format!("spill-round{round}.json"));
     if std::fs::write(&spill_path, &spill_json).is_err() {

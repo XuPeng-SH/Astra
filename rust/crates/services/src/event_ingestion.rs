@@ -110,7 +110,7 @@ fn merged_metadata_from_journal_event(
         match m {
             serde_json::Value::Object(map) => obj.extend(map.clone()),
             other => {
-                obj.insert("legacy_metadata".to_string(), other.clone());
+                obj.insert("event_metadata".to_string(), other.clone());
             }
         }
     }
@@ -762,9 +762,10 @@ impl EventIngestionWorker {
                 .get(session_id)
                 .copied()
                 .ok_or_else(|| format!("missing user_id for session {session_id}"))?;
-            let event_count = crate::storage::load_agent_event_count(&mut *tx, session_id)
-                .await
-                .map_err(|e| format!("event_count load for {session_id}: {e}"))?;
+            let event_count =
+                crate::storage::load_agent_event_count_for_user(&mut *tx, session_id, user_id)
+                    .await
+                    .map_err(|e| format!("event_count load for {session_id}: {e}"))?;
             crate::storage::upsert_agent_session_event_count(
                 &mut *tx,
                 session_id,
@@ -780,9 +781,10 @@ impl EventIngestionWorker {
             if event.event_type == "session_end" {
                 sqlx::query(
                     "UPDATE agent_sessions SET status = 'ended', ended_at = NOW() \
-                     WHERE session_id = ? AND status != 'ended'",
+                     WHERE session_id = ? AND user_id = ? AND status != 'ended'",
                 )
                 .bind(&event.session_id)
+                .bind(&event.user_id)
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| format!("session close for {}: {e}", event.session_id))?;
@@ -1133,6 +1135,23 @@ mod tests {
         let merged = super::merged_metadata_from_journal_event(&journal);
         let obj = merged.expect("expected metadata");
         assert!(obj.get("cloud_pull").is_some());
+    }
+
+    #[test]
+    fn merged_metadata_wraps_non_object_metadata_under_canonical_key() {
+        let mut journal = make_turn_event();
+        journal.metadata = Some(serde_json::json!("raw scalar metadata"));
+
+        let merged = super::merged_metadata_from_journal_event(&journal).expect("metadata");
+
+        assert_eq!(
+            merged.get("event_metadata"),
+            Some(&serde_json::json!("raw scalar metadata"))
+        );
+        assert!(
+            merged.get("legacy_metadata").is_none(),
+            "new journal metadata must not emit compatibility-only keys"
+        );
     }
 
     #[test]

@@ -79,6 +79,35 @@ async fn start_http_server(host: &str, port: u16) -> Result<(), String> {
         .map_err(|e| format!("API server failed to start: {e}"))
 }
 
+async fn fresh_access_token_or_error(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+) -> Result<String, String> {
+    session_runtime::fresh_access_token(api, profile)
+        .await
+        .ok_or_else(|| {
+            "Unable to obtain a valid access token; run `astra login` and retry.".to_string()
+        })
+}
+
+fn repl_bridge_command_requires_access_token(slash_cmd: &str) -> bool {
+    matches!(
+        slash_cmd,
+        "/team" | "/task" | "/memory" | "/plan" | "/review" | "/grep"
+    )
+}
+
+async fn repl_bridge_access_token(
+    slash_cmd: &str,
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+) -> Result<Option<String>, String> {
+    if repl_bridge_command_requires_access_token(slash_cmd) {
+        return fresh_access_token_or_error(api, profile).await.map(Some);
+    }
+    Ok(session_runtime::fresh_access_token(api, profile).await)
+}
+
 impl From<ExitCode> for i32 {
     fn from(code: ExitCode) -> i32 {
         code as i32
@@ -457,10 +486,8 @@ async fn execute_headless_task_body(
         session_routing,
     } = input;
     use astra_services::TaskStatus;
-    let (_creds, profile_name, _, token) = get_profile_and_token(profile)?;
-    let token = session_runtime::fresh_access_token(api, profile)
-        .await
-        .unwrap_or(token);
+    let (_creds, profile_name, _, _token) = get_profile_and_token(profile)?;
+    let token = fresh_access_token_or_error(api, profile).await?;
     let session_id = session_routing.server_session_id.clone();
     let effective_model = resolve_one_shot_model(
         api,
@@ -1010,7 +1037,7 @@ async fn execute_repl_bridge_command(
     state.unified_skill_registry = pipeline_modules.unified_skill_registry.clone();
     state.mcp_manager = pipeline_modules.mcp_manager.clone();
 
-    let token = session_runtime::fresh_access_token(api, profile).await;
+    let token = repl_bridge_access_token(slash_cmd, api, profile).await?;
     if let Some(ref tok) = token {
         maybe_wire_delegation_engine(&mut state, api, tok);
     }
@@ -1097,6 +1124,78 @@ mod permission_mode_display_tests {
     }
 }
 
+#[cfg(test)]
+mod token_refresh_error_tests {
+    use super::{repl_bridge_access_token, repl_bridge_command_requires_access_token};
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var(key).ok();
+            // SAFETY: callers use `#[serial]` to isolate process env mutation.
+            unsafe { std::env::remove_var(key) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => {
+                    // SAFETY: callers use `#[serial]` to isolate process env mutation.
+                    unsafe { std::env::set_var(self.key, value) };
+                }
+                None => {
+                    // SAFETY: callers use `#[serial]` to isolate process env mutation.
+                    unsafe { std::env::remove_var(self.key) };
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn repl_bridge_auth_policy_matches_command_capabilities() {
+        for command in ["/team", "/task", "/memory", "/plan", "/review", "/grep"] {
+            assert!(
+                repl_bridge_command_requires_access_token(command),
+                "{command} needs cloud auth or delegation wiring and must fail fast"
+            );
+        }
+        for command in ["/diff", "/allow", "/debug", "/bug", "/agent", "/telemetry"] {
+            assert!(
+                !repl_bridge_command_requires_access_token(command),
+                "{command} must remain available without cloud auth"
+            );
+        }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn repl_bridge_auth_policy_fails_fast_only_for_cloud_commands() {
+        let _env = EnvVarGuard::remove("ASTRA_ACCESS_TOKEN");
+
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        let missing_profile = Some("__missing_repl_bridge_auth_test_profile__");
+
+        let err = repl_bridge_access_token("/task", &api, missing_profile)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("Unable to obtain a valid access token"),
+            "cloud-backed slash commands should fail before running half-wired: {err}"
+        );
+
+        let local_token = repl_bridge_access_token("/diff", &api, missing_profile)
+            .await
+            .expect("local slash command auth lookup should be best-effort");
+        assert_eq!(local_token, None);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_cli_command(
     command: Option<Command>,
@@ -1180,10 +1279,8 @@ async fn execute_cli_command_impl(
         Some(Command::Message(words)) => {
             let raw_message = words.join(" ");
             let message = apply_system_prompt(&raw_message, system_prompt.as_deref());
-            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
-            let token = session_runtime::fresh_access_token(api, profile.as_deref())
-                .await
-                .unwrap_or(token);
+            let (_, _, _, _token) = get_profile_and_token(profile.as_deref())?;
+            let token = fresh_access_token_or_error(api, profile.as_deref()).await?;
             let session_routing = resolve_one_shot_session_routing(
                 api,
                 profile.as_deref(),
@@ -1672,10 +1769,8 @@ async fn execute_cli_command_impl(
                 return Ok(ExitCode::Success);
             };
 
-            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
-            let token = session_runtime::fresh_access_token(api, profile.as_deref())
-                .await
-                .unwrap_or(token);
+            let (_, _, _, _token) = get_profile_and_token(profile.as_deref())?;
+            let token = fresh_access_token_or_error(api, profile.as_deref()).await?;
             let explicit_session_id = args.session_id.clone();
             let session_routing = resolve_one_shot_session_routing(
                 api,
@@ -2467,10 +2562,8 @@ pub(crate) async fn run_print_mode(
     };
     let message = apply_system_prompt(&raw_message, system_prompt);
 
-    let (_, _, _, token) = get_profile_and_token(profile)?;
-    let token = session_runtime::fresh_access_token(api, profile)
-        .await
-        .unwrap_or(token);
+    let (_, _, _, _token) = get_profile_and_token(profile)?;
+    let token = fresh_access_token_or_error(api, profile).await?;
     let session_routing =
         resolve_one_shot_session_routing(api, profile, cli_context.session_id.clone(), true)
             .await?;

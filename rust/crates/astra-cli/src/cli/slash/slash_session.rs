@@ -4435,7 +4435,7 @@ fn handle_session_verify(state: &SessionState) {
 
     // Session disk usage summary
     if sid != "none" {
-        let sessions_dir = session_journal::local_sessions_dir();
+        let sessions_dir = session_journal::local_owner_sessions_dir();
         eprintln!();
         eprintln!("  {}", "Disk".dim());
         match list_local_sessions() {
@@ -4443,7 +4443,7 @@ fn handle_session_verify(state: &SessionState) {
                 let total_journals: u64 = all_sessions
                     .iter()
                     .filter_map(|s| {
-                        std::fs::metadata(sessions_dir.join(format!("{s}.jsonl")))
+                        std::fs::metadata(session_journal::journal_file_path(s))
                             .ok()
                             .map(|m| m.len())
                     })
@@ -5236,7 +5236,7 @@ async fn prepared_fork_restore_from_journal(
 ) -> Result<PreparedForkRestore, String> {
     let restored_journal = session_runtime::restored_journal_state(session_id)?;
     // Try CSL first — full-fidelity message history via CslManager.
-    let base_dir = session_journal::local_sessions_dir();
+    let base_dir = session_journal::local_owner_sessions_dir();
     let store = std::sync::Arc::new(
         astra_turn_core::conversation_log::file_store::FileCslStore::new(base_dir),
     );
@@ -5277,7 +5277,7 @@ async fn load_prepared_fork_restore(
             "missing session journal for forked child {new_sid}"
         ));
     }
-    let base_dir = session_journal::local_sessions_dir();
+    let base_dir = session_journal::local_owner_sessions_dir();
     let store = std::sync::Arc::new(
         astra_turn_core::conversation_log::file_store::FileCslStore::new(base_dir),
     );
@@ -5465,11 +5465,17 @@ async fn apply_restored_session(
     let prepared_workspace = load_prepared_workspace_restore(&restored)?;
     let prepared_history = prepared_fork_restore_from_journal(&restored.session_id).await?;
     let last_turn_event = local_journal.last_turn_event;
+    let user_id = state
+        .ingestion_user_id
+        .as_deref()
+        .filter(|user_id| !user_id.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(crate::cli::cli_config::cli_utils::cli_user_id);
 
     let mut step_restore_error = None;
     // Try new crash recovery state machine first; fall back to legacy restore
     let step_restored =
-        match astra_pipeline::crash_recovery::recover_from_crash(&restored.session_id) {
+        match astra_pipeline::crash_recovery::recover_from_crash(&user_id, &restored.session_id) {
             Ok(Some(astra_pipeline::crash_recovery::RecoveryOutcome::AutoRecovered {
                 restored: cr_restored,
                 ..
@@ -5563,12 +5569,13 @@ async fn apply_restored_session(
             }
             Ok(None) => {
                 // No crash detected — use legacy restore
-                match astra_pipeline::step_restore::restore_session(&restored.session_id) {
+                match astra_pipeline::step_restore::restore_session(&user_id, &restored.session_id)
+                {
                     Ok(r) => r,
                     Err(astra_pipeline::step_restore::RestoreError::IoError(error)) => {
                         return Err(format!(
-                            "Failed to read local step checkpoint for {}: {}",
-                            restored.session_id, error
+                            "Failed to read local step checkpoint for user_id={} session_id={}: {}",
+                            user_id, restored.session_id, error
                         ));
                     }
                     Err(error) => {
@@ -5582,12 +5589,13 @@ async fn apply_restored_session(
                     error = %cr_err,
                     "crash recovery state machine failed, falling back to legacy restore"
                 );
-                match astra_pipeline::step_restore::restore_session(&restored.session_id) {
+                match astra_pipeline::step_restore::restore_session(&user_id, &restored.session_id)
+                {
                     Ok(r) => r,
                     Err(astra_pipeline::step_restore::RestoreError::IoError(error)) => {
                         return Err(format!(
-                            "Failed to read local step checkpoint for {}: {}",
-                            restored.session_id, error
+                            "Failed to read local step checkpoint for user_id={} session_id={}: {}",
+                            user_id, restored.session_id, error
                         ));
                     }
                     Err(error) => {
@@ -5607,8 +5615,8 @@ async fn apply_restored_session(
         && let Some(error) = step_restore_error.as_ref()
     {
         return Err(format!(
-            "Failed to restore local step checkpoint for {}: {}",
-            restored.session_id, error
+            "Failed to restore local step checkpoint for user_id={} session_id={}: {}",
+            user_id, restored.session_id, error
         ));
     }
     if let Some(error) = step_restore_error.as_ref() {
@@ -6395,7 +6403,9 @@ mod resume_tests {
             "turns_completed": turn_count,
             "remaining_turns": 2,
         }));
+        let user_id = crate::cli::cli_config::cli_utils::cli_user_id();
         astra_pipeline::step_checkpoint::write_step_checkpoint(
+            &user_id,
             session_id,
             turn_count,
             &astra_pipeline::step_protocol::StepCheckpoint::Heavy(Box::new(heavy)),
@@ -6422,7 +6432,9 @@ mod resume_tests {
             serde_json::json!({"role": "assistant", "content": "restoring session approvals"}),
         ];
         heavy.approval_overrides = Some(approval_overrides);
+        let user_id = crate::cli::cli_config::cli_utils::cli_user_id();
         astra_pipeline::step_checkpoint::write_step_checkpoint(
+            &user_id,
             session_id,
             turn_count,
             &astra_pipeline::step_protocol::StepCheckpoint::Heavy(Box::new(heavy)),
@@ -6507,8 +6519,9 @@ mod resume_tests {
     fn write_completed_read_step_event(session_id: &str, turn_count: u32, created_at: u64) {
         let args = serde_json::json!({"path": "src/lib.rs"});
         let idem_key = astra_pipeline::step_protocol::IdempotencyKey::semantic("read_file", &args);
+        let user_id = crate::cli::cli_config::cli_utils::cli_user_id();
         let mut event_store =
-            astra_pipeline::step_checkpoint::FileBackedEventStore::empty(session_id);
+            astra_pipeline::step_checkpoint::FileBackedEventStore::empty(&user_id, session_id);
         let _ = <astra_pipeline::step_checkpoint::FileBackedEventStore as astra_pipeline::step_protocol::StepEventStore>::append(
             &mut event_store,
             astra_pipeline::step_protocol::StepEvent {
@@ -6563,7 +6576,9 @@ mod resume_tests {
         }));
         heavy.consecutive_context_window_errors = 2;
         let completed_event_created_at = heavy.light.created_at.saturating_add(1);
+        let user_id = crate::cli::cli_config::cli_utils::cli_user_id();
         astra_pipeline::step_checkpoint::write_step_checkpoint(
+            &user_id,
             session_id,
             turn_count,
             &astra_pipeline::step_protocol::StepCheckpoint::Heavy(Box::new(heavy)),
@@ -6583,7 +6598,9 @@ mod resume_tests {
             _ => unreachable!("heavy checkpoint constructor should yield Heavy"),
         };
         heavy.light.protocol_version = 0;
+        let user_id = crate::cli::cli_config::cli_utils::cli_user_id();
         astra_pipeline::step_checkpoint::write_step_checkpoint(
+            &user_id,
             session_id,
             turn_count,
             &astra_pipeline::step_protocol::StepCheckpoint::Heavy(Box::new(heavy)),
@@ -7284,7 +7301,7 @@ mod resume_tests {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let session_id = format!("csl-resume-{}", uuid::Uuid::new_v4());
 
-        let store = FileCslStore::new(session_journal::local_sessions_dir());
+        let store = FileCslStore::new(session_journal::local_owner_sessions_dir());
         let snapshot = CslEntry::Snapshot {
             seq: 0,
             turn: 1,
@@ -7406,7 +7423,9 @@ mod resume_tests {
     async fn restore_from_corrupt_csl_returns_error_instead_of_falling_back() {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let session_id = format!("corrupt-csl-{}", uuid::Uuid::new_v4());
-        let session_dir = session_journal::local_sessions_dir().join(&session_id);
+        let store = astra_services::local_session_artifact_store();
+        let session_dir = astra_services::SessionArtifactStore::session_dir(&store, &session_id)
+            .expect("owner-bound test session dir");
         std::fs::create_dir_all(&session_dir).unwrap();
         write_local_resumable_session(&session_id, 2);
         std::fs::write(
@@ -7635,9 +7654,11 @@ mod resume_tests {
     async fn load_resumable_session_candidates_keeps_cloud_results_when_local_scan_fails() {
         let _creds_guard = crate::tests::isolate_credentials();
         let tmp = tempfile::tempdir().unwrap();
-        let broken_root = tmp.path().join("broken-sessions-root");
-        std::fs::write(&broken_root, "not-a-directory").unwrap();
-        let _guard = JournalDirGuard::new(&broken_root);
+        let sessions_root = tmp.path().join("sessions-root");
+        let _guard = JournalDirGuard::new(&sessions_root);
+        let broken_owner_root = session_journal::local_owner_sessions_dir();
+        std::fs::create_dir_all(broken_owner_root.parent().unwrap()).unwrap();
+        std::fs::write(&broken_owner_root, "not-a-directory").unwrap();
         write_profile_with_token("placeholder-session");
 
         let session_id = format!("cloud-only-{}", uuid::Uuid::new_v4());
@@ -7676,9 +7697,11 @@ mod resume_tests {
     #[tokio::test]
     async fn load_resumable_session_candidates_errors_when_local_scan_fails_without_cloud() {
         let tmp = tempfile::tempdir().unwrap();
-        let broken_root = tmp.path().join("broken-sessions-root");
-        std::fs::write(&broken_root, "not-a-directory").unwrap();
-        let _guard = JournalDirGuard::new(&broken_root);
+        let sessions_root = tmp.path().join("sessions-root");
+        let _guard = JournalDirGuard::new(&sessions_root);
+        let broken_owner_root = session_journal::local_owner_sessions_dir();
+        std::fs::create_dir_all(broken_owner_root.parent().unwrap()).unwrap();
+        std::fs::write(&broken_owner_root, "not-a-directory").unwrap();
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
 
         let error = load_resumable_session_candidates(None, &api, 20)
@@ -8180,7 +8203,7 @@ mod resume_tests {
         let parent_id = format!("fork-parent-{}", uuid::Uuid::new_v4());
         let child_id = format!("fork-child-{}", uuid::Uuid::new_v4());
 
-        let base_dir = session_journal::local_sessions_dir();
+        let base_dir = session_journal::local_owner_sessions_dir();
         let store = std::sync::Arc::new(FileCslStore::new(base_dir));
 
         // Write a 2-turn parent CSL.
@@ -8241,7 +8264,7 @@ mod resume_tests {
         let parent_id = format!("fork-resume-parent-{}", uuid::Uuid::new_v4());
         let child_id = format!("fork-resume-child-{}", uuid::Uuid::new_v4());
 
-        let base_dir = session_journal::local_sessions_dir();
+        let base_dir = session_journal::local_owner_sessions_dir();
         let store = std::sync::Arc::new(FileCslStore::new(base_dir));
 
         let snapshot = CslEntry::Snapshot {
@@ -8291,7 +8314,7 @@ mod resume_tests {
         let parent_id = format!("fork-no-csl-{}", uuid::Uuid::new_v4());
         let child_id = format!("fork-no-csl-child-{}", uuid::Uuid::new_v4());
 
-        let base_dir = session_journal::local_sessions_dir();
+        let base_dir = session_journal::local_owner_sessions_dir();
         let store = std::sync::Arc::new(FileCslStore::new(base_dir));
 
         // Parent has no CSL data. fork() succeeds but writes nothing to child.
@@ -8325,7 +8348,9 @@ mod resume_tests {
 
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let sid = format!("fork-snapshot-{}", uuid::Uuid::new_v4());
-        let store = std::sync::Arc::new(FileCslStore::new(session_journal::local_sessions_dir()));
+        let store = std::sync::Arc::new(FileCslStore::new(
+            session_journal::local_owner_sessions_dir(),
+        ));
         let mut mgr = CslManager::new(store, sid.clone(), Default::default()).unwrap();
         mgr.persist_turn(
             1,

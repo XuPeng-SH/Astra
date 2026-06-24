@@ -6,6 +6,8 @@ use uuid::Uuid;
 
 use astra_core::{ErrorResponse, MatrixOneSettings, SharedPool, error_response, internal_error};
 
+use crate::storage::{agent_event_exists_for_user_session, agent_session_exists_for_user};
+
 // ── Data types ───────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, PartialEq)]
@@ -134,20 +136,28 @@ impl ContextService for DatabaseContextService {
     ) -> Result<SnapshotRecord, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
 
-        let session_row = query("SELECT user_id FROM agent_sessions WHERE session_id = ?")
-            .bind(&request.session_id)
-            .fetch_optional(&pool)
+        if !agent_session_exists_for_user(&pool, &request.session_id, &user_id)
             .await
-            .map_err(internal_error)?;
-        let session_row = session_row.ok_or_else(|| {
-            error_response(
+            .map_err(internal_error)?
+        {
+            return Err(error_response(
                 StatusCode::NOT_FOUND,
                 format!("Session {} not found", request.session_id),
-            )
-        })?;
-        let owner: String = session_row.try_get("user_id").map_err(internal_error)?;
-        if owner != user_id {
-            return Err(error_response(StatusCode::FORBIDDEN, "Permission denied"));
+            ));
+        }
+        if !agent_event_exists_for_user_session(
+            &pool,
+            &request.event_id,
+            &request.session_id,
+            &user_id,
+        )
+        .await
+        .map_err(internal_error)?
+        {
+            return Err(error_response(
+                StatusCode::NOT_FOUND,
+                format!("Event {} not found", request.event_id),
+            ));
         }
 
         let capture_id = Uuid::new_v4().to_string();
@@ -168,10 +178,11 @@ impl ContextService for DatabaseContextService {
 
         query(
             "INSERT INTO ctx_snapshots \
-             (context_capture_id, session_id, event_id, context_data, created_at) \
-             VALUES (?, ?, ?, ?, NOW())",
+             (context_capture_id, user_id, session_id, event_id, context_data, created_at) \
+             VALUES (?, ?, ?, ?, ?, NOW())",
         )
         .bind(&capture_id)
+        .bind(&user_id)
         .bind(&request.session_id)
         .bind(&request.event_id)
         .bind(&data_str)
@@ -180,11 +191,12 @@ impl ContextService for DatabaseContextService {
         .map_err(internal_error)?;
 
         let select_sql = format!(
-            "SELECT {} FROM ctx_snapshots WHERE context_capture_id = ?",
+            "SELECT {} FROM ctx_snapshots WHERE context_capture_id = ? AND user_id = ?",
             SNAPSHOT_SELECT_COLS
         );
         let row = query(&select_sql)
             .bind(&capture_id)
+            .bind(&user_id)
             .fetch_one(&pool)
             .await
             .map_err(internal_error)?;
@@ -201,12 +213,10 @@ impl ContextService for DatabaseContextService {
 
         let count_sql = if filter.session_id.is_some() {
             "SELECT COUNT(cs.context_capture_id) AS total FROM ctx_snapshots cs \
-             JOIN agent_sessions s ON cs.session_id = s.session_id \
-             WHERE s.user_id = ? AND cs.session_id = ?"
+             WHERE cs.user_id = ? AND cs.session_id = ?"
         } else {
             "SELECT COUNT(cs.context_capture_id) AS total FROM ctx_snapshots cs \
-             JOIN agent_sessions s ON cs.session_id = s.session_id \
-             WHERE s.user_id = ?"
+             WHERE cs.user_id = ?"
         };
 
         let total_row = if let Some(sid) = &filter.session_id {
@@ -228,8 +238,7 @@ impl ContextService for DatabaseContextService {
             format!(
                 "SELECT {} \
                  FROM ctx_snapshots cs \
-                 JOIN agent_sessions s ON cs.session_id = s.session_id \
-                 WHERE s.user_id = ? AND cs.session_id = ? \
+                 WHERE cs.user_id = ? AND cs.session_id = ? \
                  ORDER BY cs.created_at DESC LIMIT ? OFFSET ?",
                 SNAPSHOT_LIST_SELECT_COLS
             )
@@ -237,8 +246,7 @@ impl ContextService for DatabaseContextService {
             format!(
                 "SELECT {} \
                  FROM ctx_snapshots cs \
-                 JOIN agent_sessions s ON cs.session_id = s.session_id \
-                 WHERE s.user_id = ? \
+                 WHERE cs.user_id = ? \
                  ORDER BY cs.created_at DESC LIMIT ? OFFSET ?",
                 SNAPSHOT_LIST_SELECT_COLS
             )
@@ -290,8 +298,7 @@ impl ContextService for DatabaseContextService {
              IFNULL(CAST(cs.context_data AS CHAR), '{}') AS context_data_json, \
              DATE_FORMAT(cs.created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
              FROM ctx_snapshots cs \
-             JOIN agent_sessions s ON cs.session_id = s.session_id \
-             WHERE cs.context_capture_id = ? AND s.user_id = ?"
+             WHERE cs.context_capture_id = ? AND cs.user_id = ?"
             .to_string();
         let row = query(&sql)
             .bind(&context_capture_id)

@@ -1,7 +1,8 @@
 //! Session workspace metadata — describes a session's runtime context.
 //!
 //! Written once on session start and updated per-turn with cumulative stats.
-//! Stored at `~/.astra/sessions/<session_id>/workspace.yaml`.
+//! Stored at
+//! `~/.astra/sessions/v1/users/<owner>/sessions/<session_id>/workspace.yaml`.
 //!
 //! This provides:
 //! - Quick session identification without parsing the JSONL journal
@@ -943,6 +944,8 @@ mod tests {
 
         async fn load_json_artifact(
             &self,
+            _user_id: &str,
+            _session_id: &str,
             _artifact_id: &str,
         ) -> Result<Option<StoredSessionArtifact>, crate::SessionArtifactStoreError> {
             Ok(None)
@@ -950,6 +953,7 @@ mod tests {
 
         async fn load_latest_json_artifact(
             &self,
+            _user_id: &str,
             _session_id: &str,
             _artifact_kind: &str,
         ) -> Result<Option<StoredSessionArtifact>, crate::SessionArtifactStoreError> {
@@ -958,6 +962,7 @@ mod tests {
 
         async fn list_json_artifacts(
             &self,
+            _user_id: &str,
             _session_id: &str,
             _artifact_kind: Option<&str>,
             _limit: usize,
@@ -1402,8 +1407,14 @@ mod tests {
 
         let valid_sid = "git-root-valid";
         let corrupt_sid = "git-root-corrupt";
-        std::fs::write(sessions_dir.join(format!("{valid_sid}.jsonl")), "").unwrap();
-        std::fs::write(sessions_dir.join(format!("{corrupt_sid}.jsonl")), "").unwrap();
+        std::fs::create_dir_all(
+            crate::session_journal::journal_file_path(valid_sid)
+                .parent()
+                .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(crate::session_journal::journal_file_path(valid_sid), "").unwrap();
+        std::fs::write(crate::session_journal::journal_file_path(corrupt_sid), "").unwrap();
 
         let mut valid = WorkspaceMetadata::new(valid_sid, "gpt-5");
         valid.git_root = Some("/repo".to_string());
@@ -1453,7 +1464,7 @@ mod tests {
 
         // Cleanup
         let _ = std::fs::remove_dir_all(workspace_dir_for(&sid));
-        let _ = std::fs::remove_dir_all(crate::session_journal::local_sessions_dir().join(&sid));
+        let _ = std::fs::remove_dir_all(workspace_dir_for(&sid));
     }
 
     #[test]

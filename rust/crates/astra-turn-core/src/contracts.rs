@@ -8,6 +8,7 @@ pub trait TurnSessionActivityWriter: Send + Sync {
     async fn update_session_activity(
         &self,
         session_id: &str,
+        user_id: &str,
         plan: SessionActivityUpdatePlan,
     ) -> Result<(), String>;
 }
@@ -66,6 +67,7 @@ pub struct TurnToolEventPersistPlan {
 #[derive(Clone, Debug, PartialEq)]
 pub struct TurnDecisionAuditRecord {
     pub decision_id: String,
+    pub user_id: String,
     pub session_id: String,
     pub event_id: String,
     pub decision_type: String,

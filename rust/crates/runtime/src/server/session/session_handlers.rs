@@ -358,7 +358,7 @@ pub(crate) async fn list_resumable_sessions_handler(
         sessions.truncate(limit as usize);
     }
     Ok(Json(
-        astra_services::session_restore::ResumableSessionsResponse { sessions, limit },
+        astra_services::session_restore::ResumableSessionsResponse { sessions },
     ))
 }
 
@@ -407,8 +407,9 @@ pub(crate) async fn get_session_state_handler(
         .await?;
     }
 
-    let transcript_high_watermark = transcript_high_watermark(pool, &session.session_id).await?;
-    let active_run = active_run_projection(pool, &session.session_id).await?;
+    let transcript_high_watermark =
+        transcript_high_watermark(pool, &session.user_id, &session.session_id).await?;
+    let active_run = active_run_projection(pool, &session.user_id, &session.session_id).await?;
     let run_event_high_watermark = active_run
         .as_ref()
         .map(|run| run.run_event_high_watermark)
@@ -469,17 +470,21 @@ pub(crate) async fn get_session_state_handler(
     let transcript_replay_required = cold_start && transcript_high_watermark > 0;
     let run_event_replay_required = cold_start && run_event_high_watermark > 0;
     let replay_required = transcript_replay_required || run_event_replay_required;
-    let workspace_authority = load_workspace_authority(&state, &session.session_id).await?;
+    let workspace_authority =
+        load_workspace_authority(&state, &session.user_id, &session.session_id).await?;
     let latest_context_manifest = load_latest_context_manifest(
         pool,
+        &session.user_id,
         &session.session_id,
         active_run.as_ref().map(|run| run.run_id.as_str()),
     )
     .await?;
-    let state_summary = load_state_summary(pool, &session.session_id).await?;
-    let artifact_previews = load_artifact_previews(&state, &session.session_id).await?;
+    let state_summary = load_state_summary(pool, &session.user_id, &session.session_id).await?;
+    let artifact_previews =
+        load_artifact_previews(&state, &session.user_id, &session.session_id).await?;
     let projection_observability = load_session_projection_observability(
         pool,
+        &session.user_id,
         &session.session_id,
         transcript_high_watermark,
         active_run.as_ref(),
@@ -534,9 +539,10 @@ pub(crate) async fn get_session_transcript_handler(
     Query(query): Query<TranscriptQuery>,
 ) -> Result<Json<TranscriptResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
+    let user_id = user.user_id.clone();
     let _ = state
         .session_service
-        .get_session(session_id.clone(), user.user_id.clone())
+        .get_session(session_id.clone(), user_id.clone())
         .await?;
     let pool = state
         .shared_pool
@@ -548,11 +554,12 @@ pub(crate) async fn get_session_transcript_handler(
         "SELECT session_id, item_seq, run_id, role, content,
                 DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at
          FROM session_transcript_items
-         WHERE session_id = ? AND item_seq < ?
+         WHERE session_id = ? AND user_id = ? AND item_seq < ?
          ORDER BY item_seq DESC
          LIMIT ?",
     )
     .bind(&session_id)
+    .bind(&user_id)
     .bind(before_seq)
     .bind(i64::from(limit))
     .fetch_all(pool.get())
@@ -560,7 +567,7 @@ pub(crate) async fn get_session_transcript_handler(
     .map_err(internal_error)?;
 
     let run_ids = transcript_assistant_run_ids(&rows);
-    let reasoning_by_run = load_transcript_reasoning_by_run(pool, &session_id, &run_ids)
+    let reasoning_by_run = load_transcript_reasoning_by_run(pool, &user_id, &session_id, &run_ids)
         .await
         .map_err(|error| {
             internal_error(format!(
@@ -604,6 +611,7 @@ pub(crate) async fn get_session_transcript_handler(
     items.reverse();
     let page_refs = load_transcript_page_refs(
         pool,
+        &user_id,
         &session_id,
         items.first().map(|item| item.item_seq),
         items.last().map(|item| item.item_seq),
@@ -645,6 +653,7 @@ fn transcript_assistant_run_ids(rows: &[sqlx::mysql::MySqlRow]) -> Vec<String> {
 
 async fn load_transcript_page_refs(
     pool: &SharedPool,
+    user_id: &str,
     session_id: &str,
     start_item_seq: Option<i64>,
     end_item_seq: Option<i64>,
@@ -653,11 +662,12 @@ async fn load_transcript_page_refs(
         return Ok(Vec::new());
     };
     let rows = sqlx::query(
-        "SELECT page_seq, start_item_seq, end_item_seq, item_count, page_hash
-         FROM transcript_pages
-         WHERE session_id = ? AND end_item_seq >= ? AND start_item_seq <= ?
-         ORDER BY page_seq ASC",
+        "SELECT tp.page_seq, tp.start_item_seq, tp.end_item_seq, tp.item_count, tp.page_hash
+         FROM transcript_pages tp
+         WHERE tp.user_id = ? AND tp.session_id = ? AND tp.end_item_seq >= ? AND tp.start_item_seq <= ?
+         ORDER BY tp.page_seq ASC",
     )
+    .bind(user_id)
     .bind(session_id)
     .bind(start_item_seq)
     .bind(end_item_seq)
@@ -677,15 +687,17 @@ async fn load_transcript_page_refs(
 
 async fn load_session_projection_observability(
     pool: &SharedPool,
+    user_id: &str,
     session_id: &str,
     transcript_high_watermark: i64,
     active_run: Option<&ActiveRunProjection>,
 ) -> Result<SessionProjectionObservabilityResponse, (StatusCode, Json<ErrorResponse>)> {
     let transcript_page_row = sqlx::query(
-        "SELECT COUNT(*) AS page_count, COALESCE(MAX(end_item_seq), 0) AS page_high_watermark
-         FROM transcript_pages
-         WHERE session_id = ?",
+        "SELECT COUNT(*) AS page_count, COALESCE(MAX(tp.end_item_seq), 0) AS page_high_watermark
+         FROM transcript_pages tp
+         WHERE tp.user_id = ? AND tp.session_id = ?",
     )
+    .bind(user_id)
     .bind(session_id)
     .fetch_one(pool.get())
     .await
@@ -702,9 +714,10 @@ async fn load_session_projection_observability(
         let row = sqlx::query(
             "SELECT projection_event_idx
              FROM run_display_projections
-             WHERE run_id = ?",
+             WHERE run_id = ? AND user_id = ?",
         )
         .bind(&active_run.run_id)
+        .bind(user_id)
         .fetch_optional(pool.get())
         .await
         .map_err(internal_error)?;
@@ -715,11 +728,12 @@ async fn load_session_projection_observability(
     } else {
         0
     };
-    let prompt_request_count = astra_services::count_prompt_requests_for_session(pool, session_id)
-        .await
-        .map_err(internal_error)?;
+    let prompt_request_count =
+        astra_services::count_prompt_requests_for_session(pool, user_id, session_id)
+            .await
+            .map_err(internal_error)?;
     let latest_prompt_request =
-        astra_services::load_latest_prompt_observability_for_session(pool, session_id)
+        astra_services::load_latest_prompt_observability_for_session(pool, user_id, session_id)
             .await
             .map_err(internal_error)?
             .map(|request| PromptRequestObservabilityResponse {
@@ -758,10 +772,11 @@ fn workspace_authority_from_artifact(
 
 async fn load_workspace_authority(
     state: &AppState,
+    user_id: &str,
     session_id: &str,
 ) -> Result<Option<WorkspaceAuthorityResponse>, (StatusCode, Json<ErrorResponse>)> {
     let artifact = session_artifact_store(state)?
-        .load_latest_json_artifact(session_id, WORKSPACE_METADATA_ARTIFACT_KIND)
+        .load_latest_json_artifact(user_id, session_id, WORKSPACE_METADATA_ARTIFACT_KIND)
         .await
         .map_err(internal_error)?;
     artifact
@@ -773,17 +788,19 @@ async fn load_workspace_authority(
 
 async fn load_state_summary(
     pool: &SharedPool,
+    user_id: &str,
     session_id: &str,
 ) -> Result<Vec<StateCategorySummaryResponse>, (StatusCode, Json<ErrorResponse>)> {
     let rows = sqlx::query(
         "SELECT category, COUNT(*) AS total
          FROM session_state_items
-         WHERE session_id = ? AND status IN ('active', 'backlog')
+         WHERE session_id = ? AND user_id = ? AND status IN ('active', 'backlog')
          GROUP BY category
          ORDER BY total DESC, category ASC
          LIMIT 16",
     )
     .bind(session_id)
+    .bind(user_id)
     .fetch_all(pool.get())
     .await
     .map_err(internal_error)?;
@@ -798,10 +815,11 @@ async fn load_state_summary(
 
 async fn load_artifact_previews(
     state: &AppState,
+    user_id: &str,
     session_id: &str,
 ) -> Result<Vec<ArtifactPreviewResponse>, (StatusCode, Json<ErrorResponse>)> {
     let artifacts = session_artifact_store(state)?
-        .list_json_artifacts(session_id, None, 8)
+        .list_json_artifacts(user_id, session_id, None, 8)
         .await
         .map_err(internal_error)?;
     Ok(artifacts
@@ -821,19 +839,22 @@ async fn load_artifact_previews(
 
 async fn load_latest_context_manifest(
     pool: &SharedPool,
+    user_id: &str,
     session_id: &str,
     preferred_run_id: Option<&str>,
 ) -> Result<Option<ContextManifestSummaryResponse>, (StatusCode, Json<ErrorResponse>)> {
     if let Some(run_id) = preferred_run_id
-        && let Some(summary) = fetch_latest_context_manifest(pool, session_id, Some(run_id)).await?
+        && let Some(summary) =
+            fetch_latest_context_manifest(pool, user_id, session_id, Some(run_id)).await?
     {
         return Ok(Some(summary));
     }
-    fetch_latest_context_manifest(pool, session_id, None).await
+    fetch_latest_context_manifest(pool, user_id, session_id, None).await
 }
 
 async fn fetch_latest_context_manifest(
     pool: &SharedPool,
+    user_id: &str,
     session_id: &str,
     run_id: Option<&str>,
 ) -> Result<Option<ContextManifestSummaryResponse>, (StatusCode, Json<ErrorResponse>)> {
@@ -843,10 +864,11 @@ async fn fetch_latest_context_manifest(
                     budget_template_id, policy_version,
                     DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at
              FROM context_manifests
-             WHERE session_id = ? AND run_id = ?
+             WHERE user_id = ? AND session_id = ? AND run_id = ?
              ORDER BY created_at DESC, manifest_id DESC
              LIMIT 1",
         )
+        .bind(user_id)
         .bind(session_id)
         .bind(run_id)
         .fetch_optional(pool.get())
@@ -858,10 +880,11 @@ async fn fetch_latest_context_manifest(
                     budget_template_id, policy_version,
                     DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at
              FROM context_manifests
-             WHERE session_id = ?
+             WHERE user_id = ? AND session_id = ?
              ORDER BY created_at DESC, manifest_id DESC
              LIMIT 1",
         )
+        .bind(user_id)
         .bind(session_id)
         .fetch_optional(pool.get())
         .await
@@ -887,6 +910,7 @@ async fn fetch_latest_context_manifest(
 
 async fn load_transcript_reasoning_by_run(
     pool: &SharedPool,
+    user_id: &str,
     session_id: &str,
     run_ids: &[String],
 ) -> Result<HashMap<String, TranscriptReasoningProjection>, sqlx::Error> {
@@ -900,6 +924,8 @@ async fn load_transcript_reasoning_by_run(
          WHERE session_id = ",
     );
     query.push_bind(session_id);
+    query.push(" AND user_id = ");
+    query.push_bind(user_id);
     query.push(" AND run_id IN (");
     {
         let mut separated = query.separated(", ");
@@ -1259,11 +1285,12 @@ pub(crate) async fn resume_session_handler(
 ) -> Result<Json<astra_services::session_restore::RestoredSession>, (StatusCode, Json<ErrorResponse>)>
 {
     let user = state.auth_service.current_user(&headers).await?;
+    let user_id = user.user_id.clone();
     let session = state
         .session_service
         .update_session(
             session_id,
-            user.user_id,
+            user_id.clone(),
             SessionUpdateRequestData {
                 title: None,
                 metadata: None,
@@ -1276,7 +1303,7 @@ pub(crate) async fn resume_session_handler(
     };
     let svc = astra_services::session_restore::HybridRestoreService::new(shared_pool.get().clone());
     let restored = svc
-        .restore_session(&session.session_id)
+        .restore_session(&user_id, &session.session_id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| {
@@ -1336,13 +1363,15 @@ pub(crate) async fn list_session_artifacts_handler(
     Query(query): Query<SessionArtifactListQuery>,
 ) -> Result<Json<SessionArtifactListResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
+    let user_id = user.user_id.clone();
     let _ = state
         .session_service
-        .get_session(session_id.clone(), user.user_id)
+        .get_session(session_id.clone(), user_id.clone())
         .await?;
     let artifact_store = session_artifact_store(&state)?;
     let artifacts = artifact_store
         .list_json_artifacts(
+            &user_id,
             &session_id,
             query.artifact_kind.as_deref(),
             query.limit as usize,
@@ -1365,13 +1394,14 @@ pub(crate) async fn get_latest_session_artifact_handler(
     headers: HeaderMap,
 ) -> Result<Json<SessionArtifactResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
+    let user_id = user.user_id.clone();
     let _ = state
         .session_service
-        .get_session(session_id.clone(), user.user_id)
+        .get_session(session_id.clone(), user_id.clone())
         .await?;
     let artifact_store = session_artifact_store(&state)?;
     let artifact = artifact_store
-        .load_latest_json_artifact(&session_id, &artifact_kind)
+        .load_latest_json_artifact(&user_id, &session_id, &artifact_kind)
         .await
         .map_err(internal_artifact_error)?
         .ok_or_else(session_artifact_not_found)?;
@@ -1384,16 +1414,16 @@ pub(crate) async fn get_session_artifact_handler(
     headers: HeaderMap,
 ) -> Result<Json<SessionArtifactResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
+    let user_id = user.user_id.clone();
     let _ = state
         .session_service
-        .get_session(session_id.clone(), user.user_id)
+        .get_session(session_id.clone(), user_id.clone())
         .await?;
     let artifact_store = session_artifact_store(&state)?;
     let artifact = artifact_store
-        .load_json_artifact(&artifact_id)
+        .load_json_artifact(&user_id, &session_id, &artifact_id)
         .await
         .map_err(internal_artifact_error)?
-        .filter(|artifact| artifact.session_id == session_id)
         .ok_or_else(session_artifact_not_found)?;
     Ok(Json(session_artifact_response(artifact)))
 }
@@ -1548,8 +1578,10 @@ async fn persist_session_state_revision(
     match insert_result {
         Ok(_) => Ok(()),
         Err(error) if is_duplicate_key_error(&error) => {
-            update_session_state_revision(pool, &revision).await?;
-            Ok(())
+            match update_session_state_revision(pool, &revision).await? {
+                true => Ok(()),
+                false => Err(sqlx::Error::RowNotFound),
+            }
         }
         Err(error) => Err(error),
     }
@@ -1569,7 +1601,7 @@ async fn update_session_state_revision(
              run_event_high_watermark = ?,
              state_projection_hash = ?,
              updated_at = NOW(6)
-         WHERE session_id = ?",
+         WHERE session_id = ? AND user_id = ?",
     )
     .bind(revision.user_id)
     .bind(revision.monotonic_id)
@@ -1579,6 +1611,7 @@ async fn update_session_state_revision(
     .bind(revision.run_event_high_watermark)
     .bind(revision.state_projection_hash)
     .bind(revision.session_id)
+    .bind(revision.user_id)
     .execute(pool.get())
     .await?;
     Ok(result.rows_affected() > 0)
@@ -1675,14 +1708,16 @@ async fn refresh_device_lease(
 
 async fn transcript_high_watermark(
     pool: &SharedPool,
+    user_id: &str,
     session_id: &str,
 ) -> Result<i64, (StatusCode, Json<ErrorResponse>)> {
     let row = sqlx::query(
         "SELECT COALESCE(MAX(item_seq), 0) AS high_watermark
          FROM session_transcript_items
-         WHERE session_id = ?",
+         WHERE session_id = ? AND user_id = ?",
     )
     .bind(session_id)
+    .bind(user_id)
     .fetch_one(pool.get())
     .await
     .map_err(internal_error)?;
@@ -1691,16 +1726,18 @@ async fn transcript_high_watermark(
 
 async fn active_run_projection(
     pool: &SharedPool,
+    user_id: &str,
     session_id: &str,
 ) -> Result<Option<ActiveRunProjection>, (StatusCode, Json<ErrorResponse>)> {
     let row = sqlx::query(
         "SELECT run_id, last_event_idx
          FROM agent_runs
-         WHERE session_id = ? AND status IN ('running', 'waiting', 'paused')
+         WHERE session_id = ? AND user_id = ? AND status IN ('running', 'waiting', 'paused')
          ORDER BY updated_at DESC
          LIMIT 1",
     )
     .bind(session_id)
+    .bind(user_id)
     .fetch_optional(pool.get())
     .await
     .map_err(internal_error)?;
@@ -2123,6 +2160,49 @@ mod tests {
                 (session_id, "artifact-owner".to_string()),
             ],
             "artifact handlers should verify session ownership before touching artifact storage"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_state_and_transcript_handlers_verify_session_ownership_before_db_access() {
+        let session_service = Arc::new(RecordingSessionService::default());
+        let state = build_state(Arc::new(RecordingAuthService), session_service.clone());
+        let session_id = "session-456".to_string();
+
+        let state_err = match get_session_state_handler(
+            State(state.clone()),
+            Path(session_id.clone()),
+            auth_headers(),
+            Query(SessionStateQuery::default()),
+        )
+        .await
+        {
+            Ok(_) => panic!("state should stop at session ownership check"),
+            Err(err) => err,
+        };
+        assert_eq!(state_err.0, StatusCode::FORBIDDEN);
+
+        let transcript_err = match get_session_transcript_handler(
+            State(state),
+            Path(session_id.clone()),
+            auth_headers(),
+            Query(TranscriptQuery::default()),
+        )
+        .await
+        {
+            Ok(_) => panic!("transcript should stop at session ownership check"),
+            Err(err) => err,
+        };
+        assert_eq!(transcript_err.0, StatusCode::FORBIDDEN);
+
+        let calls = session_service.get_session_calls.lock().await.clone();
+        assert_eq!(
+            calls,
+            vec![
+                (session_id.clone(), "artifact-owner".to_string()),
+                (session_id, "artifact-owner".to_string()),
+            ],
+            "state/transcript handlers should verify session ownership before touching durable session projections"
         );
     }
 

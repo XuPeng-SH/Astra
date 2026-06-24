@@ -65,6 +65,7 @@ pub struct PromptRequestObservability {
 }
 
 pub struct PromptRequestPlanInput<'a> {
+    pub user_id: &'a str,
     pub session_id: &'a str,
     pub turn: u32,
     pub round: u32,
@@ -120,6 +121,7 @@ pub fn plan_prompt_request(input: PromptRequestPlanInput<'_>) -> Result<PromptRe
     }))?;
     Ok(PromptRequestPlan {
         request_id: prompt_request_id(
+            input.user_id,
             input.session_id,
             input.turn,
             input.round,
@@ -141,7 +143,8 @@ pub async fn persist_prompt_request(
     plan: &PromptRequestPlan,
 ) -> Result<PromptRequestPersistResult, String> {
     let db = pool.get();
-    if let Some(existing) = load_existing_request(db, &plan.request_id).await? {
+    ensure_session_owner(db, &input.session_id, &input.user_id).await?;
+    if let Some(existing) = load_existing_request(db, input, &plan.request_id).await? {
         return Ok(existing);
     }
 
@@ -255,7 +258,7 @@ pub async fn persist_prompt_request(
 
     if let Err(error) = write_result {
         let _ = tx.rollback().await;
-        if let Some(existing) = load_existing_request(db, &plan.request_id).await? {
+        if let Some(existing) = load_existing_request(db, input, &plan.request_id).await? {
             return Ok(existing);
         }
         return Err(error);
@@ -274,15 +277,17 @@ pub async fn persist_prompt_request(
 
 pub async fn load_latest_prompt_observability_for_run(
     pool: &SharedPool,
+    user_id: &str,
     run_id: &str,
 ) -> Result<Option<PromptRequestObservability>, String> {
     load_latest_prompt_observability(
         pool,
         "SELECT request_id, request_hash, message_count, tool_count, summary_json
          FROM prompt_request_records
-         WHERE run_id = ?
+         WHERE user_id = ? AND run_id = ?
          ORDER BY created_at DESC, turn DESC, round DESC, attempt DESC
          LIMIT 1",
+        user_id,
         run_id,
     )
     .await
@@ -290,24 +295,31 @@ pub async fn load_latest_prompt_observability_for_run(
 
 pub async fn load_latest_prompt_observability_for_session(
     pool: &SharedPool,
+    user_id: &str,
     session_id: &str,
 ) -> Result<Option<PromptRequestObservability>, String> {
     load_latest_prompt_observability(
         pool,
         "SELECT request_id, request_hash, message_count, tool_count, summary_json
          FROM prompt_request_records
-         WHERE session_id = ?
+         WHERE user_id = ? AND session_id = ?
          ORDER BY created_at DESC, turn DESC, round DESC, attempt DESC
          LIMIT 1",
+        user_id,
         session_id,
     )
     .await
 }
 
-pub async fn count_prompt_requests_for_run(pool: &SharedPool, run_id: &str) -> Result<u32, String> {
+pub async fn count_prompt_requests_for_run(
+    pool: &SharedPool,
+    user_id: &str,
+    run_id: &str,
+) -> Result<u32, String> {
     count_prompt_requests(
         pool,
-        "SELECT COUNT(*) AS total FROM prompt_request_records WHERE run_id = ?",
+        "SELECT COUNT(*) AS total FROM prompt_request_records WHERE user_id = ? AND run_id = ?",
+        user_id,
         run_id,
     )
     .await
@@ -315,11 +327,13 @@ pub async fn count_prompt_requests_for_run(pool: &SharedPool, run_id: &str) -> R
 
 pub async fn count_prompt_requests_for_session(
     pool: &SharedPool,
+    user_id: &str,
     session_id: &str,
 ) -> Result<u32, String> {
     count_prompt_requests(
         pool,
-        "SELECT COUNT(*) AS total FROM prompt_request_records WHERE session_id = ?",
+        "SELECT COUNT(*) AS total FROM prompt_request_records WHERE user_id = ? AND session_id = ?",
+        user_id,
         session_id,
     )
     .await
@@ -328,9 +342,11 @@ pub async fn count_prompt_requests_for_session(
 async fn count_prompt_requests(
     pool: &SharedPool,
     sql: &str,
+    user_id: &str,
     bind_value: &str,
 ) -> Result<u32, String> {
     let row = sqlx::query(sql)
+        .bind(user_id)
         .bind(bind_value)
         .fetch_one(pool.get())
         .await
@@ -341,9 +357,11 @@ async fn count_prompt_requests(
 async fn load_latest_prompt_observability(
     pool: &SharedPool,
     sql: &str,
+    user_id: &str,
     bind_value: &str,
 ) -> Result<Option<PromptRequestObservability>, String> {
     let row = sqlx::query(sql)
+        .bind(user_id)
         .bind(bind_value)
         .fetch_optional(pool.get())
         .await
@@ -377,14 +395,17 @@ fn prompt_observability_from_row(
 
 async fn load_existing_request(
     pool: &sqlx::Pool<sqlx::MySql>,
+    input: &PromptRequestPersistInput,
     request_id: &str,
 ) -> Result<Option<PromptRequestPersistResult>, String> {
     let row = sqlx::query(
         "SELECT request_id, request_hash, previous_request_id, message_count, tool_count, summary_json
          FROM prompt_request_records
-         WHERE request_id = ?",
+         WHERE request_id = ? AND user_id = ? AND session_id = ?",
     )
     .bind(request_id)
+    .bind(&input.user_id)
+    .bind(&input.session_id)
     .fetch_optional(pool)
     .await
     .map_err(|error| error.to_string())?;
@@ -412,6 +433,28 @@ async fn load_existing_request(
     .transpose()
 }
 
+async fn ensure_session_owner(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    session_id: &str,
+    user_id: &str,
+) -> Result<(), String> {
+    let exists: Option<i32> = sqlx::query_scalar(
+        "SELECT 1 FROM agent_sessions WHERE session_id = ? AND user_id = ? LIMIT 1",
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| error.to_string())?;
+    if exists.is_some() {
+        Ok(())
+    } else {
+        Err(format!(
+            "prompt_request_records owner mismatch for session_id={session_id} user_id={user_id}: agent_sessions owner root missing or belongs to another user"
+        ))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ExistingPromptChunk {
     logical_key: String,
@@ -437,10 +480,11 @@ async fn load_previous_request_id(
     sqlx::query(
         "SELECT request_id
          FROM prompt_request_records
-         WHERE session_id = ? AND source = ?
+         WHERE user_id = ? AND session_id = ? AND source = ?
          ORDER BY created_at DESC, turn DESC, round DESC, attempt DESC
          LIMIT 1",
     )
+    .bind(&input.user_id)
     .bind(&input.session_id)
     .bind(&input.source)
     .fetch_optional(pool)
@@ -528,13 +572,15 @@ fn build_chunk_plan(
 }
 
 fn prompt_request_id(
+    user_id: &str,
     session_id: &str,
     turn: u32,
     round: u32,
     attempt: u32,
     source: &str,
 ) -> String {
-    let digest = sha256_hex(format!("{session_id}|{turn}|{round}|{attempt}|{source}").as_bytes());
+    let digest =
+        sha256_hex(format!("{user_id}|{session_id}|{turn}|{round}|{attempt}|{source}").as_bytes());
     format!("promptreq-{}", &digest[..24])
 }
 
@@ -618,6 +664,7 @@ mod tests {
     fn plan_prompt_request_hash_is_order_stable_for_object_keys() {
         let messages_a = [json!({"role": "system", "content": {"b": 2, "a": 1}})];
         let plan_a = plan_prompt_request(PromptRequestPlanInput {
+            user_id: "user-1",
             session_id: "session-1",
             turn: 1,
             round: 0,
@@ -630,6 +677,7 @@ mod tests {
         .expect("plan");
         let messages_b = [json!({"content": {"a": 1, "b": 2}, "role": "system"})];
         let plan_b = plan_prompt_request(PromptRequestPlanInput {
+            user_id: "user-1",
             session_id: "session-1",
             turn: 1,
             round: 0,
@@ -652,6 +700,7 @@ mod tests {
         ];
         let tools = [json!({"function": {"name": "bash"}})];
         let plan = plan_prompt_request(PromptRequestPlanInput {
+            user_id: "user-1",
             session_id: "session-1",
             turn: 2,
             round: 1,
@@ -668,6 +717,44 @@ mod tests {
         assert_eq!(
             plan.summary_json["message_roles"][1]["content_kind"],
             "array"
+        );
+    }
+
+    #[test]
+    fn plan_prompt_request_id_is_owner_session_attempt_bound() {
+        let messages = [json!({"role": "user", "content": "same prompt"})];
+        let owner_a = plan_prompt_request(PromptRequestPlanInput {
+            user_id: "owner-a",
+            session_id: "shared-session",
+            turn: 2,
+            round: 1,
+            attempt: 0,
+            source: "bridge_inprocess",
+            messages: &messages,
+            tools: &[],
+            max_output_tokens: None,
+        })
+        .expect("owner a plan");
+        let owner_b = plan_prompt_request(PromptRequestPlanInput {
+            user_id: "owner-b",
+            session_id: "shared-session",
+            turn: 2,
+            round: 1,
+            attempt: 0,
+            source: "bridge_inprocess",
+            messages: &messages,
+            tools: &[],
+            max_output_tokens: None,
+        })
+        .expect("owner b plan");
+
+        assert_ne!(
+            owner_a.request_id, owner_b.request_id,
+            "prompt request ids must include owner identity so two owners with the same external session id never collide"
+        );
+        assert_eq!(
+            owner_a.request_hash, owner_b.request_hash,
+            "request hash should describe wire content, not ownership"
         );
     }
 }

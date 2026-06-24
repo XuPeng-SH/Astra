@@ -1,100 +1,48 @@
 mod common;
 
 use sqlx::Row;
+use std::path::{Path, PathBuf};
 
 #[test]
-fn web_traceability_agent_events_schema_source_contract() {
-    let source = include_str!("../src/storage.rs");
-    for column in [
-        "run_id VARCHAR(64) NULL",
-        "parent_run_id VARCHAR(64) NULL",
-        "turn_id VARCHAR(64) NULL",
-        "turn_seq BIGINT NULL",
-        "round_index BIGINT NULL",
-        "tool_call_id VARCHAR(128) NULL",
-        "parent_agent_id VARCHAR(255) NULL",
-        "trace_kind VARCHAR(64) NULL",
-    ] {
-        assert!(source.contains(column), "agent_events missing {column}");
-    }
-    for index in [
-        "idx_agent_events_trace (session_id, turn_id, created_at)",
-        "idx_agent_events_run (session_id, run_id, created_at)",
-        "idx_agent_events_parent_run (session_id, parent_run_id, created_at)",
-        "idx_agent_events_tool_call (session_id, tool_call_id)",
-    ] {
-        assert!(source.contains(index), "agent_events missing {index}");
-    }
-    assert!(
-        source.contains("add_column_if_missing(&pool, &settings.database, \"agent_events\""),
-        "trace columns must be added idempotently on existing schemas"
+fn service_table_queries_name_columns_explicitly() {
+    let mut files = Vec::new();
+    collect_rust_files(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        &mut files,
     );
+
+    let mut offenders = Vec::new();
+    for path in files {
+        let Ok(source) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for (line_idx, line) in source.lines().enumerate() {
+            let normalized = line.split_whitespace().collect::<Vec<_>>().join(" ");
+            if normalized.contains("SELECT *") && !normalized.contains("mo_diff(") {
+                offenders.push(format!("{}:{}", path.display(), line_idx + 1));
+            }
+        }
+    }
+
     assert!(
-        source.contains("add_index_if_missing(&pool, &settings.database, \"agent_events\""),
-        "trace indexes must be added idempotently on existing schemas"
+        offenders.is_empty(),
+        "production table reads must name selected columns; offenders:\n{}",
+        offenders.join("\n")
     );
 }
 
-#[test]
-fn schema_rationalization_source_contract() {
-    let storage_source = include_str!("../src/storage.rs");
-    let prompt_source = include_str!("../src/prompt_delta.rs");
-    let harness_source = include_str!("../src/harness.rs");
-    let workflow_source = include_str!("../src/workflows.rs");
-
-    for removed in [
-        "CREATE TABLE IF NOT EXISTS prompt_chunks",
-        "CREATE TABLE IF NOT EXISTS harness_sources",
-        "CREATE TABLE IF NOT EXISTS harness_decisions",
-        "CREATE TABLE IF NOT EXISTS wf_definitions",
-        "CREATE TABLE IF NOT EXISTS wf_runs",
-        "CREATE TABLE IF NOT EXISTS skill_marketplace_stats",
-        "CREATE TABLE IF NOT EXISTS skill_quality_reports",
-    ] {
-        assert!(
-            !storage_source.contains(removed),
-            "storage bootstrap must not recreate removed table: {removed}"
-        );
+fn collect_rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rust_files(&path, out);
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            out.push(path);
+        }
     }
-
-    assert!(
-        !prompt_source.contains("INSERT INTO prompt_chunks"),
-        "prompt persistence must not write a dead prompt_chunks table"
-    );
-    assert!(
-        !harness_source.contains("INSERT INTO harness_sources"),
-        "harness citations must use the original source ids directly"
-    );
-    assert!(
-        !harness_source.contains("INSERT INTO harness_decisions"),
-        "harness decisions must live in current entities, not a write-only audit table"
-    );
-    assert!(
-        !workflow_source.contains("DatabaseWorkflowService"),
-        "workflow persistence must not keep a dead database-backed implementation around"
-    );
-    for removed_sql in ["wf_definitions", "wf_runs"] {
-        assert!(
-            !workflow_source.contains(removed_sql),
-            "workflow module must not reference removed workflow tables: {removed_sql}"
-        );
-    }
-
-    let marketplace_source = include_str!("../src/marketplace_stats.rs");
-    for removed in ["skill_marketplace_stats", "skill_quality_reports"] {
-        assert!(
-            !marketplace_source.contains(removed),
-            "marketplace stats service must use unified skill_metrics storage instead of {removed}"
-        );
-    }
-    assert!(
-        marketplace_source.contains("skill_metrics"),
-        "marketplace stats service must use the unified skill_metrics table"
-    );
-    assert!(
-        !prompt_source.contains("payload_json, previous_chunk_hash"),
-        "prompt deltas must not persist unread payload_json blobs"
-    );
 }
 
 #[tokio::test]
@@ -133,6 +81,11 @@ async fn schema_rationalization_runtime_contract() {
         unique_key_columns(&pool, &schema, "skill_metrics", "uq_skill_metrics_slot").await,
         ["skill_name", "metric_type", "metric_slot"],
         "skill_metrics must enforce one aggregate slot per skill without collapsing report rows"
+    );
+
+    assert!(
+        !table_exists(&pool, &schema, "session_artifact_grants").await,
+        "deprecated singular session_artifact_grants table must not exist"
     );
 
     for table in [
@@ -184,6 +137,27 @@ async fn column_names(pool: &astra_core::SharedPool, schema: &str, table: &str) 
     .into_iter()
     .map(|row| row.try_get::<String, _>("COLUMN_NAME").unwrap())
     .collect()
+}
+
+async fn column_default(
+    pool: &astra_core::SharedPool,
+    schema: &str,
+    table: &str,
+    column: &str,
+) -> Option<String> {
+    sqlx::query(
+        "SELECT COLUMN_DEFAULT FROM INFORMATION_SCHEMA.COLUMNS
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = ?
+         LIMIT 1",
+    )
+    .bind(schema)
+    .bind(table)
+    .bind(column)
+    .fetch_optional(pool.get())
+    .await
+    .expect("load column default")
+    .and_then(|row| row.try_get::<Option<String>, _>("COLUMN_DEFAULT").ok())
+    .flatten()
 }
 
 async fn table_exists(pool: &astra_core::SharedPool, schema: &str, table: &str) -> bool {
@@ -259,6 +233,79 @@ async fn phase1_run_durability_schema_contract() {
     let pool = common::setup_pool().await;
     let schema = current_schema(&pool).await;
 
+    let agent_events = column_names(&pool, &schema, "agent_events").await;
+    for expected in [
+        "run_id",
+        "parent_run_id",
+        "turn_id",
+        "turn_seq",
+        "round_index",
+        "tool_call_id",
+        "parent_agent_id",
+        "trace_kind",
+    ] {
+        assert!(
+            agent_events.iter().any(|column| column == expected),
+            "agent_events missing traceability column {expected}"
+        );
+    }
+    assert_eq!(
+        index_columns(&pool, &schema, "agent_events", "idx_agent_events_trace").await,
+        ["session_id", "turn_id", "created_at"],
+        "agent_events trace lookup must use session/turn/created ordering"
+    );
+    assert_eq!(
+        index_columns(&pool, &schema, "agent_events", "idx_agent_events_run").await,
+        ["session_id", "run_id", "created_at"],
+        "agent_events run lookup must use session/run/created ordering"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "agent_events",
+            "idx_agent_events_owner_session_created"
+        )
+        .await,
+        ["user_id", "session_id", "created_at"],
+        "agent_events owner-bound session scans must not post-filter by user_id"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "agent_events",
+            "idx_agent_events_parent_run"
+        )
+        .await,
+        ["session_id", "parent_run_id", "created_at"],
+        "agent_events parent-run lookup must use session/parent-run/created ordering"
+    );
+    assert_eq!(
+        index_columns(&pool, &schema, "agent_events", "idx_agent_events_tool_call").await,
+        ["session_id", "tool_call_id"],
+        "agent_events tool-call lookup must use session/tool-call ordering"
+    );
+
+    let agent_sessions = column_names(&pool, &schema, "agent_sessions").await;
+    for expected in ["active_plan_id", "config_version_id"] {
+        assert!(
+            agent_sessions.iter().any(|column| column == expected),
+            "agent_sessions missing {expected}"
+        );
+    }
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "agent_sessions",
+            "idx_agent_sessions_config_version"
+        )
+        .await,
+        ["config_version_id"],
+        "session config-version lookup must use the current schema index"
+    );
+
     assert_eq!(
         unique_key_columns(&pool, &schema, "agent_run_events", "uq_run_event_idx").await,
         ["run_id", "event_idx"],
@@ -309,6 +356,46 @@ async fn phase1_run_durability_schema_contract() {
         retry_scope_column.is_some(),
         "agent_runs must declare a retry_scope column for the application-level validator to bind to"
     );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "prompt_request_records",
+            "uq_prompt_request_attempt"
+        )
+        .await,
+        [
+            "user_id",
+            "session_id",
+            "turn",
+            "round",
+            "source",
+            "attempt"
+        ],
+        "prompt request idempotency must be bound to owner/session attempt identity"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "agent_runs",
+            "idx_agent_runs_user_session_status_updated"
+        )
+        .await,
+        ["user_id", "session_id", "status", "updated_at"],
+        "active-run lookup must use owner/session/status ordering"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "agent_run_events",
+            "idx_agent_run_events_owner_session_run_idx"
+        )
+        .await,
+        ["user_id", "session_id", "run_id", "event_idx"],
+        "reasoning event replay must use owner/session/run/event ordering"
+    );
 
     let batch_columns = column_names(&pool, &schema, "session_tool_output_batches").await;
     for expected in [
@@ -351,6 +438,11 @@ async fn phase2_web_hydration_schema_contract() {
             "session_device_leases missing {expected}"
         );
     }
+    assert_eq!(
+        unique_key_columns(&pool, &schema, "session_device_leases", "uq_session_device").await,
+        ["user_id", "session_id", "device_id"],
+        "device leases must enforce owner/session/device uniqueness"
+    );
 
     let lease_events = column_names(&pool, &schema, "session_device_lease_events").await;
     for expected in [
@@ -374,6 +466,141 @@ async fn phase2_web_hydration_schema_contract() {
         transcript_pk,
         ["session_id", "item_seq"],
         "session_transcript_items must page by stable (session_id,item_seq) primary key"
+    );
+    let transcript_page_columns = column_names(&pool, &schema, "transcript_pages").await;
+    assert!(
+        transcript_page_columns
+            .iter()
+            .any(|column| column == "user_id"),
+        "transcript_pages must carry physical owner scope"
+    );
+    assert!(
+        column_default(&pool, &schema, "transcript_pages", "user_id")
+            .await
+            .is_none_or(|default| !default.trim_matches('\'').is_empty()),
+        "transcript_pages.user_id must not use an empty-string owner sentinel"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "transcript_pages",
+            "idx_transcript_pages_owner_session_end"
+        )
+        .await,
+        ["user_id", "session_id", "end_item_seq"],
+        "transcript page lookups must use owner/session/end index"
+    );
+    let ctx_snapshot_columns = column_names(&pool, &schema, "ctx_snapshots").await;
+    assert!(
+        ctx_snapshot_columns
+            .iter()
+            .any(|column| column == "user_id"),
+        "ctx_snapshots must carry physical owner scope"
+    );
+    assert!(
+        column_default(&pool, &schema, "ctx_snapshots", "user_id")
+            .await
+            .is_none_or(|default| !default.trim_matches('\'').is_empty()),
+        "ctx_snapshots.user_id must not use an empty-string owner sentinel"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "ctx_snapshots",
+            "idx_ctx_snapshots_owner_session_created"
+        )
+        .await,
+        ["user_id", "session_id", "created_at"],
+        "context snapshot lookups must use owner/session recency index"
+    );
+    let ctx_decision_columns = column_names(&pool, &schema, "ctx_decision_audits").await;
+    assert!(
+        ctx_decision_columns
+            .iter()
+            .any(|column| column == "user_id"),
+        "ctx_decision_audits must carry physical owner scope"
+    );
+    assert!(
+        column_default(&pool, &schema, "ctx_decision_audits", "user_id")
+            .await
+            .is_none_or(|default| !default.trim_matches('\'').is_empty()),
+        "ctx_decision_audits.user_id must not use an empty-string owner sentinel"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "ctx_decision_audits",
+            "idx_ctx_decisions_owner_session_type_created"
+        )
+        .await,
+        ["user_id", "session_id", "decision_type", "created_at"],
+        "decision audit lookups must use owner/session/type recency index"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "prompt_request_records",
+            "idx_prompt_requests_owner_session_created"
+        )
+        .await,
+        [
+            "user_id",
+            "session_id",
+            "created_at",
+            "turn",
+            "round",
+            "attempt"
+        ],
+        "session prompt observability must use owner/session recency index"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "prompt_request_records",
+            "idx_prompt_requests_owner_run_created"
+        )
+        .await,
+        [
+            "user_id",
+            "run_id",
+            "created_at",
+            "turn",
+            "round",
+            "attempt"
+        ],
+        "run prompt observability must use owner/run recency index"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "auth_audit_logs",
+            "idx_auth_audit_logs_user_resource_created"
+        )
+        .await,
+        ["user_id", "resource_type", "resource_id", "created_at"],
+        "auth audit lookups must be observable by owner/resource recency"
+    );
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "tool_exactly_once_results").await,
+        ["user_id", "session_id", "dedup_key"],
+        "tool exactly-once recovery must dedupe within the owner/session boundary"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "tool_exactly_once_results",
+            "idx_tool_exactly_once_session"
+        )
+        .await,
+        ["session_id", "user_id"],
+        "session deletion and consistency checks must find exactly-once rows by session and owner"
     );
 
     let revision_columns = column_names(&pool, &schema, "session_state_revisions").await;
@@ -452,6 +679,34 @@ async fn phase3_context_manifest_schema_contract() {
             "context_manifests missing {expected}"
         );
     }
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "context_manifests",
+            "idx_ctx_manifest_owner_session_created"
+        )
+        .await,
+        ["user_id", "session_id", "created_at", "manifest_id"],
+        "latest context manifest lookup must use owner/session recency index"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "context_manifests",
+            "idx_ctx_manifest_owner_session_run_created"
+        )
+        .await,
+        [
+            "user_id",
+            "session_id",
+            "run_id",
+            "created_at",
+            "manifest_id"
+        ],
+        "run-specific context manifest lookup must use owner/session/run recency index"
+    );
 
     let items = column_names(&pool, &schema, "context_manifest_items").await;
     for expected in ["render_mode", "included", "raw_ref", "budget_tokens"] {
@@ -460,6 +715,10 @@ async fn phase3_context_manifest_schema_contract() {
             "context_manifest_items missing {expected}"
         );
     }
+    assert!(
+        !items.iter().any(|column| column == "user_id"),
+        "context_manifest_items must inherit owner scope through context_manifests, not store a second owner column"
+    );
 
     let render_modes = sqlx::query(
         "SELECT COUNT(*) AS count FROM context_manifest_items
@@ -506,6 +765,84 @@ async fn phase4_state_projection_schema_contract() {
     let pool = common::setup_pool().await;
     let schema = current_schema(&pool).await;
 
+    let conversation_log_columns = column_names(&pool, &schema, "conversation_log").await;
+    for expected in ["user_id", "session_id", "seq", "turn", "entry_type"] {
+        assert!(
+            conversation_log_columns
+                .iter()
+                .any(|column| column == expected),
+            "conversation_log missing {expected}"
+        );
+    }
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "conversation_log").await,
+        ["user_id", "session_id", "seq"],
+        "conversation_log identity must be owner/session/seq"
+    );
+    assert!(
+        column_default(&pool, &schema, "conversation_log", "user_id")
+            .await
+            .is_none_or(|default| !default.trim_matches('\'').is_empty()),
+        "conversation_log.user_id must not use an empty-string owner sentinel"
+    );
+    assert_eq!(
+        index_columns(&pool, &schema, "conversation_log", "idx_csl_owner_snapshot").await,
+        ["user_id", "session_id", "entry_type", "seq"],
+        "CSL latest-snapshot lookup must use owner/session index"
+    );
+    assert_eq!(
+        index_columns(&pool, &schema, "conversation_log", "idx_csl_owner_turn").await,
+        ["user_id", "session_id", "turn"],
+        "CSL fork/read-by-turn lookup must use owner/session index"
+    );
+    assert!(
+        index_columns(&pool, &schema, "conversation_log", "idx_csl_snapshot")
+            .await
+            .is_empty(),
+        "conversation_log must not keep obsolete session-only snapshot index"
+    );
+    assert!(
+        index_columns(&pool, &schema, "conversation_log", "idx_csl_turn")
+            .await
+            .is_empty(),
+        "conversation_log must not keep obsolete session-only turn index"
+    );
+
+    let todo_counter_columns = column_names(&pool, &schema, "session_todo_counters").await;
+    for expected in ["user_id", "session_id", "next_id", "version"] {
+        assert!(
+            todo_counter_columns.iter().any(|column| column == expected),
+            "session_todo_counters missing {expected}"
+        );
+    }
+    assert!(
+        column_default(&pool, &schema, "session_todo_counters", "user_id")
+            .await
+            .is_none_or(|default| !default.trim_matches('\'').is_empty()),
+        "session_todo_counters.user_id must not use an empty-string owner sentinel"
+    );
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "session_todo_counters").await,
+        ["user_id", "session_id"],
+        "session todo counters must be owner-bound at the uniqueness boundary"
+    );
+    assert!(
+        index_columns(
+            &pool,
+            &schema,
+            "session_todo_counters",
+            "idx_session_todo_counters_owner_session"
+        )
+        .await
+        .is_empty(),
+        "session_todo_counters must not keep a redundant owner/session secondary index"
+    );
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "session_todo_idempotency").await,
+        ["session_id", "user_id", "action", "idempotency_key"],
+        "todo idempotency ledger must dedupe by session/owner/action/key"
+    );
+
     let state_items = column_names(&pool, &schema, "session_state_items").await;
     for expected in [
         "scope",
@@ -522,8 +859,19 @@ async fn phase4_state_projection_schema_contract() {
     }
     assert_eq!(
         unique_key_columns(&pool, &schema, "session_state_items", "uq_state_current").await,
-        ["session_id", "scope", "category", "item_key"],
-        "state current projection must upsert by semantic key"
+        ["user_id", "session_id", "scope", "category", "item_key"],
+        "state current projection must upsert by owner/session semantic key"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "session_state_items",
+            "idx_state_owner_session_status_category"
+        )
+        .await,
+        ["user_id", "session_id", "status", "category"],
+        "state summary lookup must use owner/session/status/category index"
     );
     assert_eq!(
         index_columns(
@@ -594,6 +942,34 @@ async fn phase4_state_projection_schema_contract() {
             &pool,
             &schema,
             "session_artifacts",
+            "idx_session_artifacts_owner_kind_order"
+        )
+        .await,
+        [
+            "user_id",
+            "session_id",
+            "artifact_kind",
+            "created_at",
+            "artifact_id"
+        ],
+        "owner-bound artifact latest/list-by-kind reads must use user/session/kind ordering"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "session_artifacts",
+            "idx_session_artifacts_owner_session_order"
+        )
+        .await,
+        ["user_id", "session_id", "created_at", "artifact_id"],
+        "owner-bound artifact preview reads must use user/session ordering"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "session_artifacts",
             "idx_artifacts_root_scope"
         )
         .await,
@@ -602,10 +978,6 @@ async fn phase4_state_projection_schema_contract() {
     );
 
     let grants = column_names(&pool, &schema, "session_artifacts_grants").await;
-    assert!(
-        !table_exists(&pool, &schema, "session_artifact_grants").await,
-        "deprecated singular session_artifact_grants table must not exist"
-    );
     for expected in [
         "grant_id",
         "artifact_id",
@@ -642,25 +1014,6 @@ async fn phase4_state_projection_schema_contract() {
         ["target_delegation_id", "artifact_id", "expires_at"],
         "delegation artifact grants must use a target/artifact/expiry index"
     );
-
-    let check_text = include_str!("../src/storage.rs");
-    for expected in [
-        "session",
-        "user",
-        "project",
-        "workspace",
-        "bubble_up",
-        "apply_suggestion",
-        "activate",
-        "delegation_direct",
-        "same_root_tree",
-        "delegation",
-    ] {
-        assert!(
-            check_text.contains(expected),
-            "Phase 4 CHECK constraints missing {expected}: {check_text}"
-        );
-    }
 }
 
 #[tokio::test]
@@ -757,16 +1110,6 @@ async fn phase5_personal_skill_schema_contract() {
             "skill_installations missing Phase 5 column {expected}"
         );
     }
-
-    let storage_source = include_str!("../src/storage.rs");
-    assert!(
-        storage_source.contains("skill_md_v1")
-            && storage_source.contains("draft")
-            && storage_source.contains("published")
-            && storage_source.contains("superseded")
-            && storage_source.contains("quarantined"),
-        "Phase 5 schema must document normalize_version and version.status enum"
-    );
 }
 
 #[tokio::test]
@@ -799,13 +1142,6 @@ async fn phase6_artifact_retention_preview_schema_contract() {
         .await,
         ["status", "retention_until", "retention_policy"],
         "retention GC must use status/retention_until/retention_policy index"
-    );
-    let storage_source = include_str!("../src/storage.rs");
-    assert!(
-        storage_source.contains("chk_session_artifacts_status")
-            && storage_source.contains("expiring")
-            && storage_source.contains("expired"),
-        "session_artifacts status enum must be constrained in schema source"
     );
 
     let tool_outputs = column_names(&pool, &schema, "session_tool_outputs").await;
@@ -861,7 +1197,7 @@ async fn phase6_artifact_retention_preview_schema_contract() {
     let required_templates = sqlx::query(
         "SELECT tool_name FROM preview_template_registry
          WHERE tool_name IN ('pg_dump', 'fetch_url', 'parse_pdf', 'SKILL.md', 'cargo', 'rustc',
-          'clippy', 'sql_compat_scan', 'pg_schema_structurize', 'slow_query_analyzer', 'curl',
+          'clippy', 'pg_schema_structurize', 'slow_query_analyzer', 'curl',
           'git_log', 'docker_logs', 'kubectl', 'python_stdout', 'npm_build', 'csv_head',
           'json_preview', 'markdown_preview')
          AND status = 'active'",

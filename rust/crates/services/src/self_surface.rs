@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::durable_task::{ContractStatus, SubtaskStage, TaskContract};
 use crate::session_journal::{self, JournalEvent, JournalEventType};
-use crate::session_restore::{HybridRestoreService, RestoredSession, SessionRestoreService};
+use crate::session_restore::{HybridRestoreService, RestoredSession};
 use crate::session_workspace::{self, ContextTraceSignal, WorkspaceMetadata};
 
 #[cfg(test)]
@@ -569,7 +569,7 @@ async fn load_local_artifacts(session_id: &str) -> Result<LoadedSelfSurfaceArtif
         .map_err(|error| format!("failed to read workspace for session {session_id}: {error}"))?;
     let journal_events = read_journal_events(session_id)?;
     let restore_service = HybridRestoreService::local_only();
-    let restored = restore_service.restore_session(session_id).await?;
+    let restored = restore_service.restore_local_session(session_id).await?;
     if workspace.is_none() && restored.is_none() && journal_events.is_empty() {
         return Err(format!(
             "no persistent local state found for session {session_id}"
@@ -2205,7 +2205,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let _guard = JournalDirGuard::new(temp.path());
         let session_id = "svc-self-journal-error";
-        std::fs::create_dir_all(temp.path().join(format!("{session_id}.jsonl"))).unwrap();
+        let journal_path = crate::session_journal::journal_file_path(session_id);
+        std::fs::create_dir_all(&journal_path).unwrap();
 
         let service = LocalSelfSurfaceService::new();
         let error = service
@@ -2377,11 +2378,9 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let _guard = JournalDirGuard::new(temp.path());
         let session_id = "0ac7696c-8a67-4e9f-b7bb-88b3bf7b59a0";
-        std::fs::write(
-            temp.path().join(format!("{session_id}.jsonl")),
-            REAL_SESSION_0AC769_FIXTURE,
-        )
-        .unwrap();
+        let path = crate::session_journal::journal_file_path(session_id);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, REAL_SESSION_0AC769_FIXTURE).unwrap();
 
         let service =
             LocalSelfSurfaceService::new().with_runtime_support(Arc::new(StubRuntimeSupport));
@@ -2423,11 +2422,9 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let _guard = JournalDirGuard::new(temp.path());
         let session_id = "0ac7696c-8a67-4e9f-b7bb-88b3bf7b59a0";
-        std::fs::write(
-            temp.path().join(format!("{session_id}.jsonl")),
-            REAL_SESSION_0AC769_FIXTURE,
-        )
-        .unwrap();
+        let path = crate::session_journal::journal_file_path(session_id);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, REAL_SESSION_0AC769_FIXTURE).unwrap();
 
         let service =
             LocalSelfSurfaceService::new().with_runtime_support(Arc::new(StubRuntimeSupport));

@@ -612,6 +612,7 @@ fn build_server_skill_executor(
     request_constraints: RequestConstraints,
     inherited_permissions: InheritedPermissions,
     skill_resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
+    user_id: &str,
     session_id: &str,
     edge_connection_pool: Option<&astra_server_types::edge_connection_pool::EdgeConnectionPool>,
     cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
@@ -626,6 +627,7 @@ fn build_server_skill_executor(
     let mut subrun_executor = ServerSkillSubRunExecutor::new(
         matrixone.clone(),
         Arc::clone(encryptor),
+        user_id.to_string(),
         session_id.to_string(),
     )
     .with_pool(shared_pool.cloned())
@@ -895,9 +897,10 @@ fn should_emit_stream_turn_complete(final_status: &RunStatus) -> bool {
     matches!(final_status, RunStatus::Completed | RunStatus::Paused)
 }
 
+use crate::server::session_turn::infer_session_turn;
 pub(crate) use persistence::{
     PostLoopPersistContext, TranscriptPersistItem, build_run_turn_complete_event_with_interruption,
-    format_task_board_resume_hint, infer_session_turn, persist_server_loop_core_events,
+    format_task_board_resume_hint, persist_server_loop_core_events,
     persist_server_loop_trace_events, persist_session_transcript_items,
     restore_session_state_compact, restore_step_checkpoint_runtime_state, server_trace_context,
     trace_context_from_subrun_context,
@@ -1967,11 +1970,21 @@ impl AgenticRunLifecycleService {
         });
     }
 
-    fn build_csl_store(&self) -> Option<Arc<dyn astra_turn_core::conversation_log::CslStore>> {
+    fn build_csl_store(
+        &self,
+        user_id: &str,
+    ) -> Option<Arc<dyn astra_turn_core::conversation_log::CslStore>> {
         let pool = self.shared_pool.as_ref()?;
-        let store =
-            astra_turn_core::conversation_log::db_store::DbCslStore::new(self.matrixone.clone())
-                .with_pool(pool.clone());
+        let store = match astra_turn_core::conversation_log::db_store::DbCslStore::new(
+            self.matrixone.clone(),
+            user_id.to_string(),
+        ) {
+            Ok(store) => store.with_pool(pool.clone()),
+            Err(error) => {
+                tracing::warn!(%error, "CSL DB store creation failed");
+                return None;
+            }
+        };
         Some(Arc::new(store))
     }
 
@@ -1982,7 +1995,7 @@ impl AgenticRunLifecycleService {
         run_id: &str,
         loop_state: &mut AgenticLoopState,
     ) -> Option<astra_turn_core::conversation_log::manager::CslManager> {
-        let store = self.build_csl_store()?;
+        let store = self.build_csl_store(user_id)?;
         let mut mgr = match astra_turn_core::conversation_log::manager::CslManager::new(
             store,
             session_id.to_string(),
@@ -3265,6 +3278,7 @@ impl AgenticRunLifecycleService {
             request_constraints.clone(),
             root_permissions.clone(),
             skill_resolver.clone(),
+            user_id,
             session_id,
             self.edge_connection_pool.as_ref(),
             cancel_token,
@@ -3312,7 +3326,7 @@ impl AgenticRunLifecycleService {
             restricted_tools,
             boosted_tools: std::collections::HashSet::new(),
             widen_selection_pending: false,
-            step_recorder: StepRecorder::new(session_id, run_id),
+            step_recorder: StepRecorder::new(user_id, session_id, run_id),
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(0.75),
             call_counts: HashMap::new(),
@@ -4552,7 +4566,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // active plan → None, transient errors → None (best-effort).
         let plan_resume_hint = if let Some(shared) = &self.shared_pool {
             let repo = astra_plan::CloudPlanRepository::new(shared.get().clone());
-            astra_plan::plan_resume_hint_for_session(&repo, &session_id).await
+            astra_plan::plan_resume_hint_for_session(&repo, &user_id, &session_id).await
         } else {
             None
         };
@@ -4601,7 +4615,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         #[cfg(feature = "harness")]
         loop_state.harness.set_user_id(&user_id);
 
-        loop_state.session_turn = infer_session_turn(self.shared_pool.as_ref(), &session_id).await;
+        loop_state.session_turn =
+            infer_session_turn(self.shared_pool.as_ref(), &user_id, &session_id).await;
         let fresh_session_current_date = loop_state
             .pipeline_session
             .as_ref()
@@ -4615,12 +4630,23 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // compaction, and context-window counters. Without this, server-side
         // session resume starts cold even though finalization persisted the
         // state needed for long-running sessions.
-        if let Ok(Some(restored)) = astra_pipeline::step_restore::restore_session(&session_id) {
-            restore_step_checkpoint_runtime_state(
-                restored,
-                &fresh_session_current_date,
-                &mut loop_state,
-            );
+        match astra_pipeline::step_restore::restore_session(&user_id, &session_id) {
+            Ok(Some(restored)) => {
+                restore_step_checkpoint_runtime_state(
+                    restored,
+                    &fresh_session_current_date,
+                    &mut loop_state,
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    %user_id,
+                    %session_id,
+                    %error,
+                    "failed to restore owner-bound local step checkpoint"
+                );
+            }
         }
 
         // ── CSL: Load conversation history from the log ─────────────
@@ -5282,7 +5308,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         #[cfg(feature = "harness")]
         state.harness.set_user_id(&user_id);
 
-        state.session_turn = infer_session_turn(self.shared_pool.as_ref(), &session_id).await;
+        state.session_turn =
+            infer_session_turn(self.shared_pool.as_ref(), &user_id, &session_id).await;
         let fresh_session_current_date = state
             .pipeline_session
             .as_ref()
@@ -5293,12 +5320,23 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
         // ── Runtime warm-start from step checkpoint ────────────────
         if request.session_id.is_some() {
-            if let Ok(Some(restored)) = astra_pipeline::step_restore::restore_session(&session_id) {
-                restore_step_checkpoint_runtime_state(
-                    restored,
-                    &fresh_session_current_date,
-                    &mut state,
-                );
+            match astra_pipeline::step_restore::restore_session(&user_id, &session_id) {
+                Ok(Some(restored)) => {
+                    restore_step_checkpoint_runtime_state(
+                        restored,
+                        &fresh_session_current_date,
+                        &mut state,
+                    );
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        %user_id,
+                        %session_id,
+                        %error,
+                        "failed to restore owner-bound local step checkpoint"
+                    );
+                }
             }
         }
 
@@ -5312,7 +5350,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
         let plan_resume_hint = if let Some(shared) = &self.shared_pool {
             let repo = astra_plan::CloudPlanRepository::new(shared.get().clone());
-            astra_plan::plan_resume_hint_for_session(&repo, &session_id).await
+            astra_plan::plan_resume_hint_for_session(&repo, &user_id, &session_id).await
         } else {
             None
         };
@@ -7179,7 +7217,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             restricted_tools,
             boosted_tools: std::collections::HashSet::new(),
             widen_selection_pending: false,
-            step_recorder: StepRecorder::new(&config.session_id, &config.run_id),
+            step_recorder: StepRecorder::new(&config.user_id, &config.session_id, &config.run_id),
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(0.75),
             call_counts: HashMap::new(),

@@ -109,6 +109,7 @@ pub fn agentic_turn_stream_snapshot_with_kind<'a>(
 /// Mutable agentic-loop fields updated by [`ingest_agentic_turn_stream`].
 pub struct AgenticTurnIngestMut<'a> {
     pub task_profile: TaskExecutionProfile,
+    pub step_persistence_enabled: bool,
     pub first_ttft_ms: &'a mut Option<u64>,
     pub current_session_id: &'a mut Option<String>,
     pub current_run_id: &'a mut Option<String>,
@@ -179,7 +180,9 @@ pub fn ingest_agentic_turn_stream(
 
     if let Some(sid) = snap.session_id.as_ref() {
         *st.current_session_id = Some(sid.clone());
-        st.step_recorder.attach_persistence(sid);
+        if st.step_persistence_enabled {
+            st.step_recorder.attach_persistence(sid);
+        }
     }
     if snap.run_id.is_some() {
         *st.current_run_id = snap.run_id.clone();
@@ -348,6 +351,8 @@ fn persist_final_assistant_message(messages: &mut Vec<Value>, final_text: &str) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_USER_ID: &str = "test-user";
     use crate::interaction_types::TurnInteractionMode;
     use serde_json::json;
 
@@ -385,7 +390,7 @@ mod tests {
                 total_cache_creation: 0,
                 total_tool_calls: 0,
                 total_evidence_tool_calls: 0,
-                step_recorder: StepRecorder::with_persistence("s", "t"),
+                step_recorder: StepRecorder::with_persistence(TEST_USER_ID, "s", "t"),
                 all_tools_used: HashSet::new(),
                 has_any_usage: false,
                 forced_factual_retry: false,
@@ -400,8 +405,16 @@ mod tests {
         }
 
         fn ingest_mut(&mut self) -> AgenticTurnIngestMut<'_> {
+            self.ingest_mut_with_persistence(false)
+        }
+
+        fn ingest_mut_with_persistence(
+            &mut self,
+            step_persistence_enabled: bool,
+        ) -> AgenticTurnIngestMut<'_> {
             AgenticTurnIngestMut {
                 task_profile: TaskExecutionProfile::default(),
+                step_persistence_enabled,
                 first_ttft_ms: &mut self.first_ttft_ms,
                 current_session_id: &mut self.current_session_id,
                 current_run_id: &mut self.current_run_id,
@@ -422,6 +435,52 @@ mod tests {
                 turn_policy: self.turn_policy.clone(),
             }
         }
+    }
+
+    #[test]
+    fn ingest_attaches_step_persistence_using_recorder_owner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let mut p = Pack::new();
+        p.step_recorder = StepRecorder::new(TEST_USER_ID, "ephemeral", "task-1");
+
+        let session_id = Some("authoritative-session".to_string());
+        let run_id = None;
+        let error_message = None;
+        let tool_calls = Vec::new();
+        let snap = AgenticTurnStreamSnapshot {
+            ttft_ms: None,
+            session_id: &session_id,
+            run_id: &run_id,
+            full_text: "",
+            tool_calls: &tool_calls,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            has_usage: false,
+            error_message: &error_message,
+            error_kind: None,
+        };
+
+        let outcome = ingest_agentic_turn_stream(
+            &snap,
+            0,
+            |_| String::new(),
+            "continue this session",
+            &[],
+            true,
+            p.ingest_mut_with_persistence(true),
+        );
+
+        assert_eq!(outcome, AgenticTurnIngestOutcome::Break);
+        assert_eq!(
+            p.current_session_id.as_deref(),
+            Some("authoritative-session")
+        );
+        let summary = p.step_recorder.summary();
+        assert_eq!(summary.user_id, TEST_USER_ID);
+        assert_eq!(summary.session_id, "authoritative-session");
     }
 
     #[test]

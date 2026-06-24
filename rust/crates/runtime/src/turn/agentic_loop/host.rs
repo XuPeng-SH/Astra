@@ -133,6 +133,12 @@ pub struct HostTurnResult {
     pub error_kind: Option<astra_core::ErrorKind>,
 }
 
+pub enum ControlToolRecovery {
+    Unsupported,
+    Missing,
+    Recovered(EdgeToolExecResult),
+}
+
 pub use astra_turn_core::interaction_types::{
     ASK_USER_TOOL_NAME, TurnInteractionMode, TurnInteractionPolicy,
     interaction_scoped_tool_restrictions, tool_counts_as_factual_evidence,
@@ -298,6 +304,24 @@ pub trait AgenticLoopHost: Send {
     /// rather than inferring capabilities from the resolved tool list.
     fn capabilities(&self) -> astra_turn_core::capability::CapabilitySet {
         astra_turn_core::capability::CapabilitySet::all()
+    }
+
+    /// Recover a host-owned control-tool result when the LLM emitted a tool
+    /// call but the post-SSE edge result row is missing.
+    ///
+    /// This is intentionally host-scoped: replaying arbitrary missing tools
+    /// would duplicate side effects. Implementations must recover only from
+    /// an authoritative host state source, such as the multi-agent fanout
+    /// registry for `agent_fanout`, and must return [`ControlToolRecovery::Unsupported`]
+    /// for tool names they do not own.
+    async fn recover_missing_control_tool_result(
+        &mut self,
+        _parent_run_id: Option<&str>,
+        _tool_call_id: &str,
+        _tool_name: &str,
+        _args: &Value,
+    ) -> ControlToolRecovery {
+        ControlToolRecovery::Unsupported
     }
 
     /// Inject an additional tool schema into the host's tool list.
@@ -2391,7 +2415,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         restricted_tools: HashSet::new(),
         boosted_tools: HashSet::new(),
         widen_selection_pending: false,
-        step_recorder: StepRecorder::new("test-session", "test-task"),
+        step_recorder: StepRecorder::new("test-user", "test-session", "test-task"),
         idempotency_cache: InMemoryIdempotencyCache::new(),
         semantic_dedup: SemanticDedup::new(0.95),
         call_counts: HashMap::new(),
@@ -2486,11 +2510,21 @@ pub(crate) mod tests {
         )])
     }
 
-    /// Unwind-safe cleanup guard for tests that write under
-    /// `session_journal::local_sessions_dir()`. Removes the provided directory
-    /// on drop — including during panic unwinds from failed assertions — so
-    /// repeated runs don't leak `tier-gate-*` / `precompact-spill-*` siblings.
+    /// Unwind-safe cleanup guard for tests that write owner-bound session
+    /// artifacts. Removes the provided directory on drop — including during
+    /// panic unwinds from failed assertions — so repeated runs don't leak
+    /// `tier-gate-*` / `precompact-spill-*` siblings.
     struct SpillDirGuard(std::path::PathBuf);
+
+    impl SpillDirGuard {
+        fn new(session_id: &str) -> Self {
+            let store = astra_services::local_session_artifact_store();
+            Self(
+                astra_services::SessionArtifactStore::session_dir(&store, session_id)
+                    .expect("session id must resolve owner-bound spill directory"),
+            )
+        }
+    }
 
     impl Drop for SpillDirGuard {
         fn drop(&mut self) {
@@ -2511,6 +2545,8 @@ pub(crate) mod tests {
         pub(crate) rendered_final_text: Vec<String>,
         pub(crate) executed_messages: Vec<Vec<Value>>,
         pub(crate) turn_intent: Option<TurnIntent>,
+        pub(crate) recovered_control_results: HashMap<String, EdgeToolExecResult>,
+        pub(crate) recovered_control_requests: Vec<(Option<String>, String, String, Value)>,
         /// PR 5a test observer: number of times the turn loop has
         /// invoked the parent-turn-completed hook. Each entry is the
         /// value of `state.current_run_id` at hook time so tests can
@@ -2518,6 +2554,7 @@ pub(crate) mod tests {
         /// populated that field.
         pub(crate) turn_completed_run_ids: Vec<Option<String>>,
         pub(crate) cancelled_agent_ids: Vec<String>,
+        pub(crate) cancel_child_agents_delay: Option<std::time::Duration>,
     }
 
     impl MockHost {
@@ -2533,8 +2570,11 @@ pub(crate) mod tests {
                 rendered_final_text: Vec::new(),
                 executed_messages: Vec::new(),
                 turn_intent: None,
+                recovered_control_results: HashMap::new(),
+                recovered_control_requests: Vec::new(),
                 turn_completed_run_ids: Vec::new(),
                 cancelled_agent_ids: Vec::new(),
+                cancel_child_agents_delay: None,
             }
         }
 
@@ -2550,6 +2590,21 @@ pub(crate) mod tests {
 
         pub(crate) fn with_turn_intent(mut self, intent: TurnIntent) -> Self {
             self.turn_intent = Some(intent);
+            self
+        }
+
+        pub(crate) fn with_recovered_control_tool_result(
+            mut self,
+            tool_call_id: &str,
+            result: EdgeToolExecResult,
+        ) -> Self {
+            self.recovered_control_results
+                .insert(tool_call_id.to_string(), result);
+            self
+        }
+
+        pub(crate) fn with_cancel_child_agents_delay(mut self, delay: std::time::Duration) -> Self {
+            self.cancel_child_agents_delay = Some(delay);
             self
         }
 
@@ -2578,6 +2633,38 @@ pub(crate) mod tests {
 
         async fn judge_turn_intent(&mut self, _state: &AgenticLoopState) -> Option<TurnIntent> {
             self.turn_intent.clone()
+        }
+
+        async fn recover_missing_control_tool_result(
+            &mut self,
+            parent_run_id: Option<&str>,
+            tool_call_id: &str,
+            tool_name: &str,
+            args: &Value,
+        ) -> ControlToolRecovery {
+            let Some(result) = self.recovered_control_results.remove(tool_call_id) else {
+                return if self
+                    .recovered_control_results
+                    .values()
+                    .any(|result| result.tool == tool_name)
+                {
+                    ControlToolRecovery::Missing
+                } else {
+                    ControlToolRecovery::Unsupported
+                };
+            };
+            if result.tool != tool_name {
+                self.recovered_control_results
+                    .insert(tool_call_id.to_string(), result);
+                return ControlToolRecovery::Unsupported;
+            }
+            self.recovered_control_requests.push((
+                parent_run_id.map(str::to_string),
+                tool_call_id.to_string(),
+                tool_name.to_string(),
+                args.clone(),
+            ));
+            ControlToolRecovery::Recovered(result)
         }
 
         fn emit_headless_line(&mut self, _style: HeadlessStderrStyle, line: String) {
@@ -2616,6 +2703,9 @@ pub(crate) mod tests {
             agent_ids: &[String],
             _reason: &str,
         ) -> Vec<String> {
+            if let Some(delay) = self.cancel_child_agents_delay {
+                tokio::time::sleep(delay).await;
+            }
             self.cancelled_agent_ids.extend(agent_ids.iter().cloned());
             agent_ids.to_vec()
         }
@@ -2829,7 +2919,7 @@ pub(crate) mod tests {
             restricted_tools: HashSet::new(),
             boosted_tools: HashSet::new(),
             widen_selection_pending: false,
-            step_recorder: StepRecorder::new("test-session", "test-task"),
+            step_recorder: StepRecorder::new("test-user", "test-session", "test-task"),
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(0.95),
             call_counts: HashMap::new(),
@@ -6199,8 +6289,7 @@ pub(crate) mod tests {
                 .expect("system time")
                 .as_nanos()
         );
-        let _guard =
-            SpillDirGuard(astra_services::session_journal::local_sessions_dir().join(&session_id));
+        let _guard = SpillDirGuard::new(&session_id);
 
         let mut host = MockHost::new(vec![
             edge_tool_result(
@@ -6268,8 +6357,7 @@ pub(crate) mod tests {
                 .expect("system time")
                 .as_nanos()
         );
-        let _guard =
-            SpillDirGuard(astra_services::session_journal::local_sessions_dir().join(&session_id));
+        let _guard = SpillDirGuard::new(&session_id);
 
         let mut host = MockHost::new(vec![
             edge_tool_result(
@@ -6336,8 +6424,7 @@ pub(crate) mod tests {
                 .expect("system time")
                 .as_nanos()
         );
-        let _guard =
-            SpillDirGuard(astra_services::session_journal::local_sessions_dir().join(&session_id));
+        let _guard = SpillDirGuard::new(&session_id);
 
         let mut host = MockHost::new(vec![
             edge_tool_result(

@@ -7,7 +7,7 @@
 //! # Usage in chat_stream.rs
 //!
 //! ```ignore
-//! let mut recorder = StepRecorder::new("session-123", "task-1");
+//! let mut recorder = StepRecorder::new("user-123", "session-123", "task-1");
 //!
 //! // Before main loop:
 //! recorder.begin_turn(turn_number);
@@ -225,6 +225,7 @@ fn redact_pem_blocks(text: &mut String) -> usize {
 /// Records chat_stream execution as Step lifecycle events.
 /// Wraps the implicit state machine with explicit StepAction tracking.
 pub struct StepRecorder {
+    user_id: String,
     session_id: String,
     task_id: String,
     events: Vec<StepEvent>,
@@ -248,8 +249,9 @@ pub struct StepRecorder {
 }
 
 impl StepRecorder {
-    pub fn new(session_id: &str, task_id: &str) -> Self {
+    pub fn new(user_id: &str, session_id: &str, task_id: &str) -> Self {
         Self {
+            user_id: user_id.to_string(),
             session_id: session_id.to_string(),
             task_id: task_id.to_string(),
             events: Vec::new(),
@@ -273,10 +275,10 @@ impl StepRecorder {
     ///
     /// Scans existing checkpoints so `checkpoint_count` starts after the
     /// highest existing file number, preventing cross-turn overwrites.
-    pub fn with_persistence(session_id: &str, task_id: &str) -> Self {
-        let file_store = FileBackedEventStore::empty(session_id);
-        let persisted_summary = persisted_event_summary(session_id);
-        let existing_max = crate::step_checkpoint::list_checkpoints(session_id)
+    pub fn with_persistence(user_id: &str, session_id: &str, task_id: &str) -> Self {
+        let file_store = FileBackedEventStore::empty(user_id, session_id);
+        let persisted_summary = persisted_event_summary(user_id, session_id);
+        let existing_max = crate::step_checkpoint::list_checkpoints(user_id, session_id)
             .unwrap_or_default()
             .iter()
             .map(|(n, _)| *n)
@@ -289,7 +291,7 @@ impl StepRecorder {
             step_sequence: persisted_summary.next_step_sequence,
             checkpoint_count: existing_max.saturating_add(1),
             persisted_tail_event_id: persisted_summary.tail_event_id,
-            ..Self::new(session_id, task_id)
+            ..Self::new(user_id, session_id, task_id)
         }
     }
 
@@ -304,7 +306,7 @@ impl StepRecorder {
 
         self.rebind_session_id(session_id);
 
-        let existing_max = crate::step_checkpoint::list_checkpoints(session_id)
+        let existing_max = crate::step_checkpoint::list_checkpoints(&self.user_id, session_id)
             .unwrap_or_default()
             .iter()
             .map(|(n, _)| *n)
@@ -312,14 +314,14 @@ impl StepRecorder {
             .unwrap_or(0);
         self.checkpoint_count = self.checkpoint_count.max(existing_max.saturating_add(1));
 
-        let persisted_summary = persisted_event_summary(session_id);
+        let persisted_summary = persisted_event_summary(&self.user_id, session_id);
         self.step_sequence = self.step_sequence.max(persisted_summary.next_step_sequence);
         self.persisted_tail_event_id = if self.events.is_empty() {
             persisted_summary.tail_event_id
         } else {
             None
         };
-        let mut file_store = FileBackedEventStore::empty(session_id);
+        let mut file_store = FileBackedEventStore::empty(&self.user_id, session_id);
         self.persistence_required = true;
         for event in &self.events {
             if let Err(error) = file_store.append(event.clone()) {
@@ -1165,6 +1167,7 @@ impl StepRecorder {
         slowest_tools.truncate(5);
 
         RecorderSummary {
+            user_id: self.user_id.clone(),
             session_id: self.session_id.clone(),
             task_id: self.task_id.clone(),
             iterations: if self.events.is_empty() {
@@ -1438,10 +1441,10 @@ struct PersistedEventSummary {
     tail_event_id: Option<String>,
 }
 
-fn persisted_event_summary(session_id: &str) -> PersistedEventSummary {
+fn persisted_event_summary(user_id: &str, session_id: &str) -> PersistedEventSummary {
     let mut max_sequence = None;
     let mut tail_event_id = None;
-    if let Err(error) = FileBackedEventStore::for_each_event(session_id, |event| {
+    if let Err(error) = FileBackedEventStore::for_each_event(user_id, session_id, |event| {
         if let Some(sequence) = step_sequence_from_event(event) {
             max_sequence = Some(max_sequence.map_or(sequence, |max: u32| max.max(sequence)));
         }
@@ -1480,6 +1483,7 @@ fn step_sequence_from_event(event: &StepEvent) -> Option<u32> {
 /// Summary of a recorded session for debugging/audit.
 #[derive(Debug, Clone)]
 pub struct RecorderSummary {
+    pub user_id: String,
     pub session_id: String,
     pub task_id: String,
     pub iterations: u32,
@@ -1503,6 +1507,8 @@ fn epoch_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_USER_ID: &str = "test-user";
 
     #[test]
     fn redact_credentials_redacts_assignments_but_keeps_token_counters() {
@@ -1545,7 +1551,7 @@ mod tests {
 
     #[test]
     fn recorder_basic_lifecycle() {
-        let mut rec = StepRecorder::new("sess-1", "task-1");
+        let mut rec = StepRecorder::new(TEST_USER_ID, "sess-1", "task-1");
         rec.begin_turn(0);
 
         assert!(rec.current_step().is_some());
@@ -1555,7 +1561,7 @@ mod tests {
 
     #[test]
     fn recorder_perceive_records_memory() {
-        let mut rec = StepRecorder::new("sess-1", "task-1");
+        let mut rec = StepRecorder::new(TEST_USER_ID, "sess-1", "task-1");
         rec.begin_turn(0);
         rec.record_perceive(
             "show me PRs",
@@ -1573,7 +1579,7 @@ mod tests {
 
     #[test]
     fn recorder_plan_phase_transition() {
-        let mut rec = StepRecorder::new("sess-1", "task-1");
+        let mut rec = StepRecorder::new(TEST_USER_ID, "sess-1", "task-1");
         rec.begin_turn(0);
         rec.record_plan(&["github_list_prs".into(), "grep".into()], 0.85, 0.3, 4000);
 
@@ -1584,7 +1590,7 @@ mod tests {
 
     #[test]
     fn recorder_act_with_tools() {
-        let mut rec = StepRecorder::new("sess-1", "task-1");
+        let mut rec = StepRecorder::new(TEST_USER_ID, "sess-1", "task-1");
         rec.begin_turn(0);
         rec.begin_act(2);
 
@@ -1606,7 +1612,7 @@ mod tests {
 
     #[test]
     fn recorder_cached_tool_completes_with_cached_marker() {
-        let mut rec = StepRecorder::new("sess-1", "task-1");
+        let mut rec = StepRecorder::new(TEST_USER_ID, "sess-1", "task-1");
         rec.begin_turn(0);
         rec.begin_act(1);
         rec.begin_tool("grep", "call-1");
@@ -1627,7 +1633,7 @@ mod tests {
 
     #[test]
     fn recorder_tool_failure_and_retry() {
-        let mut rec = StepRecorder::new("sess-1", "task-1");
+        let mut rec = StepRecorder::new(TEST_USER_ID, "sess-1", "task-1");
         rec.begin_turn(0);
         rec.begin_act(1);
         rec.begin_tool("bash", "call-1");
@@ -1644,7 +1650,7 @@ mod tests {
 
     #[test]
     fn recorder_verdict_stall() {
-        let mut rec = StepRecorder::new("sess-1", "task-1");
+        let mut rec = StepRecorder::new(TEST_USER_ID, "sess-1", "task-1");
         rec.begin_turn(0);
         rec.begin_act(1);
         rec.begin_tool("grep", "call-1");
@@ -1670,7 +1676,7 @@ mod tests {
 
     #[test]
     fn skip_tool_with_reason_marks_slot_and_records_payload() {
-        let mut rec = StepRecorder::new("sess-1", "task-1");
+        let mut rec = StepRecorder::new(TEST_USER_ID, "sess-1", "task-1");
         rec.begin_turn(0);
         rec.begin_act(1);
         rec.begin_tool_with_key("grep", "call-1", Some("sem:grep"));
@@ -1705,7 +1711,7 @@ mod tests {
 
     #[test]
     fn recorder_verdict_force_stop() {
-        let mut rec = StepRecorder::new("sess-1", "task-1");
+        let mut rec = StepRecorder::new(TEST_USER_ID, "sess-1", "task-1");
         rec.begin_turn(0);
         rec.begin_act(0);
         rec.record_verdict("Critical", false, false, true, 2);
@@ -1724,7 +1730,7 @@ mod tests {
 
     #[test]
     fn recorder_end_turn_completed() {
-        let mut rec = StepRecorder::new("sess-1", "task-1");
+        let mut rec = StepRecorder::new(TEST_USER_ID, "sess-1", "task-1");
         rec.begin_turn(0);
         rec.end_turn(true);
 
@@ -1735,7 +1741,7 @@ mod tests {
 
     #[test]
     fn regression_incomplete_turn_is_not_recorded_as_retry() {
-        let mut rec = StepRecorder::new("sess-regression", "task-1");
+        let mut rec = StepRecorder::new(TEST_USER_ID, "sess-regression", "task-1");
         rec.begin_turn(0);
         rec.begin_act(1);
         rec.begin_tool("read_file", "call-1");
@@ -1759,7 +1765,7 @@ mod tests {
 
     #[test]
     fn regression_incomplete_turn_has_single_terminal_event() {
-        let mut rec = StepRecorder::new("sess-regression", "task-1");
+        let mut rec = StepRecorder::new(TEST_USER_ID, "sess-regression", "task-1");
         rec.begin_turn(0);
         rec.begin_act(1);
         rec.begin_tool("read_file", "call-1");
@@ -1791,7 +1797,7 @@ mod tests {
 
     #[test]
     fn regression_failed_tool_event_carries_actionable_payload() {
-        let mut rec = StepRecorder::new("sess-regression", "task-1");
+        let mut rec = StepRecorder::new(TEST_USER_ID, "sess-regression", "task-1");
         rec.begin_turn(0);
         rec.begin_act(1);
         rec.begin_tool_with_key_and_args_preview(
@@ -1846,7 +1852,7 @@ mod tests {
 
     #[test]
     fn recorder_redacts_args_preview_in_started_and_completed_events() {
-        let mut rec = StepRecorder::new("sess-redaction", "task-1");
+        let mut rec = StepRecorder::new(TEST_USER_ID, "sess-redaction", "task-1");
         rec.begin_turn(0);
         rec.begin_act(1);
         rec.begin_tool_with_key_and_args_preview(
@@ -1894,7 +1900,7 @@ mod tests {
 
     #[test]
     fn skip_tool_with_reason_redacts_persisted_output() {
-        let mut rec = StepRecorder::new("sess-redaction", "task-1");
+        let mut rec = StepRecorder::new(TEST_USER_ID, "sess-redaction", "task-1");
         rec.begin_turn(0);
         rec.begin_act(1);
         rec.begin_tool("bash", "call-1");
@@ -1921,7 +1927,7 @@ mod tests {
 
     #[test]
     fn complete_tool_with_metadata_backfills_actionable_payload() {
-        let mut rec = StepRecorder::new("sess-regression", "task-1");
+        let mut rec = StepRecorder::new(TEST_USER_ID, "sess-regression", "task-1");
         rec.begin_turn(0);
         rec.begin_act(1);
 
@@ -1952,7 +1958,7 @@ mod tests {
 
     #[test]
     fn recorder_summary() {
-        let mut rec = StepRecorder::new("sess-1", "task-1");
+        let mut rec = StepRecorder::new(TEST_USER_ID, "sess-1", "task-1");
 
         // Turn 0: 2 tools
         rec.begin_turn(0);
@@ -1971,6 +1977,9 @@ mod tests {
         rec.end_turn(true);
 
         let summary = rec.summary();
+        assert_eq!(summary.user_id, TEST_USER_ID);
+        assert_eq!(summary.session_id, "sess-1");
+        assert_eq!(summary.task_id, "task-1");
         assert_eq!(summary.iterations, 2);
         assert_eq!(summary.total_tools, 3);
         assert_eq!(summary.total_tool_time_ms, 210);
@@ -1980,7 +1989,7 @@ mod tests {
 
     #[test]
     fn recorder_events_form_causal_chain() {
-        let mut rec = StepRecorder::new("sess-1", "task-1");
+        let mut rec = StepRecorder::new(TEST_USER_ID, "sess-1", "task-1");
         rec.begin_turn(0);
         rec.begin_act(1);
         rec.begin_tool("grep", "c1");
@@ -1999,7 +2008,7 @@ mod tests {
 
     #[test]
     fn recorder_multi_turn_phase_log() {
-        let mut rec = StepRecorder::new("sess-1", "task-1");
+        let mut rec = StepRecorder::new(TEST_USER_ID, "sess-1", "task-1");
         rec.begin_turn(0);
         rec.record_plan(&["grep".into()], 0.9, 0.0, 4000);
         rec.begin_act(1);
@@ -2026,13 +2035,22 @@ mod tests {
         let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
         let sid = "test-cp-resume";
 
-        // Create checkpoint files directly (simulating previous turns)
-        let cp_dir = tmp.path().join(sid).join("step_checkpoints");
-        std::fs::create_dir_all(&cp_dir).unwrap();
-        std::fs::write(cp_dir.join("000003-light.json"), "{}").unwrap();
-        std::fs::write(cp_dir.join("000005-heavy.json"), "{}").unwrap();
+        let light = crate::step_protocol::StepCheckpoint::light(
+            "step-3".to_string(),
+            "task-1".to_string(),
+            sid.to_string(),
+            crate::step_protocol::ExecutionCursor::default(),
+        );
+        crate::step_checkpoint::write_step_checkpoint(TEST_USER_ID, sid, 3, &light).unwrap();
+        let heavy = crate::step_protocol::StepCheckpoint::heavy(
+            "step-5".to_string(),
+            "task-1".to_string(),
+            sid.to_string(),
+            crate::step_protocol::ExecutionCursor::default(),
+        );
+        crate::step_checkpoint::write_step_checkpoint(TEST_USER_ID, sid, 5, &heavy).unwrap();
 
-        let rec = StepRecorder::with_persistence(sid, "task-1");
+        let rec = StepRecorder::with_persistence(TEST_USER_ID, sid, "task-1");
         // checkpoint_count should be max(5,3) + 1 = 6
         assert_eq!(
             rec.summary().checkpoints,
@@ -2047,12 +2065,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
 
-        let mut rec = StepRecorder::new("ephemeral", "task-1");
+        let mut rec = StepRecorder::new(TEST_USER_ID, "ephemeral", "task-1");
         rec.begin_turn(0);
         rec.record_plan(&["bash".into()], 0.9, 0.0, 4000);
         rec.attach_persistence("sess-adopted");
         rec.end_turn(true);
 
+        assert_eq!(rec.summary().user_id, TEST_USER_ID);
         assert_eq!(rec.summary().session_id, "sess-adopted");
         assert_eq!(
             rec.current_step().unwrap().step_id(),
@@ -2064,29 +2083,25 @@ mod tests {
                 .all(|event| event.step_id == "sess-adopted-turn-0-step-0")
         );
 
-        let adopted_path = tmp.path().join("sess-adopted").join("step_events.jsonl");
-        let persisted = std::fs::read_to_string(adopted_path).unwrap();
-        let parsed: Vec<StepEvent> = persisted
-            .lines()
-            .map(serde_json::from_str)
-            .collect::<Result<_, _>>()
-            .expect("step_events.jsonl should be plaintext JSONL");
+        let parsed =
+            crate::step_checkpoint::FileBackedEventStore::new(TEST_USER_ID, "sess-adopted")
+                .all_events()
+                .to_vec();
         assert!(
             parsed
                 .iter()
                 .any(|event| event.step_id == "sess-adopted-turn-0-step-0")
         );
         assert!(
-            !tmp.path()
-                .join("ephemeral")
-                .join("step_events.jsonl")
+            !crate::step_checkpoint::owner_session_dir_for(TEST_USER_ID, "ephemeral")
+                .unwrap()
                 .exists()
         );
     }
 
     #[test]
     fn required_persistence_drops_new_events_after_attach_failure() {
-        let mut rec = StepRecorder::new("ephemeral", "task-1");
+        let mut rec = StepRecorder::new(TEST_USER_ID, "ephemeral", "task-1");
         rec.begin_turn(0);
         rec.attach_persistence("../invalid-session-id");
         let events_after_failed_attach = rec.events().len();
@@ -2107,13 +2122,13 @@ mod tests {
         let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
         let sid = "sess-continued";
 
-        let mut first = StepRecorder::with_persistence(sid, "task-1");
+        let mut first = StepRecorder::with_persistence(TEST_USER_ID, sid, "task-1");
         first.begin_turn_with_context(0, 0);
         first.end_turn(false);
         let previous_tail = first.events().last().unwrap().event_id.clone();
         drop(first);
 
-        let mut second = StepRecorder::with_persistence(sid, "task-2");
+        let mut second = StepRecorder::with_persistence(TEST_USER_ID, sid, "task-2");
         assert!(
             second.events().is_empty(),
             "persistent recorder must not materialize historical journals into memory"
@@ -2154,7 +2169,7 @@ mod tests {
 
     #[test]
     fn regression_recreated_visible_turns_have_unique_step_ids_and_context() {
-        let mut rec = StepRecorder::new("sess-regression", "task-1");
+        let mut rec = StepRecorder::new(TEST_USER_ID, "sess-regression", "task-1");
         rec.begin_turn(6);
         rec.end_turn(false);
         rec.begin_turn(6);
@@ -2193,7 +2208,7 @@ mod tests {
 
     #[test]
     fn regression_step_events_jsonl_satisfies_trace_invariants() {
-        let mut rec = StepRecorder::new("sess-regression", "task-1");
+        let mut rec = StepRecorder::new(TEST_USER_ID, "sess-regression", "task-1");
         rec.begin_turn(3);
         rec.record_plan(&["read_file".into()], 0.8, 0.2, 4000);
         rec.begin_act(1);
@@ -2297,7 +2312,7 @@ mod tests {
         // only sees the result), the recorder must auto-inject a
         // ToolCallStarted event so the event stream is always a
         // valid span: Started → Completed/Failed/Skipped.
-        let mut rec = StepRecorder::new("sess-started-fix", "task-1");
+        let mut rec = StepRecorder::new(TEST_USER_ID, "sess-started-fix", "task-1");
         rec.begin_turn(0);
         rec.begin_act(1);
         // Skip begin_tool — go straight to complete (simulates fast-path)
@@ -2353,7 +2368,7 @@ mod tests {
     fn begin_then_complete_does_not_double_emit_started() {
         // Normal path: begin_tool → complete_tool. Must emit exactly one
         // ToolCallStarted (from begin_tool), not a second from complete.
-        let mut rec = StepRecorder::new("sess-no-double", "task-1");
+        let mut rec = StepRecorder::new(TEST_USER_ID, "sess-no-double", "task-1");
         rec.begin_turn(0);
         rec.begin_act(1);
         rec.begin_tool_with_key_and_args_preview("bash", "call-1", None, Some("ls"));
@@ -2380,7 +2395,7 @@ mod tests {
 
     #[test]
     fn parallel_completions_are_correlated_by_call_id() {
-        let mut rec = StepRecorder::new("sess-parallel", "task-1");
+        let mut rec = StepRecorder::new(TEST_USER_ID, "sess-parallel", "task-1");
         rec.begin_turn(0);
         rec.begin_act(3);
         rec.begin_tool_with_key_and_args_preview("read_file", "call-a", None, Some("a.rs"));

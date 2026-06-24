@@ -303,13 +303,8 @@ fn file_checkpoint_dir_for(session_id: &str) -> Option<PathBuf> {
             );
         }
     }
-    let home = dirs::home_dir()?;
-    Some(
-        home.join(".astra")
-            .join("sessions")
-            .join(session_id)
-            .join("file_checkpoints"),
-    )
+    let store = astra_services::local_session_artifact_store();
+    astra_services::SessionArtifactStore::session_path(&store, session_id, "file_checkpoints").ok()
 }
 #[path = "edge_tools/worktree.rs"]
 mod worktree;
@@ -1022,7 +1017,7 @@ pub struct ToolExecutor {
     /// P3.1 seam: cross-session lessons loaded at session bootstrap.
     /// Populated once via `set_session_lessons`, then passed through on
     /// every `build_self_model_snapshot` for the session's lifetime.
-    session_lessons: std::sync::Mutex<Vec<astra_runtime::self_model::LessonHint>>,
+    session_lessons: std::sync::Mutex<Vec<astra_services::LessonHint>>,
     /// P3.3 seam: latest auto-invoked diagnostic skill output.
     /// `AutoInvokeHandler::maybe_fire` writes each successful parse here;
     /// the next `build_self_model_snapshot` injects it into the prompt and
@@ -1875,7 +1870,7 @@ impl ToolExecutor {
     /// P3.1 seam: stash cross-session lessons loaded at session bootstrap.
     /// Every subsequent `build_self_model_snapshot` will project them via
     /// [`astra_runtime::self_model::SelfModel::with_lessons`].
-    pub fn set_session_lessons(&self, lessons: Vec<astra_runtime::self_model::LessonHint>) {
+    pub fn set_session_lessons(&self, lessons: Vec<astra_services::LessonHint>) {
         if let Ok(mut g) = self.session_lessons.lock() {
             *g = lessons;
         }
@@ -1885,7 +1880,7 @@ impl ToolExecutor {
     /// injection-freshness observer (`observe_bridge_injections`) so it can
     /// fingerprint the same slice the next SelfModel snapshot will
     /// project into the system prompt.
-    pub fn session_lessons_snapshot(&self) -> Vec<astra_runtime::self_model::LessonHint> {
+    pub fn session_lessons_snapshot(&self) -> Vec<astra_services::LessonHint> {
         self.session_lessons
             .lock()
             .map(|g| g.clone())
@@ -3335,15 +3330,7 @@ impl ToolExecutor {
         let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(50) as usize;
         let agent_filter = args.get("agent_id").and_then(Value::as_str);
 
-        let journal_path = std::path::PathBuf::from(
-            std::env::var("HOME")
-                .ok()
-                .or_else(|| dirs::home_dir().map(|p| p.to_string_lossy().into_owned()))
-                .unwrap_or_else(|| ".".to_string()),
-        )
-        .join(".astra")
-        .join("sessions")
-        .join(format!("{session_id}.jsonl"));
+        let journal_path = astra_services::session_journal::journal_file_path(&session_id);
 
         if !journal_path.exists() {
             return format!("Error: journal not found at {}", journal_path.display());
@@ -3382,8 +3369,7 @@ impl ToolExecutor {
             Some(s) if !s.trim().is_empty() => s,
             _ => return "Error: no active session.".to_string(),
         };
-        let journal_path = astra_services::session_journal::local_sessions_dir()
-            .join(format!("{session_id}.jsonl"));
+        let journal_path = astra_services::session_journal::journal_file_path(&session_id);
 
         let events: Vec<serde_json::Value> = match std::fs::read_to_string(&journal_path) {
             Ok(content) => content
@@ -3488,14 +3474,7 @@ impl ToolExecutor {
         let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize;
         let query = args.get("query").and_then(Value::as_str).unwrap_or("");
 
-        let journal_path = std::path::PathBuf::from(
-            dirs::home_dir()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|| ".".to_string()),
-        )
-        .join(".astra")
-        .join("sessions")
-        .join(format!("{session_id}.jsonl"));
+        let journal_path = astra_services::session_journal::journal_file_path(&session_id);
 
         let events: Vec<serde_json::Value> = match std::fs::read_to_string(&journal_path) {
             Ok(content) => content
