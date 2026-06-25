@@ -1427,7 +1427,7 @@ pub enum SessionEvent {
     SessionStart,
     /// Fires when a session ends (explicit `/quit`, timeout, or graceful close).
     SessionEnd,
-    /// Fires after the user submits a prompt, before tool selection / LLM call.
+    /// Fires after the user submits a prompt, before tool surface / LLM call.
     UserPromptSubmit,
     /// Fires when a sub-agent (delegation) is spawned.
     SubagentStart,
@@ -1936,8 +1936,8 @@ mod tests {
             ("*", "", true),
             // complex patterns
             ("*file*", "read_file_contents", true),
-            ("git_*_*", "git_log_search", true),
-            ("git_*_*", "git_status", false),
+            ("tool_*_*", "tool_read_file", true),
+            ("tool_*_*", "tool_status", false),
         ] {
             assert_eq!(
                 glob_match(pattern, text),

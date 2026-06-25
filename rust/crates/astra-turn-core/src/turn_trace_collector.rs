@@ -9,7 +9,7 @@
 //! let collector = TurnTraceCollector::new("turn-1", "session-abc");
 //!
 //! // During context assembly:
-//! collector.record_tool_selection(&selected_tools, strategy, confidence, &per_tool_costs, tools_available, latency_ms);
+//! collector.record_tool_surface(&visible_tools, &per_tool_costs, tools_available, latency_ms);
 //! collector.record_memory_retrieval(&query, candidates, &ranked_results, latency_ms);
 //! collector.record_compression(&pipeline_outcome, initial_msgs, final_msgs, ...);
 //!
@@ -26,8 +26,8 @@ use astra_core::sync_poison::{recover_rwlock_read, recover_rwlock_write};
 use crate::context_assembly_trace::{
     CompressionMethod, ContextAssemblyTrace, ContextAssemblyTraceBuilder, DecisionExplanation,
     HistorySelectionTrace, MemoryRetrievalTrace, SystemPromptBreakdown, TokenBudgetTrace,
-    ToolSelectionTrace, build_history_trace_from_compression, build_memory_trace_from_retrieval,
-    build_tool_trace_from_selection,
+    ToolSurfaceTrace, build_history_trace_from_compression, build_memory_trace_from_retrieval,
+    build_tool_surface_trace, build_tool_surface_trace_with_deferred,
 };
 
 /// Thread-safe trace collector for a single turn.
@@ -47,7 +47,7 @@ struct CollectorState {
     system_prompt: Option<SystemPromptBreakdown>,
     history: Option<HistorySelectionTrace>,
     memory: Option<MemoryRetrievalTrace>,
-    tools: Option<ToolSelectionTrace>,
+    tools: Option<ToolSurfaceTrace>,
     token_budget: Option<TokenBudgetTrace>,
     explanations: Vec<DecisionExplanation>,
 }
@@ -101,23 +101,37 @@ impl TurnTraceCollector {
         state.system_prompt = Some(breakdown);
     }
 
-    /// Record tool selection results.
-    pub fn record_tool_selection(
+    /// Record the concrete tool surface exposed to the model.
+    pub fn record_tool_surface(
         &self,
-        selected_tools: &[String],
-        strategy: &str,
-        confidence: f64,
+        visible_tools: &[String],
         per_tool_costs: &[(String, u32)],
         tools_available: u32,
         latency_ms: u64,
     ) {
-        let trace = build_tool_trace_from_selection(
+        let trace =
+            build_tool_surface_trace(tools_available, visible_tools, per_tool_costs, latency_ms);
+        let mut state = recover_rwlock_write(&self.inner);
+        state.tools = Some(trace);
+    }
+
+    /// Record the concrete tool surface plus deferred activation telemetry.
+    pub fn record_tool_surface_with_deferred(
+        &self,
+        visible_tools: &[String],
+        per_tool_costs: &[(String, u32)],
+        tools_available: u32,
+        latency_ms: u64,
+        deferred_active_tools: &[String],
+        deferred_available: u32,
+    ) {
+        let trace = build_tool_surface_trace_with_deferred(
             tools_available,
-            selected_tools,
-            strategy,
-            confidence,
+            visible_tools,
             per_tool_costs,
             latency_ms,
+            deferred_active_tools,
+            deferred_available,
         );
         let mut state = recover_rwlock_write(&self.inner);
         state.tools = Some(trace);
@@ -310,7 +324,7 @@ impl TurnTraceCollector {
             || state.token_budget.is_some()
     }
 
-    /// Check if tool selection trace has already been recorded.
+    /// Check if tool surface trace has already been recorded.
     pub fn has_tool_trace(&self) -> bool {
         recover_rwlock_read(&self.inner).tools.is_some()
     }
@@ -346,11 +360,9 @@ mod tests {
         let collector = TurnTraceCollector::new("turn-1", "session-abc");
 
         // Record some data
-        collector.record_tool_selection(
-            &["view".to_string(), "edit".to_string()],
-            "tfidf",
-            0.85,
-            &[("view".into(), 500), ("edit".into(), 500)],
+        collector.record_tool_surface(
+            &["read_file".to_string(), "str_replace".to_string()],
+            &[("read_file".into(), 500), ("str_replace".into(), 500)],
             50,
             15,
         );
@@ -367,8 +379,30 @@ mod tests {
         let trace = collector.finalize();
         assert_eq!(trace.turn_id, "turn-1");
         assert_eq!(trace.session_id, "session-abc");
-        assert_eq!(trace.tools.tools_selected.len(), 2);
+        assert_eq!(trace.tools.visible_tools.len(), 2);
         assert_eq!(trace.memory.memories_selected.len(), 1);
+    }
+
+    #[test]
+    fn collector_records_deferred_activation_tool_surface_telemetry() {
+        let collector = TurnTraceCollector::new("turn-1", "session-abc");
+
+        collector.record_tool_surface_with_deferred(
+            &["tool_search".to_string(), "web_fetch".to_string()],
+            &[("tool_search".into(), 90), ("web_fetch".into(), 220)],
+            2,
+            11,
+            &["web_fetch".to_string()],
+            5,
+        );
+
+        let trace = collector.finalize();
+        assert_eq!(
+            trace.tools.deferred_active_tools,
+            vec!["web_fetch".to_string()]
+        );
+        assert_eq!(trace.tools.deferred_available, 5);
+        assert_eq!(trace.tools.surface_latency_ms, 11);
     }
 
     #[test]
@@ -376,11 +410,9 @@ mod tests {
         let collector1 = TurnTraceCollector::new("turn-1", "session-abc");
         let collector2 = collector1.clone_arc();
 
-        collector1.record_tool_selection(
-            &["view".to_string()],
-            "tfidf",
-            0.8,
-            &[("view".into(), 100)],
+        collector1.record_tool_surface(
+            &["read_file".to_string()],
+            &[("read_file".into(), 100)],
             10,
             5,
         );
@@ -388,7 +420,7 @@ mod tests {
         // Both should see the same data
         assert!(collector2.has_data());
         let trace = collector2.finalize();
-        assert_eq!(trace.tools.tools_selected.len(), 1);
+        assert_eq!(trace.tools.visible_tools.len(), 1);
     }
 
     #[test]
@@ -454,21 +486,19 @@ mod tests {
     }
 
     #[test]
-    fn record_tool_selection_applies_per_tool_costs() {
+    fn record_tool_surface_applies_per_tool_costs() {
         let collector = TurnTraceCollector::new("turn-0", "s1");
-        collector.record_tool_selection(
+        collector.record_tool_surface(
             &["bash".into(), "grep".into()],
-            "tfidf",
-            0.8,
             &[("bash".into(), 350), ("grep".into(), 280)],
             10,
             5,
         );
         let trace = collector.finalize();
-        assert_eq!(trace.tools.tools_selected[0].tool_name, "bash");
-        assert_eq!(trace.tools.tools_selected[0].tokens, 350);
-        assert_eq!(trace.tools.tools_selected[1].tool_name, "grep");
-        assert_eq!(trace.tools.tools_selected[1].tokens, 280);
+        assert_eq!(trace.tools.visible_tools[0].tool_name, "bash");
+        assert_eq!(trace.tools.visible_tools[0].tokens, 350);
+        assert_eq!(trace.tools.visible_tools[1].tool_name, "grep");
+        assert_eq!(trace.tools.visible_tools[1].tokens, 280);
     }
 
     #[test]

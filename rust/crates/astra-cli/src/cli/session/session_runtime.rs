@@ -239,29 +239,6 @@ fn create_pipeline_modules_inner(
     let mcp_manager =
         std::sync::Arc::new(tokio::sync::RwLock::new(mcp_client::McpClientManager::new()));
 
-    // Configure sampling so MCP servers can request LLM completions.
-    {
-        if let Some(token) = current_access_token(profile) {
-            let sampling = mcp_client::SamplingConfig {
-                api: std::sync::Arc::new(
-                    astra_thin_client::ThinClient::new(api.api_origin().as_str(), None)
-                        .expect("valid API origin for sampling"),
-                ),
-                token,
-                model: "default".to_string(),
-                max_tokens_cap: mcp_client::DEFAULT_SAMPLING_MAX_TOKENS_CAP,
-            };
-            tokio::task::block_in_place(|| {
-                handle.block_on(async {
-                    mcp_manager
-                        .write()
-                        .await
-                        .set_sampling_config(Some(sampling));
-                })
-            });
-        }
-    }
-
     // Set initial roots to the current working directory.
     {
         if let Ok(cwd) = std::env::current_dir() {
@@ -290,7 +267,13 @@ fn create_pipeline_modules_inner(
                         let mut results: Vec<(String, Result<(), String>)> = Vec::new();
                         for config in mcp_configs {
                             let name = config.name.clone();
-                            match manager.connect_and_discover_skills(config, &reg).await {
+                            match mcp_client::connect_and_discover_skills(
+                                &mut manager,
+                                config,
+                                &reg,
+                            )
+                            .await
+                            {
                                 Ok(_) => results.push((name, Ok(()))),
                                 Err(e) => results.push((name, Err(format_mcp_error(&e)))),
                             }
@@ -1567,10 +1550,10 @@ mod tests {
                     30,
                     100,
                 )
-                .with_tool_selection(
-                    vec!["github_ci_status".into()],
+                .with_tool_surface(
+                    vec!["github".into()],
                     vec![],
-                    vec!["github_ci_status".into()],
+                    vec!["github".into()],
                     30,
                 ),
             )
@@ -1589,10 +1572,10 @@ mod tests {
                     90,
                 )
                 .with_cache_tokens(80, 10)
-                .with_tool_selection(
-                    vec!["github_list_prs".into()],
+                .with_tool_surface(
+                    vec!["github".into()],
                     vec![],
-                    vec!["github_list_prs".into()],
+                    vec!["github".into()],
                     35,
                 ),
             )
@@ -1607,7 +1590,7 @@ mod tests {
         assert_eq!(restored.total_completion_tokens, 50);
         assert_eq!(restored.total_cache_read_tokens, 80);
         assert_eq!(restored.total_cache_creation_tokens, 10);
-        assert_eq!(restored.recent_tools, vec!["github_list_prs".to_string()]);
+        assert_eq!(restored.recent_tools, vec!["github".to_string()]);
         assert_eq!(restored.history.len(), 2);
     }
 
@@ -1636,10 +1619,10 @@ mod tests {
                     50,
                     10,
                 )
-                .with_tool_selection(
-                    vec!["git_log".into()],
+                .with_tool_surface(
+                    vec!["git".into()],
                     vec![],
-                    vec!["git_log".into()],
+                    vec!["git".into()],
                     10,
                 ),
             )
@@ -1666,10 +1649,10 @@ mod tests {
                     20,
                     10,
                 )
-                .with_tool_selection(
-                    vec!["github_ci_status".into()],
+                .with_tool_surface(
+                    vec!["github".into()],
                     vec![],
-                    vec!["github_ci_status".into()],
+                    vec!["github".into()],
                     20,
                 ),
             )
@@ -1683,7 +1666,7 @@ mod tests {
         assert_eq!(restored.turn, 1);
         assert_eq!(restored.total_prompt_tokens, 80);
         assert_eq!(restored.total_completion_tokens, 20);
-        assert_eq!(restored.recent_tools, vec!["github_ci_status".to_string()]);
+        assert_eq!(restored.recent_tools, vec!["github".to_string()]);
     }
 
     #[test]
@@ -1743,10 +1726,10 @@ mod tests {
                     8,
                     10,
                 )
-                .with_tool_selection(
-                    vec!["github_ci_status".into()],
+                .with_tool_surface(
+                    vec!["github".into()],
                     vec![],
-                    vec!["github_ci_status".into()],
+                    vec!["github".into()],
                     20,
                 ),
             )
@@ -1757,7 +1740,7 @@ mod tests {
         assert_eq!(restored.turn, 3);
         assert_eq!(restored.total_prompt_tokens, 30);
         assert_eq!(restored.total_completion_tokens, 8);
-        assert_eq!(restored.recent_tools, vec!["github_ci_status".to_string()]);
+        assert_eq!(restored.recent_tools, vec!["github".to_string()]);
     }
 
     #[test]

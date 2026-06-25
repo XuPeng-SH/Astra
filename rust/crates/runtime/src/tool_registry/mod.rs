@@ -1,54 +1,37 @@
-//! Intelligent tool selection: registry, pre-filter, budget gate.
+//! Tool surface registry: deterministic always_load tools plus explicit deferred activation.
 //!
 //! Layered architecture:
 //!
-//! 1. **Pinned tools** — always included (bash, read_file, etc.), no selection budget
-//! 2. **Pre-filter** — rank dynamic tools by TF-IDF + trigger match + intent/scope signals
-//! 3. **Recall-first** — adaptive threshold, intent diversity, MIN_RECALL_TOOLS guarantee
-//! 4. **Budget gate** — enforce token budget, greedily fill from ranked list
+//! 1. **AlwaysLoad tools** — stable schemas included in `tools[]` for tool-bearing turns.
+//! 2. **Deferred tools** — advertised compactly and activated with `tool_search`.
+//! 3. **Declaration drift checks** — test metadata keeps schema, runtime, and
+//!    provider inventories from drifting silently.
 //!
-//! Cross-language coverage comes from rich multilingual triggers on each tool,
-//! NOT from embeddings. With a compact built-in catalog, keyword coverage + intent rules
-//! achieve high accuracy without ML dependencies.
+//! The registry never promotes a deferred tool by query text alone. This keeps
+//! the tool surface cache-stable and makes activation intent explicit.
 
-pub use astra_turn_core::tool_registry_meta::{IntentType, Scope, TOOL_CATALOG, ToolMeta};
+use astra_turn_core::tool_registry_meta::TOOL_CATALOG;
 
 mod registry;
-pub mod scoring;
 pub mod surface;
-pub mod tool_pool;
 
 #[cfg(test)]
 mod surface_tests;
 
-pub use astra_turn_core::tool_registry_chain::{ChainContext, ChainStep, ToolChain};
-pub use astra_turn_core::tool_registry_report::{
-    SelectionFeedback, SelectionReport, ToolQualityTracker,
-};
-pub use astra_turn_core::tool_registry_selection_edge_hints::{
-    apply_selector_hints_to_edge_profile, top_dynamic_tool_names,
-};
-pub use astra_turn_core::tool_registry_state::ConversationState;
-pub use plugin::{PluginRegistry, PluginToolEntry};
 pub use registry::ToolRegistry;
-pub use scoring::{DEFAULT_TOOL_BUDGET_TOKENS, FilterOptions, pre_filter_dynamic, tfidf_score};
+
+pub const DEFAULT_TOOL_SCHEMA_BUDGET_TOKENS: u32 = 800;
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
-
-pub use astra_turn_core::tool_registry_chain as chain;
-pub use astra_turn_core::tool_registry_plugin as plugin;
-pub use astra_turn_core::tool_registry_report as report;
-pub use astra_turn_core::tool_registry_state as state;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astra_text_utils::text_tokenize::tokenize;
     use astra_turn_core::tool::schema::tool_schema_name;
-    use astra_turn_core::tool_registry_state::word_boundary_match;
-    use scoring::tfidf_score;
+    use astra_turn_core::tool_registry_report::ToolSurfaceReport;
     use serde_json::Value;
     use serde_json::json;
+
     fn mock_schemas() -> Vec<Value> {
         // Build schemas matching TOOL_CATALOG names
         TOOL_CATALOG
@@ -69,63 +52,51 @@ mod tests {
     // ── Catalog invariants ──
 
     #[test]
-    fn catalog_has_expected_tools() {
-        assert_eq!(TOOL_CATALOG.len(), 34);
+    fn catalog_has_unique_non_empty_names() {
+        assert!(!TOOL_CATALOG.is_empty(), "tool catalog must not be empty");
+        let mut seen = std::collections::BTreeSet::new();
+        for tool in TOOL_CATALOG {
+            assert!(!tool.name.is_empty(), "catalog tool name must not be empty");
+            assert!(
+                seen.insert(tool.name),
+                "duplicate catalog tool name: {}",
+                tool.name
+            );
+        }
     }
 
     #[test]
-    fn catalog_pinned_metadata_matches_default_pinned_catalog_subset() {
-        let catalog_names: std::collections::HashSet<&str> =
-            TOOL_CATALOG.iter().map(|tool| tool.name).collect();
-        let expected: std::collections::HashSet<&str> = surface::DEFAULT_PINNED
+    fn always_load_tools_are_core_set() {
+        let always_load: std::collections::HashSet<&str> = surface::default_always_load_names()
             .iter()
-            .copied()
-            .filter(|name| catalog_names.contains(name))
-            .collect();
-        let actual: std::collections::HashSet<&str> = TOOL_CATALOG
-            .iter()
-            .filter(|tool| tool.pinned)
-            .map(|tool| tool.name)
-            .collect();
-        assert_eq!(
-            actual, expected,
-            "catalog pinned metadata is only a catalog subset mirror; the runtime ToolSurface remains the source of truth"
-        );
-    }
-
-    #[test]
-    fn pinned_tools_are_core_set() {
-        let pinned: Vec<&str> = TOOL_CATALOG
-            .iter()
-            .filter(|t| t.pinned)
-            .map(|t| t.name)
+            .map(String::as_str)
             .collect();
         // Runtime default catalog core — file, edit, search, git, memory, and activation.
-        assert!(pinned.contains(&"bash"));
-        assert!(pinned.contains(&"read_file"));
-        assert!(pinned.contains(&"str_replace"));
-        assert!(pinned.contains(&"list_dir"));
+        assert!(always_load.contains(&"bash"));
+        assert!(always_load.contains(&"read_file"));
+        assert!(always_load.contains(&"str_replace"));
+        assert!(always_load.contains(&"list_dir"));
         assert!(
-            pinned.contains(&"memory"),
-            "consolidated memory tool must be pinned — intrinsic capability"
+            always_load.contains(&"memory"),
+            "consolidated memory tool must be always_load — intrinsic capability"
         );
         assert!(
-            pinned.contains(&"write_file"),
+            always_load.contains(&"write_file"),
             "write_file completes the read/edit/write triad"
         );
         assert!(
-            pinned.contains(&"grep") && pinned.contains(&"glob"),
+            always_load.contains(&"grep") && always_load.contains(&"glob"),
             "grep/glob are near-universal for code navigation"
         );
         assert!(
-            pinned.contains(&"git"),
-            "consolidated git tool must be pinned — git ops appear in most coding turns"
+            always_load.contains(&"git"),
+            "consolidated git tool must be always_load — git ops appear in most coding turns"
         );
         assert!(
-            !pinned.contains(&"web_fetch")
-                && !pinned.contains(&"session")
-                && !pinned.contains(&"introspect"),
-            "runtime-deferred tools must not stay catalog-pinned"
+            !always_load.contains(&"web_fetch")
+                && !always_load.contains(&"session")
+                && !always_load.contains(&"introspect"),
+            "runtime-deferred tools must not stay catalog-always_load"
         );
     }
 
@@ -152,98 +123,48 @@ mod tests {
         }
     }
 
-    // ── ConversationState extraction ──
+    // ── Tool surface contract ──
 
     #[test]
-    fn state_detects_fetch() {
-        let state = ConversationState::from_message("matrixorigin memoria 最新的pr?", 1);
-        assert!(state.is_fetch, "should detect fetch from '最新'");
-    }
-
-    #[test]
-    fn state_detects_mutate() {
-        let state = ConversationState::from_message("create a new issue for the bug", 1);
-        assert!(state.is_mutate, "should detect mutation");
-    }
-
-    #[test]
-    fn state_detects_history_ref() {
-        let state = ConversationState::from_message("分析一下之前的决策", 1);
-        assert!(state.references_history, "should detect history reference");
-    }
-
-    #[test]
-    fn state_detects_analytical() {
-        let state = ConversationState::from_message("为什么选错了工具", 1);
-        assert!(state.is_analytical, "should detect analytical intent");
-    }
-
-    #[test]
-    fn state_detects_conversational() {
-        let state = ConversationState::from_message("谢谢", 1);
-        assert!(state.is_conversational, "should detect conversational");
-    }
-
-    #[test]
-    fn state_long_message_not_conversational() {
-        let state = ConversationState::from_message(
-            "thank you for that, now please fix the test in main.rs",
-            1,
-        );
+    fn always_load_memory_always_available_for_recall() {
+        // memory is always_load so memory lifecycle cases always have it available
+        // without an activation round trip.
         assert!(
-            !state.is_conversational,
-            "long message should not be conversational"
-        );
-    }
-
-    // ── Pre-filter ordering ──
-
-    #[test]
-    fn pinned_memory_always_available_for_recall() {
-        // memory is now pinned — it no longer needs to rank in
-        // pre_filter_dynamic. Verify it IS pinned so memory lifecycle
-        // cases always have it available.
-        let tool = TOOL_CATALOG.iter().find(|t| t.name == "memory").unwrap();
-        assert!(
-            tool.pinned,
-            "memory must be pinned for reliable memory lifecycle"
+            surface::default_always_load_names()
+                .iter()
+                .any(|name| name == "memory"),
+            "memory must be always_load for reliable memory lifecycle"
         );
     }
 
     #[test]
-    fn select_code_intel_query_includes_lsp() {
+    fn code_intel_query_leaves_lsp_deferred() {
         let registry = ToolRegistry::new(mock_schemas());
-        let selected = registry.select("find references for this symbol with lsp", 1);
-        let names = ToolRegistry::selected_names(&selected);
+        let selected = registry.build_initial_surface("find references for this symbol with lsp");
+        let names = ToolRegistry::visible_names(&selected);
         assert!(
-            names.contains(&"lsp".to_string()),
-            "lsp should be selected for code-intel query, got: {:?}",
+            !names.contains(&"lsp".to_string()),
+            "lsp is deferred until explicit activation, got: {:?}",
             names
         );
     }
 
     /// Regression: recall queries should surface recall-oriented memory tools.
     #[test]
-    fn select_memory_query_has_memory() {
+    fn memory_is_visible_for_recall_queries() {
         let registry = ToolRegistry::new(mock_schemas());
-        let selected = registry.select("我有哪些记忆？", 1);
-        let names = ToolRegistry::selected_names(&selected);
-        let has_memory =
-            names.contains(&"memory".to_string()) || names.contains(&"memory".to_string());
-        assert!(
-            has_memory,
-            "memory query must select memory (or legacy memory), got: {:?}",
-            names
-        );
+        let selected = registry.build_initial_surface("我有哪些记忆？");
+        let names = ToolRegistry::visible_names(&selected);
+        assert!(names.contains(&"memory".to_string()));
     }
 
-    /// Regression: implicit Chinese preferences should still surface memory
-    /// even after it leaves the pinned baseline.
+    /// Regression: implicit Chinese preferences still have memory available
+    /// because memory is always_load.
     #[test]
-    fn select_preference_statement_has_memory() {
+    fn memory_is_visible_for_preference_statements() {
         let registry = ToolRegistry::new(mock_schemas());
-        let selected = registry.select("苹果比较好吃", 1);
-        let names = ToolRegistry::selected_names(&selected);
+        let selected = registry.build_initial_surface("苹果比较好吃");
+        let names = ToolRegistry::visible_names(&selected);
         assert!(
             names.contains(&"memory".to_string()),
             "memory must be selected for implicit preference intent, got: {:?}",
@@ -252,10 +173,10 @@ mod tests {
     }
 
     #[test]
-    fn select_tracking_intent_has_memory() {
+    fn memory_is_visible_for_tracking_statements() {
         let registry = ToolRegistry::new(mock_schemas());
-        let selected = registry.select("我关注 matrixorigin", 1);
-        let names = ToolRegistry::selected_names(&selected);
+        let selected = registry.build_initial_surface("我关注 matrixorigin");
+        let names = ToolRegistry::visible_names(&selected);
         assert!(
             names.contains(&"memory".to_string()),
             "memory must be selected for tracking intent, got: {:?}",
@@ -263,111 +184,78 @@ mod tests {
         );
     }
 
-    /// Conversational greetings should produce no dynamic tools (save tokens).
     #[test]
-    fn prefilter_greeting_returns_empty() {
-        let state = ConversationState::from_message("hi", 1);
-        let ranked = pre_filter_dynamic(&state, "hi", &FilterOptions::default());
-        assert!(
-            ranked.is_empty(),
-            "pure greeting should skip dynamic tools, got {} tools",
-            ranked.len()
-        );
-    }
-
-    /// CJK bigram tokenizer produces "记忆" bigram from "记忆"
-    #[test]
-    fn tokenize_cjk_bigrams() {
-        let terms = tokenize("我有哪些记忆");
-        assert!(
-            terms.contains(&"记忆".to_string()),
-            "tokenizer should emit CJK bigram '记忆', got: {:?}",
-            terms
-        );
-        // Also check unigrams present
-        assert!(terms.contains(&"记".to_string()));
-        assert!(terms.contains(&"忆".to_string()));
-    }
-
-    // ── Budget gate ──
-
-    #[test]
-    fn non_conversational_zero_budget_includes_pinned() {
+    fn non_conversational_zero_budget_includes_always_load() {
         let registry = ToolRegistry::new(mock_schemas());
-        let result = registry.select_with_budget("inspect the repository files", 1, 0);
-        let names = ToolRegistry::selected_names(&result);
+        let (result, _report) =
+            registry.build_initial_surface_with_report("inspect the repository files", 0);
+        let names = ToolRegistry::visible_names(&result);
         assert!(
             names.contains(&"bash".to_string()),
-            "non-conversational zero-budget query must still include pinned bash"
+            "non-conversational zero-budget query must still include always_load bash"
         );
         assert!(
             names.contains(&"read_file".to_string()),
-            "non-conversational zero-budget query must still include pinned read_file"
+            "non-conversational zero-budget query must still include always_load read_file"
         );
-        assert_eq!(names.len(), registry.pinned_tool_names_sorted().len());
+        assert_eq!(names.len(), registry.always_load_tool_names_sorted().len());
     }
 
     #[test]
-    fn budget_respects_limit() {
+    fn budget_does_not_add_deferred_tools() {
         let registry = ToolRegistry::new(mock_schemas());
-        // Very small budget — should include fewer dynamic tools
-        let result = registry.select_with_budget("最新的pr?", 1, 50);
-        let total_dynamic = result.len() - registry.pinned_tool_names_sorted().len();
-        assert!(
-            total_dynamic <= 2,
-            "50 token budget should fit ≤2 dynamic tools, got {}",
-            total_dynamic
-        );
+        let (result, _report) = registry.build_initial_surface_with_report("最新的pr?", 50);
+        let names = ToolRegistry::visible_names(&result);
+        assert_eq!(names, registry.always_load_tool_names_sorted());
     }
 
     // ── ToolRegistry integration ──
 
     #[test]
-    fn registry_select_pr_query_includes_github() {
+    fn pr_query_leaves_github_deferred() {
         let registry = ToolRegistry::new(mock_schemas());
-        let selected = registry.select("matrixorigin memoria 最新的pr?", 1);
-        let names = ToolRegistry::selected_names(&selected);
+        let selected = registry.build_initial_surface("matrixorigin memoria 最新的pr?");
+        let names = ToolRegistry::visible_names(&selected);
         assert!(
-            names.contains(&"github".to_string()),
-            "PR query must include github_list_prs, got: {:?}",
+            !names.contains(&"github".to_string()),
+            "github must stay deferred until activated, got: {:?}",
             names
         );
-        // Pinned always present
+        // AlwaysLoad always present
         assert!(names.contains(&"bash".to_string()));
         assert!(names.contains(&"read_file".to_string()));
     }
 
     #[test]
-    fn runtime_surface_selects_default_deferred_tool_as_dynamic_when_relevant() {
+    fn runtime_surface_keeps_default_deferred_tool_deferred_when_relevant() {
         let registry = ToolRegistry::new_with_tool_surface(
             mock_schemas(),
             &astra_config::ToolSurfaceConfig::default(),
         );
-        let selected = registry.select_with_budget(
+        let (selected, _report) = registry.build_initial_surface_with_report(
             "fetch the contents of https://example.com and summarize the web page",
-            1,
             800,
         );
-        let names = ToolRegistry::selected_names(&selected);
+        let names = ToolRegistry::visible_names(&selected);
 
         assert!(
             !registry
-                .pinned_schemas()
+                .always_load_schemas()
                 .iter()
                 .any(|(name, _)| name == "web_fetch"),
             "web_fetch is intentionally deferred by the runtime surface"
         );
         assert!(
-            names.contains(&"web_fetch".to_string()),
-            "runtime-surface selector must be able to add relevant deferred catalog tools dynamically; got: {names:?}"
+            !names.contains(&"web_fetch".to_string()),
+            "runtime tool surface must not add deferred catalog tools from query text alone; got: {names:?}"
         );
     }
 
     #[test]
-    fn registry_select_conversational_uses_no_tools() {
+    fn conversational_query_uses_no_tools() {
         let registry = ToolRegistry::new(mock_schemas());
-        let selected = registry.select("你好", 1);
-        let names = ToolRegistry::selected_names(&selected);
+        let selected = registry.build_initial_surface("你好");
+        let names = ToolRegistry::visible_names(&selected);
         assert_eq!(
             names.len(),
             0,
@@ -377,35 +265,31 @@ mod tests {
     }
 
     #[test]
-    fn registry_select_complex_query() {
+    fn complex_query_uses_always_load_surface() {
         let registry = ToolRegistry::new(mock_schemas());
-        let selected = registry.select("analyze why the CI failed on the latest PR", 1);
-        let names = ToolRegistry::selected_names(&selected);
-        // Should include both GitHub tools and git tools
+        let selected = registry.build_initial_surface("analyze why the CI failed on the latest PR");
+        let names = ToolRegistry::visible_names(&selected);
+        assert!(names.contains(&"git".to_string()));
+        assert!(!names.contains(&"github".to_string()));
+    }
+
+    #[test]
+    fn repo_stats_query_leaves_github_deferred() {
+        let registry = ToolRegistry::new(mock_schemas());
+        let selected = registry.build_initial_surface("matrixorigin memoria 多少star了？");
+        let names = ToolRegistry::visible_names(&selected);
         assert!(
-            names.contains(&"github".to_string()) || names.contains(&"github".to_string()),
-            "CI/PR query should include GitHub tools, got: {:?}",
+            !names.contains(&"github".to_string()),
+            "repo stats query should activate github through tool_search first, got: {:?}",
             names
         );
     }
 
     #[test]
-    fn registry_select_repo_stats_query() {
+    fn memory_query_uses_always_load_memory() {
         let registry = ToolRegistry::new(mock_schemas());
-        let selected = registry.select("matrixorigin memoria 多少star了？", 1);
-        let names = ToolRegistry::selected_names(&selected);
-        assert!(
-            names.contains(&"github".to_string()),
-            "repo stats query should include github_repo_stats, got: {:?}",
-            names
-        );
-    }
-
-    #[test]
-    fn registry_select_memory_query() {
-        let registry = ToolRegistry::new(mock_schemas());
-        let selected = registry.select("我之前记住的偏好是什么?", 1);
-        let names = ToolRegistry::selected_names(&selected);
+        let selected = registry.build_initial_surface("我之前记住的偏好是什么?");
+        let names = ToolRegistry::visible_names(&selected);
         assert!(
             names.contains(&"memory".to_string()),
             "memory query should include memory, got: {:?}",
@@ -414,147 +298,71 @@ mod tests {
     }
 
     #[test]
-    fn registry_select_create_issue() {
+    fn create_issue_query_leaves_github_deferred() {
         let registry = ToolRegistry::new(mock_schemas());
-        let selected = registry.select("create a new issue for this bug", 1);
-        let names = ToolRegistry::selected_names(&selected);
+        let selected = registry.build_initial_surface("create a new issue for this bug");
+        let names = ToolRegistry::visible_names(&selected);
         assert!(
-            names.contains(&"github".to_string()),
-            "create issue query should include github_create_issue, got: {:?}",
+            !names.contains(&"github".to_string()),
+            "create issue query should activate github through tool_search first, got: {:?}",
             names
         );
     }
 
     #[test]
-    fn registry_select_git_status() {
+    fn git_status_query_uses_always_load_git() {
         let registry = ToolRegistry::new(mock_schemas());
-        let selected = registry.select("git status 看看改了什么", 1);
-        let names = ToolRegistry::selected_names(&selected);
+        let selected = registry.build_initial_surface("git status 看看改了什么");
+        let names = ToolRegistry::visible_names(&selected);
         assert!(
             names.contains(&"git".to_string()),
-            "git status query should include git_status, got: {:?}",
+            "git status query should include git, got: {:?}",
             names
         );
     }
 
     #[test]
-    fn registry_select_reflect_query() {
+    fn reflect_query_leaves_introspect_deferred() {
         let registry = ToolRegistry::new(mock_schemas());
-        let selected = registry.select("为什么上次选错了工具?", 1);
-        let names = ToolRegistry::selected_names(&selected);
+        let selected = registry.build_initial_surface("为什么上次选错了工具?");
+        let names = ToolRegistry::visible_names(&selected);
         assert!(
-            names.contains(&"introspect".to_string()),
-            "reflect query should include reflect, got: {:?}",
+            !names.contains(&"introspect".to_string()),
+            "introspect should stay deferred until explicit activation, got: {:?}",
             names
         );
     }
 
-    // ── Word boundary matching ──
+    // ── Schema-budget report assembly ──
 
     #[test]
-    fn word_boundary_match_basic() {
-        assert!(word_boundary_match("show me the pr", "pr"));
-        assert!(word_boundary_match("pr list", "pr"));
-        assert!(!word_boundary_match("spray", "pr"));
-        assert!(!word_boundary_match("express", "pr"));
-    }
-
-    #[test]
-    fn word_boundary_match_cjk_adjacent() {
-        // CJK chars are not ASCII word chars, so they act as boundaries
-        assert!(word_boundary_match("最新的pr", "pr"));
-        assert!(word_boundary_match("看pr详情", "pr"));
-    }
-
-    // ── select_with_budget ──
-
-    #[test]
-    fn select_with_budget_larger_returns_more_tools() {
+    fn report_schema_budget_total_does_not_change_visible_tools() {
         let schemas = mock_schemas();
         let registry = ToolRegistry::new(schemas);
-        let small = registry.select_with_budget("matrixorigin memoria 最新的pr?", 1, 500);
-        let large = registry.select_with_budget("matrixorigin memoria 最新的pr?", 1, 6000);
-        assert!(
-            large.len() >= small.len(),
-            "larger budget should include at least as many tools"
+        let (small, small_report) =
+            registry.build_initial_surface_with_report("matrixorigin memoria 最新的pr?", 500);
+        let (large, large_report) =
+            registry.build_initial_surface_with_report("matrixorigin memoria 最新的pr?", 6000);
+        assert_eq!(
+            ToolRegistry::visible_names(&large),
+            ToolRegistry::visible_names(&small)
         );
+        assert_eq!(small_report.schema_budget_total, 500);
+        assert_eq!(large_report.schema_budget_total, 6000);
     }
 
     #[test]
-    fn select_with_budget_zero_still_returns_pinned() {
+    fn report_budget_zero_still_returns_always_load() {
         let schemas = mock_schemas();
         let registry = ToolRegistry::new(schemas);
-        let selected = registry.select_with_budget("matrixorigin memoria 最新的pr?", 1, 0);
-        // Pinned tools are budget-exempt, always included
-        assert_eq!(selected.len(), registry.pinned_tool_names_sorted().len());
-    }
-
-    // ── TF-IDF scoring ──
-
-    #[test]
-    fn tokenize_mixed_cjk_ascii() {
-        let terms = tokenize("matrixorigin memoria 最新的pr?");
-        assert!(terms.contains(&"matrixorigin".to_string()));
-        assert!(terms.contains(&"memoria".to_string()));
-        assert!(terms.contains(&"最".to_string()));
-        assert!(terms.contains(&"新".to_string()));
-        assert!(terms.contains(&"的".to_string()));
-        assert!(terms.contains(&"pr".to_string()));
-    }
-
-    #[test]
-    fn tfidf_github_tools_rank_high_for_pr_query() {
-        let terms = tokenize("list pull requests");
-        let prs_idx = TOOL_CATALOG
-            .iter()
-            .position(|t| t.name == "github")
-            .unwrap();
-        let git_idx = TOOL_CATALOG.iter().position(|t| t.name == "git").unwrap();
-        assert!(
-            tfidf_score(&terms, prs_idx) > tfidf_score(&terms, git_idx),
-            "github_list_prs should score higher than git_status for 'list pull requests'"
+        let (selected, report) =
+            registry.build_initial_surface_with_report("matrixorigin memoria 最新的pr?", 0);
+        // AlwaysLoad tools are budget-exempt, always included
+        assert_eq!(
+            selected.len(),
+            registry.always_load_tool_names_sorted().len()
         );
-    }
-
-    #[test]
-    fn tfidf_memory_tools_rank_high_for_recall() {
-        let terms = tokenize("search memory recall preferences");
-        let mem_idx = TOOL_CATALOG
-            .iter()
-            .position(|t| t.name == "memory")
-            .unwrap();
-        let git_idx = TOOL_CATALOG.iter().position(|t| t.name == "git").unwrap();
-        assert!(
-            tfidf_score(&terms, mem_idx) > tfidf_score(&terms, git_idx),
-            "memory should score higher than git_diff for memory query"
-        );
-    }
-
-    #[test]
-    fn tfidf_git_tools_rank_high_for_diff() {
-        let terms = tokenize("git diff");
-        let diff_idx = TOOL_CATALOG.iter().position(|t| t.name == "git").unwrap();
-        let issue_idx = TOOL_CATALOG
-            .iter()
-            .position(|t| t.name == "github")
-            .unwrap();
-        assert!(
-            tfidf_score(&terms, diff_idx) > tfidf_score(&terms, issue_idx),
-            "git_diff should score higher than github_list_issues for 'git diff'"
-        );
-    }
-
-    #[test]
-    fn state_detects_git_signal() {
-        let state = ConversationState::from_message("show me the git diff", 1);
-        assert!(state.is_git, "should detect git signal");
-        assert!(state.is_fetch, "should detect fetch signal");
-    }
-
-    #[test]
-    fn state_detects_github_signal() {
-        let state = ConversationState::from_message("matrixorigin 最新的pr", 1);
-        assert!(state.is_github, "should detect github signal from 'pr'");
+        assert_eq!(report.schema_budget_total, 0);
     }
 
     // ── Real token measurement ──
@@ -600,61 +408,57 @@ mod tests {
         assert_eq!(cost, 40, "unknown tool should fall back to default 40");
     }
 
-    // ── Selection report ──
+    // ── Surface report ──
 
     #[test]
-    fn select_with_report_returns_consistent_data() {
+    fn build_surface_with_report_returns_consistent_data() {
         let registry = ToolRegistry::new(mock_schemas());
-        let (schemas, report) = registry.select_with_report("matrixorigin 最新的pr?", 1, 3000);
-        assert_eq!(schemas.len(), report.selected_count as usize);
-        assert_eq!(
-            ToolRegistry::selected_names(&schemas),
-            report.tools_selected
-        );
-        assert_eq!(report.budget_total, 3000);
+        let (schemas, report) =
+            registry.build_initial_surface_with_report("matrixorigin 最新的pr?", 3000);
+        assert_eq!(schemas.len(), report.visible_count as usize);
+        assert_eq!(ToolRegistry::visible_names(&schemas), report.visible_tools);
+        assert_eq!(report.schema_budget_total, 3000);
     }
 
     #[test]
-    fn select_with_report_conversational_zero_budget() {
+    fn build_surface_with_report_conversational_zero_budget() {
         let registry = ToolRegistry::new(mock_schemas());
-        let (_schemas, report) = registry.select_with_report("你好", 1, 3000);
+        let (_schemas, report) = registry.build_initial_surface_with_report("你好", 3000);
         assert_eq!(
-            report.budget_used, 0,
+            report.schema_budget_used, 0,
             "conversational query should use 0 budget"
         );
-        assert_eq!(report.selected_count, 0);
+        assert_eq!(report.visible_count, 0);
     }
 
-    // ── Selection feedback ──
+    // ── Surface feedback ──
 
     #[test]
     fn feedback_perfect_precision() {
-        let report = SelectionReport {
-            tools_selected: vec!["bash".into(), "github".into()],
-            dynamic_tools_selected: vec!["github".into()],
-            selected_count: 2,
-            budget_used: 50,
-            budget_total: 3000,
+        let report = ToolSurfaceReport {
+            visible_tools: vec!["bash".into(), "github".into()],
+            visible_count: 2,
+            schema_budget_used: 50,
+            schema_budget_total: 3000,
         };
         let fb = report.feedback(&["github".into()]);
-        // precision = hits(1) / selected(2) = 0.5
+        // precision = hits(1) / visible(2) = 0.5
         assert!(
             (fb.precision - 0.5).abs() < 0.01,
-            "precision: 1 of 2 selected was used"
+            "precision: 1 of 2 visible tools was used"
         );
         // recall = hits(1) / used(1) = 1.0
-        assert_eq!(fb.recall, 1.0, "all used tools were selected");
-        assert_eq!(fb.unused_count, 1, "bash was selected but not used");
+        assert_eq!(fb.recall, 1.0, "all used tools were visible");
+        assert_eq!(fb.unused_count, 1, "bash was visible but not used");
     }
 
     #[test]
     fn feedback_no_tools_used() {
-        let report = SelectionReport {
-            tools_selected: vec!["bash".into(), "github".into()],
-            dynamic_tools_selected: vec!["github".into()],
-            selected_count: 2,
-            budget_used: 50,
-            budget_total: 3000,
+        let report = ToolSurfaceReport {
+            visible_tools: vec!["bash".into(), "github".into()],
+            visible_count: 2,
+            schema_budget_used: 50,
+            schema_budget_total: 3000,
         };
         let fb = report.feedback(&[]);
         // precision = 0/2 = 0.0 (nothing used)
@@ -668,381 +472,69 @@ mod tests {
     }
 
     #[test]
-    fn feedback_tool_not_in_selection() {
-        let report = SelectionReport {
-            tools_selected: vec!["bash".into()],
-            dynamic_tools_selected: Vec::new(),
-            selected_count: 1,
-            budget_used: 30,
-            budget_total: 3000,
+    fn feedback_tool_not_visible() {
+        let report = ToolSurfaceReport {
+            visible_tools: vec!["bash".into()],
+            visible_count: 1,
+            schema_budget_used: 30,
+            schema_budget_total: 3000,
         };
         let fb = report.feedback(&["github".into()]);
-        // precision = 0/1 = 0.0 (selected bash, never used)
-        assert_eq!(fb.precision, 0.0, "selected tool wasn't used → precision 0");
-        // recall = 0/1 = 0.0 (used tool wasn't in selection)
-        assert_eq!(fb.recall, 0.0, "used tool wasn't selected → recall 0");
-        assert_eq!(fb.unused_count, 1, "bash selected but not used");
-    }
-
-    // ── Quality tracker wiring tests ──
-
-    #[test]
-    fn quality_tracker_boosts_tool_ranking() {
-        let state = ConversationState::from_message_with_context(
-            "show me the github pull requests",
-            2,
-            &[],
-        );
-
-        // Without tracker: get baseline ranking
-        let baseline = pre_filter_dynamic(
-            &state,
-            "show me the github pull requests",
-            &FilterOptions::default(),
-        );
-
-        // With tracker: record many successful uses for a specific tool
-        let mut tracker = ToolQualityTracker::new();
-        for _ in 0..10 {
-            tracker.record_selection(&["github".into()]);
-            tracker.record_feedback(&SelectionFeedback {
-                tools_used: vec!["github".into()],
-                unused_count: 0,
-                precision: 1.0,
-                recall: 1.0,
-            });
-            tracker.record_quality("github", 0.95);
-        }
-
-        let boosted = pre_filter_dynamic(
-            &state,
-            "show me the github pull requests",
-            &FilterOptions {
-                quality_tracker: Some(&tracker),
-                ..Default::default()
-            },
-        );
-
-        let find_score = |results: &[(usize, f64)], name: &str| -> Option<f64> {
-            results.iter().find_map(|(idx, score)| {
-                if TOOL_CATALOG[*idx].name == name {
-                    Some(*score)
-                } else {
-                    None
-                }
-            })
-        };
-
-        let baseline_score = find_score(&baseline, "github").unwrap_or(0.0);
-        let boosted_score = find_score(&boosted, "github").unwrap_or(0.0);
-        assert!(
-            boosted_score >= baseline_score,
-            "quality tracker should boost tool score: baseline={:.4} boosted={:.4}",
-            baseline_score,
-            boosted_score
-        );
-    }
-
-    #[test]
-    fn quality_tracker_penalizes_ineffective_tool() {
-        let state = ConversationState::from_message_with_context("show me the git log", 2, &[]);
-
-        // Record many selections but zero uses for a dynamic tool
-        let mut tracker = ToolQualityTracker::new();
-        for _ in 0..10 {
-            tracker.record_selection(&["git".into()]);
-            // No record_feedback → tool never used → use_rate = 0
-        }
-
-        let baseline = pre_filter_dynamic(&state, "show me the git log", &FilterOptions::default());
-        let penalized = pre_filter_dynamic(
-            &state,
-            "show me the git log",
-            &FilterOptions {
-                quality_tracker: Some(&tracker),
-                ..Default::default()
-            },
-        );
-
-        let find_score = |results: &[(usize, f64)], name: &str| -> Option<f64> {
-            results.iter().find_map(|(idx, score)| {
-                if TOOL_CATALOG[*idx].name == name {
-                    Some(*score)
-                } else {
-                    None
-                }
-            })
-        };
-
-        let baseline_score = find_score(&baseline, "git").unwrap_or(0.0);
-        let penalized_score = find_score(&penalized, "git").unwrap_or(0.0);
-        assert!(
-            penalized_score <= baseline_score,
-            "quality tracker should penalize ineffective tool: baseline={:.4} penalized={:.4}",
-            baseline_score,
-            penalized_score
-        );
-    }
-
-    #[test]
-    fn registry_select_with_quality_changes_output() {
-        let schemas = mock_schemas();
-        let registry = ToolRegistry::new(schemas);
-
-        // Record extensive failure for one dynamic tool
-        let mut tracker = ToolQualityTracker::new();
-        for _ in 0..20 {
-            tracker.record_selection(&["github".into()]);
-            // Never used → penalized
-        }
-
-        // Both should compile and produce valid results
-        let (without, report_without) =
-            registry.select_with_quality("show me the PRs", 2, 800, &[], None);
-        let (with, report_with) =
-            registry.select_with_quality("show me the PRs", 2, 800, &[], Some(&tracker));
-
-        // Basic sanity: both should include pinned tools
-        assert!(without.len() >= registry.pinned_tool_names_sorted().len());
-        assert!(with.len() >= registry.pinned_tool_names_sorted().len());
-
-        // Report should be well-formed
-        assert!(report_without.budget_total == 800);
-        assert!(report_with.budget_total == 800);
-    }
-
-    // ── Disambiguation wiring tests ──
-
-    #[test]
-    fn disambiguation_auto_computed_on_state() {
-        let state = ConversationState::from_message_with_context(
-            "create a PR and show me the latest issues",
-            2,
-            &[],
-        );
-        // Should have disambiguation computed (is_fetch + is_mutate = conflict)
-        assert!(state.disambiguation.is_some());
-        let disambig = state.disambiguation.as_ref().unwrap();
-        assert_eq!(disambig.conflict_score, 0.8, "fetch+mutate should conflict");
-        assert_eq!(
-            disambig.recommendation,
-            astra_turn_core::routing_metrics::DisambiguationAction::WidenToolSelection
-        );
-    }
-
-    #[test]
-    fn disambiguation_widens_tool_selection() {
-        // Single-intent query: just fetch
-        let fetch_state =
-            ConversationState::from_message_with_context("show me the latest PRs", 2, &[]);
-        let fetch_results = pre_filter_dynamic(
-            &fetch_state,
-            "show me the latest PRs",
-            &FilterOptions::default(),
-        );
-
-        // Multi-intent conflicting query: fetch + mutate
-        let conflict_state = ConversationState::from_message_with_context(
-            "show me the latest PRs and create a new issue",
-            2,
-            &[],
-        );
-        let conflict_results = pre_filter_dynamic(
-            &conflict_state,
-            "show me the latest PRs and create a new issue",
-            &FilterOptions::default(),
-        );
-
-        // Conflicting query should select at least as many tools (lower threshold)
-        assert!(
-            conflict_results.len() >= fetch_results.len(),
-            "conflicting intents should widen selection: fetch={} conflict={}",
-            fetch_results.len(),
-            conflict_results.len()
-        );
-    }
-
-    #[test]
-    fn disambiguation_conversational_has_no_conflict() {
-        let state = ConversationState::from_message_with_context("hello", 1, &[]);
-        let disambig = state.disambiguation.as_ref().unwrap();
-        assert_eq!(disambig.primary_intent, "conversational");
-        assert_eq!(disambig.conflict_score, 0.0);
-    }
-
-    // ── ConfidenceCalibrator integration tests ──
-
-    #[test]
-    fn calibrator_lowers_threshold_for_high_correction_rate() {
-        use astra_turn_core::routing_metrics::ConfidenceCalibrator;
-        let cal = ConfidenceCalibrator::new(0.7);
-        // Record 10 github selections, 8 were corrected (80% correction rate)
-        for _ in 0..10 {
-            cal.record("github", true);
-        }
-        for _ in 0..2 {
-            cal.record("github", false);
-        }
-        let threshold = cal.calibrated_threshold("github");
-        // Should be lowered: 0.7 - (0.83 * 0.3) ≈ 0.45
-        assert!(
-            threshold < 0.7,
-            "high correction rate should lower threshold"
-        );
-        assert!(threshold >= 0.3, "threshold should not go below min");
-    }
-
-    #[test]
-    fn calibrated_prefilter_includes_more_tools_with_corrections() {
-        use astra_turn_core::routing_metrics::ConfidenceCalibrator;
-
-        let state = ConversationState::from_message("list open PRs in matrixone", 3);
-
-        // Without calibrator
-        let results_uncalibrated = scoring::pre_filter_dynamic(
-            &state,
-            "list open PRs in matrixone",
-            &FilterOptions::default(),
-        );
-
-        // With calibrator that has high correction rate for "github"
-        let cal = ConfidenceCalibrator::new(0.7);
-        for _ in 0..10 {
-            cal.record("github", true);
-        }
-        let results_calibrated = scoring::pre_filter_dynamic(
-            &state,
-            "list open PRs in matrixone",
-            &FilterOptions {
-                calibrator: Some(&cal),
-                ..Default::default()
-            },
-        );
-
-        // Calibrated should include at least as many tools (lower threshold → more tools)
-        assert!(
-            results_calibrated.len() >= results_uncalibrated.len(),
-            "calibrated ({}) should be >= uncalibrated ({})",
-            results_calibrated.len(),
-            results_uncalibrated.len(),
-        );
-    }
-
-    #[test]
-    fn calibrator_no_effect_with_insufficient_data() {
-        use astra_turn_core::routing_metrics::ConfidenceCalibrator;
-        let cal = ConfidenceCalibrator::new(0.7);
-        // Only 3 records — below the 5-minimum
-        for _ in 0..3 {
-            cal.record("fetch", true);
-        }
-        let threshold = cal.calibrated_threshold("fetch");
-        assert_eq!(
-            threshold, 0.7,
-            "should return base threshold with insufficient data"
-        );
+        // precision = 0/1 = 0.0 (visible bash, never used)
+        assert_eq!(fb.precision, 0.0, "visible tool wasn't used -> precision 0");
+        // recall = 0/1 = 0.0 (used tool wasn't visible)
+        assert_eq!(fb.recall, 0.0, "used tool wasn't visible -> recall 0");
+        assert_eq!(fb.unused_count, 1, "bash visible but not used");
     }
 
     // ── Phase 6: Testing gap coverage ──
 
     #[test]
-    fn budget_edge_exactly_one_tool_fits() {
-        // Phase 6.2: Budget exhaustion boundary
+    fn tiny_schema_budget_does_not_hide_always_load_tools() {
+        // Phase 6.2: schema-budget exhaustion boundary
         let reg = ToolRegistry::new(mock_schemas());
-        // Use a very small budget — should still include pinned + at most 1 dynamic
-        let (schemas, report) = reg.select_with_report("list PRs", 1, 1);
+        // Use a very small schema budget — always_load tools remain budget-exempt.
+        let (schemas, report) = reg.build_initial_surface_with_report("list PRs", 1);
         assert!(
-            schemas.len() >= reg.pinned_tool_names_sorted().len(),
-            "should always include pinned tools even with tiny budget"
+            schemas.len() >= reg.always_load_tool_names_sorted().len(),
+            "should always include always_load tools even with tiny budget"
         );
-        assert!(report.budget_used <= 1 || report.budget_used == 0);
+        assert!(report.schema_budget_used <= 1 || report.schema_budget_used == 0);
     }
 
     #[test]
-    fn conversational_query_never_includes_dynamic() {
+    fn conversational_query_returns_no_tools() {
         let reg = ToolRegistry::new(mock_schemas());
-        let (schemas, _) = reg.select_with_report("hello there", 1, 2000);
-        let names = ToolRegistry::selected_names(&schemas);
-        let pinned: std::collections::HashSet<String> =
-            reg.pinned_tool_names_sorted().into_iter().collect();
-        let dynamic: Vec<_> = names
-            .iter()
-            .filter(|name| !pinned.contains(name.as_str()))
-            .collect();
+        let (schemas, _) = reg.build_initial_surface_with_report("hello there", 2000);
         assert!(
-            dynamic.is_empty(),
-            "conversational should have 0 dynamic tools, got: {:?}",
-            dynamic
+            schemas.is_empty(),
+            "conversational turns should be tool-free"
         );
     }
 
     #[test]
-    fn calibrator_100_percent_correction_clamps_at_min() {
-        use astra_turn_core::routing_metrics::ConfidenceCalibrator;
-        let cal = ConfidenceCalibrator::new(0.7);
-        // 100% correction rate
-        for _ in 0..20 {
-            cal.record("fetch", true);
-        }
-        let threshold = cal.calibrated_threshold("fetch");
-        assert!(
-            threshold >= 0.3,
-            "100% correction rate should clamp at min_threshold (0.3), got {}",
-            threshold
-        );
-    }
-
-    #[test]
-    fn quality_tracker_insufficient_data_returns_neutral() {
-        use crate::tool_registry::report::ToolQualityTracker;
-        let mut tracker = ToolQualityTracker::new();
-        // Only 2 selections — below 3 minimum
-        tracker.record_selection(&["bash".to_string()]);
-        tracker.record_selection(&["bash".to_string()]);
-        let boost = tracker.boost_factor("bash");
-        assert_eq!(boost, 1.0, "insufficient data should return neutral (1.0)");
-    }
-
-    #[test]
-    fn disambiguation_five_intents_has_high_conflict() {
-        use astra_turn_core::routing_metrics::disambiguate_intents;
-        let disambig = disambiguate_intents(true, true, true, true, true, false);
-        assert!(
-            disambig.conflict_score >= 0.3,
-            "5 conflicting intents should have high conflict, got {}",
-            disambig.conflict_score
-        );
-    }
-
-    #[test]
-    fn select_report_schemas_and_names_consistent() {
+    fn surface_report_schemas_and_names_consistent() {
         // Phase 6: Data consistency check
         let reg = ToolRegistry::new(mock_schemas());
-        let (schemas, report) = reg.select_with_report("show me open PRs in matrixone", 3, 800);
+        let (schemas, report) =
+            reg.build_initial_surface_with_report("show me open PRs in matrixone", 800);
         assert_eq!(
             schemas.len(),
-            report.selected_count as usize,
+            report.visible_count as usize,
             "schema count should match report count"
         );
         assert_eq!(
             schemas.len(),
-            report.tools_selected.len(),
+            report.visible_tools.len(),
             "schema count should match selected names count"
         );
     }
 
     #[test]
-    fn prefilter_all_tools_have_nonnegative_scores() {
-        let state = ConversationState::from_message("analyze everything", 1);
-        let ranked =
-            scoring::pre_filter_dynamic(&state, "analyze everything", &FilterOptions::default());
-        for (idx, score) in &ranked {
-            assert!(
-                *score >= 0.0,
-                "tool {} has negative score {}",
-                TOOL_CATALOG[*idx].name,
-                score
-            );
-        }
+    fn surface_report_schema_budget_used_excludes_deferred_discovery_entries() {
+        let registry = ToolRegistry::new(mock_schemas());
+        let (_schemas, report) =
+            registry.build_initial_surface_with_report("analyze everything", 800);
+        assert_eq!(report.schema_budget_used, 0);
     }
 }

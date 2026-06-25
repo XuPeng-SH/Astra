@@ -804,8 +804,8 @@ impl CacheBreakDetector {
                     .flatten()
                     .collect();
                     return Some(format!(
-                        "Tool schemas changed ({}). Consider pinning tool order and \
-                         avoiding dynamic tool registration mid-session; same-name schema \
+                        "Tool schemas changed ({}). Keep tool schema order stable and \
+                         avoid dynamic tool registration mid-session; same-name schema \
                          churn (e.g. dynamic agent/skill lists embedded in a tool description) \
                          also breaks cache.",
                         parts.join("; ")
@@ -1354,7 +1354,7 @@ mod tests {
 
     #[test]
     fn no_break_on_identical_snapshots() {
-        let tools = make_tools(&["bash", "edit"]);
+        let tools = make_tools(&["bash", "str_replace"]);
         let mut det = CacheBreakDetector::new();
 
         let s1 = snap("system prompt", &tools, "claude-3.5-sonnet");
@@ -1385,7 +1385,7 @@ mod tests {
         let mut det = CacheBreakDetector::new();
 
         det.record_turn(
-            snap("prompt", &make_tools(&["bash", "edit"]), "claude"),
+            snap("prompt", &make_tools(&["bash", "str_replace"]), "claude"),
             None,
         );
         let event = det.record_turn(
@@ -1401,7 +1401,7 @@ mod tests {
                 changed,
             } => {
                 assert!(added.contains(&"grep".to_string()));
-                assert!(removed.contains(&"edit".to_string()));
+                assert!(removed.contains(&"str_replace".to_string()));
                 assert!(changed.is_empty(), "no same-name schema churn expected");
             }
             other => panic!("expected ToolSchemasChanged, got {other:?}"),
@@ -1681,7 +1681,7 @@ mod tests {
 
         det.record_turn(snap("prompt v1", &make_tools(&["bash"]), "claude"), None);
         let event = det.record_turn(
-            snap("prompt v2", &make_tools(&["bash", "edit"]), "gpt-4o"),
+            snap("prompt v2", &make_tools(&["bash", "str_replace"]), "gpt-4o"),
             None,
         );
 
@@ -1749,11 +1749,11 @@ mod tests {
 
     #[test]
     fn capture_snapshot_per_tool_hashes() {
-        let tools = make_tools(&["bash", "edit", "grep"]);
+        let tools = make_tools(&["bash", "str_replace", "grep"]);
         let snap = PromptStateSnapshot::capture("test", &tools, "model", 1000);
         assert_eq!(snap.per_tool_hashes.len(), 3);
         assert_eq!(snap.per_tool_hashes[0].0, "bash");
-        assert_eq!(snap.per_tool_hashes[1].0, "edit");
+        assert_eq!(snap.per_tool_hashes[1].0, "str_replace");
         assert_eq!(snap.per_tool_hashes[2].0, "grep");
     }
 
@@ -1945,7 +1945,7 @@ mod tests {
             let mut det = CacheBreakDetector::new();
             det.record_turn(snap("p", &make_tools(&["bash"]), "c"), None);
             let e = det
-                .record_turn(snap("p", &make_tools(&["bash", "edit"]), "c"), None)
+                .record_turn(snap("p", &make_tools(&["bash", "str_replace"]), "c"), None)
                 .unwrap();
             assert!(
                 e.suggestion.is_some(),
@@ -1980,7 +1980,7 @@ mod tests {
 
     #[test]
     fn compression_hint_healthy_cache() {
-        let tools = make_tools(&["bash", "edit"]);
+        let tools = make_tools(&["bash", "str_replace"]);
         let mut det = CacheBreakDetector::new();
 
         // Record 5 turns with no breaks → high hit rate
@@ -2229,18 +2229,18 @@ mod tests {
         let tools = make_tools(&["bash"]);
         let mut det = CacheBreakDetector::new();
 
-        det.record_turn_for_source("pinned", snap("p", &tools, "m"), None);
-        // Fill the rest to the cap; "pinned" is currently oldest.
+        det.record_turn_for_source("stable", snap("p", &tools, "m"), None);
+        // Fill the rest to the cap; "stable" is currently oldest.
         for i in 0..(MAX_TRACKED_SOURCES - 1) {
             det.record_turn_for_source(&format!("t{i}"), snap("p", &tools, "m"), None);
         }
-        // Refresh pinned — it becomes most recent.
-        det.record_turn_for_source("pinned", snap("p", &tools, "m"), None);
-        // One more write triggers eviction — but "pinned" is no longer oldest.
+        // Refresh stable — it becomes most recent.
+        det.record_turn_for_source("stable", snap("p", &tools, "m"), None);
+        // One more write triggers eviction — but "stable" is no longer oldest.
         det.record_turn_for_source("overflow", snap("p", &tools, "m"), None);
 
         assert!(
-            det.snapshot_for_source("pinned").is_some(),
+            det.snapshot_for_source("stable").is_some(),
             "refreshed source must survive eviction"
         );
         assert!(

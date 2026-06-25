@@ -1,4 +1,4 @@
-//! Compaction-tier budget pressure for `/chat` payload assembly (selector + schemas).
+//! Compaction-tier budget pressure for `/chat` payload assembly (messages + schemas).
 
 use serde_json::Value;
 
@@ -8,14 +8,14 @@ const ABSOLUTE_TRIM_SCHEMA_TOKENS: usize = 128_000;
 const ABSOLUTE_COMPACT_HISTORY_TOKENS: usize = 200_000;
 const ABSOLUTE_AGGRESSIVE_PRUNE_TOKENS: usize = 320_000;
 
-/// Same pressure value used when building `SelectionContext` for tool selection.
+/// Same pressure value used when building `SelectionContext` for tool surface.
 #[must_use]
 pub fn budget_pressure_for_chat_turn(
     messages: &[Value],
     model: Option<&str>,
-    pinned_schema_tokens: usize,
+    always_load_schema_tokens: usize,
 ) -> f64 {
-    let estimated = prompts::estimate_tokens(messages, pinned_schema_tokens, 0);
+    let estimated = prompts::estimate_tokens(messages, always_load_schema_tokens, 0);
     let budget = prompts::budget_for_model(model);
     let tier = budget.compaction_tier(estimated);
     tier.budget_pressure()

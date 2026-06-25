@@ -358,8 +358,8 @@ fn rollback_file_tool_scope_hint(path: Option<&str>) -> String {
         })
 }
 
-fn rollback_turn_tool_scope_hint() -> &'static str {
-    "when available, use `rollback_turn_actions` with scope=`current_turn` to revert mixed file/database changes from the same turn"
+fn rollback_file_current_turn_scope_hint() -> &'static str {
+    "call `rollback_file_edits` with scope=`current_turn` to restore recorded file edits from this turn"
 }
 
 fn restore_file_compensation_summary(path: Option<&str>, delete_if_created: bool) -> String {
@@ -369,14 +369,14 @@ fn restore_file_compensation_summary(path: Option<&str>, delete_if_created: bool
             "{} to restore prior contents for {} or delete it if this write created the file; alternatively, {}",
             rollback_file_tool_scope_hint(path),
             target,
-            rollback_turn_tool_scope_hint()
+            rollback_file_current_turn_scope_hint()
         )
     } else {
         format!(
             "{} to restore prior contents for {}; alternatively, {}",
             rollback_file_tool_scope_hint(path),
             target,
-            rollback_turn_tool_scope_hint()
+            rollback_file_current_turn_scope_hint()
         )
     }
 }
@@ -394,7 +394,7 @@ fn restore_deleted_file_compensation_summary(path: Option<&str>) -> String {
         "{} to restore deleted contents for {}; alternatively, {}",
         rollback_file_tool_scope_hint(path),
         file_target_summary(path),
-        rollback_turn_tool_scope_hint()
+        rollback_file_current_turn_scope_hint()
     )
 }
 
@@ -404,42 +404,25 @@ fn adjust_config_compensation_summary(path: Option<&str>) -> String {
         .map(|path| format!("config path `{path}`"))
         .unwrap_or_else(|| "the changed config path".to_string());
     format!(
-        "prefer `rollback_session_state` with scope=`current_turn` (or {}) to restore {}; alternatively rerun `adjust_config` with the previous `old` value from the tool result",
-        rollback_turn_tool_scope_hint(),
+        "prefer `rollback_session_state` with scope=`current_turn` to restore {}; alternatively rerun `adjust_config` with the previous `old` value from the tool result",
         target
     )
-}
-
-fn tool_priority_compensation_summary(tool: Option<&str>) -> String {
-    let target = tool
-        .filter(|tool| !tool.is_empty())
-        .map(|tool| format!("tool `{tool}`"))
-        .unwrap_or_else(|| "the affected tool".to_string());
-    format!(
-        "prefer `rollback_session_state` with scope=`current_turn` (or {}) to restore {}'s prior preference state; the `previous_pinned_tools` and `previous_deprioritized_tools` fields remain the manual fallback",
-        rollback_turn_tool_scope_hint(),
-        target
-    )
-}
-
-fn set_goal_compensation_summary() -> &'static str {
-    "prefer `rollback_session_state` with scope=`current_turn` (or, when available, `rollback_turn_actions`) to restore the previous_goal and goal-tracking snapshot; rerun `set_goal` with the `previous_goal` from the tool result only as the manual fallback"
 }
 
 fn compress_context_compensation_summary() -> &'static str {
-    "prefer `rollback_session_state` with scope=`current_turn` (or, when available, `rollback_turn_actions`) to restore session-local compression state; manual compression journal markers remain append-only if you inspect the persisted journal later"
+    "prefer `rollback_session_state` with scope=`current_turn` to restore session-local compression state; manual compression journal markers remain append-only if you inspect the persisted journal later"
 }
 
-fn task_create_compensation_summary() -> &'static str {
-    "prefer `rollback_session_state` with scope=`current_turn` (or, when available, `rollback_turn_actions`) to restore the pre-task snapshot; `task(action='stop')` with the returned `task_id` remains the manual fallback if you only want to cancel the created task"
+fn task_action_create_compensation_summary() -> &'static str {
+    "prefer `rollback_session_state` with scope=`current_turn` to restore the pre-task snapshot; `task(action='stop')` with the returned `task_id` remains the manual fallback if you only want to cancel the created task"
 }
 
-fn task_update_compensation_summary() -> &'static str {
-    "prefer `rollback_session_state` with scope=`current_turn` (or, when available, `rollback_turn_actions`) to restore the pre-update task snapshot; otherwise use `task(action='get')` plus the `previous_status` from the tool result and rerun `task(action='update', task_id='...', new_status='<previous_status>')` manually"
+fn task_action_update_compensation_summary() -> &'static str {
+    "prefer `rollback_session_state` with scope=`current_turn` to restore the pre-update task snapshot; otherwise use `task(action='get')` plus the `previous_status` from the tool result and rerun `task(action='update', task_id='...', new_status='<previous_status>')` manually"
 }
 
-fn task_stop_compensation_summary() -> &'static str {
-    "prefer `rollback_session_state` with scope=`current_turn` (or, when available, `rollback_turn_actions`) to restore the pre-stop task snapshot; otherwise use `task(action='update', task_id='...', new_status='<previous_status>')` with the `previous_status` from the tool result to reopen the task manually"
+fn task_action_stop_compensation_summary() -> &'static str {
+    "prefer `rollback_session_state` with scope=`current_turn` to restore the pre-stop task snapshot; otherwise use `task(action='update', task_id='...', new_status='<previous_status>')` with the `previous_status` from the tool result to reopen the task manually"
 }
 
 fn task_action_profile(args: &Value) -> ActionCompensationProfile {
@@ -448,23 +431,24 @@ fn task_action_profile(args: &Value) -> ActionCompensationProfile {
         .to_ascii_lowercase()
         .as_str()
     {
-        "create" => {
-            session_state_action_profile(ActionCategory::Write, task_create_compensation_summary())
-        }
+        "create" => session_state_action_profile(
+            ActionCategory::Write,
+            task_action_create_compensation_summary(),
+        ),
         "update" => {
             let category = match string_arg(args, "new_status") {
                 Some("deleted") => ActionCategory::Destructive,
                 _ => ActionCategory::Write,
             };
-            session_state_action_profile(category, task_update_compensation_summary())
+            session_state_action_profile(category, task_action_update_compensation_summary())
         }
         "stop" => session_state_action_profile(
             ActionCategory::Destructive,
-            task_stop_compensation_summary(),
+            task_action_stop_compensation_summary(),
         ),
         "archive" => session_state_action_profile(
             ActionCategory::Write,
-            "prefer `rollback_session_state` with scope=`current_turn` (or, when available, `rollback_turn_actions`) to restore the pre-archive task snapshot",
+            "prefer `rollback_session_state` with scope=`current_turn` to restore the pre-archive task snapshot",
         ),
         "list" | "get" | "list_user" => ActionCompensationProfile::read(true),
         _ => ActionCompensationProfile::read(true),
@@ -568,10 +552,8 @@ fn sql_action_profile(args: &Value) -> ActionCompensationProfile {
             ActionCategory::Write,
             true,
             CompensationKind::RestoreDatabaseSnapshot,
-            format!(
-                "call `rollback_database_snapshots` with scope=`current_turn` during the turn, or scope=`snapshot` with the captured snapshot_id, to restore affected data; alternatively, {}",
-                rollback_turn_tool_scope_hint()
-            ),
+            "call `rollback_database_snapshots` with scope=`current_turn` during the turn, or scope=`snapshot` with the captured snapshot_id, to restore affected data"
+                .to_string(),
         ),
         Some("DROP" | "DELETE" | "TRUNCATE" | "ALTER" | "GRANT" | "REVOKE") => {
             ActionCompensationProfile::compensated(
@@ -579,10 +561,8 @@ fn sql_action_profile(args: &Value) -> ActionCompensationProfile {
                 ActionCategory::Destructive,
                 true,
                 CompensationKind::RestoreDatabaseSnapshot,
-                format!(
-                    "call `rollback_database_snapshots` with scope=`current_turn` during the turn, or scope=`snapshot` with the captured snapshot_id, to restore affected objects; alternatively, {}",
-                    rollback_turn_tool_scope_hint()
-                ),
+                "call `rollback_database_snapshots` with scope=`current_turn` during the turn, or scope=`snapshot` with the captured snapshot_id, to restore affected objects"
+                    .to_string(),
             )
         }
         _ if args
@@ -595,10 +575,8 @@ fn sql_action_profile(args: &Value) -> ActionCompensationProfile {
                 ActionCategory::Destructive,
                 true,
                 CompensationKind::RestoreDatabaseSnapshot,
-                format!(
-                    "call `rollback_database_snapshots` with scope=`current_turn` during the turn, or scope=`snapshot` with the captured snapshot_id, to restore affected objects; alternatively, {}",
-                    rollback_turn_tool_scope_hint()
-                ),
+                "call `rollback_database_snapshots` with scope=`current_turn` during the turn, or scope=`snapshot` with the captured snapshot_id, to restore affected objects"
+                    .to_string(),
             )
         }
         _ => ActionCompensationProfile::read(true),
@@ -633,14 +611,6 @@ pub fn tool_action_profile(tool_name: &str, args: &Value) -> ActionCompensationP
             ActionCategory::Write,
             adjust_config_compensation_summary(string_arg(&normalized_args, "path")),
         ),
-        "prioritize_tool" | "deprioritize_tool" => session_state_action_profile(
-            ActionCategory::Write,
-            tool_priority_compensation_summary(string_arg(&normalized_args, "tool")),
-        ),
-        "set_goal" => session_state_action_profile(
-            ActionCategory::Destructive,
-            set_goal_compensation_summary(),
-        ),
         "compress_context" => session_state_action_profile(
             ActionCategory::Write,
             compress_context_compensation_summary(),
@@ -659,7 +629,7 @@ pub fn tool_action_profile(tool_name: &str, args: &Value) -> ActionCompensationP
                 ActionCategory::Execute,
                 false,
                 CompensationKind::GitRevertCommit,
-                "use `rollback_turn_actions` with scope=`current_turn` during the turn to revert the recorded commit when it is still the current HEAD tail, or call `git` with action=`revert_commit` and the returned commit_sha for an explicit compensating revert commit".to_string(),
+                "call `git` with action=`revert_commit` and the returned commit_sha to create an explicit compensating revert commit".to_string(),
             ),
             Some("revert_commit") => ActionCompensationProfile::manual(
                 false,
@@ -683,7 +653,7 @@ pub fn tool_action_profile(tool_name: &str, args: &Value) -> ActionCompensationP
                     ActionCategory::Execute,
                     false,
                     CompensationKind::GitApplyStash,
-                    "use `rollback_turn_actions` with scope=`current_turn` to re-apply the recorded stash for the turn, or re-apply the captured stash with `git` using action=`stash`, sub_action=`apply`, and the returned stash_ref"
+                    "re-apply the captured stash with `git` using action=`stash`, sub_action=`apply`, and the returned stash_ref"
                         .to_string(),
                 ),
                 Some("apply") => ActionCompensationProfile::manual(
@@ -712,14 +682,14 @@ pub fn tool_action_profile(tool_name: &str, args: &Value) -> ActionCompensationP
                     ActionCategory::Execute,
                     false,
                     CompensationKind::GitRestoreWorktree,
-                    "use `rollback_turn_actions` with scope=`current_turn` during the turn to remove the recorded worktree and restore the session root while it is still clean; otherwise leave with `git` action=`worktree`, sub_action=`exit` or remove it manually".to_string(),
+                    "leave the worktree with `git` action=`worktree`, sub_action=`exit`; remove the recorded worktree path manually only after confirming it is clean".to_string(),
                 ),
                 Some("add" | "create") => ActionCompensationProfile::compensated(
                     true,
                     ActionCategory::Execute,
                     false,
                     CompensationKind::GitRestoreWorktree,
-                    "use `rollback_turn_actions` with scope=`current_turn` during the turn to remove the recorded clean worktree; if it has since changed, remove it manually with `git` action=`worktree`, sub_action=`remove` and the recorded path".to_string(),
+                    "remove the recorded clean worktree with `git` action=`worktree`, sub_action=`remove` and the recorded path; if it has changed, inspect it before removal".to_string(),
                 ),
                 Some("exit") => ActionCompensationProfile::manual(
                     false,
@@ -748,60 +718,6 @@ pub fn tool_action_profile(tool_name: &str, args: &Value) -> ActionCompensationP
                 "git action is unknown or not yet modeled for automatic rollback",
             ),
         },
-        "git_worktree" => match string_arg(&normalized_args, "action")
-            .map(|action| action.to_ascii_lowercase())
-            .as_deref()
-        {
-            Some("list" | "ls") => ActionCompensationProfile::read(true),
-            Some("enter") => ActionCompensationProfile::compensated(
-                true,
-                ActionCategory::Execute,
-                false,
-                CompensationKind::GitRestoreWorktree,
-                "use `rollback_turn_actions` with scope=`current_turn` during the turn to remove the recorded worktree and restore the session root while it is still clean; otherwise leave with `git_worktree` action=`exit` or remove it manually".to_string(),
-            ),
-            Some("add" | "create") => ActionCompensationProfile::compensated(
-                true,
-                ActionCategory::Execute,
-                false,
-                CompensationKind::GitRestoreWorktree,
-                "use `rollback_turn_actions` with scope=`current_turn` during the turn to remove the recorded clean worktree; if it has since changed, remove it manually with `git_worktree` action=`remove` and the recorded path".to_string(),
-            ),
-            Some("exit") => {
-                let exit_action = string_arg(&normalized_args, "exit_action")
-                    .map(|value| value.to_ascii_lowercase());
-                if exit_action.as_deref() == Some("remove") {
-                    ActionCompensationProfile::manual(
-                        false,
-                        ActionCategory::Destructive,
-                        "git_worktree exit with exit_action=remove can delete the worktree and discard work; use action=`enter` or recreate the worktree manually if you need to return",
-                    )
-                } else {
-                    ActionCompensationProfile::manual(
-                        false,
-                        ActionCategory::Execute,
-                        "git_worktree exit restores the original session root; re-enter the worktree or recreate it manually if you need to return",
-                    )
-                }
-            }
-            Some("remove" | "rm" | "delete") => ActionCompensationProfile::manual(
-                false,
-                ActionCategory::Destructive,
-                "git_worktree remove can delete the worktree and optionally its branch; restore it by recreating the worktree or branch manually if needed",
-            ),
-            _ => ActionCompensationProfile::manual(
-                false,
-                ActionCategory::Execute,
-                "git_worktree action is unknown or not yet modeled for automatic rollback",
-            ),
-        },
-        "git_checkout_file" => ActionCompensationProfile::compensated(
-            true,
-            ActionCategory::Destructive,
-            true,
-            CompensationKind::RestoreOrDeleteFile,
-            restore_file_compensation_summary(string_arg(&normalized_args, "path"), true),
-        ),
         "notebook_edit" => ActionCompensationProfile::compensated(
             true,
             ActionCategory::Write,
@@ -823,18 +739,13 @@ pub fn tool_action_profile(tool_name: &str, args: &Value) -> ActionCompensationP
             CompensationKind::RestoreFileContents,
             format!(
                 "{} to revert renamed files from the same turn",
-                rollback_turn_tool_scope_hint()
+                rollback_file_current_turn_scope_hint()
             ),
         ),
         "rollback_database_snapshots" => ActionCompensationProfile::manual(
             true,
             ActionCategory::Destructive,
             "database snapshot restore mutates state; capture a fresh snapshot first if you may need to undo the rollback",
-        ),
-        "rollback_turn_actions" => ActionCompensationProfile::manual(
-            true,
-            ActionCategory::Destructive,
-            "turn rollback can mutate both workspace files and database state; capture fresh recovery points first if you may need to undo the rollback",
         ),
         "bash" | "exec" | "run_command" | "shell" => {
             shell_action_profile(string_arg(&normalized_args, "command"))
@@ -1018,13 +929,6 @@ mod tests {
         assert!(!p.reversible);
         assert_eq!(p.compensation_kind, Some(CompensationKind::Manual));
 
-        // rollback_turn_actions
-        let p = tool_action_profile("rollback_turn_actions", &json!({}));
-        assert_eq!(p.category, ActionCategory::Destructive);
-        assert!(!p.requires_pre_state);
-        assert!(!p.reversible);
-        assert_eq!(p.compensation_kind, Some(CompensationKind::Manual));
-
         // destructive shell (rm -rf, force push, etc.)
         let p = tool_action_profile("bash", &json!({"command": "rm -rf /tmp/test"}));
         assert_eq!(p.category, ActionCategory::Destructive);
@@ -1051,38 +955,6 @@ mod tests {
                 .as_deref()
                 .unwrap_or_default()
                 .contains("rollback_session_state")
-        );
-
-        let prioritize = tool_action_profile("prioritize_tool", &json!({"tool": "bash"}));
-        assert!(prioritize.bounded);
-        assert_eq!(prioritize.category, ActionCategory::Write);
-        assert!(prioritize.reversible);
-        assert_eq!(
-            prioritize.compensation_kind,
-            Some(CompensationKind::RestoreSessionState)
-        );
-        assert!(
-            prioritize
-                .compensation_summary
-                .as_deref()
-                .unwrap_or_default()
-                .contains("prior preference state")
-        );
-
-        let set_goal = tool_action_profile("set_goal", &json!({"goal": "ship rollback shell"}));
-        assert!(set_goal.bounded);
-        assert_eq!(set_goal.category, ActionCategory::Destructive);
-        assert!(set_goal.reversible);
-        assert_eq!(
-            set_goal.compensation_kind,
-            Some(CompensationKind::RestoreSessionState)
-        );
-        assert!(
-            set_goal
-                .compensation_summary
-                .as_deref()
-                .unwrap_or_default()
-                .contains("previous_goal")
         );
 
         let compress = tool_action_profile("compress_context", &json!({"turns": 4}));
@@ -1181,8 +1053,8 @@ mod tests {
     }
 
     #[test]
-    fn legacy_task_tool_names_are_not_special_compensation_surfaces() {
-        let profile = tool_action_profile("task_create", &json!({"title": "demo"}));
+    fn unknown_tool_names_are_not_special_compensation_surfaces() {
+        let profile = tool_action_profile("unknown_task_surface", &json!({"title": "demo"}));
         assert_eq!(profile.category, ActionCategory::Read);
         assert!(profile.compensation_kind.is_none());
     }
@@ -1213,17 +1085,17 @@ mod tests {
     }
 
     #[test]
-    fn git_worktree_compensation() {
+    fn git_action_worktree_compensation() {
         // list: read-only
-        let p = tool_action_profile("git_worktree", &json!({"action": "list"}));
+        let p = tool_action_profile("git", &json!({"action": "worktree", "sub_action": "list"}));
         assert!(p.bounded);
         assert_eq!(p.category, ActionCategory::Read);
         assert_eq!(p.compensation_kind, None);
 
         // enter: reversible via GitRestoreWorktree
         let p = tool_action_profile(
-            "git_worktree",
-            &json!({"action": "enter", "branch": "demo"}),
+            "git",
+            &json!({"action": "worktree", "sub_action": "enter", "branch": "demo"}),
         );
         assert!(p.bounded);
         assert_eq!(p.category, ActionCategory::Execute);
@@ -1236,11 +1108,14 @@ mod tests {
             p.compensation_summary
                 .as_deref()
                 .unwrap_or_default()
-                .contains("rollback_turn_actions")
+                .contains("action=`worktree`")
         );
 
         // add: same compensation
-        let p = tool_action_profile("git_worktree", &json!({"action": "add", "branch": "demo"}));
+        let p = tool_action_profile(
+            "git",
+            &json!({"action": "worktree", "sub_action": "add", "branch": "demo"}),
+        );
         assert!(p.bounded);
         assert_eq!(p.category, ActionCategory::Execute);
         assert!(p.reversible);
@@ -1276,7 +1151,10 @@ mod tests {
         );
 
         // checkout file: destructive but bounded + reversible
-        let p = tool_action_profile("git_checkout_file", &json!({"path": "src/lib.rs"}));
+        let p = tool_action_profile(
+            "git",
+            &json!({"action": "checkout_file", "path": "src/lib.rs"}),
+        );
         assert!(p.bounded);
         assert_eq!(p.category, ActionCategory::Destructive);
         assert!(p.reversible);
@@ -1318,18 +1196,19 @@ mod tests {
     }
 
     #[test]
-    fn git_worktree_list_is_read_only() {
-        let profile = tool_action_profile("git_worktree", &json!({"action": "list"}));
+    fn git_action_worktree_list_is_read_only() {
+        let profile =
+            tool_action_profile("git", &json!({"action": "worktree", "sub_action": "list"}));
         assert!(profile.bounded);
         assert_eq!(profile.category, ActionCategory::Read);
         assert_eq!(profile.compensation_kind, None);
     }
 
     #[test]
-    fn git_worktree_enter_is_compensated() {
+    fn git_action_worktree_enter_is_compensated() {
         let profile = tool_action_profile(
-            "git_worktree",
-            &json!({"action": "enter", "branch": "demo"}),
+            "git",
+            &json!({"action": "worktree", "sub_action": "enter", "branch": "demo"}),
         );
         assert!(profile.bounded);
         assert_eq!(profile.category, ActionCategory::Execute);
@@ -1343,12 +1222,12 @@ mod tests {
                 .compensation_summary
                 .as_deref()
                 .unwrap_or_default()
-                .contains("rollback_turn_actions")
+                .contains("action=`worktree`")
         );
     }
 
     #[test]
-    fn rename_symbol_uses_turn_rollback_hint() {
+    fn rename_symbol_uses_file_rollback_hint() {
         let profile = tool_action_profile(
             "rename_symbol",
             &json!({"path": "src/lib.rs", "old_name": "foo", "new_name": "bar"}),
@@ -1358,7 +1237,7 @@ mod tests {
                 .compensation_summary
                 .as_deref()
                 .unwrap_or_default()
-                .contains("rollback_turn_actions")
+                .contains("rollback_file_edits")
         );
     }
 
@@ -1390,7 +1269,7 @@ mod tests {
 
     #[test]
     fn notebook_and_rename_symbol_compensation() {
-        // notebook_edit: uses turn rollback hint
+        // notebook_edit: uses file rollback hint
         let p = tool_action_profile(
             "notebook_edit",
             &json!({"cell_id": "cell-1", "content": "x"}),
@@ -1399,10 +1278,10 @@ mod tests {
             p.compensation_summary
                 .as_deref()
                 .unwrap_or_default()
-                .contains("rollback_turn_actions")
+                .contains("rollback_file_edits")
         );
 
-        // rename_symbol: uses turn rollback hint
+        // rename_symbol: uses file rollback hint
         let p = tool_action_profile(
             "rename_symbol",
             &json!({"path": "src/lib.rs", "old_name": "foo", "new_name": "bar"}),
@@ -1411,7 +1290,7 @@ mod tests {
             p.compensation_summary
                 .as_deref()
                 .unwrap_or_default()
-                .contains("rollback_turn_actions")
+                .contains("rollback_file_edits")
         );
     }
 
@@ -1480,9 +1359,7 @@ mod tests {
                 "apply_patch" => {
                     json!({"path": "tmp.txt", "patch": "--- a\n+++ b\n@@ -1 +1 @@\n-a\n+b"})
                 }
-                "rollback_database_snapshots" | "rollback_file_edits" | "rollback_turn_actions" => {
-                    json!({})
-                }
+                "rollback_database_snapshots" | "rollback_file_edits" => json!({}),
                 other => panic!("add sample args for {other}"),
             }
         }

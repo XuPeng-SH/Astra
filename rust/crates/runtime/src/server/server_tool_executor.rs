@@ -51,10 +51,7 @@ use crate::server::tool_plan_gate::{
     PlanModeSnapshot, is_plan_mode_blocked_tool, plan_mode_authoring_active,
 };
 use crate::server::tool_route_runtime::{ToolRouteRuntimeContext, execute_tool_route_with_events};
-use crate::server::tool_session_config::{
-    ToolPreferenceAction, execute_adjust_config, execute_compress_context,
-    execute_tool_preference_update,
-};
+use crate::server::tool_session_config::{execute_adjust_config, execute_compress_context};
 use crate::server::tool_session_state_rollback::{
     self, RollbackSessionStateContext, SessionStateRestoreContext, SessionStateRollbackAction,
     SessionStateRollbackJournal,
@@ -81,6 +78,13 @@ use astra_tools::plan_task_mirror;
 
 mod tool_handlers;
 
+#[derive(Clone, Default)]
+struct McpRuntimeSnapshot {
+    schemas: Vec<Value>,
+    manager: Option<Arc<tokio::sync::RwLock<astra_mcp::McpClientManager>>>,
+    agent_binding_mcp: Option<Arc<super::runtime_mcp::AgentBindingMcpRuntime>>,
+}
+
 fn resolved_server_tool_names(
     capabilities: &astra_turn_core::capability::CapabilitySet,
     workspace: &WorkspaceBinding,
@@ -93,36 +97,24 @@ fn resolved_server_tool_names(
         .collect()
 }
 
-/// Per-turn mutation accounting and self-modification preferences.
-/// Held inside a single [`Mutex`] so tool-preference updates and
-/// adjust_config mutation counting share the same lock — avoiding
-/// the lock-ordering hazard of three independent locks.
+/// Per-turn mutation accounting for session config changes.
+/// Held inside a [`Mutex`] so config mutation accounting stays atomic.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SessionConfigInner {
     /// Per-turn mutation accounting for adjust_config governor.
     pub(crate) mutation_counter: (u32, u32),
-    /// Self-modification pinned tool preferences.
-    pub(crate) pinned_tools: Vec<String>,
-    /// Self-modification deprioritized tool preferences.
-    pub(crate) deprioritized_tools: Vec<String>,
 }
 
 /// Self-modification session configuration state.
-///
-/// Groups pinned/deprioritized tool preferences and mutation counter
-/// that were previously scattered across individual fields on
-/// [`ServerToolExecutor`].
 pub(crate) struct SessionConfigState {
     pub(crate) inner: Mutex<SessionConfigInner>,
 }
 
 impl SessionConfigState {
-    fn new(pinned_tools: Vec<String>, deprioritized_tools: Vec<String>) -> Self {
+    fn new() -> Self {
         Self {
             inner: Mutex::new(SessionConfigInner {
                 mutation_counter: (0, 0),
-                pinned_tools,
-                deprioritized_tools,
             }),
         }
     }
@@ -203,7 +195,7 @@ pub struct ServerToolExecutor {
     /// Optional observability session for self-mod and rollback-backed session state.
     pub(crate) observability_session:
         Option<Arc<std::sync::RwLock<crate::observability::ObservabilitySession>>>,
-    /// Self-modification session config state (preferences + mutation counter).
+    /// Self-modification session config mutation state.
     pub(crate) session_config: SessionConfigState,
 
     // ── Plan mode ─────────────────────────────────────────────────────────────
@@ -222,17 +214,12 @@ pub struct ServerToolExecutor {
     plan_resume_hint_handle: Option<Arc<std::sync::RwLock<Option<String>>>>,
 
     // ── MCP and external tool integration ─────────────────────────────────────
-    /// MCP client manager for forwarding `mcp__*` tool calls to connected
-    /// MCP servers. Set by `stream_chat()` after MCP discovery.
-    mcp_manager: Option<Arc<tokio::sync::RwLock<astra_mcp::McpClientManager>>>,
-    /// Agent Binding MCP adapter for stateless per-call JSON-RPC over the
-    /// shared HTTP transport pool. Unlike `mcp_manager`, this never holds a
-    /// long-lived authorization-scoped MCP session.
-    agent_binding_mcp: Option<Arc<super::runtime_mcp::AgentBindingMcpRuntime>>,
-    /// Plugin-registered tool schemas (e.g. MCP servers). Joined with the
-    /// server-side allowlist when `tool_search(select:NAME)` runs so
-    /// deferred activation reaches plugin tools. Populated by the server
-    /// loop host once MCP servers have been refreshed.
+    /// MCP runtime snapshot installed from one discovery pass. Manager,
+    /// Agent Binding ownership, and MCP schemas move together so
+    /// `tool_search(select:mcp__*)` cannot observe a half-refresh state.
+    mcp_runtime: Arc<std::sync::RwLock<McpRuntimeSnapshot>>,
+    /// Plugin-registered non-MCP tool schemas. MCP schemas live in
+    /// `mcp_runtime` so routing ownership and discovery data stay atomic.
     plugin_schemas: Arc<std::sync::RwLock<Vec<Value>>>,
     /// Deferred tool names whose full schema has been fetched via
     /// `tool_search(query="select:NAME")` or direct-call recovery. This is
@@ -280,11 +267,6 @@ impl ServerToolExecutor {
 
         let memoria_client =
             astra_tools::memoria::MemoriaClient::new(cloud_base.clone(), cloud_token.clone());
-        let (pinned_tools, deprioritized_tools) =
-            astra_services::session_workspace::read_workspace(&session_id)
-                .map(|workspace| (workspace.pinned_tools, workspace.deprioritized_tools))
-                .unwrap_or_else(|_| (Vec::new(), Vec::new()));
-
         let default_executor = DefaultToolExecutor::for_workspace(
             &workspace_root,
             user_id.clone(),
@@ -323,18 +305,17 @@ impl ServerToolExecutor {
             tool_execution_service: ToolExecutionService::builder().build(),
             observability_session: None,
             introspect_snapshot: Arc::new(std::sync::RwLock::new(None)),
-            session_config: SessionConfigState::new(pinned_tools, deprioritized_tools),
+            session_config: SessionConfigState::new(),
             cancel_token: None,
             workspace_artifact_store: None,
             context_manifest_pool: None,
             plan_repo: None,
             plan_mode_cache: Arc::new(tokio::sync::RwLock::new(PlanModeSnapshot::default())),
             plan_resume_hint_handle: None,
+            mcp_runtime: Arc::new(std::sync::RwLock::new(McpRuntimeSnapshot::default())),
             plugin_schemas: Arc::new(std::sync::RwLock::new(Vec::new())),
             activated_deferred_tools: Arc::new(std::sync::RwLock::new(HashSet::new())),
             current_tool_surface: Arc::new(std::sync::RwLock::new(ToolSurfaceNames::default())),
-            mcp_manager: None,
-            agent_binding_mcp: None,
             agent_tool_context: None,
             work_surface_events: WorkSurfaceEventEmitter::new(session_id.clone()),
             execution_binding: ExecutionBindingState::server_sandbox(&workspace_root),
@@ -403,34 +384,6 @@ impl ServerToolExecutor {
         outcome.output
     }
 
-    pub(super) fn prioritize_tool(&self, args: &Value) -> String {
-        let outcome = crate::server::tool_session_config::execute_tool_preference_update(
-            &self.session_id,
-            &self.session_config.inner,
-            args,
-            crate::server::tool_session_config::ToolPreferenceAction::Prioritize,
-            |tool| self.supports_server_tool_name(tool),
-            || self.publish_current_workspace("prioritize_tool"),
-            &self.session_state_journal,
-            self.journal_turn_index.load(Ordering::Relaxed),
-        );
-        outcome.output
-    }
-
-    pub(super) fn deprioritize_tool(&self, args: &Value) -> String {
-        let outcome = crate::server::tool_session_config::execute_tool_preference_update(
-            &self.session_id,
-            &self.session_config.inner,
-            args,
-            crate::server::tool_session_config::ToolPreferenceAction::Deprioritize,
-            |tool| self.supports_server_tool_name(tool),
-            || self.publish_current_workspace("deprioritize_tool"),
-            &self.session_state_journal,
-            self.journal_turn_index.load(Ordering::Relaxed),
-        );
-        outcome.output
-    }
-
     pub(super) fn compress_context(&self, args: &Value) -> String {
         let outcome = crate::server::tool_session_config::execute_compress_context(
             &self.session_id,
@@ -493,24 +446,19 @@ impl ServerToolExecutor {
         self
     }
 
-    /// Set the MCP client manager for forwarding `mcp__*` tool calls.
-    pub fn set_mcp_manager(
-        &mut self,
-        manager: Arc<tokio::sync::RwLock<astra_mcp::McpClientManager>>,
-    ) {
-        self.mcp_manager = Some(manager);
+    /// Install the MCP execution bundle in one step so schemas and runtime
+    /// ownership are derived from the same discovery snapshot.
+    pub(crate) fn install_mcp_bundle(&mut self, bundle: &super::runtime_mcp::RuntimeMcpBundle) {
+        let mut guard = rwlock_write_reset_on_poison(&self.mcp_runtime, "mcp_runtime");
+        *guard = McpRuntimeSnapshot {
+            schemas: bundle.schemas.clone(),
+            manager: bundle.manager.clone(),
+            agent_binding_mcp: bundle.agent_binding_mcp.clone(),
+        };
     }
 
-    pub(crate) fn set_agent_binding_mcp(
-        &mut self,
-        agent_binding_mcp: Arc<super::runtime_mcp::AgentBindingMcpRuntime>,
-    ) {
-        self.agent_binding_mcp = Some(agent_binding_mcp);
-    }
-
-    /// Install plugin-registered schemas (MCP, etc.) so
+    /// Install plugin-registered non-MCP schemas so
     /// `tool_search(select:NAME)` can resolve them for deferred activation.
-    /// Called by the server loop host after MCP manager refresh.
     ///
     /// Poison handling: plugin schemas are a rebuildable cache. Reset cached
     /// state on poison instead of reusing possibly half-written inner data.
@@ -635,10 +583,12 @@ impl ServerToolExecutor {
         // Use set-based comparison, not length comparison: same-count with
         // different names (e.g., {a,b} → {c,d}) must also trigger pruning.
         let retained_set: HashSet<&str> = retained.iter().map(String::as_str).collect();
+        let before = guard.len();
         guard.retain(|name| retained_set.contains(name.as_str()));
+        let after = guard.len();
         tracing::debug!(
-            before = guard.len(),
-            after = guard.len(),
+            before,
+            after,
             "pruning stale activated_deferred_tools entries"
         );
         retained
@@ -742,12 +692,17 @@ impl ServerToolExecutor {
         self.tool_has_runtime_binding(name)
     }
 
-    pub(crate) fn plugin_schemas_snapshot(&self, label: &str) -> Vec<Value> {
-        rwlock_read_clone_or_default(&self.plugin_schemas, label)
+    pub(crate) fn external_schemas_snapshot(&self, label: &str) -> Vec<Value> {
+        let mut schemas = rwlock_read_clone_or_default(&self.plugin_schemas, label);
+        let mcp_runtime =
+            rwlock_read_clone_or_default(&self.mcp_runtime, "mcp_runtime_schema_snapshot");
+        schemas.extend(mcp_runtime.schemas);
+        schemas
     }
 
     async fn execute_mcp_tool(&self, name: &str, args: &Value) -> astra_tools::ToolResult {
-        if let Some(agent_binding_mcp) = &self.agent_binding_mcp {
+        let mcp_runtime = rwlock_read_clone_or_default(&self.mcp_runtime, "mcp_runtime_execute");
+        if let Some(agent_binding_mcp) = &mcp_runtime.agent_binding_mcp {
             return match agent_binding_mcp.call_tool_by_mcp_name(name, args).await {
                 Ok(content) => astra_tools::ToolResult::text(content),
                 Err(error) => astra_tools::ToolResult::error(
@@ -758,7 +713,7 @@ impl ServerToolExecutor {
                 ),
             };
         }
-        let Some(mgr) = &self.mcp_manager else {
+        let Some(mgr) = &mcp_runtime.manager else {
             return self.runtime_binding_error_result(name, args);
         };
         match mgr
@@ -816,13 +771,21 @@ impl ServerToolExecutor {
     }
 
     fn plugin_schema_has_name(&self, name: &str) -> bool {
-        self.plugin_schemas_snapshot("plugin_schemas_runtime_binding")
+        self.external_schemas_snapshot("external_schemas_runtime_binding")
             .iter()
             .any(|schema| tool_schema_name(schema).is_some_and(|schema_name| schema_name == name))
     }
 
     fn mcp_tool_has_runtime_binding(&self, name: &str) -> bool {
-        let Some(manager) = &self.mcp_manager else {
+        let mcp_runtime = rwlock_read_clone_or_default(&self.mcp_runtime, "mcp_runtime_binding");
+        if mcp_runtime
+            .agent_binding_mcp
+            .as_ref()
+            .is_some_and(|runtime| runtime.owns_public_tool_name(name))
+        {
+            return true;
+        }
+        let Some(manager) = &mcp_runtime.manager else {
             return false;
         };
         manager
@@ -1047,8 +1010,8 @@ impl ServerToolExecutor {
     /// in-memory snapshot against a MatrixOne store.
     pub fn with_task_store(mut self, store: Arc<dyn TaskStore>) -> Self {
         // Drop any TaskState rollback entries that referenced the old store.
-        // Other action kinds (ToolPreferences, ConfigOverride, Compression)
-        // are store-independent and survive the swap.
+        // Other action kinds (ConfigOverride, Compression) are store-independent
+        // and survive the swap.
         let dropped = tool_session_state_rollback::drop_task_state_entries(
             self.session_state_journal.as_ref(),
         );
@@ -1777,40 +1740,12 @@ mod tests {
     #[tokio::test]
     async fn session_state_tools_execute_from_tool_engine_registry() {
         let (exec, _dir) = test_executor();
-        for name in [
-            "prioritize_tool",
-            "deprioritize_tool",
-            "compress_context",
-            "rollback_session_state",
-        ] {
+        for name in ["compress_context", "rollback_session_state"] {
             assert!(
                 exec.tool_engine.contains(name),
                 "{name} should be registered in ToolEngine for server-local execution"
             );
         }
-
-        let prioritize = exec
-            .execute_with_metadata("prioritize_tool", &json!({}))
-            .await;
-        assert!(prioritize.is_error, "{prioritize:?}");
-        assert!(
-            prioritize
-                .output
-                .contains("Missing required parameter: tool"),
-            "{prioritize:?}"
-        );
-
-        let deprioritize = exec
-            .execute_with_metadata("deprioritize_tool", &json!({}))
-            .await;
-        assert!(deprioritize.is_error, "{deprioritize:?}");
-        assert!(
-            deprioritize
-                .output
-                .contains("Missing required parameter: tool"),
-            "{deprioritize:?}"
-        );
-
         let compress = exec
             .execute_with_metadata("compress_context", &json!({}))
             .await;
@@ -1849,28 +1784,12 @@ mod tests {
     #[tokio::test]
     async fn matrixone_tools_execute_from_tool_engine_registry() {
         let (exec, _dir) = test_executor();
-        for name in ["mo", "mo_query", "rollback_database_snapshots"] {
+        for name in ["mo_query", "rollback_database_snapshots"] {
             assert!(
                 exec.tool_engine.contains(name),
                 "{name} should be registered in ToolEngine for server-local execution"
             );
         }
-
-        let mo_missing_sql = exec.execute_with_metadata("mo", &json!({})).await;
-        assert!(mo_missing_sql.is_error, "{mo_missing_sql:?}");
-        assert!(
-            mo_missing_sql.output.contains("Missing 'sql' parameter"),
-            "{mo_missing_sql:?}"
-        );
-
-        let mo_unknown_action = exec
-            .execute_with_metadata("mo", &json!({"action": "vacuum"}))
-            .await;
-        assert!(mo_unknown_action.is_error, "{mo_unknown_action:?}");
-        assert!(
-            mo_unknown_action.output.contains("Unknown mo action"),
-            "{mo_unknown_action:?}"
-        );
 
         let mo_query_missing_sql = exec.execute_with_metadata("mo_query", &json!({})).await;
         assert!(mo_query_missing_sql.is_error, "{mo_query_missing_sql:?}");
@@ -2240,13 +2159,28 @@ mod tests {
         .into_iter()
         .find(|schema| schema.pointer("/function/name").and_then(Value::as_str) == Some("session"))
         .expect("session schema should exist");
-        let actions = session_schema
+        let mut actions = session_schema
             .pointer("/function/parameters/properties/action/enum")
             .and_then(Value::as_array)
-            .expect("session action enum should exist");
+            .expect("session action enum should exist")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        actions.sort_unstable();
+        assert_eq!(
+            actions,
+            [
+                "config",
+                "history_around",
+                "history_page",
+                "history_search",
+                "sleep",
+            ],
+            "session action surface must stay narrow and current"
+        );
         for action in ["history_page", "history_search", "history_around"] {
             assert!(
-                actions.iter().any(|value| value.as_str() == Some(action)),
+                actions.contains(&action),
                 "session action {action} must be advertised for web-agent history recall"
             );
         }
@@ -2565,27 +2499,6 @@ esac
                 .as_ref()
                 .is_some_and(|metadata| metadata.contains_key("runtime_environment")),
             "ToolEngine task errors should still receive execution metadata"
-        );
-    }
-
-    #[tokio::test]
-    async fn retired_task_tool_names_are_not_executable_on_server_executor() {
-        let (exec, _dir) = test_executor();
-
-        let retired = exec
-            .execute("task_create", &json!({"title": "old surface"}))
-            .await;
-        assert!(
-            retired.contains("not available") || retired.contains("Unknown tool"),
-            "retired task_create must not remain an executable task surface: {retired}"
-        );
-
-        let unified = exec
-            .execute("task", &json!({"action": "create", "title": "new surface"}))
-            .await;
-        assert!(
-            unified.contains("\"success\":true") && unified.contains("task-1"),
-            "unified task(action=create) should remain the executable surface: {unified}"
         );
     }
 
@@ -3957,7 +3870,7 @@ esac
             .expect("task_board_snapshot");
         assert_eq!(snapshot["session_id"], "test-session");
         assert_eq!(snapshot["run_id"], "run-task");
-        assert_eq!(snapshot["reason"], "task_create");
+        assert_eq!(snapshot["reason"], "task.create");
         assert_eq!(snapshot["workspace"]["kind"], "server_sandbox");
         assert_eq!(snapshot["executor"]["kind"], "server_local");
         assert_eq!(snapshot["transport"], "server_local");
@@ -4018,14 +3931,6 @@ esac
         assert!(
             source.contains("publish_current_workspace(\"adjust_config\")"),
             "adjust_config should publish remote workspace artifacts"
-        );
-        assert!(
-            source.contains("publish_current_workspace(\"prioritize_tool\")"),
-            "prioritize_tool should publish remote workspace artifacts"
-        );
-        assert!(
-            source.contains("publish_current_workspace(\"deprioritize_tool\")"),
-            "deprioritize_tool should publish remote workspace artifacts"
         );
         let handlers = include_str!("server_tool_executor/tool_handlers.rs");
         assert!(
@@ -4116,7 +4021,9 @@ esac
             .await;
         assert!(delegate.is_error, "{delegate:?}");
         assert!(
-            delegate.output.contains("agent.delegate has been removed"),
+            delegate
+                .output
+                .contains("Tool `agent` action `delegate` is not available"),
             "{delegate:?}"
         );
         assert!(
@@ -4285,7 +4192,7 @@ esac
     // ── Path traversal security ────────────────────────────────────────
 
     #[tokio::test]
-    async fn server_tool_search_falls_back_to_global_catalog_without_installed_surface() {
+    async fn server_tool_search_fails_closed_without_installed_surface() {
         let (exec, _dir) = test_executor();
 
         let result = exec
@@ -4294,14 +4201,19 @@ esac
 
         let parsed = parse_tool_search_output(&result.output);
         assert_eq!(parsed["mode"].as_str(), Some("select"));
-        // When surface is not installed, tool_search falls back to the
-        // full global catalog so callers that depend on tool_search without
-        // a surface aren't silently broken.
-        assert!(parsed["status"].as_str() != Some("empty_surface"));
-        assert!(parsed["total_tools"].as_u64().is_some_and(|n| n > 0));
+        assert_eq!(parsed["status"].as_str(), Some("completed"));
+        assert_eq!(parsed["selection_status"].as_str(), Some("empty_surface"));
+        assert_eq!(parsed["total_tools"].as_u64(), Some(0));
+        assert!(tool_search_match_names(&parsed).is_empty());
+        assert_eq!(
+            tool_search_string_array(&parsed, "missing"),
+            vec!["github".to_string()]
+        );
         assert!(
-            !tool_search_match_names(&parsed).is_empty(),
-            "must find github in global fallback catalog"
+            parsed["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("No tools are searchable")),
+            "{parsed}"
         );
     }
 
@@ -4674,25 +4586,28 @@ esac
     #[tokio::test]
     async fn server_tool_search_rejects_stale_mcp_plugin_schema_not_owned_by_manager() {
         let (mut exec, _dir) = test_executor();
-        exec.set_mcp_manager(Arc::new(tokio::sync::RwLock::new(
-            astra_mcp::McpClientManager::new(),
-        )));
         exec.set_current_visible_tool_schemas(&[
             json!({"type": "function", "function": {"name": "bash"}}),
             json!({"type": "function", "function": {"name": "tool_search"}}),
         ]);
-        exec.set_plugin_schemas(vec![json!({
-            "type": "function",
-            "function": {
-                "name": "mcp__calculator",
-                "description": "Evaluate arithmetic expression.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"expr": {"type": "string"}},
-                    "required": ["expr"]
+        exec.install_mcp_bundle(&crate::server::runtime_mcp::RuntimeMcpBundle {
+            schemas: vec![json!({
+                "type": "function",
+                "function": {
+                    "name": "mcp__calculator",
+                    "description": "Evaluate arithmetic expression.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"expr": {"type": "string"}},
+                        "required": ["expr"]
+                    }
                 }
-            }
-        })]);
+            })],
+            manager: Some(Arc::new(tokio::sync::RwLock::new(
+                astra_mcp::McpClientManager::new(),
+            ))),
+            agent_binding_mcp: None,
+        });
         exec.set_current_activatable_tool_names(HashSet::from(["mcp__calculator".to_string()]));
 
         let result = exec
@@ -5161,12 +5076,10 @@ esac
         assert!(second.contains("Successfully wrote"));
 
         let rollback = exec
-            .execute(
-                "session",
-                &json!({"action": "rollback_edits", "scope": "current_turn"}),
-            )
+            .execute("rollback_file_edits", &json!({"scope": "current_turn"}))
             .await;
-        let rollback_json: Value = serde_json::from_str(&rollback).unwrap();
+        let rollback_json: Value = serde_json::from_str(&rollback)
+            .unwrap_or_else(|error| panic!("rollback output should be JSON: {error}; {rollback}"));
         assert_eq!(
             rollback_json["success"].as_bool(),
             Some(true),
@@ -5203,12 +5116,10 @@ esac
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "AAA bbb CCC\n");
 
         let rollback = exec
-            .execute(
-                "session",
-                &json!({"action": "rollback_edits", "scope": "current_turn"}),
-            )
+            .execute("rollback_file_edits", &json!({"scope": "current_turn"}))
             .await;
-        let rollback_json: Value = serde_json::from_str(&rollback).unwrap();
+        let rollback_json: Value = serde_json::from_str(&rollback)
+            .unwrap_or_else(|error| panic!("rollback output should be JSON: {error}; {rollback}"));
         assert_eq!(
             rollback_json["success"].as_bool(),
             Some(true),
@@ -5232,11 +5143,12 @@ esac
 
         let rollback = exec
             .execute(
-                "session",
-                &json!({"action": "rollback_edits", "scope": "file", "path": "gone.txt"}),
+                "rollback_file_edits",
+                &json!({"scope": "file", "path": "gone.txt"}),
             )
             .await;
-        let rollback_json: Value = serde_json::from_str(&rollback).unwrap();
+        let rollback_json: Value = serde_json::from_str(&rollback)
+            .unwrap_or_else(|error| panic!("rollback output should be JSON: {error}; {rollback}"));
         assert_eq!(
             rollback_json["success"].as_bool(),
             Some(true),
@@ -5530,6 +5442,14 @@ esac
             .await;
         assert!(result.is_error, "got: {}", result.output);
         assert!(result.output.contains("exit code: 42"));
+        assert_eq!(
+            result
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("exit_code"))
+                .and_then(Value::as_i64),
+            Some(42)
+        );
     }
 
     #[tokio::test]
@@ -6000,7 +5920,7 @@ esac
     }
 
     #[tokio::test]
-    async fn session_enter_plan_retired_action_is_unknown() {
+    async fn session_enter_plan_unknown_action_is_unknown() {
         let (exec, _dir) = test_executor();
         let result = exec
             .execute("session", &json!({"action": "enter_plan"}))
@@ -6027,7 +5947,7 @@ esac
     // ── Git operations ─────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn git_status_in_non_git_dir_returns_error() {
+    async fn git_action_status_in_non_git_dir_returns_error() {
         let (exec, _dir) = test_executor();
         let result = exec.execute("git", &json!({"action": "status"})).await;
         assert!(result.contains("Error:") || result.contains("fatal"));
@@ -6059,7 +5979,7 @@ esac
     }
 
     #[tokio::test]
-    async fn git_log_caps_at_100() {
+    async fn git_action_log_caps_at_100() {
         let (exec, dir) = test_executor();
         // Initialize a git repo
         std::process::Command::new("git")
@@ -6096,19 +6016,20 @@ esac
     }
 
     #[tokio::test]
-    async fn git_helper_aliases_are_not_executable_on_server_executor() {
+    async fn git_helper_style_names_are_not_executable_on_server_executor() {
         let (exec, _dir) = test_executor();
-        for name in [
-            "git_status",
-            "git_diff",
-            "git_log",
-            "git_show",
-            "git_blame",
-            "git_file_history",
-            "git_log_search",
-            "git_contributors",
-        ] {
-            let result = exec.execute_with_metadata(name, &json!({})).await;
+        let actions = [
+            "status",
+            "diff",
+            "log",
+            "show",
+            "blame",
+            "file_history",
+            "log_search",
+            "contributors",
+        ];
+        for name in actions.into_iter().map(|action| format!("git_{action}")) {
+            let result = exec.execute_with_metadata(&name, &json!({})).await;
             assert!(result.is_error, "{name}: {result:?}");
             let metadata = result.metadata.as_ref().expect("metadata should exist");
             assert_eq!(
@@ -6124,29 +6045,6 @@ esac
                 "{name}: {result:?}"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn standalone_delegate_is_not_executable_on_server_executor() {
-        let (exec, _dir) = test_executor();
-        let result = exec
-            .execute_with_metadata("delegate", &json!({"task": "review this"}))
-            .await;
-
-        assert!(result.is_error, "{result:?}");
-        let metadata = result.metadata.as_ref().expect("metadata should exist");
-        assert_eq!(
-            metadata.get("capability_denial").and_then(Value::as_str),
-            Some("UnknownTool"),
-            "{result:?}"
-        );
-        assert!(
-            metadata
-                .get("execution_started")
-                .and_then(Value::as_bool)
-                .is_some_and(|started| !started),
-            "{result:?}"
-        );
     }
 
     #[tokio::test]
@@ -6216,7 +6114,7 @@ esac
         exec.set_turn_index(11);
 
         let result = exec
-            .execute_with_metadata("mo", &json!({"sql": "UPDATE metrics SET value = 1"}))
+            .execute_with_metadata("mo_query", &json!({"sql": "UPDATE metrics SET value = 1"}))
             .await;
         assert!(!result.is_error, "got: {}", result.output);
         let fields = result.metadata.as_ref().expect("mo_query metadata");
@@ -6287,17 +6185,18 @@ esac
     }
 
     #[tokio::test]
-    async fn github_helper_aliases_are_not_executable_on_server_executor() {
+    async fn github_helper_style_names_are_not_executable_on_server_executor() {
         let (exec, _dir) = test_executor();
-        for name in [
-            "github_list_prs",
-            "github_get_pr",
-            "github_ci_status",
-            "github_list_issues",
-            "github_get_issue",
-            "github_repo_stats",
-        ] {
-            let result = exec.execute_with_metadata(name, &json!({})).await;
+        let actions = [
+            "list_prs",
+            "get_pr",
+            "ci_status",
+            "list_issues",
+            "get_issue",
+            "repo_stats",
+        ];
+        for name in actions.into_iter().map(|action| format!("github_{action}")) {
+            let result = exec.execute_with_metadata(&name, &json!({})).await;
             assert!(result.is_error, "{name}: {result:?}");
             let metadata = result.metadata.as_ref().expect("metadata should exist");
             assert_eq!(
@@ -7261,7 +7160,7 @@ esac
     }
 
     #[tokio::test]
-    async fn exit_plan_mode_approved_does_not_reuse_retired_cli_style_plan_tree() {
+    async fn exit_plan_mode_approved_does_not_reuse_stale_cli_style_plan_tree() {
         let repo = Arc::new(InMemoryPlanRepo::new());
         let mut state = astra_plan::PlanModeState::new_with_owner(
             "ship user-visible plan".into(),
@@ -7335,7 +7234,7 @@ esac
             approved_plan_tasks
                 .iter()
                 .all(|task| task.subtasks.len() == 1),
-            "retired tree-shaped history should remain untouched while approval is pending: {approved_plan_tasks:?}"
+            "stale tree-shaped history should remain untouched while approval is pending: {approved_plan_tasks:?}"
         );
     }
 
@@ -7723,7 +7622,7 @@ esac
                     .and_then(serde_json::Value::as_str)
                     == Some(stale_fingerprint.as_str())
             })
-            .expect("stale retired task remains");
+            .expect("stale task remains");
         assert!(
             verify
                 .subtasks
@@ -7968,12 +7867,8 @@ esac
     }
 
     #[test]
-    fn with_task_store_preserves_tool_preferences_entries() {
-        // ToolPreferences is a store-independent action and must survive
-        // a task-store swap. (Compression / ConfigOverride carry an
-        // ObservabilitySession snapshot that's not trivially constructible
-        // in a unit test, so we exercise the retain predicate via the
-        // simpler ToolPreferences variant.)
+    fn with_task_store_preserves_compression_entries() {
+        // Compression is store-independent and must survive a task-store swap.
         let (exec, _dir) = test_executor();
 
         tool_session_state_rollback::record(
@@ -7992,10 +7887,21 @@ esac
         tool_session_state_rollback::record(
             exec.session_state_journal.as_ref(),
             exec.journal_turn_index.load(Ordering::Relaxed),
-            "prefs-seed".to_string(),
-            SessionStateRollbackAction::ToolPreferences {
-                previous_pinned_tools: vec!["bash".into()],
-                previous_deprioritized_tools: vec![],
+            "compression-seed".to_string(),
+            SessionStateRollbackAction::Compression {
+                turn: 1,
+                snapshot: crate::observability::ObservabilitySessionRollbackSnapshot {
+                    config: astra_config::runtime_config::RuntimeConfig::default(),
+                    original_query: None,
+                    recent_queries: vec![],
+                    compressed_turns: vec![],
+                    user_corrections: vec![],
+                    context_traces: vec![],
+                    drift_min_severity_threshold: 0.5,
+                    drift_analysis_window: 5,
+                    last_reported_drift_turn: None,
+                    last_query_at: None,
+                },
             },
         );
         assert_eq!(
@@ -8010,11 +7916,11 @@ esac
         assert_eq!(
             surviving.len(),
             1,
-            "exactly the ToolPreferences entry should survive"
+            "exactly the Compression entry should survive"
         );
         assert!(matches!(
             surviving[0].action,
-            SessionStateRollbackAction::ToolPreferences { .. }
+            SessionStateRollbackAction::Compression { .. }
         ));
     }
 

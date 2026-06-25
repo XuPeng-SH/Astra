@@ -98,7 +98,7 @@ impl ThinClient {
         })
     }
 
-    /// Shared `reqwest::Client` (TLS / proxy policy aligned with thin API). For optional in-library LLM tool selection and ad-hoc calls to other origins (e.g. Memoria health).
+    /// Shared `reqwest::Client` (TLS / proxy policy aligned with thin API). For optional in-library LLM tool surface and ad-hoc calls to other origins (e.g. Memoria health).
     pub fn http_client(&self) -> &Client {
         &self.http
     }
@@ -694,22 +694,6 @@ impl ThinClient {
             .get(url)
             .headers(Self::bearer_headers(token)?)
             .query(query)
-            .send()
-            .await?;
-        Self::text_or_api(resp).await
-    }
-
-    pub async fn post_skills_register_json(
-        &self,
-        token: &str,
-        body: &Value,
-    ) -> Result<String, ThinClientError> {
-        let url = self.url(paths::SKILLS)?;
-        let resp = self
-            .http
-            .post(url)
-            .headers(Self::bearer_headers(token)?)
-            .json(body)
             .send()
             .await?;
         Self::text_or_api(resp).await

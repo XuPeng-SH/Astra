@@ -938,7 +938,7 @@ mod tests {
     fn always_enabled_for_untrusted_workspace_benign_request() {
         let cell = ApprovalCell::new(
             1,
-            "git_show".into(),
+            "git".into(),
             "Git show HEAD".into(),
             None,
             "This command needs your approval before it runs.".into(),
@@ -1030,7 +1030,7 @@ mod tests {
         );
         assert!(
             !rendered.contains("Match:"),
-            "selection hint must not reuse the retired match-target label, got:\n{rendered}"
+            "selection hint must not reuse the blocked match-target label, got:\n{rendered}"
         );
     }
 

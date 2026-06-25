@@ -64,16 +64,6 @@ pub fn trailing_identical_sig_depth(turn_sigs: &[BTreeSet<String>]) -> usize {
 /// Call sites append the actual budget number, e.g. `format!("{} (budget: {} turns)", MSG, n)`.
 pub const CLI_AGENTIC_TURN_BUDGET_STALL_ABORT_MSG: &str = "Turn budget exhausted. To increase, set ASTRA_MAX_TURNS (interactive) or ASTRA_PLAN_SUBTASK_MAX_TURNS (plan subtasks).";
 
-/// User-visible error when the legacy in-process bridge exhausts the tool-round budget.
-pub fn cli_agentic_tool_round_budget_abort_msg(current_limit: usize) -> String {
-    format!(
-        "Tool-round budget exhausted (limit: {}). The circuit breaker terminated this turn \
-         due to detected stall or regression. To increase the ceiling, set \
-         `circuit_breaker_absolute_max_rounds` in your runtime config.",
-        current_limit,
-    )
-}
-
 /// Maximum consecutive exploration-only rounds before triggering correction.
 /// Lowered from 8→5→3: with auto-expanding read_file (full-file on 2nd+ ranged
 /// read) and EdgeToolCache dedup, agents need fewer exploration rounds.
@@ -448,32 +438,30 @@ pub fn assess_progress(
     }
 }
 
-/// Legacy wrapper kept for backward compatibility with existing call sites
-/// (TurnGuard). Now delegates to [`assess_progress`]: only `NoProgress`
-/// flips to `Diverging` (the single state that warrants injecting a
-/// correction). `LowNovelty` maps to `Exploring` (surfaced as a hint,
-/// not a correction), and `Healthy` maps to `Healthy`.
+/// Detect divergence using the default exploration window.
 ///
-/// The `exploration_round_budget` parameter is retained as the window
-/// size so callers that tuned the round count continue to work.
+/// Delegates to [`assess_progress`]: only `NoProgress` flips to
+/// `Diverging` (the single state that warrants injecting a correction).
+/// `LowNovelty` maps to `Exploring` (surfaced as a hint, not a correction),
+/// and `Healthy` maps to `Healthy`.
 pub fn detect_divergence(
     tool_sigs: &[BTreeSet<String>],
 ) -> Result<DivergenceStatus, StallDetectionError> {
-    detect_divergence_with_budget(tool_sigs, MAX_EXPLORATION_ROUNDS)
+    detect_divergence_with_window(tool_sigs, MAX_EXPLORATION_ROUNDS)
 }
 
-pub fn detect_divergence_with_budget(
+pub fn detect_divergence_with_window(
     tool_sigs: &[BTreeSet<String>],
-    exploration_round_budget: usize,
+    exploration_round_window: usize,
 ) -> Result<DivergenceStatus, StallDetectionError> {
-    match assess_progress(tool_sigs, exploration_round_budget)? {
+    match assess_progress(tool_sigs, exploration_round_window)? {
         ProgressStatus::Healthy => Ok(DivergenceStatus::Healthy),
         ProgressStatus::LowNovelty(_) => {
             // Report as Exploring (hint-only); callers should NOT inject
             // a correction — the agent may be doing legitimate analysis.
-            Ok(DivergenceStatus::Exploring(exploration_round_budget))
+            Ok(DivergenceStatus::Exploring(exploration_round_window))
         }
-        ProgressStatus::NoProgress => Ok(DivergenceStatus::Diverging(exploration_round_budget)),
+        ProgressStatus::NoProgress => Ok(DivergenceStatus::Diverging(exploration_round_window)),
     }
 }
 
@@ -502,7 +490,7 @@ pub struct StallReflection {
     pub what_to_try: String,
     /// Confidence in the diagnosis (0.0-1.0).
     pub confidence: f64,
-    /// Tools to avoid (deprioritized or repeatedly failing).
+    /// Tools to avoid (under health avoidance or repeatedly failing).
     pub avoid_tools: Vec<String>,
 }
 
@@ -528,7 +516,7 @@ impl StallReflection {
 /// Analyze stall history and build a structured reflection.
 ///
 /// `tool_sigs`: per-turn tool signatures (name:args sets).
-/// `error_tools`: tools that have been deprioritized due to repeated errors.
+/// `error_tools`: tools that have active health avoidance due to repeated errors.
 /// `nudge_count`: how many nudges have been sent already (escalation).
 pub fn build_stall_reflection(
     tool_sigs: &[BTreeSet<String>],
@@ -783,9 +771,7 @@ fn tools_relate_to_intent(
             || query_lower.contains("review")
             || query_lower.contains("diff")
             || query_lower.contains("blame"))
-            && tool_names
-                .iter()
-                .any(|n| n.starts_with("git_") || n == "bash")
+            && tool_names.iter().any(|n| n == "git" || n == "bash")
     }
 }
 
@@ -872,16 +858,6 @@ mod tests {
         assert_eq!(
             trailing_identical_sig_depth(&[BTreeSet::new(), BTreeSet::new()]),
             0
-        );
-    }
-
-    #[test]
-    fn tool_round_abort_message_points_to_tool_round_limit() {
-        assert_eq!(
-            cli_agentic_tool_round_budget_abort_msg(30),
-            "Tool-round budget exhausted (limit: 30). The circuit breaker terminated this turn \
-             due to detected stall or regression. To increase the ceiling, set \
-             `circuit_breaker_absolute_max_rounds` in your runtime config."
         );
     }
 
@@ -1038,7 +1014,7 @@ mod tests {
 
     #[test]
     fn divergence_healthy_productive() {
-        let sigs = make_sigs(&[&["github_list_prs"], &["memory"]]);
+        let sigs = make_sigs(&[&["github"], &["memory"]]);
         assert_eq!(detect_divergence(&sigs).unwrap(), DivergenceStatus::Healthy);
     }
 
@@ -1100,7 +1076,7 @@ mod tests {
         let sigs = make_sigs(&[
             &["bash"],
             &["list_dir"],
-            &["github_list_prs"],
+            &["github"],
             &["bash"],
             &["list_dir"],
         ]);
@@ -1262,13 +1238,9 @@ mod tests {
 
     #[test]
     fn reflection_non_exploration_stall() {
-        let sigs = make_sigs(&[
-            &["github_list_prs"],
-            &["github_list_prs"],
-            &["github_list_prs"],
-        ]);
+        let sigs = make_sigs(&[&["github"], &["github"], &["github"]]);
         let reflection = build_stall_reflection(&sigs, &[], 0);
-        assert!(reflection.what_happened.contains("github_list_prs"));
+        assert!(reflection.what_happened.contains("github"));
         assert!(reflection.what_to_try.contains("different"));
         assert!(reflection.confidence >= 0.6);
     }
@@ -1327,15 +1299,15 @@ mod tests {
     #[test]
     fn reflection_includes_error_tools() {
         let sigs = make_sigs(&[&["read_file"], &["bash"], &["read_file"]]);
-        let reflection = build_stall_reflection(&sigs, &["bash", "git_log"], 0);
+        let reflection = build_stall_reflection(&sigs, &["bash", "git"], 0);
         assert!(reflection.avoid_tools.contains(&"bash".to_string()));
-        assert!(reflection.avoid_tools.contains(&"git_log".to_string()));
+        assert!(reflection.avoid_tools.contains(&"git".to_string()));
     }
 
     #[test]
     fn reflection_to_nudge_message_format() {
         let sigs = make_sigs(&[&["bash"], &["bash"], &["bash"]]);
-        let reflection = build_stall_reflection(&sigs, &["git_log"], 0);
+        let reflection = build_stall_reflection(&sigs, &["git"], 0);
         let msg = reflection.to_nudge_message();
         assert!(msg.contains("REFLECTION"));
         assert!(msg.contains("What happened:"));
@@ -1361,7 +1333,7 @@ mod tests {
 
     #[test]
     fn nudge_ignored_detects_violation() {
-        let avoid = vec!["bash".to_string(), "git_log".to_string()];
+        let avoid = vec!["bash".to_string(), "git".to_string()];
         let mut used = std::collections::HashSet::new();
         used.insert("bash".to_string());
         used.insert("memory".to_string());
@@ -1404,9 +1376,9 @@ mod tests {
     #[test]
     fn intent_drift_on_task_when_tools_match_query() {
         let turns = make_intent_turns(&[
-            (&["git_log"], ""),
-            (&["git_show"], r#"{"commit":"abc123"}"#),
-            (&["git_diff"], r#"{"commit":"abc123"}"#),
+            (&["git"], r#"{"action":"log"}"#),
+            (&["git"], r#"{"action":"show","revision":"abc123"}"#),
+            (&["git"], r#"{"action":"diff","ref":"abc123"}"#),
         ]);
         let result = detect_intent_drift("review 最新的commit", &turns);
         assert_eq!(result, IntentDrift::OnTask);
@@ -1416,7 +1388,7 @@ mod tests {
     fn intent_drift_detected_when_unrelated_tools() {
         // User asked to review a commit, but agent writes a skill file
         let turns = make_intent_turns(&[
-            (&["git_log"], ""),
+            (&["git"], r#"{"action":"log"}"#),
             (&["write_file"], r#"{"path":"skills/web_search.py"}"#),
             (&["list_dir"], r#"{"path":"skills/"}"#),
             (&["write_file"], r#"{"path":"skills/test.py"}"#),
@@ -1429,7 +1401,7 @@ mod tests {
     fn intent_drift_not_triggered_below_window() {
         // Only 2 off-task turns (below INTENT_DRIFT_WINDOW=3)
         let turns = make_intent_turns(&[
-            (&["git_log"], ""),
+            (&["git"], r#"{"action":"log"}"#),
             (&["write_file"], r#"{"path":"random.txt"}"#),
             (&["list_dir"], r#"{"path":"random/"}"#),
         ]);
@@ -1443,7 +1415,7 @@ mod tests {
         let turns = make_intent_turns(&[
             (&["write_file"], r#"{"path":"random.txt"}"#),
             (&["list_dir"], r#"{"path":"random/"}"#),
-            (&["git_show"], r#"{"commit":"abc"}"#), // on-task: resets counter
+            (&["git"], r#"{"action":"show","revision":"abc"}"#), // on-task: resets counter
             (&["write_file"], r#"{"path":"random2.txt"}"#),
             (&["list_dir"], r#"{"path":"random2/"}"#),
         ]);
@@ -1539,7 +1511,7 @@ mod tests {
     #[test]
     fn intent_drift_correction_includes_user_query() {
         let turns = make_intent_turns(&[
-            (&["write_file"], "skill.py"),
+            (&["write_file"], "SKILL.md"),
             (&["write_file"], "test.py"),
             (&["list_dir"], "skills/"),
         ]);
@@ -1892,26 +1864,26 @@ mod tests {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    //  detect_divergence_with_budget — custom budgets
+    //  detect_divergence_with_window — custom windows
     // ══════════════════════════════════════════════════════════════════════
 
     #[test]
     fn divergence_with_budget_2_triggers_at_exact_repeat() {
-        // New semantics: window=2 budget, both rounds identical sig → Diverging.
+        // New semantics: window=2, both rounds identical sig → Diverging.
         let sigs = make_sigs(&[&["bash"], &["bash"]]);
         assert!(matches!(
-            detect_divergence_with_budget(&sigs, 2).unwrap(),
+            detect_divergence_with_window(&sigs, 2).unwrap(),
             DivergenceStatus::Diverging(_)
         ));
     }
 
     #[test]
     fn divergence_with_budget_2_distinct_rounds_healthy() {
-        // New semantics: two distinct rounds within budget=2 → Healthy
+        // New semantics: two distinct rounds within window=2 → Healthy
         // (novelty = 2/2 = 100%).
         let sigs = make_sigs(&[&["bash"], &["read_file"]]);
         assert_eq!(
-            detect_divergence_with_budget(&sigs, 2).unwrap(),
+            detect_divergence_with_window(&sigs, 2).unwrap(),
             DivergenceStatus::Healthy
         );
     }
@@ -1921,7 +1893,7 @@ mod tests {
         // window=1 → a single round trivially equals itself → Diverging.
         let sigs = make_sigs(&[&["bash"]]);
         assert!(matches!(
-            detect_divergence_with_budget(&sigs, 1).unwrap(),
+            detect_divergence_with_window(&sigs, 1).unwrap(),
             DivergenceStatus::Diverging(_)
         ));
     }
@@ -1931,7 +1903,7 @@ mod tests {
         // Not enough history to judge → Healthy (new semantics).
         let sigs = make_sigs(&[&["bash"], &["read_file"]]);
         assert_eq!(
-            detect_divergence_with_budget(&sigs, 10).unwrap(),
+            detect_divergence_with_window(&sigs, 10).unwrap(),
             DivergenceStatus::Healthy
         );
     }
@@ -1939,7 +1911,7 @@ mod tests {
     #[test]
     fn divergence_with_budget_empty_sigs() {
         assert_eq!(
-            detect_divergence_with_budget(&[], 5).unwrap(),
+            detect_divergence_with_window(&[], 5).unwrap(),
             DivergenceStatus::Healthy
         );
     }
@@ -1947,7 +1919,7 @@ mod tests {
     #[test]
     fn divergence_with_budget_zero_is_error() {
         assert_eq!(
-            detect_divergence_with_budget(&[], 0),
+            detect_divergence_with_window(&[], 0),
             Err(StallDetectionError::InvalidWindowOrBudget(0))
         );
     }
@@ -2016,11 +1988,7 @@ mod tests {
 
     #[test]
     fn reflection_non_exploration_escalation_with_nudge() {
-        let sigs = make_sigs(&[
-            &["github_list_prs"],
-            &["github_list_prs"],
-            &["github_list_prs"],
-        ]);
+        let sigs = make_sigs(&[&["github"], &["github"], &["github"]]);
         let r = build_stall_reflection(&sigs, &[], 1);
         assert!(
             r.what_to_try.contains("STOP"),
@@ -2141,9 +2109,9 @@ mod tests {
     #[test]
     fn intent_drift_all_on_task_git_tools() {
         let turns = make_intent_turns(&[
-            (&["git_log"], ""),
-            (&["git_diff"], "abc"),
-            (&["git_show"], "def"),
+            (&["git"], r#"{"action":"log"}"#),
+            (&["git"], r#"{"action":"diff","ref":"abc"}"#),
+            (&["git"], r#"{"action":"show","revision":"def"}"#),
             (&["bash"], r#"git blame file.rs"#),
         ]);
         assert_eq!(

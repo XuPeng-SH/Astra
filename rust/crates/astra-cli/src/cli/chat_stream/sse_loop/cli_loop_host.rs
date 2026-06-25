@@ -1,6 +1,6 @@
 //! CLI implementation of [`AgenticLoopHost`].
 //!
-//! Wraps CLI-specific concerns (tool executor, permission manager, selector,
+//! Wraps CLI-specific concerns (tool executor, permission manager, tool surface,
 //! skill registry, terminal rendering) behind the runtime trait so the
 //! multi-turn loop runs in the runtime crate.
 
@@ -138,6 +138,7 @@ pub(crate) struct CliAgenticLoopHost<'a> {
     pub term_width: usize,
     pub render_policy: RenderPolicy,
     pub message: &'a str,
+    pub semantic_query_override: Option<&'a str>,
     pub history: &'a [(String, String)],
     pub recent_tools: &'a [String],
     pub project_root: PathBuf,
@@ -276,12 +277,6 @@ impl CliAgenticLoopHost<'_> {
             std::io::stdin().is_terminal(),
         )
     }
-
-    /// Backwards-compatible inherent alias used by existing call sites
-    /// inside this module. Delegates to `turn_interaction_mode_inherent`.
-    fn turn_interaction_mode(&self) -> TurnInteractionMode {
-        self.turn_interaction_mode_inherent()
-    }
 }
 
 fn deferred_input_status_line(input: &Value) -> Option<String> {
@@ -375,8 +370,8 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
     ) -> Result<HostTurnResult, astra_core::ClassifiedError> {
         let assembly_start = Instant::now();
 
-        // Preserve the lifecycle-created collector: it may already contain the
-        // initial skill selector shortlist for this turn.
+        // Preserve the lifecycle-created collector: it may already contain
+        // turn setup trace data.
         let turn_id = format!("turn-{}", self.chat_turn_index);
         let session_id = state.current_session_id.clone().unwrap_or_default();
         if let Some(ref collector) = state.telemetry.turn_trace_collector {
@@ -438,7 +433,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             state.push_volatile(
                 astra_runtime::turn::agentic_loop::host::VolatileKind::PlanModeMarker,
                 format!(
-                    "[mode={mode_after}] User pressed Shift+Tab; permission mode is now `{mode_after}`. Adjust your tool selection accordingly."
+                    "[mode={mode_after}] User pressed Shift+Tab; permission mode is now `{mode_after}`. Adjust your tool surface accordingly."
                 ),
             );
         }
@@ -498,7 +493,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             .filter(|content| !content.trim().is_empty())
             .collect::<Vec<_>>();
 
-        let interaction_mode = self.turn_interaction_mode();
+        let interaction_mode = self.turn_interaction_mode_inherent();
         let interaction_scoped_restrictions =
             interaction_scoped_tool_restrictions(interaction_mode);
         state
@@ -567,7 +562,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             term_width: self.term_width,
             render_policy: self.render_policy,
             message: self.message,
-            semantic_query_override: None,
+            semantic_query_override: self.semantic_query_override,
             history: self.history,
             recent_tools: self.recent_tools,
             project_root: self.project_root.as_path(),
@@ -582,25 +577,19 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             valid_tool_names: &mut self.valid_tool_names,
             turn_guard: &state.turn_guard,
             restricted_tools: &mut state.restricted_tools,
-            widen_selection_pending: &mut state.widen_selection_pending,
+            widen_surface_pending: &mut state.widen_surface_pending,
             step_recorder: &mut state.step_recorder,
             file_context: &self.file_context,
             assembly_start,
             telem: PrepareTurnTelemetry {
                 first_memoria_ms: &mut state.telemetry.first_memoria_ms,
-                first_selection_report: &mut state.telemetry.first_selection_report,
+                first_surface_report: &mut state.telemetry.first_surface_report,
                 first_budget_pressure: &mut state.telemetry.first_budget_pressure,
                 first_context_assembly_ms: &mut state.telemetry.first_context_assembly_ms,
                 all_selected_skills: &mut state.telemetry.all_selected_skills,
-                initial_skill_selector_shortlist: state
-                    .telemetry
-                    .initial_skill_selector_shortlist
-                    .as_ref()
-                    .and_then(|shortlist| serde_json::to_value(shortlist).ok()),
                 trace_collector: state.telemetry.turn_trace_collector.as_ref(),
             },
             perm_manager: self.perm_manager,
-            skill_search: &state.skills.search,
             pre_clear_lines: pre_clear,
             is_plan_subtask: self.is_plan_subtask,
             plan_subtask_id: self.plan_subtask_id,
@@ -612,7 +601,6 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             skill_resolver: state.skills.resolver.clone(),
             skill_effort: state.skills.effort.as_ref().map(|e| e.to_string()),
             skill_agent_type: state.skills.agent_type.clone(),
-            tool_budget_override: state.tool_budget_override,
             interaction_mode,
             turn_policy: &mut state.last_turn_policy,
             skill_allowed_tools: state
@@ -763,7 +751,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
                         calls: h.total_calls as u32,
                         errors: h.total_failures as u32,
                         avg_ms: 0,
-                        deprioritized: h.deprioritized,
+                        avoidance_advised: h.avoidance_advised,
                         consecutive_failures: h.consecutive_failures as u32,
                         last_failure_category: None,
                     })
@@ -819,7 +807,9 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
                         .forced_redundant_reads_corrective,
                     forced_cache_waste_corrective: state.stall.forced_cache_waste_corrective,
                     forced_search_fanout_corrective: state.stall.forced_search_fanout_corrective,
-                    forced_exploration_family_phase2: state.stall.forced_exploration_family_phase2,
+                    forced_exploration_family_lockout: state
+                        .stall
+                        .forced_exploration_family_lockout,
                     forced_exploration_family_corrective: state
                         .stall
                         .forced_exploration_family_corrective,
@@ -955,6 +945,11 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             return ControlToolRecovery::Unsupported;
         }
         let Some(spawn_context) = self.executor.spawn_context.as_ref() else {
+            tracing::warn!(
+                target: "astra_cli::agentic_loop_host",
+                tool_call_id,
+                "agent_fanout recovery skipped: missing spawn context"
+            );
             return ControlToolRecovery::Missing;
         };
         let Some(parent_run_id) = parent_run_id else {
@@ -1113,8 +1108,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         // Bug B step 3: capture the parent turn's cacheable prefix
         // so subsequent agent-spawn / delegate calls can inherit it
         // for prompt-cache reuse. No-op unless:
-        //   - the `prefix_store` Arc was plumbed in (CLI startup
-        //     sets this on every host when fork_prefix.enabled)
+        //   - the `prefix_store` Arc was plumbed in by the host
         //   - ingest populated the expected state fields
         let Some(store) = self.prefix_store.as_ref() else {
             return;

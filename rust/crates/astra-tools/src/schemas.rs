@@ -20,7 +20,30 @@ pub const SERVER_RUN_SCRIPT_RPC_TOOL_NAMES: &[&str] = &[
 ];
 
 pub fn all_tool_schemas() -> Vec<Value> {
-    all_tool_schemas_with_env(|k| std::env::var(k).ok())
+    let mut schemas = all_tool_schemas_core();
+    enforce_task_schema_unknown_field_contract(&mut schemas);
+    // run_script is Unix-only (UDS RPC transport). Always exposed on Unix;
+    // there is no environment gate for production tools.
+    #[cfg(unix)]
+    {
+        schemas.push(run_script_schema_default());
+    }
+    schemas.push(json!({
+        "type": "function",
+        "function": {
+            "name": "powershell",
+            "description": "Execute a PowerShell command. Use for Windows shell tasks, pwsh scripts, and cross-platform automation when PowerShell syntax is preferred over bash. PREFER dedicated tools (git, glob, grep, read_file, write_file, str_replace) over shell commands when they cover the operation.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "PowerShell command to run"},
+                    "timeout": {"type": "number", "description": "Timeout in seconds (default 120). Pass a larger value for long-running builds/tests (e.g. 300 for cargo build, 600 for full test suites)."}
+                },
+                "required": ["command"]
+            }
+        }
+    }));
+    schemas
 }
 
 /// Check whether a tool name has a corresponding schema in the built-in
@@ -51,38 +74,6 @@ pub fn narrow_run_script_for_server(schemas: &mut [Value]) {
     }
 }
 
-/// Like `all_tool_schemas()` but reads env via a caller-supplied closure.
-/// The `env` parameter is currently unused (all gated tools have been
-/// removed) but kept for forward compatibility with future per-env
-/// opt-in surfaces.
-pub fn all_tool_schemas_with_env<F: Fn(&str) -> Option<String>>(env: F) -> Vec<Value> {
-    let _ = env; // reserved for future env-gated tools
-    let mut schemas = all_tool_schemas_core();
-    enforce_task_schema_unknown_field_contract(&mut schemas);
-    // run_script is Unix-only (UDS RPC transport). Always exposed on Unix —
-    // no env gate, this is the production tool.
-    #[cfg(unix)]
-    {
-        schemas.push(run_script_schema_default());
-    }
-    schemas.push(json!({
-        "type": "function",
-        "function": {
-            "name": "powershell",
-            "description": "Execute a PowerShell command. Use for Windows shell tasks, pwsh scripts, and cross-platform automation when PowerShell syntax is preferred over bash. PREFER dedicated tools (git, glob, grep, read_file, write_file, str_replace) over shell commands when they cover the operation.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string", "description": "PowerShell command to run"},
-                    "timeout": {"type": "number", "description": "Timeout in seconds (default 120). Pass a larger value for long-running builds/tests (e.g. 300 for cargo build, 600 for full test suites)."}
-                },
-                "required": ["command"]
-            }
-        }
-    }));
-    schemas
-}
-
 fn enforce_task_schema_unknown_field_contract(schemas: &mut [Value]) {
     if let Some(task) = schemas.iter_mut().find(|schema| {
         schema
@@ -110,10 +101,9 @@ fn enforce_task_schema_unknown_field_contract(schemas: &mut [Value]) {
     }
 }
 
-/// Default `run_script` schema exposed when the caller has not yet wired
-/// session-specific priority/enabled-tool hints. Uses the full sandbox
-/// allowlist + Project mode + neutral priority. Sites that know the session
-/// context (manifest_loader, repl_turn) should call
+/// Default `run_script` schema exposed when the caller has not yet supplied
+/// a session-specific enabled-tool set. Uses the full RPC allowlist in
+/// Project mode. Sites that know the session context should call
 /// `run_script::build_run_script_schema` directly for a tighter schema.
 #[cfg(unix)]
 fn run_script_schema_default() -> Value {
@@ -127,11 +117,7 @@ fn run_script_schema_for(enabled_tool_names: &[&str]) -> Value {
         .iter()
         .map(|s| (*s).to_string())
         .collect();
-    crate::run_script::build_run_script_schema(
-        &enabled,
-        crate::run_script::ExecutionMode::Project,
-        crate::run_script::PriorityHint::Neutral,
-    )
+    crate::run_script::build_run_script_schema(&enabled, crate::run_script::ExecutionMode::Project)
 }
 
 fn all_tool_schemas_core() -> Vec<Value> {
@@ -248,6 +234,24 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "single": ["path", "old_str", "new_str"],
                         "batch_same_file": ["path", "edits"],
                         "batch_multi_file": ["edits[].path", "edits[].old_str", "edits[].new_str"]
+                    }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "rollback_file_edits",
+                "description": "List or restore file edits recorded by write_file and str_replace. Use scope=current_turn to undo this turn's recorded file edits, scope=file with path to restore the latest recorded edit for one file, scope=turn with turn_index to restore a previous turn, or scope=list to inspect available file edit rollback entries.",
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "scope": {"type": "string", "enum": ["current_turn","turn","file","list"], "description": "Rollback scope. Defaults to current_turn; path implies file scope."},
+                        "path": {"type": "string", "description": "File path for scope=file."},
+                        "turn_index": {"type": "integer", "description": "Turn index for scope=turn."},
+                        "file_after_sequence": {"type": "integer", "description": "Only restore file edits recorded after this journal sequence."},
+                        "after_sequence": {"type": "integer", "description": "Alias for file_after_sequence."}
                     }
                 }
             }
@@ -451,7 +455,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         },
                         "query": {
                             "type": "string",
-                            "description": "Search query (TF-IDF over commit messages). Used by: log_search (required)."
+                            "description": "Commit-message search query. Used by: log_search (required)."
                         },
                         "since": {
                             "type": "string",
@@ -521,7 +525,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                     "type": "object",
                     "properties": {
                         "action": {"type": "string", "enum": ["list_prs","get_pr","ci_status","repo_stats","list_issues","get_issue","create_issue"], "description": "GitHub operation"},
-                        "repo": {"type": "string", "description": "owner/name or bare name (e.g. 'anthropics/claude-code' or 'memoria'). Inferred from current git remote when omitted."},
+                        "repo": {"type": "string", "description": "owner/name or bare name (e.g. 'anthropics/reference-agent' or 'memoria'). Inferred from current git remote when omitted."},
                         "pr_number": {"type": "integer", "description": "PR number. REQUIRED when action=get_pr or action=ci_status."},
                         "issue_number": {"type": "integer", "description": "Issue number. REQUIRED when action=get_issue."},
                         "title": {"type": "string", "description": "Issue title. REQUIRED when action=create_issue."},
@@ -626,18 +630,15 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "session",
-                "description": "Session lifecycle and introspection. Actions grouped by category:\n  Config: `config`(set key=value), `prioritize`/`deprioritize`(tool priority).\n  Lifecycle: `set_goal`, `compact`(compress context), `rollback_edits`(revert file changes to previous turn), `sleep`(pause, max 300s).\n  History: `timeline`, `summary`, `history_page`, `history_search`, `history_around` — use when the user refers to older turns and visible context is insufficient.\nFor plan mode use the dedicated `enter_plan_mode`/`exit_plan_mode` tools — they are not session sub-actions. Use `ask_user` for user questions.",
+                "description": "Session lifecycle and history. Actions: config(path+value), sleep, history_page, history_search, history_around. Use dedicated tools for file rollback (`rollback_file_edits`), session-state rollback (`rollback_session_state`), context compression (`compress_context`), plan mode (`enter_plan_mode`/`exit_plan_mode`), and user questions (`ask_user`).",
                 "parameters": {
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
-                        "action": {"type": "string", "enum": ["config","prioritize","deprioritize","set_goal","compact","rollback_edits","sleep","timeline","summary","history_page","history_search","history_around"]},
-                        "key": {"type": "string", "description": "Config key"},
+                        "action": {"type": "string", "enum": ["config","sleep","history_page","history_search","history_around"]},
+                        "path": {"type": "string", "description": "Config path for action=config."},
                         "value": {"type": "string", "description": "Config value"},
-                        "tool": {"type": "string", "description": "Tool name (prioritize/deprioritize)"},
-                        "goal": {"type": "string", "description": "Goal text"},
-                        "scope": {"type": "string", "enum": ["current_turn","turn","file","list"], "description": "Rollback scope"},
-                        "path": {"type": "string", "description": "File path (rollback scope=file)"},
-                        "turn_index": {"type": "integer", "description": "Turn index (rollback scope=turn)"},
+                        "force": {"type": "boolean", "description": "Override config drift/mutation governor for action=config."},
                         "duration_ms": {"type": "integer", "description": "Sleep ms, max 300000"},
                         "reason": {"type": "string", "description": "Reason (sleep)"},
                         "pattern": {"type": "string", "description": "history_search search text: compact topic, phrase, filename, error text, decision, or Chinese/English keyword."},
@@ -653,40 +654,9 @@ fn all_tool_schemas_core() -> Vec<Value> {
                     "required": ["action"],
                     "x-astra-per-action-required": {
                         "config": ["path", "value"],
-                        "prioritize": ["tool"],
-                        "deprioritize": ["tool"],
-                        "history_search": ["pattern"]
+                        "history_search": ["pattern"],
+                        "history_around": ["item_seq"]
                     }
-                }
-            }
-        }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": "prioritize_tool",
-                "description": "Pin a tool as preferred for this session when it is clearly more useful than alternatives. This updates server-side session preferences and can be rolled back with rollback_session_state.",
-                "parameters": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "properties": {
-                        "tool": {"type": "string", "description": "Tool name to prioritize."}
-                    },
-                    "required": ["tool"]
-                }
-            }
-        }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": "deprioritize_tool",
-                "description": "Soft-deprioritize a tool for this session when it is unreliable, irrelevant, or repeatedly less suitable than another available tool. This updates server-side session preferences and can be rolled back with rollback_session_state.",
-                "parameters": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "properties": {
-                        "tool": {"type": "string", "description": "Tool name to deprioritize."}
-                    },
-                    "required": ["tool"]
                 }
             }
         }),
@@ -708,7 +678,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "rollback_session_state",
-                "description": "List or restore server-side session-state mutations such as tool preference changes, config overrides, task-state snapshots, and manual context-compression markers. This is for session state, not file contents; use rollback_file_edits for file rollback.",
+                "description": "List or restore server-side session-state mutations such as config overrides, task-state snapshots, and manual context-compression markers. This is for session state, not file contents; use rollback_file_edits for file rollback.",
                 "parameters": {
                     "type": "object",
                     "additionalProperties": false,
@@ -717,27 +687,6 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "turn_index": {"type": "integer", "description": "Turn index when scope=turn."},
                         "session_state_after_sequence": {"type": "integer", "description": "Only restore entries recorded after this rollback-journal sequence."},
                         "after_sequence": {"type": "integer", "description": "Alias for session_state_after_sequence."}
-                    }
-                }
-            }
-        }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": "mo",
-                "description": "MatrixOne database operations. Actions: query (run SQL), snapshot (create named snapshot), branch (create named branch).",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "action": {"type": "string", "enum": ["query","snapshot","branch"], "description": "MO operation"},
-                        "sql": {"type": "string", "description": "SQL to execute (for query)"},
-                        "name": {"type": "string", "description": "Snapshot/branch name"}
-                    },
-                    "required": ["action"],
-                    "x-astra-per-action-required": {
-                        "query": ["sql"],
-                        "snapshot": ["sub_action"],
-                        "branch": ["sub_action"]
                     }
                 }
             }
@@ -904,7 +853,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "introspect",
-                "description": "Query runtime state. Subtopics: `session` (default: token pressure, cache hit rate, tool health, alerts, working memory, plan/task/session lifecycle context including restore/resume state and last lifecycle event when available), `cache` (cache-regression diagnosis), `recent` (recent LLM-round summaries), `volatile` (runtime nudges/coaching queued for next turn), `stall` (loop-guard state), `all` (session + recent + volatile + stall). Use `detail: full` for deep diagnosis (stall forensics, context pressure, performance); use `detail: summary` (default) for quick health checks.",
+                "description": "Query runtime state. Subtopics: `session` (default: token pressure, cache hit rate, tool health, alerts, working memory, plan/task/session lifecycle context including restore/resume state and last lifecycle event when available), `cache` (cache-regression diagnosis), `recent` (recent LLM-round summaries), `volatile` (runtime nudges/coaching queued for next turn), `stall` (loop-guard state), `all` (session + recent + volatile + stall). Set detail='full' for deep diagnosis (stall forensics, context pressure, performance); use detail='summary' for quick health checks.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -937,17 +886,15 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "function": {
                 "name": "tool_search",
                 "description":
-                    "Search deferred tools. Use keyword queries to find matches, or \
-                     `query=\"select:NAME\"` / `select:NAME1,NAME2` to queue selected tools \
-                     for the next request's tools[] and return compact callable shape. Then \
-                     invoke the chosen tool directly.",
+                    "Search deferred tools. Keywords list candidates. `select:NAME[,NAME]` \
+                     returns compact callable shape and queues schemas for the next request.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "query": {
                             "type": "string",
                             "description":
-                                "Keyword query, or `select:NAME` / `select:NAME1,NAME2`."
+                                "Keyword query, `select:NAME`, or `select:NAME1,NAME2`."
                         },
                         "max_results": {
                             "type": "integer",
@@ -963,7 +910,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "notify",
-                "description": "Send a notification to the user. Use for proactive updates (background task done, blocker found, unsolicited insight). Gateways route based on notification_type: 'normal' = in-chat reply, 'proactive' = push notification. CLI mode: both render as text. Example: notify(message='Build completed successfully', notification_type='proactive').",
+                "description": "Send a user notification or status update. Use notification_type='proactive' only for push-worthy updates; CLI renders both modes inline.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1149,7 +1096,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
         // Top-level sentinel tool that flips the session into plan
         // mode. Promoted from the buried `session.enter_plan` action
         // in 2026-05 because the model rarely picked the sub-action
-        // — claudecode's dedicated `EnterPlanMode` tool is the
+        // — the reference agent's dedicated `EnterPlanMode` tool is the
         // reference. While in plan mode, write tools (str_replace,
         // write_file, bash, git commit, …) are denied at the
         // permission gate; read tools stay available for codebase
@@ -1266,7 +1213,7 @@ mod tests {
 
     #[test]
     fn agent_schema_does_not_expose_model_background_parameter() {
-        let schemas = all_tool_schemas_with_env(|_| None);
+        let schemas = all_tool_schemas();
         let agent = find_schema(&schemas, "agent").expect("agent schema must exist");
         let props = agent
             .get("function")
@@ -1287,7 +1234,7 @@ mod tests {
         // queue. If a future refactor collapses the description
         // without the sync/async paragraph, the cache-safe short
         // description would lose the load-bearing semantics.
-        let schemas = all_tool_schemas_with_env(|_| None);
+        let schemas = all_tool_schemas();
         let agent = find_schema(&schemas, "agent").expect("agent schema must exist");
         let desc = agent
             .get("function")
@@ -1306,7 +1253,7 @@ mod tests {
 
     #[test]
     fn agent_schema_parallel_fanout_warns_against_agents_payloads() {
-        let schemas = all_tool_schemas_with_env(|_| None);
+        let schemas = all_tool_schemas();
         let agent = find_schema(&schemas, "agent").expect("agent schema must exist");
         let desc = agent
             .get("function")
@@ -1337,7 +1284,7 @@ mod tests {
 
     #[test]
     fn agent_fanout_schema_exposes_atomic_group_contract() {
-        let schemas = all_tool_schemas_with_env(|_| None);
+        let schemas = all_tool_schemas();
         let fanout = find_schema(&schemas, "agent_fanout").expect("agent_fanout schema must exist");
         let desc = fanout
             .get("function")
@@ -1383,8 +1330,8 @@ mod tests {
     }
 
     #[test]
-    fn agent_schema_pins_exact_runtime_agent_id_contract() {
-        let schemas = all_tool_schemas_with_env(|_| None);
+    fn agent_schema_enforces_exact_runtime_agent_id_contract() {
+        let schemas = all_tool_schemas();
         let agent = find_schema(&schemas, "agent").expect("agent schema must exist");
         let desc = agent
             .get("function")
@@ -1420,18 +1367,13 @@ mod tests {
 
     #[test]
     fn typed_background_task_schemas_replace_job_public_contract() {
-        let schemas = all_tool_schemas_with_env(|_| None);
+        let schemas = all_tool_schemas();
         assert!(
             find_schema(&schemas, "job").is_none()
                 && find_schema(&schemas, "task_output").is_some()
                 && find_schema(&schemas, "task_stop").is_some()
                 && find_schema(&schemas, "task_list").is_some(),
             "model-facing schema must expose typed background task tools, not generic job"
-        );
-        assert!(
-            find_schema(&schemas, "agent_job").is_none()
-                && find_schema(&schemas, "task_output").is_some(),
-            "agent_job must not remain in the model-facing schema; use agent background lifecycle separately"
         );
         let output_desc = find_schema(&schemas, "task_output")
             .and_then(|schema| {
@@ -1460,15 +1402,11 @@ mod tests {
             output_block_desc.contains("Default false"),
             "task_output must default to snapshot reads unless the user asks to wait"
         );
-        assert!(
-            find_schema(&schemas, "agent_job").is_none(),
-            "agent_job must not remain in the model-facing schema"
-        );
     }
 
     #[test]
     fn task_schema_keeps_compact_multi_step_contract() {
-        let schemas = all_tool_schemas_with_env(|_| None);
+        let schemas = all_tool_schemas();
         let task = find_schema(&schemas, "task").expect("task schema must exist");
         let desc = task
             .get("function")
@@ -1477,7 +1415,7 @@ mod tests {
             .unwrap_or_default();
         assert!(
             desc.len() <= 140,
-            "task description should stay compact in the pinned prefix: {desc}"
+            "task description should stay compact in the always-load prefix: {desc}"
         );
         assert!(
             desc.contains("3+ outcomes") && desc.contains("subtasks"),
@@ -1488,7 +1426,7 @@ mod tests {
 
     #[test]
     fn memory_and_task_schemas_stay_compact() {
-        let schemas = all_tool_schemas_with_env(|_| None);
+        let schemas = all_tool_schemas();
         let memory = find_schema(&schemas, "memory").expect("memory schema must exist");
         let task = find_schema(&schemas, "task").expect("task schema must exist");
         let memory_tokens = schema_token_cost(memory);
@@ -1505,14 +1443,15 @@ mod tests {
     }
 
     #[test]
-    fn pinned_high_frequency_descriptions_stay_compact() {
-        let schemas = all_tool_schemas_with_env(|_| None);
+    fn always_load_high_frequency_descriptions_stay_compact() {
+        let schemas = all_tool_schemas();
         for (name, max_len) in [
             ("bash", 180usize),
             ("str_replace", 180),
             ("git", 140),
             ("memory", 120),
             ("ask_user", 180),
+            ("notify", 180),
             ("task", 140),
             ("tool_search", 240),
         ] {
@@ -1527,8 +1466,25 @@ mod tests {
     }
 
     #[test]
+    fn notify_always_load_incremental_schema_cost_is_quantified() {
+        let schemas = all_tool_schemas();
+        let notify = find_schema(&schemas, "notify").expect("notify schema must exist");
+        let notify_tokens = schema_token_cost(notify);
+        const EXPECTED_NOTIFY_TOKENS: usize = 126;
+        const NOTIFY_ALWAYS_LOAD_TOKEN_CEILING: usize = 180;
+        assert_eq!(
+            notify_tokens, EXPECTED_NOTIFY_TOKENS,
+            "notify always-load cost changed; update docs/design/skills-and-tools.md if intentional"
+        );
+        assert!(
+            notify_tokens <= NOTIFY_ALWAYS_LOAD_TOKEN_CEILING,
+            "notify always-load cost is {notify_tokens} tokens; keep the status-update primitive compact"
+        );
+    }
+
+    #[test]
     fn task_schema_discourages_single_umbrella_task() {
-        let schemas = all_tool_schemas_with_env(|_| None);
+        let schemas = all_tool_schemas();
         let task = find_schema(&schemas, "task").expect("task schema must exist");
         let desc = task["function"]["description"].as_str().unwrap();
 
@@ -1538,7 +1494,7 @@ mod tests {
 
     #[test]
     fn task_schema_exposes_lifecycle_progress_and_dependencies() {
-        let schemas = all_tool_schemas_with_env(|_| None);
+        let schemas = all_tool_schemas();
         let task = find_schema(&schemas, "task").expect("task schema must exist");
         let properties = &task["function"]["parameters"]["properties"];
         assert_eq!(
@@ -1587,7 +1543,7 @@ mod tests {
                 .as_str()
                 .unwrap_or_default()
                 .contains("Archive completed"),
-            "archive bulk criteria should live on older_than_days, not in the pinned description"
+            "archive bulk criteria should live on older_than_days, not in the always-load description"
         );
         let subtask_id_desc = properties["subtask_id"]["description"]
             .as_str()
@@ -1758,7 +1714,7 @@ mod tests {
 
     #[test]
     fn plan_schema_uses_semantic_guidance_not_lexical_triggers() {
-        let schemas = all_tool_schemas_with_env(|_| None);
+        let schemas = all_tool_schemas();
         let enter =
             find_schema(&schemas, "enter_plan_mode").expect("enter_plan_mode schema must exist");
         let plan_desc = enter["function"]["description"].as_str().unwrap();
@@ -1783,8 +1739,8 @@ mod tests {
     }
 
     #[test]
-    fn exit_plan_mode_schema_points_to_task_board_not_legacy_plan_todos() {
-        let schemas = all_tool_schemas_with_env(|_| None);
+    fn exit_plan_mode_schema_points_to_task_board() {
+        let schemas = all_tool_schemas();
         let exit =
             find_schema(&schemas, "exit_plan_mode").expect("exit_plan_mode schema must exist");
         let desc = exit["function"]["description"].as_str().unwrap();
@@ -1812,7 +1768,7 @@ mod tests {
 
     #[test]
     fn introspect_schema_mentions_lifecycle_and_resume_state() {
-        let schemas = all_tool_schemas_with_env(|_| None);
+        let schemas = all_tool_schemas();
         let introspect = find_schema(&schemas, "introspect").expect("introspect schema must exist");
         let desc = introspect["function"]["description"]
             .as_str()
@@ -1833,35 +1789,17 @@ mod tests {
 
     #[test]
     fn self_mod_session_state_top_level_schemas_exist() {
-        let schemas = all_tool_schemas_with_env(|_| None);
-        for name in [
-            "prioritize_tool",
-            "deprioritize_tool",
-            "compress_context",
-            "rollback_session_state",
-        ] {
+        let schemas = all_tool_schemas();
+        for name in ["compress_context", "rollback_session_state"] {
             find_schema(&schemas, name)
                 .expect("top-level schema must exist for ToolEngine routing");
-        }
-
-        let prioritize = find_schema(&schemas, "prioritize_tool").expect("prioritize_tool schema");
-        let deprioritize =
-            find_schema(&schemas, "deprioritize_tool").expect("deprioritize_tool schema");
-        for schema in [prioritize, deprioritize] {
-            let required = schema["function"]["parameters"]["required"]
-                .as_array()
-                .expect("tool preference schemas should declare required fields");
-            assert!(
-                required.iter().any(|value| value.as_str() == Some("tool")),
-                "tool preference schemas must require tool: {schema:?}"
-            );
         }
     }
 
     #[test]
     fn matrixone_top_level_schemas_exist() {
-        let schemas = all_tool_schemas_with_env(|_| None);
-        for name in ["mo", "mo_query", "rollback_database_snapshots"] {
+        let schemas = all_tool_schemas();
+        for name in ["mo_query", "rollback_database_snapshots"] {
             find_schema(&schemas, name)
                 .expect("top-level schema must exist for ToolEngine routing");
         }
@@ -1887,8 +1825,51 @@ mod tests {
     }
 
     #[test]
+    fn session_schema_exposes_only_lifecycle_and_history_actions() {
+        let schemas = all_tool_schemas();
+        let session = find_schema(&schemas, "session").expect("session schema");
+        let mut actions = session["function"]["parameters"]["properties"]["action"]["enum"]
+            .as_array()
+            .expect("session action enum")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+
+        actions.sort_unstable();
+        assert_eq!(
+            actions,
+            [
+                "config",
+                "history_around",
+                "history_page",
+                "history_search",
+                "sleep",
+            ],
+            "session action surface must stay narrow and current"
+        );
+        for current in [
+            "config",
+            "sleep",
+            "history_page",
+            "history_search",
+            "history_around",
+        ] {
+            assert!(
+                actions.contains(&current),
+                "session must expose current action {current}"
+            );
+        }
+        let props = session["function"]["parameters"]["properties"]
+            .as_object()
+            .expect("session properties");
+        assert!(props.contains_key("path"));
+        assert!(!props.contains_key("key"));
+        assert!(!props.contains_key("tool"));
+    }
+
+    #[test]
     fn get_agent_info_schema_exposes_capability_dimension() {
-        let schemas = all_tool_schemas_with_env(|_| None);
+        let schemas = all_tool_schemas();
         let get_agent_info =
             find_schema(&schemas, "get_agent_info").expect("get_agent_info schema must exist");
         let properties = get_agent_info["function"]["parameters"]["properties"]
@@ -1911,11 +1892,11 @@ mod tests {
 
     #[test]
     fn execute_code_no_longer_present_in_schemas() {
-        let schemas = all_tool_schemas_with_env(|_| None);
+        let schemas = all_tool_schemas();
         let names = schema_names(&schemas);
         assert!(
             !names.contains(&"execute_code"),
-            "execute_code was removed; legacy references must not leak into the schema list"
+            "removed tool name execute_code must not leak into the schema list"
         );
     }
 
@@ -1924,9 +1905,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn run_script_visible_by_default_on_unix() {
-        // run_script is the production successor to execute_code and must
-        // be discoverable without any opt-in env var.
-        let schemas = all_tool_schemas_with_env(|_| None);
+        let schemas = all_tool_schemas();
         let names = schema_names(&schemas);
         assert!(
             names.contains(&"run_script"),
@@ -1937,7 +1916,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn run_script_default_schema_lists_all_sandbox_tools() {
-        let schemas = all_tool_schemas_with_env(|_| None);
+        let schemas = all_tool_schemas();
         let rs = schemas
             .iter()
             .find(|s| {
@@ -1990,7 +1969,7 @@ mod tests {
     #[cfg(not(unix))]
     #[test]
     fn run_script_hidden_on_non_unix() {
-        let schemas = all_tool_schemas_with_env(|_| None);
+        let schemas = all_tool_schemas();
         let names = schema_names(&schemas);
         assert!(
             !names.contains(&"run_script"),
@@ -2000,7 +1979,7 @@ mod tests {
 
     #[test]
     fn read_file_schema_exposes_only_line_range_contract() {
-        let schemas = all_tool_schemas_with_env(|_| None);
+        let schemas = all_tool_schemas();
         let read_file = find_schema(&schemas, "read_file").expect("read_file schema must exist");
         let func = read_file
             .get("function")
@@ -2035,17 +2014,17 @@ mod tests {
                 "read_file schema should expose `{name}`"
             );
         }
-        for legacy in ["offset", "limit", "length", "count"] {
+        for removed_arg in ["offset", "limit", "length", "count"] {
             assert!(
-                !properties.contains_key(legacy),
-                "read_file schema must not expose legacy/count field `{legacy}`"
+                !properties.contains_key(removed_arg),
+                "read_file schema must not expose removed/count field `{removed_arg}`"
             );
         }
     }
 
     #[test]
     fn write_file_schema_requires_content_or_delete_contract() {
-        let schemas = all_tool_schemas_with_env(|_| None);
+        let schemas = all_tool_schemas();
         let write_file = find_schema(&schemas, "write_file").expect("write_file schema must exist");
         let func = write_file
             .get("function")
@@ -2122,7 +2101,7 @@ mod tests {
 
     #[test]
     fn str_replace_schema_uses_provider_compatible_edit_mode_contract() {
-        let schemas = all_tool_schemas_with_env(|_| None);
+        let schemas = all_tool_schemas();
         let str_replace =
             find_schema(&schemas, "str_replace").expect("str_replace schema must exist");
         let desc = str_replace
@@ -2135,7 +2114,7 @@ mod tests {
 
         assert!(
             desc.contains("Do not use aliases"),
-            "str_replace description should steer models away from legacy alias fields: {desc}"
+            "str_replace description should steer models away from unsupported alias fields: {desc}"
         );
         assert_eq!(
             params.get("additionalProperties").and_then(Value::as_bool),
@@ -2239,7 +2218,7 @@ mod tests {
 
     #[test]
     fn bash_schema_timeout_default_matches_code_default() {
-        let schemas = all_tool_schemas_with_env(|_| None);
+        let schemas = all_tool_schemas();
         let bash = find_schema(&schemas, "bash").expect("bash schema must exist");
         let desc = timeout_description(bash);
         assert!(
@@ -2256,7 +2235,7 @@ mod tests {
 
     #[test]
     fn bash_schema_hints_to_extend_timeout_for_long_commands() {
-        let schemas = all_tool_schemas_with_env(|_| None);
+        let schemas = all_tool_schemas();
         let bash = find_schema(&schemas, "bash").expect("bash schema must exist");
         let desc = timeout_description(bash);
         // Presence of at least ONE of these signal tokens tells the
@@ -2274,7 +2253,7 @@ mod tests {
 
     #[test]
     fn powershell_schema_timeout_default_matches_code_default() {
-        let schemas = all_tool_schemas_with_env(|_| None);
+        let schemas = all_tool_schemas();
         let ps = find_schema(&schemas, "powershell").expect("powershell schema must exist");
         let desc = timeout_description(ps);
         assert!(

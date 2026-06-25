@@ -11,6 +11,7 @@ use astra_tools::detach::{
     AdoptionAckOutcome, await_adoption_ack, detach_signal_observed, render_bash_detached_marker,
     restore_detach_signal_receiver, sigkill_process_group, terminate_detached_payload,
 };
+use astra_tools::exit_semantics::{self, ExitSemantics};
 use serde_json::Value;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command as TokioCommand;
@@ -19,45 +20,8 @@ pub(crate) fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-// ---------------------------------------------------------------------------
-// Command semantics — interpret exit codes per-command (inspired by Claude
-// Code's commandSemantics.ts). Many commands use non-zero exit codes to convey
-// information, not errors. Without this, the model treats grep exit 1 as a
-// failure and wastes turns retrying.
-// ---------------------------------------------------------------------------
-
-/// Semantic interpretation of a command's exit code.
-struct CommandResult {
-    is_error: bool,
-    /// Optional human-readable note (e.g. "No matches found").
-    note: Option<&'static str>,
-}
-
-/// Interpret exit code based on the command that produced it.
-/// Extracts the *last* command in a pipeline (that's what determines the exit code).
-fn interpret_exit_code(command: &str, code: i32) -> CommandResult {
-    match astra_tools::exit_semantics::classify_exit(command, code) {
-        astra_tools::exit_semantics::ExitSemantics::Success
-        | astra_tools::exit_semantics::ExitSemantics::DomainNegative => CommandResult {
-            is_error: false,
-            note: None,
-        },
-        astra_tools::exit_semantics::ExitSemantics::InformationalFailure => CommandResult {
-            is_error: false,
-            note: Some(informational_failure_note(command)),
-        },
-        astra_tools::exit_semantics::ExitSemantics::TimedOut
-        | astra_tools::exit_semantics::ExitSemantics::Cancelled
-        | astra_tools::exit_semantics::ExitSemantics::Signaled
-        | astra_tools::exit_semantics::ExitSemantics::ExecutionError => CommandResult {
-            is_error: true,
-            note: None,
-        },
-    }
-}
-
-fn informational_failure_note(command: &str) -> &'static str {
-    let family = astra_tools::exit_semantics::command_family(command);
+fn empty_result_note(command: &str) -> &'static str {
+    let family = exit_semantics::command_family(command);
     if matches!(family.as_deref(), Some("pgrep" | "pkill" | "killall")) {
         "No processes matched"
     } else {
@@ -65,10 +29,24 @@ fn informational_failure_note(command: &str) -> &'static str {
     }
 }
 
+fn empty_nonzero_exit_output(command: &str, exit_code: i32) -> String {
+    match exit_semantics::classify_exit(command, exit_code) {
+        ExitSemantics::EmptyResult => empty_result_note(command).to_string(),
+        semantics if semantics.is_tool_error() => {
+            format!("Error: command failed (exit code {exit_code})")
+        }
+        _ => format!("(exit code {exit_code})"),
+    }
+}
+
+fn should_append_exit_code(command: &str, exit_code: i32) -> bool {
+    exit_semantics::classify_exit(command, exit_code).is_tool_error()
+}
+
 // ---------------------------------------------------------------------------
 // Bash security layer — detect dangerous or potentially destructive commands.
 //
-// Modeled after Claude Code's `bashSecurity.ts` top-5 detection patterns.
+// Modeled after the reference agent's `bashSecurity.ts` top-5 detection patterns.
 // Returns a warning string when a command matches; the caller decides whether
 // to block (sandbox Restrictive mode) or append the warning to the result
 // (sandbox Permissive mode, letting the model see the warning and self-correct).
@@ -4160,7 +4138,7 @@ impl ToolExecutor {
             eprintln!("  {}", warning);
         }
 
-        // Nudge: redirect `git diff <range>` to the built-in git_diff/git_show tools.
+        // Nudge: redirect `git diff <range>` to the built-in git(action=diff/show) tool.
         // Large multi-commit diffs via bash can timeout or produce huge uncontrolled output,
         // while built-in tools have output budgets and pressure-scaling.
         // We don't hard-block — instead, auto-pipe through `head -c` to prevent the
@@ -4248,15 +4226,7 @@ impl ToolExecutor {
             return if out.status.success() {
                 "(no output)".to_string()
             } else {
-                // Use command semantics to interpret exit code
-                let sem = interpret_exit_code(command, exit_code);
-                if let Some(note) = sem.note {
-                    note.to_string()
-                } else if sem.is_error {
-                    format!("Error: command failed (exit code {exit_code})")
-                } else {
-                    format!("(exit code {exit_code})")
-                }
+                empty_nonzero_exit_output(command, exit_code)
             };
         }
 
@@ -4314,13 +4284,53 @@ impl ToolExecutor {
 
         // Append exit code context for non-zero, non-build commands
         if !out.status.success() {
-            let sem = interpret_exit_code(command, exit_code);
-            if sem.is_error {
+            if should_append_exit_code(command, exit_code) {
                 result.push_str(&format!("\n(exit code {exit_code})"));
             }
         }
 
         result
+    }
+
+    fn render_bash_outcome(
+        &self,
+        command: &str,
+        out: std::process::Output,
+    ) -> super::ToolExecutionOutcome {
+        let exit_code = out.status.code().unwrap_or(-1);
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        let exit_semantics = astra_tools::exit_semantics::classify_exit(command, exit_code);
+        let result_class = astra_tools::exit_semantics::classify_command_result(
+            command,
+            &stdout,
+            &stderr,
+            Some(exit_code),
+        );
+        let output = self.render_bash_output(command, out);
+        let mut outcome = if exit_semantics.is_tool_error() || result_class.is_tool_error() {
+            super::ToolExecutionOutcome::error(output)
+        } else {
+            super::ToolExecutionOutcome::ok(output)
+        };
+        let fields = outcome
+            .tool_result_fields
+            .get_or_insert_with(serde_json::Map::new);
+        fields.insert(
+            "exit_code".to_string(),
+            Value::Number(serde_json::Number::from(exit_code)),
+        );
+        fields.insert(
+            "exit_semantics".to_string(),
+            serde_json::to_value(exit_semantics).unwrap_or_else(|_| {
+                Value::String(format!("{exit_semantics:?}").to_ascii_lowercase())
+            }),
+        );
+        fields.insert(
+            "result_class".to_string(),
+            Value::String(result_class.as_str().to_string()),
+        );
+        outcome
     }
 
     pub(crate) async fn bash_async(&self, args: &Value) -> String {
@@ -4342,7 +4352,7 @@ impl ToolExecutor {
         handle: astra_tools::detach::DetachShellHandle,
     ) {
         handle.mark_active(false);
-        if !handle.is_retired() {
+        if !handle.is_blocked() {
             *slot.lock().await = Some(handle);
         }
     }
@@ -4370,10 +4380,10 @@ impl ToolExecutor {
         match outcome {
             Ok(DetachableShellOutput::Completed(out)) => {
                 self.restore_bash_detach_handle(slot, handle).await;
-                let output =
-                    self.finalize_tool_output(self.render_bash_output(&command, out), "bash");
-                self.record_output_size(output.len());
-                Some(super::tool_execution_outcome_from_output(output))
+                let mut outcome = self.render_bash_outcome(&command, out);
+                outcome.output = self.finalize_tool_output(outcome.output, "bash");
+                self.record_output_size(outcome.output.len());
+                Some(outcome)
             }
             Ok(DetachableShellOutput::Detached {
                 payload,
@@ -4442,13 +4452,21 @@ impl ToolExecutor {
         args: &Value,
         cancel_token: Option<&tokio_util::sync::CancellationToken>,
     ) -> String {
+        self.bash_outcome_with_cancel(args, cancel_token).output
+    }
+
+    pub(crate) fn bash_outcome_with_cancel(
+        &self,
+        args: &Value,
+        cancel_token: Option<&tokio_util::sync::CancellationToken>,
+    ) -> super::ToolExecutionOutcome {
         let (command, timeout_secs) = match self.prepare_bash_invocation(args) {
             Ok(invocation) => invocation,
-            Err(message) => return message,
+            Err(message) => return super::tool_execution_outcome_from_output(message),
         };
         match self.run_shell_output_cancelable(&command, timeout_secs, cancel_token) {
-            Ok(out) => self.render_bash_output(&command, out),
-            Err(error) => error,
+            Ok(out) => self.render_bash_outcome(&command, out),
+            Err(error) => super::ToolExecutionOutcome::error(error),
         }
     }
 
@@ -4511,15 +4529,7 @@ impl ToolExecutor {
                     return if out.status.success() {
                         "(no output)".to_string()
                     } else {
-                        // Use command semantics to interpret exit code
-                        let sem = interpret_exit_code(command, exit_code);
-                        if let Some(note) = sem.note {
-                            note.to_string()
-                        } else if sem.is_error {
-                            format!("Error: command failed (exit code {exit_code})")
-                        } else {
-                            format!("(exit code {exit_code})")
-                        }
+                        empty_nonzero_exit_output(command, exit_code)
                     };
                 }
 
@@ -4536,8 +4546,7 @@ impl ToolExecutor {
                 }
 
                 if !out.status.success() {
-                    let sem = interpret_exit_code(command, exit_code);
-                    if sem.is_error {
+                    if should_append_exit_code(command, exit_code) {
                         result.push_str(&format!("\n(exit code {exit_code})"));
                     }
                 }
@@ -5064,8 +5073,7 @@ mod tests {
         check_bash_path_boundary_with_oldpwd, check_dangerous_command,
         check_powershell_path_boundary, default_bash_timeout_secs, destructive_command_warning,
         destructive_powershell_warning, find_powershell_program, forbidden_name_based_process_kill,
-        html_to_text, interpret_exit_code, is_ssrf_target, looks_like_html,
-        run_command_with_cleanup,
+        html_to_text, is_ssrf_target, looks_like_html, run_command_with_cleanup,
     };
     use std::process::Command;
     use std::time::Duration;
@@ -8149,50 +8157,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Command semantics tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn interpret_exit_code_rules() {
-        let cases: &[(&str, i32, bool, Option<&str>)] = &[
-            ("grep -r foo .", 1, false, Some("No matches found")),
-            ("grep -r foo .", 2, true, None),
-            ("diff a b", 1, false, None),
-            ("test -f /tmp/x", 1, false, None),
-            (
-                "cat file | grep pattern",
-                1,
-                false,
-                Some("No matches found"),
-            ),
-            (
-                "cd /work/repo && grep -n missing src/main.rs",
-                1,
-                false,
-                Some("No matches found"),
-            ),
-            (
-                "pgrep missing-process-name",
-                1,
-                false,
-                Some("No processes matched"),
-            ),
-            (
-                "cd /work/repo && pgrep missing-process-name",
-                1,
-                false,
-                Some("No processes matched"),
-            ),
-            ("cargo build", 1, true, None),
-        ];
-        for (cmdline, code, is_error, note) in cases {
-            let r = interpret_exit_code(cmdline, *code);
-            assert_eq!(r.is_error, *is_error, "cmd={cmdline} code={code}");
-            assert_eq!(r.note, *note, "cmd={cmdline} code={code}");
-        }
-    }
-
-    // -----------------------------------------------------------------------
     // Destructive command warning tests
     // -----------------------------------------------------------------------
 
@@ -8275,12 +8239,16 @@ mod tests {
     }
 
     #[test]
-    fn bash_false_command_is_error() {
+    fn bash_false_command_is_domain_negative_not_error() {
         let executor = test_executor();
         let result = executor.bash(&serde_json::json!({"command": "false"}));
         assert!(
-            result.contains("exit code") || result.to_lowercase().contains("error"),
-            "false should indicate failure: {result}"
+            !result.to_lowercase().starts_with("error"),
+            "false is a predicate result, not a tool execution error: {result}"
+        );
+        assert!(
+            result.contains("exit code"),
+            "false still reports status: {result}"
         );
     }
 

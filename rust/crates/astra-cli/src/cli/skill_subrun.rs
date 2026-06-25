@@ -10,7 +10,6 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use astra_core::SkillSearchSettings;
 use astra_runtime::{
     pipeline::step_protocol::InMemoryIdempotencyCache,
     pipeline::step_recorder::StepRecorder,
@@ -136,7 +135,7 @@ pub(crate) fn persist_failed_subrun(state: &mut AgenticLoopState, error: &str) -
     let blocked_tools = state
         .turn_guard
         .health
-        .deprioritized_tools()
+        .health_avoidance_tools()
         .iter()
         .map(|tool| tool.to_string())
         .collect::<Vec<_>>();
@@ -235,9 +234,6 @@ impl AgenticLoopHost for SubRunHost {
         if let Some(ref agent_type) = self.agent_type {
             payload["agent_type"] = json!(agent_type);
         }
-        payload["skill_search"] =
-            serde_json::to_value(&state.skills.search).unwrap_or_else(|_| json!({}));
-
         // Attach tool schemas. In fork mode, prefer the parent's frozen
         // canonical schemas so the tool-schema hash matches the parent's
         // cached prefix (cache key alignment). Falls back to live
@@ -248,7 +244,7 @@ impl AgenticLoopHost for SubRunHost {
             );
         let schemas_to_use = resolve_subrun_schemas(
             self.inherited_prefix.as_ref(),
-            base_tool_surface.pinned_schemas(),
+            base_tool_surface.always_load_schemas(),
         );
         state.last_turn_policy = attach_subrun_tool_surface(
             &mut payload,
@@ -446,8 +442,6 @@ pub(crate) struct CliSkillSubRunExecutor {
     cancel_token: Option<std::sync::Arc<tokio_util::sync::CancellationToken>>,
     /// Skill resolver inherited from parent — enables nested skill invocations.
     skill_resolver: Option<std::sync::Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
-    /// Same surfacing policy as the parent loop / session state.
-    skill_search: SkillSearchSettings,
     /// Parent interactive session id for self-introspection persistence.
     active_session_id: Option<String>,
 }
@@ -470,7 +464,6 @@ impl CliSkillSubRunExecutor {
             inherited_permissions,
             cancel_token,
             skill_resolver: None,
-            skill_search: SkillSearchSettings::default(),
             active_session_id: None,
         }
     }
@@ -481,11 +474,6 @@ impl CliSkillSubRunExecutor {
         resolver: Option<std::sync::Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
     ) -> Self {
         self.skill_resolver = resolver;
-        self
-    }
-
-    pub fn with_skill_search(mut self, skill_search: SkillSearchSettings) -> Self {
-        self.skill_search = skill_search;
         self
     }
 
@@ -526,7 +514,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
         // Resolve per-model workflow-guard policy up front; `effective_model`
         // is moved into the SubRunHost below.
         let resolved_tool_policy = astra_config::runtime_config::RuntimeConfig::load()
-            .tool_selection
+            .tool_policy
             .resolve_for_model(effective_model.as_deref());
 
         let all_schemas = edge_tools::all_tool_schemas();
@@ -664,7 +652,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             turn_guard: TurnGuard::with_profile(task_profile),
             restricted_tools,
             boosted_tools: HashSet::new(),
-            widen_selection_pending: false,
+            widen_surface_pending: false,
             step_recorder,
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(
@@ -681,7 +669,6 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
                 resolver: self.skill_resolver.clone(),
                 quality_tracker: astra_skills::quality::SkillQualityTracker::new(),
                 improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
-                search: self.skill_search.clone(),
                 tool_event_hooks: astra_skills::hooks::load_tool_event_hooks(&self.project_root),
                 session_event_hooks: astra_skills::hooks::load_session_event_hooks(
                     &self.project_root,
@@ -728,7 +715,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             last_measured_prompt_tokens: None,
             consecutive_context_window_errors: 0,
             compaction_effectiveness: Default::default(),
-            pinned_tool_schema_tokens: 0,
+            always_load_tool_schema_tokens: 0,
             sticky_tool_schemas: Vec::new(),
             max_turn_input_tokens: astra_core::RuntimeLimits::global().max_turn_input_tokens,
             budget_wrapup_injected: false,
@@ -742,7 +729,6 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             permission_handler: None,
             tactical_adapter: None,
             step_signal_collector: None,
-            tool_budget_override: None,
             recent_tactical_actions: Vec::new(),
             server_tool_executor: None,
             interruption: None,
@@ -780,7 +766,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
 ///
 /// Returns the parent's frozen canonical schemas when fork-prefix
 /// inheritance is active **and** schemas were captured; otherwise
-/// returns `fallback_pinned` (the live surface's T1 set).
+/// returns `fallback_always_load` (the live surface's T1 set).
 ///
 /// When fork inheritance is configured but `frozen_tool_schemas` is
 /// `None` we **must** fall back, but we also emit a warning: the
@@ -791,7 +777,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
 /// better than silent.
 fn resolve_subrun_schemas(
     inherited: Option<&astra_runtime::orchestration::InheritedChildPrefix>,
-    fallback_pinned: Vec<Value>,
+    fallback_always_load: Vec<Value>,
 ) -> Vec<Value> {
     match inherited {
         Some(ip) => match &ip.frozen_tool_schemas {
@@ -802,27 +788,26 @@ fn resolve_subrun_schemas(
                     prefix_id = %ip.prefix_id,
                     parent_run_id = %ip.parent_run_id,
                     "fork inheritance active but frozen_tool_schemas is None; \
-                     falling back to T1 pinned schemas — child tool_schema_hash \
+                     falling back to T1 always-load schemas — child tool_schema_hash \
                      will not match parent's, prefix-cache reuse will miss"
                 );
-                fallback_pinned
+                fallback_always_load
             }
         },
-        None => fallback_pinned,
+        None => fallback_always_load,
     }
 }
 
-fn empty_selection_report_for_schemas(
+fn empty_surface_report_for_schemas(
     schemas: &[Value],
-) -> astra_runtime::tool_registry::SelectionReport {
-    let mut tools_selected: Vec<String> = tool_names_from_schemas(schemas).into_iter().collect();
-    tools_selected.sort();
-    astra_runtime::tool_registry::SelectionReport {
-        selected_count: tools_selected.len() as u32,
-        tools_selected,
-        dynamic_tools_selected: Vec::new(),
-        budget_used: 0,
-        budget_total: 0,
+) -> astra_turn_core::tool_registry_report::ToolSurfaceReport {
+    let mut visible_tools: Vec<String> = tool_names_from_schemas(schemas).into_iter().collect();
+    visible_tools.sort();
+    astra_turn_core::tool_registry_report::ToolSurfaceReport {
+        visible_count: visible_tools.len() as u32,
+        visible_tools,
+        schema_budget_used: 0,
+        schema_budget_total: 0,
     }
 }
 
@@ -836,26 +821,17 @@ fn attach_subrun_tool_surface(
     interaction_mode: TurnInteractionMode,
 ) -> TurnInteractionPolicy {
     let activated = executor.activated_deferred_tool_names_for_schema_injection();
-    let mut selection_report = empty_selection_report_for_schemas(&schemas_to_use);
+    let mut surface_report = empty_surface_report_for_schemas(&schemas_to_use);
     if !activated.is_empty() {
         let refs: Vec<&str> = activated.iter().map(String::as_str).collect();
-        inject_required_tool_names(
-            &mut schemas_to_use,
-            &mut selection_report,
-            &refs,
-            all_schemas,
-        );
+        inject_required_tool_names(&mut schemas_to_use, &mut surface_report, &refs, all_schemas);
     }
     schemas_to_use = executor.runtime_bound_tool_schemas(schemas_to_use);
-    selection_report = empty_selection_report_for_schemas(&schemas_to_use);
 
-    astra_runtime::turn::agentic_prepare_payload::apply_selector_hints_then_attach_filtered_edge_tools(
+    astra_runtime::turn::agentic_prepare_payload::attach_filtered_edge_tools_to_payload(
         payload,
         schemas_to_use,
         restricted_tools,
-        Some(&selection_report),
-        0.5,   // neutral confidence
-        None,  // no learned task type
     );
     let final_visible_schemas: Vec<Value> = payload
         .get("edge_tools")
@@ -876,10 +852,12 @@ fn attach_subrun_tool_surface(
         .cloned()
         .collect();
     let eligible_surface_schemas = executor.runtime_bound_tool_schemas(eligible_surface_schemas);
+    let eligible_external_schemas =
+        executor.runtime_bound_external_schemas_excluding(restricted_tools);
     let tool_surface = astra_runtime::tool_registry::surface::ToolSurface::build_excluding_visible(
         eligible_surface_schemas,
         &astra_config::runtime_config::RuntimeConfig::cached().tool_surface,
-        &[],
+        &eligible_external_schemas,
         &final_visible_tool_names,
     );
     let mut activatable_tool_names = HashSet::new();
@@ -896,6 +874,8 @@ fn attach_subrun_tool_surface(
                     manifest.context_window,
                 astra_runtime::turn::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES:
                     manifest.names,
+                astra_runtime::turn::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOL_OMITTED_NAMES:
+                    manifest.omitted_names,
             }),
         );
     }
@@ -1068,13 +1048,10 @@ mod tests {
         let interaction_mode = TurnInteractionMode::NonInteractive;
         let mut restricted_tools = interaction_scoped_tool_restrictions(interaction_mode);
 
-        astra_runtime::turn::agentic_prepare_payload::apply_selector_hints_then_attach_filtered_edge_tools(
+        astra_runtime::turn::agentic_prepare_payload::attach_filtered_edge_tools_to_payload(
             &mut payload,
             vec![schema("mo_query"), schema(ASK_USER_TOOL_NAME)],
             &mut restricted_tools,
-            None,
-            0.5,
-            None,
         );
 
         let policy = turn_policy_from_payload_edge_tools(&payload, interaction_mode);
@@ -1264,17 +1241,6 @@ mod tests {
             !edge_tool_names.contains("agent_fanout"),
             "subrun tools[] must not advertise an unbound runtime tool: {payload}"
         );
-        let recommended: Vec<String> = payload["edge_profile"]["recommended_tools"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|entry| entry["name"].as_str())
-            .map(ToString::to_string)
-            .collect();
-        assert!(
-            !recommended.iter().any(|name| name == "agent_fanout"),
-            "subrun edge_profile must not recommend a tool absent from the executable surface: {recommended:?}"
-        );
     }
 
     #[tokio::test]
@@ -1329,12 +1295,12 @@ mod tests {
         assert!(executor.inherited_permissions.is_background);
     }
 
-    // ── Phase-R10 adversarial contract pins (CLI-side constants) ────────
+    // ── Phase-R10 adversarial contract guards (CLI-side constants) ───────
     //
-    // These pin the exact values of [`SUBRUN_MAX_TURNS`] and
+    // These assert the exact values of [`SUBRUN_MAX_TURNS`] and
     // [`SUBRUN_MAX_CUMULATIVE_TOKENS`] so silent drift (e.g. a typo
     // bumping 25→35 or 120_000→12_000) breaks this test loudly.
-    // The server-side equivalents are pinned in
+    // The server-side equivalents are covered in
     // `rust/crates/astra-cli/tests/phase_r10_skill_subrun_contracts.rs`
     // via the now-`pub` constants in
     // [`astra_runtime::server::server_skill_subrun`].
@@ -1349,12 +1315,12 @@ mod tests {
         assert_eq!(SUBRUN_MAX_CUMULATIVE_TOKENS, 120_000);
     }
 
-    /// No fork inheritance → just use the live surface's pinned set.
+    /// No fork inheritance → just use the live surface's always-load set.
     #[test]
-    fn resolve_subrun_schemas_no_inheritance_uses_pinned_fallback() {
-        let pinned = vec![schema("read_file"), schema("write_file")];
-        let resolved = resolve_subrun_schemas(None, pinned.clone());
-        assert_eq!(resolved, pinned);
+    fn resolve_subrun_schemas_no_inheritance_uses_always_load_fallback() {
+        let always_load = vec![schema("read_file"), schema("write_file")];
+        let resolved = resolve_subrun_schemas(None, always_load.clone());
+        assert_eq!(resolved, always_load);
     }
 
     /// Fork inheritance with captured schemas → use the captured set
@@ -1363,7 +1329,7 @@ mod tests {
     fn resolve_subrun_schemas_fork_with_frozen_uses_parent_schemas() {
         use astra_runtime::orchestration::InheritedChildPrefix;
         let frozen = vec![schema("bash"), schema("grep")];
-        let pinned_fallback = vec![schema("read_file"), schema("write_file")];
+        let always_load_fallback = vec![schema("read_file"), schema("write_file")];
         let ip = InheritedChildPrefix {
             prefix_id: "p1".into(),
             parent_run_id: "r1".into(),
@@ -1373,20 +1339,20 @@ mod tests {
             frozen_tool_schemas: Some(frozen.clone()),
             expected_cache_read_tokens: 0,
         };
-        let resolved = resolve_subrun_schemas(Some(&ip), pinned_fallback);
+        let resolved = resolve_subrun_schemas(Some(&ip), always_load_fallback);
         assert_eq!(resolved, frozen);
     }
 
     /// Fork inheritance present but `frozen_tool_schemas` is None — the
     /// degenerate case the reviewer flagged. We still have to return
     /// *something* that lets the child run, so we fall back to the
-    /// T1 pinned set, but the helper's job is to make the regression
+    /// T1 always-load set, but the helper's job is to make the regression
     /// loud (verified by the tracing target/log assertions in the
     /// surrounding integration; here we pin behavior + payload shape).
     #[test]
-    fn resolve_subrun_schemas_fork_without_frozen_falls_back_to_pinned() {
+    fn resolve_subrun_schemas_fork_without_frozen_falls_back_to_always_load() {
         use astra_runtime::orchestration::InheritedChildPrefix;
-        let pinned_fallback = vec![schema("read_file"), schema("write_file")];
+        let always_load_fallback = vec![schema("read_file"), schema("write_file")];
         let ip = InheritedChildPrefix {
             prefix_id: "p2".into(),
             parent_run_id: "r2".into(),
@@ -1396,9 +1362,9 @@ mod tests {
             frozen_tool_schemas: None,
             expected_cache_read_tokens: 0,
         };
-        let resolved = resolve_subrun_schemas(Some(&ip), pinned_fallback.clone());
+        let resolved = resolve_subrun_schemas(Some(&ip), always_load_fallback.clone());
         // Behaviour: must return fallback (NOT empty, NOT inherited).
-        assert_eq!(resolved, pinned_fallback);
+        assert_eq!(resolved, always_load_fallback);
     }
 
     // Session c47c2dca regression guard. Same invariant as

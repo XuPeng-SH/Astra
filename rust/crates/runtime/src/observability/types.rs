@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use astra_services::session_journal::{JournalEvent, JournalWriter};
 use astra_services::session_workspace::{
     ContextTraceBudgetSignal, ContextTraceHistorySignal, ContextTraceMemorySignal,
-    ContextTraceSignal, ContextTraceTimingSignal, ContextTraceToolSelection,
+    ContextTraceSignal, ContextTraceTimingSignal, ContextTraceToolSurface,
 };
 use serde::{Deserialize, Serialize};
 
@@ -93,7 +93,7 @@ pub struct ObservabilitySession {
 
     /// Most recent [`StrategyApplication`] summary, if any, published into
     /// observability for self-model rendering so the agent passively "knows"
-    /// what tool-selection surfaces were adjusted (blocked/boosted/widened).
+    /// what tool-surface surfaces were adjusted (blocked/boosted/widened).
     ///
     /// Reset lazily — it lingers until the next published strategy update.
     pub last_strategy_application: Option<crate::turn::agentic::stage_bridge::StrategyApplication>,
@@ -130,7 +130,7 @@ pub struct ObservabilitySession {
     /// when the agent loops too often.
     pub stall_event_count: u32,
 
-    /// Gap 6: per-tool outcome bias currently applied by the selector
+    /// Gap 6: per-tool outcome bias currently applied as advisory health signal
     /// (`ToolHealthTracker::outcome_bias_by_tool`). Sorted by tool name.
     ///
     /// Values are `OutcomeBiasEntry { score, last_failure_tag }`. The tag
@@ -155,7 +155,7 @@ pub struct ObservabilitySession {
     pub cached_skill_names: Vec<String>,
 
     /// Per-turn export of `ToolHealthTracker::export()` so SelfModel can
-    /// reconstruct summaries + deprioritized/outcome memory without holding
+    /// reconstruct summaries + health avoidance/outcome memory without holding
     /// a reference to the live tracker.
     pub last_tool_health_export: Vec<astra_pipeline::ToolHealthEntry>,
 

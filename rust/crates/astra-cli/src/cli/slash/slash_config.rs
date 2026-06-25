@@ -142,25 +142,6 @@ fn show_config() {
         format!("{:.2}", config.memory.long_term_weight).yellow()
     );
 
-    // Tool selection settings
-    println!("\n{}", "🔧 Tool Selection".bold());
-    println!(
-        "  confidence_threshold: {}",
-        format!("{:.2}", config.tool_selection.confidence_threshold).yellow()
-    );
-    println!(
-        "  max_tools: {}",
-        config.tool_selection.max_tools.to_string().yellow()
-    );
-    println!(
-        "  prefer_recent_tools: {}",
-        config
-            .tool_selection
-            .prefer_recent_tools
-            .to_string()
-            .yellow()
-    );
-
     // Token budget settings
     println!("\n{}", "🎯 Token Budget".bold());
     println!(

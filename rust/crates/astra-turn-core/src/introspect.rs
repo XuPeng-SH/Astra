@@ -1,4 +1,4 @@
-//! Budget-adaptive runtime introspection for the `introspect` pinned tool.
+//! Budget-adaptive runtime introspection for the deferred `introspect` tool.
 //!
 //! The LLM calls `introspect` to query its own session state — token pressure,
 //! cache efficiency, tool health, active alerts, and working memory. Output
@@ -120,7 +120,7 @@ pub struct StallSnapshotSummary {
     pub forced_cache_waste_corrective: bool,
     #[serde(default)]
     pub forced_search_fanout_corrective: bool,
-    pub forced_exploration_family_phase2: bool,
+    pub forced_exploration_family_lockout: bool,
     pub forced_exploration_family_corrective: bool,
 }
 
@@ -132,7 +132,7 @@ pub struct ToolHealthEntry {
     pub errors: u32,
     pub avg_ms: u64,
     #[serde(default)]
-    pub deprioritized: bool,
+    pub avoidance_advised: bool,
     #[serde(default)]
     pub consecutive_failures: u32,
     #[serde(default)]
@@ -267,14 +267,14 @@ fn render_full(s: &IntrospectSnapshot) -> String {
 
     if !s.tool_health.is_empty() {
         out.push_str("\n## Tool Health\n");
-        out.push_str("| Tool | Calls | Errors | Avg ms | ConsecFail | Depri | LastFail |\n");
+        out.push_str("| Tool | Calls | Errors | Avg ms | ConsecFail | Avoid | LastFail |\n");
         out.push_str("|------|-------|--------|--------|------------|-------|----------|\n");
         for t in &s.tool_health {
-            let depri = if t.deprioritized { "YES" } else { "-" };
+            let avoidance = if t.avoidance_advised { "YES" } else { "-" };
             let last_fail = t.last_failure_category.as_deref().unwrap_or("-");
             out.push_str(&format!(
                 "| {} | {} | {} | {} | {} | {} | {} |\n",
-                t.name, t.calls, t.errors, t.avg_ms, t.consecutive_failures, depri, last_fail
+                t.name, t.calls, t.errors, t.avg_ms, t.consecutive_failures, avoidance, last_fail
             ));
         }
     }
@@ -375,7 +375,7 @@ pub fn render_stall_state(s: &IntrospectSnapshot) -> String {
         || st.forced_redundant_reads_corrective
         || st.forced_cache_waste_corrective
         || st.forced_search_fanout_corrective
-        || st.forced_exploration_family_phase2
+        || st.forced_exploration_family_lockout
         || st.forced_exploration_family_corrective;
     if st.nudge_count == 0 && st.events.is_empty() && !any_forced {
         return "## Stall / Loop-Guard\n(Healthy — no nudges, no forced corrections this turn.)"
@@ -413,8 +413,8 @@ pub fn render_stall_state(s: &IntrospectSnapshot) -> String {
     if st.forced_search_fanout_corrective {
         forced.push("search_fanout_corrective");
     }
-    if st.forced_exploration_family_phase2 {
-        forced.push("exploration_family_phase2");
+    if st.forced_exploration_family_lockout {
+        forced.push("exploration_family_lockout");
     }
     if st.forced_exploration_family_corrective {
         forced.push("exploration_family_corrective");
@@ -613,7 +613,7 @@ mod tests {
                     calls: 15,
                     errors: 5,
                     avg_ms: 2300,
-                    deprioritized: false,
+                    avoidance_advised: false,
                     consecutive_failures: 0,
                     last_failure_category: None,
                 },
@@ -622,7 +622,7 @@ mod tests {
                     calls: 22,
                     errors: 0,
                     avg_ms: 12,
-                    deprioritized: false,
+                    avoidance_advised: false,
                     consecutive_failures: 0,
                     last_failure_category: None,
                 },
@@ -631,7 +631,7 @@ mod tests {
                     calls: 8,
                     errors: 1,
                     avg_ms: 45,
-                    deprioritized: true,
+                    avoidance_advised: true,
                     consecutive_failures: 3,
                     last_failure_category: Some("Timeout".into()),
                 },
@@ -1082,10 +1082,10 @@ mod tests {
     // ── Tests for enhanced tool health rendering ─────────────────────────
 
     #[test]
-    fn render_full_shows_deprioritized_tool() {
+    fn render_full_shows_health_avoidance_tool() {
         let snap = sample_snapshot();
         let out = render_full(&snap);
-        assert!(out.contains("YES"), "deprioritized YES missing: {out}");
+        assert!(out.contains("YES"), "health avoidance YES missing: {out}");
         assert!(
             out.contains("Timeout"),
             "last failure category missing: {out}"

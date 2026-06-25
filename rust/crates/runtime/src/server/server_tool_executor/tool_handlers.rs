@@ -16,8 +16,9 @@ use crate::server::tool_agent_runtime::{execute_agent_fanout_tool, execute_agent
 use crate::server::tool_database_snapshots::{execute_mo_query, rollback_database_snapshots};
 use crate::server::tool_execution_result::tool_result_from_output;
 use crate::server::tool_file_runtime::{
-    execute_publish_artifact, execute_server_delete_file, execute_server_multi_edit,
-    execute_server_run_script, execute_server_str_replace, execute_server_write_file,
+    execute_publish_artifact, execute_rollback_file_edits, execute_server_delete_file,
+    execute_server_multi_edit, execute_server_run_script, execute_server_str_replace,
+    execute_server_write_file,
 };
 use crate::server::tool_introspect::handle_introspect;
 use crate::server::tool_local_execution::memory_args_with_context;
@@ -62,6 +63,7 @@ pub(super) fn server_tool_engine() -> ToolEngine<ServerToolExecutor> {
 
     register_handler_or_log!(engine, "write_file", WriteFileToolHandler);
     register_handler_or_log!(engine, "str_replace", StrReplaceToolHandler);
+    register_handler_or_log!(engine, "rollback_file_edits", RollbackFileEditsToolHandler);
     register_handler_or_log!(engine, "bash", BashToolHandler);
     register_handler_or_log!(engine, "git", DefaultExecutorToolHandler { name: "git" });
     register_handler_or_log!(
@@ -80,15 +82,12 @@ pub(super) fn server_tool_engine() -> ToolEngine<ServerToolExecutor> {
     register_handler_or_log!(engine, "enter_plan_mode", EnterPlanModeToolHandler);
     register_handler_or_log!(engine, "exit_plan_mode", ExitPlanModeToolHandler);
     register_handler_or_log!(engine, "introspect", IntrospectToolHandler);
-    register_handler_or_log!(engine, "prioritize_tool", PrioritizeToolHandler);
-    register_handler_or_log!(engine, "deprioritize_tool", DeprioritizeToolHandler);
     register_handler_or_log!(engine, "compress_context", CompressContextToolHandler);
     register_handler_or_log!(
         engine,
         "rollback_session_state",
         RollbackSessionStateToolHandler
     );
-    register_handler_or_log!(engine, "mo", MoToolHandler);
     register_handler_or_log!(engine, "mo_query", MoQueryToolHandler);
     register_handler_or_log!(
         engine,
@@ -149,9 +148,9 @@ impl ToolHandler<ServerToolExecutor> for ToolSearchToolHandler {
         _cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
         let mut pool = context.capability_filtered_server_tool_schemas();
-        pool.extend(context.plugin_schemas_snapshot("plugin_schemas_tool_search"));
+        pool.extend(context.external_schemas_snapshot("external_schemas_tool_search"));
         let Some(searchable_names) = context.current_searchable_tool_names() else {
-            return tool_result_from_output(astra_tools::tool_search::tool_search(&pool, args));
+            return tool_result_from_output(astra_tools::tool_search::tool_search(&[], args));
         };
         retain_tool_schemas_by_names(&mut pool, &searchable_names);
         tool_result_from_output(astra_tools::tool_search::tool_search(&pool, args))
@@ -495,6 +494,31 @@ impl ToolHandler<ServerToolExecutor> for StrReplaceToolHandler {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
+struct RollbackFileEditsToolHandler;
+
+#[async_trait]
+impl ToolHandler<ServerToolExecutor> for RollbackFileEditsToolHandler {
+    async fn execute(
+        &self,
+        context: &ServerToolExecutor,
+        args: &Value,
+        cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
+        if cancel_token.is_some_and(|t| t.is_cancelled()) {
+            return astra_tools::ToolResult::error(
+                "File rollback not executed: run was cancelled".to_string(),
+            );
+        }
+        tool_result_from_output(execute_rollback_file_edits(
+            &context.workspace_root,
+            args,
+            context.journal_turn_index.load(Ordering::Relaxed),
+            context.file_journal.as_ref(),
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
 struct BashToolHandler;
 
 #[async_trait]
@@ -512,36 +536,6 @@ impl ToolHandler<ServerToolExecutor> for BashToolHandler {
             );
         }
         context.server_bash(args).await
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct PrioritizeToolHandler;
-
-#[async_trait]
-impl ToolHandler<ServerToolExecutor> for PrioritizeToolHandler {
-    async fn execute(
-        &self,
-        context: &ServerToolExecutor,
-        args: &Value,
-        _cancel_token: Option<&CancellationToken>,
-    ) -> astra_tools::ToolResult {
-        tool_result_from_output(context.prioritize_tool(args))
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct DeprioritizeToolHandler;
-
-#[async_trait]
-impl ToolHandler<ServerToolExecutor> for DeprioritizeToolHandler {
-    async fn execute(
-        &self,
-        context: &ServerToolExecutor,
-        args: &Value,
-        _cancel_token: Option<&CancellationToken>,
-    ) -> astra_tools::ToolResult {
-        tool_result_from_output(context.deprioritize_tool(args))
     }
 }
 
@@ -585,7 +579,6 @@ impl ToolHandler<ServerToolExecutor> for RollbackSessionStateToolHandler {
                     restore_context: SessionStateRestoreContext {
                         session_id: &context.session_id,
                         observability_session: context.observability_session.as_ref(),
-                        config: &context.session_config.inner,
                         task_manager: &context.task_manager(),
                     },
                 },
@@ -594,46 +587,6 @@ impl ToolHandler<ServerToolExecutor> for RollbackSessionStateToolHandler {
             )
             .await,
         )
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct MoToolHandler;
-
-#[async_trait]
-impl ToolHandler<ServerToolExecutor> for MoToolHandler {
-    async fn execute(
-        &self,
-        context: &ServerToolExecutor,
-        args: &Value,
-        cancel_token: Option<&CancellationToken>,
-    ) -> astra_tools::ToolResult {
-        // P2-C: Cooperative cancellation check at heavy handler entry
-        if cancel_token.is_some_and(|t| t.is_cancelled()) {
-            return astra_tools::ToolResult::error(
-                "MatrixOne tool not executed: run was cancelled".to_string(),
-            );
-        }
-        let action = args
-            .get("action")
-            .and_then(|value| value.as_str())
-            .unwrap_or("query");
-        match action {
-            "query" => execute_mo_query(
-                context.database_snapshot_journal.as_ref(),
-                args,
-                context.journal_turn_index.load(Ordering::Relaxed),
-            ),
-            "snapshot" | "branch" => {
-                context
-                    .default_executor
-                    .execute(&format!("mo_{action}"), args)
-                    .await
-            }
-            other => tool_result_from_output(format!(
-                "Error: Unknown mo action: '{other}'. Use: query, snapshot, branch"
-            )),
-        }
     }
 }
 

@@ -17,9 +17,8 @@
 //! ## Scope
 //!
 //! Only covers the **active** tool set shipped today (the names
-//! advertised in `astra-tools::schemas`). Legacy separate names
-//! (`task_create`, `git_show`, `memory_retrieve`, `hover_info`, …)
-//! have been retired — the model now issues unified action-param
+//! advertised in `astra-tools::schemas`). Retired separate names
+//! have been removed — the model now issues unified action-param
 //! calls (`task(action="create")`, `git(action="show")`,
 //! `memory(action="retrieve")`, `lsp(operation="hover")`) and we
 //! don't maintain preview code for dead paths.
@@ -167,13 +166,17 @@ pub fn render_preview(tool: &str, args: &Value, style: PreviewStyle, desc_budget
         "github" => github_preview(args, path_budget, verbose),
         "memory" => memory_preview(args, path_budget, verbose),
         "session" => session_preview(args, path_budget, verbose),
-        "mo" => mo_preview(args, path_budget, verbose),
+        "mo_query" => mo_query_preview(args, path_budget, verbose),
         "agent" => agent_preview(args, path_budget, verbose),
         "skill" => skill_preview(args, path_budget, verbose),
         "task" => task_preview(args, path_budget, verbose),
         "task_output" => background_task_output_preview(args, path_budget, verbose),
         "task_stop" => background_task_stop_preview(args, path_budget, verbose),
         "task_list" => "List background tasks".to_string(),
+        "tool_search" => {
+            let query = args.get("query").and_then(Value::as_str).unwrap_or("");
+            format!("Searching tools: \"{}\"", trunc(query, path_budget(17)))
+        }
 
         // ── Web ─────────────────────────────────────────────────────
         "web_fetch" => {
@@ -245,13 +248,8 @@ fn git_preview(args: &Value, path_budget: impl Fn(usize) -> usize, verbose: bool
     match action {
         "status" => "Git status".to_string(),
         "log" => {
-            // Schema canonical key is `ref`; accept `branch` as legacy
-            // alias since some older replays still emit that.
             let n = args.get("n").and_then(Value::as_u64);
-            let git_ref = args
-                .get("ref")
-                .or_else(|| args.get("branch"))
-                .and_then(Value::as_str);
+            let git_ref = args.get("ref").and_then(Value::as_str);
             match (n, git_ref) {
                 (Some(n), Some(r)) => format!("Git log -{n} {r}"),
                 (Some(n), None) => format!("Git log -{n}"),
@@ -260,12 +258,8 @@ fn git_preview(args: &Value, path_budget: impl Fn(usize) -> usize, verbose: bool
             }
         }
         "show" => {
-            // Schema canonical: `revision` (runtime `git_ops::show` reads
-            // this). Accept legacy `commit`/`ref` for resilience.
             let rev = args
                 .get("revision")
-                .or_else(|| args.get("commit"))
-                .or_else(|| args.get("ref"))
                 .and_then(Value::as_str)
                 .unwrap_or("HEAD");
             format!("Git show {}", trunc(rev, path_budget(9)))
@@ -305,12 +299,7 @@ fn git_preview(args: &Value, path_budget: impl Fn(usize) -> usize, verbose: bool
             format!("Git revert {}", trunc(sha, path_budget(11)))
         }
         "stash" => {
-            // Schema canonical: `sub_action`. Accept `stash_action` alias.
-            let sub = args
-                .get("sub_action")
-                .or_else(|| args.get("stash_action"))
-                .and_then(Value::as_str)
-                .unwrap_or("");
+            let sub = args.get("sub_action").and_then(Value::as_str).unwrap_or("");
             if sub.is_empty() {
                 "Git stash".to_string()
             } else {
@@ -354,24 +343,15 @@ fn github_preview(args: &Value, path_budget: impl Fn(usize) -> usize, verbose: b
             truncate_line(s, b)
         }
     };
-    // Schema canonical: `number` (single field for both PR and issue
-    // numbers). Runtime `github.rs` still reads `pr_number` /
-    // `issue_number` — accept both so the preview works regardless
-    // of which shape the model sends.
-    let numeric = |primary: &str| -> Option<u64> {
-        args.get("number")
-            .or_else(|| args.get(primary))
-            .and_then(Value::as_u64)
-    };
     match action {
         "list_prs" => format!("GitHub: list PRs {repo_display}"),
-        "get_pr" => match numeric("pr_number") {
+        "get_pr" => match args.get("pr_number").and_then(Value::as_u64) {
             Some(n) => format!("GitHub: PR #{n} {repo_display}"),
             None => format!("GitHub: get PR {repo_display}"),
         },
         "ci_status" => format!("GitHub: CI status {repo_display}"),
         "list_issues" => format!("GitHub: list issues {repo_display}"),
-        "get_issue" => match numeric("issue_number") {
+        "get_issue" => match args.get("issue_number").and_then(Value::as_u64) {
             Some(n) => format!("GitHub: issue #{n} {repo_display}"),
             None => format!("GitHub: get issue {repo_display}"),
         },
@@ -440,30 +420,6 @@ fn session_preview(args: &Value, path_budget: impl Fn(usize) -> usize, verbose: 
             let path = args.get("path").and_then(Value::as_str).unwrap_or("");
             format!("Adjust config: {}", trunc(path, 15))
         }
-        "prioritize" => {
-            let tool = args.get("tool").and_then(Value::as_str).unwrap_or("");
-            format!("Prioritize: {}", trunc(tool, 12))
-        }
-        "deprioritize" => {
-            let tool = args.get("tool").and_then(Value::as_str).unwrap_or("");
-            format!("Deprioritize: {}", trunc(tool, 14))
-        }
-        "set_goal" => {
-            let goal = args.get("goal").and_then(Value::as_str).unwrap_or("");
-            format!("Set goal: \"{}\"", trunc(goal, 12))
-        }
-        "compact" => "Compress context".to_string(),
-        "timeline" => "Session timeline".to_string(),
-        "summary" => "Session summary".to_string(),
-        "history" => "Session history".to_string(),
-        "rollback_edits" => match args.get("scope").and_then(Value::as_str) {
-            Some(s) => format!("Revert file edits: {}", trunc(s, 19)),
-            None => "Revert file edits".to_string(),
-        },
-        "ask_user" => {
-            let q = args.get("question").and_then(Value::as_str).unwrap_or("");
-            format!("Asking user: \"{}\"", trunc(q, 15))
-        }
         "sleep" => {
             let duration_ms = args.get("duration_ms").and_then(Value::as_u64).unwrap_or(0);
             let reason = args.get("reason").and_then(Value::as_str);
@@ -472,16 +428,29 @@ fn session_preview(args: &Value, path_budget: impl Fn(usize) -> usize, verbose: 
                 _ => format!("Sleeping: {duration_ms}ms"),
             }
         }
-        "tool_search" => {
-            let query = args.get("query").and_then(Value::as_str).unwrap_or("");
-            format!("Searching tools: \"{}\"", trunc(query, 18))
+        "history_page" => {
+            let cursor = args
+                .get("before_seq")
+                .or_else(|| args.get("after_seq"))
+                .and_then(Value::as_i64);
+            match cursor {
+                Some(seq) => format!("Session history page near item {seq}"),
+                None => "Session history page".to_string(),
+            }
+        }
+        "history_search" => {
+            let pattern = args.get("pattern").and_then(Value::as_str).unwrap_or("");
+            format!("Searching session history: \"{}\"", trunc(pattern, 18))
+        }
+        "history_around" => {
+            let item_seq = args.get("item_seq").and_then(Value::as_i64).unwrap_or(0);
+            format!("Session history around item {item_seq}")
         }
         _ => format!("Session: {action}"),
     }
 }
 
-fn mo_preview(args: &Value, path_budget: impl Fn(usize) -> usize, verbose: bool) -> String {
-    let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+fn mo_query_preview(args: &Value, path_budget: impl Fn(usize) -> usize, verbose: bool) -> String {
     let trunc = |s: &str, b: usize| -> String {
         if verbose {
             s.to_string()
@@ -489,21 +458,8 @@ fn mo_preview(args: &Value, path_budget: impl Fn(usize) -> usize, verbose: bool)
             truncate_line(s, path_budget(b))
         }
     };
-    match action {
-        "query" => {
-            let sql = args.get("sql").and_then(Value::as_str).unwrap_or("");
-            format!("MO query: \"{}\"", trunc(sql, 11))
-        }
-        "snapshot" => {
-            let name = args.get("name").and_then(Value::as_str).unwrap_or("");
-            format!("MO snapshot: {}", trunc(name, 13))
-        }
-        "branch" => {
-            let name = args.get("name").and_then(Value::as_str).unwrap_or("");
-            format!("MO branch: {}", trunc(name, 11))
-        }
-        _ => format!("MO: {action}"),
-    }
+    let sql = args.get("sql").and_then(Value::as_str).unwrap_or("");
+    format!("MO query: \"{}\"", trunc(sql, 11))
 }
 
 fn agent_preview(args: &Value, path_budget: impl Fn(usize) -> usize, verbose: bool) -> String {
@@ -532,7 +488,7 @@ fn agent_preview(args: &Value, path_budget: impl Fn(usize) -> usize, verbose: bo
             // human-readable summaries that visually clutter when N
             // parallel agents all share a similar prefix
             // ("Correctness & logic review of the latest 7 commits…").
-            // Matches claudecode/Kiro: per-agent rows show the name,
+            // Matches reference-agent/Kiro: per-agent rows show the name,
             // not the full description.
             let name = args.get("name").and_then(Value::as_str);
             let label = name.or_else(|| args.get("description").and_then(Value::as_str));
@@ -1025,13 +981,13 @@ mod tests {
     #[test]
     fn git_unified_show() {
         assert_eq!(
-            p("git", json!({"action": "show", "commit": "abc123"})),
+            p("git", json!({"action": "show", "revision": "abc123"})),
             "Git show abc123"
         );
     }
 
     #[test]
-    fn github_get_pr() {
+    fn github_action_get_pr() {
         assert_eq!(
             p(
                 "github",
@@ -1072,12 +1028,9 @@ mod tests {
     }
 
     #[test]
-    fn session_tool_search() {
+    fn tool_search_with_query() {
         assert_eq!(
-            p(
-                "session",
-                json!({"action": "tool_search", "query": "github"})
-            ),
+            p("tool_search", json!({"query": "github"})),
             r#"Searching tools: "github""#
         );
     }
@@ -1096,7 +1049,7 @@ mod tests {
     #[test]
     fn mo_query() {
         assert_eq!(
-            p("mo", json!({"action": "query", "sql": "SELECT 1"})),
+            p("mo_query", json!({"sql": "SELECT 1"})),
             r#"MO query: "SELECT 1""#
         );
     }
@@ -1119,7 +1072,7 @@ mod tests {
     /// agents all show "Spawn agent: Correctness & logic re…
     /// (code-revi…)" — visually indistinguishable. Names like
     /// "review_tui" / "review_fixes" make the strip readable
-    /// (claudecode/Kiro both display names this way).
+    /// (reference-agent/Kiro both display names this way).
     #[test]
     fn agent_spawn_prefers_short_name_over_long_description() {
         assert_eq!(
@@ -1139,9 +1092,6 @@ mod tests {
         );
     }
 
-    /// Backwards-compat: when `name` is absent, fall back to
-    /// `description` (the pre-fix behaviour). This keeps every
-    /// historical session's render bytes identical.
     #[test]
     fn agent_spawn_falls_back_to_description_when_name_absent() {
         assert_eq!(
@@ -1155,7 +1105,7 @@ mod tests {
                 })
             ),
             "Spawn agent: Correctness review (code-review)",
-            "without `name`, fall back to description (legacy behaviour)"
+            "without `name`, fall back to description"
         );
     }
 
@@ -1177,7 +1127,7 @@ mod tests {
     }
 
     #[test]
-    fn task_create() {
+    fn task_action_create() {
         assert_eq!(
             p(
                 "task",
@@ -1288,14 +1238,9 @@ mod tests {
     }
 
     // ─── Schema-canonical field names ──────────────────────────────────
-    // The older tests above use legacy field names (status / commit /
-    // branch / stash_action / pr_number) to pin the backward-compat
-    // fallback paths. These tests pin the schema-canonical keys so a
-    // refactor that drops an alias won't silently regress the
-    // canonical path.
 
     #[test]
-    fn git_show_uses_canonical_revision_field() {
+    fn git_action_show_uses_canonical_revision_field() {
         assert_eq!(
             p("git", json!({"action": "show", "revision": "abc123"})),
             "Git show abc123"
@@ -1303,7 +1248,7 @@ mod tests {
     }
 
     #[test]
-    fn git_show_defaults_to_head_when_omitted() {
+    fn git_action_show_defaults_to_head_when_omitted() {
         assert_eq!(p("git", json!({"action": "show"})), "Git show HEAD");
     }
 
@@ -1335,7 +1280,7 @@ mod tests {
     }
 
     #[test]
-    fn git_checkout_file_with_ref() {
+    fn git_action_checkout_file_with_ref() {
         assert_eq!(
             p(
                 "git",
@@ -1346,7 +1291,7 @@ mod tests {
     }
 
     #[test]
-    fn git_worktree_add() {
+    fn git_action_worktree_add() {
         assert_eq!(
             p(
                 "git",
@@ -1357,22 +1302,22 @@ mod tests {
     }
 
     #[test]
-    fn github_get_pr_uses_canonical_number_field() {
+    fn github_action_get_pr_uses_canonical_pr_number_field() {
         assert_eq!(
             p(
                 "github",
-                json!({"action": "get_pr", "owner": "o", "repo": "r", "number": 7})
+                json!({"action": "get_pr", "owner": "o", "repo": "r", "pr_number": 7})
             ),
             "GitHub: PR #7 o/r"
         );
     }
 
     #[test]
-    fn github_get_issue_uses_canonical_number_field() {
+    fn github_action_get_issue_uses_canonical_issue_number_field() {
         assert_eq!(
             p(
                 "github",
-                json!({"action": "get_issue", "owner": "o", "repo": "r", "number": 99})
+                json!({"action": "get_issue", "owner": "o", "repo": "r", "issue_number": 99})
             ),
             "GitHub: issue #99 o/r"
         );
@@ -1416,18 +1361,31 @@ mod tests {
     }
 
     #[test]
-    fn session_timeline_summary_history_render() {
+    fn session_history_actions_render() {
         assert_eq!(
-            p("session", json!({"action": "timeline"})),
-            "Session timeline"
+            p("session", json!({"action": "history_page"})),
+            "Session history page"
         );
         assert_eq!(
-            p("session", json!({"action": "summary"})),
-            "Session summary"
+            p(
+                "session",
+                json!({"action": "history_page", "before_seq": 42})
+            ),
+            "Session history page near item 42"
         );
         assert_eq!(
-            p("session", json!({"action": "history"})),
-            "Session history"
+            p(
+                "session",
+                json!({"action": "history_search", "pattern": "failed build"})
+            ),
+            r#"Searching session history: "failed build""#
+        );
+        assert_eq!(
+            p(
+                "session",
+                json!({"action": "history_around", "item_seq": 17})
+            ),
+            "Session history around item 17"
         );
     }
 

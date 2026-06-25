@@ -1,44 +1,109 @@
+use std::sync::Arc;
+
 use serde_json::Value;
 
 use astra_config::ToolSurfaceConfig;
 
-use super::scoring::{DEFAULT_TOOL_BUDGET_TOKENS, FilterOptions, pre_filter_dynamic};
-use crate::pipeline::routing::{RoutingDecision, ToolFilter};
-use astra_turn_core::routing_metrics::ConfidenceCalibrator;
+use super::DEFAULT_TOOL_SCHEMA_BUDGET_TOKENS;
 use astra_turn_core::tool::schema::tool_schema_name;
 use astra_turn_core::tool_registry_meta::{TOOL_CATALOG, ToolMeta};
-use astra_turn_core::tool_registry_report::{SelectionReport, ToolQualityTracker};
-use astra_turn_core::tool_registry_state::ConversationState;
+use astra_turn_core::tool_registry_report::ToolSurfaceReport;
 
-use super::tool_pool::sort_schemas_by_name;
+fn sort_schemas_by_name(schemas: &mut [Value]) {
+    schemas.sort_by(|a, b| {
+        let a_name = tool_schema_name(a).unwrap_or("");
+        let b_name = tool_schema_name(b).unwrap_or("");
+        a_name.cmp(b_name)
+    });
+}
 
-/// The main tool selection interface.
+fn split_ascii_words(text: &str) -> Vec<&str> {
+    text.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .filter(|word| !word.is_empty())
+        .collect()
+}
+
+fn is_pure_conversational_query(query: &str) -> bool {
+    const CONVERSATIONAL_THRESHOLD_CHARS: usize = 20;
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+
+    let lower = trimmed.to_lowercase();
+    let has_content = lower
+        .chars()
+        .any(|c| c.is_alphanumeric() || ('\u{4e00}'..='\u{9fff}').contains(&c));
+    if !has_content {
+        return true;
+    }
+    if lower.chars().count() > CONVERSATIONAL_THRESHOLD_CHARS {
+        return false;
+    }
+
+    const CONVERSATIONAL_CN: &[&str] = &["你好", "谢谢", "再见", "好的", "是的", "不是", "嗯"];
+    let compact_cjk: String = lower
+        .chars()
+        .filter(|c| c.is_alphanumeric() || ('\u{4e00}'..='\u{9fff}').contains(c))
+        .collect();
+    if CONVERSATIONAL_CN
+        .iter()
+        .any(|phrase| compact_cjk == *phrase)
+    {
+        return true;
+    }
+
+    const CONVERSATIONAL_EN: &[&str] = &[
+        "hello",
+        "hi",
+        "hey",
+        "thanks",
+        "thank you",
+        "bye",
+        "goodbye",
+        "yes",
+        "no",
+        "ok",
+        "okay",
+        "sure",
+        "yep",
+        "nope",
+    ];
+    let words = split_ascii_words(&lower);
+    CONVERSATIONAL_EN.iter().any(|phrase| {
+        let phrase_words = split_ascii_words(phrase);
+        words == phrase_words
+            || (phrase_words.len() == 1
+                && matches!(phrase_words[0], "hello" | "hi" | "hey")
+                && words == [phrase_words[0], "there"])
+    })
+}
+
+/// The main tool surface interface.
 ///
 /// ```text
 /// let registry = ToolRegistry::new(all_tool_schemas());
-/// let selected = registry.select("matrixorigin memoria最新的pr?", 1);
-/// // selected contains: 7 pinned + relevant dynamic tools within budget
+/// let surface = registry.build_initial_surface("matrixorigin memoria最新的pr?");
+/// // surface contains the stable always_load tools; deferred tools are activated explicitly
 /// ```
 pub struct ToolRegistry {
     all_schemas: Vec<Value>,
-    budget_tokens: u32,
+    schema_budget_tokens: u32,
     /// Real token costs measured from actual schemas (schema JSON bytes / 4).
     /// Maps tool name → measured token cost.
     measured_costs: std::collections::HashMap<String, u32>,
     /// O(1) lookup: tool name → index into all_schemas.
     schema_index: std::collections::HashMap<String, usize>,
-    /// Pre-resolved pinned tool schemas (cloned once at construction).
-    pinned_schemas: Vec<(String, Value)>,
-    /// Pre-sorted pinned schemas for `pinned_only()` — shared via Arc
-    /// to avoid ~5-8KB clone per conversational turn. Atomically replaced
-    /// on runtime pin/unpin mutations.
-    pinned_sorted: std::sync::Arc<Vec<Value>>,
-    /// Cached set of pinned tool names, rebuilt alongside `pinned_sorted`.
+    /// Pre-resolved always_load tool schemas (cloned once at construction).
+    always_load_schemas: Vec<(String, Value)>,
+    /// Pre-sorted always_load schemas for `always_load_only()` — shared via Arc
+    /// to avoid ~5-8KB clone per conversational turn. Atomically replaced when
+    /// runtime-injected schemas change.
+    always_load_sorted: Arc<Vec<Value>>,
+    /// Cached set of always_load tool names, rebuilt alongside `always_load_sorted`.
     /// Avoids reconstructing a `HashSet<String>` (cloning ~14 names) on every
     /// selection path — 2-3 calls per turn previously.
-    pinned_name_cache: std::collections::HashSet<String>,
-    /// Plugin tool names (registered dynamically, always included in selection).
-    plugin_tool_names: Vec<String>,
+    always_load_name_cache: std::collections::HashSet<String>,
 }
 
 impl ToolRegistry {
@@ -67,33 +132,34 @@ impl ToolRegistry {
             .collect();
         let measured_costs = Self::measure_all_schemas(&all_schemas);
         let schema_index = Self::build_schema_index(&all_schemas);
-        let pinned_schemas = Self::resolve_pinned(&all_schemas, &schema_index, surface_cfg);
-        let mut pinned_sorted: Vec<Value> = pinned_schemas.iter().map(|(_, s)| s.clone()).collect();
-        sort_schemas_by_name(&mut pinned_sorted);
-        let pinned_name_cache: std::collections::HashSet<String> = pinned_schemas
+        let always_load_schemas =
+            Self::resolve_always_load(&all_schemas, &schema_index, surface_cfg);
+        let mut always_load_sorted: Vec<Value> =
+            always_load_schemas.iter().map(|(_, s)| s.clone()).collect();
+        sort_schemas_by_name(&mut always_load_sorted);
+        let always_load_name_cache: std::collections::HashSet<String> = always_load_schemas
             .iter()
             .map(|(name, _)| name.clone())
             .collect();
         Self {
             all_schemas,
-            budget_tokens: DEFAULT_TOOL_BUDGET_TOKENS,
+            schema_budget_tokens: DEFAULT_TOOL_SCHEMA_BUDGET_TOKENS,
             measured_costs,
             schema_index,
-            pinned_schemas,
-            pinned_sorted: std::sync::Arc::new(pinned_sorted),
-            pinned_name_cache,
-            plugin_tool_names: Vec::new(),
+            always_load_schemas,
+            always_load_sorted: Arc::new(always_load_sorted),
+            always_load_name_cache,
         }
     }
 
-    pub fn with_budget(mut self, budget: u32) -> Self {
-        self.budget_tokens = budget;
+    pub fn with_schema_budget(mut self, budget: u32) -> Self {
+        self.schema_budget_tokens = budget;
         self
     }
 
-    /// Get the configured default token budget.
-    pub fn default_budget(&self) -> u32 {
-        self.budget_tokens
+    /// Get the configured default schema-token budget used for surface telemetry.
+    pub fn default_schema_budget(&self) -> u32 {
+        self.schema_budget_tokens
     }
 
     /// Access the full list of tool schemas.
@@ -123,8 +189,8 @@ impl ToolRegistry {
             .collect()
     }
 
-    /// Pre-resolve pinned tool schemas once at construction.
-    fn resolve_pinned(
+    /// Pre-resolve always_load tool schemas once at construction.
+    fn resolve_always_load(
         schemas: &[Value],
         index: &std::collections::HashMap<String, usize>,
         surface_cfg: Option<&ToolSurfaceConfig>,
@@ -138,7 +204,7 @@ impl ToolRegistry {
             }
         };
         super::surface::ToolSurface::build(schemas.to_vec(), cfg, &[])
-            .pinned_schemas()
+            .always_load_schemas()
             .into_iter()
             .filter_map(|schema| {
                 let name = tool_schema_name(&schema).map(str::to_string);
@@ -155,44 +221,24 @@ impl ToolRegistry {
         self.schema_index.get(name).map(|&i| &self.all_schemas[i])
     }
 
-    /// Pre-resolved pinned schemas (name, schema) — cloned once at construction.
-    pub fn pinned_schemas(&self) -> &[(String, Value)] {
-        &self.pinned_schemas
+    /// Pre-resolved always_load schemas (name, schema) — cloned once at construction.
+    pub fn always_load_schemas(&self) -> &[(String, Value)] {
+        &self.always_load_schemas
     }
 
-    /// Borrow the cached set of pinned tool names. Rebuilt alongside
-    /// `pinned_sorted` whenever the pinned set mutates, so this is O(1)
-    /// and allocation-free per call.
-    fn pinned_name_set(&self) -> &std::collections::HashSet<String> {
-        &self.pinned_name_cache
-    }
-
-    /// Return the resolved pinned tool names in stable order for cross-crate
+    /// Return the resolved always_load tool names in stable order for cross-crate
     /// wire metadata. The internal cache remains a set because hot-path
     /// membership checks should stay O(1).
-    pub fn pinned_tool_names_sorted(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.pinned_name_cache.iter().cloned().collect();
+    pub fn always_load_tool_names_sorted(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.always_load_name_cache.iter().cloned().collect();
         names.sort();
         names
     }
 
-    fn dynamic_budget_used_for_names(&self, names: &[String]) -> u32 {
-        names.iter().map(|name| self.token_cost(name)).sum()
-    }
-
-    fn dynamic_names_for_selected(&self, names: &[String]) -> Vec<String> {
-        let pinned_names = self.pinned_name_set();
-        names
-            .iter()
-            .filter(|name| !pinned_names.contains(*name))
-            .cloned()
-            .collect()
-    }
-
-    /// Total measured token cost of all pinned tool schemas.
+    /// Total measured token cost of all always_load tool schemas.
     /// Used for accurate overhead estimation in budget pressure calculation.
-    pub fn total_pinned_token_cost(&self) -> u32 {
-        self.pinned_schemas
+    pub fn total_always_load_token_cost(&self) -> u32 {
+        self.always_load_schemas
             .iter()
             .map(|(name, _)| self.token_cost(name))
             .sum()
@@ -207,370 +253,92 @@ impl ToolRegistry {
         })
     }
 
-    /// Select tools for a given user query and conversation turn.
+    /// Build the visible tool surface for a given user query and conversation turn.
     ///
     /// Returns tool schemas to include in the LLM request.
-    /// Pinned tools are always included. Dynamic tools are ranked by
-    /// relevance and added within the token budget.
-    pub fn select(&self, query: &str, turn_count: u32) -> Vec<Value> {
-        self.select_with_budget(query, turn_count, self.budget_tokens)
-    }
-
-    /// Select tools with a custom token budget, returning both schemas and a report.
-    pub fn select_with_report(
-        &self,
-        query: &str,
-        turn_count: u32,
-        budget: u32,
-    ) -> (Vec<Value>, SelectionReport) {
-        self.select_with_report_ctx(query, turn_count, budget, &[])
-    }
-
-    /// Select tools with context from recent turns (for recency boost).
-    pub fn select_with_report_ctx(
-        &self,
-        query: &str,
-        turn_count: u32,
-        budget: u32,
-        recent_tools: &[String],
-    ) -> (Vec<Value>, SelectionReport) {
-        let state = ConversationState::from_message_with_context(query, turn_count, recent_tools);
-
-        // Conversational short-circuit: pure greetings/acks need no tools.
-        // BUT: if recent_tools is non-empty, the session has active tool context
-        // and the next turn likely needs related tools (e.g., memory_retrieve
-        // after memory_store). Don't short-circuit in that case.
-        if state.is_conversational
-            && !state.is_fetch
-            && !state.is_mutate
-            && !state.is_analytical
-            && !state.references_history
-            && state.recent_tools.is_empty()
-        {
-            let report = SelectionReport {
-                tools_selected: Vec::new(),
-                dynamic_tools_selected: Vec::new(),
-                selected_count: 0,
-                budget_used: 0,
-                budget_total: budget,
-            };
-            return (Vec::new(), report);
-        }
-
-        let pinned_names = self.pinned_name_set();
-        let filter = FilterOptions {
-            pinned_names: Some(pinned_names),
-            ..Default::default()
-        };
-        let ranked = pre_filter_dynamic(&state, query, &filter);
-        let schemas = self.budget_select_measured(&ranked, budget);
-        let names = Self::selected_names(&schemas);
-        let dynamic_tools_selected = self.dynamic_names_for_selected(&names);
-
-        let budget_used = self.dynamic_budget_used_for_names(&dynamic_tools_selected);
-
-        // Observability: dynamic path — record the top-ranked
-        // candidates before budget trimming so a reviewer can see
-        // WHY a tool was excluded (scored too low vs. priced out).
-        // Cap the top list at 10 to keep lines bounded.
-
-        let report = SelectionReport {
-            selected_count: schemas.len() as u32,
-            tools_selected: names,
-            dynamic_tools_selected,
-            budget_used,
-            budget_total: budget,
-        };
-
-        (schemas, report)
-    }
-
-    /// Select tools with a custom token budget.
-    pub fn select_with_budget(&self, query: &str, turn_count: u32, budget: u32) -> Vec<Value> {
-        let (schemas, _report) = self.select_with_report(query, turn_count, budget);
+    /// AlwaysLoad tools are included deterministically. Non-always_load built-ins are
+    /// deferred and must be activated explicitly through `tool_search`.
+    pub fn build_initial_surface(&self, query: &str) -> Vec<Value> {
+        let (schemas, _report) =
+            self.build_initial_surface_with_report(query, self.schema_budget_tokens);
         schemas
     }
 
-    /// Select tools with quality-aware scoring: uses historical effectiveness
-    /// data from the tracker to boost/penalize tool rankings.
-    pub fn select_with_quality(
+    /// Build a tool surface with a custom schema-token budget, returning both schemas and a report.
+    pub fn build_initial_surface_with_report(
         &self,
         query: &str,
-        turn_count: u32,
-        budget: u32,
-        recent_tools: &[String],
-        quality_tracker: Option<&ToolQualityTracker>,
-    ) -> (Vec<Value>, SelectionReport) {
-        let state = ConversationState::from_message_with_context(query, turn_count, recent_tools);
+        schema_budget: u32,
+    ) -> (Vec<Value>, ToolSurfaceReport) {
+        self.build_initial_surface_with_report_ctx(query, schema_budget, &[])
+    }
 
-        if state.is_conversational
-            && !state.is_fetch
-            && !state.is_mutate
-            && !state.is_analytical
-            && !state.references_history
-            && state.recent_tools.is_empty()
-        {
-            let report = SelectionReport {
-                tools_selected: Vec::new(),
-                dynamic_tools_selected: Vec::new(),
-                selected_count: 0,
-                budget_used: 0,
-                budget_total: budget,
+    /// Build a tool surface with context from recent turns.
+    pub fn build_initial_surface_with_report_ctx(
+        &self,
+        query: &str,
+        schema_budget: u32,
+        recent_tools: &[String],
+    ) -> (Vec<Value>, ToolSurfaceReport) {
+        // Conversational short-circuit: pure greetings/acks need no tools. If
+        // recent tools exist, preserve tool continuity for follow-up turns.
+        if recent_tools.is_empty() && is_pure_conversational_query(query) {
+            let report = ToolSurfaceReport {
+                visible_tools: Vec::new(),
+                visible_count: 0,
+                schema_budget_used: 0,
+                schema_budget_total: schema_budget,
             };
             return (Vec::new(), report);
         }
 
-        let pinned_names = self.pinned_name_set();
-        let filter = FilterOptions {
-            pinned_names: Some(pinned_names),
-            quality_tracker,
-            ..Default::default()
-        };
-        let ranked = pre_filter_dynamic(&state, query, &filter);
-        let schemas = self.budget_select_measured(&ranked, budget);
-        let names = Self::selected_names(&schemas);
-        let dynamic_tools_selected = self.dynamic_names_for_selected(&names);
+        let schemas = self.always_load_only();
+        let names = Self::visible_names(schemas.as_ref());
 
-        let budget_used = self.dynamic_budget_used_for_names(&dynamic_tools_selected);
-
-        let report = SelectionReport {
-            selected_count: schemas.len() as u32,
-            tools_selected: names,
-            dynamic_tools_selected,
-            budget_used,
-            budget_total: budget,
+        let report = ToolSurfaceReport {
+            visible_count: schemas.as_ref().len() as u32,
+            visible_tools: names,
+            schema_budget_used: 0,
+            schema_budget_total: schema_budget,
         };
 
-        (schemas, report)
+        (schemas.as_ref().clone(), report)
     }
-    /// Pipeline-integrated selection using a pre-computed RoutingDecision.
+
+    /// Pipeline-integrated tool surface using a pre-computed RoutingDecision.
     ///
-    /// This is the new preferred entry point for tool selection. It uses
-    /// the RoutingDecision's embedded ConversationState for backward-compatible
-    /// TF-IDF scoring, while leveraging the enriched routing intelligence
-    /// (task type, domain, confidence, tool filter) for better decisions.
-    ///
-    /// ```text
-    /// let routing = RoutingEngine::analyze(query, turn, &recent, &hints, boost);
-    /// let (schemas, report) = registry.select_routed(query, &routing, 800, &[], None, None);
-    /// ```
-    pub fn select_routed(
-        &self,
-        query: &str,
-        routing: &RoutingDecision,
-        budget: u32,
-        extra_boost_terms: &[String],
-        quality_tracker: Option<&ToolQualityTracker>,
-        calibrator: Option<&ConfidenceCalibrator>,
-    ) -> (Vec<Value>, SelectionReport) {
-        self.select_routed_with_memory(
-            query,
-            routing,
-            budget,
-            extra_boost_terms,
-            quality_tracker,
-            calibrator,
-            &[],
-        )
-    }
-
-    /// Like [`select_routed`] but also accepts memory domain hints for gate softening.
-    #[allow(clippy::too_many_arguments)]
-    pub fn select_routed_with_memory(
-        &self,
-        query: &str,
-        routing: &RoutingDecision,
-        budget: u32,
-        extra_boost_terms: &[String],
-        quality_tracker: Option<&ToolQualityTracker>,
-        calibrator: Option<&ConfidenceCalibrator>,
-        memory_domain_hints: &[crate::pipeline::routing::DomainHint],
-    ) -> (Vec<Value>, SelectionReport) {
-        self.select_routed_with_pressure(
-            query,
-            routing,
-            budget,
-            extra_boost_terms,
-            quality_tracker,
-            calibrator,
-            memory_domain_hints,
-            0.0,
-            &std::collections::HashMap::new(),
-            &[],
-            &std::collections::HashMap::new(),
-        )
-    }
-
-    /// Pressure-aware tool selection.  When `budget_pressure` > 0, the scoring
-    /// pipeline applies a rising minimum-score floor that excludes marginally
-    /// relevant tools, saving schema tokens under token pressure.
-    #[allow(clippy::too_many_arguments)]
-    pub fn select_routed_with_pressure(
-        &self,
-        query: &str,
-        routing: &RoutingDecision,
-        budget: u32,
-        extra_boost_terms: &[String],
-        quality_tracker: Option<&ToolQualityTracker>,
-        calibrator: Option<&ConfidenceCalibrator>,
-        memory_domain_hints: &[crate::pipeline::routing::DomainHint],
-        budget_pressure: f64,
-        co_occurrence: &std::collections::HashMap<String, f64>,
-        file_context: &[String],
-        outcome_bias: &std::collections::HashMap<String, f64>,
-    ) -> (Vec<Value>, SelectionReport) {
-        // Use tool_filter for early conversational detection
-        if routing.tool_filter == ToolFilter::Minimal {
-            let schemas = self.pinned_only();
-            let names = Self::selected_names(&schemas);
-            // Observability: minimal-filter early return. A G3-class
-            // bug where a tool is missing from the routed-minimal
-            // path shows up as `final` not containing the expected
-            // tool — visible without reading the routing engine.
-            return (
-                schemas,
-                SelectionReport {
-                    tools_selected: names.clone(),
-                    dynamic_tools_selected: Vec::new(),
-                    selected_count: names.len() as u32,
-                    budget_used: 0,
-                    budget_total: budget,
-                },
-            );
-        }
-
-        // Build effective query: original + routing boost terms + extra boost
-        let effective_query = if routing.boost_terms.is_empty() && extra_boost_terms.is_empty() {
-            query.to_string()
-        } else {
-            let mut parts = vec![query.to_string()];
-            parts.extend(routing.boost_terms.iter().cloned());
-            parts.extend(extra_boost_terms.iter().cloned());
-            parts.join(" ")
-        };
-
-        // Use the routing's ConversationState for scoring.
-        // Pass memory domain hints for gate softening in tool relevance scoring.
-        // When budget_pressure > 0 or co-occurrence data exists, apply the full
-        // co-occurrence-aware scoring pipeline for maximum selection quality.
-        let has_co_occurrence = !co_occurrence.is_empty();
-        let has_file_context = !file_context.is_empty();
-        let has_outcome_bias = !outcome_bias.is_empty();
-        let pinned_names = self.pinned_name_set();
-        let mut filter = FilterOptions {
-            pinned_names: Some(pinned_names),
-            quality_tracker,
-            calibrator,
-            memory_domain_hints,
-            ..Default::default()
-        };
-        if budget_pressure > 0.01 || has_co_occurrence || has_file_context || has_outcome_bias {
-            filter.budget_pressure = budget_pressure;
-            filter.co_occurrence = Some(co_occurrence);
-            filter.file_context = Some(file_context);
-            filter.outcome_bias = Some(outcome_bias);
-        }
-        let ranked = pre_filter_dynamic(&routing.conversation_state, &effective_query, &filter);
-        let schemas = self.budget_select_measured(&ranked, budget);
-        let names = Self::selected_names(&schemas);
-        let selected_count = schemas.len() as u32;
-        let dynamic_tools_selected = self.dynamic_names_for_selected(&names);
-
-        let budget_used = self.dynamic_budget_used_for_names(&dynamic_tools_selected);
-
-        // Observability: routed + pressure dynamic path — this is
-        // the production selector entry point (tool_selector.rs).
-        // G3 would show up here as a final list missing the tool
-        // the caller expected, paired with a top list that shows
-        // either (a) the tool absent entirely, or (b) a low score.
-
+    /// Routing decides whether this is a tool-bearing turn. The built-in
+    /// surface is deterministic: only always_load schemas are returned. Deferred
+    /// tools stay deferred until explicitly activated via `tool_search`.
+    pub fn build_routed_surface(&self, schema_budget: u32) -> (Vec<Value>, ToolSurfaceReport) {
+        let schemas = self.always_load_only();
+        let names = Self::visible_names(schemas.as_ref());
         (
-            schemas,
-            SelectionReport {
-                selected_count,
-                tools_selected: names,
-                dynamic_tools_selected,
-                budget_used,
-                budget_total: budget,
+            schemas.as_ref().clone(),
+            ToolSurfaceReport {
+                visible_count: names.len() as u32,
+                visible_tools: names,
+                schema_budget_used: 0,
+                schema_budget_total: schema_budget,
             },
         )
     }
 
-    /// Budget selection using measured token costs from actual schemas.
-    fn budget_select_measured(
-        &self,
-        ranked_dynamic: &[(usize, f64)],
-        budget_tokens: u32,
-    ) -> Vec<Value> {
-        let mut result = Vec::new();
-        let mut used_tokens: u32 = 0;
-        let mut included_names = std::collections::HashSet::new();
-
-        // Always include pinned tools first (budget-exempt).
-        // Iterate over the pre-sorted Arc to avoid per-turn ~5-8KB clone.
-        for schema in self.pinned_sorted.iter() {
-            if let Some(name) = tool_schema_name(schema) {
-                included_names.insert(name.to_string());
-            }
-            result.push(schema.clone());
-        }
-
-        // Add dynamic tools greedily from ranked list using measured costs
-        for &(idx, _score) in ranked_dynamic {
-            let tool = &TOOL_CATALOG[idx];
-            if included_names.contains(tool.name) {
-                continue;
-            }
-            let cost = self.token_cost(tool.name);
-            if used_tokens + cost > budget_tokens {
-                continue;
-            }
-            if let Some(schema) = self.find_schema(tool.name) {
-                included_names.insert(tool.name.to_string());
-                result.push(schema);
-                used_tokens += cost;
-            }
-        }
-
-        // Include registered plugin tools if budget permits
-        for name in &self.plugin_tool_names {
-            if included_names.contains(name) {
-                continue;
-            }
-            let cost = self.token_cost(name);
-            if used_tokens + cost > budget_tokens {
-                continue;
-            }
-            if let Some(schema) = self.find_schema(name) {
-                result.push(schema);
-                used_tokens += cost;
-            }
-        }
-
-        // Sort alphabetically for prompt-cache stability (same rationale as select_two_phase)
-        sort_schemas_by_name(&mut result);
-
-        result
+    /// Return only always_load tools.
+    pub fn always_load_only(&self) -> Arc<Vec<Value>> {
+        Arc::clone(&self.always_load_sorted)
     }
 
-    fn find_schema(&self, name: &str) -> Option<Value> {
-        self.all_schemas
+    fn rebuild_always_load_sorted(&mut self) {
+        let mut sorted: Vec<Value> = self
+            .always_load_schemas
             .iter()
-            .find(|s| tool_schema_name(s) == Some(name))
-            .cloned()
-    }
-
-    /// Return only pinned tools.
-    pub fn pinned_only(&self) -> Vec<Value> {
-        self.pinned_sorted.as_ref().clone()
-    }
-
-    fn rebuild_pinned_sorted(&mut self) {
-        let mut sorted: Vec<Value> = self.pinned_schemas.iter().map(|(_, s)| s.clone()).collect();
+            .map(|(_, s)| s.clone())
+            .collect();
         sort_schemas_by_name(&mut sorted);
-        self.pinned_sorted = std::sync::Arc::new(sorted);
-        self.pinned_name_cache = self
-            .pinned_schemas
+        self.always_load_sorted = Arc::new(sorted);
+        self.always_load_name_cache = self
+            .always_load_schemas
             .iter()
             .map(|(name, _)| name.clone())
             .collect();
@@ -595,8 +363,8 @@ impl ToolRegistry {
             .collect()
     }
 
-    /// Return names of currently selected tools.
-    pub fn selected_names(schemas: &[Value]) -> Vec<String> {
+    /// Return names of currently visible tools.
+    pub fn visible_names(schemas: &[Value]) -> Vec<String> {
         schemas
             .iter()
             .filter_map(|s| tool_schema_name(s).map(String::from))
@@ -610,28 +378,26 @@ impl ToolRegistry {
 
     /// Register plugin tools from a PluginRegistry.
     ///
-    /// Post-Phase-5 contract:
-    /// plugin schemas become **lookup-able** (the executor can dispatch
-    /// them, `tool_search(select:NAME)` can return them), but they do
-    /// NOT join the selector's dynamic-candidate list. Plugins default
-    /// to the deferred listing; the user must explicitly pin them via
-    /// `runtime.tool_surface.pinned_tools` to put them in `tools[]`.
+    /// Plugin schemas become **lookup-able** (the executor can dispatch them
+    /// and `tool_search(select:NAME)` can return them), but lookup alone does
+    /// not place them in the visible `tools[]` surface. Plugins default to the
+    /// deferred listing. Callers that need a plugin in `tools[]` must build the
+    /// visible surface with that plugin explicitly always_load.
     ///
     /// This keeps the Anthropic prompt-cache prefix byte-stable across
-    /// plugin registration — previously a single `register_plugins`
-    /// call pushed the plugin into `plugin_tool_names`, which
-    /// `budget_select_measured` then stuffed into every turn's `tools[]`,
-    /// silently busting the cache boundary for the rest of the session.
-    pub fn register_plugins(&mut self, plugins: &super::plugin::PluginRegistry) {
+    /// plugin registration: schemas are added to lookup/execution indexes,
+    /// but the selected `tools[]` surface remains always_load-only.
+    pub fn register_plugins(
+        &mut self,
+        plugins: &astra_turn_core::tool_registry_plugin::PluginRegistry,
+    ) {
         let plugin_schemas = plugins.schemas();
         if plugin_schemas.is_empty() {
             return;
         }
-        // Plugins are looked up by name (for executor dispatch and
-        // `tool_search(select:NAME)`) but intentionally NOT added to
-        // `plugin_tool_names` — that field drives `budget_select_measured`,
-        // which puts names into `tools[]`. Plugins live in the deferred
-        // listing instead.
+        // Plugins are looked up by name for executor dispatch and
+        // `tool_search(select:NAME)`. They live in the deferred listing unless
+        // the caller builds a always_load visible surface for them.
         self.all_schemas.extend(
             plugin_schemas
                 .into_iter()
@@ -642,17 +408,17 @@ impl ToolRegistry {
         self.schema_index = Self::build_schema_index(&self.all_schemas);
     }
 
-    /// Inject a single tool schema dynamically (e.g. the `skill` or `delegate` tool).
+    /// Inject a single tool schema dynamically (e.g. a session-local plugin tool).
     ///
-    /// When `pinned` is true the tool is budget-exempt (always included like
-    /// core tools such as `bash` and `read_file`).  When false it behaves as a
-    /// plugin tool that is only included when budget allows.
+    /// When `always_load` is true the tool is budget-exempt (always included like
+    /// core tools such as `bash` and `read_file`). When false it is lookupable
+    /// by name but does not enter `tools[]` unless explicitly reinserted as always_load.
     pub fn inject_schema(&mut self, schema: Value) {
-        self.inject_schema_pinned(schema, true);
+        self.inject_schema_always_load(schema, true);
     }
 
-    /// Inject with explicit pinning control.
-    pub fn inject_schema_pinned(&mut self, schema: Value, pinned: bool) {
+    /// Inject with explicit load policy control.
+    pub fn inject_schema_always_load(&mut self, schema: Value, always_load: bool) {
         if let Some(name) = tool_schema_name(&schema) {
             if self.schema_index.contains_key(name) {
                 return;
@@ -663,18 +429,16 @@ impl ToolRegistry {
             self.measured_costs
                 .insert(name_owned.clone(), (json_bytes / 4) as u32);
             self.schema_index.insert(name_owned.clone(), idx);
-            if pinned {
-                self.pinned_schemas.push((name_owned, schema.clone()));
-                self.rebuild_pinned_sorted();
-            } else {
-                self.plugin_tool_names.push(name_owned);
+            if always_load {
+                self.always_load_schemas.push((name_owned, schema.clone()));
+                self.rebuild_always_load_sorted();
             }
             self.all_schemas.push(schema);
         }
     }
 
     /// Insert a new schema or replace an existing schema with the same tool name.
-    pub fn upsert_schema_pinned(&mut self, schema: Value, pinned: bool) {
+    pub fn upsert_schema_always_load(&mut self, schema: Value, always_load: bool) {
         let Some(name) = tool_schema_name(&schema).map(str::to_string) else {
             return;
         };
@@ -685,21 +449,25 @@ impl ToolRegistry {
 
         if let Some(&idx) = self.schema_index.get(&name) {
             self.all_schemas[idx] = schema.clone();
-            if let Some((_, existing)) = self.pinned_schemas.iter_mut().find(|(n, _)| n == &name) {
+            if let Some((_, existing)) = self
+                .always_load_schemas
+                .iter_mut()
+                .find(|(n, _)| n == &name)
+            {
                 *existing = schema;
-            } else if pinned {
-                self.pinned_schemas.push((name, schema));
+            } else if always_load {
+                self.always_load_schemas.push((name, schema));
             }
-            self.rebuild_pinned_sorted();
+            self.rebuild_always_load_sorted();
             return;
         }
 
-        self.inject_schema_pinned(schema, pinned);
+        self.inject_schema_always_load(schema, always_load);
     }
 
-    /// Insert or replace a pinned schema by tool name.
+    /// Insert or replace a always_load schema by tool name.
     pub fn upsert_schema(&mut self, schema: Value) {
-        self.upsert_schema_pinned(schema, true);
+        self.upsert_schema_always_load(schema, true);
     }
 
     /// Total tool count (built-in + registered plugins).
@@ -786,28 +554,35 @@ mod tests {
     }
 
     #[test]
-    fn injected_schema_is_pinned_by_default() {
+    fn injected_schema_is_always_load_by_default() {
         let mut reg = ToolRegistry::new(vec![sample_schema("bash")]);
         reg.inject_schema(sample_schema("skill"));
-        // Default inject is pinned (budget-exempt)
-        assert!(reg.pinned_schemas.iter().any(|(n, _)| n == "skill"));
-        assert!(!reg.plugin_tool_names.contains(&"skill".to_string()));
+        // Default inject is always_load (budget-exempt)
+        assert!(reg.always_load_schemas.iter().any(|(n, _)| n == "skill"));
     }
 
     #[test]
-    fn injected_schema_unpinned_is_plugin() {
+    fn injected_schema_deferred_is_lookupable_but_not_selected() {
         let mut reg = ToolRegistry::new(vec![sample_schema("bash")]);
-        reg.inject_schema_pinned(sample_schema("skill"), false);
-        assert!(reg.plugin_tool_names.contains(&"skill".to_string()));
-        assert!(!reg.pinned_schemas.iter().any(|(n, _)| n == "skill"));
+        reg.inject_schema_always_load(sample_schema("skill"), false);
+        assert!(reg.schema_by_name("skill").is_some());
+        assert!(!reg.always_load_schemas.iter().any(|(n, _)| n == "skill"));
+
+        let (selected, report) = reg.build_initial_surface_with_report("use the skill tool", 800);
+        let names = ToolRegistry::visible_names(&selected);
+        assert!(
+            !names.contains(&"skill".to_string()),
+            "deferred injected tools must not enter the visible surface by lookup alone"
+        );
+        assert_eq!(report.schema_budget_used, 0);
     }
 
     #[test]
-    fn pinned_only_includes_injected_pinned() {
+    fn always_load_only_includes_injected_always_load_tool() {
         let mut reg = ToolRegistry::new(vec![sample_schema("bash")]);
         reg.inject_schema(sample_schema("skill"));
-        let pinned = reg.pinned_only();
-        let names: Vec<&str> = pinned
+        let always_load = reg.always_load_only();
+        let names: Vec<&str> = always_load
             .iter()
             .filter_map(|s| {
                 s.get("function")
@@ -817,12 +592,12 @@ mod tests {
             .collect();
         assert!(
             names.contains(&"skill"),
-            "pinned_only should include injected pinned tools"
+            "always_load_only should include injected always_load tools"
         );
     }
 
     #[test]
-    fn new_with_tool_surface_honors_runtime_pinned_overrides() {
+    fn new_with_tool_surface_honors_runtime_always_load_additions() {
         let schemas = vec![
             sample_schema("bash"),
             sample_schema("grep"),
@@ -831,112 +606,108 @@ mod tests {
             sample_schema("skill"),
         ];
         let cfg = ToolSurfaceConfig {
-            pinned_tools: vec!["github".into(), "-grep".into()],
+            always_load_tools: vec!["github".into()],
         };
 
         let reg = ToolRegistry::new_with_tool_surface(schemas, &cfg);
-        let pinned_names: Vec<String> = reg
-            .pinned_schemas
+        let always_load_names: Vec<String> = reg
+            .always_load_schemas
             .iter()
             .map(|(name, _)| name.clone())
             .collect();
 
-        assert!(pinned_names.iter().any(|name| name == "github"));
-        assert!(!pinned_names.iter().any(|name| name == "grep"));
+        assert!(always_load_names.iter().any(|name| name == "github"));
+        assert!(
+            always_load_names.iter().any(|name| name == "grep"),
+            "default always_load declarations must stay in the resolved runtime surface"
+        );
         assert_eq!(
-            reg.pinned_tool_names_sorted(),
+            reg.always_load_tool_names_sorted(),
             {
-                let mut names = pinned_names.clone();
+                let mut names = always_load_names.clone();
                 names.sort();
                 names
             },
-            "cross-crate pinned metadata must be stable and reflect runtime overrides"
+            "resolved always_load names must be stable and reflect runtime additions"
         );
     }
 
     #[test]
-    fn custom_pinned_tool_is_budget_exempt_in_selection_report() {
+    fn custom_always_load_tool_is_budget_exempt_in_surface_report() {
         let schemas = vec![
             sample_schema("bash"),
             sample_schema("tool_search"),
             sample_schema("web_fetch"),
         ];
         let cfg = ToolSurfaceConfig {
-            pinned_tools: vec!["web_fetch".into()],
+            always_load_tools: vec!["web_fetch".into()],
         };
         let reg = ToolRegistry::new_with_tool_surface(schemas, &cfg);
 
-        let (selected, report) = reg.select_with_report("fetch this web page", 1, 0);
-        let names = ToolRegistry::selected_names(&selected);
+        let (selected, report) = reg.build_initial_surface_with_report("fetch this web page", 0);
+        let names = ToolRegistry::visible_names(&selected);
 
         assert!(names.contains(&"web_fetch".to_string()));
         assert_eq!(
-            report.budget_used, 0,
-            "user-pinned tools are part of this registry's pinned surface and must not consume dynamic budget"
-        );
-        assert!(
-            !report
-                .dynamic_tools_selected
-                .iter()
-                .any(|name| name == "web_fetch"),
-            "user-pinned tools must not be advertised as dynamically selected"
+            report.schema_budget_used, 0,
+            "user-always_load tools are part of this registry's always_load surface and must not consume deferred-tool budget"
         );
     }
 
     #[test]
-    fn custom_unpinned_default_tool_can_be_selected_as_dynamic_when_relevant() {
+    fn unknown_always_load_config_does_not_remove_default_tool() {
         let schemas = vec![
             sample_schema("bash"),
             sample_schema("grep"),
             sample_schema("tool_search"),
         ];
         let cfg = ToolSurfaceConfig {
-            pinned_tools: vec!["-grep".into()],
+            always_load_tools: vec!["not_a_real_tool".into()],
         };
         let reg = ToolRegistry::new_with_tool_surface(schemas, &cfg);
 
-        let (selected, report) = reg.select_with_report("grep for UserSession in the code", 1, 800);
-        let names = ToolRegistry::selected_names(&selected);
+        let (selected, report) =
+            reg.build_initial_surface_with_report("grep for UserSession in the code", 0);
+        let names = ToolRegistry::visible_names(&selected);
 
         assert!(
-            !reg.pinned_schemas.iter().any(|(name, _)| name == "grep"),
-            "grep is intentionally unpinned for this registry instance"
+            reg.always_load_schemas
+                .iter()
+                .any(|(name, _)| name == "grep"),
+            "unknown always_load_tools entries must not remove default always_load tools"
         );
         assert!(
             names.contains(&"grep".to_string()),
-            "relevant custom-unpinned tools must be selectable dynamically; got: {names:?}"
+            "default always_load tools stay visible even with zero deferred budget: {names:?}"
         );
-        assert!(
-            report
-                .dynamic_tools_selected
-                .iter()
-                .any(|name| name == "grep"),
-            "user-unpinned default tools must be reported as dynamic; got: {:?}",
-            report.dynamic_tools_selected
+        assert_eq!(
+            report.schema_budget_used, 0,
+            "always_load tools must not consume deferred-tool budget"
         );
     }
 
-    // ── Selector observability integration (Pass B) ──
+    // ── Tool surface observability integration (Pass B) ──
     //
-    // These tests verify the `[selector]` stderr hook plumbs through
-    // the real `select_with_report_ctx` path. They exercise both the
-    // conversational short-circuit and the dynamic ranking branch.
+    // These tests verify the real `build_initial_surface_with_report_ctx` path. They exercise
+    // both the conversational short-circuit and the non-conversational
+    // always_load-only branch.
     // Stderr content is not captured (no stable API in tokio tests),
     // but the flag guard ensures the hot path runs without panic
     // when observability is on — which is what we'd regress if the
     // obs module grew a lifetime bug or serde panic.
 
     #[test]
-    fn select_with_report_ctx_conversational_path_does_not_panic_with_obs_on() {
+    fn build_initial_surface_with_report_ctx_conversational_path_does_not_panic_with_obs_on() {
         let mut schemas = vec![sample_schema("bash"), sample_schema("read_file")];
-        // Ensure a pinned + non-pinned mix so both branches of
-        // pinned_only + filter are exercised under observability.
-        schemas.push(sample_schema("github_list_prs"));
+        // Ensure a always_load + non-always_load mix so construction keeps the deferred
+        // schema lookupable while the conversational path returns no tools.
+        schemas.push(sample_schema("github"));
         let registry = ToolRegistry::new(schemas);
         // "hello" is the conversational short-circuit case.
-        let (out_schemas, report) = registry.select_with_report_ctx("hello", 0, 800, &[]);
+        let (out_schemas, report) =
+            registry.build_initial_surface_with_report_ctx("hello", 800, &[]);
         assert!(out_schemas.is_empty());
-        assert_eq!(report.selected_count as usize, out_schemas.len());
+        assert_eq!(report.visible_count as usize, out_schemas.len());
     }
 
     #[test]
@@ -944,9 +715,9 @@ mod tests {
         let schemas: Vec<Value> = TOOL_CATALOG.iter().map(|t| sample_schema(t.name)).collect();
         let registry = ToolRegistry::new(schemas);
         // "谢谢" with no recent_tools → should short-circuit to no tools.
-        let (out, report) = registry.select_with_report_ctx("谢谢", 1, 800, &[]);
+        let (out, report) = registry.build_initial_surface_with_report_ctx("谢谢", 800, &[]);
         assert_eq!(
-            report.selected_count, 0,
+            report.visible_count, 0,
             "conversational + no recent_tools should return no tools"
         );
         assert!(
@@ -956,7 +727,28 @@ mod tests {
     }
 
     #[test]
-    fn select_with_report_ctx_dynamic_path_does_not_panic_with_obs_on() {
+    fn conversational_shortcut_requires_pure_ack_or_greeting() {
+        assert!(is_pure_conversational_query("hello there"));
+        assert!(is_pure_conversational_query("谢谢"));
+        assert!(!is_pure_conversational_query("hi fix the tests"));
+        assert!(!is_pure_conversational_query("你好请修复测试"));
+    }
+
+    #[test]
+    fn conversational_with_recent_tools_preserves_tool_surface() {
+        let schemas: Vec<Value> = TOOL_CATALOG.iter().map(|t| sample_schema(t.name)).collect();
+        let registry = ToolRegistry::new(schemas);
+        let recent_tools = vec!["read_file".to_string()];
+
+        let (out, report) =
+            registry.build_initial_surface_with_report_ctx("hello", 800, &recent_tools);
+
+        assert!(!out.is_empty());
+        assert_eq!(report.visible_count as usize, out.len());
+    }
+
+    #[test]
+    fn build_initial_surface_with_report_ctx_non_conversational_path_returns_always_load_tools() {
         let schemas = vec![
             sample_schema("bash"),
             sample_schema("read_file"),
@@ -964,16 +756,19 @@ mod tests {
             sample_schema("list_dir"),
         ];
         let registry = ToolRegistry::new(schemas);
-        // Analytical-ish query — forces the dynamic branch.
-        let (out, report) =
-            registry.select_with_report_ctx("search for TODO in source files", 0, 800, &[]);
+        // Analytical-ish query forces the non-conversational always_load-only path.
+        let (out, report) = registry.build_initial_surface_with_report_ctx(
+            "search for TODO in source files",
+            800,
+            &[],
+        );
         assert!(!out.is_empty());
-        assert!(report.selected_count > 0);
+        assert!(report.visible_count > 0);
     }
 }
 
 #[cfg(test)]
-mod pinned_budget_tests {
+mod always_load_budget_tests {
     use super::*;
     use serde_json::json;
 }

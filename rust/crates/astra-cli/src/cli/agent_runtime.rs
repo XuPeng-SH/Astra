@@ -15,6 +15,19 @@ fn attach_session_to_spawner(
     }
 }
 
+fn fork_cache_event_sink(
+    sink: astra_config::runtime_config::ForkCacheSinkKind,
+) -> std::sync::Arc<dyn astra_turn_core::fork_cache_event::ForkCacheEventSink> {
+    match sink {
+        astra_config::runtime_config::ForkCacheSinkKind::Noop => {
+            std::sync::Arc::new(astra_turn_core::fork_cache_event::NoopForkCacheSink)
+        }
+        astra_config::runtime_config::ForkCacheSinkKind::Stderr => {
+            std::sync::Arc::new(astra_turn_core::fork_cache_event::StderrForkCacheSink)
+        }
+    }
+}
+
 /// Build a fully-wired [`DynamicAgentSpawner`] without mutating a
 /// SessionState. Extracted from [`initialize_multi_agent_runtime`] so
 /// the one-shot `chat -m` code path can wire dynamic sub-agent support
@@ -23,10 +36,9 @@ fn attach_session_to_spawner(
 ///
 /// Applies the fork-prefix pipeline configuration from
 /// `RuntimeConfig.fork_prefix` in the same way the REPL path does:
-/// - syncs the process-global flag
-/// - installs the configured sink (Noop/Stderr) when enabled
+/// - installs the configured sink (Noop/Stderr)
 /// - always attaches an `InMemoryPrefixStore` (cheap; capture
-///   no-ops when the flag is off)
+///   only records when a turn has cacheable prefix metadata)
 ///
 /// Returns only the spawner + mailbox_router the caller needs to
 /// hand to `AgentActionContext`. The delegation engine is NOT
@@ -37,7 +49,6 @@ pub(crate) async fn build_one_shot_spawner(
     api: &astra_thin_client::ThinClient,
     token: String,
     unified_skill_registry: std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
-    skill_search: astra_core::SkillSearchSettings,
     session_id: Option<String>,
     default_model: Option<String>,
 ) -> std::sync::Arc<astra_runtime::orchestration::DynamicAgentSpawner> {
@@ -57,8 +68,7 @@ pub(crate) async fn build_one_shot_spawner(
     let mut spawn_executor =
         spawn_subrun::CliSpawnAgentExecutor::new(api.clone(), token, project_root, None)
             .with_default_model(default_model)
-            .with_skill_resolver(skill_resolver)
-            .with_skill_search(skill_search);
+            .with_skill_resolver(skill_resolver);
     // One-shot `chat -m` uses the captured token only — no profile to
     // re-read from. The token-provider wiring lives on the REPL path
     // (`initialize_multi_agent_runtime`) where token rotation is real.
@@ -67,19 +77,8 @@ pub(crate) async fn build_one_shot_spawner(
     }
 
     let runtime_cfg = astra_config::runtime_config::RuntimeConfig::load();
-    let fork_cfg = &runtime_cfg.fork_prefix;
-    if fork_cfg.enabled {
-        let sink: std::sync::Arc<dyn astra_turn_core::fork_cache_event::ForkCacheEventSink> =
-            match fork_cfg.sink {
-                astra_config::runtime_config::ForkCacheSinkKind::Noop => {
-                    std::sync::Arc::new(astra_turn_core::fork_cache_event::NoopForkCacheSink)
-                }
-                astra_config::runtime_config::ForkCacheSinkKind::Stderr => {
-                    std::sync::Arc::new(astra_turn_core::fork_cache_event::StderrForkCacheSink)
-                }
-            };
-        spawn_executor = spawn_executor.with_fork_cache_sink(sink);
-    }
+    spawn_executor =
+        spawn_executor.with_fork_cache_sink(fork_cache_event_sink(runtime_cfg.fork_prefix.sink));
 
     let prefix_store: std::sync::Arc<dyn astra_turn_core::fork_prefix_store::PrefixCaptureSink> =
         std::sync::Arc::new(astra_turn_core::fork_prefix_store::InMemoryPrefixStore::new());
@@ -98,7 +97,7 @@ pub(crate) async fn build_one_shot_spawner(
 
 /// Resolve the user-facing cap on concurrent live subagents.
 ///
-/// Default 10 — matches the rough Claude Code parity used elsewhere
+/// Default 10 — matches the rough reference-agent parity used elsewhere
 /// (see workflow agent fan-out cap). A long-lived chat session that
 /// keeps spawning replacement agents on every transient failure can
 /// otherwise accumulate dozens of in-flight runs, all burning tokens.
@@ -173,22 +172,8 @@ pub(crate) async fn initialize_multi_agent_runtime(
 
     // Read fork-prefix config once for both executors so the
     // delegate and spawn paths stay in lockstep on observability.
-    let runtime_cfg_for_delegate = astra_config::runtime_config::RuntimeConfig::load();
-    let fork_cfg_for_delegate = &runtime_cfg_for_delegate.fork_prefix;
-    let delegate_fork_cache_sink: Option<
-        std::sync::Arc<dyn astra_turn_core::fork_cache_event::ForkCacheEventSink>,
-    > = if fork_cfg_for_delegate.enabled {
-        Some(match fork_cfg_for_delegate.sink {
-            astra_config::runtime_config::ForkCacheSinkKind::Noop => {
-                std::sync::Arc::new(astra_turn_core::fork_cache_event::NoopForkCacheSink)
-            }
-            astra_config::runtime_config::ForkCacheSinkKind::Stderr => {
-                std::sync::Arc::new(astra_turn_core::fork_cache_event::StderrForkCacheSink)
-            }
-        })
-    } else {
-        None
-    };
+    let runtime_cfg = astra_config::runtime_config::RuntimeConfig::load();
+    let shared_fork_cache_sink = fork_cache_event_sink(runtime_cfg.fork_prefix.sink);
 
     let mut delegate_executor = delegate_subrun::CliDelegateSubRunExecutor::new(
         api.clone(),
@@ -199,11 +184,8 @@ pub(crate) async fn initialize_multi_agent_runtime(
         None,
     )
     .with_skill_resolver(skill_resolver.clone())
-    .with_skill_search(state.skill_search.clone())
     .with_progress_broadcaster(progress_broadcaster.clone());
-    if let Some(sink) = delegate_fork_cache_sink.clone() {
-        delegate_executor = delegate_executor.with_fork_cache_sink(sink);
-    }
+    delegate_executor = delegate_executor.with_fork_cache_sink(shared_fork_cache_sink.clone());
 
     // Build the shared fork-prefix store once up-front so both the
     // spawner and the delegation engine hold the same Arc. Bug B
@@ -229,7 +211,6 @@ pub(crate) async fn initialize_multi_agent_runtime(
         spawn_subrun::CliSpawnAgentExecutor::new(api.clone(), token, project_root, None)
             .with_default_model(state.model.clone())
             .with_skill_resolver(skill_resolver)
-            .with_skill_search(state.skill_search.clone())
             .with_bg_task_commands(state.bg_task_commands.clone())
             .with_bg_task_list_cache(state.bg_task_list_cache.clone());
     // Wire a token provider so each spawn reads the freshest access
@@ -256,26 +237,9 @@ pub(crate) async fn initialize_multi_agent_runtime(
     }
 
     // Fork-prefix pipeline: driven entirely by RuntimeConfig (which
-    // already layers defaults → user TOML → project TOML).
-    // When the pipeline is on, the operator's chosen sink
-    // (Noop / Stderr) is installed. When off, the sink is never
-    // attached.
-    //
-    // Keep the prefix store attached unconditionally: cheap to own.
-    let runtime_cfg = astra_config::runtime_config::RuntimeConfig::load();
-    let fork_cfg = &runtime_cfg.fork_prefix;
-    if fork_cfg.enabled {
-        let sink: std::sync::Arc<dyn astra_turn_core::fork_cache_event::ForkCacheEventSink> =
-            match fork_cfg.sink {
-                astra_config::runtime_config::ForkCacheSinkKind::Noop => {
-                    std::sync::Arc::new(astra_turn_core::fork_cache_event::NoopForkCacheSink)
-                }
-                astra_config::runtime_config::ForkCacheSinkKind::Stderr => {
-                    std::sync::Arc::new(astra_turn_core::fork_cache_event::StderrForkCacheSink)
-                }
-            };
-        spawn_executor = spawn_executor.with_fork_cache_sink(sink);
-    }
+    // already layers defaults -> user TOML -> project TOML). Keep the
+    // prefix store attached unconditionally: cheap to own.
+    spawn_executor = spawn_executor.with_fork_cache_sink(shared_fork_cache_sink);
 
     state.agent_spawner = Some(std::sync::Arc::new(attach_session_to_spawner(
         astra_runtime::orchestration::DynamicAgentSpawner::with_broadcaster(

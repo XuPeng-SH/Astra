@@ -1,29 +1,27 @@
 //! Phase-5 contract: registering a plugin must not pollute `tools[]`.
 //!
 //! Pre-phase-5 state:
-//!   - `ToolRegistry::register_plugins` pushed plugin schemas into both
-//!     `all_schemas` (makes the schema lookup-able) AND `plugin_tool_names`
-//!     (makes the selector's `budget_select_measured` include it in
-//!     `tools[]` whenever budget permits).
+//!   - `ToolRegistry::register_plugins` made plugin schemas lookupable and
+//!     also fed them into the query-shaped visible surface.
 //!   - Result: the moment a plugin registers, the Anthropic prompt-cache
 //!     prefix breaks; every subsequent `tools[]` also includes the plugin.
 //!   - Intended contract: MCP tools default to a deferred listing;
-//!     user must explicitly pin them.
+//!     callers must explicitly opt them into the always-load surface.
 //!
 //! Contract:
 //!   1. Plugin schemas are still **looked up** by name (so the executor
 //!      can dispatch, and `tool_search(select:NAME)` can return the
 //!      schema).
-//!   2. Plugin names are **NOT** in the selector's dynamic-candidate
-//!      list — they stay out of `tools[]` unless the user pins them via
-//!      `runtime.tool_surface.pinned_tools`.
-//!   3. Registering a plugin leaves the pinned `tools[]` bytes stable.
+//!   2. Plugin names are **NOT** query-promoted — they stay out of
+//!      `tools[]` unless the caller builds a visible surface with the plugin
+//!      explicitly always_load.
+//!   3. Registering a plugin leaves the always_load `tools[]` bytes stable.
 
 use astra_config::ToolSurfaceConfig;
+use astra_runtime::tool_registry::ToolRegistry;
 use astra_runtime::tool_registry::surface::ToolSurface;
-use astra_runtime::tool_registry::{PluginRegistry, ToolRegistry};
 use astra_turn_core::tool_registry_meta::{IntentType, Scope, TOOL_CATALOG};
-use astra_turn_core::tool_registry_plugin::PluginToolEntry;
+use astra_turn_core::tool_registry_plugin::{PluginRegistry, PluginToolEntry};
 use serde_json::{Value, json};
 
 fn catalog_schemas() -> Vec<Value> {
@@ -47,7 +45,7 @@ fn weather_plugin() -> PluginToolEntry {
         name: "mcp__weather".into(),
         description: "Get weather for a city".into(),
         triggers: vec!["weather".into()],
-        pinned: false,
+        always_load: false,
         intents: vec![IntentType::CodeRead],
         scope: Scope::External,
         schema: json!({
@@ -95,51 +93,28 @@ fn registered_plugin_is_lookupable_by_name() {
     );
 }
 
-// ── 2. Plugin names stay out of the dynamic-candidate list ──────────────────
+// ── 2. Plugin names stay out of the default visible surface ─────────────────
 //
-// The selector's `budget_select_measured` iterates over
-// `plugin_tool_names` to decide what non-catalog schemas to stuff into
-// `tools[]`. Post-phase-5 that path stays empty — plugins are deferred.
+// The real invariant is "plugin registration does not reach tools[]" unless a
+// caller explicitly always-loads that plugin in the visible surface.
 
-// `dynamic_candidate_names` was a zombie API that always returned `Vec::new()`;
-// deleted in P2 cleanup. The real invariant — "plugin does not reach tools[]" —
-// is covered by `selector_does_not_include_plugin_in_production_path` below
-// and `tools_array_byte_stable_when_plugin_registers`.
-
-/// Direct invariant against the concrete path the old selector used to
-/// promote plugins into `tools[]` — `select_routed_with_pressure` must
-/// not emit the plugin name in its schemas output at any budget.
+/// Direct invariant against the concrete default-surface path: it must not
+/// emit the plugin name in its schemas output at any budget.
 #[test]
-fn selector_does_not_include_plugin_in_production_path() {
-    use astra_runtime::pipeline::routing::RoutingEngine;
-
+fn default_surface_does_not_include_plugin_in_production_path() {
     let mut registry = ToolRegistry::new(catalog_schemas());
     let plugins = make_plugins();
     registry.register_plugins(&plugins);
 
-    let query = "please check the weather in Beijing and tell me";
-    let routing = RoutingEngine::analyze(query, 1, &[], &[], vec![]);
-    let (schemas, _report) = registry.select_routed_with_pressure(
-        query,
-        &routing,
-        4000, // plenty of budget
-        &[],
-        None,
-        None,
-        &[],
-        0.0,
-        &std::collections::HashMap::new(),
-        &[],
-        &std::collections::HashMap::new(),
-    );
+    let (schemas, _report) = registry.build_routed_surface(4000);
     let names = names(&schemas);
     assert!(
         !names.contains(&"mcp__weather".to_string()),
-        "production selector must NOT include plugins in tools[] at any budget; got {names:?}"
+        "production surface must NOT include plugins in tools[] at any budget; got {names:?}"
     );
 }
 
-// ── 3. Register doesn't perturb the pinned tools[] bytes ────────────────────
+// ── 3. Register doesn't perturb the always_load tools[] bytes ────────────────────
 
 #[test]
 fn tools_array_byte_stable_when_plugin_registers() {
@@ -147,23 +122,23 @@ fn tools_array_byte_stable_when_plugin_registers() {
 
     // tools[] from an unplugged registry
     let pristine_surface = ToolSurface::build(catalog_schemas(), &cfg, &[]);
-    let baseline = serde_json::to_vec(&pristine_surface.pinned_schemas()).unwrap();
+    let baseline = serde_json::to_vec(&pristine_surface.always_load_schemas()).unwrap();
 
     // Now simulate registering a plugin and re-building the surface
     let mut registry = ToolRegistry::new(catalog_schemas());
     let plugins = make_plugins();
     registry.register_plugins(&plugins);
 
-    // Gather schemas that WOULD be sent as tools[] — pinned only.
+    // Gather schemas that WOULD be sent as tools[] — always_load only.
     // `ToolSurface::build` is the new source of truth; plugin schemas are
     // passed in separately. The bytes must match the pristine baseline.
     let plugin_schemas: Vec<Value> = plugins.schemas();
     let surface_after = ToolSurface::build(catalog_schemas(), &cfg, &plugin_schemas);
-    let after = serde_json::to_vec(&surface_after.pinned_schemas()).unwrap();
+    let after = serde_json::to_vec(&surface_after.always_load_schemas()).unwrap();
 
     assert_eq!(
         baseline, after,
-        "registering a plugin must NOT change the pinned tools[] bytes"
+        "registering a plugin must NOT change the always_load tools[] bytes"
     );
 
     // And the plugin shows up only in deferred.
@@ -177,32 +152,32 @@ fn tools_array_byte_stable_when_plugin_registers() {
         "plugin must land in the deferred list; got {deferred_names:?}"
     );
     assert!(
-        !names(&surface_after.pinned_schemas())
+        !names(&surface_after.always_load_schemas())
             .iter()
             .any(|n| n == "mcp__weather"),
-        "plugin must NOT appear in pinned"
+        "plugin must NOT appear in always_load"
     );
 }
 
-// ── 4. User can still opt-in via config ─────────────────────────────────────
+// ── 4. User can still opt into always-load via config ───────────────────────
 
 #[test]
-fn user_can_pin_a_plugin_via_config() {
+fn user_can_always_load_a_plugin_via_config() {
     let cfg = ToolSurfaceConfig {
-        pinned_tools: vec!["mcp__weather".into()],
+        always_load_tools: vec!["mcp__weather".into()],
     };
 
     let plugin_schemas = vec![weather_plugin().schema.clone()];
     let surface = ToolSurface::build(catalog_schemas(), &cfg, &plugin_schemas);
 
     assert!(
-        names(&surface.pinned_schemas())
+        names(&surface.always_load_schemas())
             .iter()
             .any(|n| n == "mcp__weather"),
-        "user config must be able to pin a plugin into tools[]"
+        "user config must be able to always-load a plugin into tools[]"
     );
     assert!(
         !surface.deferred().iter().any(|e| e.name == "mcp__weather"),
-        "pinned plugin must NOT also show up in deferred"
+        "always_load plugin must NOT also show up in deferred"
     );
 }

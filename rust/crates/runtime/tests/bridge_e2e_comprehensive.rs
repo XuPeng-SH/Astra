@@ -459,7 +459,7 @@ struct BridgeTurnScenario {
     expected_text: Option<&'static str>,
     expect_explain: bool,
     expected_tools_available_min: Option<i64>,
-    expected_tools_selected_min: Option<i64>,
+    expected_tool_calls_min: Option<i64>,
     expected_tool_event_names: Vec<&'static str>,
     expect_user_query_event: bool,
     expected_skill_selection: Vec<&'static str>,
@@ -504,13 +504,13 @@ async fn run_bridge_turn_scenario(case: BridgeTurnScenario) {
                 case.name
             );
         }
-        if let Some(min_selected) = case.expected_tools_selected_min {
-            let selected = explain["tools_selected"]
+        if let Some(min_selected) = case.expected_tool_calls_min {
+            let selected = explain["tool_calls"]
                 .as_i64()
-                .expect("tools_selected should be present");
+                .expect("tool_calls should be present");
             assert!(
                 selected >= min_selected,
-                "{}: expected tools_selected >= {min_selected}, got {selected}",
+                "{}: expected tool_calls >= {min_selected}, got {selected}",
                 case.name
             );
         }
@@ -664,7 +664,7 @@ async fn bridge_mock_llm_turn_scenario_matrix() {
             expected_text: Some("Hi there!"),
             expect_explain: true,
             expected_tools_available_min: Some(1),
-            expected_tools_selected_min: Some(0),
+            expected_tool_calls_min: Some(0),
             expected_tool_event_names: vec![],
             expect_user_query_event: true,
             expected_skill_selection: vec![],
@@ -684,7 +684,7 @@ async fn bridge_mock_llm_turn_scenario_matrix() {
             expected_text: None,
             expect_explain: true,
             expected_tools_available_min: Some(3),
-            expected_tools_selected_min: Some(1),
+            expected_tool_calls_min: Some(1),
             expected_tool_event_names: vec!["read_file"],
             expect_user_query_event: true,
             expected_skill_selection: vec!["read_file"],
@@ -707,7 +707,7 @@ async fn bridge_mock_llm_turn_scenario_matrix() {
             expected_text: None,
             expect_explain: true,
             expected_tools_available_min: Some(3),
-            expected_tools_selected_min: Some(2),
+            expected_tool_calls_min: Some(2),
             expected_tool_event_names: vec!["list_dir", "read_file"],
             expect_user_query_event: true,
             expected_skill_selection: vec!["list_dir", "read_file"],
@@ -732,7 +732,7 @@ async fn bridge_mock_llm_turn_scenario_matrix() {
             expected_text: Some("Done."),
             expect_explain: true,
             expected_tools_available_min: Some(3),
-            expected_tools_selected_min: Some(0),
+            expected_tool_calls_min: Some(0),
             expected_tool_event_names: vec![],
             expect_user_query_event: false,
             expected_skill_selection: vec![],
@@ -761,13 +761,13 @@ async fn bridge_mock_llm_turn_scenario_matrix() {
             expected_text: None,
             expect_explain: true,
             expected_tools_available_min: Some(5),
-            expected_tools_selected_min: Some(1),
+            expected_tool_calls_min: Some(1),
             expected_tool_event_names: vec!["str_replace"],
             expect_user_query_event: true,
             expected_skill_selection: vec!["str_replace"],
         },
         BridgeTurnScenario {
-            name: "memory_store_tool_selection",
+            name: "memory_store_first_tool_call",
             payload: json!({
                 "agent_id": "matrix-memory-store",
                 "messages": [{ "role": "user", "content": "记住我喜欢 Rust" }],
@@ -785,13 +785,13 @@ async fn bridge_mock_llm_turn_scenario_matrix() {
             expected_text: None,
             expect_explain: true,
             expected_tools_available_min: Some(1),
-            expected_tools_selected_min: Some(1),
+            expected_tool_calls_min: Some(1),
             expected_tool_event_names: vec!["memory"],
             expect_user_query_event: true,
             expected_skill_selection: vec!["memory"],
         },
         BridgeTurnScenario {
-            name: "memory_search_tool_selection",
+            name: "memory_search_first_tool_call",
             payload: json!({
                 "agent_id": "matrix-memory-search",
                 "messages": [{ "role": "user", "content": "我之前说过我喜欢什么语言?" }],
@@ -809,7 +809,7 @@ async fn bridge_mock_llm_turn_scenario_matrix() {
             expected_text: None,
             expect_explain: true,
             expected_tools_available_min: Some(1),
-            expected_tools_selected_min: Some(1),
+            expected_tool_calls_min: Some(1),
             expected_tool_event_names: vec!["memory"],
             expect_user_query_event: true,
             expected_skill_selection: vec!["memory"],
@@ -879,11 +879,11 @@ async fn persist_tool_events_for_tool_calls() {
     let payload = json!({
         "agent_id": "tool-persist-agent",
         "messages": [{ "role": "user", "content": "read the README" }],
-        "edge_tools": [tool_schema("read_file"), tool_schema("list_files")],
+        "edge_tools": [tool_schema("read_file"), tool_schema("list_dir")],
         "test_llm_rounds": [{
             "tool_calls": [
                 tool_call("tc-p1", "read_file", json!({"path": "README.md"})),
-                tool_call("tc-p2", "list_files", json!({"path": "/src"})),
+                tool_call("tc-p2", "list_dir", json!({"path": "/src"})),
             ]
         }]
     });
@@ -4444,7 +4444,7 @@ async fn session_event_ids_unique_across_turns() {
 // AREA 4: Explain/Trace Events
 // ══════════════════════════════════════════════════════════════════════════════
 
-/// explain event with no tool calls → tools_selected=0, no tool_selection
+/// explain event with no tool calls → tool_calls=0, no first_tool_call
 #[tokio::test]
 async fn explain_event_text_only_no_tools() {
     init_env();
@@ -4469,10 +4469,10 @@ async fn explain_event_text_only_no_tools() {
     let explain_events = events_of_type(&events, "explain");
     assert_eq!(explain_events.len(), 1);
     let ex = explain_events[0];
-    assert_eq!(ex.get("tools_selected").and_then(Value::as_i64), Some(0));
+    assert_eq!(ex.get("tool_calls").and_then(Value::as_i64), Some(0));
     assert!(
-        ex.get("tool_selection").map_or(true, Value::is_null),
-        "no tool_selection when no tools called"
+        ex.get("first_tool_call").map_or(true, Value::is_null),
+        "no first_tool_call when no tools called"
     );
 }
 
@@ -4829,7 +4829,7 @@ async fn batch_explain_counts_all_tools() {
     assert_eq!(explain_events.len(), 1);
     let ex = explain_events[0];
     assert_eq!(
-        ex.get("tools_selected").and_then(Value::as_i64),
+        ex.get("tool_calls").and_then(Value::as_i64),
         Some(3),
         "explain should count all 3 batch tool calls"
     );
@@ -4839,11 +4839,11 @@ async fn batch_explain_counts_all_tools() {
         "3 tools available"
     );
     // First tool is read_file
-    let selection = ex.get("tool_selection").expect("tool_selection present");
+    let selection = ex.get("first_tool_call").expect("first_tool_call present");
     assert_eq!(
         selection.get("name").and_then(Value::as_str),
         Some("read_file"),
-        "tool_selection = first tool in batch"
+        "first_tool_call = first tool in batch"
     );
     // Steps should record 3 tool_calls
     let steps = ex.get("steps").and_then(Value::as_array).expect("steps");
@@ -5352,9 +5352,9 @@ async fn observability_explain_total_ms_positive() {
     assert!(ms >= 0, "total_ms should be non-negative, got {ms}");
 }
 
-/// Explain event: tool_selection has name of first tool when tools present
+/// Explain event: first_tool_call has name of first tool when tools present
 #[tokio::test]
-async fn observability_explain_tool_selection_name() {
+async fn observability_explain_first_tool_call_name() {
     init_env();
     let app = build_test_app(AllCaptures::default());
 
@@ -5375,12 +5375,12 @@ async fn observability_explain_tool_selection_name() {
     let explain = events_of_type(&events, "explain");
     assert_eq!(explain.len(), 1);
 
-    let sel = explain[0].get("tool_selection");
-    assert!(sel.is_some(), "tool_selection present in explain");
+    let sel = explain[0].get("first_tool_call");
+    assert!(sel.is_some(), "first_tool_call present in explain");
     assert_eq!(
         sel.and_then(|s| s.get("name")).and_then(Value::as_str),
         Some("grep"),
-        "tool_selection.name = first tool called"
+        "first_tool_call.name = first tool called"
     );
 }
 
@@ -5809,9 +5809,9 @@ async fn gap_explain_no_tools_available() {
     let explain = events_of_type(&events, "explain");
     assert_eq!(explain.len(), 1);
     assert_eq!(
-        explain[0].get("tools_selected").and_then(Value::as_u64),
+        explain[0].get("tool_calls").and_then(Value::as_u64),
         Some(0),
-        "tools_selected=0 when no tools"
+        "tool_calls=0 when no tools"
     );
     assert_eq!(
         explain[0].get("tools_available").and_then(Value::as_u64),
@@ -7307,8 +7307,8 @@ async fn round_efficiency_parallel_tools_single_round() {
 /// Phase 2c: Multi-round review flow (suboptimal sequential pattern).
 ///
 /// Simulates the SUBOPTIMAL pattern where the model calls tools sequentially:
-///   Round 1: user → LLM calls git_log → tool_request
-///   Round 2: tool_result → LLM calls git_show → tool_request
+///   Round 1: user -> LLM calls git(action=log) -> tool_request
+///   Round 2: tool_result -> LLM calls git(action=show) -> tool_request
 ///   Round 3: tool_result → LLM returns review text
 ///
 /// This is the 3-round pattern we observe with less capable models.
@@ -7319,18 +7319,17 @@ async fn round_efficiency_review_commit_three_rounds_suboptimal() {
     let cap = AllCaptures::default();
     let app = build_test_app(cap.clone());
 
-    // ── Round 1: User asks to review → LLM calls git_log ──
+    // ── Round 1: User asks to review → LLM calls git ──
     let round1 = json!({
         "agent_id": "re-review-agent",
         "messages": [{ "role": "user", "content": "review the latest commit" }],
         "edge_tools": [
-            tool_schema("git_log"),
-            tool_schema("git_show"),
+            tool_schema("git"),
             tool_schema("read_file"),
         ],
         "test_llm_rounds": [{
             "tool_calls": [
-                tool_call("tc-r1", "git_log", json!({"max_count": 1}))
+                tool_call("tc-r1", "git", json!({"action": "log", "n": 1}))
             ]
         }]
     });
@@ -7344,10 +7343,10 @@ async fn round_efficiency_review_commit_three_rounds_suboptimal() {
     assert_eq!(tc1.len(), 1);
     assert_eq!(tc1[0]["has_tool_calls"].as_bool(), Some(true));
     let tr1 = events_of_type(&ev1, "tool_request");
-    assert_eq!(tr1.len(), 1, "round 1: 1 tool_request (git_log)");
-    assert_eq!(tr1[0]["tool"].as_str(), Some("git_log"));
+    assert_eq!(tr1.len(), 1, "round 1: 1 tool_request (git)");
+    assert_eq!(tr1[0]["tool"].as_str(), Some("git"));
 
-    // ── Round 2: CLI provides git_log result → LLM calls git_show ──
+    // ── Round 2: CLI provides git result → LLM calls git ──
     let round2 = json!({
         "agent_id": "re-review-agent",
         "session_id": session_id,
@@ -7355,15 +7354,14 @@ async fn round_efficiency_review_commit_three_rounds_suboptimal() {
             { "role": "user", "content": "review the latest commit" },
             { "role": "assistant", "content": "", "tool_calls": [
                 { "id": "tc-r1", "type": "function", "function": {
-                    "name": "git_log", "arguments": "{\"max_count\":1}"
+                    "name": "git", "arguments": "{\"action\":\"log\",\"n\":1}"
                 }}
             ]},
             { "role": "tool", "tool_call_id": "tc-r1",
               "content": "abc1234 feat: add new feature (2 hours ago)" },
         ],
         "edge_tools": [
-            tool_schema("git_log"),
-            tool_schema("git_show"),
+            tool_schema("git"),
             tool_schema("read_file"),
         ],
         "tool_results": [{
@@ -7372,7 +7370,7 @@ async fn round_efficiency_review_commit_three_rounds_suboptimal() {
         }],
         "test_llm_rounds": [{
             "tool_calls": [
-                tool_call("tc-r2", "git_show", json!({"commit": "abc1234"}))
+                tool_call("tc-r2", "git", json!({"action": "show", "revision": "abc1234"}))
             ]
         }]
     });
@@ -7385,10 +7383,10 @@ async fn round_efficiency_review_commit_three_rounds_suboptimal() {
     assert_eq!(tc2.len(), 1);
     assert_eq!(tc2[0]["has_tool_calls"].as_bool(), Some(true));
     let tr2 = events_of_type(&ev2, "tool_request");
-    assert_eq!(tr2.len(), 1, "round 2: 1 tool_request (git_show)");
-    assert_eq!(tr2[0]["tool"].as_str(), Some("git_show"));
+    assert_eq!(tr2.len(), 1, "round 2: 1 tool_request (git)");
+    assert_eq!(tr2[0]["tool"].as_str(), Some("git"));
 
-    // ── Round 3: CLI provides git_show result → LLM returns review text ──
+    // ── Round 3: CLI provides git result → LLM returns review text ──
     let round3 = json!({
         "agent_id": "re-review-agent",
         "session_id": session_id,
@@ -7396,22 +7394,21 @@ async fn round_efficiency_review_commit_three_rounds_suboptimal() {
             { "role": "user", "content": "review the latest commit" },
             { "role": "assistant", "content": "", "tool_calls": [
                 { "id": "tc-r1", "type": "function", "function": {
-                    "name": "git_log", "arguments": "{\"max_count\":1}"
+                    "name": "git", "arguments": "{\"action\":\"log\",\"n\":1}"
                 }}
             ]},
             { "role": "tool", "tool_call_id": "tc-r1",
               "content": "abc1234 feat: add new feature (2 hours ago)" },
             { "role": "assistant", "content": "", "tool_calls": [
                 { "id": "tc-r2", "type": "function", "function": {
-                    "name": "git_show", "arguments": "{\"commit\":\"abc1234\"}"
+                    "name": "git", "arguments": "{\"action\":\"show\",\"revision\":\"abc1234\"}"
                 }}
             ]},
             { "role": "tool", "tool_call_id": "tc-r2",
               "content": "+fn new_feature() {\n+    println!(\"Hello\");\n+}" },
         ],
         "edge_tools": [
-            tool_schema("git_log"),
-            tool_schema("git_show"),
+            tool_schema("git"),
             tool_schema("read_file"),
         ],
         "tool_results": [{
@@ -7459,11 +7456,11 @@ async fn round_efficiency_review_commit_three_rounds_suboptimal() {
     );
 }
 
-/// Phase 2d: Optimal review flow — model batches git_log + git_show in 1 round.
+/// Phase 2d: Optimal review flow — model batches git log + show actions in 1 round.
 ///
-/// Simulates the OPTIMAL pattern (like claudecode):
-///   Round 1: user → LLM calls git_log AND git_show together → 2 tool_requests
-///   Round 2: tool_results → LLM returns review text
+/// Simulates the OPTIMAL pattern (like reference-agent):
+///   Round 1: user -> LLM calls git(action=log) and git(action=show) together
+///   Round 2: tool_results -> LLM returns review text
 ///
 /// 2 rounds instead of 3. This is the target for Phase 4 prompt optimization.
 #[tokio::test]
@@ -7472,19 +7469,18 @@ async fn round_efficiency_review_commit_two_rounds_optimal() {
     let cap = AllCaptures::default();
     let app = build_test_app(cap.clone());
 
-    // ── Round 1: User asks to review → LLM calls git_log + git_show in parallel ──
+    // ── Round 1: User asks to review → LLM calls git log + show in parallel ──
     let round1 = json!({
         "agent_id": "re-optimal-agent",
         "messages": [{ "role": "user", "content": "review the latest commit" }],
         "edge_tools": [
-            tool_schema("git_log"),
-            tool_schema("git_show"),
+            tool_schema("git"),
             tool_schema("read_file"),
         ],
         "test_llm_rounds": [{
             "tool_calls": [
-                tool_call("tc-opt1", "git_log", json!({"max_count": 1})),
-                tool_call("tc-opt2", "git_show", json!({"commit": "HEAD"})),
+                tool_call("tc-opt1", "git", json!({"action": "log", "n": 1})),
+                tool_call("tc-opt2", "git", json!({"action": "show", "revision": "HEAD"})),
             ]
         }]
     });
@@ -7501,11 +7497,11 @@ async fn round_efficiency_review_commit_two_rounds_optimal() {
     assert_eq!(
         tr1.len(),
         2,
-        "optimal round 1: 2 tool_requests (git_log + git_show)"
+        "optimal round 1: 2 tool_requests (git log + show)"
     );
 
     let tool_names: Vec<&str> = tr1.iter().filter_map(|r| r["tool"].as_str()).collect();
-    assert_eq!(tool_names, vec!["git_log", "git_show"]);
+    assert_eq!(tool_names, vec!["git", "git"]);
 
     // ── Round 2: CLI provides both results → LLM returns final review ──
     let round2 = json!({
@@ -7515,10 +7511,10 @@ async fn round_efficiency_review_commit_two_rounds_optimal() {
             { "role": "user", "content": "review the latest commit" },
             { "role": "assistant", "content": "", "tool_calls": [
                 { "id": "tc-opt1", "type": "function", "function": {
-                    "name": "git_log", "arguments": "{\"max_count\":1}"
+                    "name": "git", "arguments": "{\"action\":\"log\",\"n\":1}"
                 }},
                 { "id": "tc-opt2", "type": "function", "function": {
-                    "name": "git_show", "arguments": "{\"commit\":\"HEAD\"}"
+                    "name": "git", "arguments": "{\"action\":\"show\",\"revision\":\"HEAD\"}"
                 }}
             ]},
             { "role": "tool", "tool_call_id": "tc-opt1",
@@ -7527,8 +7523,7 @@ async fn round_efficiency_review_commit_two_rounds_optimal() {
               "content": "diff --git a/src/main.rs\n+fn new_feature() { println!(\"Hello\"); }" },
         ],
         "edge_tools": [
-            tool_schema("git_log"),
-            tool_schema("git_show"),
+            tool_schema("git"),
             tool_schema("read_file"),
         ],
         "tool_results": [
@@ -7683,7 +7678,7 @@ async fn round_efficiency_deep_analysis_batch_tools() {
 
 /// Phase 2f: Bash compound command flow — single tool call for compound operation.
 ///
-/// Simulates claudecode-style compound git operation in 1 bash call:
+/// Simulates reference-agent-style compound git operation in 1 bash call:
 ///   Round 1: LLM calls bash("git log -1 --format='%H %s' && git diff HEAD~1") → 1 tool_request
 ///   Round 2: tool_result → LLM returns review text
 ///
@@ -7780,9 +7775,9 @@ async fn tool_call_full_args_emitted_before_tool_request() {
     let payload = json!({
         "agent_id": "tc-full-args-agent",
         "messages": [{ "role": "user", "content": "show recent commits" }],
-        "edge_tools": [tool_schema("git_log")],
+        "edge_tools": [tool_schema("git")],
         "test_llm_rounds": [{
-            "tool_calls": [tool_call("tc-gl-1", "git_log", json!({"n": 5}))]
+            "tool_calls": [tool_call("tc-gl-1", "git", json!({"action": "log", "n": 5}))]
         }]
     });
 
@@ -7793,11 +7788,11 @@ async fn tool_call_full_args_emitted_before_tool_request() {
     // Must have tool_call events with full args
     let tool_calls = events_of_type(&events, "tool_call");
     assert!(!tool_calls.is_empty(), "must emit tool_call events");
-    assert_eq!(tool_calls[0]["name"], "git_log");
+    assert_eq!(tool_calls[0]["name"], "git");
     // Arguments should be the FULL parsed object, not empty
     let args = &tool_calls[0]["arguments"];
     assert!(
-        args.get("n").is_some() || args.get("path").is_some(),
+        args.get("action").is_some() && (args.get("n").is_some() || args.get("path").is_some()),
         "tool_call arguments must contain full parsed args, got: {args}"
     );
 
@@ -7825,9 +7820,9 @@ async fn tool_call_and_tool_request_ids_match() {
     let payload = json!({
         "agent_id": "tc-id-match-agent",
         "messages": [{ "role": "user", "content": "diff HEAD" }],
-        "edge_tools": [tool_schema("git_diff")],
+        "edge_tools": [tool_schema("git")],
         "test_llm_rounds": [{
-            "tool_calls": [tool_call("tc-gd-1", "git_diff", json!({"ref": "HEAD"}))]
+            "tool_calls": [tool_call("tc-gd-1", "git", json!({"action": "diff", "ref": "HEAD"}))]
         }]
     });
 
@@ -7862,12 +7857,12 @@ async fn tool_call_full_args_parallel_tool_calls() {
     let payload = json!({
         "agent_id": "tc-parallel-args-agent",
         "messages": [{ "role": "user", "content": "review the latest commit" }],
-        "edge_tools": [tool_schema("git_log"), tool_schema("git_diff"), tool_schema("git_show")],
+        "edge_tools": [tool_schema("git")],
         "test_llm_rounds": [{
             "tool_calls": [
-                tool_call("tc-p1", "git_log", json!({"n": 3})),
-                tool_call("tc-p2", "git_diff", json!({"ref": "HEAD~1"})),
-                tool_call("tc-p3", "git_show", json!({"ref": "HEAD", "stat": true})),
+                tool_call("tc-p1", "git", json!({"action": "log", "n": 3})),
+                tool_call("tc-p2", "git", json!({"action": "diff", "ref": "HEAD~1"})),
+                tool_call("tc-p3", "git", json!({"action": "show", "revision": "HEAD", "stat_only": true})),
             ]
         }]
     });
@@ -7947,84 +7942,7 @@ async fn tool_call_args_match_tool_request_args() {
     );
 }
 
-// ── A2: Tool Selection E2E Tests (TfIdf-only verification) ───────────────────
-
-#[tokio::test]
-async fn a2_edge_profile_selection_task_type_reaches_bridge() {
-    // The CLI sends selection_task_type in edge_profile. Verify the bridge uses it
-    // for system prompt construction (task_type_section).
-    init_env();
-    let cap = AllCaptures::default();
-    let app = build_test_app(cap.clone());
-
-    let payload = json!({
-        "agent_id": "a2-task-type",
-        "messages": [{ "role": "user", "content": "review the code" }],
-        "edge_tools": [tool_schema("read_file"), tool_schema("git_log")],
-        "edge_profile": {
-            "selection_task_type": "code_review",
-            "selection_confidence": 0.85
-        },
-        "selection_confidence": 0.85,
-        "explain": true,
-        "test_llm_rounds": [{
-            "full_text": "The code looks well-structured.",
-            "usage": { "prompt_tokens": 1000, "completion_tokens": 100, "total_tokens": 1100 }
-        }]
-    });
-
-    let (st, raw) = chat_turn(&app, payload).await;
-    assert_eq!(st, StatusCode::OK);
-    let events = parse_sse_events(&raw);
-
-    // Explain event should be emitted with routing info
-    let explains = events_of_type(&events, "explain");
-    assert_eq!(explains.len(), 1);
-    let ex = explains[0];
-    assert!(
-        ex["tools_available"].as_i64().unwrap() >= 2,
-        "tools available >= 2"
-    );
-
-    // Turn should complete normally
-    let turn_completes = events_of_type(&events, "turn_complete");
-    assert_eq!(turn_completes.len(), 1);
-}
-
-#[tokio::test]
-async fn a2_selection_confidence_passed_to_bridge() {
-    // selection_confidence is used by the bridge for compaction decisions.
-    // Verify a low-confidence selection doesn't break the flow.
-    init_env();
-    let cap = AllCaptures::default();
-    let app = build_test_app(cap.clone());
-
-    let payload = json!({
-        "agent_id": "a2-low-confidence",
-        "messages": [{ "role": "user", "content": "do something ambiguous" }],
-        "edge_tools": [
-            tool_schema("read_file"),
-            tool_schema("write_file"),
-            tool_schema("grep"),
-            tool_schema("bash")
-        ],
-        "selection_confidence": 0.3,
-        "test_llm_rounds": [{
-            "full_text": "I'll help with that. What specifically would you like me to do?"
-        }]
-    });
-
-    let (st, raw) = chat_turn(&app, payload).await;
-    assert_eq!(st, StatusCode::OK);
-    let events = parse_sse_events(&raw);
-
-    let turn_completes = events_of_type(&events, "turn_complete");
-    assert_eq!(
-        turn_completes.len(),
-        1,
-        "low confidence doesn't break the flow"
-    );
-}
+// ── A2: Tool Surface E2E Tests ───────────────────────────────────────────────
 
 #[tokio::test]
 async fn a2_empty_edge_tools_still_works() {
@@ -8078,8 +7996,8 @@ async fn a2_many_edge_tools_handled() {
 }
 
 #[tokio::test]
-async fn a2_explain_shows_tools_selected_and_available_counts() {
-    // explain event must report accurate tools_selected and tools_available.
+async fn a2_explain_shows_tool_calls_and_available_counts() {
+    // explain event must report accurate tool_calls and tools_available.
     init_env();
     let cap = AllCaptures::default();
     let app = build_test_app(cap.clone());
@@ -8110,10 +8028,10 @@ async fn a2_explain_shows_tools_selected_and_available_counts() {
     let avail = ex["tools_available"].as_i64().unwrap();
     assert!(avail >= 3, "tools_available should be >= 3, got {avail}");
 
-    let selected = ex["tools_selected"].as_i64().unwrap();
+    let selected = ex["tool_calls"].as_i64().unwrap();
     assert!(
         selected >= 1,
-        "tools_selected should be >= 1 (at least the tool call count)"
+        "tool_calls should be >= 1 (at least the tool call count)"
     );
 }
 
@@ -8402,8 +8320,7 @@ async fn a4_active_skills_in_edge_profile() {
         "messages": [{ "role": "user", "content": "help me review" }],
         "edge_tools": [tool_schema("read_file")],
         "edge_profile": {
-            "active_skills": ["code-review", "test-writer"],
-            "selection_task_type": "code_review"
+            "active_skills": ["code-review", "test-writer"]
         },
         "test_llm_rounds": [{
             "full_text": "I'll help you review the code."
@@ -8638,11 +8555,11 @@ async fn a5_explain_with_multi_round_tool_flow() {
     assert_eq!(explains.len(), 1, "one explain event for multi-round");
     let ex = explains[0];
 
-    // tools_selected should count the tool calls
-    let selected = ex["tools_selected"].as_i64().unwrap();
+    // tool_calls should count the tool calls
+    let selected = ex["tool_calls"].as_i64().unwrap();
     assert!(
         selected >= 2,
-        "tools_selected >= 2 for multi-round, got {selected}"
+        "tool_calls >= 2 for multi-round, got {selected}"
     );
 
     // total_ms should be positive
@@ -8727,8 +8644,7 @@ async fn a5_persist_activity_writer_called() {
 /// is the same, so this test pins the rules rather than the heading.
 #[tokio::test]
 async fn b1_think_before_act_directive_in_system_prompt() {
-    let prompt =
-        astra_runtime::prompts::build_main_system_prompt(&["read_file", "grep"], "", 1.0, None);
+    let prompt = astra_runtime::prompts::build_main_system_prompt(&["read_file", "grep"], "", None);
     assert!(
         prompt.contains("Plan, Batch, Execute") || prompt.contains("Think-Before-Act"),
         "system prompt should carry the planning directive (current heading: \
@@ -8745,12 +8661,10 @@ async fn b1_think_before_act_directive_in_system_prompt() {
     );
 }
 
-/// B2: Bridge reads round_index from payload and injects directive into dynamic prompt.
-/// When round_index >= threshold, the system prompt sent to the mock LLM should contain
-/// the round budget warning. We verify by checking that the mock LLM receives the directive
-/// in the system message content.
+/// B2: Bridge accepts round_index from payload without reintroducing removed
+/// countdown directives.
 #[tokio::test]
-async fn b2_bridge_injects_round_budget_via_payload() {
+async fn b2_bridge_accepts_round_index_without_countdown_directive() {
     init_env();
     let cap = AllCaptures::default();
     let app = build_test_app(cap.clone());
@@ -8771,8 +8685,9 @@ async fn b2_bridge_injects_round_budget_via_payload() {
 
     cap.wait_persist_idle().await;
 
-    // Round at threshold — should inject warning
-    let threshold = astra_runtime::prompts::ROUND_BUDGET_THRESHOLD;
+    // Late round: budget directives are removed, but bridge payload handling
+    // must remain stable for non-zero round_index.
+    let threshold = 8;
     let payload_rt = json!({
         "session_id": "budget-test-sess-2",
         "messages": [{"role": "user", "content": "continue analyzing"}],
@@ -8788,8 +8703,8 @@ async fn b2_bridge_injects_round_budget_via_payload() {
 
     cap.wait_persist_idle().await;
 
-    // Round at hard limit — should inject hard stop
-    let hard = astra_runtime::prompts::ROUND_BUDGET_HARD_LIMIT;
+    // Former hard-limit-shaped round index should still be accepted.
+    let hard = 15;
     let payload_rh = json!({
         "session_id": "budget-test-sess-3",
         "messages": [{"role": "user", "content": "still going"}],
@@ -8833,13 +8748,8 @@ async fn b2_round_index_defaults_to_zero() {
 /// note: "Think-Before-Act" was consolidated into "Plan, Batch, Execute".
 #[tokio::test]
 async fn b1_think_before_act_in_sections_builder() {
-    let sections = astra_runtime::prompts::build_system_prompt_sections_with_style(
-        &["bash"],
-        "",
-        1.0,
-        None,
-        None,
-    );
+    let sections =
+        astra_runtime::prompts::build_system_prompt_sections_with_style(&["bash"], "", None, None);
     let full_text = astra_runtime::prompts::sections_to_string(&sections);
     assert!(
         full_text.contains("Plan, Batch, Execute") || full_text.contains("Think-Before-Act"),
@@ -9251,10 +9161,9 @@ async fn golden_token_usage_tracking() {
     cap.wait_persist_idle().await;
 }
 
-/// Golden: Round budget kicks in at round 3 — LLM receives warning.
-/// Simulates a verbose agent hitting the budget threshold.
+/// Golden: late-round synthesis remains stable without countdown directives.
 #[tokio::test]
-async fn golden_round_budget_forces_synthesis() {
+async fn golden_late_round_synthesis_without_countdown_directive() {
     init_env();
     let cap = AllCaptures::default();
     let app = build_test_app(cap.clone());
@@ -9294,7 +9203,7 @@ async fn golden_round_budget_forces_synthesis() {
     let texts: Vec<&Value> = events_of_type(&events, "text_delta");
     assert!(
         !texts.is_empty(),
-        "should produce synthesis text at budget threshold"
+        "should produce synthesis text in a late round"
     );
 
     cap.wait_persist_idle().await;
@@ -9646,11 +9555,11 @@ async fn c1_trace_tool_events_have_required_fields() {
         "session_id": "c1-tool-trace-sess",
         "agent_id": "c1-tool-agent",
         "messages": [{"role": "user", "content": "list files"}],
-        "edge_tools": [tool_schema("read_file"), tool_schema("list_files")],
+        "edge_tools": [tool_schema("read_file"), tool_schema("list_dir")],
         "test_llm_rounds": [{
             "tool_calls": [
                 tool_call("tc-c1a", "read_file", json!({"path": "main.rs"})),
-                tool_call("tc-c1b", "list_files", json!({"path": "/src"}))
+                tool_call("tc-c1b", "list_dir", json!({"path": "/src"}))
             ]
         }]
     });
@@ -9982,7 +9891,7 @@ async fn c3_explain_event_comprehensive_fields() {
 
     // Tool statistics
     assert_eq!(
-        ex.get("tools_selected").and_then(Value::as_i64),
+        ex.get("tool_calls").and_then(Value::as_i64),
         Some(2),
         "2 tool calls"
     );
@@ -10021,7 +9930,7 @@ async fn c3_explain_text_only_zero_tools() {
 
     let ex = explain[0];
     assert_eq!(
-        ex.get("tools_selected").and_then(Value::as_i64),
+        ex.get("tool_calls").and_then(Value::as_i64),
         Some(0),
         "text-only turn should have 0 tools selected"
     );

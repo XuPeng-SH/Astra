@@ -309,6 +309,13 @@ pub trait EdgeToolRoundRow {
     fn assistant_tool_call_id(&self, index: usize) -> String {
         format!("edge-{index}")
     }
+
+    /// True when [`Self::assistant_tool_call_id`] came from a server tool-call
+    /// id or edge executor request id, rather than the synthetic `edge-{index}`
+    /// fallback used for edge-only rounds.
+    fn has_explicit_assistant_tool_call_id(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -316,6 +323,40 @@ pub struct MatchedEdgeToolOutput {
     pub output: String,
     pub duration_ms: u64,
     pub tool_result_fields: Option<serde_json::Map<String, Value>>,
+}
+
+fn matched_edge_tool_output<T: EdgeToolRoundRow>(row: &T) -> MatchedEdgeToolOutput {
+    MatchedEdgeToolOutput {
+        output: row.tool_output().to_string(),
+        duration_ms: row.tool_duration_ms(),
+        tool_result_fields: row.tool_result_fields().cloned(),
+    }
+}
+
+pub fn take_edge_output_for_tool_call_id_or_signature_with_duration<T: EdgeToolRoundRow>(
+    tool_call_id: &str,
+    name: &str,
+    args: &Value,
+    round: &[T],
+    consumed: &mut [bool],
+    by_sig: &HashMap<String, String>,
+) -> MatchedEdgeToolOutput {
+    if !tool_call_id.is_empty() {
+        for (i, e) in round.iter().enumerate() {
+            if consumed.get(i).copied().unwrap_or(true) {
+                continue;
+            }
+            if e.has_explicit_assistant_tool_call_id()
+                && e.assistant_tool_call_id(i) == tool_call_id
+                && e.tool_name() == name
+            {
+                consumed[i] = true;
+                return matched_edge_tool_output(e);
+            }
+        }
+    }
+
+    take_edge_output_for_tool_call_with_duration(name, args, round, consumed, by_sig)
 }
 
 pub fn take_edge_output_for_tool_call_with_duration<T: EdgeToolRoundRow>(
@@ -332,11 +373,7 @@ pub fn take_edge_output_for_tool_call_with_duration<T: EdgeToolRoundRow>(
         }
         if tool_dedup_signature(e.tool_name(), e.tool_args()) == sig {
             consumed[i] = true;
-            return MatchedEdgeToolOutput {
-                output: e.tool_output().to_string(),
-                duration_ms: e.tool_duration_ms(),
-                tool_result_fields: e.tool_result_fields().cloned(),
-            };
+            return matched_edge_tool_output(e);
         }
     }
     MatchedEdgeToolOutput {
@@ -1033,11 +1070,8 @@ mod tests {
             "delete_file",
             "multi_edit",
             "git",
-            "git_checkout_file",
             "github",
             "mo_query",
-            "mo_snapshot",
-            "mo_branch",
             "memory", // action-aware; conservatively classified as Mutating
         ];
         for &tool in READ_ONLY_TOOLS.iter() {
@@ -1117,6 +1151,9 @@ mod tests {
                 self.request_id.clone()
             }
         }
+        fn has_explicit_assistant_tool_call_id(&self) -> bool {
+            !self.request_id.is_empty()
+        }
     }
 
     #[test]
@@ -1130,6 +1167,64 @@ mod tests {
         let msg = openai_assistant_with_tool_calls_message(&[], &edge, "");
         let tc = msg["tool_calls"].as_array().unwrap();
         assert_eq!(tc[0]["id"], "req-abc");
+    }
+
+    #[test]
+    fn take_edge_output_prefers_request_id_when_arguments_differ() {
+        let edge_args = json!({
+            "action": "start",
+            "target_count": 3,
+            "slots": [{"id": "review", "prompt": "review"}],
+            "title": "Review"
+        });
+        let server_args = json!({
+            "action": "start",
+            "target_count": 3,
+            "slots": [{"id": "review", "prompt": "review"}]
+        });
+        let rows = vec![RowWithRequestId {
+            tool: "agent_fanout".into(),
+            args: edge_args,
+            output: r#"{"completed":3}"#.into(),
+            request_id: "call-fanout-1".into(),
+        }];
+        let mut consumed = vec![false];
+
+        let out = take_edge_output_for_tool_call_id_or_signature_with_duration(
+            "call-fanout-1",
+            "agent_fanout",
+            &server_args,
+            &rows,
+            &mut consumed,
+            &HashMap::new(),
+        );
+
+        assert_eq!(out.output, r#"{"completed":3}"#);
+        assert!(consumed[0]);
+    }
+
+    #[test]
+    fn take_edge_output_falls_back_to_signature_when_request_id_differs() {
+        let args = json!({"pattern": "needle"});
+        let rows = vec![RowWithRequestId {
+            tool: "grep".into(),
+            args: args.clone(),
+            output: "matched by args".into(),
+            request_id: "other-call".into(),
+        }];
+        let mut consumed = vec![false];
+
+        let out = take_edge_output_for_tool_call_id_or_signature_with_duration(
+            "call-grep-1",
+            "grep",
+            &args,
+            &rows,
+            &mut consumed,
+            &HashMap::new(),
+        );
+
+        assert_eq!(out.output, "matched by args");
+        assert!(consumed[0]);
     }
 
     #[test]
@@ -1296,14 +1391,14 @@ mod tests {
             "id": "call_abc",
             "type": "function",
             "function": {
-                "name": "git_log",
-                "arguments": "{\"n\":5}"
+                "name": "git",
+                "arguments": "{\"action\":\"log\",\"n\":5}"
             }
         });
         let (id, name, args) = parse_flat_tool_call_event(&tc);
         assert_eq!(id, "call_abc");
-        assert_eq!(name, "git_log");
-        assert_eq!(args, json!({"n": 5}));
+        assert_eq!(name, "git");
+        assert_eq!(args, json!({"action": "log", "n": 5}));
     }
 
     /// OpenAI format with empty function.name should still return empty
@@ -1330,16 +1425,16 @@ mod tests {
             "id": "call_1",
             "type": "function",
             "function": {
-                "name": "git_show",
-                "arguments": "{\"commit\":\"abc\"}"
+                "name": "git",
+                "arguments": "{\"action\":\"show\",\"revision\":\"abc\"}"
             }
         })];
         let slot =
             resolve_headless_tool_slot(HeadlessRoundToolIdx::ServerToolCall(0), &server, |_| {
                 panic!("edge lookup not used")
             });
-        assert_eq!(slot.name, "git_show");
-        assert_eq!(slot.args, json!({"commit": "abc"}));
+        assert_eq!(slot.name, "git");
+        assert_eq!(slot.args, json!({"action": "show", "revision": "abc"}));
     }
 
     /// Regression: openai_tool_call_entries_from_server must handle OpenAI-format
@@ -1375,15 +1470,16 @@ mod tests {
     #[test]
     fn openai_assistant_message_mixed_format_tool_calls() {
         let server = vec![
-            json!({"id": "c1", "name": "git_status", "arguments": {}}),
-            json!({"id": "c2", "type": "function", "function": {"name": "git_diff", "arguments": "{\"ref\":\"HEAD\"}"}}),
+            json!({"id": "c1", "name": "git", "arguments": {"action": "status"}}),
+            json!({"id": "c2", "type": "function", "function": {"name": "git", "arguments": "{\"action\":\"diff\",\"ref\":\"HEAD\"}"}}),
         ];
         let msg = openai_assistant_with_tool_calls_message(&server, &[] as &[Row], "");
         let tc = msg["tool_calls"].as_array().unwrap();
-        assert_eq!(tc[0]["function"]["name"], "git_status");
-        assert_eq!(tc[1]["function"]["name"], "git_diff");
+        assert_eq!(tc[0]["function"]["name"], "git");
+        assert_eq!(tc[1]["function"]["name"], "git");
         let args: Value =
             serde_json::from_str(tc[1]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["action"], "diff");
         assert_eq!(args["ref"], "HEAD");
     }
 

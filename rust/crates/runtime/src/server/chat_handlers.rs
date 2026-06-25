@@ -212,7 +212,6 @@ fn chat_stream_bridge_fallback_payload(
             .llm_token_service
             .as_ref()
             .map(|config| serde_json::json!(config)),
-        "skill_search": chat_data.skill_search.as_ref(),
         "allow_skills": allow_skills,
         "allow_skill_sources": allow_skill_sources,
         "allow_tools": allow_tools,
@@ -561,7 +560,6 @@ pub(super) async fn chat_route_handler(
 
 #[cfg(test)]
 mod tests {
-    use astra_core::SkillSearchSettings;
     use astra_services::runs::{ChatRequestData, SelectedModelRequest};
 
     use super::*;
@@ -650,18 +648,12 @@ mod tests {
                 url: "http://catalog:8081/api/v1/llm-token".to_string(),
                 timeout_ms: Some(2500),
             }),
-            skill_search: Some(SkillSearchSettings {
-                dynamic_surface: false,
-                min_catalog_size: 12,
-                surface_cap: 20,
-            }),
             allow_skills: Some(vec!["plan".to_string()]),
             allow_skill_sources: None,
             allow_tools: Some(vec!["bash".to_string()]),
             workspace_binding: None,
             executor_binding: None,
             runtime_mcp_bindings: Vec::new(),
-            mcp_binding_ids: Some(vec![301]),
             context: Some(context),
             edge_executor_id: None,
             capabilities: Vec::new(),
@@ -683,9 +675,7 @@ mod tests {
         assert_eq!(obj["execution_budget"]["hard_turn_limit"], 7);
         assert_eq!(obj["explain"], true);
         assert_eq!(obj["interaction_mode"], "auto");
-        assert_eq!(obj["skill_search"]["dynamic_surface"], false);
-        assert_eq!(obj["skill_search"]["min_catalog_size"], 12);
-        assert_eq!(obj["skill_search"]["surface_cap"], 20);
+        assert!(!obj.contains_key("skill_search"));
         assert_eq!(
             obj["llm_token_service"]["url"],
             "http://catalog:8081/api/v1/llm-token"
@@ -694,7 +684,6 @@ mod tests {
         assert_eq!(obj["allow_skills"], serde_json::json!(["plan"]));
         assert_eq!(obj["allow_skill_sources"], serde_json::Value::Null);
         assert_eq!(obj["allow_tools"], serde_json::json!(["bash"]));
-        assert!(!obj.contains_key("mcp_binding_ids"));
         assert_eq!(
             obj["edge_profile"]["system_prompt_override"],
             "override text"
@@ -722,7 +711,6 @@ mod tests {
             runtime_auth: None,
             runtime_profile: None,
             llm_token_service: None,
-            skill_search: None,
             allow_skills: Some(vec![
                 " plan ".to_string(),
                 "PLAN".to_string(),
@@ -741,7 +729,6 @@ mod tests {
             workspace_binding: None,
             executor_binding: None,
             runtime_mcp_bindings: Vec::new(),
-            mcp_binding_ids: None,
             context: None,
             edge_executor_id: None,
             capabilities: Vec::new(),

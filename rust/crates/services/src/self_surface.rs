@@ -97,8 +97,7 @@ pub struct EnvironmentSurface {
     pub resolved_sources: Vec<&'static str>,
     pub available_tools: usize,
     pub tool_names: Vec<String>,
-    pub pinned_tools: Vec<String>,
-    pub deprioritized_tools: Vec<String>,
+    pub health_avoidance_tools: Vec<String>,
     pub discovered_skills: Vec<String>,
     pub active_experiment_id: Option<String>,
     pub active_variant: Option<String>,
@@ -115,7 +114,7 @@ pub struct StepRecord {
     pub actor: String,
     pub phase: String,
     pub summary: String,
-    pub selected_tools: Vec<String>,
+    pub visible_tools: Vec<String>,
     pub used_tools: Vec<String>,
     pub selected_skills: Vec<String>,
     pub tool_calls: Vec<ToolCallView>,
@@ -141,22 +140,10 @@ pub struct DecisionRecord {
     pub id: String,
     pub turn: Option<u32>,
     pub ts: String,
-    pub strategy: String,
-    pub confidence: f64,
-    pub selected_tools: Vec<String>,
+    pub visible_tools: Vec<String>,
     pub selected_skills: Vec<String>,
-    pub rejected_tools: usize,
-    pub alternatives: Vec<ScoredAlternative>,
-    pub boost_terms: Vec<String>,
-    pub learned_context_summary: Option<String>,
     pub routing_domain_hint: Option<String>,
     pub source_step_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ScoredAlternative {
-    pub tool: String,
-    pub score: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -208,8 +195,7 @@ pub struct ProfileSurface {
 pub struct CapabilitySurface {
     pub total_tools: usize,
     pub tool_names: Vec<String>,
-    pub pinned_tools: Vec<String>,
-    pub deprioritized_tools: Vec<String>,
+    pub health_avoidance_tools: Vec<String>,
     pub skills: Vec<String>,
     pub tool_health: Vec<ToolHealthView>,
 }
@@ -218,7 +204,7 @@ pub struct CapabilitySurface {
 pub struct SurfaceConstraints {
     pub max_mutations_per_turn: u32,
     pub config_drift_ceiling: f64,
-    pub min_tool_pool_size: usize,
+    pub min_available_tool_count: usize,
     pub token_reserve_fraction: f64,
 }
 
@@ -227,7 +213,7 @@ impl Default for SurfaceConstraints {
         Self {
             max_mutations_per_turn: 2,
             config_drift_ceiling: 0.30,
-            min_tool_pool_size: 5,
+            min_available_tool_count: 5,
             token_reserve_fraction: 0.20,
         }
     }
@@ -254,13 +240,11 @@ pub struct TraceSurface {
     pub recent_decisions: Vec<DecisionRecord>,
     pub compact_trace: Option<ContextTraceSignal>,
     pub compact_preview: Option<String>,
-    pub latest_selection_trace: Option<serde_json::Value>,
     pub latest_full_context_trace: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BudgetConfig {
-    pub tool_budget_tokens: u32,
     pub compression_threshold: f64,
     pub max_turn_input_tokens: u32,
     pub compression_threshold_min: f64,
@@ -270,7 +254,6 @@ pub struct BudgetConfig {
 impl Default for BudgetConfig {
     fn default() -> Self {
         Self {
-            tool_budget_tokens: 0,
             compression_threshold: 0.0,
             max_turn_input_tokens: 0,
             compression_threshold_min: 0.0,
@@ -284,7 +267,6 @@ pub struct BudgetSurface {
     pub session_id: String,
     pub persistence_error: Option<String>,
     pub budget: Option<BudgetState>,
-    pub tool_budget_tokens: u32,
     pub compression_threshold: f64,
     pub max_turn_input_tokens: u32,
     pub compression_threshold_min: f64,
@@ -307,7 +289,7 @@ pub struct HealthSurface {
     pub phase: String,
     pub risk_flags: Vec<String>,
     pub pending_blockers: Vec<String>,
-    pub blocked_tools: Vec<String>,
+    pub health_avoidance_tools: Vec<String>,
     pub tool_hotspots: Vec<ToolHealthView>,
     pub recent_failures: Vec<ToolFailureView>,
     pub acceptance_ok: bool,
@@ -371,7 +353,7 @@ pub struct ToolHealthView {
     pub total_calls: usize,
     pub total_failures: usize,
     pub success_rate: f64,
-    pub deprioritized: bool,
+    pub avoidance_advised: bool,
     pub consecutive_failures: usize,
     pub rehabilitation_count: usize,
 }
@@ -669,10 +651,7 @@ fn build_environment_surface(
         resolved_sources: resolved_sources(artifacts),
         available_tools: tool_names.len(),
         tool_names,
-        pinned_tools: workspace
-            .map(|ws| ws.pinned_tools.clone())
-            .unwrap_or_default(),
-        deprioritized_tools: merged_deprioritized_tools(artifacts),
+        health_avoidance_tools: merged_health_avoidance_tools(artifacts),
         discovered_skills: merged_skills(workspace),
         active_experiment_id: workspace.and_then(|ws| ws.active_experiment_id.clone()),
         active_variant: workspace.and_then(|ws| ws.active_variant.clone()),
@@ -840,8 +819,7 @@ fn build_profile_surface(
         capabilities: CapabilitySurface {
             total_tools: snapshot.environment.available_tools,
             tool_names: snapshot.environment.tool_names.clone(),
-            pinned_tools: snapshot.environment.pinned_tools.clone(),
-            deprioritized_tools: snapshot.environment.deprioritized_tools.clone(),
+            health_avoidance_tools: snapshot.environment.health_avoidance_tools.clone(),
             skills: snapshot.environment.discovered_skills.clone(),
             tool_health: health.tool_health.into_iter().take(8).collect(),
         },
@@ -902,11 +880,6 @@ fn build_trace_surface(
         recent_decisions: snapshot.recent_decisions.clone(),
         compact_trace: latest_context_trace(artifacts).cloned(),
         compact_preview: latest_context_trace(artifacts).map(ContextTraceSignal::preview),
-        latest_selection_trace: artifacts
-            .journal_events
-            .iter()
-            .rev()
-            .find_map(|event| serde_json::to_value(event.selection_trace.as_ref()?).ok()),
         latest_full_context_trace: artifacts.latest_full_context_trace.clone(),
     }
 }
@@ -926,7 +899,6 @@ fn build_budget_surface(
         session_id: artifacts.session_id.clone(),
         persistence_error: snapshot.run.persistence_error.clone(),
         budget: snapshot.run.budget.clone(),
-        tool_budget_tokens: budget_config.tool_budget_tokens,
         compression_threshold: budget_config.compression_threshold,
         max_turn_input_tokens: budget_config.max_turn_input_tokens,
         compression_threshold_min: budget_config.compression_threshold_min,
@@ -946,7 +918,7 @@ fn build_health_surface(
         phase: snapshot.run.phase.clone(),
         risk_flags: snapshot.run.risk_flags.clone(),
         pending_blockers: snapshot.run.pending_blockers.clone(),
-        blocked_tools: health.blocked_tools,
+        health_avoidance_tools: health.health_avoidance_tools,
         tool_hotspots: health.tool_health.into_iter().take(10).collect(),
         recent_failures: health.recent_failures,
         acceptance_ok: snapshot.acceptance.ok,
@@ -1216,17 +1188,17 @@ struct ToolHealthAccumulator {
     total_failures: usize,
     consecutive_failures: usize,
     rehabilitation_count: usize,
-    deprioritized: bool,
+    avoidance_advised: bool,
 }
 
 struct HealthData {
-    blocked_tools: Vec<String>,
+    health_avoidance_tools: Vec<String>,
     tool_health: Vec<ToolHealthView>,
     recent_failures: Vec<ToolFailureView>,
 }
 
 fn build_health_data(artifacts: &SessionArtifacts) -> HealthData {
-    let blocked_tools = merged_deprioritized_tools(artifacts);
+    let health_avoidance_tools = merged_health_avoidance_tools(artifacts);
     let mut by_tool: BTreeMap<String, ToolHealthAccumulator> = BTreeMap::new();
 
     for event in &artifacts.journal_events {
@@ -1248,8 +1220,8 @@ fn build_health_data(artifacts: &SessionArtifacts) -> HealthData {
         }
     }
 
-    for tool in &blocked_tools {
-        by_tool.entry(tool.clone()).or_default().deprioritized = true;
+    for tool in &health_avoidance_tools {
+        by_tool.entry(tool.clone()).or_default().avoidance_advised = true;
     }
 
     let mut tool_health = by_tool
@@ -1263,7 +1235,7 @@ fn build_health_data(artifacts: &SessionArtifacts) -> HealthData {
             } else {
                 (acc.total_calls.saturating_sub(acc.total_failures)) as f64 / acc.total_calls as f64
             },
-            deprioritized: acc.deprioritized,
+            avoidance_advised: acc.avoidance_advised,
             consecutive_failures: acc.consecutive_failures,
             rehabilitation_count: acc.rehabilitation_count,
         })
@@ -1275,7 +1247,7 @@ fn build_health_data(artifacts: &SessionArtifacts) -> HealthData {
     });
 
     HealthData {
-        blocked_tools,
+        health_avoidance_tools,
         tool_health,
         recent_failures: recent_tool_failures(&artifacts.journal_events, 12),
     }
@@ -1294,7 +1266,7 @@ fn build_recent_steps(events: &[JournalEvent], journal_limit: usize) -> Vec<Step
             actor: actor_for_event(event).to_string(),
             phase: phase_for_event_type(&event.event_type).to_string(),
             summary: summarize_event(event),
-            selected_tools: event.tools_selected.clone().unwrap_or_default(),
+            visible_tools: event.visible_tools.clone().unwrap_or_default(),
             used_tools: event.tools_used.clone().unwrap_or_default(),
             selected_skills: event.selected_skills.clone().unwrap_or_default(),
             tool_calls: event
@@ -1343,7 +1315,7 @@ fn build_recent_decisions(
         .workspace
         .as_ref()
         .and_then(|ws| ws.last_context_trace.as_ref())
-        .and_then(|trace| trace.tool_selection.as_ref())
+        .and_then(|trace| trace.tool_surface.as_ref())
     {
         decisions.push(DecisionRecord {
             id: format!(
@@ -1362,18 +1334,12 @@ fn build_recent_decisions(
                 .and_then(|ws| ws.last_context_trace.as_ref())
                 .and_then(|trace| trace.captured_at.clone())
                 .unwrap_or_else(|| "workspace".to_string()),
-            strategy: trace.strategy.clone(),
-            confidence: trace.confidence,
-            selected_tools: trace.selected_tools.clone(),
+            visible_tools: trace.visible_tools.clone(),
             selected_skills: artifacts
                 .workspace
                 .as_ref()
                 .map(|workspace| merged_skills(Some(workspace)))
                 .unwrap_or_default(),
-            rejected_tools: trace.rejected_tools,
-            alternatives: Vec::new(),
-            boost_terms: Vec::new(),
-            learned_context_summary: None,
             routing_domain_hint: None,
             source_step_id: None,
         });
@@ -1383,63 +1349,19 @@ fn build_recent_decisions(
 }
 
 fn decision_from_event(event: &JournalEvent) -> Option<DecisionRecord> {
-    let selected_tools = event
-        .selection_trace
-        .as_ref()
-        .map(|trace| trace.final_tools.clone())
-        .or_else(|| event.tools_selected.clone())
-        .unwrap_or_default();
+    let visible_tools = event.visible_tools.clone().unwrap_or_default();
     let selected_skills = event.selected_skills.clone().unwrap_or_default();
-    let has_decision = !selected_tools.is_empty()
-        || !selected_skills.is_empty()
-        || event.selection_trace.is_some();
+    let has_decision = !visible_tools.is_empty() || !selected_skills.is_empty();
     if !has_decision {
         return None;
     }
-
-    let alternatives = event
-        .selection_trace
-        .as_ref()
-        .and_then(|trace| trace.candidate_scores.clone())
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(tool, score)| ScoredAlternative { tool, score })
-        .collect::<Vec<_>>();
-
-    let rejected_tools = event
-        .selection_trace
-        .as_ref()
-        .and_then(|trace| trace.candidate_scores.as_ref().map(|scores| scores.len()))
-        .map(|candidate_count| candidate_count.saturating_sub(selected_tools.len()))
-        .unwrap_or_default();
 
     Some(DecisionRecord {
         id: format!("decision:{}", step_id(event)),
         turn: event.turn,
         ts: event.ts.clone(),
-        strategy: event
-            .selection_trace
-            .as_ref()
-            .map(|trace| trace.strategy.clone())
-            .unwrap_or_else(|| "unknown".to_string()),
-        confidence: event
-            .selection_trace
-            .as_ref()
-            .map(|trace| trace.confidence)
-            .unwrap_or_default(),
-        selected_tools,
+        visible_tools,
         selected_skills,
-        rejected_tools,
-        alternatives,
-        boost_terms: event
-            .selection_trace
-            .as_ref()
-            .and_then(|trace| trace.boost_terms.clone())
-            .unwrap_or_default(),
-        learned_context_summary: event
-            .selection_trace
-            .as_ref()
-            .and_then(|trace| trace.learned_context_summary.clone()),
         routing_domain_hint: event.routing_domain_hint.clone(),
         source_step_id: Some(step_id(event)),
     })
@@ -1555,7 +1477,7 @@ fn build_acceptance_surface(
     checks.push(SelfSurfaceCheck {
         name: "decision_records_have_selected_targets".to_string(),
         ok: recent_decisions.iter().all(|decision| {
-            !decision.selected_tools.is_empty() || !decision.selected_skills.is_empty()
+            !decision.visible_tools.is_empty() || !decision.selected_skills.is_empty()
         }),
         detail: format!("decision_records={}", recent_decisions.len()),
     });
@@ -1655,8 +1577,8 @@ fn build_risk_flags(
     if !health.recent_failures.is_empty() {
         flags.push("recent_tool_failures".to_string());
     }
-    if !health.blocked_tools.is_empty() {
-        flags.push("deprioritized_tools".to_string());
+    if !health.health_avoidance_tools.is_empty() {
+        flags.push("health_avoidance_tools".to_string());
     }
     if evolution
         .records
@@ -1742,28 +1664,34 @@ fn persistence_pending_blockers(persistence_error: Option<&str>) -> Vec<String> 
         .unwrap_or_default()
 }
 
-fn merged_deprioritized_tools(artifacts: &SessionArtifacts) -> Vec<String> {
-    let mut blocked_tools = artifacts
-        .restored
-        .as_ref()
-        .map(|restored| restored.blocked_tools.clone())
-        .unwrap_or_default();
-    if let Some(ws) = artifacts.workspace.as_ref() {
-        for tool in &ws.deprioritized_tools {
-            if !blocked_tools.contains(tool) {
-                blocked_tools.push(tool.clone());
+fn merged_health_avoidance_tools(artifacts: &SessionArtifacts) -> Vec<String> {
+    // Use BTreeSet for deduplication and sorted output
+    // Only scan the last 100 events for performance (avoid full scan on large sessions)
+    let events_to_scan = artifacts.journal_events.len().saturating_sub(100)..;
+    let mut health_avoidance_tools = BTreeSet::new();
+
+    for event in &artifacts.journal_events[events_to_scan] {
+        let Some(names) = event
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("health_avoidance_tools"))
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        for name in names {
+            if let Some(name) = name.as_str().filter(|name| !name.is_empty()) {
+                health_avoidance_tools.insert(name.to_string());
             }
         }
     }
-    blocked_tools.sort();
-    blocked_tools.dedup();
-    blocked_tools
+    health_avoidance_tools.into_iter().collect()
 }
 
 fn merged_skills(workspace: Option<&WorkspaceMetadata>) -> Vec<String> {
     let mut skills = BTreeSet::new();
     if let Some(ws) = workspace {
-        for skill in ws.pinned_skills.iter().chain(ws.discovered_skills.iter()) {
+        for skill in &ws.discovered_skills {
             skills.insert(skill.clone());
         }
     }
@@ -2110,8 +2038,6 @@ fn event_type_name(event_type: &JournalEventType) -> String {
         JournalEventType::PipelineFeedback => "pipeline_feedback",
         JournalEventType::PipelineAlert => "pipeline_alert",
         JournalEventType::PipelineCompactionAudit => "pipeline_compaction_audit",
-        JournalEventType::MemorySuppressed => "memory_suppressed",
-        JournalEventType::ContextReleased => "context_released",
         JournalEventType::Bootstrap => "bootstrap",
         JournalEventType::TraceSpan => "trace_span",
     }
@@ -2156,7 +2082,6 @@ mod tests {
 
         fn budget_config(&self, _: Option<&str>) -> Result<BudgetConfig, String> {
             Ok(BudgetConfig {
-                tool_budget_tokens: 800,
                 compression_threshold: 0.7,
                 max_turn_input_tokens: 120000,
                 compression_threshold_min: 0.5,
@@ -2170,6 +2095,21 @@ mod tests {
                 ok: true,
                 detail: "stubbed".to_string(),
             }]
+        }
+    }
+
+    #[derive(Clone)]
+    struct StubArtifactLoader {
+        artifacts: LoadedSelfSurfaceArtifacts,
+    }
+
+    #[async_trait]
+    impl SelfSurfaceArtifactLoader for StubArtifactLoader {
+        async fn load_artifacts(
+            &self,
+            _session_id: &str,
+        ) -> Result<LoadedSelfSurfaceArtifacts, String> {
+            Ok(self.artifacts.clone())
         }
     }
 
@@ -2282,7 +2222,7 @@ mod tests {
         ws.last_context_trace = Some(ContextTraceSignal {
             turn_id: "turn-2".to_string(),
             captured_at: Some(Utc::now().to_rfc3339()),
-            tool_selection: None,
+            tool_surface: None,
             memory: None,
             history: None,
             budget: Some(crate::session_workspace::ContextTraceBudgetSignal {
@@ -2316,7 +2256,7 @@ mod tests {
                 config_value: None,
                 turns_compacted: None,
                 facts_stored: None,
-                tools_selected: Some(vec!["bash".to_string()]),
+                visible_tools: Some(vec!["bash".to_string()]),
                 selected_skills: Some(vec!["goal-driven-evolution".to_string()]),
                 tools_used: Some(vec!["bash".to_string()]),
                 tool_calls: Some(vec![ToolCallRecord {
@@ -2346,7 +2286,6 @@ mod tests {
                 session_lineage: None,
                 coordination: None,
                 edge_policy: None,
-                selection_trace: None,
                 context_assembly_trace: None,
                 routing_domain_hint: Some("code".to_string()),
                 entity_learn_skipped_no_domain: false,
@@ -2371,6 +2310,78 @@ mod tests {
         assert_eq!(snapshot.recent_steps.len(), 2);
         assert_eq!(snapshot.recent_decisions.len(), 1);
         assert!(snapshot.acceptance.ok);
+    }
+
+    #[tokio::test]
+    async fn self_surface_serializes_health_avoidance_tools_without_legacy_keys() {
+        let session_id = "svc-self-health-surface";
+        let artifacts = LoadedSelfSurfaceArtifacts {
+            session_id: session_id.to_string(),
+            workspace: None,
+            restored: Some(RestoredSession {
+                session_id: session_id.to_string(),
+                blocked_tools: vec!["hard_restricted_tool".to_string()],
+                ..Default::default()
+            }),
+            journal_events: vec![JournalEvent::turn_guard_verdict(
+                Some(session_id),
+                3,
+                "warning",
+                &[],
+                &["flaky_http".to_string()],
+                &["flaky_http".to_string()],
+                false,
+                0,
+                3,
+                1,
+                0,
+                &[],
+                0,
+                0,
+            )],
+            latest_full_context_trace: None,
+        };
+        let service = LocalSelfSurfaceService::new()
+            .with_runtime_support(Arc::new(StubRuntimeSupport))
+            .with_artifact_loader(Arc::new(StubArtifactLoader { artifacts }));
+
+        let snapshot = service.snapshot(session_id, 10).await.unwrap();
+        assert_eq!(
+            snapshot.environment.health_avoidance_tools,
+            vec!["flaky_http".to_string()]
+        );
+        assert!(
+            !snapshot
+                .environment
+                .health_avoidance_tools
+                .contains(&"hard_restricted_tool".to_string()),
+            "checkpoint hard restrictions must not be reported as health-avoidance tools"
+        );
+        assert!(
+            snapshot
+                .run
+                .risk_flags
+                .contains(&"health_avoidance_tools".to_string())
+        );
+
+        let environment_json = serde_json::to_value(&snapshot.environment).unwrap();
+        assert_eq!(
+            environment_json["health_avoidance_tools"],
+            serde_json::json!(["flaky_http"])
+        );
+        assert!(environment_json.get("health_avoidance_count").is_none());
+
+        let health = service
+            .surface(session_id, SelfSurfaceDimension::Health, 10)
+            .await
+            .unwrap();
+        let health_json = serde_json::to_value(&health).unwrap();
+        assert_eq!(
+            health_json["body"]["health_avoidance_tools"],
+            serde_json::json!(["flaky_http"])
+        );
+        assert!(health_json["body"].get("blocked_tools").is_none());
+        assert!(health_json["body"].get("health_avoidance_count").is_none());
     }
 
     #[tokio::test]
@@ -2512,13 +2523,11 @@ mod tests {
                 .risk_flags
                 .contains(&"session_persistence_degraded".to_string())
         );
-        assert!(
-            snapshot
-                .run
-                .pending_blockers
-                .iter()
-                .any(|blocker| blocker.contains("session_persistence: failed to append turn event"))
-        );
+        assert!(snapshot
+            .run
+            .pending_blockers
+            .iter()
+            .any(|blocker| blocker.contains("session_persistence: failed to append turn event")));
         assert!(!snapshot.acceptance.ok);
         assert!(
             snapshot

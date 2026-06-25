@@ -224,17 +224,17 @@ fn deferred_tools_block_for_bridge_model(
         .unwrap_or_default()
 }
 
-/// Extract the pinned (T1) tool names from the CLI-built `edge_profile`.
+/// Extract the always_load (T1) tool names from the CLI-built `edge_profile`.
 ///
-/// When the key is present, the names reflect the resolved `ToolSurface` pinned
-/// set (user TOML overrides included). When absent (test-only path or
+/// When the key is present, the names reflect the resolved `ToolSurface` always_load
+/// set (user TOML additions included). When absent (test-only path or
 /// server-side tools), falls back to the runtime-configured surface so
-/// cache_control markers still match TOML overrides.
-fn pinned_tool_names_for_bridge(
+/// cache_control markers still match tool_surface config.
+fn always_load_tool_names_for_bridge(
     edge_profile: &Map<String, Value>,
 ) -> std::collections::HashSet<String> {
     edge_profile
-        .get(astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_PINNED_TOOL_NAMES)
+        .get(astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_ALWAYS_LOAD_TOOL_NAMES)
         .and_then(Value::as_array)
         .map(|arr| {
             arr.iter()
@@ -242,7 +242,7 @@ fn pinned_tool_names_for_bridge(
                 .map(str::to_string)
                 .collect()
         })
-        .unwrap_or_else(crate::turn::prompt_cache::runtime_pinned_tool_names)
+        .unwrap_or_else(crate::turn::prompt_cache::runtime_always_load_tool_names)
 }
 
 /// Decide whether the bridge should run its own `prefetch_memories` call.
@@ -555,15 +555,67 @@ fn preview_chars(value: &str, limit: usize) -> String {
     value.chars().take(limit).collect()
 }
 
+fn parse_exit_semantics_tag(tag: &str) -> Option<astra_tools::exit_semantics::ExitSemantics> {
+    serde_json::from_value::<astra_tools::exit_semantics::ExitSemantics>(Value::String(
+        tag.to_string(),
+    ))
+    .ok()
+}
+
 fn normalize_exit_semantics_tag(tag: &str) -> Option<String> {
-    let semantics = serde_json::from_value::<astra_tools::exit_semantics::ExitSemantics>(
-        Value::String(tag.to_string()),
-    )
-    .ok()?;
+    let semantics = parse_exit_semantics_tag(tag)?;
     serde_json::to_value(semantics)
         .ok()?
         .as_str()
         .map(ToString::to_string)
+}
+
+fn parse_result_class_tag(tag: &str) -> Option<astra_tools::exit_semantics::CommandResultClass> {
+    serde_json::from_value::<astra_tools::exit_semantics::CommandResultClass>(Value::String(
+        tag.to_string(),
+    ))
+    .ok()
+}
+
+fn normalize_result_class_tag(tag: &str) -> Option<String> {
+    let result_class = parse_result_class_tag(tag)?;
+    serde_json::to_value(result_class)
+        .ok()?
+        .as_str()
+        .map(ToString::to_string)
+}
+
+fn structured_tool_result_error(
+    exit_semantics: Option<astra_tools::exit_semantics::ExitSemantics>,
+    result_class: Option<astra_tools::exit_semantics::CommandResultClass>,
+) -> Option<bool> {
+    if exit_semantics.is_some_and(|semantics| semantics.is_tool_error())
+        || result_class.is_some_and(|class| class.is_tool_error())
+    {
+        return Some(true);
+    }
+    if exit_semantics.is_some() || result_class.is_some() {
+        return Some(false);
+    }
+    None
+}
+
+fn status_success(status: &str) -> bool {
+    matches!(
+        super::super::agentic_loop::tool_support::edge_tool_status_exit_code(status),
+        Some(0)
+    )
+}
+
+fn bridge_tool_result_ok(
+    status: &str,
+    exit_semantics: Option<astra_tools::exit_semantics::ExitSemantics>,
+    result_class: Option<astra_tools::exit_semantics::CommandResultClass>,
+    output_semantic_error: bool,
+) -> bool {
+    let transport_error = structured_tool_result_error(exit_semantics, result_class)
+        .unwrap_or_else(|| !status_success(status));
+    !transport_error && !output_semantic_error
 }
 
 #[cfg(test)]
@@ -575,6 +627,10 @@ mod exit_semantics_tests {
         assert_eq!(
             normalize_exit_semantics_tag("execution_error"),
             Some("execution_error".to_string())
+        );
+        assert_eq!(
+            normalize_exit_semantics_tag("empty_result"),
+            Some("empty_result".to_string())
         );
         assert_eq!(
             normalize_exit_semantics_tag("domain_negative"),
@@ -650,10 +706,14 @@ fn build_bridge_tool_call_records(
             .get("status")
             .and_then(Value::as_str)
             .unwrap_or("ok");
-        let status_ok = matches!(
-            super::super::agentic_loop::tool_support::edge_tool_status_exit_code(status),
-            Some(0)
-        );
+        let exit_semantics_value = tool_result
+            .get("exit_semantics")
+            .and_then(Value::as_str)
+            .and_then(parse_exit_semantics_tag);
+        let result_class_value = tool_result
+            .get("result_class")
+            .and_then(Value::as_str)
+            .and_then(parse_result_class_tag);
         let output = tool_result.get("output").map(|output| match output {
             Value::String(s) => s.clone(),
             Value::Null => String::new(),
@@ -711,7 +771,12 @@ fn build_bridge_tool_call_records(
         let output_semantic_error = output
             .as_deref()
             .is_some_and(astra_turn_core::tool_result_semantics::is_tool_error);
-        let ok = status_ok && !output_semantic_error;
+        let ok = bridge_tool_result_ok(
+            status,
+            exit_semantics_value,
+            result_class_value,
+            output_semantic_error,
+        );
         let error = tool_result
             .get("error")
             .and_then(Value::as_str)
@@ -738,8 +803,6 @@ fn build_bridge_tool_call_records(
             ok,
             error.as_deref(),
         );
-        // Extract exit semantics from the tool_result (propagated
-        // from astra-tools shell_ops and server_tool_executor).
         let exit_semantics = tool_result
             .get("exit_semantics")
             .and_then(Value::as_str)
@@ -747,7 +810,7 @@ fn build_bridge_tool_call_records(
         let result_class = tool_result
             .get("result_class")
             .and_then(Value::as_str)
-            .map(ToString::to_string);
+            .and_then(normalize_result_class_tag);
         records.push(ToolCallRecord {
             name: tool_name,
             ok,
@@ -1009,9 +1072,7 @@ fn flush_turn_event_buffer_or_warn(
 }
 
 // ── Bridge observability — delegated to turn::bridge_observability ────────────
-use super::observability::{
-    build_legacy_context_trace_signal, persist_legacy_bridge_trace_and_quality,
-};
+use super::observability::{build_context_trace_signal, persist_legacy_bridge_trace_and_quality};
 
 // ── LLM streaming — delegated to turn::bridge_llm_stream ─────────────────────
 use super::llm_stream::call_llm_stream_with_request_overrides;
@@ -1314,10 +1375,6 @@ impl InProcessChatTurnBridge {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        let selection_confidence = payload
-            .get("selection_confidence")
-            .and_then(Value::as_f64)
-            .unwrap_or(1.0); // Default: high confidence
         let edge_profile = payload
             .get("edge_profile")
             .and_then(Value::as_object)
@@ -1787,10 +1844,8 @@ impl InProcessChatTurnBridge {
 
                 // Per-turn hybrid recall runs every turn; session-start
                 // (profile + episodes) only on turn 1.
-                let sid_for_suppress: Option<&str> =
-                    if session_id.is_empty() { None } else { Some(&session_id) };
                 let (per_turn, cached_session_start) = tokio::join!(
-                    prefetch_memories(mem_url, mem_key, user_msg, &user_id, top_k, sid_for_suppress),
+                    prefetch_memories(mem_url, mem_key, user_msg, &user_id, top_k),
                     async {
                         if is_first_turn {
                             cached_first_turn_session_start_memory(
@@ -1927,10 +1982,7 @@ impl InProcessChatTurnBridge {
                 .and_then(|m| m.get("content").and_then(Value::as_str))
                 .unwrap_or("");
 
-            let task_type = edge_profile
-                .get("selection_task_type")
-                .and_then(Value::as_str)
-                .or_else(|| prompts::detect_task_type(user_content_for_signal));
+            let task_type = prompts::detect_task_type(user_content_for_signal);
             // ── Self-awareness section (injected by CLI via edge_profile) ──
             let self_awareness_hint = edge_profile
                 .get("self_awareness_text")
@@ -2052,14 +2104,8 @@ impl InProcessChatTurnBridge {
             // ── Memoria client (shared across P1 anchor + compaction + P3 write) ──
             let memoria_client_shared = memoria_client_owned.clone();
 
-            // ── Round budget directive: encourage synthesis after several rounds ──
-            let tool_cfg = astra_config::runtime_config::RuntimeConfig::load().tool_selection;
-            let (tool_round_guidance, guidance_signals) = prompts::tool_round_guidance_trace_with(
-                &messages,
-                round_index,
-                tool_cfg.effective_round_budget_warning(),
-                tool_cfg.effective_round_budget_limit(),
-            );
+            let (tool_round_guidance, guidance_signals) =
+                prompts::tool_round_guidance_trace(&messages, round_index);
 
             // Split bridge-composed signals into session-stable (RuntimeIdentity
             // scope → cached behind the Session→None marker) and turn-volatile
@@ -2071,7 +2117,7 @@ impl InProcessChatTurnBridge {
             // VOLATILE (change each turn by design):
             //   environment_volatile (git branch dirty/diff/recent commits),
             //   feedback_rules_hint (accumulates on each user correction),
-            //   skill_hint (active skill/tool selection),
+            //   skill_hint (active skill/tool surface),
             //   self_awareness_hint (turn/token/outcome signals),
             //   typed memory_entries (per-turn retrieval, routed through the
             //     Memory section),
@@ -2259,15 +2305,14 @@ impl InProcessChatTurnBridge {
             // full `<available_skills>` catalog in `CacheScope::Session`, so a
             // catalog change flips the cache once then stabilizes.
             //
-            // `ToolSurfaceConfig` honours the user's `runtime.tool_surface`
-            // TOML: pinned_tools additive over defaults; `-name` removes a
-            // default. Loaded via the same `RuntimeConfig::load()` path as
-            // `tool_selection` above (line 1451) for consistency.
+            // `ToolSurfaceConfig` honors the user's `runtime.tool_surface`
+            // TOML: always_load_tools add extra always_load tools over the
+            // declaration defaults. Loaded via the same `RuntimeConfig::load()`
+            // path as `tool_surface` above (line 1451) for consistency.
             let deferred_block_str = deferred_tools_block_for_bridge_model(
                 &edge_profile,
                 &model_name,
             );
-            let bridge_selection_trace = edge_profile.get("recommended_tools").cloned();
             let bridge_restricted_snapshot = HashSet::new();
             let initial_session_memory_entry = if let Some(memoria) = memoria_client_shared.as_ref()
             {
@@ -2291,8 +2336,7 @@ impl InProcessChatTurnBridge {
                             &edge_tools,
                             &bridge_restricted_snapshot,
                         )
-                        .with_deferred_tools_block(&deferred_block_str)
-                        .with_selection_trace(bridge_selection_trace.clone()),
+                        .with_deferred_tools_block(&deferred_block_str),
                     runtime_signals: crate::turn::llm::context::BridgeRuntimeSignals::new(
                                         &stable_sections,
                                         &effective_dynamic_sections,
@@ -2301,8 +2345,6 @@ impl InProcessChatTurnBridge {
                                         edge_profile
                                             .get("system_prompt_override")
                                             .and_then(Value::as_str),
-                                        selection_confidence,
-                                        task_type,
                                     ),
                     session: crate::turn::llm::context::BridgeSessionContextInput::new(
                         &cache_cfg,
@@ -2433,8 +2475,7 @@ impl InProcessChatTurnBridge {
                                             &edge_tools,
                                             &bridge_restricted_snapshot,
                                         )
-                                        .with_deferred_tools_block(&deferred_block_str)
-                                        .with_selection_trace(bridge_selection_trace.clone()),
+                                        .with_deferred_tools_block(&deferred_block_str),
                                     runtime_signals:
                                         crate::turn::llm::context::BridgeRuntimeSignals::new(
                                             &stable_sections,
@@ -2444,8 +2485,6 @@ impl InProcessChatTurnBridge {
                                             edge_profile
                                                 .get("system_prompt_override")
                                                 .and_then(Value::as_str),
-                                            selection_confidence,
-                                            task_type,
                                         ),
                                     session:
                                         crate::turn::llm::context::BridgeSessionContextInput::new(
@@ -2500,40 +2539,6 @@ impl InProcessChatTurnBridge {
             };
 
             llm_messages.extend(merged_messages);
-
-            // Apply context release: stub tool results the agent marked as
-            // no longer needed so they don't consume tokens. Idempotent: runs
-            // every turn, so emit the per-turn stub count for observability.
-            // We log to tracing AND to the session journal so prod runs (where
-            // debug tracing is off) still leave a durable audit trail.
-            let released_count = apply_session_context_release(&session_id, &mut llm_messages);
-            if released_count > 0 {
-                tracing::debug!(
-                    target: "astra::runtime::context_release",
-                    session_id = %session_id,
-                    stubbed = released_count,
-                    "context_release applied"
-                );
-                if let Ok(writer) =
-                    astra_services::session_journal::JournalWriter::new(&session_id)
-                {
-                    let mut evt = astra_services::session_journal::JournalEvent::base_public(
-                        astra_services::session_journal::JournalEventType::ContextReleased,
-                        Some(&session_id),
-                    );
-                    // The applied-phase event is emitted *before* the LLM
-                    // round counter (`cloud_loop_turns`) is incremented for
-                    // this turn, so we leave `turn` unset here. The companion
-                    // `JournalEvent::context_released` (intent, written when
-                    // the agent calls `session(release_context)`) carries the
-                    // turn at intent time. Distinguished by `phase`.
-                    evt.metadata = Some(serde_json::json!({
-                        "applied_count": released_count,
-                        "phase": "per_turn_apply",
-                    }));
-                    let _ = writer.append(&evt);
-                }
-            }
 
             let bridge_synthetic_tail_prefix_end =
                 crate::turn::llm::context::finalize_bridge_wire_messages(
@@ -2598,7 +2603,7 @@ impl InProcessChatTurnBridge {
                 crate::turn::llm::context::annotate_tool_schemas_for_cache(
                     &mut pruned_tools,
                     &cache_cfg,
-                    &pinned_tool_names_for_bridge(&edge_profile),
+                    &always_load_tool_names_for_bridge(&edge_profile),
                 );
 
                 let loop_started = Instant::now();
@@ -3117,7 +3122,7 @@ impl InProcessChatTurnBridge {
                             crate::turn::llm::context::annotate_tool_schemas_for_cache(
                                 &mut pruned_tools,
                                 &cache_cfg,
-                                &pinned_tool_names_for_bridge(&edge_profile),
+                                &always_load_tool_names_for_bridge(&edge_profile),
                             );
                             crate::turn::llm::context::augment_manifest_trace_with_wire(
                                 &mut bridge_manifest_trace_json,
@@ -4358,12 +4363,11 @@ impl InProcessChatTurnBridge {
                         .and_then(Value::as_u64)
                 })
                 .sum();
-            let trace_signal = build_legacy_context_trace_signal(
+            let trace_signal = build_context_trace_signal(
                 trace_turn,
                 format!("turn-{trace_turn}"),
                 edge_tools.len(),
                 recent_tools_for_quality.clone(),
-                selection_confidence,
                 last_measured_prompt,
                 budget.model_limit,
                 tool_execution_ms,
@@ -4429,7 +4433,7 @@ impl InProcessChatTurnBridge {
             }
 
             if explain {
-                let tool_selection = all_round_tool_calls
+                let first_tool_call = all_round_tool_calls
                     .first()
                     .and_then(Value::as_object)
                     .and_then(|tool_call| tool_call.get("function"))
@@ -4503,7 +4507,7 @@ impl InProcessChatTurnBridge {
                     Some(final_usage.output_tokens as i64),
                     all_round_tool_calls.len(),
                     edge_tools.len(),
-                    tool_selection,
+                    first_tool_call,
                     llm_steps,
                     memory,
                     routing,
@@ -4703,14 +4707,6 @@ pub use super::super::memory_prefetch::{
     prefetch_session_start_memories,
 };
 
-fn apply_session_context_release(session_id: &str, llm_messages: &mut [Value]) -> usize {
-    if session_id.is_empty() {
-        return 0;
-    }
-    let released = astra_tools::memoria::MemoriaClient::released_snapshot(session_id);
-    crate::turn::cloud::compaction::apply_context_release(llm_messages, &released)
-}
-
 /// Test-accessible wrapper around private schema pruning — used by integration
 /// tests that need to verify progressive schema detail levels.
 pub mod bridge_inprocess_test_helpers {
@@ -4726,7 +4722,7 @@ pub mod bridge_inprocess_test_helpers {
 mod tests {
     use super::*;
     use crate::turn::bridge::sse_helpers::apply_forward_llm_sse_event;
-    use crate::turn::prompt_cache::runtime_pinned_tool_names;
+    use crate::turn::prompt_cache::runtime_always_load_tool_names;
     use astra_services::SessionArtifactStore;
     use astra_services::{
         SessionArtifactJsonRecord, SessionArtifactJsonStore, StoredSessionArtifact,
@@ -4739,8 +4735,8 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
-    fn default_test_pinned_tool_names() -> std::collections::HashSet<String> {
-        crate::turn::prompt_cache::resolve_pinned_tool_names_for_config(
+    fn default_test_always_load_tool_names() -> std::collections::HashSet<String> {
+        crate::turn::prompt_cache::resolve_always_load_tool_names_for_config(
             &astra_config::ToolSurfaceConfig::default(),
         )
     }
@@ -4966,34 +4962,6 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         read_journal_events(session_id)
-    }
-
-    #[test]
-    fn bridge_applies_session_context_release_before_llm_submission() {
-        let sid = "bridge-release-pipeline-test";
-        astra_tools::memoria::MemoriaClient::reset_released(sid);
-        astra_tools::memoria::MemoriaClient::release_context(sid, "call_001");
-        let mut messages = vec![
-            json!({"role": "assistant", "tool_calls": [{"id": "call_001", "type": "function", "function": {"name": "bash", "arguments": "{}"}}]}),
-            json!({"role": "tool", "tool_call_id": "call_001", "content": "large output"}),
-            json!({"role": "tool", "tool_call_id": "call_002", "content": "keep me"}),
-        ];
-
-        let count = apply_session_context_release(sid, &mut messages);
-
-        astra_tools::memoria::MemoriaClient::reset_released(sid);
-        assert_eq!(count, 1);
-        assert!(
-            messages[1]
-                .get("content")
-                .and_then(Value::as_str)
-                .unwrap()
-                .contains("context released")
-        );
-        assert_eq!(
-            messages[2].get("content").and_then(Value::as_str),
-            Some("keep me")
-        );
     }
 
     #[cfg(feature = "bridge-e2e-hooks")]
@@ -5306,22 +5274,24 @@ mod tests {
     }
 
     #[test]
-    fn build_legacy_context_trace_signal_keeps_only_known_timing_values() {
-        let signal = build_legacy_context_trace_signal(
+    fn build_context_trace_signal_keeps_only_known_timing_values() {
+        let signal = build_context_trace_signal(
             3,
             "turn-3".to_string(),
             5,
             vec!["read_file".to_string(), "grep".to_string()],
-            0.82,
             Some(1200),
             8000,
             450,
             1500,
         );
 
-        let tool_selection = signal.tool_selection.as_ref().expect("tool selection");
-        assert_eq!(tool_selection.strategy, "inprocess_bridge");
-        assert_eq!(tool_selection.confidence, 0.82);
+        let tool_surface = signal.tool_surface.as_ref().expect("tool surface");
+        assert_eq!(
+            tool_surface.visible_tools,
+            vec!["read_file".to_string(), "grep".to_string()]
+        );
+        assert_eq!(tool_surface.tools_available, 5);
 
         let timing = signal.timing.as_ref().expect("timing");
         assert_eq!(timing.turn, 3);
@@ -5339,19 +5309,20 @@ mod tests {
     use crate::turn::prompt_cache::CACHE_ENV_MUTEX;
 
     #[test]
-    fn pinned_tool_names_for_bridge_uses_edge_profile_override_or_runtime_fallback() {
+    fn always_load_tool_names_for_bridge_uses_edge_profile_override_or_runtime_fallback() {
         let mut edge_profile = Map::new();
         edge_profile.insert(
-            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_PINNED_TOOL_NAMES.to_string(),
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_ALWAYS_LOAD_TOOL_NAMES
+                .to_string(),
             json!(["bash"]),
         );
 
-        let overridden = pinned_tool_names_for_bridge(&edge_profile);
+        let overridden = always_load_tool_names_for_bridge(&edge_profile);
         assert!(overridden.contains("bash"));
         assert!(!overridden.contains("read_file"));
 
-        let fallback = pinned_tool_names_for_bridge(&Map::new());
-        assert_eq!(fallback, runtime_pinned_tool_names());
+        let fallback = always_load_tool_names_for_bridge(&Map::new());
+        assert_eq!(fallback, runtime_always_load_tool_names());
     }
 
     #[test]
@@ -5472,8 +5443,6 @@ mod tests {
             crate::turn::prompt_cache::assemble_system_message_via_pipeline(
                 &["bash", "read_file"],
                 &dynamic_sections,
-                0.8,
-                Some("implementation"),
                 &PromptCacheConfig::latch("openai", "gpt-4"),
                 "test-session",
                 "gpt-4",
@@ -5498,9 +5467,8 @@ mod tests {
         assert!(breakdown.environment_tokens > 0);
         assert!(breakdown.user_preferences_tokens > 0);
         // guidance_signals default to false — guard against accidental default changes
-        assert!(!breakdown.guidance_signals.round_budget_warning);
-        assert!(!breakdown.guidance_signals.synthesize_or_batch);
         assert!(!breakdown.guidance_signals.parallel_feedback);
+        assert!(!breakdown.guidance_signals.parallel_batching_nudge);
     }
 
     #[test]
@@ -5509,24 +5477,21 @@ mod tests {
         use astra_turn_core::context_assembly_trace::{PromptGuidanceSignals, PromptTraceSignals};
 
         let section = PromptSection {
-            text: "round budget warning".to_string(),
+            text: "parallel feedback".to_string(),
             scope: CacheScope::None,
             token_bucket: PromptTokenBucket::Environment,
             trace_signals: PromptTraceSignals {
                 guidance_signals: PromptGuidanceSignals {
-                    round_budget_warning: true,
-                    synthesize_or_batch: true,
-                    parallel_feedback: false,
-                    parallel_batching_nudge: false,
+                    parallel_feedback: true,
+                    parallel_batching_nudge: true,
                 },
                 ..Default::default()
             },
         };
         let breakdown = prompts::build_system_prompt_trace(&[section], vec![], vec![], None);
         assert!(!breakdown.context_signals.active_output_skills);
-        assert!(breakdown.guidance_signals.round_budget_warning);
-        assert!(breakdown.guidance_signals.synthesize_or_batch);
-        assert!(!breakdown.guidance_signals.parallel_feedback);
+        assert!(breakdown.guidance_signals.parallel_feedback);
+        assert!(breakdown.guidance_signals.parallel_batching_nudge);
     }
     #[test]
     fn annotate_tool_schemas_for_caching_adds_cache_control() {
@@ -5542,7 +5507,7 @@ mod tests {
         annotate_tool_schemas_for_caching(
             &mut tools,
             &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
-            &default_test_pinned_tool_names(),
+            &default_test_always_load_tool_names(),
         );
 
         // Only last tool should have cache_control
@@ -5567,7 +5532,7 @@ mod tests {
         annotate_tool_schemas_for_caching(
             &mut tools,
             &PromptCacheConfig::latch("openai", "gpt-4"),
-            &default_test_pinned_tool_names(),
+            &default_test_always_load_tool_names(),
         );
         assert!(
             tools[0].get("cache_control").is_none(),
@@ -5576,37 +5541,37 @@ mod tests {
     }
 
     #[test]
-    fn annotate_tool_schemas_marks_end_of_pinned_prefix() {
+    fn annotate_tool_schemas_marks_end_of_always_load_prefix() {
         let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         unsafe {
             std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED");
         }
 
-        // bash and read_file are pinned (static lib); github_list_prs is dynamic.
-        // The marker must sit on the last pinned tool so dynamic churn after
+        // bash and read_file are always_load (static lib); github is dynamic.
+        // The marker must sit on the last always_load tool so dynamic churn after
         // it doesn't invalidate the cached prefix.
         let mut tools = vec![
             json!({"function": {"name": "bash"}}),
             json!({"function": {"name": "read_file"}}),
-            json!({"function": {"name": "github_list_prs"}}),
+            json!({"function": {"name": "github"}}),
         ];
         annotate_tool_schemas_for_caching(
             &mut tools,
             &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
-            &default_test_pinned_tool_names(),
+            &default_test_always_load_tool_names(),
         );
 
         assert!(
             tools[0].get("cache_control").is_none(),
-            "first pinned tool should not have cache_control"
+            "first always_load tool should not have cache_control"
         );
         assert!(
             tools[1].get("cache_control").is_some(),
-            "last pinned tool (read_file) should have cache_control — end of static prefix"
+            "last always_load tool (read_file) should have cache_control — end of static prefix"
         );
         assert!(
             tools[2].get("cache_control").is_none(),
-            "dynamic tool (github_list_prs) must not carry the marker"
+            "dynamic tool (github) must not carry the marker"
         );
         assert_eq!(
             tools[1]["cache_control"]["type"].as_str(),
@@ -5760,7 +5725,7 @@ mod tests {
             json!({"function": {"name": "bash"}}),
             json!({"function": {"name": "read_file"}}),
         ];
-        annotate_tool_schemas_for_caching(&mut tools, &cfg, &default_test_pinned_tool_names());
+        annotate_tool_schemas_for_caching(&mut tools, &cfg, &default_test_always_load_tool_names());
 
         for (i, tool) in tools.iter().enumerate() {
             assert!(
@@ -5793,7 +5758,7 @@ mod tests {
         let loop_text = "draft review text";
         let loop_tool_calls = [json!({
             "id": "call_1", "type": "function",
-            "function": {"name": "git_show", "arguments": "{\"rev\":\"HEAD\"}"}
+            "function": {"name": "git", "arguments": "{\"action\":\"show\",\"revision\":\"HEAD\"}"}
         })];
         let should_emit = !loop_text.trim().is_empty() && loop_tool_calls.is_empty();
         assert!(
@@ -5981,7 +5946,7 @@ mod tests {
         annotate_tool_schemas_for_caching(
             &mut tools,
             &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
-            &default_test_pinned_tool_names(),
+            &default_test_always_load_tool_names(),
         );
         assert!(tools.is_empty());
     }
@@ -8114,6 +8079,69 @@ mod tests {
     }
 
     #[test]
+    fn build_bridge_records_structured_empty_result_exit_as_ok() {
+        let tool_calls = vec![json!({
+            "id": "call-1",
+            "function": {"name": "bash", "arguments": "{\"command\":\"grep needle haystack.txt\"}"}
+        })];
+        let tool_results = vec![json!({
+            "request_id": "call-1",
+            "name": "bash",
+            "status": "failed",
+            "output": "No matches found",
+            "duration_ms": 50,
+            "exit_semantics": "empty_result",
+            "result_class": "empty_result"
+        })];
+        let records = build_bridge_tool_call_records(
+            &tool_calls,
+            &tool_results,
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(records.len(), 1);
+        assert!(records[0].ok, "{records:?}");
+        assert!(records[0].error.is_none(), "{records:?}");
+        assert_eq!(records[0].exit_semantics.as_deref(), Some("empty_result"));
+        assert_eq!(records[0].result_class.as_deref(), Some("empty_result"));
+    }
+
+    #[test]
+    fn build_bridge_records_structured_execution_error_overrides_success_status() {
+        let tool_calls = vec![json!({
+            "id": "call-1",
+            "function": {"name": "bash", "arguments": "{\"command\":\"exit 7\"}"}
+        })];
+        let tool_results = vec![json!({
+            "request_id": "call-1",
+            "name": "bash",
+            "status": "completed",
+            "output": "Error: command failed (exit code 7)",
+            "duration_ms": 50,
+            "exit_semantics": "execution_error",
+            "result_class": "execution_error"
+        })];
+        let records = build_bridge_tool_call_records(
+            &tool_calls,
+            &tool_results,
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(records.len(), 1);
+        assert!(!records[0].ok, "{records:?}");
+        assert!(
+            records[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("exit code 7")),
+            "{records:?}"
+        );
+        assert_eq!(
+            records[0].exit_semantics.as_deref(),
+            Some("execution_error")
+        );
+        assert_eq!(records[0].result_class.as_deref(), Some("execution_error"));
+    }
+
+    #[test]
     fn build_bridge_records_object_output_coerces_to_string_not_silent() {
         // Regression: if upstream serialization bug puts an object `{}`
         // in the `output` field instead of a string, we now preserve the
@@ -8144,7 +8172,7 @@ mod tests {
             Some(""),
             "empty-object output must not be surfaced as bare '{{}}'"
         );
-        // Must NOT contain the old sentinel marker
+        // Must NOT contain the debug sentinel marker
         assert!(
             !records[0]
                 .result_preview

@@ -182,8 +182,7 @@ impl astra_tools::ToolApprovalGate for NonInteractiveApprovalGate {
 
 use crate::server::run::binding_resolution::{
     RunExecutionBindingSnapshot, agent_working_dir_for_bindings, binding_snapshot_events,
-    execution_bindings_from_edge_profile, execution_bindings_from_metadata,
-    executor_binding_from_request, request_uses_server_workspace,
+    execution_bindings_from_metadata, executor_binding_from_request, request_uses_server_workspace,
     resolve_request_execution_bindings,
     resolve_request_execution_bindings_without_server_workspace, run_start_context_from_request,
 };
@@ -759,16 +758,6 @@ fn flush_turn_observability(state: &mut AgenticLoopState, session_id: &str, inte
     } else {
         let _ = buf.flush(&writer);
     }
-}
-
-fn skill_search_from_context(
-    context: &std::collections::HashMap<String, serde_json::Value>,
-) -> astra_core::SkillSearchSettings {
-    context
-        .get("skill_search")
-        .cloned()
-        .and_then(|v| serde_json::from_value(v).ok())
-        .unwrap_or_default()
 }
 
 fn build_runtime_evaluation_service(
@@ -1458,9 +1447,6 @@ pub struct AgenticRunLifecycleService {
     agent_binding_service: Arc<dyn astra_services::AgentBindingService>,
     /// Optional model gateway registry for per-turn model resolution.
     model_gateway_service: Arc<dyn astra_services::ModelGatewayService>,
-    /// Compatibility switch for legacy request-scoped MCP clients that omit
-    /// `runtime_profile=request_scoped_runtime_mcp`.
-    allow_implicit_request_scoped_mcp: bool,
     /// Per-run approval request channel receivers (Phase E).
     /// Key: run_id → receiver that the WS handler drains.
     approval_channels: Arc<TokioMutex<HashMap<String, mpsc::Receiver<serde_json::Value>>>>,
@@ -1529,7 +1515,6 @@ impl AgenticRunLifecycleService {
             mcp_registry_service: Arc::new(astra_services::UnconfiguredMcpRegistryService),
             agent_binding_service: Arc::new(astra_services::UnconfiguredAgentBindingService),
             model_gateway_service: Arc::new(astra_services::UnconfiguredModelGatewayService),
-            allow_implicit_request_scoped_mcp: false,
             approval_channels: Arc::new(TokioMutex::new(HashMap::new())),
             user_prompt_channels: Arc::new(TokioMutex::new(HashMap::new())),
             progress_channels: Arc::new(TokioMutex::new(HashMap::new())),
@@ -1653,11 +1638,6 @@ impl AgenticRunLifecycleService {
         service: Arc<dyn astra_services::ModelGatewayService>,
     ) -> Self {
         self.model_gateway_service = service;
-        self
-    }
-
-    pub fn with_allow_implicit_request_scoped_mcp(mut self, allow: bool) -> Self {
-        self.allow_implicit_request_scoped_mcp = allow;
         self
     }
 
@@ -2013,7 +1993,11 @@ impl AgenticRunLifecycleService {
 
         match mgr.load().await {
             Ok(Some(mat)) => {
-                restored_messages = mat.messages;
+                restored_messages =
+                    astra_turn_core::prompt_facing::sanitize_prompt_facing_messages_with_state(
+                        mat.messages,
+                        &mat.session_state,
+                    );
                 restore_session_state_compact(mat.session_state, loop_state);
             }
             Ok(None) => {
@@ -2461,17 +2445,6 @@ impl AgenticRunLifecycleService {
                 "selected_model_invalid",
             ));
         }
-        if request
-            .mcp_binding_ids
-            .as_deref()
-            .is_some_and(|ids| !ids.is_empty())
-        {
-            return Err(error_response(
-                StatusCode::BAD_REQUEST,
-                "mcp_binding_ids is no longer supported on /chat/stream; use runtime_mcp_bindings"
-                    .to_string(),
-            ));
-        }
         let request_constraints = Self::try_request_constraints(request)
             .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
         if request.agent_binding.is_none() {
@@ -2524,17 +2497,6 @@ impl AgenticRunLifecycleService {
                     "agent_binding_runtime_profile_conflict",
                 ));
             }
-            if request
-                .mcp_binding_ids
-                .as_deref()
-                .is_some_and(|ids| !ids.is_empty())
-            {
-                return Err(error_response_coded(
-                    StatusCode::BAD_REQUEST,
-                    "agent_binding cannot be combined with mcp_binding_ids",
-                    "agent_binding_runtime_profile_conflict",
-                ));
-            }
             if matches!(
                 request.runtime_profile,
                 Some(RuntimeProfileRequest::RequestScopedRuntimeMcp)
@@ -2560,17 +2522,11 @@ impl AgenticRunLifecycleService {
                 Some(RuntimeProfileRequest::RequestScopedRuntimeMcp)
             )
         {
-            if !self.allow_implicit_request_scoped_mcp {
-                return Err(error_response_coded(
-                    StatusCode::BAD_REQUEST,
-                    "runtime_mcp_bindings requires runtime_profile=request_scoped_runtime_mcp",
-                    "agent_binding_runtime_profile_conflict",
-                ));
-            }
-            tracing::warn!(
-                target: "astra_runtime::run_lifecycle",
-                "runtime_mcp_bindings without runtime_profile=request_scoped_runtime_mcp is deprecated; set runtime_profile explicitly"
-            );
+            return Err(error_response_coded(
+                StatusCode::BAD_REQUEST,
+                "runtime_mcp_bindings requires runtime_profile=request_scoped_runtime_mcp",
+                "agent_binding_runtime_profile_conflict",
+            ));
         }
         Ok(())
     }
@@ -3228,7 +3184,6 @@ impl AgenticRunLifecycleService {
             })
             .unwrap_or_default();
         let workspace_root_hint = project_root_buf.map(|p| p.to_string_lossy().into_owned());
-        let skill_search = request.skill_search.clone().unwrap_or_default();
         let (tool_event_hooks, session_event_hooks) = workspace_root_hint
             .as_ref()
             .map(|root| crate::skills::hooks::load_all_hooks(std::path::Path::new(root)))
@@ -3287,7 +3242,7 @@ impl AgenticRunLifecycleService {
             harness_sink_arc.as_ref(),
         );
         let resolved_tool_policy = astra_config::runtime_config::RuntimeConfig::load()
-            .tool_selection
+            .tool_policy
             .resolve_for_model(request.model.as_deref());
         let restricted_tools: std::collections::HashSet<String> =
             load_deployment_disabled_tools().into_iter().collect();
@@ -3325,13 +3280,13 @@ impl AgenticRunLifecycleService {
             turn_guard: TurnGuard::with_profile(task_profile),
             restricted_tools,
             boosted_tools: std::collections::HashSet::new(),
-            widen_selection_pending: false,
+            widen_surface_pending: false,
             step_recorder: StepRecorder::new(user_id, session_id, run_id),
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(0.75),
             call_counts: HashMap::new(),
             // Per-model workflow-guard policy (see
-            // `ToolSelectionConfig::resolve_for_model`). Built-in profiles
+            // `ToolPolicyConfig::resolve_for_model`). Built-in profiles
             // give stronger models (opus/sonnet-4) more rope than haiku.
             // Security guards (shell_obfuscation, destructive_sql) are
             // unaffected and stay uniform across models.
@@ -3352,7 +3307,6 @@ impl AgenticRunLifecycleService {
                 request_constraints,
                 quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
                 improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
-                search: skill_search,
                 tool_event_hooks,
                 session_event_hooks,
                 ..Default::default()
@@ -3396,7 +3350,7 @@ impl AgenticRunLifecycleService {
             last_measured_prompt_tokens: None,
             consecutive_context_window_errors: 0,
             compaction_effectiveness: Default::default(),
-            pinned_tool_schema_tokens: 0,
+            always_load_tool_schema_tokens: 0,
             sticky_tool_schemas: Vec::new(),
             max_turn_input_tokens: astra_core::RuntimeLimits::global().max_turn_input_tokens,
             budget_wrapup_injected: false,
@@ -3410,7 +3364,6 @@ impl AgenticRunLifecycleService {
             permission_handler: None,
             tactical_adapter: None,
             step_signal_collector: None,
-            tool_budget_override: None,
             recent_tactical_actions: Vec::new(),
             server_tool_executor: None,
             interruption: None,
@@ -4505,14 +4458,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 })
             })
             .or_else(|| {
-                resolve_request_execution_bindings_without_server_workspace(
-                    &request,
-                    &edge_profile,
-                    !edge_tools.is_empty(),
+                resolve_request_execution_bindings_without_server_workspace(&request).map(
+                    |(workspace, executor)| ExecutionBindingSnapshot::inferred(workspace, executor),
                 )
-                .map(|(workspace, executor)| {
-                    ExecutionBindingSnapshot::inferred(workspace, executor)
-                })
             });
         let tool_runtime_workspace = if let Some(workspace) = cloud_workspace.clone() {
             Some(workspace)
@@ -4744,13 +4692,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             }
 
             if let Some(ref bundle) = runtime_capabilities.mcp_bundle {
-                if let Some(manager) = &bundle.manager {
-                    executor.set_mcp_manager(manager.clone());
-                }
-                if let Some(agent_binding_mcp) = &bundle.agent_binding_mcp {
-                    executor.set_agent_binding_mcp(agent_binding_mcp.clone());
-                }
-                executor.set_plugin_schemas(bundle.schemas.clone());
+                executor.install_mcp_bundle(bundle);
             }
             // Wire the plan repository so enter/exit_plan_mode tools work and
             // the write-tool guard can check `active_plan_id`.
@@ -5232,14 +5174,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 })
             })
             .or_else(|| {
-                resolve_request_execution_bindings_without_server_workspace(
-                    &request,
-                    &edge_profile,
-                    !edge_tools.is_empty(),
+                resolve_request_execution_bindings_without_server_workspace(&request).map(
+                    |(workspace, executor)| ExecutionBindingSnapshot::inferred(workspace, executor),
                 )
-                .map(|(workspace, executor)| {
-                    ExecutionBindingSnapshot::inferred(workspace, executor)
-                })
             });
         let stream_agent_spawner = self
             .server_agent_spawner_for_session(&session_id)
@@ -5569,13 +5506,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
             // ── MCP: inject manager + plugin schemas into executor ────
             if let Some(ref bundle) = runtime_capabilities.mcp_bundle {
-                if let Some(manager) = &bundle.manager {
-                    executor.set_mcp_manager(manager.clone());
-                }
-                if let Some(agent_binding_mcp) = &bundle.agent_binding_mcp {
-                    executor.set_agent_binding_mcp(agent_binding_mcp.clone());
-                }
-                executor.set_plugin_schemas(bundle.schemas.clone());
+                executor.install_mcp_bundle(bundle);
             }
             if let Some(shared) = &self.shared_pool {
                 executor.set_context_manifest_pool(shared.clone());
@@ -7173,7 +7104,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
         // Sub-agent / delegation path: model comes from the agent profile
         // override, not a request field.
         let resolved_tool_policy = astra_config::runtime_config::RuntimeConfig::load()
-            .tool_selection
+            .tool_policy
             .resolve_for_model(config.agent_profile.model_override.as_deref());
         let restricted_tools: std::collections::HashSet<String> =
             load_deployment_disabled_tools().into_iter().collect();
@@ -7216,7 +7147,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             turn_guard: TurnGuard::new(),
             restricted_tools,
             boosted_tools: std::collections::HashSet::new(),
-            widen_selection_pending: false,
+            widen_surface_pending: false,
             step_recorder: StepRecorder::new(&config.user_id, &config.session_id, &config.run_id),
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(0.75),
@@ -7237,7 +7168,6 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 request_constraints: config.request_constraints.clone(),
                 quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
                 improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
-                search: skill_search_from_context(&config.context),
                 tool_event_hooks,
                 session_event_hooks,
                 ..Default::default()
@@ -7291,7 +7221,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             last_measured_prompt_tokens: None,
             consecutive_context_window_errors: 0,
             compaction_effectiveness: Default::default(),
-            pinned_tool_schema_tokens: 0,
+            always_load_tool_schema_tokens: 0,
             sticky_tool_schemas: Vec::new(),
             max_turn_input_tokens: astra_core::RuntimeLimits::global().max_turn_input_tokens,
             budget_wrapup_injected: false,
@@ -7305,7 +7235,6 @@ impl SubRunExecutor for ServerSubRunExecutor {
             permission_handler: None,
             tactical_adapter: None,
             step_signal_collector: None,
-            tool_budget_override: None,
             recent_tactical_actions: Vec::new(),
             server_tool_executor: None,
             interruption: None,
@@ -8766,7 +8695,7 @@ mod tests {
                 tool_calls_completed: 7,
                 turns_completed: 15,
                 remaining_turns: 0,
-                error_detail: Some("Round budget hard-limit reached".to_string()),
+                error_detail: Some("Circuit breaker hard-stop reached".to_string()),
                 stall_signal: None,
                 resume_restricted_tools: vec![],
             },
@@ -8774,7 +8703,7 @@ mod tests {
 
         let event = build_run_turn_complete_event_with_interruption(
             7,
-            "[Round budget hard-limit reached]",
+            "[Circuit breaker hard-stop reached]",
             Some(&interruption),
         );
 
@@ -8789,7 +8718,10 @@ mod tests {
         );
         assert_eq!(event["execution_state"]["tool_calls_completed"], 7);
         assert_eq!(event["execution_state"]["remaining_turns"], 0);
-        assert_eq!(event["assistant_text"], "[Round budget hard-limit reached]");
+        assert_eq!(
+            event["assistant_text"],
+            "[Circuit breaker hard-stop reached]"
+        );
     }
 
     #[test]
@@ -9061,14 +8993,12 @@ mod tests {
             runtime_auth: None,
             runtime_profile: None,
             llm_token_service: None,
-            skill_search: None,
             allow_skills: None,
             allow_skill_sources: None,
             allow_tools: None,
             workspace_binding: None,
             executor_binding: None,
             runtime_mcp_bindings: Vec::new(),
-            mcp_binding_ids: None,
             context: None,
             edge_executor_id: None,
             capabilities: Vec::new(),
@@ -10131,98 +10061,28 @@ mod tests {
     }
 
     #[test]
-    fn workspace_binding_request_accepts_legacy_cwd_alias() {
-        let mut request = test_request("review this repo");
-        request.workspace_binding = Some(
-            serde_json::from_value(json!({
-                "kind": "edge_workspace",
-                "display_name": "MacBook Pro",
-                "cwd": "/Users/test/repo",
-                "authority": "read_write",
-                "fallback_policy": "disabled"
-            }))
-            .expect("legacy cwd alias should deserialize"),
+    fn workspace_binding_request_rejects_cwd_alias() {
+        let err = serde_json::from_value::<astra_services::runs::WorkspaceBindingRequest>(json!({
+            "kind": "edge_workspace",
+            "display_name": "MacBook Pro",
+            "cwd": "/Users/test/repo",
+            "authority": "read_write",
+            "fallback_policy": "disabled"
+        }))
+        .expect_err("workspace_binding must use explicit root, not cwd");
+
+        assert!(
+            err.to_string().contains("unknown field `cwd`"),
+            "unexpected error: {err}"
         );
-        request.executor_binding = Some(astra_services::runs::ExecutorBindingRequest {
-            kind: astra_services::runs::ExecutorBindingRequestKind::EdgeAgent,
-            executor_id: Some("edge-1".to_string()),
-            display_name: Some("MacBook Pro".to_string()),
-            transport: Some(astra_services::runs::ToolTransportKindRequest::EdgeWs),
-            status: Some(astra_services::runs::ExecutorStatusRequest::Online),
-        });
-
-        let (workspace, executor) =
-            resolve_request_execution_bindings(&request, Path::new("/tmp/server-workspace"));
-
-        assert_eq!(workspace.kind, WorkspaceBindingKind::EdgeWorkspace);
-        assert_eq!(workspace.cwd.as_deref(), Some("/Users/test/repo"));
-        assert_eq!(executor.kind, ExecutorBindingKind::EdgeAgent);
-        assert_eq!(executor.transport, ToolTransportKind::EdgeWs);
     }
 
     #[test]
-    fn edge_profile_execution_bindings_make_legacy_edge_tools_explicit() {
-        let mut edge_profile = Map::new();
-        edge_profile.insert("cwd".to_string(), json!("/Users/xupeng/github/astra"));
-        edge_profile.insert("edge_agent_id".to_string(), json!("edge-macbook-1"));
-        edge_profile.insert("hostname".to_string(), json!("MacBook Pro"));
-
-        let (workspace, executor) = resolve_request_execution_bindings_without_server_workspace(
-            &test_request("review this repo"),
-            &edge_profile,
-            true,
-        )
-        .expect("legacy edge profile should produce explicit bindings");
-
-        assert_eq!(workspace.kind, WorkspaceBindingKind::EdgeWorkspace);
-        assert_eq!(workspace.display_name, "MacBook Pro");
-        assert_eq!(workspace.cwd.as_deref(), Some("/Users/xupeng/github/astra"));
-        assert_eq!(workspace.authority, WorkspaceAuthority::ReadWrite);
-        assert_eq!(workspace.fallback_policy, FallbackPolicy::Disabled);
-        assert_eq!(executor.kind, ExecutorBindingKind::EdgeAgent);
-        assert_eq!(executor.executor_id, "edge-macbook-1");
-        assert_eq!(executor.display_name, "MacBook Pro");
-        assert_eq!(executor.transport, ToolTransportKind::EdgeLedger);
-        assert_eq!(executor.status, ExecutorStatus::Online);
-    }
-
-    #[test]
-    fn missing_edge_profile_execution_bindings_emit_no_workspace() {
-        let (workspace, executor) = resolve_request_execution_bindings_without_server_workspace(
-            &test_request("hello"),
-            &Map::new(),
-            false,
-        )
-        .expect("missing edge profile should still produce an explicit no-workspace binding");
-
-        assert_eq!(workspace.kind, WorkspaceBindingKind::None);
-        assert_eq!(workspace.display_name, "No workspace");
-        assert_eq!(workspace.authority, WorkspaceAuthority::None);
-        assert_eq!(workspace.fallback_policy, FallbackPolicy::Disabled);
-        assert_eq!(executor.kind, ExecutorBindingKind::ServerLocal);
-        assert_eq!(executor.executor_id, "server-control-plane");
-        assert_eq!(executor.display_name, "Server control plane");
-        assert_eq!(executor.transport, ToolTransportKind::ServerLocal);
-        assert_eq!(executor.status, ExecutorStatus::Online);
-    }
-
-    #[test]
-    fn missing_edge_profile_with_edge_tools_uses_edge_ledger() {
-        let (workspace, executor) = resolve_request_execution_bindings_without_server_workspace(
-            &test_request("run client tool"),
-            &Map::new(),
-            true,
-        )
-        .expect("edge tools should produce an explicit edge-ledger binding");
-
-        assert_eq!(workspace.kind, WorkspaceBindingKind::EdgeWorkspace);
-        assert_eq!(workspace.display_name, "Edge workspace");
-        assert_eq!(workspace.cwd, None);
-        assert_eq!(workspace.authority, WorkspaceAuthority::ReadWrite);
-        assert_eq!(executor.kind, ExecutorBindingKind::EdgeAgent);
-        assert_eq!(executor.executor_id, "edge-ledger");
-        assert_eq!(executor.transport, ToolTransportKind::EdgeLedger);
-        assert_eq!(executor.status, ExecutorStatus::Online);
+    fn missing_explicit_binding_without_server_workspace_emits_no_snapshot() {
+        assert!(
+            resolve_request_execution_bindings_without_server_workspace(&test_request("hello"))
+                .is_none()
+        );
     }
 
     #[test]
@@ -10282,26 +10142,6 @@ mod tests {
         assert!(snapshot.runtime.is_none());
     }
 
-    #[tokio::test]
-    async fn validate_request_constraints_rejects_legacy_mcp_binding_ids() {
-        let service = test_service();
-        let mut request = test_request("hello");
-        request.mcp_binding_ids = Some(vec![301]);
-
-        let err = service
-            .validate_request_constraints("u1", &request)
-            .await
-            .expect_err("legacy mcp_binding_ids must be rejected on chat stream");
-
-        assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        assert!(
-            err.1
-                .0
-                .detail
-                .contains("mcp_binding_ids is no longer supported")
-        );
-    }
-
     #[test]
     fn runtime_bearer_parser_accepts_exact_single_bearer_token() {
         let parsed =
@@ -10336,7 +10176,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validate_request_constraints_rejects_implicit_request_scoped_runtime_mcp_by_default() {
+    async fn validate_request_constraints_rejects_implicit_request_scoped_runtime_mcp() {
         let service = test_service();
         let mut request = test_request("hello");
         request.runtime_mcp_bindings = vec![test_runtime_mcp_binding()];
@@ -10370,19 +10210,6 @@ mod tests {
             .validate_request_constraints("u1", &request)
             .await
             .expect("explicit request_scoped_runtime_mcp profile should allow runtime MCP");
-    }
-
-    #[tokio::test]
-    async fn validate_request_constraints_allows_implicit_request_scoped_runtime_mcp_when_enabled()
-    {
-        let service = test_service().with_allow_implicit_request_scoped_mcp(true);
-        let mut request = test_request("hello");
-        request.runtime_mcp_bindings = vec![test_runtime_mcp_binding()];
-
-        service
-            .validate_request_constraints("u1", &request)
-            .await
-            .expect("compatibility flag should allow implicit request-scoped runtime MCP");
     }
 
     #[tokio::test]
@@ -10638,7 +10465,7 @@ mod tests {
     async fn build_initial_state_includes_database_skill_provider_when_wired() {
         use astra_services::skills::{
             SkillInfoRecord, SkillListItem, SkillListRecord, SkillPublishRequestData, SkillRecord,
-            SkillRegisterRequestData, SkillService, SkillStatusRecord, SkillVersionRecord,
+            SkillService, SkillStatusRecord, SkillVersionRecord,
         };
         use async_trait::async_trait;
 
@@ -10665,14 +10492,6 @@ mod tests {
 
         #[async_trait]
         impl SkillService for MockSkillService {
-            async fn register_skill(
-                &self,
-                _: String,
-                _: SkillRegisterRequestData,
-            ) -> Result<SkillRecord, (StatusCode, Json<ErrorResponse>)> {
-                self.unsupported("register_skill")
-            }
-
             async fn list_skills(
                 &self,
                 _user_id: String,
@@ -10912,7 +10731,7 @@ mod tests {
             None,
             None,
         );
-        state.recent_tools = vec!["git_status".into()];
+        state.recent_tools = vec!["git".into()];
         state.telemetry.first_budget_pressure = 0.27;
         state.stall.events.push(("repetition_stall".into(), 1));
         state.stall.verdict_events.push(
@@ -10920,8 +10739,8 @@ mod tests {
                 turn: 1,
                 severity: "warning".into(),
                 injections: vec!["stall detected".into()],
-                avoid_tools: vec!["git_status".into()],
-                deprioritized_tools: vec![],
+                avoid_tools: vec!["git".into()],
+                health_avoidance_tools: vec![],
                 force_stop: false,
                 nudge_count: 1,
                 interaction_mode: "prompt".into(),
@@ -10929,7 +10748,7 @@ mod tests {
                 recent_error_pressure: 0,
                 recent_timeout_pressure: 0,
                 total_errors: 0,
-                deprioritized_count: 0,
+                health_avoidance_count: 0,
                 total_timeouts: 0,
                 timeout_dominant_tools: vec![],
                 total_cache_hits: 0,
@@ -10937,7 +10756,7 @@ mod tests {
             },
         );
         state.stall.tool_call_records.push(ToolCallRecord {
-            name: "git_status".into(),
+            name: "git".into(),
             ok: true,
             ms: 14,
             error: None,
@@ -11129,7 +10948,7 @@ mod tests {
             None,
             None,
         );
-        state.final_text = "[Round budget hard-limit reached]".to_string();
+        state.final_text = "[Circuit breaker hard-stop reached]".to_string();
         state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
             astra_turn_core::interruption::InterruptionKind::BudgetExhausted,
             astra_turn_core::interruption::ResumeAction::ContinueImmediately,
@@ -11138,7 +10957,7 @@ mod tests {
                 tool_calls_completed: 5,
                 turns_completed: 15,
                 remaining_turns: 0,
-                error_detail: Some("Round budget hard-limit reached".to_string()),
+                error_detail: Some("Circuit breaker hard-stop reached".to_string()),
                 stall_signal: None,
                 resume_restricted_tools: vec![],
             },
@@ -11832,14 +11651,12 @@ mod tests {
             runtime_auth: None,
             runtime_profile: None,
             llm_token_service: None,
-            skill_search: None,
             allow_skills: None,
             allow_skill_sources: None,
             allow_tools: None,
             workspace_binding: None,
             executor_binding: None,
             runtime_mcp_bindings: Vec::new(),
-            mcp_binding_ids: None,
             context: Some(ctx),
             edge_executor_id: None,
             capabilities: Vec::new(),
@@ -11992,14 +11809,12 @@ mod tests {
             runtime_auth: None,
             runtime_profile: None,
             llm_token_service: None,
-            skill_search: None,
             allow_skills: None,
             allow_skill_sources: None,
             allow_tools: None,
             workspace_binding: None,
             executor_binding: None,
             runtime_mcp_bindings: Vec::new(),
-            mcp_binding_ids: None,
             context: Some(ctx),
             edge_executor_id: None,
             capabilities: Vec::new(),

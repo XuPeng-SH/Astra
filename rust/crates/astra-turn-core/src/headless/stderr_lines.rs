@@ -3,30 +3,12 @@
 /// Human-friendly display name for a tool (matches the SSE stream rendering).
 fn friendly_tool_name(tool_name: &str) -> &str {
     match tool_name {
-        "read_file" | "view_file" => "Reading",
+        "read_file" => "Reading",
         "run_build_test" => "Running build/test",
         "powershell" => "PowerShell",
-        "rollback_database_snapshots" | "rollback_file_edits" | "rollback_turn_actions" => {
-            "Reverting"
-        }
+        "rollback_database_snapshots" | "rollback_file_edits" => "Reverting",
         "rollback_session_state" => "Reverting session state",
-        "git_status" => "Git status",
-        "git_log" => "Git log",
-        "git_show" => "Git show",
-        "git_diff" => "Git diff",
-        "git_blame" => "Git blame",
-        "git_file_history" => "Git history",
-        "git_log_search" => "Git log search",
-        "git_contributors" => "Git contributors",
         "git" => "Git",
-        "git_checkout_file" => "Git checkout file",
-        "git_worktree" => "Git worktree",
-        "github_get_pr" => "Getting PR",
-        "github_list_prs" => "Listing PRs",
-        "github_get_issue" => "Getting issue",
-        "github_list_issues" => "Listing issues",
-        "github_repo_stats" => "GitHub stats",
-        "github_ci_status" => "GitHub CI",
         "github" => "GitHub",
         "tool_search" => "Searching tools",
         "lsp" => "LSP",
@@ -50,13 +32,8 @@ fn friendly_tool_name(tool_name: &str) -> &str {
         "context_analysis" => "Analyzing context",
         "run_chain" => "Running chain",
         "adjust_config" => "Adjusting config",
-        "prioritize_tool" => "Prioritizing tool",
-        "deprioritize_tool" => "Deprioritizing tool",
-        "set_goal" => "Setting goal",
         "compress_context" => "Compressing context",
         "mo_query" => "MatrixOne query",
-        "mo_snapshot" => "MatrixOne snapshot",
-        "mo_branch" => "MatrixOne branch",
         "memory" => "Memory",
         "find_definition" => "Finding definition",
         "find_references" => "Finding references",
@@ -190,8 +167,8 @@ mod tests {
     #[test]
     fn ok_line_summary_only() {
         assert_eq!(
-            headless_stderr_tool_ok_line("git_status", "5ms", None, Some("3 files")),
-            "  ✓ Git status  3 files (5ms)"
+            headless_stderr_tool_ok_line("git", "5ms", None, Some("3 files")),
+            "  ✓ Git  3 files (5ms)"
         );
     }
 

@@ -29,19 +29,13 @@ fn is_zero_u64(v: &u64) -> bool {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ContextTraceToolSelection {
+pub struct ContextTraceToolSurface {
     #[serde(default)]
     pub tools_available: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub selected_tools: Vec<String>,
+    pub visible_tools: Vec<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub selection_scope: String,
-    #[serde(default)]
-    pub rejected_tools: usize,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub strategy: String,
-    #[serde(default)]
-    pub confidence: f64,
+    pub surface_scope: String,
     #[serde(default)]
     pub latency_ms: u64,
 }
@@ -114,7 +108,7 @@ pub struct ContextTraceSignal {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub captured_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_selection: Option<ContextTraceToolSelection>,
+    pub tool_surface: Option<ContextTraceToolSurface>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<ContextTraceMemorySignal>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -133,21 +127,15 @@ impl ContextTraceSignal {
         if !self.turn_id.is_empty() {
             parts.push(self.turn_id.clone());
         }
-        if let Some(selection) = self.tool_selection.as_ref() {
-            if !selection.selected_tools.is_empty() {
-                let label = if selection.selection_scope.is_empty() {
-                    "tools".to_string()
-                } else {
-                    format!("tools[{}]", selection.selection_scope)
-                };
-                parts.push(format!("{label}: {}", selection.selected_tools.join(", ")));
-            }
-            if !selection.strategy.is_empty() {
-                parts.push(format!(
-                    "strategy: {} ({:.2})",
-                    selection.strategy, selection.confidence
-                ));
-            }
+        if let Some(selection) = self.tool_surface.as_ref()
+            && !selection.visible_tools.is_empty()
+        {
+            let label = if selection.surface_scope.is_empty() {
+                "tools".to_string()
+            } else {
+                format!("tools[{}]", selection.surface_scope)
+            };
+            parts.push(format!("{label}: {}", selection.visible_tools.join(", ")));
         }
         if let Some(memory) = self.memory.as_ref()
             && !memory.selected_memory_ids.is_empty()
@@ -362,18 +350,9 @@ pub struct WorkspaceMetadata {
     pub last_persistence_error: Option<String>,
 
     // ─── Session state persistence (for resume) ───
-    /// Skills explicitly pinned by the user.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub pinned_skills: Vec<String>,
     /// Skills discovered during this session.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub discovered_skills: Vec<String>,
-    /// Tools manually pinned by self-modification actions for this session.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub pinned_tools: Vec<String>,
-    /// Tools manually deprioritized by self-modification actions for this session.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub deprioritized_tools: Vec<String>,
 
     // ─── Adaptive engine state (for resume without oscillation) ───
     /// Last turn where a scenario change occurred (anti-flap cooldown).
@@ -503,10 +482,7 @@ impl WorkspaceMetadata {
             background_shell_tasks: Vec::new(),
             background_local_agent_tasks: Vec::new(),
             last_persistence_error: None,
-            pinned_skills: Vec::new(),
             discovered_skills: Vec::new(),
-            pinned_tools: Vec::new(),
-            deprioritized_tools: Vec::new(),
             last_scenario_change_turn: None,
             last_token_budget_direction: 0,
             last_token_budget_change_turn: None,
@@ -556,10 +532,7 @@ impl WorkspaceMetadata {
             background_shell_tasks: Vec::new(),
             background_local_agent_tasks: Vec::new(),
             last_persistence_error: None,
-            pinned_skills: Vec::new(),
             discovered_skills: Vec::new(),
-            pinned_tools: Vec::new(),
-            deprioritized_tools: Vec::new(),
             last_scenario_change_turn: None,
             last_token_budget_direction: 0,
             last_token_budget_change_turn: None,
@@ -1066,8 +1039,6 @@ mod tests {
         ws.record_turn(100, 50, 25, 4);
         ws.record_checkpoint();
         ws.mark_completed(Some("Done"));
-        ws.pinned_tools = vec!["bash".into()];
-        ws.deprioritized_tools = vec!["web_fetch".into()];
 
         let yaml = serde_yaml_ng::to_string(&ws).unwrap();
         let parsed: WorkspaceMetadata = serde_yaml_ng::from_str(&yaml).unwrap();
@@ -1079,8 +1050,10 @@ mod tests {
         assert_eq!(parsed.summary, Some("Done".to_string()));
         assert_eq!(parsed.total_cache_read_tokens, 25);
         assert_eq!(parsed.total_cache_creation_tokens, 4);
-        assert_eq!(parsed.pinned_tools, vec!["bash".to_string()]);
-        assert_eq!(parsed.deprioritized_tools, vec!["web_fetch".to_string()]);
+        assert!(
+            !yaml.contains("health_avoidance_tools"),
+            "tool health belongs in turn health surfaces, not workspace metadata"
+        );
     }
 
     #[test]
@@ -1125,13 +1098,10 @@ mod tests {
         ws.last_context_trace = Some(ContextTraceSignal {
             turn_id: "turn-7".into(),
             captured_at: Some("2026-04-10T12:00:00Z".into()),
-            tool_selection: Some(ContextTraceToolSelection {
+            tool_surface: Some(ContextTraceToolSurface {
                 tools_available: 12,
-                selected_tools: vec!["lsp".into(), "view".into()],
-                selection_scope: "latest_round".into(),
-                rejected_tools: 4,
-                strategy: "code-intel".into(),
-                confidence: 0.91,
+                visible_tools: vec!["lsp".into(), "view".into()],
+                surface_scope: "latest_round".into(),
                 latency_ms: 18,
             }),
             memory: Some(ContextTraceMemorySignal {
@@ -1225,17 +1195,14 @@ mod tests {
     }
 
     #[test]
-    fn context_trace_preview_labels_tool_selection_scope() {
+    fn context_trace_preview_labels_tool_surface_scope() {
         let trace = ContextTraceSignal {
             turn_id: "turn-7".into(),
             captured_at: None,
-            tool_selection: Some(ContextTraceToolSelection {
+            tool_surface: Some(ContextTraceToolSurface {
                 tools_available: 4,
-                selected_tools: vec!["lsp".into()],
-                selection_scope: "latest_round".into(),
-                rejected_tools: 1,
-                strategy: "code-intel".into(),
-                confidence: 0.88,
+                visible_tools: vec!["lsp".into()],
+                surface_scope: "latest_round".into(),
                 latency_ms: 9,
             }),
             memory: None,
@@ -1558,8 +1525,6 @@ mod tests {
         assert_eq!(ws.active_experiment_id, None);
         assert_eq!(ws.active_variant, None);
         assert_eq!(ws.tuned_config_json, None);
-        assert!(ws.pinned_tools.is_empty());
-        assert!(ws.deprioritized_tools.is_empty());
     }
 
     #[test]
@@ -1583,10 +1548,9 @@ mod tests {
             !yaml.contains("tuned_config_json"),
             "should omit None fields"
         );
-        assert!(!yaml.contains("pinned_tools"), "should omit empty vectors");
         assert!(
-            !yaml.contains("deprioritized_tools"),
-            "should omit empty vectors"
+            !yaml.contains("health_avoidance_tools"),
+            "tool health belongs in turn health surfaces, not workspace metadata"
         );
     }
 

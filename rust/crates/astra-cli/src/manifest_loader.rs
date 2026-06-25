@@ -31,8 +31,8 @@
 //! ```
 
 use crate::cli::theme;
-use astra_runtime::tool_registry::plugin::{PluginRegistry, PluginToolEntry};
-use astra_runtime::tool_registry::{IntentType, Scope};
+use astra_turn_core::tool_registry_meta::{IntentType, Scope};
+use astra_turn_core::tool_registry_plugin::{PluginRegistry, PluginToolEntry};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -227,7 +227,7 @@ pub fn manifest_tool_to_entry(skill_name: &str, tool: &ManifestToolDef) -> Plugi
         name: tool.name.clone(),
         description: tool.description.clone(),
         triggers: tool.triggers.clone(),
-        pinned: false,
+        always_load: false,
         intents: tool
             .intents
             .iter()
@@ -834,7 +834,7 @@ depends_on: []
         assert_eq!(entry.name, "kubectl_get");
         assert_eq!(entry.source, "skills/kubernetes");
         assert!(entry.enabled);
-        assert!(!entry.pinned);
+        assert!(!entry.always_load);
         assert!(entry.intents.contains(&IntentType::CodeRead));
         assert_eq!(entry.scope, Scope::Local);
         assert!(entry.schema_tokens > 0);
@@ -865,7 +865,7 @@ depends_on: []
     }
 
     #[test]
-    fn registered_manifest_tools_score_via_tfidf() {
+    fn registered_manifest_tools_expose_enabled_schemas() {
         let manifest = parse_manifest(SAMPLE_MANIFEST).unwrap();
         let mut registry = PluginRegistry::new();
 
@@ -874,10 +874,12 @@ depends_on: []
             registry.register(entry).unwrap();
         }
 
-        let query = astra_runtime::text_tokenize::tokenize("show kubernetes pods");
-        let scores = registry.score_all(&query);
-        assert!(!scores.is_empty());
-        assert_eq!(scores[0].1, "kubectl_get");
+        let names: Vec<_> = registry
+            .enabled_tools()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["kubectl_get", "kubectl_apply"]);
+        assert_eq!(registry.schemas().len(), 2);
     }
 
     // ── Command template expansion ──
@@ -950,7 +952,7 @@ description: "Perform a comprehensive code review"
 user_invocable: true
 allowed_tools:
   - read_file
-  - git_diff
+  - git
 when_to_use: "Use for code review, audit, or PR feedback"
 ---
 # Code Review
@@ -1037,7 +1039,7 @@ tools: []
         assert_eq!(skill.description(), "Perform a comprehensive code review");
 
         // allowed_tools() returns SKILL.md allowed_tools
-        assert_eq!(skill.allowed_tools(), vec!["read_file", "git_diff"]);
+        assert_eq!(skill.allowed_tools(), vec!["read_file", "git"]);
 
         // instruction_text() returns markdown body
         let text = skill.instruction_text().unwrap();

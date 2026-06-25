@@ -342,18 +342,12 @@ fn complement_interval(interval: ConfidenceInterval) -> ConfidenceInterval {
     )
 }
 
-fn context_trace_confidence_expr(alias: &str) -> String {
-    format!(
-        "CAST(JSON_UNQUOTE(JSON_EXTRACT({alias}.metadata, '$.tool_selection.confidence')) AS DOUBLE)"
-    )
-}
-
 fn change_type_label(change_type: &ChangeType) -> &'static str {
     match change_type {
         ChangeType::Prompt => "prompt",
         ChangeType::Skill => "skill",
         ChangeType::Config => "config",
-        ChangeType::Selector => "selector",
+        ChangeType::ToolSurface => "tool_surface",
         ChangeType::ContextBudget => "context_budget",
         ChangeType::Knowledge => "knowledge",
     }
@@ -1176,57 +1170,53 @@ impl EvaluationService for DatabaseEvaluationService {
     ) -> ServiceResult<CalibrationResponse> {
         let pool = self.get_pool().await.map_err(internal_error)?;
         let days = clamp_eval_days(days);
-        let confidence_expr = context_trace_confidence_expr("ev");
-        let agent_filter = if agent_id.is_some() {
-            "AND ev.agent_id = ?"
-        } else {
-            ""
-        };
-        let sql = format!(
-            "SELECT samples.session_confidence, samples.session_quality \
-             FROM ( \
-                 SELECT qa.target_id AS session_id, \
-                        MAX(CAST(qa.score AS DOUBLE)) AS session_quality, \
-                        AVG({confidence_expr}) AS session_confidence \
-                 FROM eval_quality_assessments qa \
-                 JOIN agent_events ev \
-                   ON ev.session_id = qa.target_id \
-                  AND ev.user_id = qa.user_id \
-                  AND ev.event_type = 'context_trace_signal' \
-                 WHERE qa.user_id = ? \
-                   AND qa.level = 'session' \
-                   AND qa.updated_at >= DATE_SUB(NOW(), INTERVAL ? DAY) \
-                   AND qa.updated_at = ( \
-                       SELECT MAX(q2.updated_at) \
-                       FROM eval_quality_assessments q2 \
-                       WHERE q2.user_id = qa.user_id \
-                         AND q2.level = 'session' \
-                         AND q2.target_id = qa.target_id \
-                   ) \
-                   AND ev.created_at >= DATE_SUB(NOW(), INTERVAL ? DAY) \
-                   {agent_filter} \
-                 GROUP BY qa.target_id \
-             ) samples \
-             WHERE samples.session_confidence IS NOT NULL"
-        );
 
-        let mut calibration_query = query(&sql).bind(user_id).bind(days).bind(days);
-        if let Some(agent_id) = agent_id {
-            calibration_query = calibration_query.bind(agent_id);
+        let sql = if agent_id.is_some() {
+            "SELECT CAST(ca.confidence AS DOUBLE) AS confidence, \
+                    CAST(ca.quality_score AS DOUBLE) AS quality_score \
+             FROM eval_calibration_assessments ca \
+             INNER JOIN eval_quality_assessments qa \
+               ON qa.user_id = ca.user_id \
+              AND qa.target_id = ca.session_id \
+              AND qa.level = 'session' \
+             WHERE ca.user_id = ? \
+               AND ca.agent_id = ? \
+               AND ca.created_at >= DATE_SUB(NOW(), INTERVAL ? DAY)"
+        } else {
+            "SELECT CAST(ca.confidence AS DOUBLE) AS confidence, \
+                    CAST(ca.quality_score AS DOUBLE) AS quality_score \
+             FROM eval_calibration_assessments ca \
+             INNER JOIN eval_quality_assessments qa \
+               ON qa.user_id = ca.user_id \
+              AND qa.target_id = ca.session_id \
+              AND qa.level = 'session' \
+             WHERE ca.user_id = ? \
+               AND ca.created_at >= DATE_SUB(NOW(), INTERVAL ? DAY)"
+        };
+
+        let mut query_builder = query(sql).bind(user_id);
+        if let Some(agent) = agent_id {
+            query_builder = query_builder.bind(agent);
         }
-        let rows = calibration_query
+        query_builder = query_builder.bind(days);
+
+        let rows = query_builder
             .fetch_all(&pool)
             .await
             .map_err(internal_error)?;
+
         let samples: Vec<(f64, f64)> = rows
-            .into_iter()
+            .iter()
             .filter_map(|row| {
-                Some((
-                    row.try_get("session_confidence").ok()?,
-                    row.try_get("session_quality").ok()?,
-                ))
+                let confidence: Option<f64> = row.try_get("confidence").ok();
+                let quality: Option<f64> = row.try_get("quality_score").ok();
+                match (confidence, quality) {
+                    (Some(c), Some(q)) => Some((c, q)),
+                    _ => None,
+                }
             })
             .collect();
+
         let summary = summarize_calibration_samples(&samples);
         let noise_filtered_summary =
             summarize_calibration_samples(&noise_filtered_calibration_samples(&samples));
@@ -1852,39 +1842,39 @@ impl EvaluationService for DatabaseEvaluationService {
         let days = clamp_eval_days(request.days);
         let min_quality = request.min_quality.clamp(0.0, 1.0);
         let max_samples = clamp_extract_limit(request.max_samples);
-        let confidence_expr = context_trace_confidence_expr("ev");
-        let trace_count_expr =
-            format!("SUM(CASE WHEN {confidence_expr} IS NOT NULL THEN 1 ELSE 0 END)");
-        let sql = format!(
-            "SELECT qa.target_id AS session_id, \
-                    MAX(CAST(qa.score AS DOUBLE)) AS quality_score, \
-                    MAX(COALESCE(qa.step_count, 0)) AS step_count, \
-                    AVG({confidence_expr}) AS avg_confidence, \
-                    {trace_count_expr} AS trace_count, \
-                    DATE_FORMAT(MAX(qa.updated_at), '%Y-%m-%dT%H:%i:%s') AS quality_updated_at, \
-                    DATE_FORMAT(MAX(ev.created_at), '%Y-%m-%dT%H:%i:%s') AS latest_context_trace_at \
-             FROM eval_quality_assessments qa \
-             LEFT JOIN agent_events ev \
-               ON ev.session_id = qa.target_id \
-              AND ev.user_id = qa.user_id \
-              AND ev.event_type = 'context_trace_signal' \
-              AND ev.created_at >= DATE_SUB(NOW(), INTERVAL ? DAY) \
-             WHERE qa.user_id = ? \
-               AND qa.level = 'session' \
-               AND qa.updated_at >= DATE_SUB(NOW(), INTERVAL ? DAY) \
-               AND qa.score >= ? \
-               AND qa.updated_at = ( \
-                   SELECT MAX(q2.updated_at) \
-                   FROM eval_quality_assessments q2 \
-                   WHERE q2.user_id = qa.user_id \
-                     AND q2.level = 'session' \
-                     AND q2.target_id = qa.target_id \
-               ) \
-             GROUP BY qa.target_id \
-             ORDER BY quality_score DESC, MAX(qa.updated_at) DESC \
-             LIMIT ?"
-        );
-        let rows = query(&sql)
+        let sql = "SELECT qa.target_id AS session_id, \
+                   MAX(CAST(qa.score AS DOUBLE)) AS quality_score, \
+                   MAX(COALESCE(qa.step_count, 0)) AS step_count, \
+                   AVG(CAST(ca.confidence AS DOUBLE)) AS avg_confidence, \
+                   COUNT(ev.event_id) AS trace_count, \
+                   DATE_FORMAT(MAX(qa.updated_at), '%Y-%m-%dT%H:%i:%s') AS quality_updated_at, \
+                   DATE_FORMAT(MAX(ev.created_at), '%Y-%m-%dT%H:%i:%s') AS latest_context_trace_at \
+            FROM eval_quality_assessments qa \
+            LEFT JOIN eval_calibration_assessments ca \
+              ON ca.session_id = qa.target_id \
+             AND ca.user_id = qa.user_id \
+             AND ca.created_at >= DATE_SUB(NOW(), INTERVAL ? DAY) \
+            LEFT JOIN agent_events ev \
+              ON ev.session_id = qa.target_id \
+             AND ev.user_id = qa.user_id \
+             AND ev.event_type = 'context_trace_signal' \
+             AND ev.created_at >= DATE_SUB(NOW(), INTERVAL ? DAY) \
+            WHERE qa.user_id = ? \
+              AND qa.level = 'session' \
+              AND qa.updated_at >= DATE_SUB(NOW(), INTERVAL ? DAY) \
+              AND qa.score >= ? \
+              AND qa.updated_at = ( \
+                  SELECT MAX(q2.updated_at) \
+                  FROM eval_quality_assessments q2 \
+                  WHERE q2.user_id = qa.user_id \
+                    AND q2.level = 'session' \
+                    AND q2.target_id = qa.target_id \
+              ) \
+            GROUP BY qa.target_id \
+            ORDER BY quality_score DESC, MAX(qa.updated_at) DESC \
+            LIMIT ?";
+        let rows = query(sql)
+            .bind(days)
             .bind(days)
             .bind(user_id)
             .bind(days)
@@ -2061,14 +2051,6 @@ mod tests {
         assert_eq!(clamp_extract_limit(0), 1);
         assert_eq!(clamp_extract_limit(500), 500);
         assert_eq!(clamp_extract_limit(5000), MAX_EXTRACT_SAMPLES);
-    }
-
-    #[test]
-    fn context_trace_confidence_expr_uses_canonical_signal_shape() {
-        let expr = context_trace_confidence_expr("ev");
-        assert!(expr.contains("$.tool_selection.confidence"));
-        assert!(!expr.contains("$.tool_selection.selection_confidence"));
-        assert!(!expr.contains("$.selection_confidence"));
     }
 
     #[test]

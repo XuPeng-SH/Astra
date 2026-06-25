@@ -81,7 +81,7 @@ pub struct SelfModel {
     /// across turns instead of only seeing a raw correction count.
     #[serde(default)]
     pub recent_correction_excerpts: Vec<String>,
-    /// Gap 6: per-tool outcome bias currently affecting the selector
+    /// Gap 6: per-tool outcome bias currently surfaced as advisory health signal
     /// (`ToolHealthTracker::outcome_bias_by_tool`). Positive entries mildly
     /// boost the tool's score; negative entries penalize. Surfaced so the
     /// agent can audit why a tool is being preferred or avoided.
@@ -185,22 +185,20 @@ pub struct CapabilityView {
     pub tool_names: Vec<String>,
     /// Tools with health issues (name → health summary).
     pub tool_health: Vec<ToolHealthSummary>,
-    /// Currently deprioritized tools.
-    pub deprioritized_tools: Vec<String>,
-    /// Pinned (always-available) tools.
-    pub pinned_tools: Vec<String>,
+    /// Tools currently under health avoidance from repeated failures.
+    pub health_avoidance_tools: Vec<String>,
     /// Discovered skills.
     pub skills: Vec<String>,
     /// Tools currently boosted by the last auto-reflection strategy delta.
     /// These are subtracted from any per-turn restricted set so the LLM sees
-    /// them even when general deprioritization would hide them.
+    /// them when a hard runtime restriction would otherwise hide them.
     #[serde(default)]
     pub boosted_tools: Vec<String>,
     /// Whether the next tool-visibility assembly will consume a one-shot
-    /// `widen_selection` request from the pipeline (skipping the
-    /// deprioritized→restricted merge).
+    /// `widen_surface` request from the pipeline (a one-shot hard restriction
+    /// reset after a correction or strategy signal).
     #[serde(default)]
-    pub widen_selection_pending: bool,
+    pub widen_surface_pending: bool,
     /// Compact recent signature-level execution memory surfaced back to the
     /// model so it can avoid blindly repeating identical tool calls.
     #[serde(default)]
@@ -213,7 +211,7 @@ pub struct ToolHealthSummary {
     pub name: String,
     pub total_calls: usize,
     pub success_rate: f64,
-    pub deprioritized: bool,
+    pub avoidance_advised: bool,
     pub consecutive_failures: usize,
     pub rehabilitation_count: usize,
 }
@@ -293,7 +291,7 @@ pub struct ConstraintSet {
     /// Max config drift from baseline (0.0–1.0).
     pub config_drift_ceiling: f64,
     /// Minimum tools that must remain available.
-    pub min_tool_pool_size: usize,
+    pub min_available_tool_count: usize,
     /// Fraction of tokens always held in reserve.
     pub token_reserve_fraction: f64,
 }
@@ -303,7 +301,7 @@ impl Default for ConstraintSet {
         Self {
             max_mutations_per_turn: 2,
             config_drift_ceiling: 0.30,
-            min_tool_pool_size: 5,
+            min_available_tool_count: 5,
             token_reserve_fraction: 0.20,
         }
     }
@@ -318,8 +316,6 @@ impl SelfModel {
     /// sections rather than errors.
     pub fn snapshot(
         tool_names: &[&str],
-        pinned_tools: &[String],
-        manual_deprioritized_tools: &[String],
         skills: &[String],
         tool_health: Option<&ToolHealthTracker>,
         turn_number: u32,
@@ -335,8 +331,6 @@ impl SelfModel {
     ) -> Self {
         Self::snapshot_with_strategy(
             tool_names,
-            pinned_tools,
-            manual_deprioritized_tools,
             skills,
             tool_health,
             turn_number,
@@ -355,12 +349,10 @@ impl SelfModel {
 
     /// Same as [`Self::snapshot`] but also incorporates the most recent
     /// [`StrategyApplication`] so the rendered self-awareness section surfaces
-    /// `boosted_tools` / `widen_selection_pending` to the agent.
+    /// `boosted_tools` / `widen_surface_pending` to the agent.
     #[allow(clippy::too_many_arguments)]
     pub fn snapshot_with_strategy(
         tool_names: &[&str],
-        pinned_tools: &[String],
-        manual_deprioritized_tools: &[String],
         skills: &[String],
         tool_health: Option<&ToolHealthTracker>,
         turn_number: u32,
@@ -377,7 +369,7 @@ impl SelfModel {
     ) -> Self {
         // ── Capabilities ──
         let mut tool_health_summaries = Vec::new();
-        let mut deprioritized = Vec::new();
+        let mut health_avoidance = Vec::new();
         let mut outcome_memory = Vec::new();
 
         if let Some(health) = tool_health {
@@ -387,15 +379,15 @@ impl SelfModel {
                         name: name.clone(),
                         total_calls: h.total_calls,
                         success_rate: h.success_rate(),
-                        deprioritized: h.deprioritized,
+                        avoidance_advised: h.avoidance_advised,
                         consecutive_failures: h.consecutive_failures,
                         rehabilitation_count: h.rehabilitation_count,
                     });
                 }
-                if h.deprioritized
+                if h.avoidance_advised
                     && !astra_turn_core::tool::categories::registry().is_never_restrict(name)
                 {
-                    deprioritized.push(name.clone());
+                    health_avoidance.push(name.clone());
                 }
             }
             // Sort by name for stability
@@ -422,14 +414,9 @@ impl SelfModel {
                 .collect();
         }
 
-        for tool in manual_deprioritized_tools {
-            if !deprioritized.contains(tool) {
-                deprioritized.push(tool.clone());
-            }
-        }
-        deprioritized.sort();
+        health_avoidance.sort();
 
-        let (boosted_tools, widen_selection_pending) = match last_strategy {
+        let (boosted_tools, widen_surface_pending) = match last_strategy {
             Some(app) => {
                 let mut boosted: Vec<String> = app
                     .newly_boosted
@@ -448,11 +435,10 @@ impl SelfModel {
             total_tools: tool_names.len(),
             tool_names: tool_names.iter().map(|s| s.to_string()).collect(),
             tool_health: tool_health_summaries,
-            deprioritized_tools: deprioritized,
-            pinned_tools: pinned_tools.to_vec(),
+            health_avoidance_tools: health_avoidance,
             skills: skills.to_vec(),
             boosted_tools,
-            widen_selection_pending,
+            widen_surface_pending,
             outcome_memory,
         };
 
@@ -673,11 +659,11 @@ impl SelfModel {
         }
 
         // ── Tool health ──
-        if !self.capabilities.deprioritized_tools.is_empty() {
+        if !self.capabilities.health_avoidance_tools.is_empty() {
             let _ = writeln!(
                 s,
-                "Deprioritized tools: {} (repeated failures — try alternatives)",
-                self.capabilities.deprioritized_tools.join(", ")
+                "Health avoidance tools: {} (repeated failures; try alternatives)",
+                self.capabilities.health_avoidance_tools.join(", ")
             );
         }
         if !self.capabilities.outcome_memory.is_empty() {
@@ -727,9 +713,9 @@ impl SelfModel {
                 self.capabilities.boosted_tools.join(", ")
             );
         }
-        if self.capabilities.widen_selection_pending {
+        if self.capabilities.widen_surface_pending {
             s.push_str(
-                "Tool selection: widened for next turn (deprioritized set relaxed to recover from tool failures).\n",
+                "Tool surface: hard restrictions reset for next turn (one-shot recovery after correction/strategy signal).\n",
             );
         }
         // P3.1: surface the structured before/after diff of the most recent
@@ -837,9 +823,9 @@ impl SelfModel {
             );
         }
 
-        // ── Gap 6: per-tool outcome bias applied by the selector ──
-        // Explains which tools the selector is currently boosting /
-        // penalizing based on recent success / failure history.
+        // ── Gap 6: per-tool outcome bias surfaced as health advice ──
+        // Explains which tools currently have positive or negative outcome
+        // history without changing schema visibility.
         if !self.outcome_bias.is_empty() {
             let mut entries: Vec<(String, f64, Option<String>)> = self
                 .outcome_bias
@@ -870,7 +856,7 @@ impl SelfModel {
                     .collect();
                 let _ = writeln!(
                     s,
-                    "Tool outcome bias (selector-applied): {}",
+                    "Tool outcome bias (health-advisory): {}",
                     rendered.join(" · ")
                 );
             }
@@ -994,7 +980,7 @@ impl SelfModel {
                 .map(String::as_str)
                 .collect();
             // Filter relevant + dedup conflicting tool advice (e.g.,
-            // ToolDeprioritize("grep") + ToolBoost("grep")). Lessons are
+            // ToolAvoidance("grep") + ToolBoost("grep")). Lessons are
             // pre-sorted by confidence DESC, so the first occurrence for
             // a tool name wins.
             let mut seen_tools: std::collections::HashSet<String> =
@@ -1051,7 +1037,7 @@ impl SelfModel {
     ///
     /// "Substantive" means any of:
     /// - an active goal / plan / tracked goal
-    /// - outcome memory, deprioritized / boosted / low-confidence tools
+    /// - outcome memory, health avoidance / boosted / low-confidence tools
     /// - strategy diff from the last reflection
     /// - guardrail auto-tuner with a measured fail rate
     /// - session denial pressure > 0
@@ -1069,9 +1055,9 @@ impl SelfModel {
             return true;
         }
         if !self.capabilities.outcome_memory.is_empty()
-            || !self.capabilities.deprioritized_tools.is_empty()
+            || !self.capabilities.health_avoidance_tools.is_empty()
             || !self.capabilities.boosted_tools.is_empty()
-            || self.capabilities.widen_selection_pending
+            || self.capabilities.widen_surface_pending
         {
             return true;
         }
@@ -1137,7 +1123,7 @@ fn extract_tool_from_trigger(trigger: &str) -> Option<&str> {
 /// the named tool is in the current session's capability set.
 fn is_lesson_relevant(l: &LessonHint, tool_set: &std::collections::HashSet<&str>) -> bool {
     match l.kind {
-        astra_services::LessonKind::ToolDeprioritize | astra_services::LessonKind::ToolBoost => {
+        astra_services::LessonKind::ToolAvoidance | astra_services::LessonKind::ToolBoost => {
             if let Some((_prefix, tool_name)) = l.trigger_signal.split_once(':') {
                 tool_set.is_empty() || tool_set.contains(tool_name)
             } else {
@@ -1199,18 +1185,11 @@ impl SelfModel {
         // ── Capabilities ──
         s.push_str("\n## Capabilities\n");
         let _ = writeln!(s, "- Total tools: {}", self.capabilities.total_tools);
-        if !self.capabilities.pinned_tools.is_empty() {
+        if !self.capabilities.health_avoidance_tools.is_empty() {
             let _ = writeln!(
                 s,
-                "- Pinned tools: {}",
-                self.capabilities.pinned_tools.join(", ")
-            );
-        }
-        if !self.capabilities.deprioritized_tools.is_empty() {
-            let _ = writeln!(
-                s,
-                "- Deprioritized tools: {}",
-                self.capabilities.deprioritized_tools.join(", ")
+                "- Health avoidance tools: {}",
+                self.capabilities.health_avoidance_tools.join(", ")
             );
         }
         if !self.capabilities.skills.is_empty() {
@@ -1236,7 +1215,7 @@ impl SelfModel {
             .capabilities
             .tool_health
             .iter()
-            .filter(|t| t.deprioritized || t.success_rate < 0.8 || t.consecutive_failures > 0)
+            .filter(|t| t.avoidance_advised || t.success_rate < 0.8 || t.consecutive_failures > 0)
             .collect();
         if !troubled.is_empty() {
             s.push_str("\n## Tool Health (issues only)\n");
@@ -1248,8 +1227,8 @@ impl SelfModel {
                     t.success_rate * 100.0,
                     t.total_calls,
                     t.consecutive_failures,
-                    if t.deprioritized {
-                        ", DEPRIORITIZED"
+                    if t.avoidance_advised {
+                        ", AVOIDANCE ADVISED"
                     } else {
                         ""
                     }
@@ -1283,8 +1262,8 @@ impl SelfModel {
         );
         let _ = writeln!(
             s,
-            "- Min tool pool size: {}",
-            self.constraints.min_tool_pool_size
+            "- Min available tools: {}",
+            self.constraints.min_available_tool_count
         );
         let _ = writeln!(
             s,
@@ -1320,8 +1299,8 @@ fn signal_type_display(st: &SignalType) -> String {
         SignalType::ToolChurn { calls, .. } => format!("ToolChurn({}calls)", calls),
         SignalType::TaskSuccess => "TaskSuccess".to_string(),
         SignalType::TaskFailure { .. } => "TaskFailure".to_string(),
-        SignalType::ToolDeprioritized { tool_name } => {
-            format!("ToolDeprioritized({})", tool_name)
+        SignalType::ToolHealthAvoidance { tool_name } => {
+            format!("ToolHealthAvoidance({})", tool_name)
         }
         SignalType::ToolRehabilitated { tool_name } => {
             format!("ToolRehabilitated({})", tool_name)
@@ -1341,8 +1320,6 @@ mod tests {
         let config = RuntimeConfig::default();
         let model = SelfModel::snapshot(
             &["bash", "read_file", "write_file"],
-            &[],
-            &[],
             &[],
             None,
             3,
@@ -1368,8 +1345,6 @@ mod tests {
         let config = RuntimeConfig::default();
         let model = SelfModel::snapshot(
             &["bash"],
-            &[],
-            &[],
             &[],
             None,
             8,
@@ -1407,8 +1382,6 @@ mod tests {
         let model = SelfModel::snapshot(
             &["bash", "write_file"],
             &[],
-            &[],
-            &[],
             Some(&health),
             1,
             None,
@@ -1421,12 +1394,15 @@ mod tests {
             &[],
             &config,
         );
-        assert_eq!(model.capabilities.deprioritized_tools, vec!["write_file"]);
+        assert_eq!(
+            model.capabilities.health_avoidance_tools,
+            vec!["write_file"]
+        );
         assert_eq!(model.capabilities.tool_health.len(), 2);
     }
 
     #[test]
-    fn snapshot_filters_read_only_health_from_deprioritized_capabilities() {
+    fn snapshot_filters_read_only_health_from_health_avoidance_capabilities() {
         let config = RuntimeConfig::default();
         let mut health = ToolHealthTracker::new();
         health.record_resource_limit_failure("read_file");
@@ -1437,8 +1413,6 @@ mod tests {
         let model = SelfModel::snapshot(
             &["bash", "read_file"],
             &[],
-            &[],
-            &[],
             Some(&health),
             1,
             None,
@@ -1452,13 +1426,13 @@ mod tests {
             &config,
         );
 
-        assert_eq!(model.capabilities.deprioritized_tools, vec!["bash"]);
+        assert_eq!(model.capabilities.health_avoidance_tools, vec!["bash"]);
         assert!(
             model
                 .capabilities
                 .tool_health
                 .iter()
-                .any(|entry| entry.name == "read_file" && entry.deprioritized),
+                .any(|entry| entry.name == "read_file" && entry.avoidance_advised),
             "diagnostics should still show the read-only tool health record"
         );
     }
@@ -1492,8 +1466,6 @@ mod tests {
 
         let model = SelfModel::snapshot(
             &["bash", "grep"],
-            &[],
-            &[],
             &[],
             Some(&health),
             2,
@@ -1548,8 +1520,6 @@ mod tests {
         };
         let model = SelfModel::snapshot(
             &["bash", "read_file", "write_file", "grep", "glob"],
-            &[],
-            &[],
             &["debugging".to_string()],
             None,
             5,
@@ -1589,8 +1559,6 @@ mod tests {
         let model = SelfModel::snapshot(
             &["bash", "write_file"],
             &[],
-            &[],
-            &[],
             None,
             3,
             None,
@@ -1617,8 +1585,6 @@ mod tests {
         let config = RuntimeConfig::default();
         let model = SelfModel::snapshot(
             &["bash", "read_file"],
-            &["bash".to_string()],
-            &[],
             &[],
             None,
             10,
@@ -1637,7 +1603,6 @@ mod tests {
         assert!(text.contains("Turn: 10"));
         assert!(text.contains("exp-123"));
         assert!(text.contains("User corrections: 2"));
-        assert!(text.contains("Pinned tools: bash"));
         assert!(text.contains("Implement feature X"));
     }
 
@@ -1648,8 +1613,6 @@ mod tests {
             .map(|_| FeedbackSignal::new(SignalType::Acceptance))
             .collect();
         let model = SelfModel::snapshot(
-            &[],
-            &[],
             &[],
             &[],
             None,
@@ -1672,7 +1635,7 @@ mod tests {
         let c = ConstraintSet::default();
         assert_eq!(c.max_mutations_per_turn, 2);
         assert!((c.config_drift_ceiling - 0.30).abs() < f64::EPSILON);
-        assert_eq!(c.min_tool_pool_size, 5);
+        assert_eq!(c.min_available_tool_count, 5);
         assert!((c.token_reserve_fraction - 0.20).abs() < f64::EPSILON);
     }
 
@@ -1689,8 +1652,6 @@ mod tests {
         };
         let model = SelfModel::snapshot_with_strategy(
             &["bash", "read_file", "grep"],
-            &[],
-            &[],
             &[],
             None,
             3,
@@ -1709,14 +1670,14 @@ mod tests {
             model.capabilities.boosted_tools,
             vec!["bash", "grep", "read_file"]
         );
-        assert!(model.capabilities.widen_selection_pending);
+        assert!(model.capabilities.widen_surface_pending);
         let rendered = model.to_system_prompt_section();
         assert!(
             rendered.contains("Boosted tools: bash, grep, read_file"),
             "got: {rendered}"
         );
         assert!(
-            rendered.contains("widened for next turn"),
+            rendered.contains("hard restrictions reset for next turn"),
             "got: {rendered}"
         );
     }
@@ -1726,7 +1687,7 @@ mod tests {
         use crate::turn::agentic::stage_bridge::{DiffSnapshot, SkillDiffEntry};
         let config = RuntimeConfig::default();
         let diff = SkillDiffEntry {
-            skill: "pipeline.tool_selection".to_string(),
+            skill: "pipeline.tool_surface_policy".to_string(),
             before: DiffSnapshot::default(),
             after: DiffSnapshot {
                 blocked_tools: vec!["flaky_http".to_string()],
@@ -1737,8 +1698,6 @@ mod tests {
         };
         let model = SelfModel::snapshot(
             &["bash"],
-            &[],
-            &[],
             &[],
             None,
             1,
@@ -1765,8 +1724,6 @@ mod tests {
         let model = SelfModel::snapshot(
             &["bash"],
             &[],
-            &[],
-            &[],
             None,
             1,
             None,
@@ -1780,11 +1737,11 @@ mod tests {
             &config,
         );
         assert!(model.capabilities.boosted_tools.is_empty());
-        assert!(!model.capabilities.widen_selection_pending);
+        assert!(!model.capabilities.widen_surface_pending);
         let rendered = model.to_system_prompt_section();
         assert!(!rendered.contains("Boosted tools"), "got: {rendered}");
         assert!(
-            !rendered.contains("widened for next turn"),
+            !rendered.contains("hard restrictions reset for next turn"),
             "got: {rendered}"
         );
     }
@@ -1794,8 +1751,6 @@ mod tests {
         let config = RuntimeConfig::default();
         let model = SelfModel::snapshot(
             &["bash"],
-            &[],
-            &[],
             &[],
             None,
             1,
@@ -1819,8 +1774,6 @@ mod tests {
         let config = RuntimeConfig::default();
         let model = SelfModel::snapshot(
             &["bash"],
-            &[],
-            &[],
             &[],
             None,
             6,
@@ -1858,8 +1811,6 @@ mod tests {
         let model = SelfModel::snapshot(
             &["bash"],
             &[],
-            &[],
-            &[],
             None,
             2,
             None,
@@ -1890,8 +1841,6 @@ mod tests {
         let config = RuntimeConfig::default();
         SelfModel::snapshot(
             &["bash"],
-            &[],
-            &[],
             &[],
             None,
             0,
@@ -2085,8 +2034,6 @@ mod tests {
         let model = SelfModel::snapshot(
             &["bash"],
             &[],
-            &[],
-            &[],
             None,
             0,
             None,
@@ -2134,7 +2081,7 @@ mod tests {
         let model = minimal_model().with_outcome_bias(bias);
         let rendered = model.to_system_prompt_section();
         assert!(
-            rendered.contains("Tool outcome bias (selector-applied)"),
+            rendered.contains("Tool outcome bias (health-advisory)"),
             "got: {rendered}"
         );
         let line = rendered
@@ -2365,9 +2312,12 @@ mod tests {
     }
 
     #[test]
-    fn meaningful_when_deprioritized_tools_present() {
+    fn meaningful_when_health_avoidance_tools_present() {
         let mut model = minimal_model();
-        model.capabilities.deprioritized_tools.push("grep".into());
+        model
+            .capabilities
+            .health_avoidance_tools
+            .push("grep".into());
         assert!(model.has_meaningful_self_awareness());
     }
 }

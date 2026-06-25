@@ -19,120 +19,6 @@ pub(crate) fn default_skill_category(category: Option<&str>) -> String {
         .to_string()
 }
 
-// ── Legacy catalog surfacing (SkillSearchSettings → agent context; was /skill-search) ──
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SkillSurfacingCmd {
-    Show,
-    Reset,
-    SetDynamic(bool),
-    SetMinCatalog(usize),
-    SetSurfaceCap(usize),
-}
-
-fn format_skill_surfacing_line(settings: &astra_core::SkillSearchSettings) -> String {
-    format!(
-        "dynamic={}, min_catalog_size={}, surface_cap={} (legacy; runtime surfaces the full catalog)",
-        settings.dynamic_surface, settings.min_catalog_size, settings.surface_cap
-    )
-}
-
-fn parse_skill_surfacing(arg: &str) -> Result<SkillSurfacingCmd, String> {
-    let arg = arg.trim();
-    if arg.is_empty() || matches!(arg, "show" | "status") {
-        return Ok(SkillSurfacingCmd::Show);
-    }
-    if arg == "reset" {
-        return Ok(SkillSurfacingCmd::Reset);
-    }
-
-    let mut parts = arg.split_whitespace();
-    let key = parts.next().unwrap_or_default();
-    let value = parts.next().unwrap_or_default();
-    if parts.next().is_some() {
-        return Err(
-            "Usage: /skill surfacing [show|status|reset|dynamic <on|off>|min <n>|cap <n>]"
-                .to_string(),
-        );
-    }
-
-    match key {
-        "dynamic" => match value.to_ascii_lowercase().as_str() {
-            "on" | "true" | "1" => Ok(SkillSurfacingCmd::SetDynamic(true)),
-            "off" | "false" | "0" => Ok(SkillSurfacingCmd::SetDynamic(false)),
-            _ => Err("Usage: /skill surfacing dynamic <on|off>".to_string()),
-        },
-        "min" => value
-            .parse::<usize>()
-            .ok()
-            .filter(|n| *n > 0)
-            .map(SkillSurfacingCmd::SetMinCatalog)
-            .ok_or_else(|| "Usage: /skill surfacing min <positive-integer>".to_string()),
-        "cap" => value
-            .parse::<usize>()
-            .ok()
-            .filter(|n| *n > 0)
-            .map(SkillSurfacingCmd::SetSurfaceCap)
-            .ok_or_else(|| "Usage: /skill surfacing cap <positive-integer>".to_string()),
-        _ => Err(
-            "Usage: /skill surfacing [show|status|reset|dynamic <on|off>|min <n>|cap <n>]"
-                .to_string(),
-        ),
-    }
-}
-
-fn apply_skill_surfacing(state: &mut SessionState, command: SkillSurfacingCmd) -> (String, bool) {
-    match command {
-        SkillSurfacingCmd::Show => (
-            format!(
-                "Catalog surfacing: {}",
-                format_skill_surfacing_line(&state.skill_search)
-            ),
-            false,
-        ),
-        SkillSurfacingCmd::Reset => {
-            state.skill_search = astra_core::SkillSearchSettings::default();
-            (
-                format!(
-                    "Catalog surfacing reset: {}",
-                    format_skill_surfacing_line(&state.skill_search)
-                ),
-                true,
-            )
-        }
-        SkillSurfacingCmd::SetDynamic(dynamic) => {
-            state.skill_search.dynamic_surface = dynamic;
-            (
-                format!(
-                    "Catalog surfacing updated: {}",
-                    format_skill_surfacing_line(&state.skill_search)
-                ),
-                true,
-            )
-        }
-        SkillSurfacingCmd::SetMinCatalog(min_catalog_size) => {
-            state.skill_search.min_catalog_size = min_catalog_size;
-            (
-                format!(
-                    "Catalog surfacing updated: {}",
-                    format_skill_surfacing_line(&state.skill_search)
-                ),
-                true,
-            )
-        }
-        SkillSurfacingCmd::SetSurfaceCap(surface_cap) => {
-            state.skill_search.surface_cap = surface_cap;
-            (
-                format!(
-                    "Catalog surfacing updated: {}",
-                    format_skill_surfacing_line(&state.skill_search)
-                ),
-                true,
-            )
-        }
-    }
-}
-
 pub(crate) async fn handle_skill_command(
     arg: &str,
     api: &astra_thin_client::ThinClient,
@@ -211,11 +97,6 @@ pub(crate) async fn handle_skill_command(
             );
             eprintln!(
                 "    {}  {}",
-                "/skill surfacing …".magenta(),
-                "Legacy dynamic/min/cap settings (ignored by runtime)".dim()
-            );
-            eprintln!(
-                "    {}  {}",
                 "/skill new <name>".magenta(),
                 "Scaffold a new skill".dim()
             );
@@ -248,11 +129,6 @@ pub(crate) async fn handle_skill_command(
                 "    {}  {}",
                 "/skill feedback <name> +/-".magenta(),
                 "Record user feedback".dim()
-            );
-            eprintln!(
-                "    {}  {}",
-                "/skill pin/unpin <name>".magenta(),
-                "Pin/unpin for priority".dim()
             );
             eprintln!(
                 "    {}  {}",
@@ -494,30 +370,6 @@ pub(crate) async fn handle_skill_command(
                 );
             }
             eprintln!();
-        }
-
-        "surfacing" => {
-            let command = match parse_skill_surfacing(sub_arg) {
-                Ok(command) => command,
-                Err(message) => {
-                    eprintln!("  {}", message.yellow());
-                    return Ok(());
-                }
-            };
-            let (message, changed) = apply_skill_surfacing(state, command);
-            eprintln!("  {}", message.green());
-            if changed && let Some(ref j) = state.journal {
-                crate::cli::cli_config::cli_utils::append_journal_event_or_warn(
-                    j,
-                    state.session_id.as_deref(),
-                    &astra_services::session_journal::JournalEvent::config_change(
-                        state.session_id.as_deref(),
-                        "skill_search",
-                        &format_skill_surfacing_line(&state.skill_search),
-                    ),
-                    "slash_skill:surfacing",
-                );
-            }
         }
 
         "info" => {
@@ -775,7 +627,6 @@ Follow these steps:
                     }
                 };
                 let skill_md = skill_dir.join("SKILL.md");
-                let test_file = skill_dir.join("test_skill.py");
 
                 if skill_md.exists() {
                     eprintln!(
@@ -840,48 +691,10 @@ Follow these steps:
                     if ok {
                         eprintln!("  {}", "\u{2713} SKILL.md validation passed".green());
                     }
-                } else if test_file.exists() {
-                    eprintln!("  Running legacy Python tests...");
-                    let out = std::process::Command::new("python3")
-                        .args([
-                            "-m",
-                            "unittest",
-                            "discover",
-                            "-s",
-                            ".",
-                            "-p",
-                            "test_*.py",
-                            "-q",
-                        ])
-                        .current_dir(&skill_dir)
-                        .output();
-                    match out {
-                        Ok(o) => {
-                            let stdout = String::from_utf8_lossy(&o.stdout);
-                            let stderr = String::from_utf8_lossy(&o.stderr);
-                            if o.status.success() {
-                                eprintln!("  {}", "\u{2713} Local skill tests passed".green());
-                            } else {
-                                eprintln!("  {}", "\u{2717} Local skill tests failed".red());
-                            }
-                            if !stdout.is_empty() {
-                                eprintln!("{stdout}");
-                            }
-                            if !stderr.is_empty() {
-                                eprintln!("{stderr}");
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "{}",
-                                format!("  \u{2717} Failed to run local tests: {e}").red()
-                            );
-                        }
-                    }
                 } else {
                     eprintln!(
                         "  {}",
-                        "No SKILL.md or test_skill.py found. Use /skill new to scaffold.".yellow()
+                        "No SKILL.md found. Use /skill new to scaffold.".yellow()
                     );
                 }
             }
@@ -916,8 +729,6 @@ Follow these steps:
                 let dir = base.join(name);
                 if dir.join("SKILL.md").exists() {
                     Some((dir, "SKILL.md"))
-                } else if dir.join("skill.py").exists() {
-                    Some((dir, "skill.py (legacy)"))
                 } else {
                     None
                 }
@@ -1071,8 +882,6 @@ Follow these steps:
                                         }
                                         Err(e) => format!("read err: {e}").red().to_string(),
                                     }
-                                } else if d.join("skill.py").exists() {
-                                    "legacy skill.py".dim().to_string()
                                 } else {
                                     "no SKILL.md".yellow().to_string()
                                 }
@@ -1376,48 +1185,6 @@ Follow these steps:
             }
         }
 
-        "pin" => {
-            let skill_name = sub_arg.trim();
-            if skill_name.is_empty() {
-                if state.pinned_skills.is_empty() {
-                    eprintln!("  {}", "No pinned skills.".dim());
-                } else {
-                    eprintln!("  {}", "Pinned skills:".bold());
-                    for name in &state.pinned_skills {
-                        eprintln!("    📌 {name}");
-                    }
-                }
-                return Ok(());
-            }
-            // Verify the skill exists
-            let registry = &state.unified_skill_registry;
-            if registry.get_loaded_skill(skill_name).is_none() {
-                eprintln!("{}", format!("  Skill '{skill_name}' not found.").yellow());
-                return Ok(());
-            }
-            if state.pinned_skills.insert(skill_name.to_string()) {
-                eprintln!("  📌 Pinned skill '{skill_name}' — always included in budget.");
-            } else {
-                eprintln!("  Already pinned: '{skill_name}'");
-            }
-        }
-
-        "unpin" => {
-            let skill_name = sub_arg.trim();
-            if skill_name.is_empty() {
-                eprintln!("{}", "  Usage: /skill unpin <name>".yellow());
-                return Ok(());
-            }
-            if state.pinned_skills.remove(skill_name) {
-                eprintln!("  Unpinned skill '{skill_name}'.");
-            } else {
-                eprintln!(
-                    "{}",
-                    format!("  Skill '{skill_name}' was not pinned.").yellow()
-                );
-            }
-        }
-
         "install" => {
             install_skill_from_marketplace(sub_arg.trim(), api, token, state).await;
         }
@@ -1526,7 +1293,7 @@ Follow these steps:
             );
             eprintln!(
                 "  {}",
-                "Common: list · info · search · new · test · dev · health · surfacing".dim()
+                "Common: list · info · search · new · test · dev · health".dim()
             );
             eprintln!(
                 "  {}",
@@ -1554,7 +1321,7 @@ fn resolve_skill_dir_on_disk(name: &str) -> Option<std::path::PathBuf> {
         .into_iter()
         .find_map(|base| {
             let dir = base.join(name);
-            if dir.join("SKILL.md").exists() || dir.join("skill.py").exists() {
+            if dir.join("SKILL.md").exists() {
                 Some(dir)
             } else {
                 None
@@ -1595,7 +1362,6 @@ fn collect_skill_md_issues(_skill_name: &str, src: &str) -> Vec<String> {
 
 fn print_skill_directory_raw(name: &str, skill_dir: &std::path::Path) -> Result<(), String> {
     let skill_md_path = skill_dir.join("SKILL.md");
-    let json_path = skill_dir.join("skill.json");
     if skill_md_path.exists() {
         let raw = std::fs::read_to_string(&skill_md_path).map_err(|e| e.to_string())?;
         if raw.starts_with("---") {
@@ -1618,26 +1384,8 @@ fn print_skill_directory_raw(name: &str, skill_dir: &std::path::Path) -> Result<
             eprintln!("  {}", "SKILL.md has no frontmatter".yellow());
         }
         Ok(())
-    } else if json_path.exists() {
-        let raw = std::fs::read_to_string(&json_path).map_err(|e| e.to_string())?;
-        let value: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
-        let pretty = serde_json::to_string_pretty(&value).unwrap_or(raw);
-        eprintln!(
-            "\n{}",
-            format!("─── {name}/skill.json (legacy) ─────────────────────────────")
-                .bold()
-                .magenta()
-        );
-        for line in pretty.lines() {
-            eprintln!("  {line}");
-        }
-        eprintln!();
-        Ok(())
     } else {
-        Err(format!(
-            "\u{2717} No SKILL.md or skill.json in {}",
-            skill_dir.display()
-        ))
+        Err(format!("\u{2717} No SKILL.md in {}", skill_dir.display()))
     }
 }
 
@@ -2050,11 +1798,7 @@ Skill auto-generated from session {session_short}.
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        SkillSurfacingCmd, apply_skill_surfacing, matches_skill_filter, parse_list_filters,
-        parse_skill_surfacing, skill_relevance_score, truncate_desc,
-    };
-    use crate::cli::session::session_state::SessionState;
+    use super::{matches_skill_filter, parse_list_filters, skill_relevance_score, truncate_desc};
 
     // ── truncate_desc tests ────────────────────────────────────────────
 
@@ -2120,47 +1864,6 @@ mod tests {
         assert_eq!(q.as_deref(), Some("debug"));
         assert_eq!(s.as_deref(), Some("bundled"));
         assert!(c.is_none());
-    }
-
-    #[test]
-    fn parse_skill_surfacing_supports_status_and_updates() {
-        assert_eq!(parse_skill_surfacing("").unwrap(), SkillSurfacingCmd::Show);
-        assert_eq!(
-            parse_skill_surfacing("status").unwrap(),
-            SkillSurfacingCmd::Show
-        );
-        assert_eq!(
-            parse_skill_surfacing("dynamic off").unwrap(),
-            SkillSurfacingCmd::SetDynamic(false)
-        );
-        assert_eq!(
-            parse_skill_surfacing("min 12").unwrap(),
-            SkillSurfacingCmd::SetMinCatalog(12)
-        );
-        assert_eq!(
-            parse_skill_surfacing("cap 20").unwrap(),
-            SkillSurfacingCmd::SetSurfaceCap(20)
-        );
-    }
-
-    #[test]
-    fn apply_skill_surfacing_mutates_session_state() {
-        let mut state = SessionState::default();
-
-        let (_, changed) = apply_skill_surfacing(&mut state, SkillSurfacingCmd::SetDynamic(false));
-        assert!(changed);
-        assert!(!state.skill_search.dynamic_surface);
-
-        let (_, changed) = apply_skill_surfacing(&mut state, SkillSurfacingCmd::SetMinCatalog(11));
-        assert!(changed);
-        assert_eq!(state.skill_search.min_catalog_size, 11);
-
-        let (_, changed) = apply_skill_surfacing(&mut state, SkillSurfacingCmd::SetSurfaceCap(19));
-        assert!(changed);
-        assert_eq!(state.skill_search.surface_cap, 19);
-
-        let (_, changed) = apply_skill_surfacing(&mut state, SkillSurfacingCmd::Show);
-        assert!(!changed);
     }
 
     #[test]
@@ -2285,7 +1988,7 @@ mod tests {
     mod marketplace_tests {
         use super::super::{
             browse_marketplace, default_skill_category, fetch_marketplace_version,
-            install_single_skill_legacy, list_installed_marketplace, trending_marketplace,
+            list_installed_marketplace, trending_marketplace,
         };
         use wiremock::matchers::{method, path, query_param};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -2467,98 +2170,6 @@ mod tests {
 
             let client = make_client(&srv.uri());
             list_installed_marketplace(&client, Some("tok")).await;
-        }
-
-        #[tokio::test]
-        async fn install_legacy_writes_skill_md() {
-            let srv = MockServer::start().await;
-            let record = serde_json::json!({
-                "skill_id": "sk-001",
-                "skill_name": "test-install-skill",
-                "version": "1.0.0",
-                "description": "A test skill",
-                "metadata": {
-                    "manifest": "---\nname: test-install-skill\nversion: 1.0.0\n---",
-                    "instructions": "Do the thing."
-                },
-                "created_at": "2025-01-01T00:00:00Z",
-            });
-
-            Mock::given(method("GET"))
-                .and(path("/skills/test-install-skill"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(&record))
-                .expect(1)
-                .mount(&srv)
-                .await;
-
-            let client = make_client(&srv.uri());
-            let ok = install_single_skill_legacy("test-install-skill", None, &client, "tok").await;
-
-            assert!(ok, "install should succeed");
-
-            // install_single_skill_legacy writes to cwd/.astra/skills/<name>
-            let skill_dir = std::env::current_dir()
-                .unwrap()
-                .join(".astra/skills/test-install-skill");
-            let skill_md = skill_dir.join("SKILL.md");
-            assert!(skill_md.exists(), "SKILL.md should be written");
-            let content = std::fs::read_to_string(&skill_md).unwrap();
-            assert!(content.contains("test-install-skill"));
-            assert!(content.contains("Do the thing."));
-
-            // Clean up
-            let _ = std::fs::remove_dir_all(&skill_dir);
-        }
-
-        #[tokio::test]
-        async fn install_legacy_with_version_query() {
-            let srv = MockServer::start().await;
-            let record = serde_json::json!({
-                "skill_id": "sk-002",
-                "skill_name": "versioned-skill",
-                "version": "2.0.0",
-                "description": null,
-                "metadata": {
-                    "instructions": "Version 2 instructions."
-                },
-                "created_at": null,
-            });
-
-            Mock::given(method("GET"))
-                .and(path("/skills/versioned-skill"))
-                .and(query_param("version", "2.0.0"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(&record))
-                .expect(1)
-                .mount(&srv)
-                .await;
-
-            let client = make_client(&srv.uri());
-            let ok =
-                install_single_skill_legacy("versioned-skill", Some("2.0.0"), &client, "tok").await;
-
-            assert!(ok);
-
-            // Clean up
-            let skill_dir = std::env::current_dir()
-                .unwrap()
-                .join(".astra/skills/versioned-skill");
-            let _ = std::fs::remove_dir_all(&skill_dir);
-        }
-
-        #[tokio::test]
-        async fn install_legacy_returns_false_on_404() {
-            let srv = MockServer::start().await;
-
-            Mock::given(method("GET"))
-                .and(path("/skills/missing-skill"))
-                .respond_with(ResponseTemplate::new(404))
-                .mount(&srv)
-                .await;
-
-            let client = make_client(&srv.uri());
-            let ok = install_single_skill_legacy("missing-skill", None, &client, "tok").await;
-
-            assert!(!ok, "install should fail on 404");
         }
 
         #[tokio::test]
@@ -2978,130 +2589,53 @@ async fn install_single_skill(
         vec![]
     };
 
-    // Attempt bundle download (binary, base64-encoded)
     match api
         .get_bearer_path_query_text(tok, &bundle_path, &query_pairs)
         .await
     {
         Ok(text) => {
-            if let Ok(bytes) =
-                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, text.trim())
-            {
-                let install_dir = std::env::current_dir()
-                    .unwrap_or_default()
-                    .join(".astra")
-                    .join("skills");
+            match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, text.trim()) {
+                Ok(bytes) => {
+                    let install_dir = std::env::current_dir()
+                        .unwrap_or_default()
+                        .join(".astra")
+                        .join("skills");
 
-                match astra_skills::pack::unpack_skill_from_bytes(&bytes, &install_dir) {
-                    Ok((installed, manifest)) => {
-                        eprintln!(
-                            "  {} Installed {} v{} to {}",
-                            theme::icon_ok(),
-                            manifest.name.magenta(),
-                            manifest.version.dim(),
-                            installed.display().to_string().dim()
-                        );
-                        return true;
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "  {} {}",
-                            "Bundle unpack failed, trying legacy format...".yellow(),
-                            format!("{e}").dim()
-                        );
+                    match astra_skills::pack::unpack_skill_from_bytes(&bytes, &install_dir) {
+                        Ok((installed, manifest)) => {
+                            eprintln!(
+                                "  {} Installed {} v{} to {}",
+                                theme::icon_ok(),
+                                manifest.name.magenta(),
+                                manifest.version.dim(),
+                                installed.display().to_string().dim()
+                            );
+                            true
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "  {} {}",
+                                "Bundle unpack failed:".red(),
+                                format!("{e}").dim()
+                            );
+                            false
+                        }
                     }
                 }
-            }
-            // Fall through to legacy install
-            install_single_skill_legacy(skill_name, version, api, tok).await
-        }
-        Err(_) => {
-            // Bundle endpoint not available, use legacy
-            install_single_skill_legacy(skill_name, version, api, tok).await
-        }
-    }
-}
-
-/// Legacy install: fetches SkillRecord JSON and writes SKILL.md directly. Returns true on success.
-async fn install_single_skill_legacy(
-    skill_name: &str,
-    version: Option<&str>,
-    api: &astra_thin_client::ThinClient,
-    tok: &str,
-) -> bool {
-    let path = format!("/skills/{}", skill_name);
-    let query_pairs: Vec<(&str, String)> = if let Some(v) = version {
-        vec![("version", v.to_string())]
-    } else {
-        vec![]
-    };
-
-    match api
-        .get_bearer_path_query_text(tok, &path, &query_pairs)
-        .await
-    {
-        Ok(text) => match serde_json::from_str::<astra_services::skills::SkillRecord>(&text) {
-            Ok(record) => {
-                let instructions = record
-                    .metadata
-                    .as_ref()
-                    .and_then(|m| m.get("instructions"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-
-                let manifest_str = record
-                    .metadata
-                    .as_ref()
-                    .and_then(|m| m.get("manifest"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-
-                let install_dir = std::env::current_dir()
-                    .unwrap_or_default()
-                    .join(".astra")
-                    .join("skills")
-                    .join(skill_name);
-
-                if let Err(e) = std::fs::create_dir_all(&install_dir) {
-                    eprintln!("  {} {}", "✗ Failed to create directory:".red(), e);
-                    return false;
-                }
-
-                let skill_md = if !manifest_str.is_empty() {
-                    format!("{manifest_str}\n\n{instructions}")
-                } else {
-                    let header = format!(
-                        "---\nname: {}\nversion: {}\ndescription: {}\n---\n\n",
-                        record.skill_name,
-                        record.version,
-                        record.description.as_deref().unwrap_or(""),
+                Err(e) => {
+                    eprintln!(
+                        "  {} {}",
+                        "Bundle response was not valid base64:".red(),
+                        format!("{e}").dim()
                     );
-                    format!("{header}{instructions}")
-                };
-
-                if let Err(e) = std::fs::write(install_dir.join("SKILL.md"), &skill_md) {
-                    eprintln!("  {} {}", "✗ Failed to write SKILL.md:".red(), e);
-                    return false;
+                    false
                 }
-
-                eprintln!(
-                    "  {} Installed {} v{} to {}",
-                    theme::icon_ok(),
-                    record.skill_name.magenta(),
-                    record.version.dim(),
-                    install_dir.display().to_string().dim()
-                );
-                true
             }
-            Err(e) => {
-                eprintln!("  {} {}", "✗ Parse error:".yellow(), format!("{e}").dim());
-                false
-            }
-        },
+        }
         Err(e) => {
             eprintln!(
                 "  {} {}",
-                "✗ Failed to fetch skill:".yellow(),
+                "Bundle download failed:".red(),
                 format!("{e}").dim()
             );
             false

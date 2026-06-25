@@ -186,7 +186,7 @@ impl ToolExecutor {
                         "search",
                         vec!["grep", "glob", "find_definition", "find_references"],
                     ),
-                    ("git", vec!["git_status", "git_diff", "git_log", "git_show"]),
+                    ("git", vec!["git"]),
                     ("tasks", vec!["task"]),
                     ("utility", vec!["bash", "web_fetch", "sleep", "ask_user"]),
                 ];
@@ -202,7 +202,11 @@ impl ToolExecutor {
             }
 
             // MCP tools
-            if self.mcp_manager.is_some() {
+            if self
+                .mcp_runtime_snapshot("mcp_runtime_diagnose")
+                .manager
+                .is_some()
+            {
                 tools_info.insert("mcp_enabled".to_string(), json!(true));
             }
 

@@ -7,7 +7,6 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use astra_core::SkillSearchSettings;
 use astra_runtime::{
     orchestration::{
         InheritedPermissions, PermissionSummary, SpawnAgentExecutor, SpawnRunConfig,
@@ -59,7 +58,6 @@ pub struct CliSpawnAgentExecutor {
     project_root: PathBuf,
     cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
     skill_resolver: Option<Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
-    skill_search: SkillSearchSettings,
     active_session_id: Option<String>,
     /// Optional sink for fork-cache telemetry. When `None` the
     /// executor still forwards `inherited_prefix` so child messages
@@ -320,7 +318,6 @@ impl CliSpawnAgentExecutor {
             project_root,
             cancel_token,
             skill_resolver: None,
-            skill_search: SkillSearchSettings::default(),
             active_session_id: None,
             fork_cache_sink: None,
             journal: None,
@@ -422,11 +419,6 @@ impl CliSpawnAgentExecutor {
         self
     }
 
-    pub fn with_skill_search(mut self, skill_search: SkillSearchSettings) -> Self {
-        self.skill_search = skill_search;
-        self
-    }
-
     pub fn with_active_session_id(mut self, session_id: impl Into<String>) -> Self {
         self.active_session_id = Some(session_id.into());
         self
@@ -495,7 +487,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
         // Resolve per-model workflow-guard policy once; used for both the
         // `SubRunHost::tool_cache` and the `AgenticLoopState` below.
         let resolved_tool_policy = astra_config::runtime_config::RuntimeConfig::load()
-            .tool_selection
+            .tool_policy
             .resolve_for_model(effective_model.as_deref());
 
         let mut host = SubRunHost {
@@ -672,7 +664,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             turn_guard: TurnGuard::with_profile(task_profile),
             restricted_tools,
             boosted_tools: HashSet::new(),
-            widen_selection_pending: false,
+            widen_surface_pending: false,
             step_recorder,
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(
@@ -689,7 +681,6 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                 resolver: self.skill_resolver.clone(),
                 quality_tracker: astra_skills::quality::SkillQualityTracker::new(),
                 improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
-                search: self.skill_search.clone(),
                 tool_event_hooks: astra_skills::hooks::load_tool_event_hooks(&effective_root),
                 session_event_hooks: astra_skills::hooks::load_session_event_hooks(&effective_root),
                 ..Default::default()
@@ -739,7 +730,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             last_measured_prompt_tokens: None,
             consecutive_context_window_errors: 0,
             compaction_effectiveness: Default::default(),
-            pinned_tool_schema_tokens: 0,
+            always_load_tool_schema_tokens: 0,
             sticky_tool_schemas: Vec::new(),
             max_turn_input_tokens: astra_core::RuntimeLimits::global().max_turn_input_tokens,
             budget_wrapup_injected: false,
@@ -753,7 +744,6 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             permission_handler: None,
             tactical_adapter: None,
             step_signal_collector: None,
-            tool_budget_override: None,
             recent_tactical_actions: Vec::new(),
             server_tool_executor: None,
             interruption: None,

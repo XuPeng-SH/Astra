@@ -190,11 +190,11 @@ composition:
 ### Current Gap
 
 ```
-Tool execution → ToolQualityTracker → boost/penalize tool selection ✅
+Tool execution → ToolHealthTracker → session-scoped safety policy ✅
 Skill execution → ??? → ??? ❌
 ```
 
-Tools have a quality feedback loop. Skills don't. This means:
+Tools have session-scoped health feedback. Skills do not yet have an equivalent quality loop. This means:
 - A skill that fails 80% of the time is selected as often as one that succeeds 95%
 - No data to improve skill instructions
 - No way to A/B test skill versions
@@ -204,7 +204,6 @@ Tools have a quality feedback loop. Skills don't. This means:
 ```rust
 // New: rust/crates/runtime/src/skills/quality.rs
 
-/// Mirrors ToolQualityTracker pattern from tool_registry/report.rs
 pub struct SkillQualityTracker {
     metrics: HashMap<String, SkillMetrics>,
 }
@@ -429,9 +428,10 @@ pub struct SkillExecutionResult {
 
 ### Phase 2: Learning Loop (问题2核心)
 
-1. Create `SkillQualityTracker` (mirrors `ToolQualityTracker` pattern)
+1. Create `SkillQualityTracker`
 2. Collect metrics from verification results + implicit signals
-3. Wire quality scores into `format_skills_within_budget()` for selection boost
+3. Feed quality scores into auto-routing and adaptive tuning signals; do not
+   mutate the cache-stable skill listing schema
 4. Add `/skill stats [name]` CLI command
 5. Persist metrics (local config file → later DB)
 
@@ -484,9 +484,11 @@ pub struct SkillExecutionResult {
 
 **Rationale**: Backward compatibility is critical for adoption. Zero-config baseline must work.
 
-### Q5: How does this relate to the Pin mechanism?
+### Q5: How does this relate to skill surfacing?
 
-**Answer**: Orthogonal. Pin controls **whether** a skill is in the context. Quality controls **where** it ranks within the budget. A pinned skill with poor quality still appears (it's pinned) but gets a warning. An unpinned skill with great quality ranks higher in budget allocation.
+**Answer**: Orthogonal. Visibility controls whether a skill is available in the
+catalog for this request. Quality controls how it is ranked and recommended
+inside that visible catalog.
 
 ---
 
@@ -524,11 +526,9 @@ pub struct SkillExecutionResult {
 | `VerificationRunner` | `services/src/durable_task.rs:770` | Execute skill verification |
 | `parse_acceptance_to_criteria()` | `services/src/contract_generator.rs:145` | Auto-detect criteria from text |
 
-### From tool_registry (pattern to mirror)
+### Current pattern references
 
 | Component | Location | Mirror for Skills |
 |-----------|----------|------------------|
-| `ToolQualityTracker` | `runtime/src/tool_registry/report.rs:58` | → `SkillQualityTracker` |
-| `SelectionReport` | `runtime/src/tool_registry/report.rs:15` | → `SkillSelectionReport` |
-| `SelectionFeedback` | `runtime/src/tool_registry/report.rs:35` | → `SkillFeedback` |
-| Boost factor `[0.5, 1.5]` | `runtime/src/tool_registry/report.rs:100` | Same range for skills |
+| `ToolSurfaceReport` | `astra-turn-core/src/tool/registry/report.rs` | → `SkillSurfaceReport` |
+| `ToolSurfaceFeedback` | `astra-turn-core/src/tool/registry/report.rs` | → `SkillFeedback` |

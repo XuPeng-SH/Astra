@@ -201,11 +201,11 @@ fn extend_runtime_sidecar_events(
             &verdict.severity,
             &verdict.injections,
             &verdict.avoid_tools,
-            &verdict.deprioritized_tools,
+            &verdict.health_avoidance_tools,
             verdict.force_stop,
             verdict.nudge_count,
             verdict.total_errors,
-            verdict.deprioritized_count,
+            verdict.health_avoidance_count,
             verdict.total_timeouts,
             &verdict.timeout_dominant_tools,
             verdict.total_cache_hits,
@@ -269,8 +269,8 @@ fn build_primary_turn_event(
         result.completion_tokens,
         turn_start.elapsed().as_millis() as u64,
     )
-    .with_tool_selection(
-        std::mem::take(&mut result.tools_selected),
+    .with_tool_surface(
+        std::mem::take(&mut result.visible_tools),
         std::mem::take(&mut result.selected_skills),
         result.tools_used.clone(),
         result.budget_used,
@@ -457,14 +457,14 @@ mod tests {
             session_id: Some(sid.clone()),
             model: Some("gpt-5".into()),
             turn: 1,
-            recent_tools: vec!["git_status".into()],
+            recent_tools: vec!["git".into()],
             ..Default::default()
         };
         let mut result = crate::tests::stub_stream_result("Workspace is clean.");
-        result.tools_used = vec!["git_status".into()];
+        result.tools_used = vec!["git".into()];
         result.tool_calls_count = 1;
         result.tool_call_records = vec![session_journal::ToolCallRecord {
-            name: "git_status".into(),
+            name: "git".into(),
             ok: true,
             ms: 12,
             error: None,
@@ -601,18 +601,14 @@ mod tests {
             session_id: sid.clone(),
             ..Default::default()
         };
-        trace.tools.tools_selected = vec![
-            astra_turn_core::context_assembly_trace::ToolSelected {
-                tool_name: "git_diff".into(),
-                score: 0.0,
+        trace.tools.visible_tools = vec![
+            astra_turn_core::context_assembly_trace::VisibleTool {
+                tool_name: "git".into(),
                 tokens: 0,
-                selection_factors: Vec::new(),
             },
-            astra_turn_core::context_assembly_trace::ToolSelected {
+            astra_turn_core::context_assembly_trace::VisibleTool {
                 tool_name: "read_file".into(),
-                score: 0.0,
                 tokens: 0,
-                selection_factors: Vec::new(),
             },
         ];
         trace.token_budget.total_used = 12_345;

@@ -131,10 +131,11 @@ async fn try_edge_websocket(
     let Some(edge_result) = edge_result else {
         return EdgeTransportAttempt::TransportDisconnected;
     };
-    EdgeTransportAttempt::Delivered(plan.delivered_result(
+    EdgeTransportAttempt::Delivered(plan.delivered_result_with_fields(
         edge_result.output,
         edge_result.is_error,
         ToolTransportKind::EdgeWs,
+        edge_result.tool_result_fields,
     ))
 }
 
@@ -267,12 +268,13 @@ async fn try_edge_dispatch(
         }
         return EdgeTransportAttempt::TransportDisconnected;
     };
-    let (output, is_error) =
-        astra_thin_client::ToolResultRequest::parse_output_and_error(&result_json);
-    EdgeTransportAttempt::Delivered(plan.delivered_result(
+    let (output, is_error, tool_result_fields) =
+        astra_thin_client::ToolResultRequest::parse_output_error_and_fields(&result_json);
+    EdgeTransportAttempt::Delivered(plan.delivered_result_with_fields(
         output,
         is_error,
         ToolTransportKind::EdgeLedger,
+        tool_result_fields,
     ))
 }
 

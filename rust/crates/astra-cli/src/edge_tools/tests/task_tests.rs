@@ -26,16 +26,8 @@ fn setup() -> (tempfile::TempDir, ToolExecutor) {
 // ── Task tool tests ─────────────────────────────────────────��────────────
 
 #[tokio::test]
-async fn legacy_task_tool_names_are_not_executable() {
+async fn task_tool_create_is_executable() {
     let (_dir, exe) = setup();
-
-    let legacy = exe
-        .execute("task_create", &json!({"title": "old surface"}))
-        .await;
-    assert!(
-        legacy.starts_with("Error:") || legacy.contains("Unknown"),
-        "legacy task_create must not remain an executable task surface: {legacy}"
-    );
 
     let unified = exe
         .execute("task", &json!({"action": "create", "title": "new surface"}))
@@ -418,18 +410,17 @@ async fn task_tool_rejects_unknown_fields_instead_of_ignoring_typos() {
         "adopt typo should be rejected locally before cloud checks: {adopt_typo}"
     );
 
-    let old_background_action = exe
+    let unknown_background_action = exe
         .execute(
             "task",
             &json!({"action": "background_shell", "command": "echo hi"}),
         )
         .await;
     assert!(
-        old_background_action.starts_with("Error:")
-            && old_background_action.contains("unknown `task` action")
-            && old_background_action.contains("background_shell")
-            && !old_background_action.contains("agent_job(action='"),
-        "old task background actions should be ordinary unknown task actions: {old_background_action}"
+        unknown_background_action.starts_with("Error:")
+            && unknown_background_action.contains("unknown `task` action")
+            && unknown_background_action.contains("background_shell"),
+        "background_shell should be an ordinary unknown task action: {unknown_background_action}"
     );
 }
 
@@ -527,92 +518,6 @@ async fn task_action_update_rejects_empty_mutation() {
     let details: serde_json::Value = serde_json::from_str(&details).unwrap();
     assert_eq!(details["title"], "No-op task");
     assert_eq!(details["status"], "pending");
-}
-
-#[tokio::test]
-async fn session_summary_surfaces_paused_open_work_with_canonical_update_hint() {
-    let dir = tempfile::tempdir().unwrap();
-    let exe = ToolExecutor::new(dir.path()).with_active_session_id("summary-paused-session");
-    exe.task_action_create(&json!({"title": "Paused investigation"}))
-        .await;
-    exe.task_action_update(&json!({"task_id": "task-1", "new_status": "paused"}))
-        .await;
-
-    let summary = exe.execute("session", &json!({"action": "summary"})).await;
-
-    assert!(summary.contains("Open tasks: 1"), "{summary}");
-    assert!(summary.contains("⏸ task-1"), "{summary}");
-    assert!(summary.contains("Paused investigation"), "{summary}");
-    assert!(
-        summary.contains("new_status=\"...\""),
-        "summary must teach the canonical status field: {summary}"
-    );
-    assert!(
-        !summary.contains(", status=\"...\""),
-        "summary must not advertise the old status field: {summary}"
-    );
-}
-
-#[tokio::test]
-async fn session_summary_surfaces_task_board_load_failure() {
-    struct FailingTaskStore;
-
-    #[async_trait]
-    impl TaskStore for FailingTaskStore {
-        async fn load(&self, _session_id: &str) -> Result<Vec<SessionTask>, String> {
-            Err("simulated summary task-board outage".to_string())
-        }
-
-        async fn save(&self, _session_id: &str, _tasks: Vec<SessionTask>) -> Result<(), String> {
-            Ok(())
-        }
-
-        async fn mutate(
-            &self,
-            _session_id: &str,
-            mutation: TaskMutation,
-        ) -> Result<String, String> {
-            let result = mutation(Vec::new(), 1)?;
-            Ok(result.response)
-        }
-
-        async fn next_task_id(&self, _session_id: &str) -> Result<u32, String> {
-            Ok(1)
-        }
-
-        async fn peek_next_task_id(&self, _session_id: &str) -> Result<u32, String> {
-            Ok(1)
-        }
-    }
-
-    let dir = tempfile::tempdir().unwrap();
-    let _guard = JournalDirGuard::new(dir.path());
-    let journal_path = session_journal::journal_file_path("summary-task-load-fail");
-    std::fs::create_dir_all(journal_path.parent().unwrap()).unwrap();
-    std::fs::write(
-        &journal_path,
-        r#"{"type":"turn","turn":1,"tokens_in":1,"tokens_out":2}"#,
-    )
-    .unwrap();
-    let exe = ToolExecutor::new(dir.path())
-        .with_active_session_id("summary-task-load-fail")
-        .with_shared_task_manager(Arc::new(TaskManager::new(
-            "summary-task-load-fail",
-            Arc::new(FailingTaskStore),
-        )));
-
-    let summary = exe.execute("session", &json!({"action": "summary"})).await;
-
-    assert!(
-        summary.contains("Task board unavailable")
-            && summary.contains("simulated summary task-board outage")
-            && summary.contains("Do not assume there are no open tasks"),
-        "session summary should surface task-board load failure instead of silently omitting open tasks: {summary}"
-    );
-    assert!(
-        !summary.contains("Open tasks: 0"),
-        "session summary must not report zero open tasks when task board is unreadable: {summary}"
-    );
 }
 
 #[tokio::test]
@@ -727,7 +632,7 @@ async fn task_mutations_append_lifecycle_events_to_session_journal() {
         .await;
     exe.task_action_stop(&json!({"task_id": "task-1", "reason": "user cancelled"}))
         .await;
-    exe.task_archive(&json!({"task_id": "task-1"})).await;
+    exe.task_action_archive(&json!({"task_id": "task-1"})).await;
 
     let raw = std::fs::read_to_string(session_journal::journal_file_path("task-journal-session"))
         .unwrap();
@@ -851,7 +756,7 @@ async fn task_action_stop_cancels_subtasks() {
     assert_eq!(parsed["cancelled_subtasks"], 2);
 }
 
-// ── task_archive tests ───────────────────────────────────────────────────
+// ── task(action=archive) tests ────────────────────────────────────────────
 
 #[tokio::test]
 async fn task_archive_works_without_cloud_connection() {
@@ -862,7 +767,7 @@ async fn task_archive_works_without_cloud_connection() {
     exe.task_action_update(&json!({"task_id": "task-1", "new_status": "completed"}))
         .await;
 
-    let result = exe.task_archive(&json!({"task_id": "task-1"})).await;
+    let result = exe.task_action_archive(&json!({"task_id": "task-1"})).await;
     let parsed = parse_task_json(&result);
     assert!(
         parsed["success"].as_bool().unwrap(),

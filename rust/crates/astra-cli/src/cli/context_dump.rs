@@ -28,8 +28,8 @@
 //! ```
 //!
 //! The `trace` field serialises every byte the runtime recorded
-//! (token budget, system-prompt breakdown, tool + memory +
-//! skill-selector + decision traces).  `chat_history` captures
+//! (token budget, system-prompt breakdown, tool-surface, memory,
+//! and decision traces).  `chat_history` captures
 //! the same user/assistant/reasoning text the TUI shows, so the
 //! dump reproduces what the model "saw" this turn.  This is the
 //! truth file — paste it into a bug report and the maintainer
@@ -724,7 +724,7 @@ mod tests {
                 config_value: None,
                 turns_compacted: None,
                 facts_stored: None,
-                tools_selected: None,
+                visible_tools: None,
                 selected_skills: None,
                 tools_used: None,
                 tool_calls: None,
@@ -741,7 +741,6 @@ mod tests {
                 session_lineage: None,
                 coordination: None,
                 edge_policy: None,
-                selection_trace: None,
                 context_assembly_trace: None,
                 routing_domain_hint: None,
                 entity_learn_skipped_no_domain: false,

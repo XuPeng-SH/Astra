@@ -298,7 +298,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
         // Resolve per-model workflow-guard policy before `effective_model` is
         // consumed by `.with_model(...)` below.
         let resolved_tool_policy = astra_config::runtime_config::RuntimeConfig::load()
-            .tool_selection
+            .tool_policy
             .resolve_for_model(effective_model.as_deref());
 
         // Build the host for the sub-run.
@@ -424,7 +424,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             turn_guard: TurnGuard::with_profile(task_profile),
             restricted_tools,
             boosted_tools: HashSet::new(),
-            widen_selection_pending: false,
+            widen_surface_pending: false,
             step_recorder,
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(
@@ -494,7 +494,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             last_measured_prompt_tokens: None,
             consecutive_context_window_errors: 0,
             compaction_effectiveness: Default::default(),
-            pinned_tool_schema_tokens: 0,
+            always_load_tool_schema_tokens: 0,
             sticky_tool_schemas: Vec::new(),
             max_turn_input_tokens: astra_core::RuntimeLimits::global().max_turn_input_tokens,
             budget_wrapup_injected: false,
@@ -508,7 +508,6 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             permission_handler: None,
             tactical_adapter: None,
             step_signal_collector: None,
-            tool_budget_override: None,
             recent_tactical_actions: Vec::new(),
             server_tool_executor: None,
             interruption: None,

@@ -21,13 +21,45 @@ use crate::{ToolApprovalGate, ToolContext, ToolExecutor, ToolProgressCallback, T
 // ─── Helper ─────────────────────────────────────────────────────────────────
 
 /// Convert a String-returning tool function to ToolResult.
-/// Convention: outputs starting with "Error" are error results.
+/// Prefer structured JSON failure (`status=failed`, `success=false`, or
+/// `error`) over legacy text prefixes.
 fn string_to_result(output: String) -> ToolResult {
-    if output.starts_with("Error") {
+    let parsed = serde_json::from_str::<Value>(&output).ok();
+    let structured_error = parsed
+        .as_ref()
+        .and_then(|value| value.get("success").and_then(Value::as_bool))
+        .is_some_and(|success| !success)
+        || parsed
+            .as_ref()
+            .and_then(|value| value.get("status").and_then(Value::as_str))
+            .is_some_and(structured_status_is_error)
+        || parsed
+            .as_ref()
+            .and_then(|value| value.get("error"))
+            .is_some_and(json_error_value_is_error);
+    if structured_error || output.starts_with("Error") {
         ToolResult::error(output)
     } else {
         ToolResult::text(output)
     }
+}
+
+fn json_error_value_is_error(error: &Value) -> bool {
+    !error.is_null() && error.as_str() != Some("")
+}
+
+fn structured_status_is_error(status: &str) -> bool {
+    matches!(
+        status.trim().to_ascii_lowercase().as_str(),
+        "failed"
+            | "error"
+            | "partial_failure"
+            | "denied"
+            | "cancelled"
+            | "canceled"
+            | "timeout"
+            | "timed_out"
+    )
 }
 
 fn outcome_to_result(outcome: crate::git_gix::ToolExecutionOutcome) -> ToolResult {
@@ -652,12 +684,12 @@ impl DefaultToolExecutor {
             }
         };
         let output = match action {
-            "list_prs" => client.github_list_prs(args).await,
-            "get_pr" => client.github_get_pr(args).await,
-            "ci_status" => client.github_ci_status(args).await,
-            "list_issues" => client.github_list_issues(args).await,
-            "get_issue" => client.github_get_issue(args).await,
-            "repo_stats" => client.github_repo_stats(args).await,
+            "list_prs" => client.list_prs(args).await,
+            "get_pr" => client.get_pr(args).await,
+            "ci_status" => client.ci_status(args).await,
+            "list_issues" => client.list_issues(args).await,
+            "get_issue" => client.get_issue(args).await,
+            "repo_stats" => client.repo_stats(args).await,
             "create_issue" => client.create_issue(args).await,
             _ => return ToolResult::error(format!("Error: Unknown github action '{action}'")),
         };
@@ -1054,6 +1086,77 @@ mod tests {
             "ok() outcomes must stay successful even when output starts with 'Error'"
         );
         assert!(result.output.starts_with("Error code 0"));
+    }
+
+    #[test]
+    fn string_to_result_uses_structured_failure_status() {
+        let result = string_to_result(
+            serde_json::json!({
+                "status": "failed",
+                "error": "'query' is required",
+            })
+            .to_string(),
+        );
+
+        assert!(
+            result.is_error,
+            "structured status=failed must classify as tool error"
+        );
+    }
+
+    #[test]
+    fn string_to_result_does_not_misclassify_completed_json() {
+        let result = string_to_result(
+            serde_json::json!({
+                "status": "completed",
+                "output": "Error count: 0",
+            })
+            .to_string(),
+        );
+
+        assert!(
+            !result.is_error,
+            "completed structured JSON must not be classified by incidental text"
+        );
+    }
+
+    #[test]
+    fn string_to_result_does_not_misclassify_null_or_empty_error() {
+        for error in [serde_json::Value::Null, serde_json::json!("")] {
+            let result = string_to_result(
+                serde_json::json!({
+                    "ok": true,
+                    "error": error,
+                    "output": "completed"
+                })
+                .to_string(),
+            );
+
+            assert!(
+                !result.is_error,
+                "null/empty JSON error fields are not failures"
+            );
+        }
+    }
+
+    #[test]
+    fn string_to_result_does_not_misclassify_agent_domain_status_json() {
+        for status in ["launched", "still_running", "waiting", "interrupted"] {
+            let result = string_to_result(
+                serde_json::json!({
+                    "status": status,
+                    "agent_id": "reviewer@abc",
+                    "finish_reason": "budget_exhausted",
+                    "result": "partial review",
+                })
+                .to_string(),
+            );
+
+            assert!(
+                !result.is_error,
+                "agent status {status} is a domain state, not a malformed tool call"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1589,6 +1692,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_tool_search_missing_query_returns_structured_error() {
+        let (_tmp, exec) = test_executor();
+        let result = exec.execute("tool_search", &serde_json::json!({})).await;
+
+        assert!(
+            result.is_error,
+            "structured tool_search failure must be marked as a tool error"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&result.output)
+            .unwrap_or_else(|error| panic!("tool_search error must stay JSON: {error}"));
+        assert_eq!(parsed["mode"].as_str(), Some("error"));
+        assert_eq!(parsed["status"].as_str(), Some("failed"));
+        assert_eq!(parsed["error"].as_str(), Some("'query' is required"));
+    }
+
+    #[tokio::test]
     async fn dispatch_github_without_client_gives_actionable_guidance() {
         let (_tmp, exec) = test_executor();
         let result = exec
@@ -1601,8 +1720,8 @@ mod tests {
             result.output
         );
         assert!(
-            !result.output.contains("github_list_prs"),
-            "error must not leak legacy helper tool names: {}",
+            !result.output.contains("github_"),
+            "error must not leak helper-style tool names: {}",
             result.output
         );
         assert!(
@@ -1655,17 +1774,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_github_helper_names_are_unknown_tools() {
+    async fn dispatch_github_helper_style_names_are_unknown_tools() {
         let (_tmp, exec) = test_executor();
-        for name in [
-            "github_list_prs",
-            "github_get_pr",
-            "github_ci_status",
-            "github_list_issues",
-            "github_get_issue",
-            "github_repo_stats",
-        ] {
-            let result = exec.execute(name, &serde_json::json!({})).await;
+        let actions = [
+            "list_prs",
+            "get_pr",
+            "ci_status",
+            "list_issues",
+            "get_issue",
+            "repo_stats",
+        ];
+        for name in actions.into_iter().map(|action| format!("github_{action}")) {
+            let result = exec.execute(&name, &serde_json::json!({})).await;
             assert!(result.is_error, "{name}: {}", result.output);
             assert!(
                 result

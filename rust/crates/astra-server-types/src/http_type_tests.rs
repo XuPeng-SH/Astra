@@ -174,6 +174,22 @@ fn chat_request_rejects_legacy_top_level_model_field() {
 }
 
 #[test]
+fn chat_request_rejects_mcp_binding_ids_unknown_field() {
+    let result = serde_json::from_str::<ChatRequest>(
+        r#"{"message":"hello","selected_model":{"model":"gpt-4"},"mcp_binding_ids":[301]}"#,
+    );
+    assert!(
+        result.is_err(),
+        "mcp_binding_ids must not remain a request field"
+    );
+    let err = result.err().unwrap();
+    assert!(
+        err.to_string().contains("unknown field `mcp_binding_ids`"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
 fn chat_request_rejects_selected_model_string_form() {
     let result =
         serde_json::from_str::<ChatRequest>(r#"{"message":"hello","selected_model":"gpt-4"}"#);
@@ -991,7 +1007,6 @@ fn chat_request_into_data_maps_all_fields() {
             url: "http://catalog:8081/api/v1/llm-token".into(),
             timeout_ms: Some(2500),
         }),
-        skill_search: Some(astra_core::SkillSearchSettings::default()),
         allow_skills: None,
         allow_skill_sources: None,
         allow_tools: None,
@@ -1005,7 +1020,6 @@ fn chat_request_into_data_maps_all_fields() {
                 "Bearer runtime-token".to_string(),
             )]),
         }],
-        mcp_binding_ids: None,
         context: Some(ctx.clone()),
         edge_executor_id: Some("edge-1".into()),
         capabilities: vec!["bash".into(), "fs".into()],
@@ -1037,13 +1051,8 @@ fn chat_request_into_data_maps_all_fields() {
         data.llm_token_service.as_ref().and_then(|v| v.timeout_ms),
         Some(2500)
     );
-    assert_eq!(
-        data.skill_search,
-        Some(astra_core::SkillSearchSettings::default())
-    );
     assert_eq!(data.runtime_mcp_bindings.len(), 1);
     assert_eq!(data.runtime_mcp_bindings[0].id, "external_nl2sql");
-    assert!(data.mcp_binding_ids.is_none());
     assert_eq!(data.context, Some(ctx));
     assert_eq!(data.edge_executor_id.as_deref(), Some("edge-1"));
     assert_eq!(data.capabilities, vec!["bash", "fs"]);
@@ -1074,7 +1083,6 @@ fn chat_request_into_data_maps_defaults() {
     assert!(data.model.is_none());
     assert!(data.llm_token_service.is_none());
     assert!(data.runtime_mcp_bindings.is_empty());
-    assert!(data.mcp_binding_ids.is_none());
     assert!(data.context.is_none());
     assert!(data.edge_executor_id.is_none());
     assert!(data.capabilities.is_empty());
@@ -1099,12 +1107,10 @@ fn chat_request_into_data_merges_plan_subtask_into_context() {
         workspace_binding: None,
         executor_binding: None,
         llm_token_service: None,
-        skill_search: None,
         allow_skills: None,
         allow_skill_sources: None,
         allow_tools: None,
         runtime_mcp_bindings: Vec::new(),
-        mcp_binding_ids: None,
         context: None,
         edge_executor_id: None,
         capabilities: Vec::new(),

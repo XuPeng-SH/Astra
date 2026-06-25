@@ -41,9 +41,9 @@ pub const SERVER_BUILTIN_TOOL_NAMES: &[&str] = &[
     "memory",
     "session",
     "task",
-    "mo",
     "mo_query",
     "rollback_database_snapshots",
+    "rollback_file_edits",
     "rollback_session_state",
     // AgentDelegation
     "agent",
@@ -58,9 +58,6 @@ pub const SERVER_BUILTIN_TOOL_NAMES: &[&str] = &[
     "get_agent_info",
     "symbols",
     "introspect",
-    // Tool preference
-    "prioritize_tool",
-    "deprioritize_tool",
     // Context management
     "compress_context",
     // Artifact publishing
@@ -188,6 +185,7 @@ mod tests {
                 stdout: format!("executed {}\n", name),
                 stderr: String::new(),
                 exit_code: 0,
+                metadata: None,
             }
         }
     }

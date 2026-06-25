@@ -24,7 +24,7 @@ pub const MAX_CONCURRENT_READ_ONLY: usize = 10;
 
 /// Alias used by the CLI-side batch path (`stream_render::execute_tools_batch`).
 /// Kept equal to [`MAX_CONCURRENT_READ_ONLY`] so the in-turn cap matches
-/// claude-code semantics (10) across both speculative and batched paths.
+/// reference-agent semantics (10) across both speculative and batched paths.
 pub const MAX_CONCURRENT_TOOL_EXECUTIONS: usize = MAX_CONCURRENT_READ_ONLY;
 
 /// Process-wide semaphore shared across every tool-execution batch.
@@ -80,7 +80,7 @@ pub fn parse_tool_args(tc: &Value) -> Option<Value> {
 
 /// Classify a tool call as parallelizable using args-aware classification.
 ///
-/// For shell tools (bash, BashTool), inspects the `command` argument to
+/// For shell tools, inspects the `command` argument to
 /// determine if the command is read-only (e.g. `git status`, `ls`).
 /// Falls back to the process-wide [`crate::concurrency_safety`] registry
 /// for MCP / dynamic tools not in the static table.

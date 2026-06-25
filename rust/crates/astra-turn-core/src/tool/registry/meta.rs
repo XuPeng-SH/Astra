@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::capability::Capability;
 
-/// Intent type for tag-based pre-filtering.
+/// Intent type for catalog diagnostics and tool discovery metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IntentType {
@@ -37,7 +37,7 @@ impl IntentType {
     }
 }
 
-/// Data source scope for tag-based pre-filtering.
+/// Data source scope for catalog diagnostics and capability filtering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Scope {
@@ -51,17 +51,15 @@ pub enum Scope {
     CrossSession,
 }
 
-/// Static metadata for a tool — used for selection, never sent to LLM.
+/// Static metadata for a tool — used for catalog diagnostics and discovery, never sent to LLM.
 #[derive(Debug, Clone)]
 pub struct ToolMeta {
-    /// Tool function name (e.g. "bash", "github_list_prs")
+    /// Tool function name (e.g. "bash", "github")
     pub name: &'static str,
-    /// Short description for embedding index
+    /// Short description for deferred discovery metadata.
     pub description: &'static str,
-    /// Trigger phrases — additional semantic signals for retrieval
+    /// Trigger phrases — search hints for `tool_search`.
     pub triggers: &'static [&'static str],
-    /// Whether this tool is always included (no selection needed)
-    pub pinned: bool,
     /// Intent classification tags
     pub intents: &'static [IntentType],
     /// Data source scope
@@ -69,7 +67,7 @@ pub struct ToolMeta {
     /// Runtime capabilities required before this tool can be advertised.
     pub requires: &'static [Capability],
     /// Calls that may be routed to schema/shape validation without an active
-    /// executor for `requires`. This is for validation-only legacy actions,
+    /// executor for `requires`. This is for validation-only action shapes,
     /// not for executing capability-gated work.
     pub binding_validation: RuntimeBindingValidation,
     /// Estimated token cost of the full JSON schema (~JSON bytes / 4)
@@ -104,9 +102,6 @@ impl RuntimeBindingValidation {
 pub static TOOL_CATALOG: &[ToolMeta] = &[
     // ── Built-in tools ──────────────────────────────────────────────
     //
-    // `pinned` must match the runtime default surface for catalog-backed tools.
-    // Non-core tools stay selectable/deferred by default and can still be
-    // promoted into `tools[]` by relevance or explicit user config.
     ToolMeta {
         name: "bash",
         description: "Execute shell commands for builds, tests, installs, git, CLI tasks",
@@ -114,7 +109,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "run", "execute", "build", "test", "install", "command", "shell", "script", "compile",
             "运行", "执行", "编译", "测试", "安装", "命令", "脚本",
         ],
-        pinned: true,
         intents: &[IntentType::CodeEdit, IntentType::CodeRead, IntentType::Git],
         scope: Scope::Local,
         requires: &[],
@@ -133,7 +127,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "下载文件",
             "预览文件",
         ],
-        pinned: false,
         intents: &[IntentType::CodeRead],
         scope: Scope::Local,
         requires: &[],
@@ -163,7 +156,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "文件内容",
             "查看文件",
         ],
-        pinned: true,
         intents: &[IntentType::CodeRead],
         scope: Scope::Local,
         requires: &[],
@@ -195,8 +187,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "输出到文件",
             "导出文件",
         ],
-        // Pinned: paired with str_replace/read_file as the basic edit triad.
-        pinned: true,
         intents: &[IntentType::CodeEdit],
         scope: Scope::Local,
         requires: &[],
@@ -228,7 +218,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "更改",
             // Note: 重命名 is intentionally not here — LSP rename is preferred for semantic renames
         ],
-        pinned: true,
         intents: &[IntentType::CodeEdit],
         scope: Scope::Local,
         requires: &[],
@@ -260,7 +249,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "文件结构",
             "目录结构",
         ],
-        pinned: true,
         intents: &[IntentType::CodeRead],
         scope: Scope::Local,
         requires: &[],
@@ -280,9 +268,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "代码搜索",
             "全文搜索",
         ],
-        // Pinned: near-universal for code navigation — including in the static
-        // tool prefix keeps prompt cache stable across turns.
-        pinned: true,
         intents: &[IntentType::CodeRead],
         scope: Scope::Local,
         requires: &[],
@@ -312,8 +297,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "文件模式",
             "扩展名",
         ],
-        // Pinned: partner to grep for locating files before reading them.
-        pinned: true,
         intents: &[IntentType::CodeRead],
         scope: Scope::Local,
         requires: &[],
@@ -334,7 +317,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "状态",
             "健康度",
         ],
-        pinned: false,
         intents: &[IntentType::CodeRead],
         scope: Scope::Local,
         requires: &[],
@@ -353,9 +335,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "搜工具",
             "查工具",
         ],
-        // Pinned: activation primitive for the deferred tool layer. Must always
-        // be in tools[] so the model can reach any deferred tool.
-        pinned: true,
         intents: &[IntentType::CodeRead],
         scope: Scope::Local,
         requires: &[],
@@ -410,7 +389,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "文档链接",
             "联动编辑",
         ],
-        pinned: false,
         intents: &[IntentType::CodeRead, IntentType::CodeEdit],
         scope: Scope::Local,
         requires: &[Capability::LSPServer],
@@ -439,7 +417,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "分支",
             "历史",
         ],
-        pinned: true,
         intents: &[IntentType::Git],
         scope: Scope::LocalGit,
         requires: &[],
@@ -459,7 +436,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "merge",
             "review",
         ],
-        pinned: false,
         intents: &[IntentType::GitHub],
         scope: Scope::External,
         requires: &[Capability::GitHubAuth],
@@ -491,16 +467,16 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "获取页面",
             "打开网址",
         ],
-        pinned: false,
         intents: &[IntentType::CodeRead],
         scope: Scope::External,
         requires: &[],
         binding_validation: RuntimeBindingValidation::None,
         schema_tokens: 25,
     },
-    // memory is pinned — intrinsic memory capability. The model must always be
-    // able to store and retrieve memories regardless of query content. Without
-    // this, implicit preferences and background extraction have no stable path.
+    // ToolSpec marks memory as always-load: intrinsic memory capability. The
+    // model must always be able to store and retrieve memories regardless of
+    // query content. Without this, implicit preferences and background
+    // extraction have no stable path.
     ToolMeta {
         name: "memory",
         description: "Memory operations: store, retrieve, purge, correct, profile, search, feedback. Pass action parameter.",
@@ -508,7 +484,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "memory", "remember", "recall", "forget", "store", "retrieve", "记忆", "记住", "回忆",
             "存储",
         ],
-        pinned: true,
         intents: &[IntentType::Memory],
         scope: Scope::CrossSession,
         requires: &[Capability::MemoryService],
@@ -517,69 +492,22 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
     },
     ToolMeta {
         name: "session",
-        description: "Session state and lifecycle operations: config, prioritize, deprioritize, compact, rollback_edits, ask_user, sleep, timeline, summary, history, suppress_memory(memory_id), unsuppress_memory(memory_id), list_suppressed, release_context(tool_call_id|string[]), list_released.",
+        description: "Session lifecycle and history operations: config, sleep, history_page, history_search, history_around.",
         triggers: &[
             "config",
             "adjust",
-            "prioritize",
-            "deprioritize",
-            "goal",
-            "compact",
-            "plan",
             "rollback",
-            "ask",
             "sleep",
-            "search tools",
-            "suppress",
-            "unsuppress",
-            "release",
-            "压缩",
-            "目标",
+            "history",
+            "session history",
             "配置",
-            "计划",
+            "历史",
         ],
-        pinned: false,
         intents: &[IntentType::Introspect],
         scope: Scope::Local,
         requires: &[],
         binding_validation: RuntimeBindingValidation::None,
         schema_tokens: 60,
-    },
-    ToolMeta {
-        name: "prioritize_tool",
-        description: "Pin a tool as preferred for this session",
-        triggers: &[
-            "prioritize_tool",
-            "prioritize",
-            "prefer tool",
-            "pin tool",
-            "工具优先",
-            "优先使用",
-        ],
-        pinned: false,
-        intents: &[IntentType::Introspect],
-        scope: Scope::Local,
-        requires: &[],
-        binding_validation: RuntimeBindingValidation::None,
-        schema_tokens: 25,
-    },
-    ToolMeta {
-        name: "deprioritize_tool",
-        description: "Soft-deprioritize a tool for this session",
-        triggers: &[
-            "deprioritize_tool",
-            "deprioritize",
-            "avoid tool",
-            "lower priority",
-            "不要优先",
-            "降低工具优先级",
-        ],
-        pinned: false,
-        intents: &[IntentType::Introspect],
-        scope: Scope::Local,
-        requires: &[],
-        binding_validation: RuntimeBindingValidation::None,
-        schema_tokens: 25,
     },
     ToolMeta {
         name: "compress_context",
@@ -592,7 +520,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "压缩上下文",
             "压缩历史",
         ],
-        pinned: false,
         intents: &[IntentType::Introspect],
         scope: Scope::Local,
         requires: &[],
@@ -610,32 +537,11 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "回滚会话",
             "恢复会话状态",
         ],
-        pinned: false,
         intents: &[IntentType::Introspect],
         scope: Scope::Local,
         requires: &[],
         binding_validation: RuntimeBindingValidation::None,
         schema_tokens: 35,
-    },
-    ToolMeta {
-        name: "mo",
-        description: "MatrixOne database operations: query, snapshot, branch. Execute SQL and manage DB state.",
-        triggers: &[
-            "sql",
-            "query",
-            "database",
-            "matrixone",
-            "snapshot",
-            "branch",
-            "数据库",
-            "查询",
-        ],
-        pinned: false,
-        intents: &[IntentType::CodeEdit],
-        scope: Scope::External,
-        requires: &[Capability::Database],
-        binding_validation: RuntimeBindingValidation::None,
-        schema_tokens: 40,
     },
     ToolMeta {
         name: "mo_query",
@@ -648,7 +554,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "数据库查询",
             "执行 SQL",
         ],
-        pinned: false,
         intents: &[IntentType::Database],
         scope: Scope::External,
         requires: &[Capability::Database],
@@ -666,7 +571,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "数据库回滚",
             "恢复数据库快照",
         ],
-        pinned: false,
         intents: &[IntentType::Database],
         scope: Scope::External,
         requires: &[Capability::Database],
@@ -677,15 +581,10 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         name: "agent",
         description: "Multi-agent operations: spawn one sub-agent, collect one background result, send messages, or execute a tool chain.",
         triggers: &["agent", "spawn", "chain", "orchestrate", "代理"],
-        pinned: false,
         intents: &[IntentType::CodeEdit],
         scope: Scope::External,
         requires: &[Capability::AgentSpawner],
-        binding_validation: RuntimeBindingValidation::ActionAllowlist(&[
-            "",
-            "delegate",
-            "run_chain",
-        ]),
+        binding_validation: RuntimeBindingValidation::ActionAllowlist(&["", "run_chain"]),
         schema_tokens: 40,
     },
     ToolMeta {
@@ -709,7 +608,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "多视角审查",
             "同时审查",
         ],
-        pinned: false,
         intents: &[IntentType::CodeEdit],
         scope: Scope::External,
         requires: &[Capability::AgentSpawner],
@@ -725,7 +623,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "shell output",
             "bg output",
         ],
-        pinned: false,
         intents: &[IntentType::CodeEdit],
         scope: Scope::Local,
         requires: &[Capability::LocalBackgroundTasks],
@@ -741,7 +638,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "kill background",
             "cancel background",
         ],
-        pinned: false,
         intents: &[IntentType::CodeEdit],
         scope: Scope::Local,
         requires: &[Capability::LocalBackgroundTasks],
@@ -757,7 +653,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "list background",
             "bg tasks",
         ],
-        pinned: false,
         intents: &[IntentType::CodeEdit],
         scope: Scope::Local,
         requires: &[Capability::LocalBackgroundTasks],
@@ -777,7 +672,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "函数列表",
             "类列表",
         ],
-        pinned: false,
         intents: &[IntentType::CodeRead],
         scope: Scope::Local,
         requires: &[],
@@ -788,7 +682,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         name: "powershell",
         description: "Execute PowerShell commands for Windows shell tasks and cross-platform automation",
         triggers: &["powershell", "pwsh", "ps1", "windows", "PowerShell"],
-        pinned: false,
         intents: &[IntentType::CodeEdit, IntentType::CodeRead],
         scope: Scope::Local,
         requires: &[],
@@ -799,7 +692,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         name: "run_script",
         description: "Execute a structured script via sandbox RPC transport (Unix-only)",
         triggers: &["run_script", "script", "sandbox", "rpc"],
-        pinned: false,
         intents: &[IntentType::CodeEdit],
         scope: Scope::Local,
         requires: &[],
@@ -810,7 +702,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         name: "skill",
         description: "Execute a discovered skill by name. Skills wrap reusable workflows.",
         triggers: &["skill", "workflow", "技能"],
-        pinned: true,
         intents: &[IntentType::CodeRead],
         scope: Scope::Local,
         requires: &[Capability::SkillsCatalog],
@@ -821,7 +712,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         name: "enter_plan_mode",
         description: "Switch the runtime into plan-authoring mode. Server-owned state machine.",
         triggers: &["plan", "enter plan mode"],
-        pinned: false,
         intents: &[IntentType::CodeEdit],
         scope: Scope::External,
         requires: &[Capability::PlanLifecycle],
@@ -832,7 +722,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         name: "exit_plan_mode",
         description: "Submit the authored plan for user review and exit plan-authoring mode.",
         triggers: &["exit plan", "submit plan"],
-        pinned: false,
         intents: &[IntentType::CodeEdit],
         scope: Scope::External,
         requires: &[Capability::PlanLifecycle],
@@ -840,13 +729,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         schema_tokens: 20,
     },
 ];
-
-/// Returns `true` when `name` matches a pinned tool in [`TOOL_CATALOG`].
-/// Pinned tools are essential to agent operation and must never be blocked
-/// by cross-session learning or pattern-library heuristics.
-pub fn is_pinned_tool(name: &str) -> bool {
-    TOOL_CATALOG.iter().any(|t| t.pinned && t.name == name)
-}
 
 /// Look up the static [`ToolMeta`] for a tool by name.
 ///
@@ -977,17 +859,6 @@ mod tests {
     }
 
     #[test]
-    fn catalog_pinned_tools_include_bash_and_read_file() {
-        let pinned: Vec<&str> = TOOL_CATALOG
-            .iter()
-            .filter(|t| t.pinned)
-            .map(|t| t.name)
-            .collect();
-        assert!(pinned.contains(&"bash"), "bash should be pinned");
-        assert!(pinned.contains(&"read_file"), "read_file should be pinned");
-    }
-
-    #[test]
     fn catalog_schema_tokens_positive_for_all() {
         for tool in TOOL_CATALOG {
             assert!(
@@ -1002,7 +873,8 @@ mod tests {
     fn catalog_has_expected_count() {
         // Sanity check — if tools are added/removed, update this.
         // Post-consolidation: 8 git→1, 7 github→1, 5 memory→1, 5 session→1,
-        // 3 mo→1, 2 agent→1 — catalog now has ~17 entries.
+        // MatrixOne exposes the canonical query tool plus rollback support;
+        // agent fan-out is a dedicated tool.
         assert!(
             TOOL_CATALOG.len() >= 15,
             "expected at least 15 tools, got {}",
@@ -1026,25 +898,8 @@ mod tests {
     }
 
     #[test]
-    fn catalog_consolidated_memory_is_pinned() {
-        let tool = TOOL_CATALOG
-            .iter()
-            .find(|t| t.name == "memory")
-            .expect("consolidated `memory` tool must exist in catalog");
-        assert!(
-            tool.pinned,
-            "memory must be pinned — intrinsic store/retrieve capability"
-        );
-    }
-
-    #[test]
     fn catalog_includes_top_level_session_state_tools() {
-        for name in [
-            "prioritize_tool",
-            "deprioritize_tool",
-            "compress_context",
-            "rollback_session_state",
-        ] {
+        for name in ["compress_context", "rollback_session_state"] {
             let tool = TOOL_CATALOG
                 .iter()
                 .find(|tool| tool.name == name)
@@ -1062,7 +917,6 @@ mod tests {
             ("agent", Capability::AgentSpawner),
             ("agent_fanout", Capability::AgentSpawner),
             ("memory", Capability::MemoryService),
-            ("mo", Capability::Database),
             ("mo_query", Capability::Database),
             ("rollback_database_snapshots", Capability::Database),
             ("github", Capability::GitHubAuth),
@@ -1090,7 +944,7 @@ mod tests {
             "agent",
             Some("run_chain")
         ));
-        assert!(tool_allows_validation_without_runtime_binding(
+        assert!(!tool_allows_validation_without_runtime_binding(
             "agent",
             Some("delegate")
         ));
@@ -1125,16 +979,5 @@ mod tests {
                 tool.description
             );
         }
-    }
-
-    #[test]
-    fn is_pinned_tool_matches_catalog() {
-        assert!(is_pinned_tool("bash"));
-        assert!(is_pinned_tool("read_file"));
-        assert!(is_pinned_tool("str_replace"));
-        assert!(is_pinned_tool("memory"));
-        assert!(!is_pinned_tool("session"));
-        assert!(!is_pinned_tool("web_fetch"));
-        assert!(!is_pinned_tool("nonexistent_tool"));
     }
 }

@@ -14,7 +14,7 @@ The current codebase has two prompt paths that diverged during evolution:
 |---|---|---|
 | System prompt | DB `agents` table → versioned | Hardcoded string |
 | Context enrichment | ContextManager (5 sections, budget-capped) | Simplified `_enrich_system_prompt` |
-| Skill selection | ToolRegistry (pinned/dynamic + embedding) | Edge tools passed through, no selection |
+| Skill selection | ToolRegistry (always-load/deferred + explicit activation) | Edge tools passed through, no selection |
 | Cross-session memory | Continuity + Observer | Observer only |
 | Scratchpad | ✅ | ❌ |
 | Prompt versioning | PromptManager (DB, rollback, feedback) | None |
@@ -338,7 +338,7 @@ This enables the **ContextBudgetTuner** (already designed) to make data-driven d
 
 Edge tools and cloud skills are two separate worlds:
 - Edge sends `edge_tools` (OpenAI schemas) → cloud passes them through to LLM unchanged
-- Cloud has `ToolRegistry` (semantic retrieval, budget control) → only for cloud skills
+- Cloud has `ToolRegistry` (always-load/deferred partition + `tool_search` activation) → only for cloud skills
 - The LLM sees both, but the platform doesn't know the relationship
 
 ### Design: Unified Tool Catalog with Edge/Cloud Annotations
@@ -360,19 +360,19 @@ Edge tools and cloud skills are two separate worlds:
 │         │                  │                │               │
 │         └──────────────────┼────────────────┘               │
 │                            ▼                                │
-│              ToolRegistry.get_tools_schema()                │
-│              (semantic retrieve from ALL tools,              │
-│               budget-controlled, unified audit)              │
+│              Tool surface assembly                          │
+│              (ToolSpec.load_policy + compact deferred        │
+│               catalog + explicit tool_search activation)     │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 Key changes:
-1. Edge tools are **registered into ToolRegistry** on first turn (not passed through)
-2. ToolRegistry does semantic retrieval across **all** tools (edge + cloud + MCP)
-3. Budget control applies to the **merged** set
-4. Audit trail covers **all** tool selections, not just cloud skills
+1. Builtin tools declare `ToolSpec.load_policy` once; always-load vs deferred is not inferred by ranking.
+2. Runtime plugin schemas, including MCP tools, enter the deferred catalog unless the current surface assembly explicitly promotes them.
+3. `tool_search(select:NAME)` is the activation primitive for deferred full schemas.
+4. Audit trail covers the assembled surface and activation decisions, not just cloud skills.
 
-This means: when the user asks "fix the bug in auth.go", the registry can consider `read_file` (edge), `knowledge_search` (cloud), and `db_query` (MCP) from the same catalog surface, with skill instructions exposed through the session-scoped `<available_skills>` listing.
+This means: when the user asks "fix the bug in auth.go", the runtime exposes the small core tool surface, advertises eligible non-core tools compactly, and requires explicit activation before deferred full schemas reach `tools[]`. Skill instructions remain exposed through the session-scoped `<available_skills>` listing.
 
 ### Edge Tool Metadata Enrichment
 

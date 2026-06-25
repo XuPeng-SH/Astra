@@ -220,7 +220,7 @@ fn block_index_for_marker(
 /// Places a single `cache_control` marker on the last Session-scoped
 /// block (falling back to the last Global block if no Session block
 /// exists). We intentionally emit at most one marker here to leave the
-/// remaining breakpoint budget for the tool marker plus Claude Code's
+/// remaining breakpoint budget for the tool marker plus the reference agent's
 /// single tail marker in `annotate_last_message_cache_breakpoint`.
 /// Anthropic caps requests at 4 `cache_control` entries (system + tool +
 /// message comfortably fit), and the message marker must always remain
@@ -283,7 +283,7 @@ fn cache_control_for_scope(_scope: CacheScope, _policy: &ProviderCachePolicy) ->
 // (session 5c5cbf78, 2026-05-08).
 mod wire_cache_annotations;
 pub use wire_cache_annotations::{
-    annotate_last_message_cache_breakpoint, annotate_pinned_tool_schema,
+    annotate_always_load_tool_schema, annotate_last_message_cache_breakpoint,
     anthropic_ephemeral_cache_control, message_has_cache_control,
 };
 

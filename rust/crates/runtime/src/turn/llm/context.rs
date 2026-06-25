@@ -156,12 +156,11 @@ pub(crate) struct LlmContextAssemblyInput<'a> {
 /// executors. The shared assembler only sees the selected visible schemas.
 pub(crate) struct ToolSurfacePlan<'a> {
     pub visible_tools: &'a [Value],
-    pub pinned_tools: &'a [Value],
+    pub always_load_tools: &'a [Value],
     pub dynamic_tools: &'a [Value],
     pub required_tools: &'a [Value],
     pub deferred_tools_block: &'a str,
     pub restricted_tools: &'a HashSet<String>,
-    pub selection_trace: Option<Value>,
 }
 
 impl<'a> ToolSurfacePlan<'a> {
@@ -171,28 +170,22 @@ impl<'a> ToolSurfacePlan<'a> {
     ) -> Self {
         Self {
             visible_tools,
-            pinned_tools: visible_tools,
+            always_load_tools: visible_tools,
             dynamic_tools: &[],
             required_tools: &[],
             deferred_tools_block: "",
             restricted_tools,
-            selection_trace: None,
         }
     }
 
     fn effective_tools(&self) -> Vec<Value> {
         let tools = effective_tool_schemas(
             self.visible_tools,
-            self.pinned_tools,
+            self.always_load_tools,
             self.dynamic_tools,
             self.required_tools,
         );
         filter_restricted_tool_schemas(tools, self.restricted_tools)
-    }
-
-    pub(crate) fn with_selection_trace(mut self, trace: Option<Value>) -> Self {
-        self.selection_trace = trace;
-        self
     }
 
     pub(crate) fn with_deferred_tools_block(mut self, block: &'a str) -> Self {
@@ -207,7 +200,6 @@ impl<'a> ToolSurfacePlan<'a> {
 pub(crate) struct RuntimeSignals<'a> {
     pub edge_profile: &'a Map<String, Value>,
     pub plan_resume_hint: Option<String>,
-    pub selection_confidence: f64,
     pub extra_stable_sections: &'a [crate::prompts::PromptSection],
     pub extra_volatile_sections: &'a [crate::prompts::PromptSection],
     pub session_memory_entry: Option<astra_turn_core::context_sources::MemoryEntry>,
@@ -217,12 +209,10 @@ impl<'a> RuntimeSignals<'a> {
     pub(crate) fn new(
         edge_profile: &'a Map<String, Value>,
         plan_resume_hint: Option<String>,
-        selection_confidence: f64,
     ) -> Self {
         Self {
             edge_profile,
             plan_resume_hint,
-            selection_confidence,
             extra_stable_sections: &[],
             extra_volatile_sections: &[],
             session_memory_entry: None,
@@ -273,7 +263,6 @@ pub(crate) struct LlmContextManifestTrace {
     pub stable_system_message_count: usize,
     pub volatile_preamble_count: usize,
     pub tool_schema_count: usize,
-    pub selection_trace: Option<Value>,
     pub runtime_manifest: Option<Value>,
 }
 
@@ -288,7 +277,6 @@ impl LlmContextManifestTrace {
             "stable_system_message_count": self.stable_system_message_count,
             "volatile_preamble_count": self.volatile_preamble_count,
             "tool_schema_count": self.tool_schema_count,
-            "selection_trace": self.selection_trace.clone(),
             "runtime_manifest": self.runtime_manifest.clone(),
         })
     }
@@ -352,13 +340,13 @@ fn push_unique_tool(out: &mut Vec<Value>, seen: &mut HashSet<String>, schema: &V
 
 fn effective_tool_schemas(
     visible_tools: &[Value],
-    pinned_tools: &[Value],
+    always_load_tools: &[Value],
     dynamic_tools: &[Value],
     required_tools: &[Value],
 ) -> Vec<Value> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
-    for schema in pinned_tools {
+    for schema in always_load_tools {
         push_unique_tool(&mut out, &mut seen, schema);
     }
     for schema in required_tools {
@@ -396,8 +384,6 @@ pub(crate) struct BridgeRuntimeSignals<'a> {
     pub memory_entries: &'a [astra_turn_core::context_sources::MemoryEntry],
     pub session_memory_entry: Option<astra_turn_core::context_sources::MemoryEntry>,
     pub system_override: Option<&'a str>,
-    pub selection_confidence: f64,
-    pub task_type: Option<&'a str>,
 }
 
 impl<'a> BridgeRuntimeSignals<'a> {
@@ -407,8 +393,6 @@ impl<'a> BridgeRuntimeSignals<'a> {
         memory_entries: &'a [astra_turn_core::context_sources::MemoryEntry],
         session_memory_entry: Option<astra_turn_core::context_sources::MemoryEntry>,
         system_override: Option<&'a str>,
-        selection_confidence: f64,
-        task_type: Option<&'a str>,
     ) -> Self {
         Self {
             extra_stable_sections,
@@ -416,8 +400,6 @@ impl<'a> BridgeRuntimeSignals<'a> {
             memory_entries,
             session_memory_entry,
             system_override,
-            selection_confidence,
-            task_type,
         }
     }
 }
@@ -683,11 +665,10 @@ pub(crate) fn assemble_bridge_context(
         .collect();
     let _tool_surface_metadata = (
         input.tool_surface.visible_tools.len(),
-        input.tool_surface.pinned_tools.len(),
+        input.tool_surface.always_load_tools.len(),
         input.tool_surface.dynamic_tools.len(),
         input.tool_surface.required_tools.len(),
         input.tool_surface.restricted_tools.len(),
-        input.tool_surface.selection_trace.as_ref(),
     );
     let outcome = crate::turn::prompt_cache::assemble_bridge_pipeline_outcome(
         &effective_tool_names,
@@ -697,8 +678,6 @@ pub(crate) fn assemble_bridge_context(
         input.runtime_signals.memory_entries,
         input.runtime_signals.session_memory_entry.as_ref(),
         input.runtime_signals.system_override,
-        input.runtime_signals.selection_confidence,
-        input.runtime_signals.task_type,
         input.session.cache_cfg,
         input.session.cache_capability,
         input.session.session_id,
@@ -737,7 +716,6 @@ pub(crate) fn assemble_bridge_context(
             stable_system_message_count,
             volatile_preamble_count,
             tool_schema_count,
-            selection_trace: input.tool_surface.selection_trace.clone(),
             runtime_manifest: Some(json!({
                 "schema_version": "astra_runtime_manifest.v1",
                 "selected_model": {
@@ -771,11 +749,10 @@ pub(crate) fn assemble_context_pipeline(
     let state = input.state;
     let effective_tools = input.tool_surface.effective_tools();
     let _tool_surface_metadata = (
-        input.tool_surface.pinned_tools.len(),
+        input.tool_surface.always_load_tools.len(),
         input.tool_surface.dynamic_tools.len(),
         input.tool_surface.required_tools.len(),
         input.tool_surface.restricted_tools.len(),
-        input.tool_surface.selection_trace.as_ref(),
     );
     let tool_names_owned: Vec<String> = effective_tools
         .iter()
@@ -798,7 +775,6 @@ pub(crate) fn assemble_context_pipeline(
         state,
         input.user_content,
         &tool_names,
-        input.runtime_signals.selection_confidence,
         input.runtime_signals.plan_resume_hint.as_deref(),
         Some(cache_cap),
     );
@@ -984,7 +960,6 @@ pub(crate) fn assemble_context_pipeline(
             stable_system_message_count,
             volatile_preamble_count,
             tool_schema_count,
-            selection_trace: input.tool_surface.selection_trace.clone(),
             runtime_manifest: state.runtime_manifest.clone(),
         },
     })
@@ -1103,12 +1078,12 @@ pub(crate) fn assemble_wire_messages(input: LlmWireAssemblyInput<'_>) -> Vec<Val
 pub(crate) fn annotate_tool_schemas_for_cache(
     tool_schemas: &mut [Value],
     cache_cfg: &PromptCacheConfig,
-    pinned_names: &std::collections::HashSet<String>,
+    always_load_names: &std::collections::HashSet<String>,
 ) {
-    crate::turn::prompt_cache::annotate_tool_schemas_for_caching_with_pinned(
+    crate::turn::prompt_cache::annotate_tool_schemas_for_caching_with_always_load(
         tool_schemas,
         cache_cfg,
-        pinned_names,
+        always_load_names,
     );
 }
 
@@ -1286,22 +1261,22 @@ mod context_cache_contract_tests {
 
     #[test]
     fn effective_tool_schemas_merges_priority_dedupes_and_filters_restricted() {
-        let visible = vec![tool("visible_a"), tool("pinned_a"), tool("dynamic_a")];
-        let pinned = vec![tool("pinned_a"), tool("pinned_b")];
+        let visible = vec![tool("visible_a"), tool("always_load_a"), tool("dynamic_a")];
+        let always_load = vec![tool("always_load_a"), tool("always_load_b")];
         let dynamic = vec![tool("dynamic_a"), tool("dynamic_b")];
-        let required = vec![tool("required_a"), tool("pinned_b")];
+        let required = vec![tool("required_a"), tool("always_load_b")];
         let restricted = HashSet::from(["dynamic_b".to_string()]);
 
         let merged = filter_restricted_tool_schemas(
-            effective_tool_schemas(&visible, &pinned, &dynamic, &required),
+            effective_tool_schemas(&visible, &always_load, &dynamic, &required),
             &restricted,
         );
 
         assert_eq!(
             tool_names(&merged),
             vec![
-                "pinned_a",
-                "pinned_b",
+                "always_load_a",
+                "always_load_b",
                 "required_a",
                 "dynamic_a",
                 "visible_a"
@@ -1337,7 +1312,7 @@ mod context_cache_contract_tests {
             state: &mut state,
             session_id: "sid-deepseek",
             tool_surface: ToolSurfacePlan::from_visible_tools(&visible_tools, &restricted_tools),
-            runtime_signals: RuntimeSignals::new(&edge_profile, None, 0.8)
+            runtime_signals: RuntimeSignals::new(&edge_profile, None)
                 .with_extra_sections(&[], &volatile),
             cache_cfg: &cache_cfg,
             provider: "openai",

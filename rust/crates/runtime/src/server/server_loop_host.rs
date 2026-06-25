@@ -511,7 +511,7 @@ pub struct CapturedLlmRequest {
     pub system_primary: Value,
     /// The optional per-turn dynamic system message (OpenAI split only).
     pub system_dynamic: Option<Value>,
-    /// Tool schemas after pruning + `annotate_tool_schemas_for_caching_with_pinned`.
+    /// Tool schemas after pruning + `annotate_tool_schemas_for_caching_with_always_load`.
     pub tools: Vec<Value>,
     /// Conversation messages after `add_message_cache_breakpoint` was applied
     /// (for Anthropic) or a clone of `state.messages` (otherwise).
@@ -530,7 +530,7 @@ pub struct CapturedLlmRequest {
     /// `cache_control` marker anywhere in their content. Order matches the
     /// message order. Empty for non-Anthropic providers.
     ///
-    /// Used by tests to assert Claude Code-style message-marker behavior:
+    /// Used by tests to assert reference-agent-style message-marker behavior:
     /// exactly one marker on the last non-system message for
     /// Anthropic/Bedrock-compatible requests.
     pub message_cache_control_indices: Vec<usize>,
@@ -830,12 +830,12 @@ pub struct ServerAgenticLoopHost {
     /// This is the set that `tool_search(select:NAME)` can safely expose and
     /// that a direct deferred call may convert into an activation intent.
     current_activatable_deferred_tool_names: HashSet<String>,
-    /// Resolved pinned (T1) tool names for this session. Populated from the
-    /// CLI-side `edge_profile.pinned_tool_names`. Used to place cache_control
-    /// markers at the correct pinned/dynamic boundary. Falls back to
-    /// `prompt_cache::runtime_pinned_tool_names()` when the edge omits this key
+    /// Resolved always-load (T1) tool names for this session. Populated from the
+    /// CLI-side `edge_profile.always_load_tool_names`. Used to place cache_control
+    /// markers at the correct always-load/dynamic boundary. Falls back to
+    /// `prompt_cache::runtime_always_load_tool_names()` when the edge omits this key
     /// (e.g. test fixtures or server-side-tools mode).
-    pinned_tool_names: HashSet<String>,
+    always_load_tool_names: HashSet<String>,
     /// Executor whose admission state mirrors the current wire tool surface.
     /// Used by edge-ledger validation to record direct deferred calls as
     /// next-round activations instead of returning a misleading hard error.
@@ -848,7 +848,6 @@ pub struct ServerAgenticLoopHost {
     /// path before the first `sync_valid_tools_to_visible` call; stable
     /// for the rest of the session.
     admissible_extras: Vec<String>,
-    selection_confidence: f64,
     /// `true` when tools were auto-populated from astra-tools (no CLI connected).
     server_side_tools: bool,
     /// `true` when the connected client can answer ask_user prompts.
@@ -975,7 +974,6 @@ pub struct ServerAgenticLoopHostBuilder {
     edge_tools: Vec<Value>,
     edge_profile: Map<String, Value>,
     execution_bindings: Option<ExecutionBindingSnapshot>,
-    selection_confidence: f64,
     edge_callback_ledger: Arc<TokioMutex<HashMap<String, Value>>>,
     user_id: String,
     session_id: String,
@@ -1026,7 +1024,6 @@ impl ServerAgenticLoopHostBuilder {
             edge_tools: Vec::new(),
             edge_profile: Map::new(),
             execution_bindings: None,
-            selection_confidence: 1.0,
             edge_callback_ledger: Arc::new(TokioMutex::new(HashMap::new())),
             user_id,
             session_id,
@@ -1147,11 +1144,6 @@ impl ServerAgenticLoopHostBuilder {
             WorkspaceBinding::server_sandbox(root),
             ExecutorBinding::server_local(),
         ));
-        self
-    }
-
-    pub fn with_selection_confidence(mut self, confidence: f64) -> Self {
-        self.selection_confidence = confidence;
         self
     }
 
@@ -1290,15 +1282,15 @@ impl ServerAgenticLoopHostBuilder {
         };
         valid_tools.extend(admissible_extras.iter().cloned());
 
-        // Resolve pinned tool names from the CLI-sent edge_profile. The CLI
-        // sends `EDGE_PROFILE_KEY_PINNED_TOOL_NAMES` as the ToolSurface's
-        // resolved pinned name set (user TOML overrides included). When the
+        // Resolve always-load tool names from the CLI-sent edge_profile. The CLI
+        // sends `EDGE_PROFILE_KEY_ALWAYS_LOAD_TOOL_NAMES` as the ToolSurface's
+        // resolved always-load name set (user TOML overrides included). When the
         // edge omits it (test fixtures or server-side-tools mode), fall back
         // to the runtime-configured surface so cache_control markers still
         // match TOML overrides.
-        let pinned_tool_names: HashSet<String> = self
+        let always_load_tool_names: HashSet<String> = self
             .edge_profile
-            .get(astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_PINNED_TOOL_NAMES)
+            .get(astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_ALWAYS_LOAD_TOOL_NAMES)
             .and_then(Value::as_array)
             .map(|arr| {
                 arr.iter()
@@ -1306,7 +1298,7 @@ impl ServerAgenticLoopHostBuilder {
                     .map(str::to_string)
                     .collect()
             })
-            .unwrap_or_else(|| crate::turn::prompt_cache::runtime_pinned_tool_names());
+            .unwrap_or_else(|| crate::turn::prompt_cache::runtime_always_load_tool_names());
 
         let progress_rx = self.progress_broadcaster.as_ref().map(|b| b.subscribe());
         let progress_filter = self
@@ -1327,10 +1319,9 @@ impl ServerAgenticLoopHostBuilder {
             valid_tools,
             current_deferred_tool_names: HashSet::new(),
             current_activatable_deferred_tool_names: HashSet::new(),
-            pinned_tool_names,
+            always_load_tool_names,
             current_server_tool_executor: None,
             admissible_extras,
-            selection_confidence: self.selection_confidence,
             server_side_tools,
             interactive_client: self.interactive_client,
             interaction_mode: self.interaction_mode,
@@ -1941,7 +1932,7 @@ impl ServerAgenticLoopHost {
         crate::turn::llm::context::annotate_tool_schemas_for_cache(
             &mut annotated_tools,
             &cache_cfg,
-            &self.pinned_tool_names,
+            &self.always_load_tool_names,
         );
         self.sync_valid_tools_to_wire_surface_for_state(&annotated_tools, state);
         self.last_turn_tool_schemas = annotated_tools.clone();
@@ -2290,6 +2281,17 @@ impl ServerAgenticLoopHost {
                     .as_ref()
                     .is_some_and(|executor| executor.has_runtime_binding(name))
             };
+            let action = args.get("action").and_then(Value::as_str);
+            let missing_runtime_binding =
+                !has_runtime_binding(&tool_name)
+                    && astra_turn_core::tool::runtime_binding::tool_name_requires_runtime_binding(
+                        &tool_name,
+                    )
+                    && !astra_turn_core::tool::registry::meta::tool_allows_validation_without_runtime_binding(
+                        &tool_name,
+                        action,
+                    );
+            let mut error_kind = None;
             let output = match astra_turn_core::tool::deferred_activation::classify_direct_deferred_call(
                 &tool_name,
                 is_activatable_deferred,
@@ -2306,9 +2308,10 @@ impl ServerAgenticLoopHost {
                     )
                 }
                 astra_turn_core::tool::deferred_activation::DirectDeferredCallAdmission::NotAdmitted => {
+                    error_kind = Some(astra_core::ErrorKind::ToolBinding);
                     astra_turn_core::tool::runtime_binding::runtime_binding_denial_message(
                         &tool_name,
-                        args.get("action").and_then(Value::as_str),
+                        action,
                     )
                 }
                 astra_turn_core::tool::deferred_activation::DirectDeferredCallAdmission::Unknown => {
@@ -2318,11 +2321,18 @@ impl ServerAgenticLoopHost {
                                 &tool_name,
                             )
                         } else {
+                            error_kind = Some(astra_core::ErrorKind::ToolBinding);
                             astra_turn_core::tool::runtime_binding::runtime_binding_denial_message(
                                 &tool_name,
-                                args.get("action").and_then(Value::as_str),
+                                action,
                             )
                         }
+                    } else if missing_runtime_binding {
+                        error_kind = Some(astra_core::ErrorKind::ToolBinding);
+                        astra_turn_core::tool::runtime_binding::runtime_binding_denial_message(
+                            &tool_name,
+                            action,
+                        )
                     } else {
                         astra_turn_core::tool::deferred_activation::tool_not_admitted_message(
                             &tool_name, false,
@@ -2348,7 +2358,11 @@ impl ServerAgenticLoopHost {
                         &request_id,
                         &tool_name,
                         &args,
-                        None,
+                        error_kind.map(|kind| {
+                            let mut fields = Map::new();
+                            fields.insert("error_kind".to_string(), json!(kind.as_str()));
+                            fields
+                        }),
                     )),
                     status: "failed".to_string(),
                     duration_ms: 0,
@@ -2855,7 +2869,7 @@ impl ServerAgenticLoopHost {
     /// 4. boost rescue
     /// 5. activated-deferred-tool rescue
     ///
-    /// `consume_widen` controls whether the `widen_selection_pending` flag is
+    /// `consume_widen` controls whether the `widen_surface_pending` flag is
     /// consumed (authoritative path: main turn / test helper) or merely
     /// peeked (preview path: pre-turn summary, which must not steal the flag
     /// from the main turn that follows it). This is the only legitimate
@@ -2871,7 +2885,7 @@ impl ServerAgenticLoopHost {
         // 1. Consume or peek the widen flag. Soft health diagnostics are not
         // promoted into the hard restricted-tool set.
         if consume_widen {
-            let _ = std::mem::take(&mut state.widen_selection_pending);
+            let _ = std::mem::take(&mut state.widen_surface_pending);
         }
         // 2-5. layered restrictions from the merged base.
         let mut effective = state.restricted_tools.clone();
@@ -2880,7 +2894,7 @@ impl ServerAgenticLoopHost {
             self.turn_interaction_mode(),
         ));
         // Boosted tools are never hidden, even if they landed in the restricted
-        // set earlier (e.g., via stall-based deprioritization).
+        // set earlier via a hard strategy/runtime restriction.
         for boosted in &state.boosted_tools {
             effective.remove(boosted);
         }
@@ -2968,11 +2982,6 @@ impl ServerAgenticLoopHost {
             crate::prompts::PromptTokenBucket::Environment,
         )];
         let restricted_snapshot = state.restricted_tools.clone();
-        let selection_trace = Some(json!({
-            "source": "server_loop_host",
-            "visible_tool_count": visible_tools.len(),
-            "restricted_tool_count": restricted_snapshot.len(),
-        }));
         let deferred_tools_block =
             self.deferred_tools_block_for_wire_surface(visible_tools, state, model_name);
         let cache_cfg =
@@ -2985,12 +2994,10 @@ impl ServerAgenticLoopHost {
                     visible_tools,
                     &restricted_snapshot,
                 )
-                .with_deferred_tools_block(&deferred_tools_block)
-                .with_selection_trace(selection_trace),
+                .with_deferred_tools_block(&deferred_tools_block),
                 runtime_signals: crate::turn::llm::context::RuntimeSignals::new(
                     &self.edge_profile,
                     plan_hint,
-                    self.selection_confidence,
                 )
                 .with_extra_sections(&[], &lifecycle_sections)
                 .with_session_memory_entry(session_memory_entry),
@@ -3501,7 +3508,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         crate::turn::llm::context::annotate_tool_schemas_for_cache(
             &mut final_tools,
             &cache_cfg,
-            &self.pinned_tool_names,
+            &self.always_load_tool_names,
         );
         // Runtime admission must mirror the exact tool schemas sent on the
         // wire. Pipeline pruning, sticky schema stabilization, and cache
@@ -3521,7 +3528,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             &final_system_prompt_breakdown,
             state.last_llm_context_manifest_trace.as_ref(),
         );
-        state.pinned_tool_schema_tokens = estimate_tool_schema_tokens(&final_tools);
+        state.always_load_tool_schema_tokens = estimate_tool_schema_tokens(&final_tools);
         state.last_turn_policy =
             TurnInteractionPolicy::from_tool_schemas(self.turn_interaction_mode(), &final_tools);
 
@@ -4776,7 +4783,7 @@ mod tests {
     }
 
     #[test]
-    fn builder_edge_profile_pinned_tool_names_controls_cache_marker_boundary() {
+    fn builder_edge_profile_always_load_tool_names_controls_cache_marker_boundary() {
         let cache_cfg = crate::turn::prompt_cache::PromptCacheConfig {
             cache_enabled: true,
             is_anthropic: true,
@@ -4794,17 +4801,18 @@ mod tests {
         crate::turn::llm::context::annotate_tool_schemas_for_cache(
             &mut default_tools,
             &cache_cfg,
-            &default_host.pinned_tool_names,
+            &default_host.always_load_tool_names,
         );
         assert!(default_tools[0].get("cache_control").is_none());
         assert!(
             default_tools[1].get("cache_control").is_some(),
-            "without edge override, the runtime default pinned set keeps read_file inside the cached prefix"
+            "without edge override, the runtime default always-load set keeps read_file inside the cached prefix"
         );
 
         let mut edge_profile = Map::new();
         edge_profile.insert(
-            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_PINNED_TOOL_NAMES.to_string(),
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_ALWAYS_LOAD_TOOL_NAMES
+                .to_string(),
             json!(["bash"]),
         );
         let override_host = ServerAgenticLoopHostBuilder::new(
@@ -4820,11 +4828,11 @@ mod tests {
         crate::turn::llm::context::annotate_tool_schemas_for_cache(
             &mut override_tools,
             &cache_cfg,
-            &override_host.pinned_tool_names,
+            &override_host.always_load_tool_names,
         );
         assert!(
             override_tools[0].get("cache_control").is_some(),
-            "edge_profile pinned_tool_names must move the marker to the actual resolved pinned prefix"
+            "edge_profile always_load_tool_names must move the marker to the actual resolved always-load prefix"
         );
         assert!(override_tools[1].get("cache_control").is_none());
     }
@@ -5891,13 +5899,23 @@ mod tests {
         assert!(
             direct_results[0]
                 .output
-                .contains("not available in this turn"),
-            "direct call to an unadvertised unavailable tool must fail closed: {:?}",
+                .contains("multi-agent runtime is not connected"),
+            "direct call to an unadvertised unavailable runtime tool must name the missing binding: {:?}",
             direct_results[0]
         );
         assert!(
             !direct_results[0].output.contains("select:agent_fanout"),
             "denial must not claim select can attach the runtime: {:?}",
+            direct_results[0]
+        );
+        assert_eq!(
+            direct_results[0]
+                .tool_result_fields
+                .as_ref()
+                .and_then(|fields| fields.get("error_kind"))
+                .and_then(Value::as_str),
+            Some(astra_core::ErrorKind::ToolBinding.as_str()),
+            "ledger direct-call denial must be structured as a runtime binding failure: {:?}",
             direct_results[0]
         );
     }
@@ -6506,20 +6524,6 @@ mod tests {
         .build();
         host.push_reasoning_events("");
         assert!(host.emitted_events.is_empty());
-    }
-
-    #[test]
-    fn builder_with_selection_confidence() {
-        let host = ServerAgenticLoopHostBuilder::new(
-            mock_matrixone(),
-            mock_encryptor(),
-            "u".to_string(),
-            "s".to_string(),
-        )
-        .with_selection_confidence(0.42)
-        .build();
-
-        assert!((host.selection_confidence - 0.42).abs() < f64::EPSILON);
     }
 
     #[tokio::test]
@@ -7537,13 +7541,13 @@ mod tests {
             turn_guard: TurnGuard::new(),
             restricted_tools: HashSet::new(),
             boosted_tools: HashSet::new(),
-            widen_selection_pending: false,
+            widen_surface_pending: false,
             step_recorder: StepRecorder::new("test-user", "test-session", "test-task"),
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(0.75),
             call_counts: HashMap::new(),
             max_identical_tool_calls: astra_config::runtime_config::RuntimeConfig::load()
-                .tool_selection
+                .tool_policy
                 .effective_max_identical_calls(),
             max_tools_per_turn: 15,
             repeated_cache_hit_suppression: 3,
@@ -7579,7 +7583,7 @@ mod tests {
             last_measured_prompt_tokens: None,
             consecutive_context_window_errors: 0,
             compaction_effectiveness: Default::default(),
-            pinned_tool_schema_tokens: 0,
+            always_load_tool_schema_tokens: 0,
             sticky_tool_schemas: Vec::new(),
             max_turn_input_tokens: 0,
             budget_wrapup_injected: false,
@@ -7593,7 +7597,6 @@ mod tests {
             permission_handler: None,
             tactical_adapter: None,
             step_signal_collector: None,
-            tool_budget_override: None,
             recent_tactical_actions: Vec::new(),
             server_tool_executor: None,
             interruption: None,

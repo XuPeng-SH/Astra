@@ -1,7 +1,7 @@
-//! Shared CJK-aware tokenizer for TF-IDF scoring.
+//! Shared CJK-aware tokenizer for lexical scoring.
 //!
-//! Used by both `tool_registry::scoring` (tool selection) and `turn::retrieval`
-//! (context retrieval). Consolidated here to eliminate duplication.
+//! Used by retrieval, commit search, duplicate detection, and lightweight
+//! ranking. Consolidated here to eliminate duplication.
 
 use std::collections::HashMap;
 

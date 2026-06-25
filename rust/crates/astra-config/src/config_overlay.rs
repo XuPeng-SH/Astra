@@ -22,9 +22,7 @@
 //!    write-back goes through `apply_edit`, the two ends close a loop
 //!    that's regression-guarded by `every_catalog_item_is_editable_via_apply_edit`.
 
-use crate::runtime_config::{
-    RuntimeConfig, TraceCategory, TraceLevelSerde, TraceProfile, TraceSink,
-};
+use crate::runtime_config::{RuntimeConfig, TraceCategory, TraceLevel, TraceProfile, TraceSink};
 use astra_core::runtime_limits::{RuntimeLimits, context_window_for_model};
 use serde_json::Value;
 use std::path::Path;
@@ -269,23 +267,6 @@ pub fn build_settings_catalog(config: &RuntimeConfig) -> Vec<SettingItem> {
             },
             value: Value::from(config.memory.retrieval_top_k),
         },
-        // ── Tool selection ──
-        SettingItem {
-            id: "tool_selection.max_tools".to_string(),
-            label: "Max tools surfaced to the model".to_string(),
-            kind: SettingKind::Number {
-                min: 1.0,
-                max: 200.0,
-                allow_fraction: false,
-            },
-            value: Value::from(config.tool_selection.max_tools),
-        },
-        SettingItem {
-            id: "tool_selection.prefer_recent_tools".to_string(),
-            label: "Prefer recently-used tools".to_string(),
-            kind: SettingKind::Bool,
-            value: Value::from(config.tool_selection.prefer_recent_tools),
-        },
         // ── Trace ──
         SettingItem {
             id: "trace.profile".to_string(),
@@ -528,14 +509,6 @@ pub fn apply_edit(
             ensure_range(n as f64, 1.0, 50.0, id)?;
             config.memory.retrieval_top_k = n;
         }
-        "tool_selection.max_tools" => {
-            let n = as_u32(&new_value, id)?;
-            ensure_range(n as f64, 1.0, 200.0, id)?;
-            config.tool_selection.max_tools = n;
-        }
-        "tool_selection.prefer_recent_tools" => {
-            config.tool_selection.prefer_recent_tools = as_bool(&new_value, id)?;
-        }
         "trace.profile" => {
             if let Some(s) = new_value.as_str() {
                 let profile = match s {
@@ -550,11 +523,11 @@ pub fn apply_edit(
         "trace.min_level" => {
             if let Some(s) = new_value.as_str() {
                 config.trace.min_level = match s {
-                    "error" => TraceLevelSerde::Error,
-                    "warn" => TraceLevelSerde::Warn,
-                    "info" => TraceLevelSerde::Info,
-                    "debug" => TraceLevelSerde::Debug,
-                    "trace" => TraceLevelSerde::Trace,
+                    "error" => TraceLevel::Error,
+                    "warn" => TraceLevel::Warn,
+                    "info" => TraceLevel::Info,
+                    "debug" => TraceLevel::Debug,
+                    "trace" => TraceLevel::Trace,
                     _ => return Ok(config),
                 };
                 mark_trace_custom(&mut config);

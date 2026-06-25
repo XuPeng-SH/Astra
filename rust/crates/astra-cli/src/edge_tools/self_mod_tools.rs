@@ -108,59 +108,6 @@ impl ToolExecutor {
                 old_value = Some(json!(old));
                 new_value = Some(json!(new));
             }
-            "tool_selection.max_tools" => {
-                let Some(new) = parse_u32(value) else {
-                    return json!({"error": "value must be an integer"}).to_string();
-                };
-                if !(5..=80).contains(&new) {
-                    return json!({"error": "tool_selection.max_tools must be within [5, 80]"})
-                        .to_string();
-                }
-                let old = session.config.tool_selection.max_tools;
-                if let Some(d) = bounded_drift(old as f64, new as f64, 5.0, 80.0) {
-                    if !force && d > ceiling {
-                        return json!({
-                            "error": "config_drift_ceiling_exceeded",
-                            "path": path,
-                            "old": old,
-                            "new": new,
-                            "drift": d,
-                            "ceiling": ceiling
-                        })
-                        .to_string();
-                    }
-                    drift = Some(d);
-                }
-                session.config.tool_selection.max_tools = new;
-                old_value = Some(json!(old));
-                new_value = Some(json!(new));
-            }
-            "tool_selection.tool_budget_tokens" => {
-                let Some(new) = parse_u32(value) else {
-                    return json!({"error": "value must be an integer"}).to_string();
-                };
-                if new > 40_000 {
-                    return json!({"error": "tool_selection.tool_budget_tokens must be within [0, 40000]"}).to_string();
-                }
-                let old = session.config.tool_selection.tool_budget_tokens;
-                if let Some(d) = bounded_drift(old as f64, new as f64, 0.0, 40_000.0) {
-                    if !force && d > ceiling {
-                        return json!({
-                            "error": "config_drift_ceiling_exceeded",
-                            "path": path,
-                            "old": old,
-                            "new": new,
-                            "drift": d,
-                            "ceiling": ceiling
-                        })
-                        .to_string();
-                    }
-                    drift = Some(d);
-                }
-                session.config.tool_selection.tool_budget_tokens = new;
-                old_value = Some(json!(old));
-                new_value = Some(json!(new));
-            }
             "token_budget.max_turn_input_tokens" => {
                 let Some(new) = parse_u32(value) else {
                     return json!({"error": "value must be an integer"}).to_string();
@@ -247,8 +194,6 @@ impl ToolExecutor {
                     "supported_paths": [
                         "compression.compression_threshold",
                         "memory.retrieval_top_k",
-                        "tool_selection.max_tools",
-                        "tool_selection.tool_budget_tokens",
                         "token_budget.max_turn_input_tokens",
                         "token_budget.tools_reserve",
                         "verification.strictness"
@@ -290,128 +235,6 @@ impl ToolExecutor {
             "max_mutations_per_turn": constraints.max_mutations_per_turn,
             "drift": drift,
             "drift_ceiling": ceiling
-        })
-        .to_string()
-    }
-
-    pub(super) fn prioritize_tool(&self, args: &Value) -> String {
-        let Some(tool) = extract_tool_name(args) else {
-            return json!({"error": "Missing required parameter: tool"}).to_string();
-        };
-        if !self.tool_names().iter().any(|t| t == &tool) {
-            return json!({"error": format!("Unknown tool: {tool}")}).to_string();
-        }
-
-        let mut pinned = match self.self_mod_pinned_tools.lock() {
-            Ok(v) => v,
-            Err(_) => return json!({"error": "Failed to access pinned tools"}).to_string(),
-        };
-        let mut deprioritized = match self.self_mod_deprioritized_tools.lock() {
-            Ok(v) => v,
-            Err(_) => return json!({"error": "Failed to access deprioritized tools"}).to_string(),
-        };
-        let original_pinned = pinned.clone();
-        let original_deprioritized = deprioritized.clone();
-
-        if !pinned.contains(&tool) {
-            pinned.push(tool.clone());
-        }
-        pinned.sort();
-        deprioritized.retain(|t| t != &tool);
-
-        if let Some(session_id) = self.active_session_id()
-            && let Err(error) = crate::cli::self_command::persist_tool_preferences(
-                &session_id,
-                &pinned,
-                &deprioritized,
-            )
-        {
-            *pinned = original_pinned;
-            *deprioritized = original_deprioritized;
-            return json!({
-                "error": "failed_to_persist_tool_preferences",
-                "detail": error,
-                "tool": tool,
-            })
-            .to_string();
-        }
-
-        let changed = original_pinned != *pinned || original_deprioritized != *deprioritized;
-        if changed {
-            self.record_tool_preferences_rollback(
-                original_pinned.clone(),
-                original_deprioritized.clone(),
-                format!("prioritize_tool:{tool}"),
-            );
-        }
-        json!({
-            "status": "completed",
-            "prioritized_tool": tool,
-            "previous_pinned_tools": original_pinned,
-            "previous_deprioritized_tools": original_deprioritized,
-            "pinned_tools": pinned.clone(),
-            "deprioritized_tools": deprioritized.clone()
-        })
-        .to_string()
-    }
-
-    pub(super) fn deprioritize_tool(&self, args: &Value) -> String {
-        let Some(tool) = extract_tool_name(args) else {
-            return json!({"error": "Missing required parameter: tool"}).to_string();
-        };
-        if !self.tool_names().iter().any(|t| t == &tool) {
-            return json!({"error": format!("Unknown tool: {tool}")}).to_string();
-        }
-
-        let mut pinned = match self.self_mod_pinned_tools.lock() {
-            Ok(v) => v,
-            Err(_) => return json!({"error": "Failed to access pinned tools"}).to_string(),
-        };
-        let mut deprioritized = match self.self_mod_deprioritized_tools.lock() {
-            Ok(v) => v,
-            Err(_) => return json!({"error": "Failed to access deprioritized tools"}).to_string(),
-        };
-        let original_pinned = pinned.clone();
-        let original_deprioritized = deprioritized.clone();
-
-        if !deprioritized.contains(&tool) {
-            deprioritized.push(tool.clone());
-        }
-        deprioritized.sort();
-        pinned.retain(|t| t != &tool);
-
-        if let Some(session_id) = self.active_session_id()
-            && let Err(error) = crate::cli::self_command::persist_tool_preferences(
-                &session_id,
-                &pinned,
-                &deprioritized,
-            )
-        {
-            *pinned = original_pinned;
-            *deprioritized = original_deprioritized;
-            return json!({
-                "error": "failed_to_persist_tool_preferences",
-                "detail": error,
-                "tool": tool,
-            })
-            .to_string();
-        }
-
-        let changed = original_pinned != *pinned || original_deprioritized != *deprioritized;
-        if changed {
-            self.record_tool_preferences_rollback(
-                original_pinned.clone(),
-                original_deprioritized.clone(),
-                format!("deprioritize_tool:{tool}"),
-            );
-        }
-        json!({
-            "status": "completed",
-            "deprioritized_tool": tool,
-            "previous_pinned_tools": original_pinned,
-            "previous_deprioritized_tools": original_deprioritized,
-            "pinned_tools": pinned.clone(),
-            "deprioritized_tools": deprioritized.clone()
         })
         .to_string()
     }
@@ -474,12 +297,4 @@ fn bounded_drift(old: f64, new: f64, min: f64, max: f64) -> Option<f64> {
         return None;
     }
     Some((new - old).abs() / span)
-}
-
-fn extract_tool_name(args: &Value) -> Option<String> {
-    args.get("tool")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToString::to_string)
 }

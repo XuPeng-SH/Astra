@@ -498,9 +498,6 @@ pub(crate) fn is_server_mutator_tool_name(name: &str) -> bool {
             | "mo_query"
             // session state
             | "adjust_config"
-            | "prioritize_tool"
-            | "deprioritize_tool"
-            | "set_goal"
             | "compress_context"
             | "task"
     )
@@ -565,13 +562,7 @@ fn server_session_state_mutator_in_round(tool_calls: &[Value]) -> bool {
     tool_calls.iter().any(|tool_call| {
         matches!(
             tool_call_name(tool_call),
-            Some(
-                "adjust_config"
-                    | "prioritize_tool"
-                    | "deprioritize_tool"
-                    | "set_goal"
-                    | "compress_context"
-            )
+            Some("adjust_config" | "compress_context")
         ) || task_tool_call_is_session_state_mutator(tool_call)
     })
 }
@@ -1010,7 +1001,6 @@ async fn finalize_server_rollback_boundary(
                         restore_context: tool_session_state_rollback::SessionStateRestoreContext {
                             session_id: &executor.session_id,
                             observability_session: executor.observability_session.as_ref(),
-                            config: &executor.session_config.inner,
                             task_manager: &executor.task_manager(),
                         },
                     },
@@ -1094,7 +1084,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     //
     //   round 1 post-wrap-up: physical lockout — drop the tool_calls,
     //     populate `restricted_tools` (same mechanism as
-    //     `round_budget_phase1_message`), inject a short terminal reminder,
+    //     `tool_round_hard_stop_message`), inject a short terminal reminder,
     //     and continue the loop so the model gets one more LLM call to
     //     produce text.
     //   round 2+ post-wrap-up: abort the turn with an interruption. One
@@ -1120,9 +1110,9 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                     ),
                 );
             }
-            // Physical lockout: tool_selector + policy.rs both consult
-            // `restricted_tools`. Any tool call the model emits on the
-            // next round will be filtered / blocked rather than executed.
+            // Physical lockout: the host policy consults `restricted_tools`.
+            // Any tool call the model emits on the next round will be
+            // filtered / blocked rather than executed.
             for name in host.valid_tool_names() {
                 state.restricted_tools.insert(name.clone());
             }
@@ -1934,7 +1924,7 @@ fn build_introspect_snapshot(
         forced_redundant_reads_corrective: state.stall.forced_redundant_reads_corrective,
         forced_cache_waste_corrective: state.stall.forced_cache_waste_corrective,
         forced_search_fanout_corrective: state.stall.forced_search_fanout_corrective,
-        forced_exploration_family_phase2: state.stall.forced_exploration_family_phase2,
+        forced_exploration_family_lockout: state.stall.forced_exploration_family_lockout,
         forced_exploration_family_corrective: state.stall.forced_exploration_family_corrective,
         forced_completion_soft_stop: state.stall.forced_completion_soft_stop,
     };
@@ -1960,7 +1950,7 @@ fn build_introspect_snapshot(
                 calls: h.total_calls as u32,
                 errors: h.total_failures as u32,
                 avg_ms: 0,
-                deprioritized: h.deprioritized,
+                avoidance_advised: h.avoidance_advised,
                 consecutive_failures: h.consecutive_failures as u32,
                 last_failure_category: last_fail_cat,
             }
@@ -2004,7 +1994,7 @@ fn introspect_token_pressure(state: &super::host::AgenticLoopState) -> f64 {
     }
     let fresh_estimate = crate::prompts::estimate_tokens(
         &state.messages,
-        state.pinned_tool_schema_tokens as usize,
+        state.always_load_tool_schema_tokens as usize,
         0,
     ) as u64;
     fresh_estimate as f64 / state.max_turn_input_tokens as f64
@@ -2363,7 +2353,7 @@ mod tests {
         let mut state = make_state();
         state.max_turn_input_tokens = 0;
         state.messages = vec![json!({"role": "user", "content": "hello world"})];
-        state.pinned_tool_schema_tokens = 50;
+        state.always_load_tool_schema_tokens = 50;
         assert_eq!(introspect_token_pressure(&state), 0.0);
     }
 
@@ -2374,10 +2364,10 @@ mod tests {
             json!({"role": "system", "content": "system prompt"}),
             json!({"role": "user", "content": "hello world"}),
         ];
-        state.pinned_tool_schema_tokens = 120;
+        state.always_load_tool_schema_tokens = 120;
         let expected = crate::prompts::estimate_tokens(
             &state.messages,
-            state.pinned_tool_schema_tokens as usize,
+            state.always_load_tool_schema_tokens as usize,
             0,
         ) as f64
             / 10_000.0;
@@ -2923,9 +2913,6 @@ esac
         assert!(is_server_mutator_tool_name("mo_query"));
         // Session-state mutators
         assert!(is_server_mutator_tool_name("adjust_config"));
-        assert!(is_server_mutator_tool_name("prioritize_tool"));
-        assert!(is_server_mutator_tool_name("deprioritize_tool"));
-        assert!(is_server_mutator_tool_name("set_goal"));
         assert!(is_server_mutator_tool_name("compress_context"));
         assert!(is_server_mutator_tool_name("task"));
 
@@ -2984,7 +2971,7 @@ esac
     }
 
     #[test]
-    fn task_round_mutator_detection_uses_action_not_legacy_tool_names() {
+    fn task_round_mutator_detection_uses_task_action_only() {
         assert!(server_session_state_mutator_in_round(&[json!({
             "function": {
                 "name": "task",
@@ -3005,8 +2992,8 @@ esac
         })]));
         assert!(!server_session_state_mutator_in_round(&[json!({
             "function": {
-                "name": "task_create",
-                "arguments": "{\"title\":\"old\"}"
+                "name": "taskish",
+                "arguments": "{\"action\":\"create\",\"title\":\"ignored\"}"
             }
         })]));
     }

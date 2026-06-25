@@ -8,7 +8,7 @@
 //! `stream_render.rs` did this; the parallel batch path silently handed
 //! the `SANDBOX_DENIED:` error string back to the model, which was
 //! forced to ask the user manually — defeating auto mode entirely.
-//! Observed in session `3b7ac18f`: 4 `~/claudecode/*` reads blocked,
+//! Observed in session `3b7ac18f`: 4 `~/reference-agent/*` reads blocked,
 //! 0 `sandbox_expand` approval events.
 //!
 //! This module factors out the pieces that are pure logic (no UI, no
@@ -112,9 +112,6 @@ pub(crate) fn explicit_file_tool_path_args<'a>(tool: &str, args: &'a Value) -> V
         "rollback_file_edits" => {
             push_explicit_arg_path(&mut paths, args, "path");
         }
-        "session" if args.get("action").and_then(Value::as_str) == Some("rollback_edits") => {
-            push_explicit_arg_path(&mut paths, args, "path");
-        }
         _ => {}
     }
     paths
@@ -145,7 +142,8 @@ pub(crate) fn explicit_file_tool_path_targets(
 }
 
 fn agent_run_chain_explicit_path_targets(args: &Value) -> Vec<ExplicitPathPreflightTarget> {
-    let Ok(chain) = serde_json::from_value::<astra_runtime::tool_registry::ToolChain>(args.clone())
+    let Ok(chain) =
+        serde_json::from_value::<astra_turn_core::tool_registry_chain::ToolChain>(args.clone())
     else {
         return Vec::new();
     };
@@ -1262,10 +1260,10 @@ mod tests {
     fn auto_mode_contract_detects_denial_and_derives_dir() {
         // Simulate the exact tool output + args shape from session 3b7ac18f.
         let tool_output = "SANDBOX_DENIED: The command references \
-                           '/home/user/claudecode/tools/FileReadTool/limits.ts' \
+                           '/home/user/reference-agent/tools/FileReadTool/limits.ts' \
                            which is outside the project directory …";
         let tool_args = json!({
-            "command": "cat /home/user/claudecode/tools/FileReadTool/limits.ts"
+            "command": "cat /home/user/reference-agent/tools/FileReadTool/limits.ts"
         });
 
         // Step 1: the prefix detector sees the denial.
@@ -1275,7 +1273,7 @@ mod tests {
         let dir = sandbox_expand_dir_from_args(&tool_args).expect("expand dir");
         assert_eq!(
             dir,
-            PathBuf::from("/home/user/claudecode/tools/FileReadTool")
+            PathBuf::from("/home/user/reference-agent/tools/FileReadTool")
         );
 
         // Step 3: the message body survives stripping.

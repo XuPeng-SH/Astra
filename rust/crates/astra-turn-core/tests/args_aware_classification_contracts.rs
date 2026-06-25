@@ -3,7 +3,7 @@
 //! These tests verify that the classification → partition → approval →
 //! speculation pipeline stays consistent when bash commands carry
 //! read-only vs mutating arguments. This is the cloud-edge advantage
-//! over Claude Code: `bash "git status"` runs in parallel without
+//! over the reference agent: `bash "git status"` runs in parallel without
 //! approval while `bash "rm -rf"` is serialized and gated.
 
 use std::sync::Arc;
@@ -413,28 +413,18 @@ fn non_bash_ignores_command_arg() {
     assert!(c.approval_required);
 }
 
-// ── Scenario 8: BashTool alias consistency ─────────────────────────────
+// ── Scenario 8: removed shell names do not inherit bash classification ───
 
-/// BashTool is an alias for bash — must behave identically.
 #[test]
-fn bashtool_alias_consistent_with_bash() {
+fn removed_bashtool_name_is_unknown_mutating() {
     let commands = ["git status", "ls -la", "cargo build", "rm -rf /", ""];
     for cmd in commands {
         let args = json!({"command": cmd});
-        let bash_c = classify("bash", Some(&args));
-        let bashtool_c = classify("BashTool", Some(&args));
-        assert_eq!(
-            bash_c.parallelizable, bashtool_c.parallelizable,
-            "BashTool vs bash parallelizable mismatch for {cmd:?}"
-        );
-        assert_eq!(
-            bash_c.approval_required, bashtool_c.approval_required,
-            "BashTool vs bash approval mismatch for {cmd:?}"
-        );
-        assert_eq!(
-            bash_c.category, bashtool_c.category,
-            "BashTool vs bash category mismatch for {cmd:?}"
-        );
+        let c = classify("BashTool", Some(&args));
+        assert_eq!(c.category, ToolCategory::Mutating, "{cmd:?}");
+        assert!(!c.parallelizable, "{cmd:?}");
+        assert!(!c.approval_required, "{cmd:?}");
+        assert!(!c.compactable, "{cmd:?}");
     }
 }
 

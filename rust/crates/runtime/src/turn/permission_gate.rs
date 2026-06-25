@@ -751,7 +751,7 @@ mod tests {
     // Read-only tools (read_file, grep, glob, list_dir) stay allowed so
     // the model can still explore the codebase to write a good plan.
     //
-    // claudecode references: plan-mode write block enforces "DO NOT
+    // reference-agent references: plan-mode write block enforces "DO NOT
     // write or edit any files yet. This is a read-only exploration and
     // planning phase." Without this gate, the model can call write
     // tools while in plan mode and silently bypass the workflow.
@@ -814,8 +814,6 @@ mod tests {
             ("rollback_file_edits", Some(r#"{"scope":"current_turn"}"#)),
             ("rollback_session_state", Some(r#"{"scope":"last_turn"}"#)),
             ("adjust_config", Some(r#"{"key":"model","value":"fast"}"#)),
-            ("prioritize_tool", Some(r#"{"tool":"bash"}"#)),
-            ("deprioritize_tool", Some(r#"{"tool":"grep"}"#)),
             ("compress_context", Some(r#"{"target_tokens":1000}"#)),
             ("task", Some(r#"{"action":"stop","task_id":"bg-shell-1"}"#)),
         ] {
@@ -869,21 +867,7 @@ mod tests {
         };
         let ctx = PermissionSyncContext::shared(inherited);
 
-        for tool in &[
-            "read_file",
-            "grep",
-            "glob",
-            "list_dir",
-            "git_status",
-            "git_diff",
-            "git_log",
-            "git_file_history",
-            "git_contributors",
-            "git_log_search",
-            "git_show",
-            "git_blame",
-            "symbols",
-        ] {
+        for tool in &["read_file", "grep", "glob", "list_dir", "symbols"] {
             let result = check_tool_permission_in_plan_mode(
                 tool,
                 None,
@@ -897,6 +881,32 @@ mod tests {
                 is_allowed(&result),
                 "`{tool}` is read-only — plan mode must allow it so the model \
                  can explore the codebase before writing the plan. Got: {result:?}"
+            );
+        }
+
+        for action in [
+            "status",
+            "diff",
+            "log",
+            "file_history",
+            "contributors",
+            "log_search",
+            "show",
+            "blame",
+        ] {
+            let args = serde_json::json!({"action": action}).to_string();
+            let result = check_tool_permission_in_plan_mode(
+                "git",
+                Some(args.as_str()),
+                Some(&ctx),
+                None,
+                Duration::from_secs(1),
+                true,
+            )
+            .await;
+            assert!(
+                is_allowed(&result),
+                "git(action={action}) is read-only — plan mode must allow it. Got: {result:?}"
             );
         }
     }

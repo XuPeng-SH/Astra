@@ -1,9 +1,9 @@
-//! Tool surface — T1 pinned + T2 deferred model.
+//! Tool surface — T1 always_load + T2 deferred model.
 //!
-//! See `memory/project_tool_surface_rewrite.md` and the plan file for the
-//! architectural story. Short version:
+//! See `plans/tool-surface-deferred-simplification-2026-06-23.md` and
+//! `docs/design/skills-and-tools.md` for the architectural story. Short version:
 //!
-//! - **T1 pinned** = a small, stable set of tool schemas that go into the
+//! - **T1 always_load** = a small, stable set of tool schemas that go into the
 //!   LLM `tools[]` array on every turn. Byte-stable across a session so the
 //!   Anthropic/Bedrock prompt cache can hit the whole prefix.
 //! - **T2 deferred** = every other known tool, listed as `name + short_desc`
@@ -12,62 +12,67 @@
 //!   schema visible in upcoming `tools[]` payloads until the model actually
 //!   calls that tool once.
 //!
-//! The default T1 set is the coding core (see `DEFAULT_PINNED`).
-//! Users override via `runtime.tool_surface.pinned_tools` in TOML. A name
-//! prefixed with `-` removes a default (e.g. `"-grep"`).
+//! The default T1 set is the coding core, derived from
+//! `astra_runtime_env::ToolSpec::load_policy`.
+//! Users can add extra T1 tools via `runtime.tool_surface.always_load_tools` in TOML.
 //!
-//! Implementation is complete and wired into production. See
-//! `memory/project_tool_surface_rewrite.md` for the architectural story.
+//! Implementation is complete and wired into production.
 
 use astra_config::ToolSurfaceConfig;
 use astra_turn_core::tool::schema::tool_schema_name;
+use astra_turn_core::tool_registry_report::{ToolSurfaceSnapshot, ToolSurfaceTierCounts};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashSet;
+use std::sync::LazyLock;
 
-/// Default T1 pinned tools — the coding golden path + astra intrinsics +
-/// activation primitives.
-///
-/// Rationale for each inclusion:
-/// - `bash`, `read_file`, `write_file`, `str_replace` — the coding four.
-/// - `grep`, `glob`, `list_dir` — file discovery, used in 80%+ of turns.
-/// - `memory` — astra's intrinsic memory capability (cf. TOOL_CATALOG
-///   comment at tool_registry_meta:408 — "memory is pinned, intrinsic
-///   store/retrieve capability"). Deferring it would force a
-///   round-trip for every memory op.
-/// - `git` — read-mostly VCS observability (`status`, `diff`, `log`) is part
-///   of the normal coding loop and is referenced directly by the system
-///   prompt. Deferring it makes "show diff" pay an activation round and
-///   contradicts that contract.
-/// - `skill`, `tool_search` — the two activation primitives. Needed to
-///   reach anything in the deferred list.
-/// - `task` — session_todos surface. The TUI's task dashboard lights up
-///   only when the model emits `task.create / update`. Leaving it in
-///   T2 means the model rarely activates it via `tool_search`, and the
-///   board never shows up — defeating its purpose. Pin it so multi-step
-///   work is visible by default.
-/// - `ask_user` — the structured clarification primitive. It is pinned as
-///   core interaction vocabulary, then removed by interaction-mode filtering
-///   in Auto/NonInteractive/Headless turns where no user prompt sink exists.
-///
-/// Explicitly deferred: `github`, `mo`, `agent`, `web_fetch`,
-/// `introspect`, `lsp`, `notify`, `session`, `symbols`, `powershell`,
-/// `run_script`. Users pin via config as needed.
-pub const DEFAULT_PINNED: &[&str] = &[
-    "ask_user",
-    "bash",
-    "git",
-    "glob",
-    "grep",
-    "list_dir",
-    "memory",
-    "read_file",
-    "skill",
-    "str_replace",
-    "task",
-    "tool_search",
-    "write_file",
-];
+/// Default T1 always_load tool names, derived from the single authority
+/// [`astra_runtime_env::ToolSpec`] classification.
+/// Any name classified as `ToolLoadPolicy::AlwaysLoad` automatically
+/// appears here — no manual copy needed.
+pub fn default_always_load_names() -> &'static [String] {
+    static NAMES: LazyLock<Vec<String>> = LazyLock::new(|| {
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        let mut names: Vec<String> = registry
+            .iter()
+            .filter(|spec| spec.load_policy == astra_runtime_env::ToolLoadPolicy::AlwaysLoad)
+            .map(|spec| spec.name.clone())
+            .collect();
+        names.sort_unstable();
+
+        assert_always_load_schemas(&names);
+
+        names
+    });
+    &NAMES
+}
+
+fn canonical_builtin_surface_schema_names() -> std::collections::BTreeSet<String> {
+    let mut schemas = astra_tools::schemas::all_tool_schemas();
+    schemas.push(crate::turn::skill_tool::skill_tool_schema_v2());
+    schemas
+        .iter()
+        .filter_map(|schema| tool_schema_name(schema).map(str::to_string))
+        .collect()
+}
+
+pub(crate) fn missing_always_load_schema_names(always_load_names: &[String]) -> Vec<String> {
+    let schema_names = canonical_builtin_surface_schema_names();
+    always_load_names
+        .iter()
+        .filter(|name| !schema_names.contains(name.as_str()))
+        .cloned()
+        .collect()
+}
+
+fn assert_always_load_schemas(always_load_names: &[String]) {
+    let missing = missing_always_load_schema_names(always_load_names);
+    assert!(
+        missing.is_empty(),
+        "AlwaysLoad tools missing schemas in canonical builtin surface pool: {}",
+        missing.join(", ")
+    );
+}
 
 /// One entry in the deferred manifest.
 ///
@@ -85,11 +90,12 @@ pub struct DeferredManifest {
     pub text: String,
     pub context_window: usize,
     pub names: Vec<String>,
+    pub omitted_names: Vec<String>,
 }
 
 /// The resolved tool surface for a session.
 pub struct ToolSurface {
-    pinned: Vec<Value>,
+    always_load: Vec<Value>,
     deferred: Vec<DeferredEntry>,
 }
 
@@ -106,11 +112,11 @@ impl ToolSurface {
     /// plugin schemas registered this session.
     ///
     /// Algorithm:
-    /// 1. Start from [`DEFAULT_PINNED`].
-    /// 2. Apply `cfg.pinned_tools`: a bare name adds, a `-name` removes.
-    ///    Unknown names are silently ignored.
+    /// 1. Start from names classified as `ToolLoadPolicy::AlwaysLoad`.
+    /// 2. Apply `cfg.always_load_tools`: a known tool name adds that tool to
+    ///    always_load. Unknown or malformed entries are ignored.
     /// 3. Partition the union of catalog + plugins: names in the resolved
-    ///    pinned set → `pinned_schemas`; everything else → `deferred`.
+    ///    always_load set → `always_load_schemas`; everything else → `deferred`.
     /// 4. Sort both alphabetically for byte-stability.
     pub fn build(
         catalog_schemas: Vec<Value>,
@@ -127,6 +133,14 @@ impl ToolSurface {
             .chain(plugin_schemas.iter().cloned())
         {
             if let Some(name) = tool_schema_name(&schema) {
+                if tool_name_is_forbidden_model_surface(name) {
+                    tracing::warn!(
+                        target: "astra.tool_surface",
+                        name,
+                        "tool surface: forbidden schema name '{name}' ignored"
+                    );
+                    continue;
+                }
                 if by_name.contains_key(name) {
                     tracing::warn!(
                         target: "astra.tool_surface",
@@ -138,71 +152,78 @@ impl ToolSurface {
             }
         }
 
-        // Resolve the pinned name set: defaults + additive overrides, minus
-        // any `-name` removals. Unknown names emit a warning — they are likely
-        // typos (`+web_fetc`) or stale entries after a tool was renamed.
-        let mut pinned_names: std::collections::BTreeSet<String> =
-            DEFAULT_PINNED.iter().map(|s| (*s).to_string()).collect();
-        for entry in &cfg.pinned_tools {
+        // Resolve the always_load name set: defaults plus additive overrides.
+        // Unknown names emit a warning — they are likely typos or stale
+        // entries after a tool was renamed.
+        let mut always_load_names: std::collections::BTreeSet<String> = default_always_load_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        for entry in &cfg.always_load_tools {
             let trimmed = entry.trim();
-            // Empty / whitespace-only / bare "-" / double-prefixed "--" are
-            // user-config noise — silently skip. The fence against "-- foo"
-            // becoming "-foo" (which tries to remove a tool named "-foo")
-            // is also a bug prevention.
-            if trimmed.is_empty() || trimmed == "-" || trimmed.starts_with("--") {
+            if trimmed.is_empty() {
                 continue;
             }
-            if let Some(name) = trimmed.strip_prefix('-') {
-                pinned_names.remove(name);
-            } else if by_name.contains_key(trimmed) {
-                pinned_names.insert(trimmed.to_string());
+            if by_name.contains_key(trimmed) {
+                always_load_names.insert(trimmed.to_string());
             } else {
                 tracing::warn!(
                     target: "astra.tool_surface",
                     entry = trimmed,
-                    "tool_surface.pinned_tools: unknown tool name '{trimmed}' ignored — typo or renamed tool?"
+                    "tool_surface.always_load_tools: unknown tool name '{trimmed}' ignored — typo or renamed tool?"
                 );
             }
         }
 
         // Partition. BTreeMap iteration is already alphabetical, so the
         // resulting vectors come out sorted for free.
-        let mut pinned: Vec<Value> = Vec::new();
+        let mut always_load: Vec<Value> = Vec::new();
         let mut deferred: Vec<DeferredEntry> = Vec::new();
         for (name, schema) in by_name {
-            if pinned_names.contains(&name) {
-                pinned.push(schema);
+            if always_load_names.contains(&name) {
+                always_load.push(schema);
             } else {
                 let short_desc = short_description(&schema);
                 deferred.push(DeferredEntry { name, short_desc });
             }
         }
 
-        Self { pinned, deferred }
+        Self {
+            always_load,
+            deferred,
+        }
     }
 
     /// Build a deferred manifest from the eligible schema pool after the caller
     /// has already decided the final visible `tools[]` set for this turn.
     ///
-    /// This keeps the wire contract self-consistent: a tool is either directly
-    /// visible in `tools[]` or advertised as deferred/searchable, never both.
-    ///
-    /// NOTE: `visible_names` is only used to filter `plugin_schemas` (per-turn
-    /// dynamic tools like MCP). Catalog schemas pass through unfiltered so that
-    /// the deferred block (`<deferred_tools>`) remains stable per session —
-    /// filtering by `visible_names` would make it fluctuate with every
-    /// selector change, breaking `CacheScope::Session`.
+    /// `visible_names` is authoritative for the current request: a tool that
+    /// already appears in `tools[]` must not also be advertised as deferred.
+    /// The deferred manifest is discovery metadata for tools that still require
+    /// explicit activation, not a second copy of the visible surface.
     pub fn build_excluding_visible(
         catalog_schemas: Vec<Value>,
         cfg: &ToolSurfaceConfig,
         plugin_schemas: &[Value],
         visible_names: &HashSet<String>,
     ) -> Self {
-        // Catalog schemas are NOT filtered by visible_names — the deferred set
-        // must be stable per session (CacheScope::Session). Selector-chosen
-        // tools may appear in both tools[] and <deferred_tools>; the system
-        // prompt instructs the model to prefer tools[].
-        // let catalog_schemas: Vec<Value> = ...; // intentionally removed
+        let plugin_names: HashSet<String> = plugin_schemas
+            .iter()
+            .filter_map(|schema| tool_schema_name(schema).map(str::to_string))
+            .collect();
+
+        // Callers may pass a mixed all-schemas pool that already contains
+        // plugin/MCP names. Remove plugin names from the catalog half first,
+        // then apply the same visible-name exclusion to both catalog and
+        // dynamic schemas so the deferred manifest is disjoint from tools[].
+        let catalog_schemas: Vec<Value> = catalog_schemas
+            .into_iter()
+            .filter(|schema| {
+                tool_schema_name(schema).is_none_or(|name| {
+                    !plugin_names.contains(name) && !visible_names.contains(name)
+                })
+            })
+            .collect();
 
         let plugin_schemas: Vec<Value> = plugin_schemas
             .iter()
@@ -218,24 +239,35 @@ impl ToolSurface {
     ///
     /// Returned by value so callers can annotate `cache_control` without
     /// mutating the surface.
-    pub fn pinned_schemas(&self) -> Vec<Value> {
-        self.pinned.clone()
+    pub fn always_load_schemas(&self) -> Vec<Value> {
+        self.always_load.clone()
     }
 
-    /// Resolved pinned names in the same stable order as [`pinned_schemas`].
+    /// Resolved always_load names in the same stable order as [`always_load_schemas`].
     ///
     /// This is the single runtime answer to "which tools are T1 for this
     /// surface?". Callers that need cache markers, edge metadata, or diagnostics
     /// should derive from the resolved surface instead of rebuilding the
-    /// DEFAULT_PINNED + TOML override rules locally.
-    pub fn pinned_names(&self) -> Vec<String> {
-        self.pinned
+    /// declaration + TOML addition rules locally.
+    pub fn always_load_names(&self) -> Vec<String> {
+        self.always_load
             .iter()
             .filter_map(|schema| tool_schema_name(schema).map(str::to_string))
             .collect()
     }
 
-    /// The deferred manifest — one `name + short_desc` entry per non-pinned
+    pub fn snapshot(&self) -> ToolSurfaceSnapshot {
+        ToolSurfaceSnapshot {
+            visible_tools: self.always_load_names(),
+            tier_counts: ToolSurfaceTierCounts {
+                always_load: self.always_load.len().min(u32::MAX as usize) as u32,
+                deferred_active: 0,
+                deferred_available: self.deferred.len().min(u32::MAX as usize) as u32,
+            },
+        }
+    }
+
+    /// The deferred manifest — one `name + short_desc` entry per non-always_load
     /// tool, ready to render into the system-reminder block.
     pub fn deferred(&self) -> &[DeferredEntry] {
         &self.deferred
@@ -271,8 +303,21 @@ impl ToolSurface {
             text,
             context_window,
             names: block.names,
+            omitted_names: block.omitted_names,
         })
     }
+}
+
+fn builtin_tool_is_internal(name: &str) -> bool {
+    static REGISTRY: LazyLock<astra_runtime_env::ToolRegistry> =
+        LazyLock::new(astra_runtime_env::ToolRegistry::builtins);
+    REGISTRY
+        .get(name)
+        .is_some_and(|spec| !spec.load_policy.is_public_schema_policy())
+}
+
+fn tool_name_is_forbidden_model_surface(name: &str) -> bool {
+    builtin_tool_is_internal(name)
 }
 
 /// Truncate the schema description to a compact UTF-8 char-boundary summary.

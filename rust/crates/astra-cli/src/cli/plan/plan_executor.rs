@@ -1059,7 +1059,6 @@ pub(crate) struct BackgroundPlanContext {
     pub recent_tools: Vec<String>,
     pub tool_health_entries: Vec<ToolHealthEntry>,
     pub unified_skill_registry: Arc<astra_runtime::skills::UnifiedSkillRegistry>,
-    pub skill_search: astra_core::SkillSearchSettings,
     pub delegation_engine: Option<Arc<astra_runtime::server::delegation::engine::DelegationEngine>>,
     pub messaging_metrics: Option<Arc<astra_messaging::MessagingMetrics>>,
     pub agent_spawner: Option<Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
@@ -1548,6 +1547,7 @@ async fn plan_executor_task(
                     render_policy: crate::cli::stream::stream_render::RenderPolicy::Silent,
                     cli_context: Some(&ctx.cli_context),
                     recent_tools: &ctx.recent_tools,
+                    activated_deferred_tool_names: None,
                     tool_health_entries: &ctx.tool_health_entries,
                     resume_restricted_tools: &[],
                     session_lessons: &[],
@@ -1567,7 +1567,6 @@ async fn plan_executor_task(
                     ask_user_request_tx: None,
                     plan_review_request_tx: None,
                     mcp_manager: None,
-                    skill_search: &ctx.skill_search,
                     skill_quality_tracker: &mut skill_qt,
                     discovered_skills: None,
                     messaging_metrics: ctx.messaging_metrics.clone(),
@@ -1638,8 +1637,8 @@ async fn plan_executor_task(
                             result.completion_tokens,
                             subtask_start.elapsed().as_millis() as u64,
                         )
-                        .with_tool_selection(
-                            result.tools_selected.clone(),
+                        .with_tool_surface(
+                            result.visible_tools.clone(),
                             result.selected_skills.clone(),
                             result.tools_used.clone(),
                             result.budget_used,
@@ -2115,7 +2114,6 @@ mod tests {
             recent_tools: vec![],
             tool_health_entries: vec![],
             unified_skill_registry: Arc::new(reg),
-            skill_search: astra_core::SkillSearchSettings::default(),
             delegation_engine: None,
             messaging_metrics: None,
             agent_spawner: None,
@@ -2298,7 +2296,7 @@ mod tests {
     }
 
     // Test `background_selector_without_pipeline_modules_still_selects` removed:
-    // tool selector has been deleted — tool schemas are sent in full each turn.
+    // Tool schemas are surfaced by the current deterministic tool-surface path.
 
     #[test]
     fn turn_retry_counts_increments_correctly() {
@@ -3747,7 +3745,7 @@ All acceptance checks pass:
     }
 
     #[test]
-    fn turn_event_carries_tool_selection_and_budget_telemetry() {
+    fn turn_event_carries_tool_surface_and_budget_telemetry() {
         let result = StreamResult {
             session_id: None,
             run_id: None,
@@ -3758,7 +3756,7 @@ All acceptance checks pass:
             cache_read_tokens: 17,
             cache_creation_tokens: 9,
             tool_calls_count: 2,
-            tools_selected: vec!["read_file".into(), "write_file".into()],
+            visible_tools: vec!["read_file".into(), "write_file".into()],
             selected_skills: vec!["debug".into()],
             tools_used: vec!["read_file".into(), "write_file".into()],
             tool_call_records: vec![
@@ -3808,8 +3806,8 @@ All acceptance checks pass:
             result.completion_tokens,
             2000,
         )
-        .with_tool_selection(
-            result.tools_selected.clone(),
+        .with_tool_surface(
+            result.visible_tools.clone(),
             result.selected_skills.clone(),
             result.tools_used.clone(),
             result.budget_used,
@@ -3837,7 +3835,7 @@ All acceptance checks pass:
         }
 
         assert_eq!(
-            turn_evt.tools_selected,
+            turn_evt.visible_tools,
             Some(vec!["read_file".into(), "write_file".into()])
         );
         assert_eq!(turn_evt.selected_skills, Some(vec!["debug".into()]));

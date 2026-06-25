@@ -62,7 +62,7 @@ use crate::cli::{
 use astra_thin_client::paths;
 use clap::CommandFactory;
 use crossterm::{style::Stylize, terminal};
-use std::{fs, io::Read};
+use std::io::Read;
 
 async fn start_http_server(host: &str, port: u16) -> Result<(), String> {
     let addr: std::net::SocketAddr = format!("{host}:{port}")
@@ -528,7 +528,6 @@ async fn execute_headless_task_body(
         .await?;
 
     let pipeline_modules = session_runtime::create_pipeline_modules_quiet(api, profile);
-    let skill_search = astra_core::SkillSearchSettings::default();
     let project_root = std::env::current_dir().unwrap_or_default();
     let mut pm = PermissionManager::with_load_policy(
         effective_permission_mode,
@@ -541,7 +540,6 @@ async fn execute_headless_task_body(
         api,
         token.clone(),
         pipeline_modules.unified_skill_registry.clone(),
-        skill_search.clone(),
         session_id.clone(),
         effective_model.clone(),
     )
@@ -582,7 +580,6 @@ async fn execute_headless_task_body(
         render_policy,
         cli_context: Some(cli_context),
         unified_skill_registry: &pipeline_modules.unified_skill_registry,
-        skill_search: &skill_search,
         agent_spawner: Some(spawner),
         root_agent_id: Some(&root_agent_id),
         task_manager: Some(task_manager),
@@ -1311,7 +1308,6 @@ async fn execute_cli_command_impl(
                 &crate::cli::permission_manager::PermissionLoadPolicy::HeadlessSafe,
             );
             let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
-            let skill_search = astra_core::SkillSearchSettings::default();
             let chat_ctx = crate::cli::chat_stream::BasicCliChatContext {
                 api,
                 auth_profile: profile.as_deref(),
@@ -1324,7 +1320,6 @@ async fn execute_cli_command_impl(
                 render_policy: crate::cli::stream::stream_render::RenderPolicy::Stream,
                 cli_context: Some(cli_context),
                 unified_skill_registry: astra_runtime::skills::default_unified_registry(),
-                skill_search: &skill_search,
                 agent_spawner: None,
                 root_agent_id: None,
                 task_manager: None,
@@ -1816,7 +1811,6 @@ async fn execute_cli_command_impl(
             let render_md = is_tty && !quiet;
 
             let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
-            let skill_search = astra_core::SkillSearchSettings::default();
             let render_policy = if quiet {
                 crate::cli::stream::stream_render::RenderPolicy::Silent
             } else {
@@ -1830,7 +1824,6 @@ async fn execute_cli_command_impl(
                 api,
                 token.clone(),
                 astra_runtime::skills::default_unified_registry().clone(),
-                skill_search.clone(),
                 session_id.clone(),
                 effective_model.clone(),
             )
@@ -1879,7 +1872,6 @@ async fn execute_cli_command_impl(
                 render_policy,
                 cli_context: Some(cli_context),
                 unified_skill_registry: astra_runtime::skills::default_unified_registry(),
-                skill_search: &skill_search,
                 agent_spawner: Some(one_shot_spawner),
                 root_agent_id: Some(&root_agent_id),
                 task_manager: Some(chat_task_manager),
@@ -2190,44 +2182,6 @@ async fn execute_cli_command_impl(
             let q = vec![("per_group", args.per_group.to_string())];
             let body = api
                 .get_skills_status_query_text(&token, &q)
-                .await
-                .map_err(map_thin_err)?;
-            print_json_or_raw(&body);
-            Ok(ExitCode::Success)
-        }
-
-        Some(Command::Skill(SkillCmd::Register(args))) => {
-            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
-            let skill_code = match (args.code, args.code_file) {
-                (Some(code), None) => code,
-                (None, Some(path)) => fs::read_to_string(path).map_err(|e| e.to_string())?,
-                (Some(_), Some(_)) => {
-                    return Err("provide either --code or --code-file, not both".to_string());
-                }
-                (None, None) => {
-                    return Err("missing skill code: set --code or --code-file".to_string());
-                }
-            };
-            let metadata = if let Some(raw) = args.metadata_json {
-                Some(serde_json::from_str::<serde_json::Value>(&raw).map_err(|e| e.to_string())?)
-            } else {
-                None
-            };
-            let skill_id = args
-                .skill_id
-                .unwrap_or_else(|| format!("{}@{}", args.name, args.version));
-            let body = api
-                .post_skills_register_json(
-                    &token,
-                    &serde_json::json!({
-                        "skill_id": skill_id,
-                        "skill_name": args.name,
-                        "skill_version": args.version,
-                        "skill_code": skill_code,
-                        "description": args.description,
-                        "metadata": metadata
-                    }),
-                )
                 .await
                 .map_err(map_thin_err)?;
             print_json_or_raw(&body);
@@ -2600,7 +2554,6 @@ pub(crate) async fn run_print_mode(
         return Ok(ExitCode::ToolFailure);
     }
     let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
-    let skill_search = astra_core::SkillSearchSettings::default();
 
     // Print mode wires an MO-backed TaskManager when available so that the
     // `task` tool's writes land in `session_todos` the same way the REPL
@@ -2626,7 +2579,6 @@ pub(crate) async fn run_print_mode(
         render_policy: crate::cli::stream::stream_render::RenderPolicy::Silent,
         cli_context: Some(cli_context),
         unified_skill_registry: astra_runtime::skills::default_unified_registry(),
-        skill_search: &skill_search,
         agent_spawner: None,
         root_agent_id: None,
         task_manager: Some(print_task_manager),
@@ -3045,13 +2997,13 @@ mod exit_code_tests {
     }
 
     #[test]
-    fn exit_code_success_on_informational_failure_semantics() {
+    fn exit_code_success_on_empty_result_semantics() {
         let mut sr = empty_stream_result();
         sr.tool_call_records.push(tool_call_record(
             "Bash",
             false,
             Some("grep returned 1"),
-            Some("informational_failure"),
+            Some("empty_result"),
         ));
         assert_eq!(compute_exit_code(&sr), ExitCode::Success);
     }
@@ -3133,13 +3085,13 @@ mod exit_code_tests {
             severity: "critical".to_string(),
             injections: vec![],
             avoid_tools: vec![],
-            deprioritized_tools: vec![],
+            health_avoidance_tools: vec![],
             force_stop: true,
             nudge_count: 0,
             interaction_mode: "prompt".to_string(),
             suppressed_loop_nudges: false,
             total_errors: 3,
-            deprioritized_count: 0,
+            health_avoidance_count: 0,
             recent_error_pressure: 0,
             recent_timeout_pressure: 0,
             total_timeouts: 0,
@@ -3261,13 +3213,13 @@ mod exit_code_tests {
             severity: "warning".to_string(),
             injections: vec![],
             avoid_tools: vec![],
-            deprioritized_tools: vec![],
+            health_avoidance_tools: vec![],
             force_stop: false,
             nudge_count: 1,
             interaction_mode: "prompt".to_string(),
             suppressed_loop_nudges: false,
             total_errors: 1,
-            deprioritized_count: 0,
+            health_avoidance_count: 0,
             recent_error_pressure: 0,
             recent_timeout_pressure: 0,
             total_timeouts: 0,
@@ -3502,7 +3454,7 @@ mod one_shot_persistence_tests {
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
             tool_calls_count: 0,
-            tools_selected: Vec::new(),
+            visible_tools: Vec::new(),
             selected_skills: Vec::new(),
             tools_used: Vec::new(),
             tool_call_records: Vec::new(),
@@ -3615,7 +3567,7 @@ mod one_shot_persistence_tests {
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
             tool_calls_count: 0,
-            tools_selected: Vec::new(),
+            visible_tools: Vec::new(),
             selected_skills: Vec::new(),
             tools_used: Vec::new(),
             tool_call_records: Vec::new(),
@@ -4001,9 +3953,9 @@ mod show_policy_tests {
         // End-to-end: load config, resolve, format. Asserts the whole
         // wiring works — not just the string formatter. Opus's built-in
         // profile is 4 / 20 / 4 / 3 (see
-        // `ToolSelectionConfig::builtin_model_profiles`).
+        // `ToolPolicyConfig::builtin_model_profiles`).
         let cfg = astra_config::runtime_config::RuntimeConfig::load();
-        let policy = cfg.tool_selection.resolve_for_model(Some("opus"));
+        let policy = cfg.tool_policy.resolve_for_model(Some("opus"));
         let human = format_policy_output(Some("opus"), &policy, "strict", &[], false);
         assert!(human.contains("= 4"), "expected 4s for opus: {human}");
         assert!(human.contains("= 20"), "expected 20 for opus: {human}");

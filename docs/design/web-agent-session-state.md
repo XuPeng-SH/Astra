@@ -2698,7 +2698,7 @@ Publish flow:
 1. User edits a skill in web UI.
 2. Server validates `SKILL.md` manifest and content.
 3. Server creates an immutable `user_skill_versions` row.
-4. Active version is registered into `skills_registry` with `created_by`,
+4. Active version is indexed in `skills_registry` with `created_by`,
    `source='user'`, `is_public`, and `content_hash`.
 5. `skill_installations` marks it installed for the same user.
 6. Skill selection uses the same selector, but filters by user ownership,
@@ -2719,10 +2719,11 @@ Runtime visibility contract:
   list/detail/version endpoints and the runtime resolver.
 - Runtime turns build the resolver by default from that visible catalog.
   `allow_skills` is only a request-scoped filter over the visible catalog. The
-  LLM still receives only pinned/active skills plus the shared
-  `visible_skills_for_host_turn(...)` selector shortlist; full `SKILL.md`
-  content is injected only after the model calls the `skill` tool.
-- Web composer skill tokens are per-turn selections, not session pins. The
+  LLM receives request-active skills plus the session-scoped
+  `<available_skills>` catalog. `discover_skills` performs targeted lookup for
+  catalog entries that do not fit in the prompt budget; full `SKILL.md` content
+  is injected only after the model calls the `skill` tool.
+- Web composer skill tokens are per-turn selections. The
   composer clears the submitted skill tokens as soon as the turn is submitted;
   failures restore them so the same request can be retried.
 - The composer exposes the same per-turn skill selection through both the `+`

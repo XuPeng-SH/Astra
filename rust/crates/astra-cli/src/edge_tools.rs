@@ -2,8 +2,7 @@
 //!
 //! Tools: bash, read_file (with outline mode), write_file, str_replace (with fuzzy matching),
 //!        list_dir, grep (with context_lines/max_matches), glob,
-//!        git(action=...), github(action=...), web_fetch,
-//!        mo_query, mo_snapshot, mo_branch
+//!        git(action=...), github(action=...), web_fetch, mo_query.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -23,6 +22,12 @@ use astra_turn_core::tool::deferred_activation::ToolSurfaceNames;
 /// The agentic loop / permission manager can detect this to prompt the user
 /// for authorization instead of letting the model silently fall back to bash.
 pub const SANDBOX_DENIED_PREFIX: &str = "SANDBOX_DENIED: ";
+
+#[derive(Clone, Default)]
+pub(super) struct EdgeMcpRuntimeSnapshot {
+    manager: Option<std::sync::Arc<tokio::sync::RwLock<crate::mcp_client::McpClientManager>>>,
+    schemas: Vec<Value>,
+}
 
 /// Error returned by [`ToolExecutor::expand_sandbox_path`] when a path is
 /// rejected by the validation gate.
@@ -118,8 +123,6 @@ const CLI_LOCAL_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "config",
     "context_analysis",
     "dead_code",
-    "delegate",
-    "deprioritize_tool",
     "diagnose",
     "enter_plan_mode",
     "env",
@@ -131,18 +134,15 @@ const CLI_LOCAL_EXECUTOR_TOOL_NAMES: &[&str] = &[
     "hover_info",
     "introspect",
     "lsp",
-    "mo_branch",
     "mo_query",
-    "mo_snapshot",
     "notebook_edit",
     "notify",
-    "prioritize_tool",
     "query_context",
     "reflect",
     "rename_symbol",
     "rollback_database_snapshots",
+    "rollback_file_edits",
     "rollback_session_state",
-    "rollback_turn_actions",
     "run_build_test",
     "session",
     "share_context",
@@ -224,7 +224,7 @@ pub(crate) fn is_plan_mode_blocked_tool(tool: &str, args: &Value) -> bool {
 
     matches!(
         tool,
-        "bash" | "write_file" | "str_replace" | "mo" | "rollback_database_snapshots"
+        "bash" | "write_file" | "str_replace" | "rollback_database_snapshots"
     )
 }
 
@@ -332,7 +332,7 @@ mod tool_search;
 
 /// Git porcelain status codes for git status --porcelain output parsing.
 /// Format: XY PATH or XY ORIG_PATH -> PATH where X and Y are status codes.
-mod git_status {
+mod porcelain_status {
     /// Modified in index (staged)
     pub const MODIFIED: char = 'M';
     /// Added to index (staged)
@@ -918,10 +918,10 @@ pub struct ToolExecutor {
     passive_tsc_pending: AtomicBool,
     /// Optional passive LSP sessions (rust-analyzer, typescript-language-server).
     passive_lsp: passive_lsp::PassiveLspManager,
-    /// MCP client manager for external tool servers.
-    /// When present, tool names starting with `mcp_` are routed to MCP servers.
-    pub mcp_manager:
-        Option<std::sync::Arc<tokio::sync::RwLock<crate::mcp_client::McpClientManager>>>,
+    /// MCP routing snapshot. Manager and MCP schemas are installed together so
+    /// `tool_search(select:mcp__*)` sees the same discovery snapshot as
+    /// execution.
+    mcp_runtime: std::sync::RwLock<EdgeMcpRuntimeSnapshot>,
     /// File edit journal — records before-state of every file write for undo.
     /// Wrapped in Arc so the chat session can share the journal across turns.
     pub file_journal:
@@ -1010,10 +1010,6 @@ pub struct ToolExecutor {
     /// source used by self-introspection tools; it is set by the CLI turn
     /// boundary and never inferred from a tool surface default.
     current_model: std::sync::RwLock<Option<String>>,
-    /// Self-modification pinned tool preferences (manual override hints).
-    self_mod_pinned_tools: std::sync::Mutex<Vec<String>>,
-    /// Self-modification deprioritized tool preferences (manual override hints).
-    self_mod_deprioritized_tools: std::sync::Mutex<Vec<String>>,
     /// P3.1 seam: cross-session lessons loaded at session bootstrap.
     /// Populated once via `set_session_lessons`, then passed through on
     /// every `build_self_model_snapshot` for the session's lifetime.
@@ -1034,10 +1030,8 @@ pub struct ToolExecutor {
     self_mod_mutation_counter: std::sync::Mutex<(u32, u32)>,
     /// Shared tool executor for delegating unknown tools to astra-tools.
     default_executor: astra_tools::executor::DefaultToolExecutor,
-    /// Plugin-registered tool schemas (e.g. MCP servers). Joined with the
-    /// static catalog when `tool_search(select:X)` runs, so deferred
-    /// activation can reach plugin tools. Populated by the TUI after
-    /// `PluginRegistry::register` loads the user's skill manifests.
+    /// Plugin-registered non-MCP tool schemas. MCP schemas live in
+    /// `mcp_runtime` so routing ownership and discovery data stay atomic.
     plugin_schemas: std::sync::RwLock<Vec<Value>>,
     /// Atomic snapshot of the current visible/deferred execution surface.
     ///
@@ -1121,7 +1115,7 @@ impl ToolExecutor {
             passive_cargo_pending: AtomicBool::new(false),
             passive_tsc_pending: AtomicBool::new(false),
             passive_lsp: passive_lsp::PassiveLspManager::new(),
-            mcp_manager: None,
+            mcp_runtime: std::sync::RwLock::new(EdgeMcpRuntimeSnapshot::default()),
             file_journal: std::sync::Arc::new(std::sync::Mutex::new(
                 astra_turn_core::file_edit_journal::FileEditJournal::default(),
             )),
@@ -1156,8 +1150,6 @@ impl ToolExecutor {
             session_memory_observatory: None,
             active_session_id: std::sync::Mutex::new(None),
             current_model: std::sync::RwLock::new(None),
-            self_mod_pinned_tools: std::sync::Mutex::new(Vec::new()),
-            self_mod_deprioritized_tools: std::sync::Mutex::new(Vec::new()),
             session_lessons: std::sync::Mutex::new(Vec::new()),
             latest_skill_diagnosis: std::sync::Mutex::new(None),
             latest_turn_quality_feedback: std::sync::Mutex::new(None),
@@ -1331,15 +1323,27 @@ impl ToolExecutor {
         self
     }
 
-    /// Install plugin-registered schemas so `tool_search(select:NAME)`
-    /// can resolve MCP / skill-backed tools. Called once at TUI start
-    /// after `PluginRegistry::register` loads manifests.
+    /// Install plugin-registered non-MCP schemas so `tool_search(select:NAME)`
+    /// can resolve skill-backed tools. Called after plugin manifests load.
     ///
     /// Poison handling: plugin schemas are a rebuildable cache. Reset cached
     /// state on poison instead of reusing possibly half-written inner data.
     pub fn set_plugin_schemas(&self, schemas: Vec<Value>) {
         let mut guard = rwlock_write_reset_on_poison(&self.plugin_schemas, "plugin_schemas");
         *guard = schemas;
+    }
+
+    /// Install MCP routing and schemas from one discovery snapshot.
+    pub fn install_mcp_bundle(
+        &mut self,
+        manager: std::sync::Arc<tokio::sync::RwLock<crate::mcp_client::McpClientManager>>,
+        schemas: Vec<Value>,
+    ) {
+        let mut guard = rwlock_write_reset_on_poison(&self.mcp_runtime, "mcp_runtime");
+        *guard = EdgeMcpRuntimeSnapshot {
+            manager: Some(manager),
+            schemas,
+        };
     }
 
     /// Install the visible `tools[]` names for the current LLM request.
@@ -1376,6 +1380,30 @@ impl ToolExecutor {
         let mut guard =
             rwlock_write_reset_on_poison(&self.current_tool_surface, "current_tool_surface");
         *guard = ToolSurfaceNames::installed(visible, activatable);
+    }
+
+    pub(crate) fn restore_activated_deferred_tool_names_for_session(&self, names: &[String]) {
+        let restored: HashSet<String> = names
+            .iter()
+            .map(|name| name.trim())
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .collect();
+
+        {
+            let mut surface = rwlock_write_reset_on_poison(
+                &self.current_tool_surface,
+                "current_tool_surface_restore_deferred_activation",
+            );
+            if !restored.is_empty() && matches!(*surface, ToolSurfaceNames::Uninstalled) {
+                *surface = ToolSurfaceNames::installed(HashSet::new(), HashSet::new());
+            }
+        }
+
+        *rwlock_write_reset_on_poison(
+            &self.activated_deferred_tools,
+            "activated_deferred_tools_restore",
+        ) = restored;
     }
 
     #[cfg(test)]
@@ -1459,7 +1487,7 @@ impl ToolExecutor {
     }
 
     fn plugin_schema_has_name(&self, name: &str) -> bool {
-        self.plugin_schemas_snapshot("plugin_schemas_runtime_binding")
+        self.external_schemas_snapshot("external_schemas_runtime_binding")
             .iter()
             .any(|schema| {
                 astra_turn_core::tool::schema::tool_schema_name(schema)
@@ -1468,7 +1496,8 @@ impl ToolExecutor {
     }
 
     fn mcp_tool_has_runtime_binding(&self, name: &str) -> bool {
-        let Some(manager) = &self.mcp_manager else {
+        let runtime = self.mcp_runtime_snapshot("mcp_runtime_binding");
+        let Some(manager) = &runtime.manager else {
             return false;
         };
         manager
@@ -1640,8 +1669,32 @@ impl ToolExecutor {
         }
     }
 
-    pub(super) fn plugin_schemas_snapshot(&self, label: &str) -> Vec<Value> {
-        rwlock_read_clone_or_default(&self.plugin_schemas, label)
+    pub(crate) fn runtime_bound_external_schemas_excluding(
+        &self,
+        restricted_tools: &HashSet<String>,
+    ) -> Vec<Value> {
+        let external_schemas: Vec<Value> = self
+            .external_schemas_snapshot("external_schemas_deferred_manifest")
+            .into_iter()
+            .filter(|schema| {
+                astra_turn_core::tool::schema::tool_schema_name(schema)
+                    .is_none_or(|name| !restricted_tools.contains(name))
+            })
+            .collect();
+        self.runtime_bound_tool_schemas(external_schemas)
+    }
+
+    pub(super) fn external_schemas_snapshot(&self, label: &str) -> Vec<Value> {
+        let mut schemas = rwlock_read_clone_or_default(&self.plugin_schemas, label);
+        schemas.extend(
+            self.mcp_runtime_snapshot("mcp_runtime_schema_snapshot")
+                .schemas,
+        );
+        schemas
+    }
+
+    pub(super) fn mcp_runtime_snapshot(&self, label: &str) -> EdgeMcpRuntimeSnapshot {
+        rwlock_read_clone_or_default(&self.mcp_runtime, label)
     }
 
     /// Set the shared context cache for cross-agent knowledge sharing.
@@ -1726,25 +1779,6 @@ impl ToolExecutor {
     pub fn set_active_session_id(&self, session_id: impl Into<String>) {
         let session_id = session_id.into();
         let session_changed = self.active_session_id().as_deref() != Some(session_id.as_str());
-        let (pinned_tools, deprioritized_tools) =
-            match astra_services::session_workspace::read_workspace_optional(&session_id) {
-                Ok(Some(ws)) => (ws.pinned_tools, ws.deprioritized_tools),
-                Ok(None) => (Vec::new(), Vec::new()),
-                Err(error) => {
-                    tracing::warn!(
-                        "active session {} has unreadable workspace metadata; clearing self-mod tool preferences: {}",
-                        session_id,
-                        error
-                    );
-                    (Vec::new(), Vec::new())
-                }
-            };
-        if let Ok(mut pinned) = self.self_mod_pinned_tools.lock() {
-            *pinned = pinned_tools;
-        }
-        if let Ok(mut deprioritized) = self.self_mod_deprioritized_tools.lock() {
-            *deprioritized = deprioritized_tools;
-        }
         // File-edit checkpoint persistence: on session-id set, rebind the
         // journal to an auto-persist directory keyed by session.
         //
@@ -2970,7 +3004,7 @@ impl ToolExecutor {
     /// `task(action='archive', task_id?)` — either archive one
     /// current-session task immediately, or bulk-archive stale
     /// completed history in the current session.
-    async fn task_archive(&self, args: &Value) -> String {
+    async fn task_action_archive(&self, args: &Value) -> String {
         if let Some(output) = self.route_task_action("archive", args).await {
             self.record_task_lifecycle_event("archive", args, &output);
             return output;
@@ -3320,150 +3354,6 @@ impl ToolExecutor {
         .to_string()
     }
 
-    // ── Timeline tool: unified multi-agent trace ───────────────────────────────
-
-    fn render_session_timeline(&self, args: &Value) -> String {
-        let session_id = match self.active_session_id() {
-            Some(s) if !s.trim().is_empty() => s,
-            _ => return "Error: no active session. Timeline requires a session.".to_string(),
-        };
-        let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(50) as usize;
-        let agent_filter = args.get("agent_id").and_then(Value::as_str);
-
-        let journal_path = astra_services::session_journal::journal_file_path(&session_id);
-
-        if !journal_path.exists() {
-            return format!("Error: journal not found at {}", journal_path.display());
-        }
-
-        let events: Vec<serde_json::Value> = match std::fs::read_to_string(&journal_path) {
-            Ok(content) => content
-                .lines()
-                .filter_map(|line| serde_json::from_str(line).ok())
-                .collect(),
-            Err(e) => return format!("Error reading journal: {e}"),
-        };
-
-        let mut timeline = astra_turn_core::unified_timeline::build_timeline(&events);
-
-        if let Some(filter) = agent_filter {
-            timeline.entries.retain(|e| {
-                e.agent_id.as_deref() == Some(filter)
-                    || matches!(&e.kind,
-                        astra_turn_core::unified_timeline::TimelineEntryKind::AgentSpawned { child_agent_id, .. }
-                        | astra_turn_core::unified_timeline::TimelineEntryKind::AgentCompleted { child_agent_id, .. }
-                        | astra_turn_core::unified_timeline::TimelineEntryKind::AgentFailed { child_agent_id, .. }
-                        if child_agent_id.contains(filter)
-                    )
-                    || e.agent_id.is_none() // always show parent rounds for context
-            });
-        }
-
-        astra_turn_core::unified_timeline::render_timeline(&timeline, limit)
-    }
-
-    // ── Session summary: structured overview of current session ────────────────
-
-    async fn render_session_summary(&self) -> String {
-        let session_id = match self.active_session_id() {
-            Some(s) if !s.trim().is_empty() => s,
-            _ => return "Error: no active session.".to_string(),
-        };
-        let journal_path = astra_services::session_journal::journal_file_path(&session_id);
-
-        let events: Vec<serde_json::Value> = match std::fs::read_to_string(&journal_path) {
-            Ok(content) => content
-                .lines()
-                .filter_map(|line| serde_json::from_str(line).ok())
-                .collect(),
-            Err(_) => return "Error: journal not found.".to_string(),
-        };
-
-        let mut turns = 0u32;
-        let mut total_tokens_in = 0u64;
-        let mut total_tokens_out = 0u64;
-        let mut total_rounds = 0u32;
-        let mut errors = 0u32;
-        let mut agents_spawned = 0u32;
-        let mut agents_completed = 0u32;
-
-        for evt in &events {
-            let etype = evt.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            match etype {
-                "turn" => {
-                    turns += 1;
-                    if let Some(tin) = evt.get("tokens_in").and_then(|v| v.as_u64()) {
-                        total_tokens_in += tin;
-                    }
-                    if let Some(tout) = evt.get("tokens_out").and_then(|v| v.as_u64()) {
-                        total_tokens_out += tout;
-                    }
-                }
-                "llm_round" => total_rounds += 1,
-                "turn_error" => errors += 1,
-                "agent_spawned" => agents_spawned += 1,
-                "AgentTerminated" => agents_completed += 1,
-                _ => {}
-            }
-        }
-
-        let mut out = String::from("## Session Summary\n");
-        out.push_str(&format!("Session: {session_id}\n"));
-        out.push_str(&format!(
-            "Turns: {turns} | LLM rounds: {total_rounds} | Errors: {errors}\n"
-        ));
-        out.push_str(&format!(
-            "Tokens: {} in + {} out = {} total\n",
-            total_tokens_in,
-            total_tokens_out,
-            total_tokens_in + total_tokens_out
-        ));
-        if agents_spawned > 0 {
-            out.push_str(&format!(
-                "Agents: {agents_spawned} spawned, {agents_completed} completed\n"
-            ));
-        }
-        // Task status nudge: if there is open work, remind the
-        // agent to update them (Claude Code parity: proactive nudge).
-        match self.task_manager.load_tasks().await {
-            Ok(tasks) => {
-                let open_tasks: Vec<_> = tasks.iter().filter(|t| t.status.is_open_work()).collect();
-                if !open_tasks.is_empty() {
-                    out.push_str(&format!("\nOpen tasks: {}\n", open_tasks.len()));
-                    for t in open_tasks.iter().take(5) {
-                        let status_icon = if t.status.is_in_progress() {
-                            "▶"
-                        } else if t.status == astra_tools::task_mgmt::SessionTaskStatusKind::Paused
-                        {
-                            "⏸"
-                        } else {
-                            "○"
-                        };
-                        let blocked = if !t.blocked_by.is_empty() {
-                            format!(" [blocked by: {}]", t.blocked_by.join(","))
-                        } else {
-                            String::new()
-                        };
-                        out.push_str(&format!(
-                            "  {status_icon} {} — {}{}\n",
-                            t.id, t.title, blocked
-                        ));
-                    }
-                    out.push_str(
-                        "Hint: update task status with `task(action=\"update\", task_id=\"...\", new_status=\"...\")` as you make progress.\n",
-                    );
-                }
-            }
-            Err(error) => {
-                out.push_str(&format!(
-                    "\nTask board unavailable: {error}\n\
-                     Do not assume there are no open tasks; retry `task(action=\"list\")` before creating duplicate work.\n"
-                ));
-            }
-        }
-        out
-    }
-
     // ── Session history: recall past conversation turns ──────────────────────
 
     fn render_session_history(&self, args: &Value) -> String {
@@ -3472,7 +3362,11 @@ impl ToolExecutor {
             _ => return "Error: no active session.".to_string(),
         };
         let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize;
-        let query = args.get("query").and_then(Value::as_str).unwrap_or("");
+        let query = args
+            .get("pattern")
+            .or_else(|| args.get("query"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
 
         let journal_path = astra_services::session_journal::journal_file_path(&session_id);
 
@@ -3554,144 +3448,11 @@ impl ToolExecutor {
         out
     }
 
-    // ── Memory suppress ────────────────────────────────────────────────────────
-
-    /// Suppress a Memoria `memory_id` for the active session.
-    ///
-    /// `memory_id` is the exact id shown by memory recall/search results.
-    /// The optional `reason` is written to the session journal. Suppression
-    /// only affects prompt injection for this session; it does not delete the
-    /// memory from Memoria.
-    fn suppress_memory(&self, args: &Value) -> String {
-        let memory_id = args.get("memory_id").and_then(Value::as_str).unwrap_or("");
-        if memory_id.is_empty() {
-            return "Error: missing required parameter `memory_id`.".to_string();
+    fn render_session_history_around(&self, args: &Value) -> String {
+        if args.get("item_seq").and_then(Value::as_u64).is_none() {
+            return "Error: history_around requires item_seq.".to_string();
         }
-        let session_id = match self.active_session_id() {
-            Some(s) if !s.trim().is_empty() => s,
-            _ => return "Error: no active session.".to_string(),
-        };
-        let reason = args.get("reason").and_then(Value::as_str);
-        astra_tools::memoria::MemoriaClient::suppress_memory(&session_id, memory_id);
-        let turn = self
-            .journal_turn_index
-            .load(std::sync::atomic::Ordering::Relaxed);
-        crate::cli::cli_config::cli_utils::append_session_journal_event_or_warn(
-            &session_id,
-            &astra_services::session_journal::JournalEvent::memory_suppressed(
-                Some(&session_id),
-                turn,
-                memory_id,
-                reason,
-            ),
-            "edge_tools:suppress_memory",
-        );
-        format!(
-            "Memory `{mid}` suppressed for this session. It will not be injected in future turns.",
-            mid = memory_id
-        )
-    }
-
-    /// Remove a Memoria `memory_id` from the active session suppress list.
-    fn unsuppress_memory(&self, args: &Value) -> String {
-        let memory_id = args.get("memory_id").and_then(Value::as_str).unwrap_or("");
-        if memory_id.is_empty() {
-            return "Error: missing required parameter `memory_id`.".to_string();
-        }
-        let session_id = match self.active_session_id() {
-            Some(s) if !s.trim().is_empty() => s,
-            _ => return "Error: no active session.".to_string(),
-        };
-        astra_tools::memoria::MemoriaClient::unsuppress_memory(&session_id, memory_id);
-        format!("Memory `{mid}` unsuppressed.", mid = memory_id)
-    }
-
-    /// List Memoria `memory_id` values suppressed in the active session.
-    fn list_suppressed_memories(&self) -> String {
-        let session_id = match self.active_session_id() {
-            Some(s) if !s.trim().is_empty() => s,
-            _ => return "Error: no active session.".to_string(),
-        };
-        let suppressed = astra_tools::memoria::MemoriaClient::suppressed_snapshot(&session_id);
-        if suppressed.is_empty() {
-            return "No memories are suppressed in this session.".to_string();
-        }
-        let mut out = format!("## Suppressed memories ({} total)\n", suppressed.len());
-        for id in &suppressed {
-            out.push_str(&format!("- {id}\n"));
-        }
-        out
-    }
-
-    // ── Context release ──────────────────────────────────────────────────────────
-
-    /// Release one or more tool results from future LLM context.
-    ///
-    /// `tool_call_id` accepts a string or array of strings copied from tool
-    /// result metadata. Released results remain in the journal, but their
-    /// content is replaced with a short stub before the next LLM request.
-    fn release_context(&self, args: &Value) -> String {
-        let session_id = match self.active_session_id() {
-            Some(s) if !s.trim().is_empty() => s,
-            _ => return "Error: no active session.".to_string(),
-        };
-        // Accept single ID or array of IDs. `tool_call_ids` (plural) is
-        // accepted as an alias so a typo in the agent prompt doesn't silently
-        // fall through to the missing-parameter error.
-        let raw = args
-            .get("tool_call_id")
-            .or_else(|| args.get("tool_call_ids"));
-        let ids: Vec<String> = if let Some(arr) = raw.and_then(Value::as_array) {
-            arr.iter()
-                .filter_map(Value::as_str)
-                .map(String::from)
-                .collect()
-        } else if let Some(id) = raw.and_then(Value::as_str) {
-            vec![id.to_string()]
-        } else {
-            return "Error: missing required parameter `tool_call_id` (string or array)."
-                .to_string();
-        };
-        if ids.is_empty() {
-            return "Error: `tool_call_id` must not be empty.".to_string();
-        }
-        for id in &ids {
-            astra_tools::memoria::MemoriaClient::release_context(&session_id, id);
-        }
-        let turn = self
-            .journal_turn_index
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
-        crate::cli::cli_config::cli_utils::append_session_journal_event_or_warn(
-            &session_id,
-            &astra_services::session_journal::JournalEvent::context_released(
-                Some(&session_id),
-                turn,
-                &id_refs,
-            ),
-            "edge_tools:release_context",
-        );
-        format!(
-            "Released {} tool result(s). They will be stubbed on the next LLM call.",
-            ids.len()
-        )
-    }
-
-    /// List tool_call_id values marked for context release in this session.
-    fn list_released_context(&self) -> String {
-        let session_id = match self.active_session_id() {
-            Some(s) if !s.trim().is_empty() => s,
-            _ => return "Error: no active session.".to_string(),
-        };
-        let released = astra_tools::memoria::MemoriaClient::released_snapshot(&session_id);
-        if released.is_empty() {
-            return "No tool results are released in this session.".to_string();
-        }
-        let mut out = format!("## Released context ({} tool_call_ids)\n", released.len());
-        for id in &released {
-            out.push_str(&format!("- {id}\n"));
-        }
-        out
+        "Error: session history_around requires server-backed transcript item_seq support in this runtime. Use history_page or history_search in local CLI mode.".to_string()
     }
 
     // ── Env tool: environment variable management ─────────────────────────────
@@ -4288,15 +4049,6 @@ impl ToolExecutor {
         env_tools::is_sensitive_var(name)
     }
 
-    /// Set the MCP client manager for external tool routing.
-    pub fn with_mcp_manager(
-        mut self,
-        manager: std::sync::Arc<tokio::sync::RwLock<crate::mcp_client::McpClientManager>>,
-    ) -> Self {
-        self.mcp_manager = Some(manager);
-        self
-    }
-
     /// Expand the sandbox boundary to include an additional directory.
     /// Called when the user approves access to a path outside the project.
     ///
@@ -4501,9 +4253,10 @@ impl ToolExecutor {
         // only consume site for shell-tool paths.
         self.consume_activated_deferred_tool_if_called(name);
         if name == "bash" {
-            let output = self.finalize_tool_output(self.bash_with_cancel(args, cancel_token), name);
-            self.record_output_size(output.len());
-            return Some(tool_execution_outcome_from_output(output));
+            let mut outcome = self.bash_outcome_with_cancel(args, cancel_token);
+            outcome.output = self.finalize_tool_output(outcome.output, name);
+            self.record_output_size(outcome.output.len());
+            return Some(outcome);
         }
         #[cfg(windows)]
         if name == "powershell" {
@@ -4519,23 +4272,19 @@ impl ToolExecutor {
 
     pub async fn execute_with_metadata(&self, name: &str, args: &Value) -> ToolExecutionOutcome {
         // Admission gate (fail-closed). This is a public entry point called
-        // directly by the server executor; without this gate, `mo_query`, `mo`,
+        // directly by the server executor; without this gate, `mo_query`
         // and `git` metadata-tagged paths would bypass `execute_run`'s gate.
         if let Some(denied) = self.tool_admission_denial(name, args) {
             return denied.into_outcome();
         }
         self.consume_activated_deferred_tool_if_called(name);
-        if name == "mo_query" {
-            let mut outcome = self.mo_query_with_metadata(args);
-            let output = self.finalize_tool_output(outcome.output, name);
-            self.record_output_size(output.len());
-            outcome.output = output;
+        if name == "bash" {
+            let mut outcome = self.bash_outcome_with_cancel(args, None);
+            outcome.output = self.finalize_tool_output(outcome.output, name);
+            self.record_output_size(outcome.output.len());
             return outcome;
         }
-        // Consolidated `mo` tool (action=query|snapshot|branch).
-        // Only `query` has a metadata path — snapshot/branch fall
-        // through to `execute()` which dispatches without metadata.
-        if name == "mo" && args.get("action").and_then(Value::as_str) == Some("query") {
+        if name == "mo_query" {
             let mut outcome = self.mo_query_with_metadata(args);
             let output = self.finalize_tool_output(outcome.output, name);
             self.record_output_size(output.len());
@@ -4549,26 +4298,26 @@ impl ToolExecutor {
                 .unwrap_or("status");
             match action {
                 "commit" => {
-                    let mut outcome = self.git_commit_with_metadata(args);
+                    let mut outcome = self.commit_with_metadata(args);
                     outcome.output = self.finalize_tool_output(outcome.output, name);
                     self.record_output_size(outcome.output.len());
                     return outcome;
                 }
                 "revert_commit" => {
-                    let mut outcome = self.git_revert_commit_with_metadata(args);
+                    let mut outcome = self.revert_commit_with_metadata(args);
                     outcome.output = self.finalize_tool_output(outcome.output, name);
                     self.record_output_size(outcome.output.len());
                     return outcome;
                 }
                 "stash" => {
                     let stash_args = git_stash_action_args(args);
-                    let mut outcome = self.git_stash_with_metadata(&stash_args);
+                    let mut outcome = self.stash_with_metadata(&stash_args);
                     outcome.output = self.finalize_tool_output(outcome.output, name);
                     self.record_output_size(outcome.output.len());
                     return outcome;
                 }
                 "worktree" => {
-                    let mut outcome = self.git_worktree_with_metadata(args);
+                    let mut outcome = self.worktree_with_metadata(args);
                     outcome.output = self.finalize_tool_output(outcome.output, name);
                     self.record_output_size(outcome.output.len());
                     return outcome;
@@ -4610,7 +4359,7 @@ impl ToolExecutor {
             format!(
                 "Error: Tool '{name}' is blocked while plan mode is active. \
                  The agent must call `exit_plan_mode` with an approved plan \
-                 before any write operation. This mirrors Claude Code's plan \
+                 before any write operation. This mirrors the reference agent's plan \
                  mode: the plan is authored with read-only tools, approved by \
                  the user, then execution proceeds with writes unlocked."
             )
@@ -4638,8 +4387,8 @@ impl ToolExecutor {
                     }
                 }
                 "rollback_database_snapshots" => self.rollback_database_snapshots(args),
+                "rollback_file_edits" => self.rollback_file_edits(args),
                 "rollback_session_state" => self.rollback_session_state(args).await,
-                "rollback_turn_actions" => self.rollback_turn_actions(args).await,
                 "str_replace" => {
                     let args = match astra_tools::fs_ops::normalize_str_replace_args(args) {
                         Ok(args) => args,
@@ -4663,35 +4412,35 @@ impl ToolExecutor {
                         .and_then(Value::as_str)
                         .unwrap_or("status");
                     match action {
-                        "status" => git_gix::git_status(&self.project_root, args),
-                        "diff" => git_gix::git_diff(
+                        "status" => git_gix::status(&self.project_root, args),
+                        "diff" => git_gix::diff(
                             &self.project_root,
                             args,
                             self.get_budget_pressure(),
                             self.aggregate_output_bytes
                                 .load(std::sync::atomic::Ordering::Relaxed),
                         ),
-                        "log" => git_gix::git_log(&self.project_root, args),
-                        "show" => git_gix::git_show(
+                        "log" => git_gix::log(&self.project_root, args),
+                        "show" => git_gix::show(
                             &self.project_root,
                             args,
                             self.get_budget_pressure(),
                             self.aggregate_output_bytes
                                 .load(std::sync::atomic::Ordering::Relaxed),
                         ),
-                        "blame" => git_gix::git_blame(&self.project_root, args),
-                        "file_history" => git_gix::git_file_history(&self.project_root, args),
-                        "log_search" => git_gix::git_log_search(&self.project_root, args),
-                        "contributors" => git_gix::git_contributors(&self.project_root, args),
-                        "commit" => self.git_commit(args),
-                        "revert_commit" => self.git_revert_commit(args),
+                        "blame" => git_gix::blame(&self.project_root, args),
+                        "file_history" => git_gix::file_history(&self.project_root, args),
+                        "log_search" => git_gix::log_search(&self.project_root, args),
+                        "contributors" => git_gix::contributors(&self.project_root, args),
+                        "commit" => self.commit(args),
+                        "revert_commit" => self.revert_commit(args),
                         "stash" => {
                             let stash_args = git_stash_action_args(args);
-                            self.git_stash(&stash_args)
+                            self.stash(&stash_args)
                         }
-                        "checkout_file" => self.git_checkout_file(args),
-                        "worktree" => self.git_worktree(args),
-                        "push" => git_gix::git_push(&self.project_root, args),
+                        "checkout_file" => self.checkout_file(args),
+                        "worktree" => self.worktree(args),
+                        "push" => git_gix::push(&self.project_root, args),
                         _ => format!(
                             "Error: unknown git action '{action}'. Use one of: status, diff, log, show, blame, file_history, log_search, contributors, commit, revert_commit, stash, checkout_file, worktree, push"
                         ),
@@ -4709,37 +4458,15 @@ impl ToolExecutor {
                 "run_build_test" => self.run_build_test(args),
                 "symbols" => self.symbols(args),
                 "mo_query" => self.mo_query(args),
-                "mo_snapshot" => self.mo_snapshot(args),
-                "mo_branch" => self.mo_branch(args),
-                // Consolidated `mo` tool (matches the schema in
-                // astra-tools/schemas.rs). Routes by `action` to the
-                // existing legacy handlers. Without this arm, calls
-                // to `mo` fall to DefaultToolExecutor which doesn't
-                // know about it either — the tool was effectively
-                // dead-wired. Per-action required fields (sql for
-                // query, sub_action for snapshot/branch) are
-                // enforced by the schema's `allOf` block.
-                "mo" => {
-                    let action = args.get("action").and_then(Value::as_str).unwrap_or("");
-                    match action {
-                        "query" => self.mo_query(args),
-                        "snapshot" => self.mo_snapshot(args),
-                        "branch" => self.mo_branch(args),
-                        "" => "Error: missing required parameter 'action'. Use one of: query, snapshot, branch".to_string(),
-                        other => format!(
-                            "Error: unknown mo action '{other}'. Use one of: query, snapshot, branch"
-                        ),
-                    }
-                }
                 "github" => {
                     let action = args.get("action").and_then(Value::as_str).unwrap_or("");
                     match action {
-                        "list_prs" => self.github_list_prs(args).await,
-                        "get_pr" => self.github_get_pr(args).await,
-                        "ci_status" => self.github_ci_status(args).await,
-                        "list_issues" => self.github_list_issues(args).await,
-                        "get_issue" => self.github_get_issue(args).await,
-                        "repo_stats" => self.github_repo_stats(args).await,
+                        "list_prs" => self.list_prs(args).await,
+                        "get_pr" => self.get_pr(args).await,
+                        "ci_status" => self.ci_status(args).await,
+                        "list_issues" => self.list_issues(args).await,
+                        "get_issue" => self.get_issue(args).await,
+                        "repo_stats" => self.repo_stats(args).await,
                         "create_issue" => self.github_create_issue(args).await,
                         "" => "Error: missing required parameter 'action'. Use one of: list_prs, get_pr, ci_status, list_issues, get_issue, repo_stats, create_issue".to_string(),
                         other => format!(
@@ -4768,8 +4495,6 @@ impl ToolExecutor {
                 "enter_plan_mode" => self.enter_plan_mode_remote(args).await,
                 "exit_plan_mode" => self.exit_plan_mode_remote(args).await,
                 "adjust_config" => self.adjust_config(args),
-                "prioritize_tool" => self.prioritize_tool(args),
-                "deprioritize_tool" => self.deprioritize_tool(args),
                 "compress_context" => self.compress_context(args),
                 "get_agent_info" => self.get_agent_info(args).await,
                 "reflect" => {
@@ -4810,39 +4535,14 @@ impl ToolExecutor {
                 "agent" => {
                     let action = args.get("action").and_then(Value::as_str).unwrap_or("");
                     match action {
-                        // `delegate` was a placeholder action that returned a
-                        // fake-success acknowledgement string while spawning
-                        // nothing — the CLI never wired a delegation engine,
-                        // and `agentic_delegate_interception` only matches on
-                        // tool NAME == "delegate", so `agent(action='delegate')`
-                        // was never intercepted and never spawned a sub-agent.
-                        // Models trusted the "Delegation request acknowledged"
-                        // string and reported success to the user (observed in
-                        // session f3c4b457: 5 fake delegations in 0 ms each).
-                        //
-                        // Defense in depth: the schema enum no longer advertises
-                        // "delegate", so this branch is unreachable from the
-                        // model. Kept for two reasons: (1) old session journals
-                        // may replay tool_calls with the legacy action; (2) a
-                        // sharp Error: result is far better than the silent
-                        // success the placeholder produced. The error names
-                        // the agent spawn action so the model has a working alternative
-                        // — agent_fanout is the correct fan-out shape.
-                        "delegate" => {
-                            "Error: agent.delegate has been removed because it had no execution \
-                             backend in CLI mode and silently no-op'd. Use agent(action='spawn', \
-                             description='...', prompt='...') instead. \
-                             To run N sub-agents in parallel, use agent_fanout(action='start', \
-                             target_count=N, slots=[...])."
-                                .to_string()
-                        }
                         "run_chain" => {
-                            match serde_json::from_value::<astra_runtime::tool_registry::ToolChain>(
-                                args.clone(),
-                            ) {
+                            match serde_json::from_value::<
+                                astra_turn_core::tool_registry_chain::ToolChain,
+                            >(args.clone())
+                            {
                                 Ok(chain) => {
                                     let known: Vec<&str> =
-                                        astra_runtime::tool_registry::TOOL_CATALOG
+                                        astra_turn_core::tool_registry_meta::TOOL_CATALOG
                                             .iter()
                                             .map(|t| t.name)
                                             .collect();
@@ -4913,21 +4613,11 @@ impl ToolExecutor {
                     let action = args.get("action").and_then(Value::as_str).unwrap_or("");
                     match action {
                         "config" => self.adjust_config(args),
-                        "prioritize" => self.prioritize_tool(args),
-                        "deprioritize" => self.deprioritize_tool(args),
-                        "compact" => self.compress_context(args),
-                        "rollback_edits" => self.rollback_file_edits(args),
                         "sleep" => self.sleep_tool(args).await,
-                        "timeline" => self.render_session_timeline(args),
-                        "summary" => self.render_session_summary().await,
-                        "history" => self.render_session_history(args),
-                        "suppress_memory" => self.suppress_memory(args),
-                        "unsuppress_memory" => self.unsuppress_memory(args),
-                        "list_suppressed" => self.list_suppressed_memories(),
-                        "release_context" => self.release_context(args),
-                        "list_released" => self.list_released_context(),
-                        "" => "Missing required parameter: action. Use: config, prioritize, deprioritize, compact, rollback_edits, sleep, timeline, summary, history, suppress_memory(memory_id, reason?), unsuppress_memory(memory_id), list_suppressed, release_context(tool_call_id|string[]), list_released. Use the first-class `ask_user` tool for user questions. For plan mode use the dedicated `enter_plan_mode` / `exit_plan_mode` tools.".to_string(),
-                        other => format!("Error: unknown `session` action '{other}'. Valid: config, prioritize, deprioritize, compact, rollback_edits, sleep, timeline, summary, history, suppress_memory, unsuppress_memory, list_suppressed, release_context, list_released. Use the first-class `ask_user` tool for user questions. For plan mode use the dedicated `enter_plan_mode` / `exit_plan_mode` tools."),
+                        "history_page" | "history_search" => self.render_session_history(args),
+                        "history_around" => self.render_session_history_around(args),
+                        "" => "Missing required parameter: action. Use: config, sleep, history_page, history_search, history_around. Use dedicated tools: rollback_file_edits, rollback_session_state, compress_context, ask_user, enter_plan_mode, exit_plan_mode.".to_string(),
+                        other => format!("Error: unknown `session` action '{other}'. Valid: config, sleep, history_page, history_search, history_around. Use dedicated tools: rollback_file_edits, rollback_session_state, compress_context, ask_user, enter_plan_mode, exit_plan_mode."),
                     }
                 }
                 // Task management (unified tool with action param)
@@ -4977,7 +4667,7 @@ impl ToolExecutor {
                         },
                         "archive" => {
                             match Self::validate_task_tool_args_for_action("archive", args) {
-                                Ok(()) => self.task_archive(args).await,
+                                Ok(()) => self.task_action_archive(args).await,
                                 Err(error) => format!("Error: {error}"),
                             }
                         }
@@ -5030,11 +4720,6 @@ impl ToolExecutor {
                 }
                 "share_context" => self.share_context(args),
                 "query_context" => self.query_context(args),
-                astra_runtime::turn::agentic_loop::host::DELEGATE_TOOL_NAME => {
-                    "Delegation request acknowledged. The delegation engine will execute \
-                this request and provide results in the next round."
-                        .to_string()
-                }
                 "introspect" => self.handle_introspect(args),
                 "diagnose" => self.diagnose(args).await,
                 "lsp" => self.lsp(args),
@@ -5043,7 +4728,7 @@ impl ToolExecutor {
                 "config" => self.config_tool(args),
                 "brief" => self.brief(args).await,
                 "context_analysis" => self.context_analysis(args),
-                _ if name.starts_with("mcp_") => self.execute_mcp_tool(name, args).await,
+                _ if name.starts_with("mcp__") => self.execute_mcp_tool(name, args).await,
                 _ => {
                     // Delegate unknown tools to the shared DefaultToolExecutor.
                     use astra_tools::ToolExecutor as _;
@@ -5165,7 +4850,7 @@ impl ToolExecutor {
     /// Execution stops on the first error unless the step has a skip condition.
     pub fn execute_chain(
         &self,
-        chain: &astra_runtime::tool_registry::ToolChain,
+        chain: &astra_turn_core::tool_registry_chain::ToolChain,
         input: Value,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send + '_>> {
         use astra_turn_core::tool_registry_chain::{ChainContext, resolve_args};
@@ -5278,7 +4963,7 @@ impl ToolExecutor {
                                 || session_state_entries_added > 0
                             {
                                 let rollback_output = self
-                                    .rollback_turn_actions(&serde_json::json!({
+                                    .rollback_recorded_turn_mutations(&serde_json::json!({
                                         "scope": "turn",
                                         "turn_index": rollback_turn_index,
                                         "file_after_sequence": file_checkpoint,
@@ -5294,7 +4979,7 @@ impl ToolExecutor {
                                         |error| {
                                             serde_json::json!({
                                                 "success": false,
-                                                "error": format!("invalid rollback_turn_actions output: {error}"),
+                                                "error": format!("invalid recorded turn rollback output: {error}"),
                                                 "raw_output": rollback_output,
                                             })
                                         },
@@ -5440,15 +5125,14 @@ impl ToolExecutor {
                 "tools_dropped_by_surface": caps.dropped_by_surface,
                 "tools_pass_through_mcp": caps.mcp_pass_through,
                 "tool_count": model.capabilities.total_tools,
-                "deprioritized_tools": model.capabilities.deprioritized_tools,
+                "health_avoidance_tools": model.capabilities.health_avoidance_tools,
                 "skills": model.capabilities.skills,
-                "pinned_tools": model.capabilities.pinned_tools,
                 "tool_health": model.capabilities.tool_health.iter().map(|t| {
                     json!({
                         "name": t.name,
                         "total_calls": t.total_calls,
                         "success_rate": t.success_rate,
-                        "deprioritized": t.deprioritized,
+                        "avoidance_advised": t.avoidance_advised,
                     })
                 }).collect::<Vec<_>>(),
             })
@@ -5495,7 +5179,7 @@ impl ToolExecutor {
         }
 
         let mut pool = full_tool_schemas();
-        pool.extend(self.plugin_schemas_snapshot("plugin_schemas_capability_view"));
+        pool.extend(self.external_schemas_snapshot("external_schemas_capability_view"));
 
         let outcome = astra_turn_core::tool_surface::resolve_with_diagnostics(
             astra_turn_core::tool_surface::Surface::CliLocal,
@@ -5575,34 +5259,24 @@ impl ToolExecutor {
         let obs_session = self.observability_session.as_ref()?;
         let session = obs_session.read().ok()?;
 
-        let selected_tools: Vec<String> = session
+        let visible_tools: Vec<String> = session
             .context_traces
             .last()
             .map(|trace| {
                 trace
                     .tools
-                    .tools_selected
+                    .visible_tools
                     .iter()
                     .map(|tool| tool.tool_name.clone())
                     .collect()
             })
             .unwrap_or_default();
-        let tool_name_strs = if selected_tools.is_empty() {
+        let tool_name_strs = if visible_tools.is_empty() {
             self.tool_names()
         } else {
-            selected_tools
+            visible_tools
         };
         let tool_name_refs: Vec<&str> = tool_name_strs.iter().map(|s| s.as_str()).collect();
-        let pinned_tools = self
-            .self_mod_pinned_tools
-            .lock()
-            .map(|v| v.clone())
-            .unwrap_or_default();
-        let deprioritized_tools = self
-            .self_mod_deprioritized_tools
-            .lock()
-            .map(|v| v.clone())
-            .unwrap_or_default();
 
         let elapsed = session.started_at.elapsed().as_secs();
 
@@ -5624,8 +5298,6 @@ impl ToolExecutor {
 
         let mut snapshot = astra_runtime::self_model::SelfModel::snapshot_with_strategy(
             &tool_name_refs,
-            &pinned_tools,
-            &deprioritized_tools,
             skills_slice,
             tool_health_tracker.as_ref(),
             session.turn_number,
@@ -6973,21 +6645,24 @@ mod tests {
 
     #[tokio::test]
     async fn tool_search_rejects_stale_mcp_plugin_schema_not_owned_by_manager() {
-        let executor = test_executor().with_mcp_manager(std::sync::Arc::new(
-            tokio::sync::RwLock::new(crate::mcp_client::McpClientManager::new()),
-        ));
-        executor.set_plugin_schemas(vec![serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "mcp__weather",
-                "description": "Get weather for a city.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"city": {"type": "string"}},
-                    "required": ["city"]
+        let mut executor = test_executor();
+        executor.install_mcp_bundle(
+            std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::mcp_client::McpClientManager::new(),
+            )),
+            vec![serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "mcp__weather",
+                    "description": "Get weather for a city.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"]
+                    }
                 }
-            }
-        })]);
+            })],
+        );
         executor.set_current_activatable_tool_names(HashSet::from(["mcp__weather".to_string()]));
 
         let out = executor
@@ -7006,6 +6681,37 @@ mod tests {
             executor.activated_deferred_tool_names(),
             Vec::<String>::new(),
             "stale MCP schemas must not create deferred activation state"
+        );
+    }
+
+    #[test]
+    fn runtime_bound_external_schemas_excluding_filters_restricted_plugins() {
+        let executor = test_executor();
+        executor.set_plugin_schemas(vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "custom_weather",
+                "description": "Get weather for a city.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"]
+                }
+            }
+        })]);
+
+        let unrestricted = executor.runtime_bound_external_schemas_excluding(&HashSet::new());
+        assert_eq!(
+            astra_turn_core::tool::schema::tool_names_from_schemas(&unrestricted),
+            HashSet::from(["custom_weather".to_string()])
+        );
+
+        let restricted = executor.runtime_bound_external_schemas_excluding(&HashSet::from([
+            "custom_weather".to_string(),
+        ]));
+        assert!(
+            restricted.is_empty(),
+            "restricted dynamic plugin schemas must not be advertised as deferred"
         );
     }
 
@@ -7043,6 +6749,31 @@ mod tests {
                 .and_then(|fields| fields.get("error_kind"))
                 .and_then(serde_json::Value::as_str),
             Some(astra_core::ErrorKind::ToolBinding.as_str())
+        );
+    }
+
+    #[test]
+    fn restored_activated_deferred_tool_survives_first_schema_injection() {
+        let executor = test_executor();
+        executor.restore_activated_deferred_tool_names_for_session(&[
+            "memory".to_string(),
+            " ".to_string(),
+        ]);
+
+        assert_eq!(
+            executor.activated_deferred_tool_names(),
+            vec!["memory".to_string()],
+            "session restore should seed valid pending activation"
+        );
+        assert_eq!(
+            executor.activated_deferred_tool_names_for_schema_injection(),
+            vec!["memory".to_string()],
+            "restored activation must survive until the first schema-injection opportunity"
+        );
+        assert_eq!(
+            executor.activated_deferred_tool_names(),
+            vec!["memory".to_string()],
+            "schema injection does not consume deferred activation"
         );
     }
 
@@ -7138,7 +6869,7 @@ mod tests {
 
     #[tokio::test]
     async fn tool_search_select_web_fetch_returns_schema_on_cli_path() {
-        // web_fetch is DEFERRED (not in DEFAULT_PINNED). The whole point
+        // web_fetch is deferred by default. The whole point
         // of this test is to exercise the deferred activation flow.
         let executor = test_executor();
         let out = executor

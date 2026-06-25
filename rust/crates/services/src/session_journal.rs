@@ -847,26 +847,6 @@ pub struct EdgePolicySnapshot {
     pub rules_fingerprint: Option<String>,
 }
 
-/// Tool selection decision trace for post-hoc analysis.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SelectionTrace {
-    /// Candidate tools and their TF-IDF/LLM scores (top 10).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub candidate_scores: Option<Vec<(String, f64)>>,
-    /// Boost terms applied from entity graph / pattern library.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub boost_terms: Option<Vec<String>>,
-    /// Learned context summary injected into selection.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub learned_context_summary: Option<String>,
-    /// Final selected tools.
-    pub final_tools: Vec<String>,
-    /// Selection confidence score.
-    pub confidence: f64,
-    /// Strategy used (tfidf, llm, fallback, etc.).
-    pub strategy: String,
-}
-
 /// Per-tool-call audit record, embedded in turn events for granular tracking.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ToolCallRecord {
@@ -975,9 +955,6 @@ impl ToolCallRecord {
     /// analytics (tool_error_rate, repeat_tool_call, failed_tool_calls, …).
     pub fn is_synthetic_placeholder(&self) -> bool {
         if self.surgically_removed == Some(true) {
-            return true;
-        }
-        if self.name == SURGICAL_REMOVAL_TOOL_NAME {
             return true;
         }
 
@@ -1149,7 +1126,7 @@ pub struct JournalEvent {
     pub facts_stored: Option<usize>,
     /// Tool names selected for the LLM request (for turn events).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tools_selected: Option<Vec<String>>,
+    pub visible_tools: Option<Vec<String>>,
     /// Skill names selected for the LLM request (for turn events).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub selected_skills: Option<Vec<String>>,
@@ -1198,9 +1175,6 @@ pub struct JournalEvent {
     /// Edge policy snapshot for cloud–edge audit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edge_policy: Option<EdgePolicySnapshot>,
-    /// Tool selection decision trace for post-hoc analysis.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub selection_trace: Option<SelectionTrace>,
     /// Full context assembly trace for deep observability (M1 telemetry).
     /// Stores the serialized ContextAssemblyTrace from runtime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1351,10 +1325,6 @@ pub enum JournalEventType {
     PipelineAlert,
     /// Context pipeline compaction audit (what was dropped/cleared, why).
     PipelineCompactionAudit,
-    /// Agent suppressed a memory from injection for the rest of the session.
-    MemorySuppressed,
-    /// Agent released a tool result from context (early eviction).
-    ContextReleased,
     /// Startup bootstrap phases completed (per-phase timestamps in metadata).
     Bootstrap,
     /// Lightweight trace span for cross-boundary observability (edge ↔ cloud).
@@ -2324,8 +2294,6 @@ fn is_recovery_activity_event(event_type: &JournalEventType) -> bool {
             | JournalEventType::AdaptivePerTurnApplied
             | JournalEventType::AdaptiveTuningRuleTriggered
             | JournalEventType::CompactionRetry
-            | JournalEventType::MemorySuppressed
-            | JournalEventType::ContextReleased
     )
 }
 
@@ -2785,7 +2753,7 @@ impl JournalEvent {
             config_value: None,
             turns_compacted: None,
             facts_stored: None,
-            tools_selected: None,
+            visible_tools: None,
             selected_skills: None,
             tools_used: None,
             tool_calls: None,
@@ -2802,7 +2770,6 @@ impl JournalEvent {
             session_lineage: None,
             coordination: None,
             edge_policy: None,
-            selection_trace: None,
             context_assembly_trace: None,
             routing_domain_hint: None,
             entity_learn_skipped_no_domain: false,
@@ -3454,15 +3421,15 @@ impl JournalEvent {
         evt
     }
 
-    /// Attach tool selection data to a turn event.
-    pub fn with_tool_selection(
+    /// Attach tool surface data to a turn event.
+    pub fn with_tool_surface(
         mut self,
-        tools_selected: Vec<String>,
+        visible_tools: Vec<String>,
         selected_skills: Vec<String>,
         tools_used: Vec<String>,
         budget_used: u32,
     ) -> Self {
-        self.tools_selected = Some(tools_selected);
+        self.visible_tools = Some(visible_tools);
         if !selected_skills.is_empty() {
             self.selected_skills = Some(selected_skills);
         }
@@ -3563,14 +3530,14 @@ impl JournalEvent {
     /// Captures severity, injected messages, avoided tools, and force_stop.
     fn turn_guard_avoid_reason_codes(
         avoid_tools: &[String],
-        deprioritized_tools: &[String],
+        health_avoidance_tools: &[String],
         timeout_dominant_tools: &[String],
         nudge_count: usize,
         non_timeout_errors: usize,
     ) -> Vec<&'static str> {
         let mut codes = Vec::new();
-        if !avoid_tools.is_empty() && !deprioritized_tools.is_empty() {
-            codes.push("tool_health_deprioritized");
+        if !avoid_tools.is_empty() && !health_avoidance_tools.is_empty() {
+            codes.push("tool_health_avoidance");
         }
         if non_timeout_errors > 0 {
             codes.push("session_failures");
@@ -3585,17 +3552,17 @@ impl JournalEvent {
     }
 
     fn turn_guard_avoid_reason_summary(
-        deprioritized_tools: &[String],
+        health_avoidance_tools: &[String],
         timeout_dominant_tools: &[String],
         nudge_count: usize,
         non_timeout_errors: usize,
         total_timeouts: usize,
     ) -> Option<String> {
         let mut parts = Vec::new();
-        if !deprioritized_tools.is_empty() {
+        if !health_avoidance_tools.is_empty() {
             parts.push(format!(
-                "deprioritized by tool health: {}",
-                deprioritized_tools.join(", ")
+                "health avoidance tools: {}",
+                health_avoidance_tools.join(", ")
             ));
         }
         if non_timeout_errors > 0 {
@@ -3630,11 +3597,11 @@ impl JournalEvent {
         severity: &str,
         injections: &[String],
         avoid_tools: &[String],
-        deprioritized_tools: &[String],
+        health_avoidance_tools: &[String],
         force_stop: bool,
         nudge_count: usize,
         total_errors: usize,
-        deprioritized_count: usize,
+        health_avoidance_count: usize,
         total_timeouts: usize,
         timeout_dominant_tools: &[String],
         total_cache_hits: usize,
@@ -3643,13 +3610,13 @@ impl JournalEvent {
         let non_timeout_errors = total_errors.saturating_sub(total_timeouts);
         let avoid_reason_codes = Self::turn_guard_avoid_reason_codes(
             avoid_tools,
-            deprioritized_tools,
+            health_avoidance_tools,
             timeout_dominant_tools,
             nudge_count,
             non_timeout_errors,
         );
         let avoid_reason_summary = Self::turn_guard_avoid_reason_summary(
-            deprioritized_tools,
+            health_avoidance_tools,
             timeout_dominant_tools,
             nudge_count,
             non_timeout_errors,
@@ -3664,7 +3631,7 @@ impl JournalEvent {
             "injection_preview": injections.first().map(|s| truncate(s, 200)),
             "avoid_tools": avoid_tools,
             "avoid_tools_count": avoid_tools.len(),
-            "deprioritized_tool_names": deprioritized_tools,
+            "health_avoidance_tools": health_avoidance_tools,
             "timeout_dominant_tools": timeout_dominant_tools,
             "avoid_reason_codes": avoid_reason_codes,
             "avoid_reason_summary": avoid_reason_summary,
@@ -3672,7 +3639,7 @@ impl JournalEvent {
             "nudge_count": nudge_count,
             "total_errors": total_errors,
             "non_timeout_errors": non_timeout_errors,
-            "deprioritized_tools": deprioritized_count,
+            "health_avoidance_count": health_avoidance_count,
             "total_timeouts": total_timeouts,
             "total_cache_hits": total_cache_hits,
             "flaky_tools": flaky_count,
@@ -4041,7 +4008,7 @@ impl JournalEvent {
             "turn_id": trace.get("turn_id").and_then(|value| value.as_str()),
             "tool_count": trace
                 .get("tools")
-                .and_then(|tools| tools.get("tools_selected"))
+                .and_then(|tools| tools.get("visible_tools"))
                 .and_then(|selected| selected.as_array())
                 .map(Vec::len),
             "total_tokens": trace
@@ -4286,32 +4253,6 @@ impl JournalEvent {
         let mut evt = Self::base(JournalEventType::PipelineCompactionAudit, session_id);
         evt.turn = Some(turn);
         evt.metadata = Some(event_payload);
-        evt
-    }
-
-    /// Agent suppressed a memory from being injected for the session.
-    pub fn memory_suppressed(
-        session_id: Option<&str>,
-        turn: u32,
-        memory_id: &str,
-        reason: Option<&str>,
-    ) -> Self {
-        let mut evt = Self::base(JournalEventType::MemorySuppressed, session_id);
-        evt.turn = Some(turn);
-        evt.metadata = Some(serde_json::json!({
-            "memory_id": memory_id,
-            "reason": reason,
-        }));
-        evt
-    }
-
-    /// Agent released a tool result from context (early eviction).
-    pub fn context_released(session_id: Option<&str>, turn: u32, tool_call_ids: &[&str]) -> Self {
-        let mut evt = Self::base(JournalEventType::ContextReleased, session_id);
-        evt.turn = Some(turn);
-        evt.metadata = Some(serde_json::json!({
-            "tool_call_ids": tool_call_ids,
-        }));
         evt
     }
 }
@@ -4602,7 +4543,7 @@ mod approval_tests {
             3,
             serde_json::json!({
                 "turn_id": "turn-3",
-                "tools": {"tools_selected": [{"tool_name": "read_file"}]},
+                "tools": {"visible_tools": [{"tool_name": "read_file"}]},
                 "token_budget": {"total_used": 1234}
             }),
         );
@@ -4861,7 +4802,7 @@ mod tests {
             .collect();
         assert_eq!(
             repeat_tools,
-            std::collections::BTreeSet::from(["git_show", "read_file"])
+            std::collections::BTreeSet::from(["git", "read_file"])
         );
     }
 
@@ -5015,7 +4956,7 @@ mod tests {
         let evt = JournalEvent::goal_steered(
             Some("sid-goal"),
             4,
-            "edge_tool:set_goal",
+            "control_plane:goal",
             Some("old goal"),
             "new goal",
             Some(serde_json::json!({"mode": "manual"})),
@@ -5029,7 +4970,7 @@ mod tests {
         let metadata = parsed.metadata.expect("metadata");
         assert_eq!(
             metadata.get("source").and_then(|value| value.as_str()),
-            Some("edge_tool:set_goal")
+            Some("control_plane:goal")
         );
         assert_eq!(
             metadata
@@ -5041,86 +4982,6 @@ mod tests {
             metadata.get("new_goal").and_then(|value| value.as_str()),
             Some("new goal")
         );
-    }
-
-    #[test]
-    fn journal_event_memory_suppressed_serializes_and_round_trips() {
-        let evt = JournalEvent::memory_suppressed(
-            Some("sid-suppress"),
-            5,
-            "mem-abc123",
-            Some("stale, not relevant to current task"),
-        );
-        assert_eq!(evt.event_type, JournalEventType::MemorySuppressed);
-        assert_eq!(evt.turn, Some(5));
-        let json = serde_json::to_string(&evt).unwrap();
-        assert!(json.contains("\"type\":\"memory_suppressed\""));
-        assert!(json.contains("\"memory_id\":\"mem-abc123\""));
-        assert!(json.contains("stale, not relevant"));
-        let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.event_type, JournalEventType::MemorySuppressed);
-        assert_eq!(parsed.turn, Some(5));
-        let metadata = parsed.metadata.expect("metadata");
-        assert_eq!(
-            metadata.get("memory_id").and_then(|v| v.as_str()),
-            Some("mem-abc123")
-        );
-        assert_eq!(
-            metadata.get("reason").and_then(|v| v.as_str()),
-            Some("stale, not relevant to current task")
-        );
-    }
-
-    #[test]
-    fn journal_event_memory_suppressed_with_null_reason() {
-        let evt = JournalEvent::memory_suppressed(Some("sid-s2"), 3, "mem-xyz", None);
-        let json = serde_json::to_string(&evt).unwrap();
-        let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
-        let metadata = parsed.metadata.expect("metadata");
-        assert_eq!(
-            metadata.get("memory_id").and_then(|v| v.as_str()),
-            Some("mem-xyz")
-        );
-        assert!(metadata.get("reason").unwrap().is_null());
-    }
-
-    #[test]
-    fn journal_event_context_released_serializes_and_round_trips() {
-        let evt = JournalEvent::context_released(
-            Some("sid-release"),
-            7,
-            &["call_001", "call_002", "call_003"],
-        );
-        assert_eq!(evt.event_type, JournalEventType::ContextReleased);
-        assert_eq!(evt.turn, Some(7));
-        let json = serde_json::to_string(&evt).unwrap();
-        assert!(json.contains("\"type\":\"context_released\""));
-        assert!(json.contains("call_001"));
-        assert!(json.contains("call_002"));
-        assert!(json.contains("call_003"));
-        let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.event_type, JournalEventType::ContextReleased);
-        assert_eq!(parsed.turn, Some(7));
-        let metadata = parsed.metadata.expect("metadata");
-        let ids = metadata
-            .get("tool_call_ids")
-            .and_then(|v| v.as_array())
-            .expect("tool_call_ids array");
-        assert_eq!(ids.len(), 3);
-        assert_eq!(ids[0].as_str(), Some("call_001"));
-    }
-
-    #[test]
-    fn journal_event_context_released_empty_ids() {
-        let evt = JournalEvent::context_released(Some("sid-r2"), 1, &[]);
-        let json = serde_json::to_string(&evt).unwrap();
-        let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
-        let metadata = parsed.metadata.expect("metadata");
-        let ids = metadata
-            .get("tool_call_ids")
-            .and_then(|v| v.as_array())
-            .expect("tool_call_ids array");
-        assert!(ids.is_empty());
     }
 
     #[test]
@@ -5453,10 +5314,10 @@ mod tests {
         assert!(!json.contains("\"turn\""));
     }
 
-    // ── Tool selection tracking (p5g observability + p6e feedback) ──
+    // ── tool surface tracking (p5g observability + p6e feedback) ──
 
     #[test]
-    fn turn_event_with_tool_selection_round_trip() {
+    fn turn_event_with_tool_surface_round_trip() {
         let evt = JournalEvent::turn(
             Some("s1"),
             1,
@@ -5468,31 +5329,31 @@ mod tests {
             200,
             1234,
         )
-        .with_tool_selection(
-            vec!["bash".into(), "github_list_prs".into(), "read_file".into()],
+        .with_tool_surface(
+            vec!["bash".into(), "github".into(), "read_file".into()],
             vec!["tune-performance".into()],
-            vec!["github_list_prs".into()],
+            vec!["github".into()],
             45,
         )
         .with_budget_pressure(0.6);
         let json = serde_json::to_string(&evt).unwrap();
         let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.tools_selected.as_ref().unwrap().len(), 3);
+        assert_eq!(parsed.visible_tools.as_ref().unwrap().len(), 3);
         assert_eq!(
             parsed.selected_skills.as_ref().unwrap(),
             &["tune-performance"]
         );
-        assert_eq!(parsed.tools_used.as_ref().unwrap(), &["github_list_prs"]);
+        assert_eq!(parsed.tools_used.as_ref().unwrap(), &["github"]);
         assert_eq!(parsed.budget_used, Some(45));
         assert_eq!(parsed.budget_pressure, Some(0.6));
     }
 
     #[test]
-    fn turn_event_without_tool_selection_omits_fields() {
+    fn turn_event_without_tool_surface_omits_fields() {
         let evt = JournalEvent::turn(Some("s2"), 1, None, "hello", "world", 0, 10, 5, 100);
         let json = serde_json::to_string(&evt).unwrap();
         assert!(
-            !json.contains("tools_selected"),
+            !json.contains("visible_tools"),
             "should omit None fields: {json}"
         );
         assert!(
@@ -5536,10 +5397,10 @@ mod tests {
                     50,
                     500,
                 )
-                .with_tool_selection(
-                    vec!["bash".into(), "github_list_prs".into()],
+                .with_tool_surface(
+                    vec!["bash".into(), "github".into()],
                     vec![],
-                    vec!["github_list_prs".into()],
+                    vec!["github".into()],
                     35,
                 )
                 .with_budget_pressure(0.3),
@@ -5559,9 +5420,9 @@ mod tests {
         // Verify the turn event has selection data
         let turn = &events[1];
         assert_eq!(turn.event_type, JournalEventType::Turn);
-        assert_eq!(turn.tools_selected.as_ref().unwrap().len(), 2);
+        assert_eq!(turn.visible_tools.as_ref().unwrap().len(), 2);
         assert!(turn.selected_skills.is_none());
-        assert_eq!(turn.tools_used.as_ref().unwrap(), &["github_list_prs"]);
+        assert_eq!(turn.tools_used.as_ref().unwrap(), &["github"]);
         assert_eq!(turn.budget_used, Some(35));
         assert_eq!(turn.budget_pressure, Some(0.3));
     }
@@ -5589,14 +5450,9 @@ mod tests {
             150,
             800,
         )
-        .with_tool_selection(
-            vec!["github_list_prs".into()],
-            vec![],
-            vec!["github_list_prs".into()],
-            20,
-        )
+        .with_tool_surface(vec!["github".into()], vec![], vec!["github".into()], 20)
         .with_tool_calls(vec![ToolCallRecord {
-            name: "github_list_prs".into(),
+            name: "github".into(),
             ok: true,
             ms: 761,
             error: None,
@@ -5613,7 +5469,7 @@ mod tests {
         let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
         let calls = parsed.tool_calls.unwrap();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "github_list_prs");
+        assert_eq!(calls[0].name, "github");
         assert!(calls[0].ok);
         assert_eq!(calls[0].ms, 761);
     }
@@ -5702,19 +5558,19 @@ mod tests {
         assert_eq!(meta["injections"], 1);
         assert_eq!(meta["avoid_tools"][0], "bash");
         assert_eq!(meta["avoid_tools_count"], 1);
-        assert_eq!(meta["deprioritized_tool_names"][0], "bash");
-        assert_eq!(meta["avoid_reason_codes"][0], "tool_health_deprioritized");
+        assert_eq!(meta["health_avoidance_tools"][0], "bash");
+        assert_eq!(meta["avoid_reason_codes"][0], "tool_health_avoidance");
         assert_eq!(meta["avoid_reason_codes"][1], "session_failures");
         assert_eq!(meta["avoid_reason_codes"][2], "stall_recovery");
         assert_eq!(
             meta["avoid_reason_summary"],
-            "deprioritized by tool health: bash; 2 non-timeout failure(s) recorded; 1 stall/divergence nudge(s) issued"
+            "health avoidance tools: bash; 2 non-timeout failure(s) recorded; 1 stall/divergence nudge(s) issued"
         );
         assert_eq!(meta["force_stop"], false);
         assert_eq!(meta["nudge_count"], 1);
         assert_eq!(meta["total_errors"], 2);
         assert_eq!(meta["non_timeout_errors"], 2);
-        assert_eq!(meta["deprioritized_tools"], 1);
+        assert_eq!(meta["health_avoidance_count"], 1);
         assert_eq!(meta["total_timeouts"], 0);
         assert_eq!(meta["total_cache_hits"], 0);
         assert_eq!(meta["flaky_tools"], 0);
@@ -6640,12 +6496,12 @@ mod tests {
             assert_eq!(meta["injections"], 1);
             assert_eq!(meta["avoid_tools"][0], "bash");
             assert_eq!(meta["avoid_tools_count"], 1);
-            assert_eq!(meta["deprioritized_tool_names"][0], "bash");
+            assert_eq!(meta["health_avoidance_tools"][0], "bash");
             assert_eq!(meta["force_stop"], false);
             assert_eq!(meta["nudge_count"], 1);
             assert_eq!(meta["total_errors"], 2);
             assert_eq!(meta["non_timeout_errors"], 2);
-            assert_eq!(meta["deprioritized_tools"], 1);
+            assert_eq!(meta["health_avoidance_count"], 1);
             assert_eq!(meta["total_timeouts"], 0);
             assert_eq!(meta["total_cache_hits"], 0);
             assert_eq!(meta["flaky_tools"], 0);
@@ -6913,7 +6769,7 @@ mod tests {
         // ── basic serialization round-trip ──
         {
             let record = ToolCallRecord {
-                name: "github_list_prs".into(),
+                name: "github".into(),
                 ok: true,
                 ms: 761,
                 error: None,
@@ -6930,7 +6786,7 @@ mod tests {
             assert!(json.contains("\"ok\":true"));
             assert!(!json.contains("\"error\""), "None error should be omitted");
             let parsed: ToolCallRecord = serde_json::from_str(&json).unwrap();
-            assert_eq!(parsed.name, "github_list_prs");
+            assert_eq!(parsed.name, "github");
             assert!(parsed.ok);
             assert_eq!(parsed.ms, 761);
             assert!(parsed.error.is_none());
@@ -6939,7 +6795,7 @@ mod tests {
         // ── with error field ──
         {
             let record = ToolCallRecord {
-                name: "github_ci_status".into(),
+                name: "github".into(),
                 ok: false,
                 ms: 587,
                 error: Some("missing repo parameter".into()),
@@ -6992,7 +6848,7 @@ mod tests {
         // ── unicode error message ──
         {
             let record = ToolCallRecord {
-                name: "github_list_prs".into(),
+                name: "github".into(),
                 ok: false,
                 ms: 500,
                 error: Some("连接超时: タイムアウト 🚫".into()),
@@ -7165,14 +7021,14 @@ mod tests {
 
         // ── is_synthetic_placeholder ── all patterns
         {
-            let rec = base_tool_record(
+            let unflagged_sentinel = base_tool_record(
                 SURGICAL_REMOVAL_TOOL_NAME,
                 true,
-                Some("(removed from context — skill covered this work)"),
+                Some("(removed from context - skill covered this work)"),
             );
             assert!(
-                rec.is_synthetic_placeholder(),
-                "surgically_removed records must be synthetic"
+                !unflagged_sentinel.is_synthetic_placeholder(),
+                "sentinel name alone must not be treated as a supported synthetic marker"
             );
             assert!(
                 base_tool_record("read_file", false, Some("Skipped: skill routed"))
@@ -7190,7 +7046,7 @@ mod tests {
                 )
                 .is_synthetic_placeholder()
             );
-            assert!(!base_tool_record("git_show", true, Some("diff")).is_synthetic_placeholder());
+            assert!(!base_tool_record("git", true, Some("diff")).is_synthetic_placeholder());
             assert!(
                 !base_tool_record("grep", false, Some("error: bad regex"))
                     .is_synthetic_placeholder()
@@ -7273,16 +7129,6 @@ mod tests {
                 !base_tool_record("read_file", true, Some("fn main() {}"))
                     .is_noop_or_cached_result()
             );
-        }
-
-        // ── is_recovery_activity_event ──
-        {
-            assert!(!is_recovery_activity_event(
-                &JournalEventType::MemorySuppressed
-            ));
-            assert!(!is_recovery_activity_event(
-                &JournalEventType::ContextReleased
-            ));
         }
 
         // ── classify_session_end_state: Completed ──
@@ -7617,16 +7463,16 @@ mod turn_event_buffer_tests {
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
             tool_calls_returned: 1,
-            tool_call_names: vec!["git_diff".into()],
+            tool_call_names: vec!["git".into()],
             finish_reason: Some("tool_calls".into()),
             agentic_step: Some(1),
             source: Some("agentic_loop".into()),
             run_id: Some("run-embed".into()),
             tool_calls: Some(vec![ToolCallRecord {
-                name: "git_diff".into(),
+                name: "git".into(),
                 ok: true,
                 ms: 50,
-                args_full: Some("{\"stat_only\":true}".into()),
+                args_full: Some("{\"action\":\"diff\",\"stat_only\":true}".into()),
                 result_preview: Some("diff --git ...".into()),
                 round: Some(0),
                 ..Default::default()
@@ -7637,10 +7483,10 @@ mod turn_event_buffer_tests {
         let ev = &events[0];
         let tool_calls = ev.tool_calls.as_ref().expect("embedded tool calls");
         assert_eq!(tool_calls.len(), 1);
-        assert_eq!(tool_calls[0].name, "git_diff");
+        assert_eq!(tool_calls[0].name, "git");
         assert_eq!(
             tool_calls[0].args_full.as_deref(),
-            Some("{\"stat_only\":true}")
+            Some("{\"action\":\"diff\",\"stat_only\":true}")
         );
     }
 

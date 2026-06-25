@@ -193,7 +193,6 @@ const SKILL_SUBCOMMANDS: &[(&str, &str)] = &[
     ("install", "Install from marketplace"),
     ("list", "List skills"),
     ("new", "Create skill"),
-    ("pin", "Pin skill to always load"),
     ("publish", "Publish to marketplace"),
     ("rollback", "Rollback installed skill version"),
     ("search", "Keyword search catalog"),
@@ -203,7 +202,6 @@ const SKILL_SUBCOMMANDS: &[(&str, &str)] = &[
     ("test", "Run skill test"),
     ("trending", "Show trending marketplace skills"),
     ("uninstall", "Remove local skill"),
-    ("unpin", "Remove pinned skill"),
     ("upgrade", "Upgrade installed skill version"),
 ];
 
@@ -288,7 +286,7 @@ const PROFILE_SUBCOMMANDS: &[(&str, &str)] = &[
     ("edit", "Edit a preference"),
     ("scenario", "Show the detected working scenario"),
     ("stats", "Show profile usage stats"),
-    ("tools", "Show tool preferences"),
+    ("tools", "Show blocked tool policy"),
     ("experiments", "Show enrolled experiments"),
     ("reset", "Reset profile preferences"),
     ("help", "Show profile help"),
@@ -1092,7 +1090,6 @@ mod tests {
         assert!(subs.iter().any(|(tok, _)| *tok == "rollback"));
         assert!(subs.iter().any(|(tok, _)| *tok == "trending"));
         assert!(subs.iter().any(|(tok, _)| *tok == "uninstall"));
-        assert!(subs.iter().any(|(tok, _)| *tok == "unpin"));
         assert!(subs.iter().any(|(tok, _)| *tok == "upgrade"));
     }
 

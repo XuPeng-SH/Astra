@@ -30,16 +30,23 @@ pub const EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW: &str = "deferred_tools
 /// resolve deferred names without re-parsing the rendered XML.
 pub const EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES: &str = "deferred_tool_names";
 
-/// Protocol key carrying the JSON array of pinned (T1) tool names from the
+/// Protocol key carrying deferred tool names omitted from the rendered
+/// `<deferred_tools>` block because the session-stable manifest hit its model
+/// budget. This is observability metadata only: omitted names are not
+/// activatable through `tool_search(select:NAME)` until they are rendered in a
+/// later manifest or found by keyword search.
+pub const EDGE_PROFILE_KEY_DEFERRED_TOOL_OMITTED_NAMES: &str = "deferred_tool_omitted_names";
+
+/// Protocol key carrying the JSON array of always-load (T1) tool names from the
 /// CLI-side [`ToolSurface`]. The runtime uses this to place cache_control
-/// markers at the correct pinned/dynamic boundary so the Anthropic prompt
-/// cache prefix stays correct when the user overrides the default pinned set
-/// in TOML (`runtime.tool_surface.pinned_tools`).
+/// markers at the correct always-load/dynamic boundary so the Anthropic prompt
+/// cache prefix stays correct when the user overrides the default always-load set
+/// in TOML (`runtime.tool_surface.always_load_tools`).
 ///
 /// Without this key, the runtime falls back to a compile-time constant that
 /// does not reflect user overrides, causing cache-prefix drift and ~500+ token
 /// cache misses per turn.
-pub const EDGE_PROFILE_KEY_PINNED_TOOL_NAMES: &str = "pinned_tool_names";
+pub const EDGE_PROFILE_KEY_ALWAYS_LOAD_TOOL_NAMES: &str = "always_load_tool_names";
 
 /// `git rev-parse --abbrev-ref HEAD` for edge_profile (best-effort).
 pub fn read_git_branch_abbrev() -> Option<String> {
@@ -66,7 +73,7 @@ fn retrieval_top_k_from_env() -> u32 {
         .unwrap_or(5) // default same as RuntimeConfig
 }
 
-/// Static `edge_profile` object before optional `active_skills` / selector hints / skills text.
+/// Static `edge_profile` object before optional `active_skills` / skill context.
 pub fn build_base_edge_profile_value(
     cwd: &str,
     git_branch: Option<String>,

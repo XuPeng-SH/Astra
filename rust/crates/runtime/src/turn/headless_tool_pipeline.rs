@@ -14,7 +14,7 @@ use astra_turn_core::edge_prompt_context::make_args_preview;
 use astra_turn_core::guardrails::turn_guard::TurnGuard;
 use astra_turn_core::headless_tool_assembly::{
     EdgeToolRoundRow, HeadlessResolvedToolSlot, HeadlessRoundToolIdx, READ_ONLY_TOOLS,
-    resolve_headless_tool_slot, take_edge_output_for_tool_call_with_duration,
+    resolve_headless_tool_slot, take_edge_output_for_tool_call_id_or_signature_with_duration,
 };
 
 mod execute;
@@ -25,7 +25,7 @@ mod record;
 ///
 /// `visible` is the set advertised in the current request's `tools[]`.
 /// `extras` is an explicit execution grant from the caller, e.g. a runtime
-/// or plugin transport that is installed out-of-band. Deferred-tool selection
+/// or plugin transport that is installed out-of-band. Deferred-tool surface
 /// should normally be consumed by the next surface assembly so the selected
 /// tool becomes visible instead of lingering here as long-lived state.
 pub fn admissible_tool_names(
@@ -269,7 +269,8 @@ fn resolve_headless_tool_execution<E: EdgeToolRoundRow>(
             edge_tool_round[i].tool_result_fields().cloned(),
         )
     } else {
-        let matched = take_edge_output_for_tool_call_with_duration(
+        let matched = take_edge_output_for_tool_call_id_or_signature_with_duration(
+            &id,
             &name,
             &args,
             edge_tool_round,
@@ -285,6 +286,25 @@ fn resolve_headless_tool_execution<E: EdgeToolRoundRow>(
 
     let consumed_after = consumed_edge.iter().filter(|&&c| c).count();
     let is_edge_tool = synthetic_edge_index.is_some() || consumed_after > consumed_before;
+    if !is_edge_tool
+        && matches!(name.as_str(), "agent" | "agent_fanout")
+        && !edge_tool_round.is_empty()
+    {
+        let edge_candidates = edge_tool_round
+            .iter()
+            .enumerate()
+            .map(|(i, edge)| format!("{}:{}", edge.assistant_tool_call_id(i), edge.tool_name()))
+            .collect::<Vec<_>>()
+            .join(",");
+        tracing::warn!(
+            target: "astra_runtime::headless_tool_match",
+            tool_name = %name,
+            tool_call_id = %id,
+            edge_round_len = edge_tool_round.len(),
+            edge_candidates = %edge_candidates,
+            "executor-gated tool had edge rows but no matching edge result; falling back to runtime binding"
+        );
+    }
     let early_exit_ms = if is_edge_tool && edge_duration_ms > 0 {
         edge_duration_ms
     } else {
@@ -1413,9 +1433,10 @@ mod tests {
         });
         harness.edge_tool_round[0].tool = "str_replace".to_string();
         harness.edge_tool_round[0].args = args;
-        harness.edge_tool_round[0].output =
-            "Replaced successfully\n<<<ASTRA_UNIFIED_DIFF>>>\n-old\n+new\n<<<END_ASTRA_UNIFIED_DIFF>>>"
-                .to_string();
+        harness.edge_tool_round[0].output = format!(
+            "Replaced successfully\n<<<ASTRA_UNIFIED_DIFF>>>\n-old\n+new\n<<<END_ASTRA_UNIFIED_DIFF>>>\n{}",
+            astra_turn_core::tool_result_semantics::TOOL_SUCCESS_SENTINEL
+        );
         harness.edge_tool_round[0].status = "error".to_string();
         let mut fields = edge_runtime_environment_fields();
         fields.insert("status".to_string(), Value::String("failed".to_string()));
@@ -1486,10 +1507,7 @@ mod tests {
         assert!(dir.path().join("turn.txt").exists());
 
         let rollback = server_exec
-            .execute(
-                "session",
-                &json!({"action": "rollback_edits", "scope": "current_turn"}),
-            )
+            .execute("rollback_file_edits", &json!({"scope": "current_turn"}))
             .await;
         let rollback_json: Value = serde_json::from_str(&rollback).unwrap();
         assert_eq!(
@@ -1960,7 +1978,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_tool_retries_do_not_deprioritize_missing_catalog_entry() {
+    async fn unknown_tool_retries_do_not_advise_avoidance_missing_catalog_entry() {
         let mut harness = PipelineHarness::new();
         // Push 3 calls with different args so dedup doesn't block them.
         for i in 0..3 {
@@ -1988,9 +2006,9 @@ mod tests {
                 .ctx
                 .turn_guard
                 .health
-                .deprioritized_tools()
+                .health_avoidance_tools()
                 .contains(&"outline"),
-            "unknown catalog tool should not be deprioritized"
+            "unknown catalog tool should not be avoidance_advised"
         );
     }
 
@@ -2139,8 +2157,8 @@ mod tests {
                 "deduped unknown catalog tools may record neutral cache stats, not failures"
             );
             assert!(
-                !health.deprioritized,
-                "deduped unknown catalog tools should not be deprioritized"
+                !health.avoidance_advised,
+                "deduped unknown catalog tools should not be avoidance_advised"
             );
         }
     }
@@ -2177,7 +2195,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_tool_deprioritize_warning_not_generated() {
+    async fn unknown_tool_avoidance_warning_not_generated() {
         let mut harness = PipelineHarness::new();
         // 3 calls with different args to avoid dedup. They should remain
         // short-circuited catalog misses, not health failures.
@@ -2196,10 +2214,10 @@ mod tests {
             pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(i));
         }
 
-        let warning = pipeline.ctx.turn_guard.health.deprioritize_warning();
+        let warning = pipeline.ctx.turn_guard.health.health_avoidance_warning();
         assert!(
             warning.is_none(),
-            "unknown catalog tool should not generate a deprioritize warning"
+            "unknown catalog tool should not generate a advise_avoidance warning"
         );
     }
 
@@ -2231,36 +2249,6 @@ mod tests {
         assert!(
             pipeline.ctx.turn_guard.health.get("").is_none(),
             "empty-name catalog misses use the consecutive-name guard only"
-        );
-    }
-
-    #[tokio::test]
-    async fn unknown_tool_does_not_merge_into_restricted() {
-        let mut harness = PipelineHarness::new();
-        for i in 0..3 {
-            harness.tool_calls.push(json!({
-                "id": format!("call-outline-{i}"),
-                "function": {
-                    "name": "outline",
-                    "arguments": format!("{{\"path\": \"file{i}.rs\"}}")
-                }
-            }));
-        }
-        let mut pipeline = harness.pipeline();
-
-        for i in 0..3 {
-            pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(i));
-        }
-
-        // Simulate what the server loop does between turns.
-        assert!(!pipeline.ctx.restricted_tools.contains("outline"));
-        astra_turn_core::turn_guard::merge_deprioritized_tools_into_restricted(
-            pipeline.ctx.turn_guard,
-            pipeline.ctx.restricted_tools,
-        );
-        assert!(
-            !pipeline.ctx.restricted_tools.contains("outline"),
-            "unknown catalog tool should not be added to restricted_tools"
         );
     }
 
@@ -2326,19 +2314,14 @@ mod tests {
     #[tokio::test]
     async fn no_matching_edge_execution_is_failed_tool_binding_without_rollback_class() {
         let mut harness = PipelineHarness::new();
-        harness.valid_tool_names.insert("agent_fanout".to_string());
+        harness.valid_tool_names.insert("github".to_string());
         harness.tool_calls.push(json!({
-            "id": "call-agent-fanout-0",
+            "id": "call-github-0",
             "function": {
-                "name": "agent_fanout",
+                "name": "github",
                 "arguments": serde_json::to_string(&json!({
-                    "action": "start",
-                    "target_count": 1,
-                    "slots": [{
-                        "id": "review",
-                        "description": "Review",
-                        "prompt": "Review this change."
-                    }]
+                    "action": "search",
+                    "query": "astra"
                 })).unwrap()
             }
         }));
@@ -2370,7 +2353,7 @@ mod tests {
         );
         assert!(
             !astra_turn_core::tool_result_semantics::tool_error_triggers_rollback(
-                "agent_fanout",
+                "github",
                 &executed.execution.result_str,
             ),
             "no executor means no tool implementation ran, so rollback is wrong"
@@ -2390,6 +2373,143 @@ mod tests {
                 .is_some_and(|error| error.contains("headless edge protocol")),
             "journal error should preserve the executor-missing body, got {record:?}"
         );
+    }
+
+    #[test]
+    fn validate_slot_adopts_agent_fanout_edge_result_by_request_id_when_args_differ() {
+        let mut harness = PipelineHarness::new();
+        let server_args = json!({
+            "action": "start",
+            "target_count": 3,
+            "slots": [{
+                "id": "review",
+                "description": "Review",
+                "prompt": "Review this change."
+            }]
+        });
+        let edge_args = json!({
+            "action": "start",
+            "target_count": 3,
+            "slots": [{
+                "id": "review",
+                "description": "Review",
+                "prompt": "Review this change."
+            }],
+            "title": "Review"
+        });
+        harness.valid_tool_names = HashSet::from(["agent_fanout".to_string()]);
+        harness.tool_calls.push(json!({
+            "id": "call-agent-fanout-1",
+            "function": {
+                "name": "agent_fanout",
+                "arguments": serde_json::to_string(&server_args).unwrap()
+            }
+        }));
+        harness.edge_tool_round = vec![EdgeToolExecResult {
+            request_id: "call-agent-fanout-1".to_string(),
+            tool: "agent_fanout".to_string(),
+            args: edge_args,
+            output: r#"{"completed":3,"group_id":"run-test-fanout-1"}"#.to_string(),
+            tool_result_fields: Some(edge_runtime_environment_fields()),
+            status: "completed".to_string(),
+            duration_ms: 209_858,
+        }];
+
+        let mut pipeline = harness.pipeline();
+        let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)) {
+            HeadlessPipelineStage::Continue(validated) => validated,
+            HeadlessPipelineStage::ShortCircuit => {
+                panic!("expected fanout edge result to validate, got short-circuit")
+            }
+            HeadlessPipelineStage::AbortRound => {
+                panic!("expected fanout edge result to validate, got abort")
+            }
+        };
+
+        assert_eq!(validated.execution.name, "agent_fanout");
+        assert!(validated.execution.is_edge_tool);
+        assert_eq!(validated.execution.edge_duration_ms, 209_858);
+        assert!(validated.execution.result_str.contains(r#""completed":3"#));
+        assert!(
+            pipeline.ctx.tool_results.is_empty(),
+            "matched edge result must not emit runtime-binding denial"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_executor_gated_tool_without_binding_short_circuits() {
+        let cases = [
+            (
+                "agent",
+                json!({
+                    "action": "spawn",
+                    "prompt": "Review this change.",
+                    "description": "Review"
+                }),
+            ),
+            (
+                "agent_fanout",
+                json!({
+                    "action": "start",
+                    "target_count": 1,
+                    "slots": [{
+                        "id": "review",
+                        "description": "Review",
+                        "prompt": "Review this change."
+                    }]
+                }),
+            ),
+        ];
+
+        for (tool_name, args) in cases {
+            let mut harness = PipelineHarness::new();
+            // Simulate stale resume or cached tool-surface state that
+            // incorrectly carried an executor-gated tool into the validator
+            // allow-set.
+            harness.valid_tool_names.insert(tool_name.to_string());
+            harness.tool_calls.push(json!({
+                "id": format!("call-{tool_name}-0"),
+                "function": {
+                    "name": tool_name,
+                    "arguments": serde_json::to_string(&args).unwrap()
+                }
+            }));
+            begin_recorded_turn(&mut harness, 1);
+            let mut pipeline = harness.pipeline();
+
+            assert!(matches!(
+                pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)),
+                HeadlessPipelineStage::ShortCircuit
+            ));
+            let body = pipeline
+                .ctx
+                .tool_results
+                .last()
+                .and_then(|tr| tr.get("result"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            assert!(
+                body.contains("multi-agent runtime is not connected"),
+                "executor-gated stale call should name the missing runtime for {tool_name}: {body}"
+            );
+            assert!(
+                !body.contains("headless edge protocol"),
+                "stale executor-gated calls must be denied before no-matching-edge fallback for {tool_name}: {body}"
+            );
+            let record = pipeline
+                .ctx
+                .tool_call_records
+                .last()
+                .expect("blocked runtime call should be journaled");
+            assert!(!record.ok);
+            assert!(
+                record
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("multi-agent runtime is not connected")),
+                "journal should preserve runtime-binding denial for {tool_name}, got {record:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2775,6 +2895,16 @@ mod tests {
             "id": "call-agent-1",
             "function": { "name": "agent", "arguments": serde_json::to_string(&args).unwrap() }
         }));
+        harness.edge_tool_round = vec![EdgeToolExecResult {
+            request_id: "call-agent-1".to_string(),
+            tool: "agent".to_string(),
+            args: args.clone(),
+            output: r#"{"status":"still_running","agent_id":"general-purpose_demo@123"}"#
+                .to_string(),
+            tool_result_fields: Some(edge_runtime_environment_fields()),
+            status: "completed".to_string(),
+            duration_ms: 4,
+        }];
         let sig = astra_turn_core::tool_result_semantics::tool_dedup_signature("agent", &args);
         let now_epoch = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

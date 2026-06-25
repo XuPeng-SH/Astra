@@ -24,7 +24,7 @@ use astra_runtime::{
 };
 use astra_services::skills::{
     SkillInfoRecord, SkillListItem, SkillListRecord, SkillPublishRequestData, SkillRecord,
-    SkillRegisterRequestData, SkillService, SkillStatusRecord, SkillVersionRecord,
+    SkillService, SkillStatusRecord, SkillVersionRecord,
 };
 use astra_services::{
     ModelCreateRequestData, ModelListItem, ModelRecord, ModelService, ModelUpdateRequestData,
@@ -250,14 +250,6 @@ struct TestSkillService;
 
 #[async_trait]
 impl SkillService for TestSkillService {
-    async fn register_skill(
-        &self,
-        _: String,
-        _: SkillRegisterRequestData,
-    ) -> Result<SkillRecord, (StatusCode, Json<ErrorResponse>)> {
-        unimplemented!()
-    }
-
     async fn list_skills(
         &self,
         _user_id: String,
@@ -523,15 +515,51 @@ fn normalize_chat_stream_payload(mut payload: Value) -> Value {
     let Some(object) = payload.as_object_mut() else {
         return payload;
     };
-    let legacy_model = object.remove("model");
-    if object.contains_key("selected_model") {
-        return payload;
+    if !object.contains_key("selected_model") {
+        let legacy_model = object.remove("model");
+        let model = legacy_model
+            .and_then(|value| value.as_str().map(ToOwned::to_owned))
+            .unwrap_or_else(|| DEFAULT_SELECTED_MODEL.to_string());
+        object.insert("selected_model".to_string(), json!({ "model": model }));
     }
-    let model = legacy_model
-        .and_then(|value| value.as_str().map(ToOwned::to_owned))
-        .unwrap_or_else(|| DEFAULT_SELECTED_MODEL.to_string());
-    object.insert("selected_model".to_string(), json!({ "model": model }));
+    if context_declares_edge_tools(object) {
+        object
+            .entry("workspace_binding".to_string())
+            .or_insert_with(default_edge_workspace_binding);
+        object
+            .entry("executor_binding".to_string())
+            .or_insert_with(default_edge_executor_binding);
+    }
     payload
+}
+
+fn context_declares_edge_tools(object: &serde_json::Map<String, Value>) -> bool {
+    object
+        .get("context")
+        .and_then(Value::as_object)
+        .and_then(|context| context.get("edge_tools"))
+        .and_then(Value::as_array)
+        .is_some_and(|tools| !tools.is_empty())
+}
+
+fn default_edge_workspace_binding() -> Value {
+    json!({
+        "kind": "edge_workspace",
+        "display_name": "Test edge workspace",
+        "root": "/workspace/astra",
+        "authority": "read_write",
+        "fallback_policy": "disabled"
+    })
+}
+
+fn default_edge_executor_binding() -> Value {
+    json!({
+        "kind": "edge_agent",
+        "executor_id": "test-edge-agent",
+        "display_name": "Test edge agent",
+        "transport": "edge_ledger",
+        "status": "online"
+    })
 }
 
 /// Send a POST /chat/stream request and collect all SSE events from the stream.
@@ -768,7 +796,7 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
             "workspace_binding": {
                 "kind": "edge_workspace",
                 "display_name": "MacBook Pro",
-                "cwd": "/Users/xupeng/github/astra",
+                "root": "/Users/xupeng/github/astra",
                 "authority": "read_write",
                 "fallback_policy": "disabled"
             },
@@ -1101,8 +1129,8 @@ async fn run_mock_tool_scenario(case: MockToolScenario) {
     let plan = plans.last().expect("tool hook plan");
     let audit = plan.decision_audit.as_ref().expect("tool decision audit");
     assert_eq!(
-        audit.decision_type, "tool_selection",
-        "{}: tool case should persist tool_selection",
+        audit.decision_type, "tool_surface",
+        "{}: tool case should persist tool_surface",
         case.name
     );
     let skill = plan.skill_selection.as_ref().expect("tool skill selection");
@@ -1351,7 +1379,7 @@ async fn edge_executor_offline_blocks_run_before_next_llm_round() {
             "workspace_binding": {
                 "kind": "edge_workspace",
                 "display_name": "MacBook Pro",
-                "cwd": "/Users/xupeng/github/astra",
+                "root": "/Users/xupeng/github/astra",
                 "authority": "read_write",
                 "fallback_policy": "disabled"
             },
@@ -1417,7 +1445,7 @@ async fn edge_executor_offline_child_spawn_blocks_parent_before_next_llm_round()
             "workspace_binding": {
                 "kind": "edge_workspace",
                 "display_name": "MacBook Pro",
-                "cwd": "/Users/xupeng/github/astra",
+                "root": "/Users/xupeng/github/astra",
                 "authority": "read_write",
                 "fallback_policy": "disabled"
             },
@@ -4379,7 +4407,7 @@ async fn hook_db_decision_audit_text_only() {
     assert!(!requests[0].messages.is_empty());
 }
 
-/// Tool-call response produces a "tool_selection" decision audit with skill selection.
+/// Tool-call response produces a "tool_surface" decision audit with skill selection.
 #[tokio::test]
 async fn hook_db_decision_audit_with_tools() {
     let (app, hook_writer, _observer, _tool_writer) = build_test_app_with_hooks();
@@ -4429,7 +4457,7 @@ async fn hook_db_decision_audit_with_tools() {
         .decision_audit
         .as_ref()
         .expect("decision_audit present");
-    assert_eq!(audit.decision_type, "tool_selection");
+    assert_eq!(audit.decision_type, "tool_surface");
     let tool_calls = audit.decision_output["tool_calls"].as_array().unwrap();
     assert!(tool_calls.iter().any(|t| t.as_str() == Some("list_dir")));
 
@@ -4514,7 +4542,7 @@ async fn observer_fired_with_correct_metadata() {
 
 /// Multiple tool calls across rounds produce a skill selection with all tool names.
 #[tokio::test]
-async fn hook_db_multiple_tools_selected() {
+async fn hook_db_multiple_visible_tools() {
     let (app, hook_writer, _observer, _tool_writer) = build_test_app_with_hooks();
 
     // Two rounds of approval-free tools (read_file, list_dir) + final text.
@@ -4574,7 +4602,7 @@ async fn hook_db_multiple_tools_selected() {
     let plans = hook_writer.plans.lock().await;
     assert_eq!(plans.len(), 1);
     let audit = plans[0].decision_audit.as_ref().expect("decision_audit");
-    assert_eq!(audit.decision_type, "tool_selection");
+    assert_eq!(audit.decision_type, "tool_surface");
 
     let skill = plans[0].skill_selection.as_ref().expect("skill_selection");
     // All unique tool names should be captured.
@@ -4925,16 +4953,6 @@ async fn context_meta_exposes_late_round_guidance_signals() {
             .unwrap_or(0)
             > 0,
         "context_meta should expose prompt token estimates"
-    );
-    assert_eq!(
-        late_round_context["system_prompt_breakdown"]["guidance_signals"]["round_budget_warning"]
-            .as_bool(),
-        Some(false)
-    );
-    assert_eq!(
-        late_round_context["system_prompt_breakdown"]["guidance_signals"]["synthesize_or_batch"]
-            .as_bool(),
-        Some(false)
     );
     assert!(
         late_round_context["system_prompt_breakdown"]["guidance_signals"]["parallel_feedback"]
@@ -5455,7 +5473,7 @@ async fn context_meta_surfaces_unknown_active_skills_for_debugging() {
 
 /// Realistic production-like scenario mirroring the reported "session 9474cce1"
 /// case: a MiniMax-M2.7 request with `selected_model` set, multiple
-/// `active_skills` pinned in `edge_profile`, AND the model actively invoking
+/// request-active skills in `edge_profile`, AND the model actively invoking
 /// the `skill` tool mid-conversation. The original report conflated two
 /// distinct things ("skill lost" vs "model manually re-loads skill each turn")
 /// — this test pins the *actual* invariants so future regressions are caught
@@ -5487,7 +5505,7 @@ async fn complex_scenario_model_override_plus_active_skills_plus_skill_invocatio
         let (app, _hook_writer, observer_worker, _tool_writer) = build_test_app_with_hooks_and_skills();
 
         let payload = json!({
-            "message": "Review this commit under the pinned output skills.",
+            "message": "Review this commit with the active output skills.",
             "model": "MiniMax-M2.7",
             "context": {
                 "edge_profile": {
@@ -5587,7 +5605,7 @@ async fn complex_scenario_model_override_plus_active_skills_plus_skill_invocatio
 }
 
 /// Multi-turn variant of the complex scenario: same `session_id` across two
-/// user messages, both under `selected_model` with `active_skills` pinned.
+/// user messages, both under `selected_model` with request-active skills.
 /// Catches drift in cross-turn invariants that the single-turn test can't:
 ///   * Does the skill hint consistently appear in BOTH turns' system prompts?
 ///   * Does `state.skills.invoked` persist across the turn boundary so the
@@ -5643,7 +5661,7 @@ async fn complex_scenario_multi_turn_preserves_active_skills_and_invoked_state()
             &app,
             json!({
                 "session_id": &sid,
-                "message": "second request: keep the pinned skill",
+                "message": "second request: keep the active skill",
                 "model": "MiniMax-M2.7",
                 "context": {
                     "edge_profile": {

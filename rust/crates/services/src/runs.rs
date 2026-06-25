@@ -285,11 +285,12 @@ pub enum FallbackPolicyRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkspaceBindingRequest {
     pub kind: WorkspaceBindingRequestKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
-    #[serde(default, alias = "cwd", skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<WorkspaceSourceRequest>,
@@ -436,14 +437,12 @@ pub struct ChatRequestData {
     pub runtime_auth: Option<RuntimeAuthRequest>,
     pub runtime_profile: Option<RuntimeProfileRequest>,
     pub llm_token_service: Option<LlmTokenServiceConfig>,
-    pub skill_search: Option<astra_core::SkillSearchSettings>,
     pub allow_skills: Option<Vec<String>>,
     pub allow_skill_sources: Option<Vec<String>>,
     pub allow_tools: Option<Vec<String>>,
     pub workspace_binding: Option<WorkspaceBindingRequest>,
     pub executor_binding: Option<ExecutorBindingRequest>,
     pub runtime_mcp_bindings: Vec<RuntimeMcpBindingRequest>,
-    pub mcp_binding_ids: Option<Vec<i64>>,
     pub context: Option<serde_json::Map<String, serde_json::Value>>,
     pub edge_executor_id: Option<String>,
     pub capabilities: Vec<String>,
@@ -490,14 +489,12 @@ impl std::fmt::Debug for ChatRequestData {
             .field("runtime_auth", &self.runtime_auth)
             .field("runtime_profile", &self.runtime_profile)
             .field("llm_token_service", &self.llm_token_service)
-            .field("skill_search", &self.skill_search)
             .field("allow_skills", &self.allow_skills)
             .field("allow_skill_sources", &self.allow_skill_sources)
             .field("allow_tools", &self.allow_tools)
             .field("workspace_binding", &self.workspace_binding)
             .field("executor_binding", &self.executor_binding)
             .field("runtime_mcp_bindings", &self.runtime_mcp_bindings)
-            .field("deprecated_mcp_binding_ids", &self.mcp_binding_ids)
             .field("context", &self.context)
             .field("edge_executor_id", &self.edge_executor_id)
             .field("capabilities", &self.capabilities)
@@ -4183,14 +4180,12 @@ mod tests {
             runtime_auth: None,
             runtime_profile: None,
             llm_token_service: None,
-            skill_search: None,
             allow_skills: None,
             allow_skill_sources: None,
             allow_tools: None,
             workspace_binding: None,
             executor_binding: None,
             runtime_mcp_bindings: Vec::new(),
-            mcp_binding_ids: None,
             context: None,
             edge_executor_id: None,
             capabilities: Vec::new(),
@@ -4245,14 +4240,12 @@ mod tests {
             }),
             runtime_profile: None,
             llm_token_service: None,
-            skill_search: None,
             allow_skills: None,
             allow_skill_sources: None,
             allow_tools: None,
             workspace_binding: None,
             executor_binding: None,
             runtime_mcp_bindings: Vec::new(),
-            mcp_binding_ids: None,
             context: None,
             edge_executor_id: None,
             capabilities: Vec::new(),
@@ -4321,14 +4314,12 @@ mod tests {
                     runtime_auth: None,
                     runtime_profile: None,
                     llm_token_service: None,
-                    skill_search: None,
                     allow_skills: None,
                     allow_skill_sources: None,
                     allow_tools: None,
                     workspace_binding: None,
                     executor_binding: None,
                     runtime_mcp_bindings: Vec::new(),
-                    mcp_binding_ids: None,
                     context: None,
                     edge_executor_id: None,
                     capabilities: Vec::new(),

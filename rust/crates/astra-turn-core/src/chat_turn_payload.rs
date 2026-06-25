@@ -1,4 +1,4 @@
-//! Top-level `/chat` (streaming) JSON body skeleton before `edge_tools`, `tool_results`, and selector hints.
+//! Top-level `/chat` (streaming) JSON body skeleton before `edge_tools`, `tool_results`, and skill context.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -91,9 +91,9 @@ pub fn merge_active_skills_into_edge_profile(payload: &mut Value, active_skills:
     }
 }
 
-/// Deduped skill names that affected this `/chat` request: selector-chosen registry skills,
-/// message-detected system skills ([`super::chat_turn_edge_profile::detect_active_system_skills_in_message`]),
-/// and registry skills whose instruction bodies were merged successfully.
+/// Deduped skill names that affected this `/chat` request: message-detected
+/// system skills ([`super::chat_turn_edge_profile::detect_active_system_skills_in_message`])
+/// and skills whose instruction bodies were merged successfully.
 pub fn merge_invoked_skills_into_edge_profile(payload: &mut Value, invoked_skills: &[String]) {
     if invoked_skills.is_empty() {
         return;

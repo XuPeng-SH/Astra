@@ -18,7 +18,9 @@ use uuid::Uuid;
 use astra_sandbox::{CommandRisk, analyze_command_risks};
 
 use crate::detach::DetachShellHandle;
-use crate::exit_semantics::{ExitSemantics, classify_command_result, classify_exit};
+use crate::exit_semantics::{
+    CommandResultClass, ExitSemantics, classify_command_result, classify_exit,
+};
 use crate::{ToolResult, per_tool_output_limit, truncate_output};
 
 const GREP_TIMEOUT: Duration = Duration::from_secs(20);
@@ -141,7 +143,7 @@ impl<'a> DetachHandleGuard<'a> {
     async fn restore(mut self) {
         if let (Some(slot), Some(handle)) = (self.slot.as_ref(), self.handle.take()) {
             handle.mark_active(false);
-            if !handle.is_retired() {
+            if !handle.is_blocked() {
                 *slot.lock().await = Some(handle);
             }
         }
@@ -844,17 +846,6 @@ pub(crate) fn parse_bash_timeout_secs_for(args: &Value, command: &str) -> f64 {
     default_bash_timeout_for(command).clamp(BASH_TIMEOUT_MIN_SECS, BASH_TIMEOUT_MAX_SECS)
 }
 
-/// Backwards-compatible wrapper: when the caller doesn't have the command
-/// string handy (e.g. tests constructed from only `args`), falls back to
-/// [`DEFAULT_BASH_TIMEOUT_SECS`] on the classifier-unknown path.
-#[cfg(test)]
-pub(crate) fn parse_bash_timeout_secs(args: &Value) -> f64 {
-    args.get("timeout")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(DEFAULT_BASH_TIMEOUT_SECS)
-        .clamp(BASH_TIMEOUT_MIN_SECS, BASH_TIMEOUT_MAX_SECS)
-}
-
 /// Execute a bash command with bounded partial-output capture.
 pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
     let workspace_root = ctx.workspace_root.as_path();
@@ -1062,7 +1053,8 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
             result = format!("Error: bash timed out after {timeout_secs}s with no captured output");
         }
         return ToolResult::error(truncate_output(result, output_limit))
-            .with_exit_semantics(ExitSemantics::TimedOut);
+            .with_exit_semantics(ExitSemantics::TimedOut)
+            .with_exit_code(output.exit_code);
     }
 
     if output.cancelled {
@@ -1072,7 +1064,8 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
             result = "Error: bash cancelled before any output was captured".into();
         }
         return ToolResult::error(truncate_output(result, output_limit))
-            .with_exit_semantics(ExitSemantics::Cancelled);
+            .with_exit_semantics(ExitSemantics::Cancelled)
+            .with_exit_code(output.exit_code);
     }
 
     let exit_semantics = classify_exit(command, output.exit_code);
@@ -1083,15 +1076,18 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
         Some(output.exit_code),
     );
     if output.exit_code != 0 || result_class.is_tool_error() {
-        let output = truncate_output(result, output_limit);
+        let exit_code = output.exit_code;
+        let output_text = truncate_output(result, output_limit);
         if exit_semantics.is_tool_error() || result_class.is_tool_error() {
-            return ToolResult::error(output)
+            return ToolResult::error(output_text)
                 .with_exit_semantics(exit_semantics)
-                .with_result_class(result_class);
+                .with_result_class(result_class)
+                .with_exit_code(exit_code);
         }
-        return ToolResult::text(output)
+        return ToolResult::text(output_text)
             .with_exit_semantics(exit_semantics)
-            .with_result_class(result_class);
+            .with_result_class(result_class)
+            .with_exit_code(exit_code);
     }
 
     if command_has_background_operator(command) {
@@ -1110,10 +1106,12 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
         ToolResult::text("(command completed with no output)".into())
             .with_exit_semantics(ExitSemantics::Success)
             .with_result_class(result_class)
+            .with_exit_code(output.exit_code)
     } else {
         ToolResult::text(truncate_output(result, output_limit))
             .with_exit_semantics(ExitSemantics::Success)
             .with_result_class(result_class)
+            .with_exit_code(output.exit_code)
     }
 }
 
@@ -1303,28 +1301,38 @@ pub async fn grep(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
     };
 
     if exit_code == 1 && stdout.trim().is_empty() {
-        return if stderr.trim().is_empty() {
-            ToolResult::text("No matches found".into())
+        let output = if stderr.trim().is_empty() {
+            "No matches found".into()
         } else {
-            ToolResult::text(format!("No matches found (warnings: {})", stderr.trim()))
+            format!("No matches found (warnings: {})", stderr.trim())
         };
+        return grep_process_result(output, exit_code, timed_out, cancelled);
     }
 
     if stdout.trim().is_empty() && exit_code != 0 {
         if cancelled {
-            return ToolResult::error("Error: grep was cancelled before returning results.".into());
+            return grep_process_result(
+                "Error: grep was cancelled before returning results.".into(),
+                exit_code,
+                timed_out,
+                cancelled,
+            );
         }
         if timed_out {
-            return ToolResult::error(
+            return grep_process_result(
                 "Error: grep timed out after 20s with no results. Narrow the search with 'path', 'include'/'glob', 'type', or a more specific pattern.".into(),
+                exit_code,
+                timed_out,
+                cancelled,
             );
         }
 
-        return if stderr.trim().is_empty() {
-            ToolResult::error("Error: grep failed".into())
+        let output = if stderr.trim().is_empty() {
+            "Error: grep failed".into()
         } else {
-            ToolResult::error(format!("Error: {}", stderr.trim()))
+            format!("Error: {}", stderr.trim())
         };
+        return grep_process_result(output, exit_code, timed_out, cancelled);
     }
 
     let filtered = if output_mode == SearchOutputMode::Count {
@@ -1336,6 +1344,14 @@ pub async fn grep(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
     } else {
         stdout
     };
+
+    // Count mode with all-zero results should report as no matches (exit 1)
+    let effective_exit_code =
+        if output_mode == SearchOutputMode::Count && filtered.trim().is_empty() && exit_code == 0 {
+            1
+        } else {
+            exit_code
+        };
 
     let mut lines: Vec<String> = filtered
         .lines()
@@ -1359,24 +1375,34 @@ pub async fn grep(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
         &gitignored_paths,
     );
     if lines.is_empty() {
-        return ToolResult::text(no_visible_results_message(
-            "matches",
-            timed_out,
-            cancelled,
-            stdout_capped,
-            stderr.trim(),
-        ));
-    }
-    let paged_lines = if offset > 0 {
-        if offset >= lines.len() {
-            return ToolResult::text(no_more_results_message(
-                offset,
-                lines.len(),
-                "lines",
+        return grep_process_result(
+            no_visible_results_message(
+                "matches",
                 timed_out,
                 cancelled,
                 stdout_capped,
-            ));
+                stderr.trim(),
+            ),
+            effective_exit_code,
+            timed_out,
+            cancelled,
+        );
+    }
+    let paged_lines = if offset > 0 {
+        if offset >= lines.len() {
+            return grep_process_result(
+                no_more_results_message(
+                    offset,
+                    lines.len(),
+                    "lines",
+                    timed_out,
+                    cancelled,
+                    stdout_capped,
+                ),
+                exit_code,
+                timed_out,
+                cancelled,
+            );
         }
         &lines[offset..]
     } else {
@@ -1446,7 +1472,53 @@ pub async fn grep(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
         result_text = annotate_grep_with_scope(&result_text, workspace_root);
     }
 
-    ToolResult::text(result_text)
+    grep_process_result(result_text, exit_code, timed_out, cancelled)
+}
+
+fn grep_process_result(
+    output: String,
+    exit_code: i32,
+    timed_out: bool,
+    cancelled: bool,
+) -> ToolResult {
+    let exit_semantics = grep_exit_semantics(exit_code, timed_out, cancelled);
+    let result_class = grep_result_class(exit_semantics);
+    let result = if exit_semantics.is_tool_error() {
+        ToolResult::error(output)
+    } else {
+        ToolResult::text(output)
+    };
+    result
+        .with_exit_semantics(exit_semantics)
+        .with_result_class(result_class)
+        .with_exit_code(exit_code)
+}
+
+fn grep_exit_semantics(exit_code: i32, timed_out: bool, cancelled: bool) -> ExitSemantics {
+    if cancelled {
+        return ExitSemantics::Cancelled;
+    }
+    if timed_out {
+        return ExitSemantics::TimedOut;
+    }
+    match exit_code {
+        0 => ExitSemantics::Success,
+        1 => ExitSemantics::EmptyResult,
+        128..=255 => ExitSemantics::Signaled,
+        _ => ExitSemantics::ExecutionError,
+    }
+}
+
+fn grep_result_class(exit_semantics: ExitSemantics) -> CommandResultClass {
+    match exit_semantics {
+        ExitSemantics::Success | ExitSemantics::PipelineTruncated => CommandResultClass::Success,
+        ExitSemantics::EmptyResult => CommandResultClass::EmptyResult,
+        ExitSemantics::DomainNegative => CommandResultClass::DomainNegative,
+        ExitSemantics::TimedOut
+        | ExitSemantics::Cancelled
+        | ExitSemantics::Signaled
+        | ExitSemantics::ExecutionError => CommandResultClass::ExecutionError,
+    }
 }
 
 /// Find files matching a glob pattern without blocking the async executor.
@@ -3848,6 +3920,45 @@ mod tests {
 
         assert!(!result.is_error, "grep should succeed: {}", result.output);
         assert_eq!(result.output, "No matches found");
+        let metadata = result
+            .metadata
+            .as_ref()
+            .expect("grep no-match must carry structured exit metadata");
+        assert_eq!(metadata.get("exit_code").and_then(Value::as_i64), Some(1));
+        assert_eq!(
+            metadata.get("exit_semantics").and_then(Value::as_str),
+            Some("empty_result")
+        );
+        assert_eq!(
+            metadata.get("result_class").and_then(Value::as_str),
+            Some("empty_result")
+        );
+        assert_eq!(result.exit_semantics, Some(ExitSemantics::EmptyResult));
+    }
+
+    #[test]
+    fn grep_backend_error_result_is_structured_execution_error() {
+        let result = grep_process_result("Error: grep failed".to_string(), 2, false, false);
+
+        assert!(
+            result.is_error,
+            "backend exit 2 must fail: {}",
+            result.output
+        );
+        let metadata = result
+            .metadata
+            .as_ref()
+            .expect("grep failure must carry structured exit metadata");
+        assert_eq!(metadata.get("exit_code").and_then(Value::as_i64), Some(2));
+        assert_eq!(
+            metadata.get("exit_semantics").and_then(Value::as_str),
+            Some("execution_error")
+        );
+        assert_eq!(
+            metadata.get("result_class").and_then(Value::as_str),
+            Some("execution_error")
+        );
+        assert_eq!(result.exit_semantics, Some(ExitSemantics::ExecutionError));
     }
 
     #[tokio::test]
@@ -4954,6 +5065,19 @@ printf 'probe.txt:1:needle\n'
             "got: {}",
             result.output
         );
+        let metadata = result
+            .metadata
+            .as_ref()
+            .expect("bash failure must carry structured metadata");
+        assert_eq!(metadata.get("exit_code").and_then(Value::as_i64), Some(7));
+        assert_eq!(
+            metadata.get("exit_semantics").and_then(Value::as_str),
+            Some("execution_error")
+        );
+        assert_eq!(
+            metadata.get("result_class").and_then(Value::as_str),
+            Some("execution_error")
+        );
     }
 
     #[tokio::test]
@@ -4996,12 +5120,12 @@ printf 'probe.txt:1:needle\n'
 
         assert!(
             !result.is_error,
-            "grep no-match is informational, not a tool error: {}",
+            "grep no-match is an empty result, not a tool error: {}",
             result.output
         );
         assert_eq!(
             result.exit_semantics,
-            Some(crate::exit_semantics::ExitSemantics::InformationalFailure)
+            Some(crate::exit_semantics::ExitSemantics::EmptyResult)
         );
     }
 
@@ -5021,13 +5145,43 @@ printf 'probe.txt:1:needle\n'
 
         assert!(
             !result.is_error,
-            "grep no-match pipeline is informational, not a tool error: {}",
+            "grep no-match pipeline is an empty result, not a tool error: {}",
             result.output
         );
         assert_eq!(
             result.exit_semantics,
-            Some(crate::exit_semantics::ExitSemantics::InformationalFailure)
+            Some(crate::exit_semantics::ExitSemantics::EmptyResult)
         );
+    }
+
+    #[tokio::test]
+    async fn bash_pipeline_sigpipe_to_head_is_not_tool_error_with_pipefail() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+
+        let result = execute_bash(
+            &ctx,
+            &serde_json::json!({
+                "command": "yes match | head -1"
+            }),
+        )
+        .await;
+
+        assert!(
+            !result.is_error,
+            "bounded pipeline SIGPIPE is a normal truncation outcome, not a tool error: {}",
+            result.output
+        );
+        assert_eq!(
+            result.exit_semantics,
+            Some(crate::exit_semantics::ExitSemantics::PipelineTruncated)
+        );
+        let metadata = result.metadata.as_ref().expect("structured metadata");
+        assert_eq!(
+            metadata.get("result_class").and_then(Value::as_str),
+            Some("success")
+        );
+        assert_eq!(metadata.get("exit_code").and_then(Value::as_i64), Some(141));
     }
 
     #[tokio::test]
@@ -5545,10 +5699,12 @@ printf 'probe.txt:1:needle\n'
     }
 
     #[test]
-    fn bash_default_timeout_is_120s() {
-        // Regression guard: missing `timeout` falls back to 120s.
-        let args = serde_json::json!({"command": "echo hi"});
-        assert_eq!(parse_bash_timeout_secs(&args), DEFAULT_BASH_TIMEOUT_SECS);
+    fn bash_unknown_command_default_timeout_is_120s() {
+        let args = serde_json::json!({"command": "custom-runner"});
+        assert_eq!(
+            parse_bash_timeout_secs_for(&args, "custom-runner"),
+            DEFAULT_BASH_TIMEOUT_SECS
+        );
         assert_eq!(DEFAULT_BASH_TIMEOUT_SECS, 120.0);
     }
 
@@ -5557,11 +5713,14 @@ printf 'probe.txt:1:needle\n'
         // Regression guard: high timeouts (e.g. 500s) pass through to the
         // subprocess without being clamped down to the old 120s limit.
         let args = serde_json::json!({"command": "echo ok", "timeout": 500});
-        assert_eq!(parse_bash_timeout_secs(&args), 500.0);
+        assert_eq!(parse_bash_timeout_secs_for(&args, "echo ok"), 500.0);
 
         // Above the cap is clamped.
         let args_big = serde_json::json!({"command": "echo ok", "timeout": 10_000});
-        assert_eq!(parse_bash_timeout_secs(&args_big), BASH_TIMEOUT_MAX_SECS);
+        assert_eq!(
+            parse_bash_timeout_secs_for(&args_big, "echo ok"),
+            BASH_TIMEOUT_MAX_SECS
+        );
         assert_eq!(BASH_TIMEOUT_MAX_SECS, 600.0);
     }
 
@@ -5992,7 +6151,7 @@ printf 'probe.txt:1:needle\n'
     }
 
     #[tokio::test]
-    async fn retired_detach_slot_is_not_restored_after_normal_completion() {
+    async fn blocked_detach_slot_is_not_restored_after_normal_completion() {
         let dir = tempdir().unwrap();
         let mut ctx = crate::ToolContext::test(dir.path());
         let (slot, listener) = crate::detach::new_slot_with_handle();
@@ -6004,7 +6163,7 @@ printf 'probe.txt:1:needle\n'
         assert!(result.output.contains("done"), "{}", result.output);
         assert!(
             slot.lock().await.is_none(),
-            "retired detach handles must not be restored with a consumed or abandoned listener"
+            "blocked detach handles must not be restored with a consumed or abandoned listener"
         );
     }
 

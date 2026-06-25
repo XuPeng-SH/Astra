@@ -324,6 +324,75 @@ async fn ensure_matrixone_database_exists(
     Ok(())
 }
 
+fn validate_schema_identifier(raw: &str, kind: &str) -> Result<(), sqlx::Error> {
+    use std::error::Error;
+
+    crate::snapshot_sql::validate_sql_identifier(raw, kind).map_err(|e| {
+        sqlx::Error::Configuration(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            e,
+        )) as Box<dyn Error + Send + Sync>)
+    })
+}
+
+async fn add_column_if_missing(
+    pool: &sqlx::Pool<MySql>,
+    database: &str,
+    table: &str,
+    column: &str,
+    ddl: &str,
+) -> Result<(), sqlx::Error> {
+    validate_schema_identifier(database, "matrixone database")?;
+    validate_schema_identifier(table, "matrixone table")?;
+    validate_schema_identifier(column, "matrixone column")?;
+
+    let exists = query(
+        "SELECT 1 FROM information_schema.COLUMNS \
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = ? LIMIT 1",
+    )
+    .bind(database)
+    .bind(table)
+    .bind(column)
+    .fetch_optional(pool)
+    .await?
+    .is_some();
+    if exists {
+        return Ok(());
+    }
+
+    query(ddl).execute(pool).await?;
+    Ok(())
+}
+
+async fn add_index_if_missing(
+    pool: &sqlx::Pool<MySql>,
+    database: &str,
+    table: &str,
+    index: &str,
+    ddl: &str,
+) -> Result<(), sqlx::Error> {
+    validate_schema_identifier(database, "matrixone database")?;
+    validate_schema_identifier(table, "matrixone table")?;
+    validate_schema_identifier(index, "matrixone index")?;
+
+    let exists = query(
+        "SELECT 1 FROM information_schema.STATISTICS \
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND INDEX_NAME = ? LIMIT 1",
+    )
+    .bind(database)
+    .bind(table)
+    .bind(index)
+    .fetch_optional(pool)
+    .await?
+    .is_some();
+    if exists {
+        return Ok(());
+    }
+
+    query(ddl).execute(pool).await?;
+    Ok(())
+}
+
 pub async fn ensure_core_schema(
     settings: &MatrixOneSettings,
     bootstrap_catalog: &str,
@@ -1620,7 +1689,6 @@ pub async fn ensure_core_schema(
             version VARCHAR(64) NOT NULL,
             description TEXT NULL,
             skill_definition JSON NULL,
-            code_hash VARCHAR(128) NULL,
             dependencies JSON NULL,
             manifest JSON NULL,
             publisher_id VARCHAR(255) NULL,
@@ -1983,7 +2051,34 @@ pub async fn ensure_core_schema(
     .execute(&pool)
     .await?;
 
-    // Session task scratchpad (Tier 1 — ClaudeCode-style task board).
+    for (table, column, ddl) in [
+        (
+            "agent_sessions",
+            "project_id",
+            "ALTER TABLE agent_sessions ADD COLUMN project_id VARCHAR(128) NULL",
+        ),
+        (
+            "agent_sessions",
+            "project_retention_policy",
+            "ALTER TABLE agent_sessions ADD COLUMN project_retention_policy VARCHAR(32) NOT NULL DEFAULT 'session'",
+        ),
+    ] {
+        if let Err(e) = add_column_if_missing(&pool, &settings.database, table, column, ddl).await {
+            tracing::warn!("phase4 additive column migration skipped: {table}.{column}: {e}");
+        }
+    }
+
+    for (table, index, ddl) in [(
+        "agent_sessions",
+        "idx_sessions_project",
+        "ALTER TABLE agent_sessions ADD INDEX idx_sessions_project (user_id, project_id, updated_at)",
+    )] {
+        if let Err(e) = add_index_if_missing(&pool, &settings.database, table, index, ddl).await {
+            tracing::debug!("phase4 additive index migration skipped: {table}.{index}: {e}");
+        }
+    }
+
+    // Session task scratchpad (Tier 1 — reference-agent-style task board).
     // Authoritative store for the live task board. Both edge and cloud read
     // the same rows for a given session_id; per-host `TaskManager` instances
     // are caches over this table. See `docs/plans/task-system-design.md` §2.1

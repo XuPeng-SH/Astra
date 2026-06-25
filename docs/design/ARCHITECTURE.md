@@ -28,7 +28,7 @@ Five problems block AI agents from production adoption:
 | 3 | **Memory is broken** | Agents forget across sessions. Knowledge updates silently invalidate past answers. No memory lifecycle. | ✅ **SOLVED**: Episodic/semantic/procedural memory with automated governance (confidence decay, quarantine, compression). Distributed scheduling ensures multi-instance safety. |
 | 4 | **Experimentation is expensive** | Testing on production data requires full copies. Most teams skip it. |
 | 5 | **Trust is unverifiable** | No confidence signals, no claim verification, no audit trail for compliance. |
-| 6 | **Agent loops are unreliable** | Wrong tool selection, futile retries, context bloat, silent failures. No cost governance. | 🔵 **DESIGNED**: See [agent-loop-reliability-v1-python.md](agent-loop-reliability-v1-python.md) — ChatLoop restructured into unified execution pipeline with TurnState, intent routing, circuit breaker, and structured failure reporting. |
+| 6 | **Agent loops are unreliable** | Wrong tool selection, futile retries, context bloat, silent failures. No cost governance. | ✅ **SOLVED**: Rust `TurnGuard`, stall preflight/post-tool policy, and `LoopCircuitBreaker` provide structured failure reporting, live correction, and hard safety backstops; see [session-observability.md](session-observability.md). |
 
 ## Core Thesis
 
@@ -98,12 +98,11 @@ This is the index. Each document is the **single source of truth** for its domai
 |----------|-------|
 | [Memory Architecture](memory/README.md) | Cognitive architecture: episodic/semantic/procedural memory, context engineering, attention budget, compaction, memory lifecycle |
 | [Trust and Safety](trust-and-safety.md) | Decision audit, hallucination firewall, uncertainty quantification, regression gate, observability, guardrails |
-| [Skills and Tools](skills-and-tools.md) | Skill system: Skill-as-Package (stateful architecture, schema, install lifecycle, credential management, configuration center), selection pipeline (retrieve → audit → feedback), MCP compatibility, tool design, progressive disclosure, marketplace |
+| [Skills and Tools](skills-and-tools.md) | Skill system: Skill-as-Package (stateful architecture, schema, install lifecycle, credential management, configuration center), deterministic tool surface, deferred activation, MCP compatibility, progressive disclosure, marketplace |
 | [Agents and Orchestration](agents-and-orchestration.md) | ChatLoop, PAOR planning, multi-agent delegation, streaming, sub-agent architecture |
 | [Data Versioning](data-versioning.md) | Git for Data: time travel, sandbox, branching, cost-aware branching, training data pipeline |
 | [Evaluation and Evolution](evaluation-and-evolution.md) | Quality scoring, replay gating, prompt auto-evolution, implicit feedback mining, self-improving agents, meta-learning closed loop |
 | [Write Path Optimization](write-path-optimization-v1-python.md) | Async event pipeline: fire-and-forget emit, background batch flush, embedding fully decoupled into `event_embeddings`, event tiering — 60x hot-path latency reduction |
-| [Feedback Classification Model](feedback-classification-model.md) | Native feedback classifier: data pipeline, model training, deployment as platform skill, continuous learning |
 | [Deployment Architecture](deployment-architecture.md) | Deployment topologies (single machine → K8s), edge-cloud split execution, `/chat/turn` protocol, execution backend abstraction, GPU scheduling, Ray integration |
 | [Implementation Plan](implementation-plan-v1-python.md) | Unified execution plan: write path optimization (A1-A5) + CLI edge-cloud architecture (B1-B5), acceptance criteria, risk register |
 
@@ -116,7 +115,6 @@ This is the index. Each document is the **single source of truth** for its domai
 | [Prompt Lifecycle](prompt-lifecycle.md) | Prompt assembly pipeline, unified prompt path, edge-cloud tool merging, prompt versioning via time travel, prompt A/B testing via branching, self-model section |
 | [Context Window Management](context-window-management.md) | Context as managed resource: procedural memory at point of use, history sliding window, exploration guardrails, zone-based token budgets |
 | [Token-Efficient Hierarchical LLM Routing](token-efficient-llm-routing.md) | Hierarchical Confidence Cascade: Tier 0 regex → Tier 1 cheapest LLM → Tier 2 main, intent-based context pruning, 45-60% cost reduction |
-| [Tool / Skill Selection: TF-IDF + Embedding Hybrid](tool-skill-selection-embedding-hybrid.md) | Planned: cascade rerank to cut tool/skill schema tokens; runtime-config + rate limits; TF-IDF fallback; closed-loop / per-user guardrails |
 | [Tool Result Quality Firewall](tool-result-quality-firewall.md) | Pre-LLM tool result quality assessment: schema-driven completeness checks, structural inference, quality annotation injection, trust pipeline integration |
 
 ### Supporting Documents (Implementation)
@@ -128,7 +126,6 @@ This is the index. Each document is the **single source of truth** for its domai
 | [LLM Integration](../implementation/llm-integration.md) | Provider abstraction, auto-detection from DB tokens, routing, cost tracking |
 | [GitHub Integration](../implementation/github-integration.md) | Repo operations, token management |
 | [Deployment](../implementation/deployment.md) | Project structure, Docker, configuration |
-| [Feedback Classifier Deployment](../implementation/feedback-classifier-deployment.md) | Training/inference skill isolation, ONNX export, batch processing, model artifacts |
 | [Scope Configuration](../implementation/scope-configuration.md) | Scope-based config resolution |
 | [CI](../implementation/ci.md) | GitHub Actions workflows |
 

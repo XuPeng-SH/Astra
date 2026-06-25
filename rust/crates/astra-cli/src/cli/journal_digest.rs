@@ -138,7 +138,7 @@ pub struct TurnRow {
     pub entity_learn_skipped_no_domain: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memoria_ms: Option<u64>,
-    pub tools_selected_count: usize,
+    pub visible_tools_count: usize,
     pub tools_used_count: usize,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub selected_skills: Vec<String>,
@@ -602,7 +602,7 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
                     preview(ev.user_input.as_ref(), preview_len)
                 };
 
-                let tools_selected_count = ev.tools_selected.as_ref().map_or(0, |v| v.len());
+                let visible_tools_count = ev.visible_tools.as_ref().map_or(0, |v| v.len());
                 let tools_used_count = ev.tools_used.as_ref().map_or(0, |v| v.len());
                 let selected_skills = ev.selected_skills.clone().unwrap_or_default();
 
@@ -636,7 +636,7 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
                     } else {
                         None
                     },
-                    tools_selected_count,
+                    visible_tools_count,
                     tools_used_count,
                     selected_skills: if matches!(focus, DigestFocus::All) {
                         selected_skills
@@ -1165,9 +1165,9 @@ mod tests {
             turn.tool_groups.iter().any(|group| {
                 group.round == Some(0)
                     && group.call_count == 1
-                    && group.tools.iter().any(|tool| tool == "Git show b273c589")
+                    && group.tools.iter().any(|tool| tool.starts_with("Git"))
             }),
-            "digest should preserve the first repeated git_show round"
+            "digest should preserve the first repeated git round"
         );
         assert!(
             turn.tool_groups.iter().any(|group| {
@@ -1306,7 +1306,7 @@ mod tests {
         fs::write(
             journal_path_for_test(sid),
             concat!(
-                r#"{"type":"turn","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":1,"tokens_in":38000,"tokens_out":500,"duration_ms":30000,"user_input":"/review latest 2 commits","tool_calls":[{"name":"git_show","ok":true,"ms":10},{"name":"git_show","ok":true,"ms":8}],"llm_rounds":3,"total_llm_ms":29900,"total_tool_ms":100}"#,
+                r#"{"type":"turn","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":1,"tokens_in":38000,"tokens_out":500,"duration_ms":30000,"user_input":"/review latest 2 commits","tool_calls":[{"name":"git","ok":true,"ms":10},{"name":"git","ok":true,"ms":8}],"llm_rounds":3,"total_llm_ms":29900,"total_tool_ms":100}"#,
                 "\n",
             ),
         )

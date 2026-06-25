@@ -71,7 +71,7 @@ pub struct RestoredSession {
     /// Conversation messages from Step Protocol heavy checkpoint (for LLM resume).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conversation_messages: Vec<serde_json::Value>,
-    /// Blocked/deprioritized tools from checkpoint.
+    /// Blocked/health-avoidance tools from checkpoint.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocked_tools: Vec<String>,
     /// Serialized approval overrides restored from a heavy checkpoint.
@@ -1066,11 +1066,11 @@ fn recent_tools_from_context_trace(
     trace: Option<&super::session_workspace::ContextTraceSignal>,
 ) -> Vec<String> {
     let mut tools = Vec::new();
-    if let Some(selected_tools) = trace
-        .and_then(|signal| signal.tool_selection.as_ref())
-        .map(|selection| selection.selected_tools.iter().map(String::as_str))
+    if let Some(visible_tools) = trace
+        .and_then(|signal| signal.tool_surface.as_ref())
+        .map(|selection| selection.visible_tools.iter().map(String::as_str))
     {
-        append_unique_tools(&mut tools, selected_tools);
+        append_unique_tools(&mut tools, visible_tools);
     }
     tools
 }
@@ -1940,9 +1940,9 @@ impl crate::state_sync::MatrixOneSyncService {
         .bind(None::<String>)
         .bind(
             signal
-                .tool_selection
+                .tool_surface
                 .as_ref()
-                .and_then(|selection| selection.selected_tools.first().cloned()),
+                .and_then(|selection| selection.visible_tools.first().cloned()),
         )
         .bind(duration_ms)
         .execute(&self.pool)
@@ -2243,7 +2243,7 @@ mod tests {
             turn_count: 15,
             total_tokens_in: 5000,
             total_tokens_out: 3000,
-            recent_tools: vec!["git_status".into(), "grep".into()],
+            recent_tools: vec!["git".into(), "grep".into()],
             checkpoint_count: 3,
             last_status: "active".into(),
             git_branch: Some("main".into()),
@@ -2355,7 +2355,7 @@ mod tests {
         assert_eq!(restored.turn_count, 1);
         assert_eq!(restored.total_tokens_in, 33_659);
         assert_eq!(restored.total_tokens_out, 2_855);
-        assert_eq!(restored.recent_tools, vec!["git_show", "read_file", "grep"]);
+        assert_eq!(restored.recent_tools, vec!["git", "read_file", "grep"]);
         assert_eq!(restored.model.as_deref(), Some("glm-5.1"));
         assert_eq!(restored.last_status, "completed");
         assert!(!restored.restored_from_cloud);
@@ -2380,7 +2380,7 @@ mod tests {
             .unwrap()
             .expect("workspace-backed session should restore");
 
-        assert_eq!(restored.recent_tools, vec!["git_show", "read_file", "grep"]);
+        assert_eq!(restored.recent_tools, vec!["git", "read_file", "grep"]);
         assert_eq!(restored.turn_count, 1);
         assert_eq!(restored.total_tokens_in, 33_659);
         assert_eq!(restored.total_tokens_out, 2_855);
@@ -2970,9 +2970,7 @@ mod tests {
             "model": "gpt-5.4",
             "last_context_trace": {
                 "turn_id": "turn-9",
-                "selected_tools": ["lsp", "view"],
-                "selection_strategy": "code-intel",
-                "selection_confidence": 0.93,
+                "visible_tools": ["lsp", "view"],
                 "memory_query": "resume trace persistence",
                 "memories_selected": 2,
                 "compressed_turns": 1,
@@ -3214,17 +3212,14 @@ mod tests {
     }
 
     #[test]
-    fn recent_tools_from_context_trace_uses_selected_tools() {
+    fn recent_tools_from_context_trace_uses_visible_tools() {
         let trace = session_workspace::ContextTraceSignal {
             turn_id: "turn-7".into(),
             captured_at: None,
-            tool_selection: Some(session_workspace::ContextTraceToolSelection {
+            tool_surface: Some(session_workspace::ContextTraceToolSurface {
                 tools_available: 8,
-                selected_tools: vec!["bash".into(), "grep".into(), "bash".into()],
-                selection_scope: "latest_round".into(),
-                rejected_tools: 0,
-                strategy: "recent_tools".into(),
-                confidence: 0.91,
+                visible_tools: vec!["bash".into(), "grep".into(), "bash".into()],
+                surface_scope: "latest_round".into(),
                 latency_ms: 12,
             }),
             memory: None,

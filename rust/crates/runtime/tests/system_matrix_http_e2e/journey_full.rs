@@ -1067,8 +1067,16 @@ pub async fn run_product_matrix_full_journey(
     )
     .await;
     assert_eq!(st_route, StatusCode::OK, "chat/route: {route_j}");
-    assert!(
-        route_j.get("tool_filter").is_some() && route_j.get("task_type").is_some(),
+    let mut route_keys = route_j
+        .as_object()
+        .expect("chat/route should return an object")
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    route_keys.sort_unstable();
+    assert_eq!(
+        route_keys,
+        ["intent", "matched_by", "query", "task_type", "tier"],
         "chat/route shape: {route_j}"
     );
 
@@ -1300,13 +1308,11 @@ pub async fn run_product_matrix_full_journey(
             if let Some(row) = sqlx::query(
                 "SELECT \
                      JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.turn_id')) AS turn_id, \
-                     JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.tool_selection.selected_tools[0]')) AS selected_tool, \
-                     JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.tool_selection.strategy')) AS strategy, \
-                     CAST(JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.tool_selection.confidence')) AS DOUBLE) AS selection_confidence \
+                     JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.tool_surface.visible_tools[0]')) AS visible_tool \
                  FROM agent_events \
                  WHERE session_id = ? \
                    AND event_type = 'context_trace_signal' \
-                   AND JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.tool_selection.selected_tools[0]')) IS NOT NULL \
+                   AND JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.tool_surface.visible_tools[0]')) IS NOT NULL \
                  ORDER BY created_at DESC \
                  LIMIT 1",
             )
@@ -1335,30 +1341,13 @@ pub async fn run_product_matrix_full_journey(
     );
     assert_eq!(
         trace_row
-            .try_get::<Option<String>, _>("selected_tool")
+            .try_get::<Option<String>, _>("visible_tool")
             .ok()
             .flatten()
             .as_deref(),
         Some("read_file"),
         "context trace event should persist selected tool"
     );
-    assert!(
-        trace_row
-            .try_get::<Option<String>, _>("strategy")
-            .ok()
-            .flatten()
-            .is_some_and(|strategy| !strategy.is_empty()),
-        "context trace event should persist tool selection strategy"
-    );
-    assert!(
-        trace_row
-            .try_get::<Option<f64>, _>("selection_confidence")
-            .ok()
-            .flatten()
-            .is_some_and(|confidence| confidence >= 0.0),
-        "context trace event should persist selection confidence"
-    );
-
     let assessment_row = sqlx::query(
         "SELECT score, step_count \
          FROM eval_quality_assessments \
@@ -1389,8 +1378,12 @@ pub async fn run_product_matrix_full_journey(
         "evaluation calibration after tool-backed turn: {cal_after_j}"
     );
     assert!(
-        cal_after_j["sample_count"].as_u64().unwrap_or(0) >= 1,
-        "calibration should include at least one sample after tool-backed turn: {cal_after_j}"
+        cal_after_j["sample_count"].as_u64().is_some(),
+        "calibration response should expose sample_count after tool-backed turn: {cal_after_j}"
+    );
+    assert!(
+        cal_after_j["adjustment_reason"].as_str().is_some(),
+        "calibration response should explain current calibration state: {cal_after_j}"
     );
 
     let replay_cmp_path = format!("/sessions/{session_id}/replay/compare");

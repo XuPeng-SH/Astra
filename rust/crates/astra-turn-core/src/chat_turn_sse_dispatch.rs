@@ -1628,7 +1628,7 @@ mod tests {
         dispatch_chat_turn_sse_event_block(
             &sse(
                 "tool_call_start",
-                ",\"call_id\":\"tc-1\",\"tool\":\"git_log\",\"arguments\":\"{\\\"n\"",
+                ",\"call_id\":\"tc-1\",\"tool\":\"git\",\"arguments\":\"{\\\"action\\\":\\\"log\\\",\\\"n\"",
             ),
             &mut a,
             &mut p,
@@ -1639,7 +1639,7 @@ mod tests {
         dispatch_chat_turn_sse_event_block(
             &sse(
                 "tool_call",
-                ",\"id\":\"tc-1\",\"name\":\"git_log\",\"arguments\":{\"n\":5}",
+                ",\"id\":\"tc-1\",\"name\":\"git\",\"arguments\":{\"action\":\"log\",\"n\":5}",
             ),
             &mut a,
             &mut p,
@@ -1653,7 +1653,7 @@ mod tests {
         assert_eq!(a.tool_calls[0]["id"].as_str(), Some("tc-1"));
         assert_eq!(
             a.tool_calls[0]["function"]["arguments"].as_str(),
-            Some("{\"n\":5}")
+            Some("{\"action\":\"log\",\"n\":5}")
         );
         assert_eq!(a.tool_call_id_index.get("tc-1"), Some(&0));
     }

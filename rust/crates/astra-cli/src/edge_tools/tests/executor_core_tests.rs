@@ -42,39 +42,78 @@ async fn execute_unknown_tool_returns_error() {
 }
 
 #[tokio::test]
-async fn retired_git_github_helper_aliases_are_unknown_on_cli_edge_executor() {
+async fn git_github_helper_style_names_are_unknown_on_cli_edge_executor() {
     let executor = test_executor();
 
-    for name in [
-        "git_status",
-        "git_diff",
-        "git_log",
-        "git_show",
-        "git_blame",
-        "git_file_history",
-        "git_log_search",
-        "git_contributors",
-        "git_commit",
-        "git_revert_commit",
-        "git_stash",
-        "git_checkout_file",
-        "git_worktree",
-        "github_list_prs",
-        "github_get_pr",
-        "github_ci_status",
-        "github_list_issues",
-        "github_get_issue",
-        "github_repo_stats",
-        "github_create_issue",
-    ] {
-        let result = executor.execute(name, &json!({})).await;
+    let git_actions = [
+        "status",
+        "diff",
+        "log",
+        "show",
+        "blame",
+        "file_history",
+        "log_search",
+        "contributors",
+        "commit",
+        "revert_commit",
+        "stash",
+        "checkout_file",
+        "worktree",
+    ];
+    let github_actions = [
+        "list_prs",
+        "get_pr",
+        "ci_status",
+        "list_issues",
+        "get_issue",
+        "repo_stats",
+        "create_issue",
+    ];
+
+    for name in git_actions
+        .into_iter()
+        .map(|action| format!("git_{action}"))
+        .chain(
+            github_actions
+                .into_iter()
+                .map(|action| format!("github_{action}")),
+        )
+    {
+        let result = executor.execute(&name, &json!({})).await;
         assert!(result.starts_with("Error:"), "{name}: {result}");
         assert!(result.contains("not available"), "{name}: {result}");
     }
 }
 
 #[tokio::test]
-async fn consolidated_github_create_issue_error_does_not_leak_retired_alias() {
+async fn unsupported_session_state_actions_are_rejected_on_cli_edge_executor() {
+    let executor = test_executor();
+
+    for action in [
+        "configure_later",
+        "wait_until",
+        "restore_context",
+        "questionnaire",
+        "rollback_edits",
+        "timeline",
+        "summary",
+        "history",
+    ] {
+        let result = executor
+            .execute("session", &json!({"action": action}))
+            .await;
+        assert!(result.starts_with("Error:"), "{action}: {result}");
+        assert!(
+            result.contains("unknown `session` action")
+                && result.contains("history_page")
+                && result.contains("rollback_session_state"),
+            "{action}: {result}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn consolidated_github_create_issue_error_does_not_leak_helper_style_name() {
     let executor = test_executor();
 
     let result = executor
@@ -88,7 +127,7 @@ async fn consolidated_github_create_issue_error_does_not_leak_retired_alias() {
         )
         .await;
 
-    assert!(!result.contains("github_create_issue"), "{result}");
+    assert!(!result.contains("github_"), "{result}");
     let parsed: serde_json::Value = serde_json::from_str(&result).expect("github error json");
     assert_eq!(parsed["ok"], false);
     assert_eq!(parsed["tool"], "github");
@@ -100,22 +139,18 @@ async fn consolidated_github_create_issue_error_does_not_leak_retired_alias() {
     );
 }
 
-/// Standalone `delegate` tool (the engine-managed delegation flow).
-/// In server mode the runtime intercepts this call upstream in
-/// `agentic_delegate_interception.rs` and runs real sub-agents — the
-/// executor placeholder is only seen if interception was bypassed.
-/// CLI mode wires no engine, but the tool name is reserved for
-/// server-mode parity. Keep the deferred-acknowledgement contract
-/// here; the broken path was the OTHER one (agent action='delegate'),
-/// which is now removed entirely.
+/// Standalone `delegate` is not a CLI executor tool. Server/runtime
+/// interception must happen before local tool execution; if it reaches
+/// this executor, it must fail closed.
 #[tokio::test]
-async fn execute_delegate_tool_returns_deferred_acknowledgment_for_interception_fallback() {
+async fn execute_delegate_tool_does_not_return_fake_acknowledgment() {
     let executor = test_executor();
     let result = executor.execute("delegate", &json!({})).await;
     assert!(
-        result.contains("Delegation request acknowledged"),
-        "got: {result}"
+        result.starts_with("Error"),
+        "delegate must fail closed in the CLI executor: {result}"
     );
+    assert!(!result.contains("acknowledged"), "got: {result}");
 }
 
 #[tokio::test]
@@ -152,14 +187,93 @@ async fn execute_with_metadata_marks_structured_str_replace_failure_as_error() {
     );
 }
 
-/// REGRESSION: the consolidated `agent` tool MUST NOT accept
-/// `action='delegate'`. The CLI never wires a delegation engine, and
-/// `agentic_delegate_interception` only intercepts calls whose tool
-/// NAME is "delegate" — it ignores `agent(action='delegate')`. So the
-/// old executor branch returned a "Delegation request acknowledged"
-/// string while spawning nothing, and the model believed it had queued
-/// real sub-agents. Bug observed: session f3c4b457-... shipped 5 fake
-/// "Task done Delegating" rows in 0 ms each.
+#[tokio::test]
+async fn execute_with_metadata_bash_non_zero_exit_is_structured_failure() {
+    let executor = test_executor();
+    let outcome = executor
+        .execute_with_metadata_cancelable("bash", &json!({"command": "exit 7"}), None)
+        .await;
+
+    assert!(outcome.is_error, "{outcome:?}");
+    let fields = outcome.tool_result_fields.expect("metadata fields");
+    assert_eq!(
+        fields.get("exit_code").and_then(serde_json::Value::as_i64),
+        Some(7)
+    );
+    assert_eq!(
+        fields
+            .get("exit_semantics")
+            .and_then(serde_json::Value::as_str),
+        Some("execution_error")
+    );
+    assert_eq!(
+        fields
+            .get("result_class")
+            .and_then(serde_json::Value::as_str),
+        Some("execution_error")
+    );
+}
+
+#[tokio::test]
+async fn execute_with_metadata_bash_non_zero_exit_preserves_structured_failure() {
+    let executor = test_executor();
+    let outcome = executor
+        .execute_with_metadata("bash", &json!({"command": "exit 7"}))
+        .await;
+
+    assert!(outcome.is_error, "{outcome:?}");
+    let fields = outcome.tool_result_fields.expect("metadata fields");
+    assert_eq!(
+        fields.get("exit_code").and_then(serde_json::Value::as_i64),
+        Some(7)
+    );
+    assert_eq!(
+        fields
+            .get("exit_semantics")
+            .and_then(serde_json::Value::as_str),
+        Some("execution_error")
+    );
+    assert_eq!(
+        fields
+            .get("result_class")
+            .and_then(serde_json::Value::as_str),
+        Some("execution_error")
+    );
+}
+
+#[tokio::test]
+async fn execute_with_metadata_bash_empty_result_is_structured_non_error() {
+    let executor = test_executor();
+    let outcome = executor
+        .execute_with_metadata_cancelable(
+            "bash",
+            &json!({"command": "printf 'abc\\n' | grep ZZZ_NO_MATCH"}),
+            None,
+        )
+        .await;
+
+    assert!(!outcome.is_error, "{outcome:?}");
+    let fields = outcome.tool_result_fields.expect("metadata fields");
+    assert_eq!(
+        fields.get("exit_code").and_then(serde_json::Value::as_i64),
+        Some(1)
+    );
+    assert_eq!(
+        fields
+            .get("exit_semantics")
+            .and_then(serde_json::Value::as_str),
+        Some("empty_result")
+    );
+    assert_eq!(
+        fields
+            .get("result_class")
+            .and_then(serde_json::Value::as_str),
+        Some("empty_result")
+    );
+}
+
+/// REGRESSION: the consolidated `agent` tool must reject the blocked
+/// delegate action instead of returning a successful placeholder.
 ///
 /// The fix is twofold: (1) the schema enum drops "delegate" so the
 /// model can't pick it, and (2) defence-in-depth — the executor
@@ -178,20 +292,18 @@ async fn agent_action_delegate_is_rejected_with_redirect_to_spawn() {
         .await;
     assert!(
         result.starts_with("Error"),
-        "agent.delegate must return an Error: prefix so the TUI renders \
+        "blocked delegate action must return an Error: prefix so the TUI renders \
          it as a failure (red banner), not as a normal tool result. Got: {result}"
     );
     assert!(
         result.contains("spawn"),
-        "agent.delegate's error must name the `agent` spawn action as the \
+        "blocked delegate action error must name the `agent` spawn action as the \
          alternative — without that, the model has no path to recovery. \
          Got: {result}"
     );
     assert!(
-        !result.contains("Delegation request acknowledged"),
-        "the old fake-success placeholder must be gone — its presence \
-         is what tricked the model into believing 5 sub-agents were \
-         queued when none had spawned. Got: {result}"
+        !result.contains("acknowledged"),
+        "delegate-shaped calls must not return success-style placeholder text. Got: {result}"
     );
     // End-to-end UX assertion: the Error: prefix must classify through
     // tool_result_semantics::is_tool_error → cloud_tool_result_status_label
@@ -271,7 +383,6 @@ async fn task_background_actions_are_plain_unknown_task_actions() {
             result.contains("unknown `task` action") && result.contains(action),
             "task.{action} must be rejected by the ordinary unknown-action path. Got: {result}"
         );
-        assert!(!result.contains("agent_job(action='"), "{result}");
         assert!(
             astra_turn_core::tool_result_semantics::is_tool_error(&result),
             "task.{action} rejection must classify as an error so cloud \
@@ -1051,24 +1162,6 @@ async fn typed_background_task_tools_dispatch_through_executor() {
     );
 }
 
-#[tokio::test]
-async fn removed_background_job_aliases_are_unknown_tools() {
-    let executor = test_executor();
-    for name in ["job", "agent_job"] {
-        let result = executor.execute(name, &json!({})).await;
-        assert!(
-            result.contains("Unknown tool")
-                || result.contains("unknown")
-                || result.contains("not available"),
-            "{name} must not remain executable as a background-task alias. Got: {result}"
-        );
-        assert!(
-            !result.contains("interactive REPL") && !result.contains("task_output"),
-            "{name} must not route through removed background-task compatibility guidance. Got: {result}"
-        );
-    }
-}
-
 /// The `agent` tool's action enum must NOT advertise "delegate" to
 /// the model. Schema-level removal is the strongest signal — the
 /// model cannot even shape-validly emit a call the runtime would
@@ -1127,7 +1220,7 @@ async fn execute_reflect_uses_local_surface_with_session() {
     ws.last_context_trace = Some(ContextTraceSignal {
         turn_id: "turn-3".to_string(),
         captured_at: Some(Utc::now().to_rfc3339()),
-        tool_selection: None,
+        tool_surface: None,
         memory: None,
         history: None,
         budget: Some(
@@ -1163,7 +1256,7 @@ async fn execute_reflect_uses_local_surface_with_session() {
             config_value: None,
             turns_compacted: None,
             facts_stored: None,
-            tools_selected: Some(vec!["bash".to_string()]),
+            visible_tools: Some(vec!["bash".to_string()]),
             selected_skills: None,
             tools_used: Some(vec!["bash".to_string()]),
             tool_calls: Some(vec![session_journal::ToolCallRecord {
@@ -1193,7 +1286,6 @@ async fn execute_reflect_uses_local_surface_with_session() {
             session_lineage: None,
             coordination: None,
             edge_policy: None,
-            selection_trace: None,
             context_assembly_trace: None,
             routing_domain_hint: None,
             entity_learn_skipped_no_domain: false,

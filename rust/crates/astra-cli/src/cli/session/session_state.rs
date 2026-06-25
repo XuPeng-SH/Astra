@@ -11,7 +11,6 @@ use crate::cli::slash::slash_team;
 use crate::mcp_client;
 use astra_runtime::plan as runtime_plan;
 use astra_runtime::prompts;
-use astra_runtime::tool_registry;
 use astra_services::session_journal;
 use astra_turn_core::conversation_log::manager::CslManager;
 
@@ -279,8 +278,12 @@ pub(crate) struct SessionState {
     pub config_version_id: Option<String>,
     pub context_budget: prompts::ContextBudget,
     pub journal: Option<session_journal::JournalWriter>,
-    /// Tools used in the last turn — fed into selection for recency boost.
+    /// Most recent non-empty tool usage context — fed into tool-surface
+    /// continuity for short follow-up turns.
     pub recent_tools: Vec<String>,
+    /// Deferred tools selected with `tool_search(select:...)` but not yet
+    /// consumed by a visible tool call.
+    pub activated_deferred_tool_names: Vec<String>,
     /// Session-persistent permission manager — "always"/"skip" survives across turns.
     pub perm_manager: PermissionManager,
     /// User ID for event ingestion attribution.
@@ -291,10 +294,6 @@ pub(crate) struct SessionState {
     pub tool_health_entries: Vec<astra_turn_core::tool_health_persistence::ToolHealthEntry>,
     /// Last successfully synced tool health snapshot, used to compute deltas.
     pub synced_tool_health_entries: Vec<astra_turn_core::tool_health_persistence::ToolHealthEntry>,
-    /// Cross-session tool quality tracker so the REPL save path can export
-    /// cumulative per-tool selection/quality counters.
-    pub tool_quality_tracker:
-        Option<std::sync::Arc<std::sync::Mutex<tool_registry::ToolQualityTracker>>>,
     /// Local mirror of the cloud `plans` row when plan mode was
     /// entered through the cloud workflow (`/plan "goal"` or the
     /// `enter_plan_mode` tool against an authenticated cloud
@@ -350,12 +349,8 @@ pub(crate) struct SessionState {
     pub unified_skill_registry: std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
     /// Session-scoped skill quality tracker for learning loop.
     pub skill_quality_tracker: astra_skills::quality::SkillQualityTracker,
-    /// Session-scoped skill surfacing config for dynamic tuning.
-    pub skill_search: astra_core::SkillSearchSettings,
     /// Skill auto-improvement tracker — detects user corrections and proposes SKILL.md rewrites.
     pub skill_improvement_tracker: astra_skills::improvement::ImprovementTracker,
-    /// Skills pinned by the user — always included in budget (never truncated).
-    pub pinned_skills: std::collections::HashSet<String>,
     /// Skills surfaced by `discover_skills` during this CLI session.
     pub discovered_skills: std::collections::HashSet<String>,
     pub mcp_manager: std::sync::Arc<tokio::sync::RwLock<mcp_client::McpClientManager>>,
@@ -630,6 +625,7 @@ impl Default for SessionState {
             context_budget: prompts::ContextBudget::default(),
             journal: None,
             recent_tools: Vec::new(),
+            activated_deferred_tool_names: Vec::new(),
             perm_manager: PermissionManager::with_workspace_trust(
                 default_auto_approve_from_env(),
                 &std::env::current_dir().unwrap_or_default(),
@@ -638,7 +634,6 @@ impl Default for SessionState {
             task_service: None,
             tool_health_entries: Vec::new(),
             synced_tool_health_entries: Vec::new(),
-            tool_quality_tracker: None,
             cloud_plan_mirror: None,
             plan_mode_sync_error: None,
             executing_plan: None,
@@ -657,9 +652,7 @@ impl Default for SessionState {
             runtime_idempotency_cache: None,
             unified_skill_registry: astra_runtime::skills::default_unified_registry().clone(),
             skill_quality_tracker: astra_skills::quality::SkillQualityTracker::new(),
-            skill_search: astra_core::SkillSearchSettings::default(),
             skill_improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
-            pinned_skills: std::collections::HashSet::new(),
             discovered_skills: std::collections::HashSet::new(),
             mcp_manager: std::sync::Arc::new(tokio::sync::RwLock::new(
                 mcp_client::McpClientManager::new(),
@@ -813,6 +806,7 @@ impl SessionState {
         self.total_session_cost = 0.0;
         self.journal = None;
         self.recent_tools.clear();
+        self.activated_deferred_tool_names.clear();
         self.executing_plan = None;
         self.plan_execution_config = None;
         self.executing_plan_goal = None;
@@ -866,7 +860,6 @@ impl SessionState {
     pub fn reset_for_session_restore(&mut self) {
         self.reset_for_new_session();
         self.clear_session_id();
-        self.pinned_skills.clear();
         self.discovered_skills.clear();
     }
 
@@ -940,6 +933,7 @@ mod default_tests {
             total_cache_creation_tokens: 44,
             total_session_cost: 1.25,
             recent_tools: vec!["bash".into()],
+            activated_deferred_tool_names: vec!["write_file".into()],
             redo_stack: vec![("u".into(), "a".into(), 1)],
             resume_guidance: Some("resume".into()),
             resume_restricted_tools: vec!["read_file".into()],
@@ -988,6 +982,7 @@ mod default_tests {
         assert_eq!(state.total_cache_creation_tokens, 0);
         assert_eq!(state.total_session_cost, 0.0);
         assert!(state.recent_tools.is_empty());
+        assert!(state.activated_deferred_tool_names.is_empty());
         assert!(state.redo_stack.is_empty());
         assert!(state.resume_guidance.is_none());
         assert!(state.resume_restricted_tools.is_empty());
@@ -1013,7 +1008,6 @@ mod default_tests {
     #[test]
     fn reset_for_new_session_preserves_user_preferences() {
         let runtime_config = astra_config::runtime_config::RuntimeConfig::load();
-        let skill_search = astra_core::SkillSearchSettings::default();
         let mut state = SessionState {
             model: Some("gpt-5".into()),
             explain: ExplainMode::Verbose,
@@ -1025,7 +1019,6 @@ mod default_tests {
             max_budget_limit: 12.5,
             project_instructions: Some("follow repo policy".into()),
             runtime_config: runtime_config.clone(),
-            skill_search: skill_search.clone(),
             ..Default::default()
         };
 
@@ -1047,10 +1040,9 @@ mod default_tests {
             Some("follow repo policy")
         );
         assert_eq!(
-            serde_json::to_value(&state.runtime_config.tool_selection).unwrap(),
-            serde_json::to_value(&runtime_config.tool_selection).unwrap()
+            serde_json::to_value(&state.runtime_config.tool_policy).unwrap(),
+            serde_json::to_value(&runtime_config.tool_policy).unwrap()
         );
-        assert_eq!(state.skill_search, skill_search);
     }
 
     #[test]
@@ -1164,7 +1156,7 @@ mod default_tests {
             session_id: Some("sess-restore".into()),
             history: vec![("u".into(), "a".into())],
             recent_tools: vec!["bash".into()],
-            pinned_skills: ["skill-a".to_string()].into_iter().collect(),
+            activated_deferred_tool_names: vec!["write_file".into()],
             discovered_skills: ["skill-b".to_string()].into_iter().collect(),
             executing_plan_id: Some("plan-1".into()),
             plan_execution_last_error: Some("stale".into()),
@@ -1181,7 +1173,7 @@ mod default_tests {
         assert!(state.session_id.is_none());
         assert!(state.history.is_empty());
         assert!(state.recent_tools.is_empty());
-        assert!(state.pinned_skills.is_empty());
+        assert!(state.activated_deferred_tool_names.is_empty());
         assert!(state.discovered_skills.is_empty());
         assert!(state.executing_plan_id.is_none());
         assert!(state.plan_execution_last_error.is_none());

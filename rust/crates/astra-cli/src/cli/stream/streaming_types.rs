@@ -84,9 +84,9 @@ pub(crate) struct StreamResult {
     pub(crate) cache_read_tokens: u64,
     pub(crate) cache_creation_tokens: u64,
     pub(crate) tool_calls_count: u32,
-    /// Tool names selected for LLM (first turn selection report).
-    pub(crate) tools_selected: Vec<String>,
-    /// Skill names selected by the LLM during tool selection.
+    /// Tool names visible to the LLM (first turn surface report).
+    pub(crate) visible_tools: Vec<String>,
+    /// Skill names selected by the LLM during tool surface.
     pub(crate) selected_skills: Vec<String>,
     /// Tool names with material execution across all turns.
     pub(crate) tools_used: Vec<String>,
@@ -99,7 +99,7 @@ pub(crate) struct StreamResult {
     /// Stall events that occurred during the agentic loop (stall_type, turn_number).
     pub(crate) stall_events: Vec<(String, u32)>,
     /// TurnGuard verdict events (severity, turn, injections, avoid_tools, force_stop,
-    /// nudge_count, total_errors, deprioritized_count). Only non-Healthy verdicts.
+    /// nudge_count, total_errors, health_avoidance_count). Only non-Healthy verdicts.
     pub(crate) verdict_events: Vec<VerdictEvent>,
     /// Step Protocol recorder summary for debugging and audit.
     pub(crate) step_recorder_summary: Option<astra_pipeline::step_recorder::RecorderSummary>,
@@ -161,7 +161,7 @@ impl Default for StreamResult {
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
             tool_calls_count: 0,
-            tools_selected: vec![],
+            visible_tools: vec![],
             selected_skills: vec![],
             tools_used: vec![],
             tool_call_records: vec![],

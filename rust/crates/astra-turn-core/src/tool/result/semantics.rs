@@ -18,7 +18,10 @@ fn json_tool_result_is_error(result_str: &str) -> bool {
         }
         if let Some(status) = v.get("status").and_then(|s| s.as_str()) {
             return match status.trim().to_ascii_lowercase().as_str() {
-                "completed" | "skipped" => false,
+                "completed" | "complete" | "ok" | "success" | "succeeded" | "passed" | "done"
+                | "skipped" | "launched" | "pending" | "queued" | "in_progress" | "running"
+                | "still_running" | "processing" | "starting" | "waiting" | "waiting_for_input"
+                | "interrupted" => false,
                 "failed" | "partial_failure" | "denied" | "cancelled" | "canceled" | "timeout"
                 | "timed_out" => true,
                 _ => true,
@@ -72,9 +75,9 @@ pub fn tool_output_has_explicit_failure_signal(output: &str) -> bool {
 /// Determine whether a tool result string indicates an error.
 ///
 /// For structured JSON results (our tools), checks `"ok": false`, a non-null
-/// `"error"` field, or canonical `"status"` values. Unknown/legacy JSON
+/// `"error"` field, or canonical `"status"` values. Unknown JSON
 /// statuses fail closed. For plain-text results, accepts only stable tool
-/// failure contracts plus the legacy `Error:` prefix.
+/// failure contracts plus the `Error:` prefix used by current tools.
 pub fn is_tool_error(result_str: &str) -> bool {
     if tool_output_has_explicit_failure_signal(result_str) {
         return true;
@@ -119,9 +122,6 @@ pub const TOOL_SUCCESS_SENTINEL: &str = "<<<ASTRA_TOOL_OK>>>";
 /// 1. [`TOOL_SUCCESS_SENTINEL`] substring — the canonical contract.
 /// 2. Structured JSON success (`ok:true` / `success:true` /
 ///    `status: completed`).
-/// 3. Legacy prose prefixes (kept for backward compatibility with emitters
-///    not yet migrated to the sentinel; new mutation emitters MUST use the
-///    sentinel).
 ///
 /// This is deliberately narrower than "not an error". It exists for transport
 /// reconciliation: if edge metadata says failure but the body says a mutation
@@ -154,17 +154,7 @@ pub fn tool_output_has_explicit_success_signal(output: &str) -> bool {
         }
     }
 
-    // 3. Legacy prose prefixes. DO NOT extend this list; emit the sentinel
-    //    instead. These are kept only so emitters not yet migrated keep
-    //    working.
-    let lower = trimmed.to_ascii_lowercase();
-    lower.starts_with("replaced successfully")
-        || (lower.starts_with("applied ") && lower.contains(" edit(s) successfully"))
-        || lower.starts_with("created successfully")
-        || lower.starts_with("updated successfully")
-        || lower.starts_with("deleted successfully")
-        || lower.starts_with("saved successfully")
-        || lower.starts_with("completed successfully")
+    false
 }
 
 /// Canonical tri-state result of a tool execution.
@@ -237,8 +227,8 @@ const SOFT_ERROR_PATTERNS: &[&str] = &[
     // The canonical structured banner emitted by both
     // `astra-tools::fs_ops::str_replace_fail` and
     // `astra-cli::edge_tools::fs::str_replace_fail` is the primary
-    // sentinel; the legacy substrings below are kept for backward
-    // compatibility with older error strings still in flight.
+    // sentinel; the substrings below cover the current human-readable
+    // details that follow it.
     // Catch-all sentinel for any future str_replace failure variant. The specific
     // patterns above (old_str not found / must be unique / identical / no change)
     // already cover all current paths via short-circuit OR; this entry exists so
@@ -477,8 +467,22 @@ pub fn tool_dedup_signature(name: &str, args: &Value) -> String {
 }
 
 fn canonical_read_only_tool_signature(name: &str, args: &Value) -> Option<(String, Value)> {
-    if name == "git_diff" {
+    if name == "git"
+        && args
+            .get("action")
+            .and_then(Value::as_str)
+            .is_some_and(|action| action == "status")
+    {
+        return Some(("git".to_string(), serde_json::json!({"action": "status"})));
+    }
+    if name == "git"
+        && args
+            .get("action")
+            .and_then(Value::as_str)
+            .is_some_and(|action| action == "diff")
+    {
         let mut canonical = serde_json::Map::new();
+        canonical.insert("action".to_string(), Value::String("diff".to_string()));
         if args.get("staged").and_then(Value::as_bool).unwrap_or(false) {
             canonical.insert("staged".to_string(), Value::Bool(true));
         }
@@ -513,7 +517,7 @@ fn canonical_read_only_tool_signature(name: &str, args: &Value) -> Option<(Strin
         {
             canonical.insert("path".to_string(), Value::String(path));
         }
-        return Some(("git_diff".to_string(), Value::Object(canonical)));
+        return Some(("git".to_string(), Value::Object(canonical)));
     }
     if name != "bash" {
         return None;
@@ -531,20 +535,21 @@ fn canonical_read_only_tool_signature(name: &str, args: &Value) -> Option<(Strin
     }
     match parts.as_slice() {
         ["git", "status"] | ["git", "status", "--short"] | ["git", "status", "--porcelain"] => {
-            Some(("git_status".to_string(), serde_json::json!({})))
+            Some(("git".to_string(), serde_json::json!({"action": "status"})))
         }
-        ["git", "diff"] => Some(("git_diff".to_string(), serde_json::json!({}))),
+        ["git", "diff"] => Some(("git".to_string(), serde_json::json!({"action": "diff"}))),
         ["git", "diff", "--stat"] => Some((
-            "git_diff".to_string(),
-            serde_json::json!({"stat_only": true}),
+            "git".to_string(),
+            serde_json::json!({"action": "diff", "stat_only": true}),
         )),
-        ["git", "diff", "--cached"] | ["git", "diff", "--staged"] => {
-            Some(("git_diff".to_string(), serde_json::json!({"staged": true})))
-        }
-        ["git", "diff", "HEAD"] => Some(("git_diff".to_string(), serde_json::json!({}))),
+        ["git", "diff", "--cached"] | ["git", "diff", "--staged"] => Some((
+            "git".to_string(),
+            serde_json::json!({"action": "diff", "staged": true}),
+        )),
+        ["git", "diff", "HEAD"] => Some(("git".to_string(), serde_json::json!({"action": "diff"}))),
         ["git", "diff", "--", path] => Some((
-            "git_diff".to_string(),
-            serde_json::json!({"path": normalize_tool_arguments(&Value::String((*path).to_string()))}),
+            "git".to_string(),
+            serde_json::json!({"action": "diff", "path": normalize_tool_arguments(&Value::String((*path).to_string()))}),
         )),
         _ => None,
     }
@@ -557,13 +562,13 @@ mod tests {
 
     #[test]
     fn tool_error_success_with_null_error_is_not_error() {
-        let result = r#"{"ok":true,"tool":"github_list_prs","error":null,"count":6}"#;
+        let result = r#"{"ok":true,"tool":"github","action":"list_prs","error":null,"count":6}"#;
         assert!(!is_tool_error(result));
     }
 
     #[test]
     fn tool_error_ok_false_is_error() {
-        let result = r#"{"ok":false,"tool":"github_ci_status","error":"missing repo"}"#;
+        let result = r#"{"ok":false,"tool":"github","action":"ci_status","error":"missing repo"}"#;
         assert!(is_tool_error(result));
     }
 
@@ -625,11 +630,11 @@ mod tests {
 
     #[test]
     fn explicit_success_signal_detects_str_replace_bodies() {
-        assert!(tool_output_has_explicit_success_signal(
+        let body =
+            format!("Replaced successfully\n<<<ASTRA_UNIFIED_DIFF>>>\n{TOOL_SUCCESS_SENTINEL}");
+        assert!(tool_output_has_explicit_success_signal(&body));
+        assert!(!tool_output_has_explicit_success_signal(
             "Replaced successfully\n<<<ASTRA_UNIFIED_DIFF>>>"
-        ));
-        assert!(tool_output_has_explicit_success_signal(
-            "Applied 3 edit(s) successfully\n\n<<<ASTRA_UNIFIED_DIFF>>>"
         ));
         assert!(tool_output_has_explicit_success_signal(
             r#"{"ok":true,"status":"completed"}"#
@@ -643,12 +648,12 @@ mod tests {
     }
 
     #[test]
-    fn explicit_success_signal_rejects_legacy_status_aliases() {
+    fn explicit_success_signal_rejects_noncanonical_status_aliases() {
         for status in ["ok", "success", "succeeded", "complete", "passed"] {
             let body = format!(r#"{{"status":"{status}"}}"#);
             assert!(
                 !tool_output_has_explicit_success_signal(&body),
-                "legacy status alias {status:?} must not be an explicit success signal"
+                "noncanonical status alias {status:?} must not be an explicit success signal"
             );
         }
     }
@@ -698,14 +703,23 @@ mod tests {
     }
 
     #[test]
-    fn tool_error_rejects_legacy_status_aliases() {
+    fn tool_error_accepts_declared_success_status_aliases() {
         for status in ["ok", "success", "succeeded", "complete", "passed"] {
             let body = format!(r#"{{"status":"{status}","data":[]}}"#);
             assert!(
-                is_tool_error(&body),
-                "legacy status alias {status:?} must fail closed"
+                !is_tool_error(&body),
+                "declared success status alias {status:?} must not be treated as a tool failure"
             );
         }
+    }
+
+    #[test]
+    fn tool_error_rejects_unknown_statuses() {
+        let body = r#"{"status":"mystery","data":[]}"#;
+        assert!(
+            is_tool_error(body),
+            "unknown structured statuses must still fail closed"
+        );
     }
 
     #[test]
@@ -793,6 +807,30 @@ mod tests {
     #[test]
     fn is_tool_error_json_status_completed_not_error() {
         assert!(!is_tool_error(r#"{"status": "completed", "data": []}"#));
+    }
+
+    #[test]
+    fn agent_runtime_domain_statuses_are_not_tool_execution_failures() {
+        for status in [
+            "launched",
+            "still_running",
+            "waiting",
+            "interrupted",
+            "running",
+        ] {
+            let body = json!({
+                "status": status,
+                "agent_id": "reviewer@abc",
+                "finish_reason": "budget_exhausted",
+                "result": "partial review"
+            })
+            .to_string();
+            assert!(
+                !is_tool_error(&body),
+                "domain status {status} must not be classified as malformed tool execution: {body}"
+            );
+            assert_eq!(cloud_tool_result_status_label(&body), "completed");
+        }
     }
 
     #[test]
@@ -904,22 +942,25 @@ if let Err(e) = writeln!(file, "{line}") {
     }
 
     #[test]
-    fn tool_dedup_signature_canonicalizes_simple_bash_git_diff() {
+    fn tool_dedup_signature_canonicalizes_simple_bash_git_diff_command() {
         assert_eq!(
             tool_dedup_signature("bash", &json!({"command": "git diff"})),
-            tool_dedup_signature("git_diff", &json!({}))
+            tool_dedup_signature("git", &json!({"action": "diff"}))
         );
         assert_eq!(
             tool_dedup_signature("bash", &json!({"command": "git diff HEAD"})),
-            tool_dedup_signature("git_diff", &json!({}))
+            tool_dedup_signature("git", &json!({"action": "diff"}))
         );
         assert_eq!(
             tool_dedup_signature("bash", &json!({"command": "git --no-pager diff --stat"})),
-            tool_dedup_signature("git_diff", &json!({"stat_only": true}))
+            tool_dedup_signature("git", &json!({"action": "diff", "stat_only": true}))
         );
         assert_eq!(
             tool_dedup_signature("bash", &json!({"command": "git diff -- src/"})),
-            tool_dedup_signature("git_diff", &json!({"path": "src", "ref": "HEAD"}))
+            tool_dedup_signature(
+                "git",
+                &json!({"action": "diff", "path": "src", "ref": "HEAD"})
+            )
         );
     }
 
@@ -927,7 +968,7 @@ if let Err(e) = writeln!(file, "{line}") {
     fn tool_dedup_signature_does_not_canonicalize_compound_bash_commands() {
         assert_ne!(
             tool_dedup_signature("bash", &json!({"command": "git diff | head"})),
-            tool_dedup_signature("git_diff", &json!({}))
+            tool_dedup_signature("git", &json!({"action": "diff"}))
         );
     }
 

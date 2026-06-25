@@ -574,8 +574,6 @@ fn edge_tool_is_cacheable_read(tool: &str, args: &Value) -> bool {
             | "task"
             | "agent"
             | "mo_query"
-            | "mo_snapshot"
-            | "mo_branch"
     ) {
         return false;
     }
@@ -1555,7 +1553,7 @@ impl<'a> CliSseStreamHost<'a> {
 
         let rollback_output = self
             .executor
-            .rollback_turn_actions(&serde_json::json!({
+            .rollback_recorded_turn_mutations(&serde_json::json!({
                 "scope": "turn",
                 "turn_index": turn_index,
                 "file_after_sequence": file_checkpoint,
@@ -1571,7 +1569,7 @@ impl<'a> CliSseStreamHost<'a> {
                 serde_json::json!({
                     "ok": false,
                     "error": format!(
-                        "Failed to parse rollback_turn_actions output: {error}"
+                        "Failed to parse recorded turn rollback output: {error}"
                     ),
                     "raw_output": rollback_output,
                 })
@@ -3366,27 +3364,21 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         query,
                         &catalog,
                         std::collections::HashSet::new(),
-                        None,
                     );
                     text
                 } else {
                     "Error: skill resolver not available".to_string()
                 }
             } else if tool == astra_runtime::turn::agentic_loop::host::DELEGATE_TOOL_NAME {
-                // Delegate calls are intercepted at Step 3b of the agentic loop
-                // (partition_and_execute_delegations) where the delegation engine
-                // runs sub-agents. Return a deferred acknowledgment so the server
-                // sees a success (not an error) and the model doesn't give up.
-                //
-                // D-9 dedup guard: if a speculative execution was somehow started
-                // for this call_id, discard it so the delegation result wins.
+                // Delegate calls must be intercepted by the agentic runtime.
+                // If a standalone delegate reaches edge execution, fail closed
+                // instead of manufacturing a success result.
                 if let Some(exec) = self.streaming_tool_exec.clone() {
                     exec.discard(request_id).await;
                 }
-                "Delegation request acknowledged. The delegation engine will execute \
-                 this request now, the parent agent will pause while sub-agents \
-                 run and aggregate, and the summarized results will be injected \
-                 before the parent agent finishes."
+                "Error: delegate must be handled by the delegation runtime before \
+                 local tool execution. Use agent(action='spawn', description='...', \
+                 prompt='...', run_in_background=true) for direct agent spawning."
                     .to_string()
             } else if tool == astra_turn_core::interaction_types::ASK_USER_TOOL_NAME {
                 self.ask_user_via_tui(args).await
@@ -4078,7 +4070,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         // `ToolExecutor::execute_with_metadata` takes `&self` and is `Sync`; we run all
         // tool futures concurrently on the current runtime via `join_all`, each future
         // gated by a shared semaphore so at most `MAX_CONCURRENT_TOOL_EXECUTIONS` (10)
-        // run simultaneously. This matches claude-code / parallel_tool_exec semantics and
+        // run simultaneously. This matches reference-agent / parallel_tool_exec semantics and
         // prevents unbounded fan-out on large read-only batches (e.g., 30+ grep calls)
         // from saturating edge I/O or exhausting file descriptors.
         // Each future is wrapped with `catch_unwind` so a panicking tool is surfaced as
@@ -4244,7 +4236,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         // manager's check returns Allow (the shape PermissionMode::Auto
         // produces for `sandbox_expand:*`), widen the sandbox and
         // re-execute the tool. This closes the bug in session
-        // `3b7ac18f` where `cat ~/claudecode/*` was blocked 4 times in
+        // `3b7ac18f` where `cat ~/reference-agent/*` was blocked 4 times in
         // auto mode with no approval path.
         //
         // For NeedApproval and Deny we now route to the same approval
@@ -4751,7 +4743,7 @@ fn tool_output_has_platform_warning_banner(output: &str) -> bool {
 
 /// Tool completion icon: optional empty→warn (see below), platform banners, slow runs; else ok.
 ///
-/// **Empty stdout:** warn only for `read_file` / `view_file` / `bash` / `shell` — those should
+/// **Empty stdout:** warn only for `read_file` / `bash` / `shell` — those should
 /// normally return bytes. `grep` / `glob` often mean “nothing matched” or an edge empty payload
 /// while `status == ok`; that is **not** a warning.
 ///
@@ -4773,10 +4765,7 @@ fn tool_completion_icon(
 
     let trimmed = output.trim();
 
-    let warn_if_empty_ok_status = matches!(
-        tool,
-        "read_file" | "view_file" | "bash" | "shell" | "shell_exec"
-    );
+    let warn_if_empty_ok_status = matches!(tool, "read_file" | "bash" | "shell" | "shell_exec");
     if warn_if_empty_ok_status && trimmed.is_empty() {
         return (theme::icon_warn(), true);
     }
@@ -5282,7 +5271,7 @@ impl StreamRenderState {
                     pluralize_with_count(meaningful_count, "line", "lines")
                 )))
             }
-            "read_file" | "view_file" => {
+            "read_file" => {
                 // Only skip our metadata lines, not code that happens to start with '['
                 let is_metadata = |l: &&str| {
                     str_starts_with_any_prefix(l, READ_FILE_METADATA_PREFIXES)
@@ -5770,7 +5759,7 @@ pub(crate) fn style_tool_description(tool: &str, description: &str) -> String {
     }
 
     match tool {
-        "read_file" | "view_file" => {
+        "read_file" => {
             if let Some(s) = style_first_matching_prefix(description, &["Reading: "]) {
                 return s;
             }
@@ -6133,7 +6122,7 @@ pub(crate) fn format_tool_display_from_preview(name: &str, args_preview: Option<
     match name {
         "bash" | "shell_exec" | "run_build_test" => format!("$ {preview}"),
         "powershell" => format!("PS> {preview}"),
-        "read_file" | "view_file" => format!("Reading: {preview}"),
+        "read_file" => format!("Reading: {preview}"),
         "write_file" => format!("Writing: {preview}"),
         "str_replace" | "multi_edit" => format!("Editing: {preview}"),
         "delete_file" => format!("Deleting: {preview}"),
@@ -6165,7 +6154,6 @@ pub(crate) fn format_tool_display_from_preview(name: &str, args_preview: Option<
         "web_search" => format!("Searching web: \"{preview}\""),
         "github" => format!("GitHub: {preview}"),
         "session" => format!("Session: {preview}"),
-        "mo" => format!("MO: {preview}"),
         "agent" => {
             if is_agent_control_preview(preview) {
                 preview.to_string()
@@ -6180,7 +6168,6 @@ pub(crate) fn format_tool_display_from_preview(name: &str, args_preview: Option<
         "run_chain" => format!("Running chain: {preview}"),
         "rollback_file_edits" => format!("Revert file edits: {preview}"),
         "rollback_database_snapshots" => format!("Revert DB snapshots: {preview}"),
-        "rollback_turn_actions" => format!("Rollback turn actions: {preview}"),
         "send_message" => format!("Send message: {preview}"),
         "diagnose" => format!("Diagnose: {preview}"),
         "env" => format!("Env: {preview}"),
@@ -6190,9 +6177,6 @@ pub(crate) fn format_tool_display_from_preview(name: &str, args_preview: Option<
         "share_context" => format!("Share context: {preview}"),
         "query_context" => format!("Query context: {preview}"),
         "adjust_config" => format!("Adjust config: {preview}"),
-        "prioritize_tool" => format!("Prioritize tool: {preview}"),
-        "deprioritize_tool" => format!("Deprioritize tool: {preview}"),
-        "set_goal" => format!("Set goal: \"{preview}\""),
         "compress_context" => format!("Compress context: {preview}"),
         "rollback_session_state" => format!("Rollback session state: {preview}"),
         "ask_user" => format!("Asking user: \"{preview}\""),
@@ -6202,8 +6186,6 @@ pub(crate) fn format_tool_display_from_preview(name: &str, args_preview: Option<
         "exit_plan_mode" => "Exit plan mode".to_string(),
         "task" => format_task_display_from_preview(preview),
         "mo_query" => format!("MatrixOne query: \"{preview}\""),
-        "mo_snapshot" => format!("MatrixOne snapshot: {preview}"),
-        "mo_branch" => format!("MatrixOne branch: {preview}"),
         // `memory` is action-aware; when we only have the preview string (not the
         // parsed args), surface it generically. Callers that have the full args
         // object should use the richer `format_tool_description_with_output`
@@ -8266,10 +8248,6 @@ mod tests {
             format_tool_display_from_preview("rollback_database_snapshots", Some("snap_123")),
             "Revert DB snapshots: snap_123"
         );
-        assert_eq!(
-            format_tool_display_from_preview("rollback_turn_actions", Some("turn 7")),
-            "Rollback turn actions: turn 7"
-        );
         // task
         assert_eq!(
             format_tool_display_from_preview("task", Some("create \"Fix renderer drift\"")),
@@ -8306,14 +8284,6 @@ mod tests {
         assert_eq!(
             format_tool_display_from_preview("mo_query", Some("select * from users")),
             "MatrixOne query: \"select * from users\""
-        );
-        assert_eq!(
-            format_tool_display_from_preview("mo_snapshot", Some("create pre-migration")),
-            "MatrixOne snapshot: create pre-migration"
-        );
-        assert_eq!(
-            format_tool_display_from_preview("mo_branch", Some("create exp-a")),
-            "MatrixOne branch: create exp-a"
         );
         // code navigation
         assert_eq!(
@@ -8371,6 +8341,22 @@ mod tests {
             is_error: true,
         };
         assert_eq!(edge_tool_outcome_status(&outcome), "failed");
+    }
+
+    #[test]
+    fn edge_tool_outcome_status_keeps_agent_interrupted_as_completed_tool_call() {
+        let outcome = crate::edge_tools::ToolExecutionOutcome {
+            output: serde_json::json!({
+                "status": "interrupted",
+                "finish_reason": "budget_exhausted",
+                "result": "partial review"
+            })
+            .to_string(),
+            tool_result_fields: None,
+            is_error: false,
+        };
+
+        assert_eq!(edge_tool_outcome_status(&outcome), "completed");
     }
     // ── Skill/MCP output summary tests ──
 

@@ -6,11 +6,10 @@
 //! 3. `IntentDisambiguation` — conflict detection between signals
 //!
 //! `RoutingDecision` replaces these with a single analysis that produces:
-//! - Typed task classification (7 types vs. 3)
+//! - Typed task classification (8 types vs. 3)
 //! - Memory-augmented domain detection
 //! - Unified confidence score (signals + task clarity + memory hints)
-//! - Tool filter strategy (Wide / Domain / Minimal)
-//! - Round budget estimation from task complexity
+//! - Expected round count from task complexity
 //!
 //! # Usage
 //!
@@ -29,9 +28,7 @@ use crate::routing_metrics::{DisambiguationAction, IntentDisambiguation};
 use crate::tool::registry::state::ConversationState;
 
 // Re-export core types from astra-pipeline
-pub use astra_pipeline::routing::{
-    CalibrationAxis, DomainHint, TaskType, ToolFilter, domain_hint_to_label,
-};
+pub use astra_pipeline::routing::{CalibrationAxis, DomainHint, TaskType, domain_hint_to_label};
 
 // ─── RoutingDecision ─────────────────────────────────────────────────────────
 
@@ -50,16 +47,13 @@ pub struct RoutingDecision {
     /// Domain detected from signals + memory.
     pub domain_hint: Option<DomainHint>,
 
-    /// Memory-derived boost terms for TF-IDF scoring.
+    /// Memory-derived boost terms for routing analysis.
     pub boost_terms: Vec<String>,
 
     /// Unified confidence (0.0 = completely uncertain, 1.0 = very confident).
     pub confidence: f64,
 
-    /// Recommended tool selection strategy.
-    pub tool_filter: ToolFilter,
-
-    /// Estimated round budget based on task complexity.
+    /// Estimated round count based on task complexity.
     pub estimated_rounds: u32,
 
     /// Disambiguation result (from embedded IntentDisambiguation).
@@ -314,63 +308,9 @@ fn compute_routing_confidence(
     conf.clamp(0.0, 1.0)
 }
 
-// ─── Tool Filter ─────────────────────────────────────────────────────────────
-
-/// Determine tool selection strategy from routing analysis.
-fn determine_tool_filter(
-    signals: &ConversationState,
-    disambiguation: &DisambiguationAction,
-    domain_hint: &Option<DomainHint>,
-    confidence: f64,
-) -> ToolFilter {
-    // Low confidence → wide selection
-    if confidence < 0.3 {
-        return ToolFilter::Wide;
-    }
-
-    // Strong conflict → wide
-    if *disambiguation == DisambiguationAction::WidenToolSelection {
-        return ToolFilter::Wide;
-    }
-
-    // Conversational with no action signals → minimal
-    if signals.is_conversational && signals.signal_count() == 0 {
-        return ToolFilter::Minimal;
-    }
-
-    // Domain hint → focused selection
-    if let Some(domain) = domain_hint {
-        let categories = match domain {
-            DomainHint::GitHub => vec!["github".into(), "git".into()],
-            DomainHint::Git => vec!["git".into()],
-            DomainHint::Code => vec!["code".into(), "file".into()],
-            DomainHint::Memory => vec!["memory".into()],
-            DomainHint::Web => vec!["web".into()],
-            DomainHint::System => vec!["system".into()],
-            DomainHint::Database => vec!["database".into(), "sql".into(), "matrixone".into()],
-        };
-        return ToolFilter::Domain(categories);
-    }
-
-    // Signal-based domains
-    let mut domains = Vec::new();
-    if signals.is_github {
-        domains.push("github".into());
-    }
-    if signals.is_git {
-        domains.push("git".into());
-    }
-
-    if domains.is_empty() {
-        ToolFilter::Wide
-    } else {
-        ToolFilter::Domain(domains)
-    }
-}
-
 // ─── Round Estimation ────────────────────────────────────────────────────────
 
-/// Estimate round budget from task complexity.
+/// Estimate expected rounds from task complexity.
 fn estimate_rounds(task_type: &TaskType, confidence: f64) -> u32 {
     let base = match task_type {
         TaskType::Conversational => 1,
@@ -447,15 +387,7 @@ impl RoutingEngine {
             &disambiguation,
         );
 
-        // 6. Determine tool filter
-        let tool_filter = determine_tool_filter(
-            &conversation_state,
-            &disambiguation.recommendation,
-            &domain_hint,
-            confidence,
-        );
-
-        // 7. Estimate rounds
+        // 6. Estimate rounds
         let estimated_rounds = estimate_rounds(&task_type, confidence);
 
         RoutingDecision {
@@ -465,7 +397,6 @@ impl RoutingEngine {
             domain_hint,
             boost_terms,
             confidence,
-            tool_filter,
             estimated_rounds,
             disambiguation,
         }
@@ -569,15 +500,14 @@ mod tests {
 
     #[test]
     fn short_followup_does_not_inherit_fetch_from_recent_github_tools() {
-        let d = analyze_with_recent("pr呢？", 2, &["github_ci_status"]);
+        let d = analyze_with_recent("pr呢？", 2, &["github"]);
         assert_eq!(d.task_type, TaskType::Unknown);
         assert_eq!(d.domain_hint, Some(DomainHint::GitHub));
-        assert_eq!(d.tool_filter, ToolFilter::Wide);
     }
 
     #[test]
     fn short_fetch_without_domain_does_not_inherit_recent_github_tools() {
-        let d = analyze_with_recent("最新的", 2, &["github_ci_status"]);
+        let d = analyze_with_recent("最新的", 2, &["github"]);
         assert_eq!(d.task_type, TaskType::Fetch);
         assert_eq!(d.domain_hint, None);
     }
@@ -637,31 +567,6 @@ mod tests {
     fn domain_code_from_memory() {
         let d = analyze_with_memory("improve webhook capability", &["rust code workspace"]);
         assert_eq!(d.domain_hint, Some(DomainHint::Code));
-    }
-
-    // ── Tool Filter Strategy ─────────────────────────────────────────────
-
-    #[test]
-    fn filter_wide_for_low_confidence() {
-        let d = analyze("matrixorigin");
-        assert_eq!(d.tool_filter, ToolFilter::Wide);
-    }
-
-    #[test]
-    fn filter_domain_for_github() {
-        let d = analyze("list the open PRs on GitHub");
-        match &d.tool_filter {
-            ToolFilter::Domain(domains) => {
-                assert!(domains.contains(&"github".to_string()));
-            }
-            other => panic!("Expected Domain filter, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn filter_minimal_for_greeting() {
-        let d = analyze("hello");
-        assert_eq!(d.tool_filter, ToolFilter::Minimal);
     }
 
     // ── Round Estimation ─────────────────────────────────────────────────
@@ -756,7 +661,7 @@ mod tests {
         assert!(d.disambiguation.conflict_score > 0.5);
         assert_eq!(
             d.disambiguation.recommendation,
-            DisambiguationAction::WidenToolSelection,
+            DisambiguationAction::WidenToolSurface,
         );
     }
 

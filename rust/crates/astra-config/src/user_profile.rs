@@ -3,7 +3,7 @@
 //! Provides per-user preferences, learned patterns, and scenario detection.
 //!
 //! Key features:
-//! - User preferences (verbosity, tools, language style)
+//! - User preferences (verbosity, language style, explicit tool blocks)
 //! - Scenario detection (code review, debugging, exploration, planning)
 //! - Config overrides per user
 //! - A/B experiment enrollment
@@ -96,9 +96,6 @@ pub struct UserPreferences {
     /// Output verbosity level.
     pub verbosity: Verbosity,
 
-    /// Preferred tools (boost in selection).
-    pub preferred_tools: Vec<String>,
-
     /// Blocked tools (never select).
     pub blocked_tools: Vec<String>,
 
@@ -121,7 +118,6 @@ impl Default for UserPreferences {
     fn default() -> Self {
         Self {
             verbosity: Verbosity::Normal,
-            preferred_tools: Vec::new(),
             blocked_tools: Vec::new(),
             language_style: LanguageStyle::default(),
             response_length: ResponseLength::Medium,
@@ -139,13 +135,6 @@ impl UserPreferences {
         }
     }
 
-    /// Check if a tool is preferred.
-    pub fn is_preferred_tool(&self, tool_name: &str) -> bool {
-        self.preferred_tools
-            .iter()
-            .any(|t| t == tool_name || tool_name.starts_with(t))
-    }
-
     /// Check if a tool is blocked.
     pub fn is_blocked_tool(&self, tool_name: &str) -> bool {
         self.blocked_tools
@@ -157,21 +146,6 @@ impl UserPreferences {
 /// Apply a single config override based on key path.
 fn apply_preference_override(config: &mut RuntimeConfig, key: &str, value: &serde_json::Value) {
     match key {
-        "tool_selection.confidence_threshold" => {
-            if let Some(v) = value.as_f64() {
-                config.tool_selection.confidence_threshold = v;
-            }
-        }
-        "tool_selection.max_tools" => {
-            if let Some(v) = value.as_u64() {
-                config.tool_selection.max_tools = v as u32;
-            }
-        }
-        "tool_selection.tool_budget_tokens" => {
-            if let Some(v) = value.as_u64() {
-                config.tool_selection.tool_budget_tokens = (v as u32).clamp(0, 5000);
-            }
-        }
         "token_budget.max_prompt_tokens" => {
             if let Some(v) = value.as_u64() {
                 config.token_budget.max_prompt_tokens = v as u32;
@@ -460,20 +434,20 @@ pub enum TurnContinuationMode {
 }
 
 impl Scenario {
-    /// Get recommended tool preferences for this scenario.
-    pub fn recommended_tools(&self) -> Vec<&'static str> {
+    /// Get suggested tool labels for this scenario.
+    pub fn suggested_tools(&self) -> Vec<&'static str> {
         match self {
-            Scenario::CodeReview => vec!["view", "grep", "github-mcp-server-pull_request_read"],
-            Scenario::Debugging => vec!["bash", "view", "grep", "glob"],
-            Scenario::Exploration => vec!["glob", "grep", "view", "github-mcp-server-search_code"],
-            Scenario::Planning => vec!["view", "create", "sql"],
-            Scenario::Implementation => vec!["edit", "create", "bash", "view"],
-            Scenario::Refactoring => vec!["edit", "view", "grep", "bash"],
-            Scenario::Testing => vec!["bash", "view", "edit", "create"],
-            Scenario::Documentation => vec!["view", "edit", "create"],
-            Scenario::DevOps => vec!["bash", "view", "edit", "create"],
-            Scenario::Learning => vec!["view", "grep", "web_search"],
-            Scenario::QuickAnswer => vec!["view", "grep"],
+            Scenario::CodeReview => vec!["read_file", "grep", "github"],
+            Scenario::Debugging => vec!["bash", "read_file", "grep", "glob"],
+            Scenario::Exploration => vec!["glob", "grep", "read_file", "tool_search"],
+            Scenario::Planning => vec!["read_file", "write_file", "mo_query"],
+            Scenario::Implementation => vec!["str_replace", "write_file", "bash", "read_file"],
+            Scenario::Refactoring => vec!["str_replace", "read_file", "grep", "bash"],
+            Scenario::Testing => vec!["bash", "read_file", "str_replace", "write_file"],
+            Scenario::Documentation => vec!["read_file", "str_replace", "write_file"],
+            Scenario::DevOps => vec!["bash", "read_file", "str_replace", "write_file"],
+            Scenario::Learning => vec!["read_file", "grep", "web_search"],
+            Scenario::QuickAnswer => vec!["read_file", "grep"],
         }
     }
 
@@ -486,7 +460,6 @@ impl Scenario {
                 detail_level: Verbosity::Verbose,
                 memory_top_k: Some(7),
                 verification_strictness: Some(0.7),
-                tool_budget_tokens: 900,
             },
             Scenario::Debugging => ScenarioStrategy {
                 max_tools_per_turn: 15,
@@ -494,7 +467,6 @@ impl Scenario {
                 detail_level: Verbosity::Debug,
                 memory_top_k: Some(8),
                 verification_strictness: None,
-                tool_budget_tokens: 1100,
             },
             Scenario::Exploration => ScenarioStrategy {
                 max_tools_per_turn: 15,
@@ -502,7 +474,6 @@ impl Scenario {
                 detail_level: Verbosity::Normal,
                 memory_top_k: Some(10),
                 verification_strictness: None,
-                tool_budget_tokens: 1000,
             },
             Scenario::Planning => ScenarioStrategy {
                 max_tools_per_turn: 8,
@@ -510,7 +481,6 @@ impl Scenario {
                 detail_level: Verbosity::Verbose,
                 memory_top_k: None,
                 verification_strictness: None,
-                tool_budget_tokens: 600,
             },
             Scenario::Implementation => ScenarioStrategy {
                 max_tools_per_turn: 12,
@@ -518,7 +488,6 @@ impl Scenario {
                 detail_level: Verbosity::Normal,
                 memory_top_k: None,
                 verification_strictness: Some(0.6),
-                tool_budget_tokens: 1200,
             },
             Scenario::Refactoring => ScenarioStrategy {
                 max_tools_per_turn: 12,
@@ -526,7 +495,6 @@ impl Scenario {
                 detail_level: Verbosity::Verbose,
                 memory_top_k: Some(7),
                 verification_strictness: Some(0.65),
-                tool_budget_tokens: 1100,
             },
             Scenario::Testing => ScenarioStrategy {
                 max_tools_per_turn: 15,
@@ -534,7 +502,6 @@ impl Scenario {
                 detail_level: Verbosity::Normal,
                 memory_top_k: None,
                 verification_strictness: Some(0.55),
-                tool_budget_tokens: 1000,
             },
             Scenario::Documentation => ScenarioStrategy {
                 max_tools_per_turn: 10,
@@ -542,7 +509,6 @@ impl Scenario {
                 detail_level: Verbosity::Verbose,
                 memory_top_k: None,
                 verification_strictness: None,
-                tool_budget_tokens: 600,
             },
             Scenario::DevOps => ScenarioStrategy {
                 max_tools_per_turn: 12,
@@ -550,7 +516,6 @@ impl Scenario {
                 detail_level: Verbosity::Normal,
                 memory_top_k: None,
                 verification_strictness: Some(0.6),
-                tool_budget_tokens: 900,
             },
             Scenario::Learning => ScenarioStrategy {
                 max_tools_per_turn: 12,
@@ -558,18 +523,16 @@ impl Scenario {
                 detail_level: Verbosity::Verbose,
                 memory_top_k: Some(10),
                 verification_strictness: None,
-                tool_budget_tokens: 700,
             },
             // QuickAnswer is intentionally the tightest profile in the set.
-            // Budget tuned so a short "why/how/where does X work" question cannot
-            // exceed ~3-5 tool calls in total without an explicit escalation.
+            // The execution cap keeps short factual questions from drifting into
+            // long tool rounds without an explicit escalation.
             Scenario::QuickAnswer => ScenarioStrategy {
                 max_tools_per_turn: 5,
                 prefer_read_only: true,
                 detail_level: Verbosity::Normal,
                 memory_top_k: Some(5),
                 verification_strictness: None,
-                tool_budget_tokens: 500,
             },
         }
     }
@@ -585,10 +548,6 @@ pub struct ScenarioStrategy {
     pub memory_top_k: Option<u32>,
     /// Suggested verification strictness override (None = use default).
     pub verification_strictness: Option<f64>,
-    /// Scenario-driven override for the tool selection token budget.
-    /// 0 = use registry default. Non-zero values override the per-turn budget,
-    /// allowing scenarios like Implementation to include more tool schemas.
-    pub tool_budget_tokens: u32,
 }
 
 // ─── Scenario Detector ──────────────────────────────────────────────────────
@@ -705,11 +664,11 @@ impl ScenarioDetector {
             return 0.0;
         }
 
-        let recommended = scenario.recommended_tools();
+        let suggested = scenario.suggested_tools();
         let mut matches = 0;
 
         for tool in &self.recent_tools {
-            if recommended.iter().any(|r| tool.contains(r)) {
+            if suggested.iter().any(|r| tool.contains(r)) {
                 matches += 1;
             }
         }
@@ -1112,19 +1071,14 @@ mod tests {
     }
 
     #[test]
-    fn test_preference_tool_check() {
+    fn test_blocked_tool_check() {
         let prefs = UserPreferences {
-            preferred_tools: vec!["view".to_string(), "grep".to_string()],
             blocked_tools: vec!["bash".to_string()],
             ..UserPreferences::default()
         };
 
-        assert!(prefs.is_preferred_tool("view"));
-        assert!(prefs.is_preferred_tool("grep"));
-        assert!(!prefs.is_preferred_tool("edit"));
-
         assert!(prefs.is_blocked_tool("bash"));
-        assert!(!prefs.is_blocked_tool("view"));
+        assert!(!prefs.is_blocked_tool("read_file"));
     }
 
     #[test]
@@ -1135,7 +1089,7 @@ mod tests {
         detector.observe_query("there's a bug in the auth module");
         detector.observe_query("why is this test failing");
         detector.observe_tool("bash");
-        detector.observe_tool("view");
+        detector.observe_tool("read_file");
 
         let result = detector.detect();
         assert!(result.is_some());
@@ -1193,15 +1147,15 @@ mod tests {
     #[test]
     fn test_user_stats() {
         let mut stats = UserStats::default();
-        stats.record_tool_use("view");
-        stats.record_tool_use("view");
+        stats.record_tool_use("read_file");
+        stats.record_tool_use("read_file");
         stats.record_tool_use("grep");
 
         assert_eq!(stats.total_tool_calls, 3);
-        assert_eq!(stats.tool_usage.get("view"), Some(&2));
+        assert_eq!(stats.tool_usage.get("read_file"), Some(&2));
 
         let top = stats.top_tools(2);
-        assert_eq!(top[0], ("view", 2));
+        assert_eq!(top[0], ("read_file", 2));
     }
 
     #[test]

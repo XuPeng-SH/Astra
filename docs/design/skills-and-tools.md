@@ -1,17 +1,16 @@
 # Skills and Tools
 
 > **Status**: Core Design — single source of truth for skill/tool/MCP architecture
-> **Last Updated**: 2026-07-10
-> **Supersedes**: `skills-and-tools-v1-python.md` (pre-Rust migration, archived for reference)
+> **Last Updated**: 2026-06-23
 > **Implementation**: Rust — `rust/crates/runtime/src/skills/`, `rust/crates/runtime/src/tool_registry/`
 >
 > 🟢 **Implemented**: UnifiedSkillRegistry, SKILL.md parser, 16 bundled skills, local/MCP providers,
-> ToolRegistry with pinned/dynamic split, token budget system, file watcher hot-reload,
+> ToolRegistry with deterministic always-load/deferred surface, explicit deferred activation, surface reporting, file watcher hot-reload,
 > CLI commands (/skill list|info|search|new|dev|test|doctor|validate|config|system),
 > non-blocking permission checks, skill tool schema injection.
 >
-> 🔵 **Design Target**: Pin/Unpin mechanism (§4), Registered skills via DB (§3.2),
-> Marketplace via MatrixOne Stage (§3.3), cloud skill publishing.
+> 🔵 **Design Target**: Catalog-backed published skills via DB (§3.2), Marketplace via MatrixOne
+> Stage (§3.3), cloud skill publishing.
 
 ---
 
@@ -24,7 +23,7 @@ Skills and Tools are orthogonal systems that serve different purposes:
 | Aspect       | Tool                              | Skill                                |
 |--------------|-----------------------------------|--------------------------------------|
 | **What**     | JSON schema for LLM function call | AI instruction set (SKILL.md)        |
-| **Selection**| Token budget, pinning, TF-IDF     | Metadata budget, path activation     |
+| **Selection**| Always-load surface + deferred activation | Metadata budget, path activation     |
 | **Injection**| `tools` array in API request      | System prompt text (or sub-agent)    |
 | **Execution**| Tool call → handler → result      | Inline expand or fork sub-agent      |
 | **Budget**   | Schema JSON tokens                | Metadata tokens + instruction tokens |
@@ -129,7 +128,7 @@ pub struct LoadedSkill {
 │  └──────────────┘  └──────────────┘  └──────────────┘          │
 │  Storage: stage://mo_skills/   Download → local cache           │
 ├─────────────────────────────────────────────────────────────────┤
-│  Layer 2: Registered Skills (MatrixOne Database)  [DESIGN]      │
+│  Layer 2: Catalog-backed Skills (MatrixOne DB)    [DESIGN]      │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐          │
 │  │ Team shared  │  │ User private │  │ Installed    │          │
 │  │ (org scope)  │  │ (account)    │  │ (from market)│          │
@@ -202,7 +201,7 @@ UnifiedSkillRegistry::discover_all()
   ├─ Apply metadata_budget (skip if exceeds token limit)
   ├─ Separate unconditional vs conditional (paths-based) skills
   ├─ Cache manifests (metadata only, instructions lazy-loaded)
-  └─ Return registered skill names
+  └─ Return visible skill names
 ```
 
 ### 2.6 Local Skill Search Paths
@@ -245,13 +244,13 @@ pub fn skill_search_paths() -> Vec<PathBuf> {
 
 ### 3.1 Layer 1: Local Skills [IMPLEMENTED]
 
-**Lifecycle**: Create → Discover → Auto-Pin → Use → Edit → Hot-reload → Delete
+**Lifecycle**: Create → Discover → Use → Edit → Hot-reload → Delete
 
 **Characteristics**:
 - **No registration required** — drop SKILL.md file, immediately available
 - **Weak constraints** — no version control, no permission management, no audit
 - **Hot-reload** — file watcher detects changes within 500ms
-- **Auto-pinned** — always in candidate list (budget-exempt)
+- **Auto-discovered** — metadata enters the visible catalog immediately
 - **Best for** — personal development, rapid iteration, project-specific skills
 
 **File Watcher** (`skills/watcher.rs`):
@@ -261,14 +260,14 @@ pub fn skill_search_paths() -> Vec<PathBuf> {
 - Triggers `discover_all()` on SKILL.md / manifest.yaml changes
 - Handle stored in session state, dropped on exit
 
-### 3.2 Layer 2: Registered Skills [DESIGN TARGET]
+### 3.2 Layer 2: Catalog-backed Published Skills [DESIGN TARGET]
 
-**Lifecycle**: Create/Upload → Register → Discover → Manual Pin → Use → Update → Deregister
+**Lifecycle**: Author/Import → Publish → Discover → Filter/Activate → Use → Update → Unpublish
 
 **Characteristics**:
 - **Stored in MatrixOne** — `skills_registry` table
 - **Strong constraints** — version control, scope-based access (org/user), audit trail
-- **Default unpinned** — discovered via search/budget, manually pinned
+- **Catalog-scoped** — discovered through the visible catalog and filtered by request policy
 - **Best for** — team sharing, production environments, compliance
 
 **Proposed Schema**:
@@ -281,7 +280,6 @@ CREATE TABLE skills_registry (
     owner        VARCHAR(128) NOT NULL,
     manifest     JSON NOT NULL,          -- SkillManifest serialized
     content      TEXT NOT NULL,           -- SKILL.md instruction body
-    pinned       BOOLEAN DEFAULT FALSE,
     enabled      BOOLEAN DEFAULT TRUE,
     created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -291,17 +289,18 @@ CREATE TABLE skills_registry (
 
 **CLI Commands**:
 ```bash
-/skill register <name> [--scope=org|user] [--pin]
-/skill deregister <name>
+/skill publish <name> [--scope=private|community]
+/skill installed
+/skill upgrade <name>
 ```
 
 ### 3.3 Layer 3: Cloud Marketplace [DESIGN TARGET]
 
-**Lifecycle**: Browse → Preview → Install → Register (auto) → Pin (optional) → Use
+**Lifecycle**: Browse → Preview → Install → Cache/Index → Use
 
 **Characteristics**:
 - **Stored in MatrixOne Stage** — S3/MinIO backed object storage
-- **Install = Download + Register** — cached locally, registered in DB
+- **Install = Download + local cache** — server tracks marketplace installation state separately
 - **Versioned** — directory-based versioning in Stage
 - **Best for** — community sharing, enterprise skill stores
 
@@ -339,7 +338,7 @@ SELECT manifest INTO OUTFILE 'stage://mo_skill_marketplace/private/<account>/my-
 **CLI Commands**:
 ```bash
 /skill browse [category]
-/skill install <name>[@version] [--pin]
+/skill install <name>[@version]
 /skill uninstall <name>
 /skill publish <name> [--scope=private|community]
 /skill update <name>
@@ -347,77 +346,43 @@ SELECT manifest INTO OUTFILE 'stage://mo_skill_marketplace/private/<account>/my-
 
 ---
 
-## 4. Pin Mechanism [DESIGN TARGET]
+## 4. Skill Catalog Surface [IMPLEMENTED]
 
-### 4.1 What is Pin?
+### 4.1 First Principles
 
-**Pin = always in candidate list, budget-exempt.**
+Skills have no persistent always-include preference. The runtime has one
+coherent surfacing model:
 
-Pinned skills are always included in the skill listing sent to the LLM, regardless
-of token budget pressure. Unpinned skills are subject to budget-based truncation
-and require `/skill search` or trigger-based activation to surface.
+- `available_skills` lists bounded metadata for the visible catalog.
+- `active_skills` is a request-scoped hint from a user selection, composer token,
+  or sub-agent inheritance.
+- `discover_skills` searches the same catalog when the model needs a skill that
+  is not already obvious from the metadata.
+- `skill` loads the full `SKILL.md` only when the model chooses a specific skill.
 
-Analogy to Claude Code: `alwaysLoad: true` ≈ our Pin.
+This keeps skill surfacing declarative and per request. There is no mutable
+session-level always-include preference and no second budget exemption path.
 
-### 4.2 Pin Rules by Source
+### 4.2 Source Rules
 
-| Source          | Default  | Can Change?     | Notes                        |
-|-----------------|----------|-----------------|------------------------------|
-| Bundled         | Always   | No (permanent)  | Core functionality           |
-| Local (project) | Pinned   | Yes (unpin)     | Zero-config best experience  |
-| Local (user)    | Pinned   | Yes (unpin)     | User's global skills         |
-| Registered      | Unpinned | Yes (pin/unpin) | Discovered via search/budget |
-| Marketplace     | Unpinned | Yes (pin/unpin) | Pin on install with `--pin`  |
-| MCP             | Unpinned | Yes (pin/unpin) | Discovered via search/budget |
+| Source          | Visible When                                     | Notes                         |
+|-----------------|--------------------------------------------------|-------------------------------|
+| Bundled         | Runtime catalog includes it                      | Core functionality            |
+| Local (project) | CLI-local resolver includes project paths        | CLI-only until imported       |
+| Local (user)    | CLI/server resolver includes the user's home dir | User-scoped filesystem skills |
+| Catalog DB      | DB visibility predicate admits it                | Filtered by `allow_skills`    |
+| Marketplace     | Installed or imported into a visible catalog     | Versioned source package      |
+| MCP             | Connected server exports it                      | Catalog metadata only         |
 
 ### 4.3 Budget Interaction
 
-```
-Skill Listing Budget: ~2000 tokens (1% of 200K context)
-┌──────────────────────────────────────────┐
-│ Pinned skills (always shown, full desc)  │ ← Fixed cost
-│  bundled:  16 × ~30 tokens = 480        │
-│  local:     4 × ~30 tokens = 120        │
-│  user-pin:  N × ~30 tokens              │
-├──────────────────────────────────────────┤
-│ Remaining budget for unpinned            │ ← Dynamic
-│  (truncated descriptions → names-only)   │
-└──────────────────────────────────────────┘
-```
-
-**Warning Threshold**: When pinned skills consume >70% of listing budget:
-```
-⚠ 45 pinned skills using 1400/2000 tokens of skill listing budget.
-  Consider: /skill unpin <name>  or  /config skill_listing_budget 4000
-```
-
-### 4.4 SkillManifest Pin Field
-
-```rust
-// Addition to SkillManifest
-pub struct SkillManifest {
-    // ... existing fields ...
-    pub pinned: PinState,  // Always | Pinned | Unpinned
-}
-
-pub enum PinState {
-    Always,    // Bundled — cannot be unpinned
-    Pinned,    // User/auto pinned — budget-exempt
-    Unpinned,  // Subject to budget truncation
-}
-```
-
-### 4.5 CLI Commands
-
-```bash
-/skill pin <name>           # Pin a skill (registered/marketplace/MCP)
-/skill unpin <name>         # Unpin (bundled cannot be unpinned)
-/skill pinned               # Show all pinned skills with budget usage
-```
+The always-visible payload is metadata, not full instructions. Full skill bodies
+enter context only after `skill` activation. Large catalogs should be handled by
+catalog filtering and `discover_skills`, not by long-lived inclusion flags.
 
 ---
 
-## 5. Tool Selection Pipeline [IMPLEMENTED]
+## 5. Tool Surface Pipeline [IMPLEMENTED]
 
 ### 5.1 ToolRegistry Architecture
 
@@ -425,59 +390,74 @@ pub enum PinState {
 // rust/crates/runtime/src/tool_registry/registry.rs
 pub struct ToolRegistry {
     all_schemas: Vec<Value>,                // All tool JSON schemas
-    budget_tokens: u32,                     // Token budget for dynamic tools
+    budget_tokens: u32,                     // Tool-surface report budget total
     measured_costs: HashMap<String, u32>,   // Real token costs per tool
     schema_index: HashMap<String, usize>,   // O(1) name→index lookup
-    pinned_schemas: Vec<(String, Value)>,   // Always-included (budget-exempt)
-    plugin_tool_names: Vec<String>,         // Dynamically registered tools
+    always_load_schemas: Vec<(String, Value)>,   // Always-included (budget-exempt)
 }
 ```
 
-### 5.2 Tool Selection Layers
+### 5.2 Tool Surface Layers
 
-1. **Pinned Tools** — Always included, no budget cost (bash, read_file, write_file, etc.)
-2. **Injected Tools** — Runtime-injected (e.g., `skill` tool), pinned by default
-3. **Dynamic Tools** — Ranked by TF-IDF + intent signals, selected within budget
+1. **Always-load Tools** — Cache-stable core schemas derived from `astra_runtime_env::ToolSpec::load_policy` (bash, read_file, write_file, etc.)
+2. **Deferred Tools** — Advertised compactly and activated explicitly with `tool_search(select:NAME)`
+3. **Injected Tools** — Runtime-injected schemas, including MCP/plugin tools, are deferred by default unless the current surface assembly or additive user config explicitly promotes a known schema into always-load
 
-### 5.3 Selection Methods (Progressive Quality)
+Always-load is not synonymous with "control-plane." The always-load
+control-plane set is limited to user-facing coordination primitives that should
+not require a discovery round-trip: `ask_user` for blocking clarification and
+`notify` for non-blocking status updates.
+`notify` is intentionally always-load: its compact schema currently costs 126
+tokens under the repository schema-size heuristic (`serde_json` bytes / 4),
+which is below the 180-token regression ceiling and avoids a status-update
+discovery round-trip.
+
+MCP tools are dynamic runtime discoveries, not compile-time builtin declarations.
+They therefore cannot opt into default AlwaysLoad in code via
+`ToolSpec::load_policy`; keeping them deferred preserves prompt-cache stability
+and prevents stale MCP server state from changing the static prefix. Users can
+promote a currently known MCP/plugin schema with `runtime.tool_surface.always_load_tools`
+when they intentionally want that schema in `tools[]`.
+
+### 5.3 Surface Methods
 
 | Method                | Use Case              | Features                              |
 |-----------------------|-----------------------|---------------------------------------|
-| `select()`            | Basic selection       | TF-IDF + intent                       |
-| `select_with_report()`| With telemetry       | + SelectionReport                     |
-| `select_with_quality()`| Quality-aware       | + ToolQualityTracker                  |
-| `select_calibrated()` | Full pipeline         | + confidence calibration + boost      |
-| `select_routed()`     | With routing decision | Uses RoutingDecision from pipeline    |
+| `build_surface()` | Basic surface build | Always-load-only surface; conversational turns may return no tools |
+| `build_surface_with_report()` | Telemetry | Always-load-only surface + `ToolSurfaceReport` |
+| `build_surface_with_report_ctx()` | Recent-tool context | Preserves conversational short-circuit behavior |
+| `build_routed_surface()` | Pipeline-integrated surface | Returns the always-load-only surface after routing has decided the turn is tool-bearing |
+| `schema_by_name()`    | Activation/execution lookup | Resolves full schemas for explicitly selected deferred tools |
 
 ### 5.4 Skill Tool Integration
 
-The `skill` tool is injected into the ToolRegistry as a pinned schema:
+The `skill` tool is injected into the ToolRegistry as an always-load, cache-stable schema:
 
 ```rust
 // rust/crates/runtime/src/turn/skill_tool.rs
-pub fn skill_tool_schema(skills: &[SkillToolInfo]) -> Value {
-    // Generates JSON schema with skill names as enum
-    // Budget-aware: format_skills_within_budget() trims descriptions
-}
+pub fn skill_tool_schema_v2() -> Value; // open-string `skill_name`, no catalog enum
 
 // Injected via:
-registry.inject_schema("skill", schema, /* pinned = */ true);
+registry.inject_schema("skill", schema);
+```
+
+The available catalog is rendered separately as a session-scoped prompt section:
+
+```rust
+// rust/crates/runtime/src/prompts/system.rs
+pub fn build_skill_listing_section_for_model(
+    skills: &[SkillToolInfo],
+    model: Option<&str>,
+) -> Option<PromptSection>;
 ```
 
 ### 5.5 Token Budget for Skill Listing
 
-```rust
-const DEFAULT_SKILL_LISTING_BUDGET: usize = 8_000;  // ~1% of 200K context
-const MAX_LISTING_DESC_CHARS: usize = 250;           // Per-skill cap
-
-fn format_skills_within_budget(skills: &[SkillToolInfo], budget: usize)
-    -> (Vec<String>, Vec<String>)
-{
-    // Tier 1: Bundled skills — always full description
-    // Tier 2: Other sources — proportionally truncated
-    // Tier 3: Names-only when under extreme budget pressure
-}
-```
+`build_skill_listing_section_for_model` sizes the `<available_skills>` block
+from the model context window, sorts entries for byte stability, truncates
+oversized descriptions, and drops entries that do not fit. Dropped skills remain
+available through `discover_skills`; the schema itself never changes with the
+catalog.
 
 ---
 
@@ -521,6 +501,11 @@ activation (`paths`) still gates skills until matching files are touched.
 ### 7.1 MCP Dual Role
 
 MCP servers provide both **tools** (function call schemas) and **skills** (instruction sets):
+
+MCP tools enter the tool surface as runtime plugin schemas. They use the same
+deferred activation path as other non-core tools: compact discovery first,
+full schema only after explicit activation or an explicit user always-load
+override for the current runtime.
 
 ```
 MCP Server
@@ -620,9 +605,7 @@ impl From<std::io::Error> for SkillError {
 /skill                          # Show subcommand help
 /skill list [query] [--source=local|bundled|mcp] [--category=X]
 /skill search <query>           # Keyword match on catalog (not vector search)
-/skill surfacing …              # Agent catalog listing vs discover_skills thresholds
 /skill info <name> [--raw]      # Manifest + preview; --raw = YAML frontmatter
-/skill pinned                   # [DESIGN] Show pinned skills + budget
 ```
 
 ### Skill Development
@@ -638,17 +621,14 @@ impl From<std::io::Error> for SkillError {
 /skill health                   # Catalog + on-disk SKILL.md checks (API when logged in)
 ```
 
-### Registration & Marketplace [DESIGN TARGET]
+### Marketplace [DESIGN TARGET]
 ```bash
-/skill register <name> [--scope=org|user] [--pin]
-/skill deregister <name>
-/skill pin <name>
-/skill unpin <name>
 /skill browse [category]
-/skill install <name>[@version] [--pin]
+/skill install <name>[@version]
+/skill installed
 /skill uninstall <name>
 /skill publish <name> [--scope=private|community]
-/skill update <name>
+/skill upgrade <name>
 ```
 
 ---
@@ -713,9 +693,8 @@ CREATE STAGE marketplace_private  URL = 'stage://mo_skill_marketplace/private/';
   ├─ 1. Resolve: Query skill_marketplace_index for package URL
   ├─ 2. Download: LOAD DATA INFILE 'stage://marketplace_official/code-review/1.1.0/*'
   ├─ 3. Cache: Store in ~/.astra/cache/skills/code-review/1.1.0/
-  ├─ 4. Register: INSERT INTO skills_registry (name, version, manifest, content, ...)
-  ├─ 5. Optional Pin: if --pin flag specified
-  └─ 6. Discover: registry.discover_all() picks up new skill
+  ├─ 4. Index: record installation state and visible catalog metadata
+  └─ 5. Discover: registry.discover_all() picks up new skill
 ```
 
 ### 12.4 Publish Flow
@@ -746,21 +725,23 @@ CREATE STAGE marketplace_private  URL = 'stage://mo_skill_marketplace/private/';
 
 ## 13. Design Decisions
 
-### Q1: Do local skills need database registration?
+### Q1: Do local skills need a database catalog row?
 **No.** Local skills are weak-constraint, zero-config. Drop file → use immediately.
 Matches Claude Code behavior and provides best development experience.
 
-### Q2: Is Pin a weight or a switch?
-**Switch.** Pin = always in list (budget-exempt). Unpinned = subject to budget
-truncation + search discovery. Simple, predictable, no weight-tuning complexity.
+### Q2: Are active skills a ranking weight?
+**No.** Active skills are request intent. Catalog ranking remains separate and
+`discover_skills` handles search when the model needs more candidates.
 
 ### Q3: What happens after marketplace install?
-**Becomes a Registered skill (Layer 2).** Downloaded to local cache + registered in DB.
-Works offline via cache. Updates check marketplace for newer versions.
+**Becomes a cached marketplace skill visible through the catalog.** Downloaded
+to local cache while server-side marketplace state tracks installation and
+version availability. Works offline via cache. Updates check marketplace for
+newer versions.
 
-### Q4: How many pinned skills are reasonable?
-**~30-40 under default budget.** 16 bundled + 4-5 local + 10-20 user-pinned.
-Warning at 70% budget usage. User can increase budget via config.
+### Q4: How many active skills are reasonable?
+Per-turn active skills should stay small: they are user intent, not catalog
+storage. Large catalogs should rely on metadata plus `discover_skills`.
 
 ### Q5: How do MCP tools differ from MCP skills?
 **MCP tools** are JSON schemas → direct function calling.
@@ -779,14 +760,14 @@ Both come from same MCP server but enter different systems.
 | LocalSkillProvider           | ✅ Done     | `runtime/src/skills/providers/local.rs`   | 10+   |
 | McpSkillProvider             | ✅ Done     | `runtime/src/skills/providers/mcp.rs`     | 5+    |
 | DatabaseSkillProvider        | ⚠️ Adapter  | `runtime/src/skills/providers/database.rs`| 2     |
-| ToolRegistry (pinned/dynamic)| ✅ Done     | `runtime/src/tool_registry/registry.rs`   | 50+   |
+| ToolRegistry (always-load/deferred)| ✅ Done     | `runtime/src/tool_registry/registry.rs`   | 50+   |
 | Skill tool schema + budget   | ✅ Done     | `runtime/src/turn/skill_tool.rs`          | 10+   |
 | Conditional activation       | ✅ Done     | `runtime/src/skills/activation.rs`        | 15+   |
 | File watcher hot-reload      | ✅ Done     | `runtime/src/skills/watcher.rs`           | 3     |
 | CLI /skill commands          | ✅ Done     | `rust/crates/astra-cli/src/cli/slash_skill.rs`    | 12    |
 | Non-blocking permission      | ✅ Done     | `rust/crates/astra-cli/src/cli/stream_render.rs`  | —     |
-| Pin/Unpin mechanism          | 🔵 Design  | —                                          | —     |
-| Registered skills (DB)       | 🔵 Design  | —                                          | —     |
+| Per-turn active skill hints  | ✅ Done    | `edge_profile.active_skills`, `allow_skills` | 10+ |
+| Catalog-backed skills (DB)   | 🔵 Design  | —                                          | —     |
 | Marketplace (Stage)          | 🔵 Design  | —                                          | —     |
 | Skill sandbox mode           | 🔵 Design  | —                                          | —     |
 
@@ -794,8 +775,7 @@ Both come from same MCP server but enter different systems.
 
 ## 15. References
 
-- [Claude Code skill system](~/claudecode) — reference implementation for CC compatibility
-- [skills-and-tools-v1-python.md](skills-and-tools-v1-python.md) — archived Python-era design (conceptual reference)
+- [Claude Code skill system](~/claudecode) — reference implementation for skill loading and tool discovery behavior
 - [skill-system-review-2026-03-31.md](../../plans/skill-system-review-2026-03-31.md) — authoritative audit
 - [tool-discovery-claude-code.md](tool-discovery-claude-code.md) — CC tool selection gap analysis
 - [context-window-management.md](context-window-management.md) — context budget architecture

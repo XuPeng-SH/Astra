@@ -440,6 +440,7 @@ pub(crate) fn build_full_session_state_compact(
 ) -> astra_turn_core::conversation_log::SessionStateCompact {
     astra_turn_core::conversation_log::SessionStateCompact {
         recent_tools: state.recent_tools.clone(),
+        activated_deferred_tool_names: state.activated_deferred_tool_names.clone(),
         blocked_tools: Vec::new(),
         approval_overrides: None,
         budget_remaining_tokens: 0,
@@ -794,8 +795,8 @@ mod tests {
         let t2_text = "## Code Review\n\n**permission_manager.rs:978** — boundary check incomplete\n**safety_middleware.rs:8** — missing UPDATE keyword\n**journal_digest.rs:241** — use enum instead of String";
         let t2_records = vec![
             make_record("skill", true, None),
-            make_record("git_diff", true, None),
-            make_record("git_diff", true, None),
+            make_record("git", true, None),
+            make_record("git", true, None),
             make_record(
                 "read_file",
                 true,
@@ -847,7 +848,7 @@ mod tests {
 
         let t1_records = vec![
             make_record("skill", true, None),
-            make_record("git_diff", true, None),
+            make_record("git", true, None),
             make_record("read_file", true, Some("src/cli/permission_manager.rs")),
             make_record("read_file", false, Some("src/safety_middleware.rs")),
             make_record("grep", true, None),
@@ -876,7 +877,7 @@ mod tests {
 
         let t3_records = vec![
             make_record("skill", true, None),
-            make_record("git_diff", true, None),
+            make_record("git", true, None),
         ];
         history.push((
             "review changes".into(),
@@ -936,13 +937,15 @@ mod tests {
     }
 
     #[test]
-    fn csl_projection_preserves_recent_tools_only() {
+    fn csl_projection_preserves_tool_continuity_state_only() {
         let state = &SessionState {
             recent_tools: vec!["exec".into()],
+            activated_deferred_tool_names: vec!["write_file".into()],
             ..Default::default()
         };
         let prev = astra_turn_core::conversation_log::SessionStateCompact {
             blocked_tools: vec!["old_bash".into()],
+            activated_deferred_tool_names: vec!["old_deferred".into()],
             approval_overrides: Some(serde_json::json!({"old": true})),
             delegation: Some(astra_turn_core::conversation_log::DelegationCompact {
                 id: "old_d".into(),
@@ -959,6 +962,7 @@ mod tests {
 
         let result = build_full_session_state_compact(state, CslCheckpointFields, &prev);
         assert_eq!(result.recent_tools, vec!["exec"]);
+        assert_eq!(result.activated_deferred_tool_names, vec!["write_file"]);
         assert!(result.blocked_tools.is_empty());
         assert!(result.approval_overrides.is_none());
         assert_eq!(result.budget_remaining_tokens, 0);

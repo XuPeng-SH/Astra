@@ -252,9 +252,11 @@ ON DUPLICATE KEY UPDATE version=VALUES(version), content=VALUES(content),
 
 The implicit feedback detection currently uses regex heuristics + optional LLM classification. As the platform accumulates labeled conversation data (both from heuristic detection and explicit `/rate` feedback), we can train a small specialized model for feedback classification — see §4.1 below.
 
-### 4.1 Feedback Classification Model (Design)
+### 4.1 Feedback Classification Model (Future)
 
-> Full design: [Feedback Classification Model](feedback-classification-model.md) — data pipeline, model architecture, training, deployment, continuous learning.
+No standalone implementation spec is maintained for this future model. Any
+future implementation must use the current background-job and `SKILL.md` package
+contracts, not the retired Python skill-runtime shape.
 
 **Motivation**: Regex heuristics catch obvious signals but miss nuanced dissatisfaction. LLM classification is accurate but expensive. A small fine-tuned model (e.g., distilled from labeled conversation pairs) can achieve high accuracy at near-zero marginal cost.
 
@@ -301,7 +303,7 @@ DIAGNOSE: Which input was the bottleneck?
     - Missing skill? → Skill gap detection
     - Insufficient context? → Context budget tuning
     - Stale knowledge? → Knowledge regression detection
-    - Wrong skill selected? → Self-improving skill selection
+    - Wrong visible capability? → Tool surface / skill activation diagnostics
     ↓
 PROPOSE: Generate candidate adjustment
     ↓
@@ -317,17 +319,17 @@ RECORD: Store the learning signal for future pattern matching
 
 ### Already Implemented
 
-- **Self-Improving Skill Selection**: ToolRegistry provides unified tool selection (pinned/dynamic split + embedding retrieval).
-- **RegressionGate (ChangeType.SELECTOR)**: Validates selector changes before deployment via unified gate
+- **Deterministic Tool Surface**: ToolRegistry provides an always-load/deferred surface with explicit deferred activation.
+- **RegressionGate (ChangeType.TOOL_SURFACE)**: Validates tool surface changes before deployment via unified gate
 - **InputFaceLearner**: ✅ Unified meta-learning loop for prompt, context budget, and knowledge input faces (`core/learning/input_face_learner.py`)
 
 ### The Generalization
 
-Meta-learning generalizes self-improving skill selection to ALL versioned inputs:
+Meta-learning generalizes improvement across all versioned inputs:
 
 | Input | Current | Meta-Learning |
 |-------|---------|---------------|
-| Skill selection | ToolRegistry | ✅ Pinned/dynamic selection
+| Tool surface | ToolRegistry | ✅ Always-load/deferred surface with explicit activation |
 | Prompt | PromptOptimizer | ✅ Auto-diagnose + improve via InputFaceLearner |
 | Context budget | _BUDGET_RATIOS | ✅ Task-aware dynamic adjustment via InputFaceLearner |
 | Knowledge | MemoryGovernanceEngine | ✅ Stale detection + targeted quarantine via InputFaceLearner |

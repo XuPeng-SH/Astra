@@ -515,47 +515,6 @@ pub(crate) fn persist_config_override(
     serde_json::to_value(&preview).map_err(|e| e.to_string())
 }
 
-pub(crate) fn persist_tool_preferences(
-    session_id: &str,
-    pinned_tools: &[String],
-    deprioritized_tools: &[String],
-) -> Result<(), String> {
-    let mut ws = session_workspace::read_workspace(session_id).map_err(|e| e.to_string())?;
-    let mut pinned = pinned_tools.to_vec();
-    pinned.sort();
-    pinned.dedup();
-    let mut deprioritized = deprioritized_tools.to_vec();
-    deprioritized.sort();
-    deprioritized.dedup();
-
-    let old_pinned = ws.pinned_tools.clone();
-    let old_deprioritized = ws.deprioritized_tools.clone();
-    ws.pinned_tools = pinned.clone();
-    ws.deprioritized_tools = deprioritized.clone();
-    ws.updated_at = Utc::now().to_rfc3339();
-    session_workspace::write_workspace(&ws).map_err(|e| e.to_string())?;
-
-    if old_pinned != pinned {
-        append_config_change_event(
-            session_id,
-            ws.turn_count,
-            "pinned_tools",
-            &serde_json::json!(pinned),
-            Some(serde_json::json!(old_pinned)),
-        )?;
-    }
-    if old_deprioritized != deprioritized {
-        append_config_change_event(
-            session_id,
-            ws.turn_count,
-            "deprioritized_tools",
-            &serde_json::json!(deprioritized),
-            Some(serde_json::json!(old_deprioritized)),
-        )?;
-    }
-    Ok(())
-}
-
 pub(crate) fn persist_manual_compression(
     session_id: &str,
     turn: u32,
@@ -624,7 +583,7 @@ fn normalize_reflect_focus(focus: Option<&str>) -> &'static str {
         "skill_failure" => "skill_failure",
         "unexpected_result" => "unexpected_result",
         "data_quality" => "data_quality",
-        "tool_selection" => "tool_selection",
+        "tool_surface" => "tool_surface",
         "history" => "history",
         "performance" => "performance",
         _ => "auto",
@@ -650,7 +609,7 @@ fn focused_recent_event_previews(
             JournalEventType::StallDetected,
             JournalEventType::AdaptivePerTurnApplied,
         ],
-        "tool_selection" => &[
+        "tool_surface" => &[
             JournalEventType::Turn,
             JournalEventType::AdaptiveScenarioApplied,
             JournalEventType::AdaptivePerTurnApplied,
@@ -830,9 +789,9 @@ pub(crate) fn verify_runtime_config(tuned_config_json: Option<&str>) -> Vec<Chec
     });
 
     let available_tools = ToolRegistry::all_tool_names().len();
-    let min_required = ConstraintSet::default().min_tool_pool_size;
+    let min_required = ConstraintSet::default().min_available_tool_count;
     checks.push(CheckResult {
-        name: "tool_pool_floor".to_string(),
+        name: "available_tool_floor".to_string(),
         ok: available_tools >= min_required,
         detail: format!(
             "available_tools={} min_required={}",
@@ -929,8 +888,6 @@ fn event_type_name(event_type: &JournalEventType) -> String {
         JournalEventType::PipelineFeedback => "pipeline_feedback",
         JournalEventType::PipelineAlert => "pipeline_alert",
         JournalEventType::PipelineCompactionAudit => "pipeline_compaction_audit",
-        JournalEventType::MemorySuppressed => "memory_suppressed",
-        JournalEventType::ContextReleased => "context_released",
         JournalEventType::Bootstrap => "bootstrap",
         JournalEventType::TraceSpan => "trace_span",
     }
@@ -1078,7 +1035,7 @@ mod tests {
         ws.last_context_trace = Some(ContextTraceSignal {
             turn_id: "turn-7".to_string(),
             captured_at: Some(Utc::now().to_rfc3339()),
-            tool_selection: None,
+            tool_surface: None,
             memory: None,
             history: None,
             budget: Some(
@@ -1114,7 +1071,7 @@ mod tests {
                 config_value: None,
                 turns_compacted: None,
                 facts_stored: None,
-                tools_selected: Some(vec!["bash".to_string()]),
+                visible_tools: Some(vec!["bash".to_string()]),
                 selected_skills: None,
                 tools_used: Some(vec!["bash".to_string()]),
                 tool_calls: Some(vec![ToolCallRecord {
@@ -1144,7 +1101,6 @@ mod tests {
                 session_lineage: None,
                 coordination: None,
                 edge_policy: None,
-                selection_trace: None,
                 context_assembly_trace: Some(serde_json::json!({"tokens": 7000})),
                 routing_domain_hint: Some("code".to_string()),
                 entity_learn_skipped_no_domain: false,
@@ -1211,7 +1167,7 @@ mod tests {
                 config_value: None,
                 turns_compacted: None,
                 facts_stored: None,
-                tools_selected: None,
+                visible_tools: None,
                 selected_skills: None,
                 tools_used: None,
                 tool_calls: None,
@@ -1228,7 +1184,6 @@ mod tests {
                 session_lineage: None,
                 coordination: None,
                 edge_policy: None,
-                selection_trace: None,
                 context_assembly_trace: None,
                 routing_domain_hint: Some("code".to_string()),
                 entity_learn_skipped_no_domain: false,
@@ -1266,11 +1221,10 @@ mod tests {
         let _guard = JournalDirGuard::new(temp.path());
         let session_id = "self-health-session";
         let mut ws = WorkspaceMetadata::with_context(session_id, "gpt-5.4", "/repo", Some("main"));
-        ws.deprioritized_tools = vec!["bash".to_string()];
         ws.last_context_trace = Some(ContextTraceSignal {
             turn_id: "turn-3".to_string(),
             captured_at: Some(Utc::now().to_rfc3339()),
-            tool_selection: None,
+            tool_surface: None,
             memory: None,
             history: None,
             budget: Some(
@@ -1306,7 +1260,7 @@ mod tests {
                 config_value: None,
                 turns_compacted: None,
                 facts_stored: None,
-                tools_selected: Some(vec!["bash".to_string()]),
+                visible_tools: Some(vec!["bash".to_string()]),
                 selected_skills: Some(vec!["goal-driven-evolution".to_string()]),
                 tools_used: Some(vec!["bash".to_string()]),
                 tool_calls: Some(vec![ToolCallRecord {
@@ -1336,7 +1290,6 @@ mod tests {
                 session_lineage: None,
                 coordination: None,
                 edge_policy: None,
-                selection_trace: None,
                 context_assembly_trace: None,
                 routing_domain_hint: Some("code".to_string()),
                 entity_learn_skipped_no_domain: false,
@@ -1413,7 +1366,6 @@ mod tests {
         let mut workspace =
             WorkspaceMetadata::with_context(session_id, "gpt-5.4", "/srv/cloud-repo", Some("main"));
         workspace.plan_goal = Some("ship cloud restore".to_string());
-        workspace.pinned_tools = vec!["bash".to_string()];
         workspace.discovered_skills = vec!["session-recovery".to_string()];
         let restored = astra_services::session_restore::RestoredSession {
             session_id: session_id.to_string(),

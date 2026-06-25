@@ -275,10 +275,10 @@ pub use self_surface::{
     AcceptanceSurface, BudgetConfig, BudgetState, BudgetSurface, CapabilitySurface,
     EnvironmentSurface, EventPreview, EvolutionRecord, EvolutionSurface, GoalSurface,
     HealthSurface, JournalSurface, LocalSelfSurfaceService, NoopSelfSurfaceRuntimeSupport,
-    PersistentSelfSnapshot, ProfileSurface, RunSurface, RunTotals, ScoredAlternative,
-    SelfSurfaceCheck, SelfSurfaceDimension, SelfSurfaceResponse, SelfSurfaceRuntimeSupport,
-    SelfSurfaceService, SignalsSurface, StepRecord, SurfaceConstraints, ToolCallView,
-    ToolFailureView, ToolHealthView, TraceSurface, VerificationSurface,
+    PersistentSelfSnapshot, ProfileSurface, RunSurface, RunTotals, SelfSurfaceCheck,
+    SelfSurfaceDimension, SelfSurfaceResponse, SelfSurfaceRuntimeSupport, SelfSurfaceService,
+    SignalsSurface, StepRecord, SurfaceConstraints, ToolCallView, ToolFailureView, ToolHealthView,
+    TraceSurface, VerificationSurface,
 };
 pub use session_artifact_store::{
     DatabaseSessionArtifactStore, LOCAL_SESSION_LAYOUT_VERSION, LocalSessionArtifactStore,
@@ -291,8 +291,8 @@ pub use skill_config::{
     DatabaseSkillConfigService, SkillConfigService, UnconfiguredSkillConfigService,
 };
 pub use skills::{
-    DatabaseSkillService, SkillPublishRequestData, SkillRecord, SkillRegisterRequestData,
-    SkillService, UnconfiguredSkillService,
+    DatabaseSkillService, SkillPublishRequestData, SkillRecord, SkillService,
+    UnconfiguredSkillService,
 };
 pub use state_projection::{
     BubbleUpTarget, COMPACTION_INVARIANT_SQL, CompactionInvariant, DatabasePlanTodoSink,

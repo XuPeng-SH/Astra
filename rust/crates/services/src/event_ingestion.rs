@@ -1037,9 +1037,9 @@ mod tests {
             config_value: None,
             turns_compacted: None,
             facts_stored: None,
-            tools_selected: Some(vec!["github_list_prs".into()]),
+            visible_tools: Some(vec!["github".into()]),
             selected_skills: Some(vec!["tune-performance".into()]),
-            tools_used: Some(vec!["github_list_prs".into()]),
+            tools_used: Some(vec!["github".into()]),
             tool_calls: None,
             budget_used: None,
             budget_pressure: None,
@@ -1054,7 +1054,6 @@ mod tests {
             session_lineage: None,
             coordination: None,
             edge_policy: None,
-            selection_trace: None,
             context_assembly_trace: None,
             routing_domain_hint: None,
             entity_learn_skipped_no_domain: false,
@@ -1255,7 +1254,7 @@ mod tests {
             "sig_stall",
             2,
             0.6,
-            &["github_list_prs".to_string()],
+            &["github".to_string()],
         );
         let ingestion = IngestionEvent::from_journal_event(&event, "u1");
         assert_eq!(ingestion.content.as_deref(), Some("sig_stall"));
@@ -1354,7 +1353,7 @@ mod tests {
         let mut journal = make_turn_event();
         journal.tool_calls = Some(vec![
             crate::session_journal::ToolCallRecord {
-                name: "git_log".into(),
+                name: "git".into(),
                 ok: true,
                 ms: 150,
                 error: None,
@@ -1392,7 +1391,7 @@ mod tests {
 
         // Second is successful tool_call
         assert_eq!(events[1].event_type, "tool_call");
-        assert_eq!(events[1].skill_name.as_deref(), Some("git_log"));
+        assert_eq!(events[1].skill_name.as_deref(), Some("git"));
         assert!(
             events[1].content.as_ref().unwrap().contains("150ms"),
             "got: {:?}",
@@ -1505,7 +1504,7 @@ mod tests {
             "name_stall",
             2,
             0.6,
-            &["github_list_prs".to_string()],
+            &["github".to_string()],
         );
         let events = IngestionEvent::expand_journal_event(&event, "u1");
         assert_eq!(events.len(), 1, "non-turn events should not be expanded");

@@ -1,16 +1,17 @@
-//! Tool-surface contract tests: `tool_search` is the first-class pinned
+//! Tool-surface contract tests: `tool_search` is the first-class always_load
 //! activation primitive, while selected deferred tools are queued for the next
 //! request's `tools[]` instead of becoming long-lived validator state.
 //!
 //! Pre-phase-4 state:
 //!   - `tool_search` was hidden inside the `session` meta-tool's `action`
 //!     enum, so the LLM had to call `session(action="tool_search", …)`.
-//!     Hoisting it to a top-level pinned tool gives the deferred
+//!     Hoisting it to a top-level always_load tool gives the deferred
 //!     activation flow an unambiguous entry point.
 //!   - Some paths treated an activated deferred name as an execution allowlist.
-//!     The fixed contract makes activation a one-shot input to surface
-//!     assembly; execution still depends on the current request's visible
-//!     schema set or an explicit transport/plugin grant.
+//!     The fixed contract makes activation pending schema-injection state
+//!     retained until the selected tool is actually called or becomes stale;
+//!     execution still depends on the current request's visible schema set or
+//!     an explicit transport/plugin grant.
 //!
 //! `introspect` stays in the catalog — it exposes runtime diagnostics
 //! (token pressure, cache hit rate, tool health, volatile injections,
@@ -18,7 +19,7 @@
 //! separate capability, dispatched by the edge-tool executor.
 
 use astra_tools::schemas::all_tool_schemas;
-use astra_turn_core::tool_registry_meta::{TOOL_CATALOG, is_pinned_tool};
+use astra_turn_core::tool_registry_meta::TOOL_CATALOG;
 use serde_json::Value;
 
 fn schema_names(schemas: &[Value]) -> Vec<String> {
@@ -33,7 +34,7 @@ fn schema_names(schemas: &[Value]) -> Vec<String> {
         .collect()
 }
 
-// ── 1. tool_search is a first-class, pinned tool ────────────────────────────
+// ── 1. tool_search is a first-class, always_load tool ────────────────────────────
 
 #[test]
 fn tool_search_schema_is_emitted_as_a_top_level_tool() {
@@ -45,14 +46,16 @@ fn tool_search_schema_is_emitted_as_a_top_level_tool() {
 }
 
 #[test]
-fn tool_search_is_in_catalog_and_pinned() {
+fn tool_search_is_in_catalog_and_always_load() {
     assert!(
         TOOL_CATALOG.iter().any(|t| t.name == "tool_search"),
         "tool_search must be present in TOOL_CATALOG"
     );
     assert!(
-        is_pinned_tool("tool_search"),
-        "tool_search must be pinned — it's the activation primitive for deferred tools"
+        astra_runtime::tool_registry::surface::default_always_load_names()
+            .iter()
+            .any(|name| name == "tool_search"),
+        "tool_search must be always_load — it's the activation primitive for deferred tools"
     );
 }
 
@@ -97,9 +100,12 @@ fn introspect_is_available_but_deferred_by_default() {
         .iter()
         .find(|t| t.name == "introspect")
         .expect("introspect must remain in TOOL_CATALOG");
+    assert_eq!(introspect.name, "introspect");
     assert!(
-        !introspect.pinned,
-        "introspect is diagnostic-only and should not be in every turn's pinned tool prefix"
+        !astra_runtime::tool_registry::surface::default_always_load_names()
+            .iter()
+            .any(|name| name == "introspect"),
+        "introspect is diagnostic-only and should not be in every turn's always_load tool prefix"
     );
     let names = schema_names(&all_tool_schemas());
     assert!(

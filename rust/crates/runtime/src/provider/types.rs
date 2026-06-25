@@ -82,8 +82,6 @@ impl ToolCategory {
             | "exit_plan_mode"
             | "get_agent_info"
             | "introspect"
-            | "prioritize_tool"
-            | "deprioritize_tool"
             | "compress_context"
             | "memory"
             | "session"
@@ -91,7 +89,6 @@ impl ToolCategory {
             | "task_output"
             | "task_stop"
             | "task_list"
-            | "mo"
             | "mo_query"
             | "rollback_database_snapshots"
             | "rollback_session_state" => Some(Self::StateManagement),

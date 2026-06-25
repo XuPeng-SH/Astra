@@ -754,8 +754,8 @@ impl ExplorationFamily {
 fn classify_exploration_family(record: &ToolCallRecord) -> Option<ExplorationFamily> {
     let args = record.args_full.as_deref().unwrap_or("");
     match record.name.as_str() {
-        "git_diff" => Some(ExplorationFamily::Diff),
-        "read_file" | "view" => Some(ExplorationFamily::Read),
+        "git" if tool_action_is(args, "diff") => Some(ExplorationFamily::Diff),
+        "read_file" => Some(ExplorationFamily::Read),
         "grep" | "rg" | "glob" => Some(ExplorationFamily::Search),
         "bash" if is_search_like_tool_call(&record.name, args) => Some(ExplorationFamily::Search),
         "bash" if extract_read_target(&record.name, args).is_some() => {
@@ -763,6 +763,14 @@ fn classify_exploration_family(record: &ToolCallRecord) -> Option<ExplorationFam
         }
         _ => None,
     }
+}
+
+fn tool_action_is(args: &str, expected: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(args)
+        .ok()
+        .is_some_and(|value| {
+            value.get("action").and_then(serde_json::Value::as_str) == Some(expected)
+        })
 }
 
 fn longest_exploration_family_round_streak(
@@ -982,34 +990,23 @@ fn ranges_overlap(a: &ReadRange, b: &ReadRange) -> bool {
 /// for ambiguous bash commands, and for parse failures. Recognized:
 ///   - `bash` with `sed -n '<a>,<b>p' <file>`
 ///   - `bash` with bare `cat <file>` (no shell redirection / pipe input)
-///   - `view` tool with JSON args like `{"path":"<f>","view_range":[a,b]}`
+///   - `read_file` tool with JSON args like `{"path":"<f>","start_line":a,"end_line":b}`
 fn extract_read_target(name: &str, args: &str) -> Option<ReadRange> {
     use regex::Regex;
     use std::sync::OnceLock;
     static SED_RANGE: OnceLock<Regex> = OnceLock::new();
     static CAT_FILE: OnceLock<Regex> = OnceLock::new();
 
-    if name == "view" || name == "read_file" {
-        // Prefer JSON parsing — `view`/`read_file` args_full is always JSON.
+    if name == "read_file" {
+        // Prefer JSON parsing — `read_file` args_full is always JSON.
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(args.trim()) {
             let path = v.get("path").and_then(|p| p.as_str())?.to_string();
-            let range = if name == "view" {
-                v.get("view_range")
-                    .and_then(|r| r.as_array())
-                    .and_then(|arr| {
-                        let s = arr.first()?.as_u64()? as u32;
-                        let e = arr.get(1)?.as_u64()? as u32;
-                        Some((s, e))
-                    })
-            } else {
-                // read_file uses start_line / end_line
-                let s = v
-                    .get("start_line")
-                    .and_then(|n| n.as_u64())
-                    .map(|n| n as u32);
-                let e = v.get("end_line").and_then(|n| n.as_u64()).map(|n| n as u32);
-                s.zip(e)
-            };
+            let s = v
+                .get("start_line")
+                .and_then(|n| n.as_u64())
+                .map(|n| n as u32);
+            let e = v.get("end_line").and_then(|n| n.as_u64()).map(|n| n as u32);
+            let range = s.zip(e);
             return Some(ReadRange { file: path, range });
         }
         return None;
@@ -1062,7 +1059,10 @@ fn extract_read_target(name: &str, args: &str) -> Option<ReadRange> {
 /// clears the per-file read history so we don't over-flag legitimate
 /// "edit then verify" patterns.
 fn is_mutation_for_redundant_read(name: &str, args: &str) -> bool {
-    matches!(name, "edit" | "create" | "write") || (name == "bash" && bash_args_look_mutating(args))
+    matches!(
+        name,
+        "str_replace" | "multi_edit" | "write_file" | "create_file" | "delete_file" | "apply_patch"
+    ) || (name == "bash" && bash_args_look_mutating(args))
 }
 
 fn bash_args_look_mutating(args: &str) -> bool {
@@ -1110,8 +1110,11 @@ fn bash_args_look_mutating(args: &str) -> bool {
 /// per-file history clears. Returns `None` if the target file is unclear,
 /// in which case the caller clears ALL per-file histories (conservative).
 fn mutation_target_file(name: &str, args: &str) -> Option<String> {
-    if matches!(name, "edit" | "create" | "write") {
-        // Astra's edit/create tools take JSON args with a `path` field.
+    if matches!(
+        name,
+        "str_replace" | "multi_edit" | "write_file" | "create_file" | "delete_file" | "apply_patch"
+    ) {
+        // Astra's file mutation tools take JSON args with a `path` field.
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(args.trim()) {
             return v.get("path").and_then(|p| p.as_str()).map(String::from);
         }
@@ -1554,7 +1557,7 @@ mod tests {
     fn evaluate_tool_call_records_reuses_live_query_heuristic() {
         let eval = evaluate_tool_call_records(
             "Check the latest git status",
-            &["git_status".to_string()],
+            &["git".to_string()],
             &[],
             0,
             false,
@@ -1652,10 +1655,10 @@ mod tests {
 
     #[test]
     fn build_turn_evaluation_journal_event_serializes_normalized_signals() {
-        let records = vec![journal_ok_call("git_status")];
+        let records = vec![journal_ok_call("git")];
         let eval = evaluate_tool_call_records(
             "Check the latest git status",
-            &["git_status".to_string()],
+            &["git".to_string()],
             &records,
             0,
             false,
@@ -1667,7 +1670,7 @@ mod tests {
             Some(2),
             "cli_repl",
             "Check the latest git status",
-            &["git_status".to_string()],
+            &["git".to_string()],
             &records,
             0,
             false,
@@ -1709,7 +1712,7 @@ mod tests {
         // error_rate = 3/4 = 0.75 and quality collapse. With filtering,
         // only the real success is counted and the turn scores as healthy.
         let records = vec![
-            rec("git_show", true, Some("diff contents here")),
+            rec("git", true, Some("diff contents here")),
             rec(
                 SURGICAL_REMOVAL_TOOL_NAME,
                 true,
@@ -1721,7 +1724,7 @@ mod tests {
 
         let eval = evaluate_tool_call_records(
             "review commit 179afcb",
-            &["git_show".to_string()],
+            &["git".to_string()],
             &records,
             0,
             false,
@@ -1779,7 +1782,7 @@ mod tests {
                 ..Default::default()
             })
             .chain(std::iter::once(ToolCallRecord {
-                name: "git_show".to_string(),
+                name: "git".to_string(),
                 ok: true,
                 ms: 20,
                 error: None,
@@ -1850,15 +1853,15 @@ mod tests {
             eval.signals
         );
 
-        let repeated_git_show = vec![
-            record("git_show", "6f2f96e"),
-            record("git_show", "6f2f96e"),
-            record("git_show", "6f2f96e"),
+        let repeated_git_action_show = vec![
+            record("git", r#"{"action":"show","revision":"6f2f96e"}"#),
+            record("git", r#"{"action":"show","revision":"6f2f96e"}"#),
+            record("git", r#"{"action":"show","revision":"6f2f96e"}"#),
         ];
         let eval = evaluate_tool_call_records(
             "review latest commit",
-            &["git_show".to_string()],
-            &repeated_git_show,
+            &["git".to_string()],
+            &repeated_git_action_show,
             0,
             false,
             0.1,
@@ -1866,8 +1869,8 @@ mod tests {
         assert!(
             eval.signals
                 .iter()
-                .any(|s| matches!(s, EvalSignal::RepeatToolCall(name) if name == "git_show")),
-            "identical git_show targets should still surface as repeat loops: {:?}",
+                .any(|s| matches!(s, EvalSignal::RepeatToolCall(name) if name == "git")),
+            "identical git(action=show) targets should still surface as repeat loops: {:?}",
             eval.signals
         );
     }
@@ -1958,7 +1961,7 @@ mod tests {
     }
 
     #[test]
-    fn real_session_0ac769_pattern_surfaces_git_show_and_read_file_repeats() {
+    fn real_session_0ac769_pattern_surfaces_git_action_show_and_read_file_repeats() {
         use astra_services::session_journal::ToolCallRecord;
 
         let record = |name: &str, args_preview: &str| ToolCallRecord {
@@ -1977,17 +1980,18 @@ mod tests {
         };
 
         // Real session 0ac7696c had 7 LLM rounds with this 12-tool pattern:
-        // git_show, git_show, read_file x3 + grep, grep x3 + read_file, git_show, git_show.
+        // git(action=show), git(action=show), read_file x3 + grep, grep x3 + read_file,
+        // git(action=show), git(action=show).
         // The persisted turn_evaluation surfaced repeat loops for read_file and
-        // git_show, while distinct grep queries stayed healthy.
+        // git(action=show), while distinct grep queries stayed healthy.
         let records = vec![
             record(
-                "git_show",
-                r#"{"rev":"b273c589a73799070a71f4cfc6d55349b534d8d1"}"#,
+                "git",
+                r#"{"action":"show","revision":"b273c589a73799070a71f4cfc6d55349b534d8d1"}"#,
             ),
             record(
-                "git_show",
-                r#"{"rev":"b273c589a73799070a71f4cfc6d55349b534d8d1"}"#,
+                "git",
+                r#"{"action":"show","revision":"b273c589a73799070a71f4cfc6d55349b534d8d1"}"#,
             ),
             record(
                 "read_file",
@@ -2009,12 +2013,12 @@ mod tests {
                 r#"{"path":"rust/crates/runtime/src/server/run_lifecycle.rs"}"#,
             ),
             record(
-                "git_show",
-                r#"{"rev":"b273c589a73799070a71f4cfc6d55349b534d8d1"}"#,
+                "git",
+                r#"{"action":"show","revision":"b273c589a73799070a71f4cfc6d55349b534d8d1"}"#,
             ),
             record(
-                "git_show",
-                r#"{"rev":"b273c589a73799070a71f4cfc6d55349b534d8d1"}"#,
+                "git",
+                r#"{"action":"show","revision":"b273c589a73799070a71f4cfc6d55349b534d8d1"}"#,
             ),
             record("grep", r#"/turn_evaluation/ in rust/crates/runtime/src"#),
         ];
@@ -2022,7 +2026,7 @@ mod tests {
         let eval = evaluate_tool_call_records(
             "review b273c589a73799070a71f4cfc6d55349b534d8d1",
             &[
-                "git_show".to_string(),
+                "git".to_string(),
                 "read_file".to_string(),
                 "grep".to_string(),
             ],
@@ -2056,8 +2060,8 @@ mod tests {
         assert!(
             eval.signals
                 .iter()
-                .any(|s| matches!(s, EvalSignal::RepeatToolCall(name) if name == "git_show")),
-            "expected git_show repeat signal, got {:?}",
+                .any(|s| matches!(s, EvalSignal::RepeatToolCall(name) if name == "git")),
+            "expected git repeat signal, got {:?}",
             eval.signals
         );
         assert!(
@@ -2075,7 +2079,7 @@ mod tests {
             "cli_repl",
             "review b273c589a73799070a71f4cfc6d55349b534d8d1",
             &[
-                "git_show".to_string(),
+                "git".to_string(),
                 "read_file".to_string(),
                 "grep".to_string(),
             ],
@@ -2102,10 +2106,10 @@ mod tests {
 
     #[test]
     fn llm_round_churn_surfaces_even_when_tool_calls_succeed() {
-        let records = vec![journal_ok_call("git_diff")];
+        let records = vec![journal_ok_call("git")];
         let eval = evaluate_tool_call_records_with_thresholds_and_telemetry(
             "review local changes",
-            &["git_diff".to_string()],
+            &["git".to_string()],
             &records,
             0,
             false,
@@ -2164,7 +2168,7 @@ mod tests {
             Some(2),
             "cli_repl",
             "review local changes",
-            &["git_diff".to_string()],
+            &["git".to_string()],
             &records,
             0,
             false,
@@ -2195,17 +2199,17 @@ mod tests {
     #[test]
     fn high_cost_low_yield_downgrades_expensive_exploration_churn() {
         let records = vec![
-            record_in_round("git_diff", 0, Some("b-0")),
-            record_in_round("git_diff", 0, Some("b-0")),
-            record_in_round("git_diff", 1, Some("b-1")),
-            record_in_round("git_diff", 1, Some("b-1")),
-            record_in_round("git_diff", 2, Some("b-2")),
-            record_in_round("git_diff", 2, Some("b-2")),
+            record_in_round("git", 0, Some("b-0")),
+            record_in_round("git", 0, Some("b-0")),
+            record_in_round("git", 1, Some("b-1")),
+            record_in_round("git", 1, Some("b-1")),
+            record_in_round("git", 2, Some("b-2")),
+            record_in_round("git", 2, Some("b-2")),
         ];
 
         let eval = evaluate_tool_call_records_with_thresholds_and_telemetry(
             "review local changes",
-            &["git_diff".to_string()],
+            &["git".to_string()],
             &records,
             0,
             false,
@@ -2380,7 +2384,7 @@ mod tests {
     fn is_synthetic_placeholder_via_flag() {
         use astra_services::session_journal::{SURGICAL_REMOVAL_TOOL_NAME, ToolCallRecord};
 
-        // New-style: surgically_removed flag set
+        // Current contract: surgically_removed flag set
         let flagged = ToolCallRecord {
             name: SURGICAL_REMOVAL_TOOL_NAME.to_string(),
             ok: true,
@@ -2397,8 +2401,8 @@ mod tests {
         };
         assert!(flagged.is_synthetic_placeholder());
 
-        // Backward-compat: legacy sentinel name only (no flag)
-        let legacy = ToolCallRecord {
+        // Sentinel name alone is not a supported synthetic marker.
+        let unflagged_sentinel = ToolCallRecord {
             name: SURGICAL_REMOVAL_TOOL_NAME.to_string(),
             ok: true,
             ms: 0,
@@ -2412,7 +2416,7 @@ mod tests {
             original_tool_name: None,
             ..Default::default()
         };
-        assert!(legacy.is_synthetic_placeholder());
+        assert!(!unflagged_sentinel.is_synthetic_placeholder());
 
         // Normal tool call: neither flag nor sentinel name
         let normal = ToolCallRecord {
@@ -2458,17 +2462,17 @@ mod tests {
             batch_id: batch.map(str::to_string),
             parallel: Some(batch.is_some()),
             round: Some(round),
-            args_full: None,
+            args_full: (name == "git").then(|| r#"{"action":"diff"}"#.to_string()),
             ..Default::default()
         }
     }
     #[test]
-    fn exploration_family_churn_flags_repeated_git_diff_rounds() {
-        let mut records = vec![record_in_round("git_diff", 0, None)];
+    fn exploration_family_churn_flags_repeated_git_action_diff_rounds() {
+        let mut records = vec![record_in_round("git", 0, None)];
         for round in 1..4 {
             let batch = format!("b-{round}-0");
             for _ in 0..5 {
-                records.push(record_in_round("git_diff", round, Some(batch.as_str())));
+                records.push(record_in_round("git", round, Some(batch.as_str())));
             }
         }
 
@@ -2651,9 +2655,13 @@ mod tests {
         let records = vec![
             record_with_args("bash", 0, r#"{"command":"cat src/a.rs"}"#),
             record_with_args("bash", 1, r#"{"command":"sed -n '1,20p' src/b.rs"}"#),
-            record_with_args("view", 2, r#"{"path":"src/c.rs","view_range":[1,20]}"#),
+            record_with_args(
+                "read_file",
+                2,
+                r#"{"path":"src/c.rs","start_line":1,"end_line":20}"#,
+            ),
             record_with_args("read_file", 3, r#"{"path":"src/d.rs"}"#),
-            record_with_args("git_show", 4, r#"{"commit":"HEAD"}"#),
+            record_with_args("git", 4, r#"{"action":"show","revision":"HEAD"}"#),
         ];
         let eval = evaluate_tool_call_records("investigate", &[], &records, 0, false, 0.3);
         assert!(
@@ -2735,7 +2743,7 @@ mod tests {
                 r#"{"command":"cd tmp && cargo check 2>&1 | head -30"}"#,
             ),
             record_with_args(
-                "edit",
+                "str_replace",
                 2,
                 r#"{"path":"tmp/src/main.rs","old_str":"a","new_str":"b"}"#,
             ),
@@ -2874,7 +2882,7 @@ mod tests {
             record_with_args("bash", 1, "sed -n '10,50p' src/foo.rs"),
             // Edit invalidates per-file history.
             record_with_args(
-                "edit",
+                "str_replace",
                 2,
                 r#"{"path":"src/foo.rs","old_str":"x","new_str":"y"}"#,
             ),
@@ -2915,14 +2923,30 @@ mod tests {
     }
 
     #[test]
-    fn redundant_reads_recognizes_view_tool_with_overlapping_ranges() {
-        // The native `view` tool with overlapping `view_range` should also
-        // count — the failure mode is identical regardless of bash vs view.
+    fn redundant_reads_signal_recognizes_read_file_with_overlapping_ranges() {
+        // The native `read_file` tool with overlapping ranges should also
+        // count — the failure mode is identical regardless of bash vs read_file.
         let records = vec![
-            record_with_args("view", 0, r#"{"path":"src/foo.rs","view_range":[10,50]}"#),
-            record_with_args("view", 1, r#"{"path":"src/foo.rs","view_range":[20,60]}"#),
-            record_with_args("view", 2, r#"{"path":"src/foo.rs","view_range":[30,70]}"#),
-            record_with_args("view", 3, r#"{"path":"src/foo.rs","view_range":[40,80]}"#),
+            record_with_args(
+                "read_file",
+                0,
+                r#"{"path":"src/foo.rs","start_line":10,"end_line":50}"#,
+            ),
+            record_with_args(
+                "read_file",
+                1,
+                r#"{"path":"src/foo.rs","start_line":20,"end_line":60}"#,
+            ),
+            record_with_args(
+                "read_file",
+                2,
+                r#"{"path":"src/foo.rs","start_line":30,"end_line":70}"#,
+            ),
+            record_with_args(
+                "read_file",
+                3,
+                r#"{"path":"src/foo.rs","start_line":40,"end_line":80}"#,
+            ),
         ];
         let eval = evaluate_tool_call_records("q", &[], &records, 0, false, 0.3);
         let count = eval.signals.iter().find_map(|s| match s {
