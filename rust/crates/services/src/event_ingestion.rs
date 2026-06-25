@@ -458,6 +458,37 @@ fn iso8601_to_mysql_datetime(ts: &str) -> String {
         .unwrap_or_else(|_| ts.to_string())
 }
 
+fn ingestion_event_has_parent_edges(event: &IngestionEvent) -> bool {
+    event
+        .parent_event_id
+        .as_deref()
+        .is_some_and(|id| !id.trim().is_empty())
+        || event
+            .parent_event_ids
+            .iter()
+            .any(|id| !id.trim().is_empty())
+}
+
+fn bind_ingestion_event<'q>(
+    mut query: sqlx::query::Query<'q, sqlx::MySql, sqlx::mysql::MySqlArguments>,
+    event: &'q IngestionEvent,
+) -> sqlx::query::Query<'q, sqlx::MySql, sqlx::mysql::MySqlArguments> {
+    query = query
+        .bind(&event.event_id)
+        .bind(&event.session_id)
+        .bind(&event.user_id)
+        .bind(&event.event_type)
+        .bind(&event.content)
+        .bind(event.token_usage.as_ref().map(|v| v.to_string()))
+        .bind(&event.llm_model_used)
+        .bind(&event.skill_name)
+        .bind(event.metadata.as_ref().map(|v| v.to_string()))
+        .bind(iso8601_to_mysql_datetime(&event.created_at))
+        .bind(&event.parent_event_id)
+        .bind(&event.causal_chain_id);
+    query
+}
+
 /// The background worker that batches and flushes events to MatrixOne.
 pub struct EventIngestionWorker {
     rx: mpsc::Receiver<IngestionEvent>,
@@ -677,72 +708,96 @@ impl EventIngestionWorker {
             .await
             .map_err(|e| format!("begin tx: {e}"))?;
 
-        // Multi-row INSERT IGNORE — single round-trip for the whole batch
-        let placeholders: Vec<String> = (0..events.len())
-            .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)".to_string())
-            .collect();
-        let sql = format!(
-            "INSERT IGNORE INTO agent_events \
-             (event_id, session_id, user_id, event_type, content, \
-              token_usage, llm_model_used, skill_name, metadata, \
-              created_at, parent_event_id, causal_chain_id) \
-             VALUES {}",
-            placeholders.join(", ")
-        );
-
-        let mut query = sqlx::query(&sql);
+        let mut grouped_events =
+            std::collections::BTreeMap::<(&str, &str), Vec<&IngestionEvent>>::new();
         for event in events {
-            query = query
-                .bind(&event.event_id)
-                .bind(&event.session_id)
-                .bind(&event.user_id)
-                .bind(&event.event_type)
-                .bind(&event.content)
-                .bind(event.token_usage.as_ref().map(|v| v.to_string()))
-                .bind(&event.llm_model_used)
-                .bind(&event.skill_name)
-                .bind(event.metadata.as_ref().map(|v| v.to_string()))
-                .bind(iso8601_to_mysql_datetime(&event.created_at))
-                .bind(&event.parent_event_id)
-                .bind(&event.causal_chain_id);
+            grouped_events
+                .entry((event.user_id.as_str(), event.session_id.as_str()))
+                .or_default()
+                .push(event);
         }
 
-        let insert_result = query
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| format!("batch insert ({} events): {e}", events.len()))?;
+        let mut rows_inserted = 0usize;
+        for ((user_id, session_id), session_events) in grouped_events {
+            let mut plain_events = Vec::new();
+            let mut parented_events = Vec::new();
+            for event in session_events {
+                if ingestion_event_has_parent_edges(event) {
+                    parented_events.push(event);
+                } else {
+                    plain_events.push(event);
+                }
+            }
 
-        for event in events {
-            crate::storage::insert_agent_event_edges(
+            let mut session_rows_inserted = 0usize;
+            if !plain_events.is_empty() {
+                let placeholders: Vec<String> = (0..plain_events.len())
+                    .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)".to_string())
+                    .collect();
+                let sql = format!(
+                    "INSERT IGNORE INTO agent_events \
+                     (event_id, session_id, user_id, event_type, content, \
+                      token_usage, llm_model_used, skill_name, metadata, \
+                      created_at, parent_event_id, causal_chain_id) \
+                     VALUES {}",
+                    placeholders.join(", ")
+                );
+
+                let mut query = sqlx::query(&sql);
+                for event in &plain_events {
+                    query = bind_ingestion_event(query, event);
+                }
+
+                let insert_result = query
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| format!("batch insert ({user_id}/{session_id}): {e}"))?;
+                session_rows_inserted +=
+                    usize::try_from(insert_result.rows_affected()).unwrap_or(usize::MAX);
+            }
+
+            for event in parented_events {
+                let insert_result = bind_ingestion_event(
+                    sqlx::query(
+                        "INSERT IGNORE INTO agent_events \
+                         (event_id, session_id, user_id, event_type, content, \
+                          token_usage, llm_model_used, skill_name, metadata, \
+                          created_at, parent_event_id, causal_chain_id) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    ),
+                    event,
+                )
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| format!("event insert ({user_id}/{session_id}): {e}"))?;
+                if insert_result.rows_affected() == 0 {
+                    continue;
+                }
+                session_rows_inserted +=
+                    usize::try_from(insert_result.rows_affected()).unwrap_or(usize::MAX);
+                crate::storage::insert_agent_event_edges(
+                    &mut *tx,
+                    &event.event_id,
+                    event.parent_event_id.as_deref(),
+                    &event.parent_event_ids,
+                )
+                .await
+                .map_err(|e| format!("edge insert for {}: {e}", event.event_id))?;
+            }
+
+            if session_rows_inserted == 0 {
+                continue;
+            }
+            crate::storage::add_agent_session_event_count_or_create(
                 &mut *tx,
-                &event.event_id,
-                event.parent_event_id.as_deref(),
-                &event.parent_event_ids,
+                session_id,
+                user_id,
+                i64::try_from(session_rows_inserted).unwrap_or(i64::MAX),
+                None,
             )
             .await
-            .map_err(|e| format!("edge insert for {}: {e}", event.event_id))?;
-        }
-
-        let rows_inserted = insert_result.rows_affected() as usize;
-
-        // Update event_count on agent_sessions for each affected session.
-        //
-        // BUG FIX (Session 7875e355): Race condition between fast path increment
-        // and slow path COUNT(*) reconcile. Multiple flush_batch() calls running
-        // concurrently could cause count drift.
-        //
-        // Solution: Always use COUNT(*) reconcile to ensure accuracy. The performance
-        // cost is negligible (indexed query) and correctness is more important.
-        // Additionally, record last_event_sync_at to help diagnose future issues.
-        let mut session_counts: std::collections::HashMap<&str, usize> =
-            std::collections::HashMap::new();
-        let mut session_users: std::collections::HashMap<&str, &str> =
-            std::collections::HashMap::new();
-        for event in events {
-            *session_counts.entry(&event.session_id).or_default() += 1;
-            session_users
-                .entry(&event.session_id)
-                .or_insert(event.user_id.as_str());
+            .map_err(|e| format!("event_count delta for {session_id}: {e}"))?;
+            rows_inserted += session_rows_inserted;
         }
 
         // Log if duplicates were detected (useful for debugging)
@@ -753,27 +808,6 @@ impl EventIngestionWorker {
                 "INSERT IGNORE skipped {skipped} duplicates out of {} events",
                 events.len()
             );
-        }
-
-        // Always reconcile from actual row count to prevent drift from concurrent flushes.
-        // This is more expensive than increment but guarantees accuracy.
-        for session_id in session_counts.keys() {
-            let user_id = session_users
-                .get(session_id)
-                .copied()
-                .ok_or_else(|| format!("missing user_id for session {session_id}"))?;
-            let event_count =
-                crate::storage::load_agent_event_count_for_user(&mut *tx, session_id, user_id)
-                    .await
-                    .map_err(|e| format!("event_count load for {session_id}: {e}"))?;
-            crate::storage::upsert_agent_session_event_count(
-                &mut *tx,
-                session_id,
-                user_id,
-                event_count,
-            )
-            .await
-            .map_err(|e| format!("event_count reconcile for {session_id}: {e}"))?;
         }
 
         // Close sessions that have a session_end event
@@ -1682,31 +1716,6 @@ mod tests {
         // Third enqueue also overflows
         sender.enqueue(test_event("e3", "s1", "turn"));
         assert_eq!(sender.overflow_count(), 2);
-    }
-
-    #[test]
-    fn insert_batch_sql_uses_rows_affected_guard() {
-        // Verify the insert_batch method captures rows_affected and
-        // reconciles event_count when INSERT IGNORE skips duplicates.
-        // This is a compile-time documentation test: the actual logic is
-        // exercised by integration tests against MatrixOne.
-        let source = include_str!("event_ingestion.rs");
-        assert!(
-            source.contains("rows_affected()"),
-            "insert_batch must check rows_affected to detect INSERT IGNORE skips"
-        );
-        assert!(
-            source.contains("load_agent_event_count"),
-            "insert_batch must load actual persisted agent_event counts before reconciling event_count"
-        );
-        assert!(
-            source.contains("upsert_agent_session_event_count"),
-            "insert_batch must reuse the shared agent_sessions upsert helper before reconciling event_count"
-        );
-        assert!(
-            source.contains("rows_affected()"),
-            "insert_batch must still preserve duplicate-detection logic while reconciling via the shared helper"
-        );
     }
 
     // ── Shutdown handle tests ───────────────────────────────────────────

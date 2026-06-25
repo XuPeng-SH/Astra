@@ -111,7 +111,7 @@ impl SessionService for CaptureEnabledSessionService {
             sessions: Vec::new(),
             total: 0,
             limit: 20,
-            offset: 0,
+            next_cursor: None,
         })
     }
 
@@ -156,12 +156,14 @@ impl SessionService for CaptureEnabledSessionService {
         _session_id: String,
         _user_id: String,
         _limit: u32,
-        _offset: u32,
+        _cursor: Option<astra_services::SessionActivityCursor>,
     ) -> Result<SessionActivityRecord, (StatusCode, Json<ErrorResponse>)> {
         Ok(SessionActivityRecord {
             session_id: String::new(),
             activities: vec![],
             total: 0,
+            limit: 1,
+            next_cursor: None,
         })
     }
 }

@@ -13,6 +13,7 @@ import type {
   EdgeHeartbeatRequestBody,
   EdgeRegisterRequestBody,
   EdgeStatusResponse,
+  EventListCursor,
   EventListFilters,
   EventListResponse,
   EventResponse,
@@ -44,6 +45,7 @@ import type {
   RuntimeSessionUpdateBody,
   RuntimeTranscriptParams,
   RuntimeTranscriptResponse,
+  SessionActivityCursor,
   SessionActivityResponse,
   SessionAuditSummary,
   SessionInfo,
@@ -486,7 +488,12 @@ export class AstraClient {
   ): Promise<RuntimeSessionListResponse> {
     const q = buildQueryString({
       ...(params.limit !== undefined ? { limit: params.limit } : {}),
-      ...(params.offset !== undefined ? { offset: params.offset } : {}),
+      ...(params.cursor
+        ? {
+            after_updated_at: params.cursor.updated_at,
+            after_session_id: params.cursor.session_id,
+          }
+        : {}),
     });
     return this.fetch<RuntimeSessionListResponse>(`${PATH_SESSIONS}${q}`);
   }
@@ -570,11 +577,16 @@ export class AstraClient {
   /** `GET /sessions/{id}/activity` */
   async getSessionActivity(
     sessionId: string,
-    opts?: { limit?: number; offset?: number },
+    opts?: { limit?: number; cursor?: SessionActivityCursor },
   ): Promise<SessionActivityResponse> {
     const q = buildQueryString({
       ...(opts?.limit !== undefined ? { limit: opts.limit } : {}),
-      ...(opts?.offset !== undefined ? { offset: opts.offset } : {}),
+      ...(opts?.cursor
+        ? {
+            after_created_at: opts.cursor.created_at,
+            after_log_id: opts.cursor.log_id,
+          }
+        : {}),
     });
     return this.fetch<SessionActivityResponse>(
       `${sessionActivityPath(sessionId)}${q}`,
@@ -614,11 +626,16 @@ export class AstraClient {
   /** `GET /events/session/{session_id}` */
   async getSessionEvents(
     sessionId: string,
-    opts?: { limit?: number; offset?: number },
+    opts?: { limit?: number; cursor?: EventListCursor },
   ): Promise<EventListResponse> {
     const q = buildQueryString({
       ...(opts?.limit !== undefined ? { limit: opts.limit } : {}),
-      ...(opts?.offset !== undefined ? { offset: opts.offset } : {}),
+      ...(opts?.cursor
+        ? {
+            after_created_at: opts.cursor.created_at,
+            after_event_id: opts.cursor.event_id,
+          }
+        : {}),
     });
     const raw = await this.fetch<EventListResponse>(
       `${eventsSessionPath(sessionId)}${q}`,
@@ -636,7 +653,12 @@ export class AstraClient {
         ? { causal_chain_id: filters.causalChainId }
         : {}),
       ...(filters?.limit !== undefined ? { limit: filters.limit } : {}),
-      ...(filters?.offset !== undefined ? { offset: filters.offset } : {}),
+      ...(filters?.cursor
+        ? {
+            after_created_at: filters.cursor.created_at,
+            after_event_id: filters.cursor.event_id,
+          }
+        : {}),
     });
     const raw = await this.fetch<EventListResponse>(`${PATH_EVENTS}${q}`);
     return normalizeEventList(raw);
@@ -892,7 +914,13 @@ export class AstraClient {
   ): Promise<RuntimeSkillListResponse> {
     const q = buildQueryString({
       ...(params.limit !== undefined ? { limit: params.limit } : {}),
-      ...(params.offset !== undefined ? { offset: params.offset } : {}),
+      ...(params.cursor
+        ? {
+            after_skill_name: params.cursor.skill_name,
+            after_version: params.cursor.version,
+            after_skill_id: params.cursor.skill_id,
+          }
+        : {}),
     });
     return this.fetch<RuntimeSkillListResponse>(`${PATH_SKILLS}${q}`);
   }

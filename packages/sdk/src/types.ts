@@ -976,7 +976,19 @@ export type RuntimeSessionListResponse = {
   sessions: RuntimeSessionResponse[];
   total?: number;
   limit?: number;
-  offset?: number;
+  next_cursor?: RuntimeSessionListCursor | null;
+};
+
+/**
+ * Cursor for session list pagination.
+ *
+ * `updated_at` carries `COALESCE(updated_at, created_at)` — the ordering key,
+ * not strictly the `updated_at` column. Sessions that were never updated will
+ * have their `created_at` timestamp here.
+ */
+export type RuntimeSessionListCursor = {
+  updated_at: string;
+  session_id: string;
 };
 
 export type RuntimeSessionCreateBody = {
@@ -993,7 +1005,7 @@ export type RuntimeSessionUpdateBody = {
 
 export type RuntimeSessionListParams = {
   limit?: number;
-  offset?: number;
+  cursor?: RuntimeSessionListCursor;
 };
 
 export type RuntimeTranscriptItemResponse = {
@@ -1118,12 +1130,18 @@ export type RuntimeSkillListResponse = {
   skills?: RuntimeSkillListItem[];
   total?: number;
   limit?: number;
-  offset?: number;
+  next_cursor?: RuntimeSkillListCursor | null;
+};
+
+export type RuntimeSkillListCursor = {
+  skill_name: string;
+  version: string;
+  skill_id: string;
 };
 
 export type RuntimeSkillListParams = {
   limit?: number;
-  offset?: number;
+  cursor?: RuntimeSkillListCursor;
 };
 
 /** JSON body for `POST /skills` — matches services `RegisterSkillRequest`. */
@@ -1210,10 +1228,17 @@ export type SessionActivityEntryResponse = {
   created_at: string;
 };
 
+export type SessionActivityCursor = {
+  created_at: string;
+  log_id: string;
+};
+
 export type SessionActivityResponse = {
   session_id: string;
   activities: SessionActivityEntryResponse[];
   total: number;
+  limit: number;
+  next_cursor?: SessionActivityCursor | null;
 };
 
 // ─── Run list ─────────────────────────────────────────────────────
@@ -1308,7 +1333,12 @@ export type EventListResponse = {
   events: EventResponse[];
   total: number;
   limit: number;
-  offset: number;
+  next_cursor?: EventListCursor | null;
+};
+
+export type EventListCursor = {
+  created_at: string;
+  event_id: string;
 };
 
 export type EventListFilters = {
@@ -1317,7 +1347,7 @@ export type EventListFilters = {
   agentId?: string;
   causalChainId?: string;
   limit?: number;
-  offset?: number;
+  cursor?: EventListCursor;
 };
 
 // ─── Edge status ───────────────────────────────────────────────────

@@ -1,5 +1,5 @@
 use crate::server::*;
-use astra_core::{STATUS_CANCELLED, is_duplicate_key_error};
+use astra_core::{STATUS_CANCELLED, error_response, is_duplicate_key_error};
 use astra_services::context_manifest::session_artifact_raw_payload_is_available;
 use astra_services::session_restore::SessionRestoreService;
 use astra_services::session_workspace::{WORKSPACE_METADATA_ARTIFACT_KIND, WorkspaceMetadata};
@@ -323,6 +323,7 @@ pub(crate) async fn list_sessions_handler(
     Query(query): Query<SessionListQuery>,
 ) -> Result<Json<SessionListResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
+    let cursor = query.cursor()?;
     let sessions = state
         .session_service
         .list_sessions(SessionListFilter {
@@ -330,7 +331,7 @@ pub(crate) async fn list_sessions_handler(
             agent_id: query.agent_id,
             status: query.session_status,
             limit: query.limit,
-            offset: query.offset,
+            cursor,
         })
         .await?;
     Ok(Json(SessionListResponse::from(sessions)))
@@ -1351,7 +1352,7 @@ pub(crate) async fn session_activity_handler(
 
     let activities = state
         .session_service
-        .get_session_activity(session_id, user.user_id, query.limit, query.offset)
+        .get_session_activity(session_id, user.user_id, query.limit, query.cursor()?)
         .await?;
     Ok(Json(SessionActivityResponse::from(activities)))
 }
@@ -2071,7 +2072,7 @@ mod tests {
             _session_id: String,
             _user_id: String,
             _limit: u32,
-            _offset: u32,
+            _cursor: Option<astra_services::auth::SessionActivityCursor>,
         ) -> Result<SessionActivityRecord, (StatusCode, Json<ErrorResponse>)> {
             unreachable!("get_session_activity is not used in session artifact tests")
         }

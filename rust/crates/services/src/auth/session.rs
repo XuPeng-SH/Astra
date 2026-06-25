@@ -1,13 +1,31 @@
-use crate::pagination::{MAX_API_LIST_OFFSET, clamp_api_list_pagination};
+use crate::pagination::MAX_API_LIST_LIMIT;
 use crate::storage::{log_session_audit, session_record_from_row};
 use astra_core::{ErrorResponse, MatrixOneSettings, SharedPool, error_response, internal_error};
 use async_trait::async_trait;
 use axum::{Json, http::StatusCode};
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use sqlx::{MySql, QueryBuilder, Row, query};
 use uuid::Uuid;
 
 const MAX_SESSION_ACTIVITY_ROWS: u32 = 200;
+const SESSION_LIST_CURSOR_FILTER_SQL: &str = " AND (COALESCE(updated_at, created_at) < ";
+const SESSION_LIST_CURSOR_TIE_SQL: &str = " OR (COALESCE(updated_at, created_at) = ";
+const SESSION_LIST_ORDER_SQL: &str =
+    " ORDER BY COALESCE(updated_at, created_at) DESC, session_id DESC LIMIT ";
+const SESSION_ACTIVITY_SELECT_SQL: &str = "SELECT log_id, action, \
+        IFNULL(CAST(details AS CHAR), 'null') AS details_json, \
+        DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s.%f') AS created_at \
+     FROM auth_audit_logs \
+     WHERE user_id = ? AND resource_type = 'session' AND resource_id = ? \
+     ORDER BY created_at DESC, log_id DESC LIMIT ?";
+const SESSION_ACTIVITY_SELECT_AFTER_SQL: &str = "SELECT log_id, action, \
+        IFNULL(CAST(details AS CHAR), 'null') AS details_json, \
+        DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s.%f') AS created_at \
+     FROM auth_audit_logs \
+     WHERE user_id = ? AND resource_type = 'session' AND resource_id = ? \
+       AND (created_at < ? OR (created_at = ? AND log_id < ?)) \
+     ORDER BY created_at DESC, log_id DESC LIMIT ?";
 
 #[async_trait]
 pub trait SessionService: Send + Sync {
@@ -46,7 +64,7 @@ pub trait SessionService: Send + Sync {
         session_id: String,
         user_id: String,
         limit: u32,
-        offset: u32,
+        cursor: Option<SessionActivityCursor>,
     ) -> Result<SessionActivityRecord, (StatusCode, Json<ErrorResponse>)>;
 }
 
@@ -70,7 +88,7 @@ pub struct SessionListFilter {
     pub agent_id: Option<String>,
     pub status: Option<String>,
     pub limit: u32,
-    pub offset: u32,
+    pub cursor: Option<SessionListCursor>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -92,7 +110,84 @@ pub struct SessionListRecord {
     pub sessions: Vec<SessionRecord>,
     pub total: i64,
     pub limit: u32,
-    pub offset: u32,
+    pub next_cursor: Option<SessionListCursor>,
+}
+
+/// Cursor for session list pagination.
+///
+/// The `updated_at` field carries the value of `COALESCE(updated_at, created_at)` from the
+/// database — it is the *ordering key*, not strictly the `updated_at` column.  When a session
+/// has never been updated the cursor will contain its `created_at` timestamp.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionListCursor {
+    pub updated_at: String,
+    pub session_id: String,
+}
+
+fn validate_session_list_limit(limit: u32) -> u32 {
+    limit.clamp(1, MAX_API_LIST_LIMIT)
+}
+
+fn session_list_query_limit(limit: u32) -> i64 {
+    i64::from(limit) + 1
+}
+
+fn session_list_cursor_db_updated_at(
+    cursor: &SessionListCursor,
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    let updated_at = cursor.updated_at.trim();
+    if updated_at.is_empty() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid session list cursor: updated_at is required",
+        ));
+    }
+    let db_updated_at = updated_at.replace('T', " ");
+    if db_updated_at.len() != "YYYY-MM-DD HH:MM:SS.ffffff".len()
+        || db_updated_at.as_bytes().get(10) != Some(&b' ')
+        || db_updated_at.as_bytes().get(19) != Some(&b'.')
+        || chrono::NaiveDateTime::parse_from_str(&db_updated_at, "%Y-%m-%d %H:%M:%S%.6f").is_err()
+    {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            format!("invalid session list cursor timestamp: {updated_at}"),
+        ));
+    }
+    Ok(db_updated_at)
+}
+
+fn session_list_cursor_session_id(
+    cursor: &SessionListCursor,
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    let session_id = cursor.session_id.trim();
+    if session_id.is_empty() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid session list cursor: session_id is required",
+        ));
+    }
+    Ok(session_id.to_string())
+}
+
+fn session_list_cursor_from_row(
+    row: &sqlx::mysql::MySqlRow,
+) -> Result<SessionListCursor, (StatusCode, Json<ErrorResponse>)> {
+    let updated_at: String = row.try_get("cursor_updated_at").map_err(internal_error)?;
+    let session_id: String = row.try_get("session_id").map_err(internal_error)?;
+    if updated_at.trim().is_empty() {
+        return Err(internal_error(format!(
+            "invalid agent_sessions cursor: session_id={session_id}, column=cursor_updated_at, value is empty"
+        )));
+    }
+    if session_id.trim().is_empty() {
+        return Err(internal_error(
+            "invalid agent_sessions cursor: column=session_id, value is empty",
+        ));
+    }
+    Ok(SessionListCursor {
+        updated_at,
+        session_id,
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -108,6 +203,112 @@ pub struct SessionActivityRecord {
     pub session_id: String,
     pub activities: Vec<SessionActivityEntryRecord>,
     pub total: i64,
+    pub limit: u32,
+    pub next_cursor: Option<SessionActivityCursor>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionActivityCursor {
+    pub created_at: String,
+    pub log_id: String,
+}
+
+fn validate_session_activity_limit(limit: u32) -> u32 {
+    limit.clamp(1, MAX_SESSION_ACTIVITY_ROWS)
+}
+
+fn session_activity_query_limit(limit: u32) -> i64 {
+    i64::from(limit) + 1
+}
+
+fn session_activity_cursor_db_created_at(
+    cursor: &SessionActivityCursor,
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    let created_at = cursor.created_at.trim();
+    if created_at.is_empty() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid session activity cursor: created_at is required",
+        ));
+    }
+    let db_created_at = created_at.replace('T', " ");
+    if db_created_at.len() != "YYYY-MM-DD HH:MM:SS.ffffff".len()
+        || db_created_at.as_bytes().get(10) != Some(&b' ')
+        || db_created_at.as_bytes().get(19) != Some(&b'.')
+        || chrono::NaiveDateTime::parse_from_str(&db_created_at, "%Y-%m-%d %H:%M:%S%.6f").is_err()
+    {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            format!("invalid session activity cursor timestamp: {created_at}"),
+        ));
+    }
+    Ok(db_created_at)
+}
+
+fn session_activity_cursor_log_id(
+    cursor: &SessionActivityCursor,
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    let log_id = cursor.log_id.trim();
+    if log_id.is_empty() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid session activity cursor: log_id is required",
+        ));
+    }
+    Ok(log_id.to_string())
+}
+
+fn session_activity_cursor_from_entry(
+    entry: &SessionActivityEntryRecord,
+) -> Result<SessionActivityCursor, (StatusCode, Json<ErrorResponse>)> {
+    if entry.created_at.trim().is_empty() {
+        return Err(internal_error(format!(
+            "invalid auth_audit_logs cursor: log_id={}, column=created_at, value is empty",
+            entry.log_id
+        )));
+    }
+    if entry.log_id.trim().is_empty() {
+        return Err(internal_error(
+            "invalid auth_audit_logs cursor: column=log_id, value is empty",
+        ));
+    }
+    Ok(SessionActivityCursor {
+        created_at: entry.created_at.clone(),
+        log_id: entry.log_id.clone(),
+    })
+}
+
+fn parse_session_activity_details(
+    log_id: &str,
+    details_json: Option<String>,
+) -> Result<serde_json::Value, (StatusCode, Json<ErrorResponse>)> {
+    let Some(details_json) = details_json else {
+        return Ok(serde_json::Value::Null);
+    };
+    serde_json::from_str(&details_json).map_err(|source| {
+        internal_error(format!(
+            "invalid auth session activity details JSON: log_id={log_id}: {source}"
+        ))
+    })
+}
+
+fn session_activity_entry_from_row(
+    row: sqlx::mysql::MySqlRow,
+) -> Result<SessionActivityEntryRecord, (StatusCode, Json<ErrorResponse>)> {
+    let log_id: String = row.try_get("log_id").map_err(internal_error)?;
+    let action: String = row.try_get("action").map_err(internal_error)?;
+    let details = parse_session_activity_details(
+        &log_id,
+        row.try_get::<Option<String>, _>("details_json")
+            .map_err(internal_error)?,
+    )?;
+    let created_at: String = row.try_get("created_at").map_err(internal_error)?;
+    Ok(SessionActivityEntryRecord {
+        log_id,
+        action,
+        details,
+        created_at,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -202,11 +403,11 @@ impl SessionService for DatabaseSessionService {
 
     async fn list_sessions(
         &self,
-        mut filter: SessionListFilter,
+        filter: SessionListFilter,
     ) -> Result<SessionListRecord, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
 
-        (filter.limit, filter.offset) = clamp_api_list_pagination(filter.limit, filter.offset);
+        let limit = validate_session_list_limit(filter.limit);
 
         let mut count_query = QueryBuilder::<MySql>::new(
             "SELECT COUNT(session_id) AS total FROM agent_sessions WHERE user_id = ",
@@ -226,13 +427,16 @@ impl SessionService for DatabaseSessionService {
             .fetch_one(&pool)
             .await
             .map_err(internal_error)?;
-        let total = total_row.try_get::<i64, _>("total").unwrap_or(0);
+        let total = total_row
+            .try_get::<i64, _>("total")
+            .map_err(internal_error)?;
 
         let mut list_query = QueryBuilder::<MySql>::new(
             "SELECT session_id, user_id, agent_id, title, status, event_count, \
              DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at, \
              DATE_FORMAT(updated_at, '%Y-%m-%dT%H:%i:%s') AS updated_at, \
              DATE_FORMAT(ended_at, '%Y-%m-%dT%H:%i:%s') AS ended_at, \
+             DATE_FORMAT(COALESCE(updated_at, created_at), '%Y-%m-%dT%H:%i:%s.%f') AS cursor_updated_at, \
              IFNULL(CAST(`metadata` AS CHAR), '{}') AS metadata_json \
              FROM agent_sessions WHERE user_id = ",
         );
@@ -245,26 +449,50 @@ impl SessionService for DatabaseSessionService {
             list_query.push(" AND status = ");
             list_query.push_bind(status);
         }
-        list_query.push(" ORDER BY updated_at DESC LIMIT ");
-        list_query.push_bind(i64::from(filter.limit));
-        list_query.push(" OFFSET ");
-        list_query.push_bind(i64::from(filter.offset));
+        if let Some(cursor) = &filter.cursor {
+            let updated_at = session_list_cursor_db_updated_at(cursor)?;
+            let session_id = session_list_cursor_session_id(cursor)?;
+            list_query.push(SESSION_LIST_CURSOR_FILTER_SQL);
+            list_query.push_bind(updated_at.clone());
+            list_query.push(SESSION_LIST_CURSOR_TIE_SQL);
+            list_query.push_bind(updated_at);
+            list_query.push(" AND session_id < ");
+            list_query.push_bind(session_id);
+            list_query.push("))");
+        }
+        list_query.push(SESSION_LIST_ORDER_SQL);
+        list_query.push_bind(session_list_query_limit(limit));
 
         let rows = list_query
             .build()
             .fetch_all(&pool)
             .await
             .map_err(internal_error)?;
-        let mut sessions = Vec::with_capacity(rows.len());
+        let mut entries = Vec::with_capacity(rows.len());
         for row in rows {
-            sessions.push(session_record_from_row(row)?);
+            let cursor = session_list_cursor_from_row(&row)?;
+            let session = session_record_from_row(row)?;
+            entries.push((session, cursor));
         }
+        let has_more = entries.len() > limit as usize;
+        if has_more {
+            entries.truncate(limit as usize);
+        }
+        let next_cursor = if has_more {
+            entries.last().map(|(_, cursor)| cursor.clone())
+        } else {
+            None
+        };
+        let sessions = entries
+            .into_iter()
+            .map(|(session, _)| session)
+            .collect::<Vec<_>>();
 
         Ok(SessionListRecord {
             sessions,
             total,
-            limit: filter.limit,
-            offset: filter.offset,
+            limit,
+            next_cursor,
         })
     }
 
@@ -394,7 +622,7 @@ impl SessionService for DatabaseSessionService {
         session_id: String,
         user_id: String,
         limit: u32,
-        offset: u32,
+        cursor: Option<SessionActivityCursor>,
     ) -> Result<SessionActivityRecord, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
         self.fetch_session_for_user(&pool, &session_id, &user_id)
@@ -405,8 +633,7 @@ impl SessionService for DatabaseSessionService {
                     format!("Session {session_id} 不存在"),
                 )
             })?;
-        let limit = limit.min(MAX_SESSION_ACTIVITY_ROWS);
-        let offset = offset.min(MAX_API_LIST_OFFSET);
+        let limit = validate_session_activity_limit(limit);
 
         let count_row = query(
             "SELECT COUNT(*) as cnt FROM auth_audit_logs \
@@ -417,39 +644,55 @@ impl SessionService for DatabaseSessionService {
         .fetch_one(&pool)
         .await
         .map_err(internal_error)?;
-        let total: i64 = count_row.try_get("cnt").unwrap_or(0);
+        let total: i64 = count_row.try_get("cnt").map_err(internal_error)?;
 
-        let rows = query(
-            "SELECT log_id, action, details, created_at FROM auth_audit_logs \
-             WHERE user_id = ? AND resource_type = 'session' AND resource_id = ? \
-             ORDER BY created_at DESC LIMIT ? OFFSET ?",
-        )
-        .bind(&user_id)
-        .bind(&session_id)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&pool)
-        .await
-        .map_err(internal_error)?;
+        let select_query = if let Some(cursor) = &cursor {
+            let created_at = session_activity_cursor_db_created_at(cursor)?;
+            let log_id = session_activity_cursor_log_id(cursor)?;
+            let mut query = query(SESSION_ACTIVITY_SELECT_AFTER_SQL)
+                .bind(&user_id)
+                .bind(&session_id)
+                .bind(created_at.clone())
+                .bind(created_at)
+                .bind(log_id);
+            query = query.bind(session_activity_query_limit(limit));
+            query
+        } else {
+            let mut query = query(SESSION_ACTIVITY_SELECT_SQL)
+                .bind(&user_id)
+                .bind(&session_id);
+            query = query.bind(session_activity_query_limit(limit));
+            query
+        };
 
-        let activities = rows
-            .iter()
-            .map(|row| {
-                let details_str: String = row.try_get("details").unwrap_or_default();
-                let details = serde_json::from_str(&details_str).unwrap_or(serde_json::Value::Null);
-                SessionActivityEntryRecord {
-                    log_id: row.try_get("log_id").unwrap_or_default(),
-                    action: row.try_get("action").unwrap_or_default(),
-                    details,
-                    created_at: row.try_get::<String, _>("created_at").unwrap_or_default(),
-                }
-            })
-            .collect();
+        let rows = select_query
+            .fetch_all(&pool)
+            .await
+            .map_err(internal_error)?;
+
+        let mut activities = rows
+            .into_iter()
+            .map(session_activity_entry_from_row)
+            .collect::<Result<Vec<_>, _>>()?;
+        let has_more = activities.len() > limit as usize;
+        if has_more {
+            activities.truncate(limit as usize);
+        }
+        let next_cursor = if has_more {
+            activities
+                .last()
+                .map(session_activity_cursor_from_entry)
+                .transpose()?
+        } else {
+            None
+        };
 
         Ok(SessionActivityRecord {
             session_id,
             activities,
             total,
+            limit,
+            next_cursor,
         })
     }
 }
@@ -813,11 +1056,156 @@ impl SessionService for UnconfiguredSessionService {
         _session_id: String,
         _user_id: String,
         _limit: u32,
-        _offset: u32,
+        _cursor: Option<SessionActivityCursor>,
     ) -> Result<SessionActivityRecord, (StatusCode, Json<ErrorResponse>)> {
         Err(error_response(
             StatusCode::NOT_IMPLEMENTED,
             "Session service not configured",
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_list_limit_has_hard_cap_and_minimum() {
+        assert_eq!(validate_session_list_limit(0), 1);
+        assert_eq!(validate_session_list_limit(10), 10);
+        assert_eq!(validate_session_list_limit(u32::MAX), MAX_API_LIST_LIMIT);
+    }
+
+    #[test]
+    fn session_list_cursor_rejects_incomplete_values() {
+        let cursor = SessionListCursor {
+            updated_at: "2026-04-01T10:00:00.123456".to_string(),
+            session_id: "session-1".to_string(),
+        };
+        assert_eq!(
+            session_list_cursor_db_updated_at(&cursor).unwrap(),
+            "2026-04-01 10:00:00.123456"
+        );
+        assert_eq!(
+            session_list_cursor_session_id(&cursor).unwrap(),
+            "session-1"
+        );
+
+        let invalid_time = SessionListCursor {
+            updated_at: "2026-04-01T10:00:00".to_string(),
+            session_id: "session-1".to_string(),
+        };
+        assert_eq!(
+            session_list_cursor_db_updated_at(&invalid_time)
+                .unwrap_err()
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+
+        let missing_session_id = SessionListCursor {
+            updated_at: "2026-04-01T10:00:00.123456".to_string(),
+            session_id: "  ".to_string(),
+        };
+        assert_eq!(
+            session_list_cursor_session_id(&missing_session_id)
+                .unwrap_err()
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn session_list_sql_contract_uses_seek_cursor_not_offset() {
+        let order_sql = SESSION_LIST_ORDER_SQL.to_ascii_uppercase();
+        let cursor_sql = format!(
+            "{}?{}? AND session_id < ?))",
+            SESSION_LIST_CURSOR_FILTER_SQL, SESSION_LIST_CURSOR_TIE_SQL
+        )
+        .to_ascii_uppercase();
+        assert!(!order_sql.contains(" OFFSET "));
+        assert!(!cursor_sql.contains(" OFFSET "));
+        assert!(order_sql.contains("SESSION_ID DESC"));
+        assert!(cursor_sql.contains("SESSION_ID < ?"));
+    }
+
+    #[test]
+    fn session_activity_limit_has_hard_cap_and_minimum() {
+        assert_eq!(validate_session_activity_limit(0), 1);
+        assert_eq!(validate_session_activity_limit(10), 10);
+        assert_eq!(
+            validate_session_activity_limit(u32::MAX),
+            MAX_SESSION_ACTIVITY_ROWS
+        );
+    }
+
+    #[test]
+    fn session_activity_cursor_rejects_incomplete_values() {
+        let cursor = SessionActivityCursor {
+            created_at: "2026-04-01T10:00:00.123456".to_string(),
+            log_id: "log-1".to_string(),
+        };
+        assert_eq!(
+            session_activity_cursor_db_created_at(&cursor).unwrap(),
+            "2026-04-01 10:00:00.123456"
+        );
+        assert_eq!(session_activity_cursor_log_id(&cursor).unwrap(), "log-1");
+
+        let invalid_time = SessionActivityCursor {
+            created_at: "2026-04-01T10:00:00".to_string(),
+            log_id: "log-1".to_string(),
+        };
+        assert_eq!(
+            session_activity_cursor_db_created_at(&invalid_time)
+                .unwrap_err()
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+
+        let missing_log_id = SessionActivityCursor {
+            created_at: "2026-04-01T10:00:00.123456".to_string(),
+            log_id: "  ".to_string(),
+        };
+        assert_eq!(
+            session_activity_cursor_log_id(&missing_log_id)
+                .unwrap_err()
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn session_activity_sql_contract_uses_seek_cursor_not_offset() {
+        let base_sql = SESSION_ACTIVITY_SELECT_SQL.to_ascii_uppercase();
+        let cursor_sql = SESSION_ACTIVITY_SELECT_AFTER_SQL.to_ascii_uppercase();
+        assert!(!base_sql.contains(" OFFSET "));
+        assert!(!cursor_sql.contains(" OFFSET "));
+        assert!(cursor_sql.contains("CREATED_AT < ?"));
+        assert!(cursor_sql.contains("LOG_ID < ?"));
+        assert!(cursor_sql.contains("ORDER BY CREATED_AT DESC, LOG_ID DESC"));
+    }
+
+    #[test]
+    fn session_activity_details_reject_invalid_json() {
+        assert_eq!(
+            parse_session_activity_details("log-1", None).unwrap(),
+            serde_json::Value::Null
+        );
+
+        let parsed = parse_session_activity_details("log-1", Some(r#"{"ok":true}"#.into()))
+            .expect("valid audit details JSON");
+        assert_eq!(parsed["ok"], serde_json::Value::Bool(true));
+
+        let error = parse_session_activity_details("log-1", Some("{bad".into()))
+            .expect_err("invalid audit details JSON should be rejected");
+        assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            error
+                .1
+                .0
+                .detail
+                .contains("invalid auth session activity details JSON"),
+            "unexpected error: {:?}",
+            error.1.0
+        );
     }
 }

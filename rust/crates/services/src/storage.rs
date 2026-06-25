@@ -101,25 +101,6 @@ pub fn normalized_parent_event_ids(
     out
 }
 
-pub async fn load_agent_event_count_for_user<'e, E>(
-    executor: E,
-    session_id: &str,
-    user_id: &str,
-) -> Result<i64, sqlx::Error>
-where
-    E: Executor<'e, Database = MySql>,
-{
-    let row = query(
-        "SELECT COUNT(*) AS event_count FROM agent_events \
-         WHERE session_id = ? AND user_id = ?",
-    )
-    .bind(session_id)
-    .bind(user_id)
-    .fetch_one(executor)
-    .await?;
-    row.try_get::<i64, _>("event_count")
-}
-
 pub async fn agent_session_exists_for_user<'e, E>(
     executor: E,
     session_id: &str,
@@ -158,32 +139,131 @@ where
     Ok(row.is_some())
 }
 
-pub async fn upsert_agent_session_event_count<'e, E>(
+pub async fn bump_agent_session_event_count<'e, E>(
     executor: E,
     session_id: &str,
     user_id: &str,
-    event_count: i64,
+    delta: i64,
+    last_event_id: Option<&str>,
 ) -> Result<(), sqlx::Error>
 where
     E: Executor<'e, Database = MySql>,
 {
-    // MatrixOne rejects updating key columns in ON DUPLICATE KEY UPDATE.
-    // Owner mismatch still fails atomically by assigning NULL to NOT NULL
-    // event_count, rolling back the caller's transaction before side effects persist.
-    query(
+    let result = if delta >= 0 {
+        query(
+            "UPDATE agent_sessions \
+             SET event_count = event_count + ?, \
+                 updated_at = NOW(6), \
+                 last_active_at = NOW(6), \
+                 last_event_id = COALESCE(?, last_event_id) \
+             WHERE session_id = ? AND user_id = ?",
+        )
+        .bind(delta)
+        .bind(last_event_id)
+        .bind(session_id)
+        .bind(user_id)
+        .execute(executor)
+        .await?
+    } else {
+        let decrement = delta.saturating_abs();
+        query(
+            "UPDATE agent_sessions \
+             SET event_count = CASE \
+                     WHEN event_count >= ? THEN event_count - ? \
+                     ELSE 0 \
+                 END, \
+                 updated_at = NOW(6), \
+                 last_active_at = NOW(6), \
+                 last_event_id = COALESCE(?, last_event_id) \
+             WHERE session_id = ? AND user_id = ?",
+        )
+        .bind(decrement)
+        .bind(decrement)
+        .bind(last_event_id)
+        .bind(session_id)
+        .bind(user_id)
+        .execute(executor)
+        .await?
+    };
+    if result.rows_affected() == 0 {
+        return Err(sqlx::Error::RowNotFound);
+    }
+    Ok(())
+}
+
+pub async fn add_agent_session_event_count_or_create<'e, E>(
+    executor: E,
+    session_id: &str,
+    user_id: &str,
+    delta: i64,
+    last_event_id: Option<&str>,
+) -> Result<(), sqlx::Error>
+where
+    E: Executor<'e, Database = MySql>,
+{
+    if delta < 0 {
+        return Err(sqlx::Error::Protocol(
+            "add_agent_session_event_count_or_create requires a non-negative delta".into(),
+        ));
+    }
+
+    let result = query(
         "INSERT INTO agent_sessions \
-         (session_id, user_id, status, event_count, created_at, updated_at, last_active_at) \
-         VALUES (?, ?, 'active', ?, NOW(6), NOW(6), NOW(6)) \
+         (session_id, user_id, status, event_count, last_event_id, created_at, updated_at, last_active_at) \
+         SELECT ?, ?, 'active', ?, ?, NOW(6), NOW(6), NOW(6) \
+         FROM DUAL \
+         WHERE NOT EXISTS ( \
+             SELECT 1 FROM agent_sessions \
+             WHERE session_id = ? AND user_id <> ? \
+             LIMIT 1 \
+         ) \
          ON DUPLICATE KEY UPDATE \
-         event_count = CASE WHEN user_id = VALUES(user_id) THEN VALUES(event_count) ELSE NULL END, \
+         event_count = CASE WHEN user_id = VALUES(user_id) THEN event_count + VALUES(event_count) ELSE NULL END, \
+         last_event_id = CASE WHEN user_id = VALUES(user_id) THEN COALESCE(VALUES(last_event_id), last_event_id) ELSE last_event_id END, \
          updated_at = CASE WHEN user_id = VALUES(user_id) THEN NOW(6) ELSE updated_at END, \
          last_active_at = CASE WHEN user_id = VALUES(user_id) THEN NOW(6) ELSE last_active_at END",
     )
     .bind(session_id)
     .bind(user_id)
-    .bind(event_count)
+    .bind(delta)
+    .bind(last_event_id)
+    .bind(session_id)
+    .bind(user_id)
     .execute(executor)
     .await?;
+    if result.rows_affected() == 0 {
+        return Err(sqlx::Error::RowNotFound);
+    }
+    Ok(())
+}
+
+pub async fn touch_agent_session_activity<'e, E>(
+    executor: E,
+    session_id: &str,
+    user_id: &str,
+    last_event_id: Option<&str>,
+) -> Result<(), sqlx::Error>
+where
+    E: Executor<'e, Database = MySql> + Copy,
+{
+    let result = query(
+        "UPDATE agent_sessions \
+         SET updated_at = NOW(6), \
+             last_active_at = NOW(6), \
+             last_event_id = COALESCE(?, last_event_id) \
+         WHERE session_id = ? AND user_id = ?",
+    )
+    .bind(last_event_id)
+    .bind(session_id)
+    .bind(user_id)
+    .execute(executor)
+    .await?;
+    if result.rows_affected() == 0 {
+        let exists = agent_session_exists_for_user(executor, session_id, user_id).await?;
+        if !exists {
+            return Err(sqlx::Error::RowNotFound);
+        }
+    }
     Ok(())
 }
 
@@ -580,6 +660,7 @@ pub async fn ensure_core_schema(
             INDEX idx_agent_events_session_model_created (session_id, llm_model_used, created_at DESC),
             INDEX idx_agent_events_session_parent (session_id, parent_event_id),
             INDEX idx_agent_events_owner_session_created (user_id, session_id, created_at),
+            INDEX idx_agent_events_owner_session_turn (user_id, session_id, turn_seq),
             INDEX idx_agent_events_user_created (user_id, created_at),
             INDEX idx_agent_events_causal_chain_id (causal_chain_id),
             INDEX idx_agent_events_skill_created (skill_name, created_at),
@@ -2068,11 +2149,18 @@ pub async fn ensure_core_schema(
         }
     }
 
-    for (table, index, ddl) in [(
-        "agent_sessions",
-        "idx_sessions_project",
-        "ALTER TABLE agent_sessions ADD INDEX idx_sessions_project (user_id, project_id, updated_at)",
-    )] {
+    for (table, index, ddl) in [
+        (
+            "agent_sessions",
+            "idx_sessions_project",
+            "ALTER TABLE agent_sessions ADD INDEX idx_sessions_project (user_id, project_id, updated_at)",
+        ),
+        (
+            "agent_events",
+            "idx_agent_events_owner_session_turn",
+            "ALTER TABLE agent_events ADD INDEX idx_agent_events_owner_session_turn (user_id, session_id, turn_seq)",
+        ),
+    ] {
         if let Err(e) = add_index_if_missing(&pool, &settings.database, table, index, ddl).await {
             tracing::debug!("phase4 additive index migration skipped: {table}.{index}: {e}");
         }
@@ -2461,6 +2549,23 @@ pub async fn ensure_core_schema(
             INDEX idx_eqa_user_level_updated (user_id, level, updated_at),
             INDEX idx_eqa_target (target_id),
             INDEX idx_eqa_level (level)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS eval_calibration_assessments (
+            calibration_id VARCHAR(64) PRIMARY KEY,
+            user_id        VARCHAR(36) NOT NULL,
+            agent_id       VARCHAR(255),
+            session_id     VARCHAR(64) NOT NULL,
+            confidence     DECIMAL(5,4) NOT NULL,
+            quality_score  DECIMAL(5,4) NOT NULL,
+            created_at     DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_eval_calibration_user_created (user_id, created_at),
+            INDEX idx_eval_calibration_agent_created (user_id, agent_id, created_at),
+            INDEX idx_eval_calibration_session (user_id, session_id, created_at)
         )",
     )
     .execute(&pool)
@@ -2910,6 +3015,53 @@ mod tests {
         // sanity: AGENT_ID_LEN must produce a reasonable VARCHAR width
         if AGENT_ID_LEN < 32 {
             panic!("AGENT_ID_LEN ({AGENT_ID_LEN}) is too small");
+        }
+    }
+
+    #[test]
+    fn agent_events_turn_seq_inference_index_is_declared_and_reconciled() {
+        let source = include_str!("storage.rs");
+        assert!(
+            source.contains(
+                "INDEX idx_agent_events_owner_session_turn (user_id, session_id, turn_seq)"
+            ),
+            "agent_events must index the session-turn inference path in CREATE TABLE"
+        );
+        assert!(
+            source.contains(
+                "ALTER TABLE agent_events ADD INDEX idx_agent_events_owner_session_turn (user_id, session_id, turn_seq)"
+            ),
+            "agent_events must reconcile the session-turn inference index in schema ensure"
+        );
+    }
+
+    #[test]
+    fn eval_calibration_assessments_schema_matches_runtime_queries() {
+        let source = include_str!("storage.rs");
+        let ddl = source
+            .split("CREATE TABLE IF NOT EXISTS eval_calibration_assessments")
+            .nth(1)
+            .expect("eval calibration assessment DDL")
+            .split("CREATE TABLE IF NOT EXISTS eval_training_datasets")
+            .next()
+            .expect("eval calibration assessment DDL block");
+        for column in [
+            "calibration_id VARCHAR(64) PRIMARY KEY",
+            "user_id        VARCHAR(36) NOT NULL",
+            "agent_id       VARCHAR(255)",
+            "session_id     VARCHAR(64) NOT NULL",
+            "confidence     DECIMAL(5,4) NOT NULL",
+            "quality_score  DECIMAL(5,4) NOT NULL",
+            "created_at     DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)",
+        ] {
+            assert!(ddl.contains(column), "missing calibration column: {column}");
+        }
+        for index in [
+            "INDEX idx_eval_calibration_user_created (user_id, created_at)",
+            "INDEX idx_eval_calibration_agent_created (user_id, agent_id, created_at)",
+            "INDEX idx_eval_calibration_session (user_id, session_id, created_at)",
+        ] {
+            assert!(ddl.contains(index), "missing calibration index: {index}");
         }
     }
 }

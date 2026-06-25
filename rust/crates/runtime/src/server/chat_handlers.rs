@@ -850,7 +850,7 @@ mod session_resolution_tests {
                 sessions: Vec::new(),
                 total: 0,
                 limit: 20,
-                offset: 0,
+                next_cursor: None,
             })
         }
 
@@ -908,12 +908,14 @@ mod session_resolution_tests {
             _session_id: String,
             _user_id: String,
             _limit: u32,
-            _offset: u32,
+            _cursor: Option<astra_services::SessionActivityCursor>,
         ) -> Result<SessionActivityRecord, (StatusCode, Json<ErrorResponse>)> {
             Ok(SessionActivityRecord {
                 session_id: String::new(),
                 activities: vec![],
                 total: 0,
+                limit: 1,
+                next_cursor: None,
             })
         }
     }
@@ -1186,7 +1188,7 @@ mod chat_stream_bridge_fallback_tests {
                 sessions: Vec::new(),
                 total: 0,
                 limit: 20,
-                offset: 0,
+                next_cursor: None,
             })
         }
 
@@ -1231,12 +1233,14 @@ mod chat_stream_bridge_fallback_tests {
             _session_id: String,
             _user_id: String,
             _limit: u32,
-            _offset: u32,
+            _cursor: Option<astra_services::SessionActivityCursor>,
         ) -> Result<SessionActivityRecord, (StatusCode, Json<ErrorResponse>)> {
             Ok(SessionActivityRecord {
                 session_id: String::new(),
                 activities: vec![],
                 total: 0,
+                limit: 1,
+                next_cursor: None,
             })
         }
     }
@@ -1273,7 +1277,7 @@ mod chat_stream_bridge_fallback_tests {
                 sessions: Vec::new(),
                 total: 0,
                 limit: 20,
-                offset: 0,
+                next_cursor: None,
             })
         }
 
@@ -1321,12 +1325,14 @@ mod chat_stream_bridge_fallback_tests {
             _session_id: String,
             _user_id: String,
             _limit: u32,
-            _offset: u32,
+            _cursor: Option<astra_services::SessionActivityCursor>,
         ) -> Result<SessionActivityRecord, (StatusCode, Json<ErrorResponse>)> {
             Ok(SessionActivityRecord {
                 session_id: String::new(),
                 activities: vec![],
                 total: 0,
+                limit: 1,
+                next_cursor: None,
             })
         }
     }
@@ -1361,7 +1367,7 @@ mod chat_stream_bridge_fallback_tests {
                 sessions: Vec::new(),
                 total: 0,
                 limit: 20,
-                offset: 0,
+                next_cursor: None,
             })
         }
 
@@ -1407,12 +1413,14 @@ mod chat_stream_bridge_fallback_tests {
             _session_id: String,
             _user_id: String,
             _limit: u32,
-            _offset: u32,
+            _cursor: Option<astra_services::SessionActivityCursor>,
         ) -> Result<SessionActivityRecord, (StatusCode, Json<ErrorResponse>)> {
             Ok(SessionActivityRecord {
                 session_id: String::new(),
                 activities: vec![],
                 total: 0,
+                limit: 1,
+                next_cursor: None,
             })
         }
     }

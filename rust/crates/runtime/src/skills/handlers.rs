@@ -3,7 +3,7 @@
 pub use astra_services::skills::*;
 
 use crate::AppState;
-use astra_core::ErrorResponse;
+use astra_core::{ErrorResponse, error_response};
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -20,7 +20,7 @@ pub async fn list_skills_handler(
         state.skill_service.clone(),
         &user.user_id,
         query.limit,
-        query.offset,
+        query.cursor()?,
     )
     .await?;
     Ok(Json(result))

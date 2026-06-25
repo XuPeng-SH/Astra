@@ -12,11 +12,13 @@ use uuid::Uuid;
 
 mod common;
 
+const TEST_USER_ID: &str = "test-user";
+
 fn test_event(event_id: &str, session_id: &str, event_type: &str) -> IngestionEvent {
     IngestionEvent {
         event_id: event_id.to_string(),
         session_id: session_id.to_string(),
-        user_id: "test-user".to_string(),
+        user_id: TEST_USER_ID.to_string(),
         event_type: event_type.to_string(),
         content: None,
         token_usage: None,
@@ -30,6 +32,59 @@ fn test_event(event_id: &str, session_id: &str, event_type: &str) -> IngestionEv
     }
 }
 
+async fn insert_session_root(pool: &sqlx::Pool<sqlx::MySql>, session_id: &str) {
+    sqlx::query(
+        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
+         VALUES (?, ?, 'event-ingestion-test', 'active', 0)",
+    )
+    .bind(session_id)
+    .bind(TEST_USER_ID)
+    .execute(pool)
+    .await
+    .expect("insert session root");
+}
+
+async fn assert_session_event_count(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    session_id: &str,
+    expected: i64,
+) {
+    let row = sqlx::query("SELECT event_count FROM agent_sessions WHERE session_id = ?")
+        .bind(session_id)
+        .fetch_one(pool)
+        .await
+        .expect("load session event_count");
+    let actual: i64 = row.get("event_count");
+    assert_eq!(
+        actual, expected,
+        "agent_sessions.event_count for {session_id}"
+    );
+}
+
+async fn cleanup_session(pool: &sqlx::Pool<sqlx::MySql>, session_id: &str) {
+    let event_rows = sqlx::query("SELECT event_id FROM agent_events WHERE session_id = ?")
+        .bind(session_id)
+        .fetch_all(pool)
+        .await;
+    if let Ok(event_rows) = event_rows {
+        for row in event_rows {
+            let event_id: String = row.get("event_id");
+            let _ = sqlx::query("DELETE FROM agent_event_edges WHERE child_event_id = ?")
+                .bind(&event_id)
+                .execute(pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM agent_events WHERE event_id = ?")
+                .bind(&event_id)
+                .execute(pool)
+                .await;
+        }
+    }
+    let _ = sqlx::query("DELETE FROM agent_sessions WHERE session_id = ?")
+        .bind(session_id)
+        .execute(pool)
+        .await;
+}
+
 /// Verifies that inserting the same event_id twice does not surface a
 /// duplicate key error. This guards against the MySQL 1062 error that
 /// occurred when INSERT IGNORE was not properly handling idempotent retries.
@@ -41,6 +96,8 @@ async fn event_ingest_idempotent_duplicate_key_no_error() {
 
     let event_id = format!("evt-test-{}", Uuid::new_v4());
     let session_id = Uuid::new_v4().to_string();
+    cleanup_session(&pool, &session_id).await;
+    insert_session_root(&pool, &session_id).await;
     let event = test_event(&event_id, &session_id, "test_idempotent");
 
     // Spawn worker, send event, shutdown — first insert
@@ -68,12 +125,10 @@ async fn event_ingest_idempotent_duplicate_key_no_error() {
         count, 1,
         "expected exactly 1 row for event_id {event_id}, got {count}"
     );
+    assert_session_event_count(&pool, &session_id, 1).await;
 
     // Cleanup
-    let _ = sqlx::query("DELETE FROM agent_events WHERE event_id = ?")
-        .bind(&event_id)
-        .execute(&pool)
-        .await;
+    cleanup_session(&pool, &session_id).await;
 }
 
 /// Verifies that concurrent writes with the same event_id both succeed
@@ -90,6 +145,8 @@ async fn event_ingest_concurrent_duplicate_key_no_error() {
 
     let event_id = format!("evt-test-{}", Uuid::new_v4());
     let session_id = Uuid::new_v4().to_string();
+    cleanup_session(&pool, &session_id).await;
+    insert_session_root(&pool, &session_id).await;
     let event = test_event(&event_id, &session_id, "test_concurrent");
 
     let config = IngestionConfig::default();
@@ -137,12 +194,10 @@ async fn event_ingest_concurrent_duplicate_key_no_error() {
         count, 1,
         "expected exactly 1 row for event_id {event_id}, got {count}"
     );
+    assert_session_event_count(&pool, &session_id, 1).await;
 
     // Cleanup
-    let _ = sqlx::query("DELETE FROM agent_events WHERE event_id = ?")
-        .bind(&event_id)
-        .execute(&pool)
-        .await;
+    cleanup_session(&pool, &session_id).await;
 }
 
 /// Verifies that batch insert with multiple events succeeds and
@@ -154,6 +209,8 @@ async fn event_ingest_batch_partial_duplicate_no_error() {
     let pool = shared.get().clone();
 
     let session_id = Uuid::new_v4().to_string();
+    cleanup_session(&pool, &session_id).await;
+    insert_session_root(&pool, &session_id).await;
     let event1 = test_event(
         &format!("evt-batch1-{}", Uuid::new_v4()),
         &session_id,
@@ -190,12 +247,155 @@ async fn event_ingest_batch_partial_duplicate_no_error() {
         let count: i64 = row.get("cnt");
         assert_eq!(count, 1, "expected 1 row for {}", event.event_id);
     }
+    assert_session_event_count(&pool, &session_id, 2).await;
 
     // Cleanup
-    for event in [&event1, &event2] {
-        let _ = sqlx::query("DELETE FROM agent_events WHERE event_id = ?")
-            .bind(&event.event_id)
-            .execute(&pool)
-            .await;
+    cleanup_session(&pool, &session_id).await;
+}
+
+/// Verifies that one mixed batch updates each session from its own inserted
+/// rows, while lazily creating missing session roots.
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn event_ingest_multi_session_batch_uses_per_session_insert_delta_and_lazy_roots() {
+    let shared = common::setup_pool().await;
+    let pool = shared.get().clone();
+
+    let session_a = Uuid::new_v4().to_string();
+    let session_b = Uuid::new_v4().to_string();
+    cleanup_session(&pool, &session_a).await;
+    cleanup_session(&pool, &session_b).await;
+
+    let duplicate_a = test_event(
+        &format!("evt-lazy-dup-{}", Uuid::new_v4()),
+        &session_a,
+        "test_multi_session",
+    );
+    let unique_a = test_event(
+        &format!("evt-lazy-a-{}", Uuid::new_v4()),
+        &session_a,
+        "test_multi_session",
+    );
+    let unique_b1 = test_event(
+        &format!("evt-lazy-b1-{}", Uuid::new_v4()),
+        &session_b,
+        "test_multi_session",
+    );
+    let unique_b2 = test_event(
+        &format!("evt-lazy-b2-{}", Uuid::new_v4()),
+        &session_b,
+        "test_multi_session",
+    );
+
+    let config = IngestionConfig {
+        batch_size: 50,
+        flush_interval_secs: 300,
+        channel_capacity: 8,
+        ..Default::default()
+    };
+    let (sender, shutdown, _stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
+    sender.enqueue_async(duplicate_a.clone()).await;
+    shutdown.signal();
+    handle.await.unwrap();
+
+    assert_session_event_count(&pool, &session_a, 1).await;
+
+    let config = IngestionConfig {
+        batch_size: 50,
+        flush_interval_secs: 300,
+        channel_capacity: 8,
+        ..Default::default()
+    };
+    let (sender, shutdown, _stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
+    for event in [
+        duplicate_a.clone(),
+        unique_a.clone(),
+        unique_b1.clone(),
+        unique_b2.clone(),
+    ] {
+        sender.enqueue_async(event).await;
     }
+    shutdown.signal();
+    handle.await.unwrap();
+
+    assert_session_event_count(&pool, &session_a, 2).await;
+    assert_session_event_count(&pool, &session_b, 2).await;
+
+    for (session_id, expected) in [(&session_a, 2_i64), (&session_b, 2_i64)] {
+        let actual: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE session_id = ?")
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count session events");
+        assert_eq!(actual, expected, "persisted agent_events for {session_id}");
+    }
+
+    cleanup_session(&pool, &session_a).await;
+    cleanup_session(&pool, &session_b).await;
+}
+
+/// Verifies that a duplicate event in a mixed batch cannot mutate causal
+/// edges just because another event in the same session was inserted.
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn event_ingest_parent_edges_only_for_rows_inserted_in_this_flush() {
+    let shared = common::setup_pool().await;
+    let pool = shared.get().clone();
+
+    let session_id = Uuid::new_v4().to_string();
+    cleanup_session(&pool, &session_id).await;
+    insert_session_root(&pool, &session_id).await;
+
+    let duplicate_event_id = format!("evt-edge-dup-{}", Uuid::new_v4());
+    let unique_event_id = format!("evt-edge-new-{}", Uuid::new_v4());
+    let first = test_event(&duplicate_event_id, &session_id, "test_edge");
+
+    let config = IngestionConfig::default();
+    let (sender, shutdown, _stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
+    sender.enqueue_async(first.clone()).await;
+    shutdown.signal();
+    handle.await.unwrap();
+
+    let mut duplicate_with_parent = first;
+    duplicate_with_parent.parent_event_id = Some(format!("parent-stale-{}", Uuid::new_v4()));
+
+    let mut unique_with_parent = test_event(&unique_event_id, &session_id, "test_edge");
+    let unique_parent_id = format!("parent-new-{}", Uuid::new_v4());
+    unique_with_parent.parent_event_id = Some(unique_parent_id.clone());
+
+    let config = IngestionConfig {
+        batch_size: 50,
+        flush_interval_secs: 300,
+        channel_capacity: 8,
+        ..Default::default()
+    };
+    let (sender, shutdown, _stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
+    sender.enqueue_async(duplicate_with_parent).await;
+    sender.enqueue_async(unique_with_parent).await;
+    shutdown.signal();
+    handle.await.unwrap();
+
+    let duplicate_edges: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_event_edges WHERE child_event_id = ?")
+            .bind(&duplicate_event_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count duplicate edges");
+    assert_eq!(
+        duplicate_edges, 0,
+        "duplicate event rows must not gain parent edges from a later ignored retry"
+    );
+
+    let unique_parent: Option<String> = sqlx::query_scalar(
+        "SELECT parent_event_id FROM agent_event_edges WHERE child_event_id = ?",
+    )
+    .bind(&unique_event_id)
+    .fetch_optional(&pool)
+    .await
+    .expect("load unique edge");
+    assert_eq!(unique_parent.as_deref(), Some(unique_parent_id.as_str()));
+    assert_session_event_count(&pool, &session_id, 2).await;
+
+    cleanup_session(&pool, &session_id).await;
 }
