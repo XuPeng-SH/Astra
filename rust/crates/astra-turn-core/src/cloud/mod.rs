@@ -6,6 +6,7 @@ pub mod approval_policy;
 pub mod attachments;
 pub mod cache_diagnostics;
 pub mod compact_prompt;
+pub mod drift_detection;
 pub mod grouping;
 pub mod session_facts;
 pub mod session_memory_extract;

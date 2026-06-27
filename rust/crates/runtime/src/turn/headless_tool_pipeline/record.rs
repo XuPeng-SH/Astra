@@ -98,6 +98,17 @@ fn maybe_persist_model_tool_result(
     }
 }
 
+fn truncate_tool_error(result_str: &str) -> String {
+    // Take the first non-empty line as the error summary, truncated to 200 chars.
+    result_str
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("(no output)")
+        .chars()
+        .take(200)
+        .collect()
+}
+
 impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
     pub(super) async fn record_execution(&mut self, executed: ExecutedExecution) {
         let ExecutedExecution {
@@ -159,6 +170,42 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             }
             rec.round = Some(self.ctx.llm_round);
         }
+
+        // Emit a ToolCallError journal event when a tool fails.
+        // This closes the gap where non-zero bash exits weren't surfaced
+        // to introspect/reflect because they weren't promoted to error events.
+        if is_err {
+            if let Some(sid) = self.ctx.current_session_id {
+                if let Some(rec) = self.ctx.tool_call_records.last() {
+                    let error_msg = format!(
+                        "tool '{}' failed: {}",
+                        &execution.name,
+                        truncate_tool_error(&execution.result_str)
+                    );
+                    let event = astra_services::session_journal::JournalEvent::tool_call_error(
+                        Some(sid),
+                        self.ctx.session_turn,
+                        &execution.name,
+                        &error_msg,
+                        rec.clone(),
+                    );
+                    match astra_services::session_journal::JournalWriter::new(sid) {
+                        Ok(journal) => {
+                            let _ = journal.append(&event);
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                target: "astra_runtime::headless_tool_pipeline",
+                                session_id = %sid,
+                                err = %err,
+                                "failed to open journal for ToolCallError event"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         self.ctx
             .step_recorder
             .complete_tool_with_result_and_metadata(

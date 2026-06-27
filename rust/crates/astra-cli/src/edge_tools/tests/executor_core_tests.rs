@@ -1206,8 +1206,35 @@ fn agent_schema_enum_does_not_advertise_delegate_action() {
 #[tokio::test]
 async fn execute_reflect_returns_placeholder() {
     let executor = test_executor();
-    let result = executor.execute("reflect", &json!({"focus": "auto"})).await;
-    assert!(result.contains("reflect_requires_session"), "got: {result}");
+    let result = executor
+        .execute(
+            "reflect",
+            &json!({
+                "topic": "execution",
+                "facet": "errors",
+                "depth": "forensic",
+                "horizon": "cross_session",
+                "source_policy": "cloud_only",
+                "include_context": true,
+                "question": "why did the command fail?",
+                "last_n": -10
+            }),
+        )
+        .await;
+    let value: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(value["status"], "reflect_requires_session");
+    assert_eq!(value["topic"], "execution");
+    assert_eq!(value["facet"], "errors");
+    assert_eq!(value["depth"], "forensic");
+    assert_eq!(value["horizon"], "cross_session");
+    assert_eq!(value["source_policy"], "cloud_only");
+    assert_eq!(value["include_context"], true);
+    assert_eq!(value["question"], "why did the command fail?");
+    assert_eq!(value["last_n"], 1);
+    assert!(
+        !result.contains("focus"),
+        "removed focus parameter should not appear in placeholder: {result}"
+    );
 }
 
 #[tokio::test]
@@ -1303,15 +1330,123 @@ async fn execute_reflect_uses_local_surface_with_session() {
 
     let executor = ToolExecutor::new(temp.path().to_path_buf()).with_active_session_id(session_id);
     let result = executor
-        .execute("reflect", &json!({"focus": "performance"}))
+        .execute(
+            "reflect",
+            &json!({
+                "topic": "execution",
+                "facet": "trace",
+                "depth": "forensic",
+                "horizon": "cross_session",
+                "source_policy": "cloud_only",
+                "include_context": true,
+                "last_n": 250
+            }),
+        )
         .await;
     let value: serde_json::Value = serde_json::from_str(&result).unwrap();
     assert_eq!(value["session_id"], session_id);
-    assert_eq!(value["focus"], "performance");
-    // Liquid-reflection subsystem removed. `recent_turns` surfaces the
-    // focused journal preview that downstream UIs read directly.
-    let recent = value["recent_turns"].as_array().expect("recent_turns");
-    assert!(!recent.is_empty(), "turn journal preview should be present");
+    assert_eq!(value["topic"], "execution");
+    assert_eq!(value["facet"], "trace");
+    assert_eq!(value["depth"], "forensic");
+    assert_eq!(value["horizon"], "cross_session");
+    assert_eq!(value["source_policy"], "cloud_only");
+    assert_eq!(value["include_context"], true);
+    assert_eq!(value["analysis_view"], "execution_trace");
+    assert!(value.get("last_n").is_none());
+    assert!(value.get("reflection_context").is_none());
+    assert!(value.get("recent_turns").is_none());
+    assert_eq!(value["data_coverage"]["overall"], "partial");
+    assert_eq!(value["data_coverage"]["source"], "local_session_artifacts");
+    assert_eq!(value["data_coverage"]["events"], 2);
+    assert_eq!(
+        value["data_coverage"]["providers"]["local_journal"]["status"],
+        "fresh"
+    );
+    assert_eq!(
+        value["data_coverage"]["providers"]["cloud_events"]["status"],
+        "unavailable"
+    );
+    assert_eq!(
+        value["data_coverage"]["providers"]["visible_context"]["status"],
+        "partial"
+    );
+    let warnings = value["data_coverage"]["warnings"]
+        .as_array()
+        .expect("coverage warnings");
+    assert!(
+        warnings.iter().any(|warning| warning
+            .as_str()
+            .is_some_and(|text| text.contains("cross_session"))),
+        "cross-session local reflect requests must report partial coverage: {warnings:?}"
+    );
+    assert!(
+        warnings.iter().any(|warning| warning
+            .as_str()
+            .is_some_and(|text| text.contains("cloud_only"))),
+        "cloud-only local reflect requests must report partial coverage: {warnings:?}"
+    );
+    let observations = value["observations"]
+        .as_array()
+        .expect("observation records");
+    assert_eq!(observations.len(), 1);
+    assert_eq!(observations[0]["topic"], "execution");
+    assert_eq!(observations[0]["facet"], "trace");
+    assert_eq!(observations[0]["severity"], "warning");
+    assert!(
+        observations[0]["ref_id"]
+            .as_str()
+            .is_some_and(|ref_id| ref_id.starts_with("urn:astra:observation:local:reflect:")),
+        "{value}"
+    );
+    let evidence = value["evidence"].as_array().expect("evidence");
+    assert_eq!(evidence.len(), 1);
+    assert!(
+        evidence
+            .iter()
+            .all(|item| item["source"] == "local_journal"),
+        "{evidence:?}"
+    );
+    assert!(
+        evidence.iter().all(|item| item["ref_id"]
+            .as_str()
+            .is_some_and(|ref_id| ref_id.starts_with("urn:astra:event:local:"))),
+        "{value}"
+    );
+    assert!(
+        evidence.iter().any(|item| item["summary"]
+            .as_str()
+            .is_some_and(|summary| summary.contains("bash failed"))),
+        "{value}"
+    );
+    let graph_nodes = value["graph_slice"]["nodes"]
+        .as_array()
+        .expect("graph nodes");
+    assert_eq!(graph_nodes.len(), 2);
+    assert!(
+        graph_nodes
+            .iter()
+            .any(|node| node["layer"] == "observation"),
+        "{graph_nodes:?}"
+    );
+    assert!(
+        graph_nodes.iter().any(|node| node["layer"] == "runtime"),
+        "{graph_nodes:?}"
+    );
+    assert_eq!(
+        value["graph_slice"]["edges"]
+            .as_array()
+            .expect("graph edges")
+            .len(),
+        1
+    );
+    assert_eq!(value["data_coverage"]["events"], 2);
+    // error information now lives in observations, not a separate overview.error_count field
+    assert!(
+        value["observations"]
+            .as_array()
+            .is_some_and(|obs| !obs.is_empty()),
+        "expected at least one observation"
+    );
 }
 
 #[test]

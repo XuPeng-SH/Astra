@@ -610,6 +610,88 @@ fn local_cli_catalog_includes_plan_mode_wrappers() {
 }
 
 #[test]
+fn local_cli_catalog_includes_normalized_reflect_schema() {
+    let schemas = crate::edge_tools::local_tool_schemas();
+    let reflect = tool_schema(&schemas, "reflect");
+    let shared_schemas = astra_tools::schemas::all_tool_schemas();
+    let shared_reflect = tool_schema(&shared_schemas, "reflect");
+    assert_eq!(
+        reflect, shared_reflect,
+        "local CLI reflect schema must come from astra-tools, not a second hard-coded copy"
+    );
+    assert_eq!(
+        schemas
+            .iter()
+            .filter_map(|schema| schema["function"]["name"].as_str())
+            .filter(|name| *name == "reflect")
+            .count(),
+        1,
+        "local CLI catalog must not append a duplicate reflect fallback"
+    );
+    let properties = reflect["function"]["parameters"]["properties"]
+        .as_object()
+        .expect("reflect parameters must expose properties");
+
+    for key in [
+        "topic",
+        "facet",
+        "depth",
+        "horizon",
+        "source_policy",
+        "include_context",
+        "question",
+        "last_n",
+    ] {
+        assert!(
+            properties.contains_key(key),
+            "reflect schema must expose normalized observation parameter `{key}`"
+        );
+    }
+    assert!(
+        !properties.contains_key("focus"),
+        "reflect schema must not expose removed focus parameter"
+    );
+    assert_eq!(
+        reflect["function"]["parameters"]["additionalProperties"],
+        serde_json::json!(false),
+        "reflect schema must reject legacy or misspelled parameters"
+    );
+    assert_eq!(
+        properties["topic"]["enum"],
+        serde_json::json!(["overview", "runtime", "execution", "knowledge"])
+    );
+    assert_eq!(
+        properties["facet"]["enum"],
+        serde_json::json!([
+            "overview",
+            "performance",
+            "errors",
+            "tools",
+            "trace",
+            "context",
+            "memory"
+        ])
+    );
+    assert_eq!(
+        properties["depth"]["enum"],
+        serde_json::json!(["hint", "summary", "diagnostic", "forensic"])
+    );
+    assert_eq!(
+        properties["source_policy"]["enum"],
+        serde_json::json!([
+            "auto",
+            "live_only",
+            "live_first",
+            "durable_first",
+            "local_only",
+            "cloud_only"
+        ])
+    );
+    assert_eq!(properties["last_n"]["minimum"], serde_json::json!(1));
+    assert_eq!(properties["last_n"]["maximum"], serde_json::json!(100));
+}
+
+#[test]
 fn local_cli_catalog_uses_runtime_env_surface_for_local_runtime() {
     let names: Vec<String> = crate::edge_tools::local_tool_schemas()
         .iter()

@@ -236,8 +236,6 @@ impl DecisionExplanation {
     }
 }
 
-// ─── Focus Drift Analysis ────────────────────────────────────────────────────
-
 /// Analysis of focus drift (when the agent loses track of the original task).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FocusDriftAnalysis {
@@ -446,8 +444,6 @@ fn format_cause(cause: &DriftCause) -> String {
     }
 }
 
-// ─── Drift Detector ──────────────────────────────────────────────────────────
-
 /// Detects focus drift by analyzing conversation patterns.
 pub struct DriftDetector {
     /// Minimum severity to report drift.
@@ -459,7 +455,7 @@ pub struct DriftDetector {
 impl Default for DriftDetector {
     fn default() -> Self {
         Self {
-            min_severity_threshold: 0.3,
+            min_severity_threshold: 0.4,
             analysis_window: 10,
         }
     }

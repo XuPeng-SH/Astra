@@ -3,7 +3,7 @@ use astra_pipeline::step_checkpoint;
 use astra_pipeline::step_protocol::StepCheckpoint;
 use astra_services::SessionArtifactStore;
 
-use super::super::agentic::adaptive_tuning::record_loop_completion_feedback;
+use super::super::agentic::adaptive_runtime::record_loop_completion_feedback;
 use super::host::{
     AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, VolatileKind, run_agentic_loop_impl,
 };
@@ -532,7 +532,7 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
             }
         }
 
-        // Carry `UserCancelled` forward so the adaptive-tuning layer can
+        // Carry `UserCancelled` forward so the adaptive profile layer can
         // skip scenario re-detection on the next turn. Without this gate,
         // the aborted tool history leaks into ScenarioDetector and can
         // falsely trigger an `Exploration` scenario (ratcheting the tool
@@ -801,15 +801,17 @@ fn reset_per_turn_corrective_state(state: &mut AgenticLoopState) {
     state.stall.forced_execution_retry = false;
     state.stall.forced_execution_escalation = false;
     state.stall.forced_parallel_batching = false;
-    state.stall.forced_tool_round_hard_stop = false;
-    state.stall.forced_tool_round_abort = false;
+    state.stall.forced_round_budget_phase1 = false;
+    state.stall.forced_round_budget_phase2 = false;
     state.stall.forced_completion_soft_stop = false;
     state.stall.forced_task_board_completion_gate = false;
     state.stall.forced_redundant_reads_corrective = false;
     state.stall.forced_cache_waste_corrective = false;
     state.stall.forced_search_fanout_corrective = false;
     state.stall.forced_exploration_family_corrective = false;
-    state.stall.forced_exploration_family_lockout = false;
+    state.stall.forced_exploration_family_phase2 = false;
+    state.stall.forced_intent_drift = false;
+    // NOTE: drift_nudge_count and last_drift_correction_round persist across turns
     state.stall.exploration_family_corrective_family = None;
     // Clear tool restrictions injected by exploration-family correctives so
     // they don't leak into the next user turn.
@@ -1115,10 +1117,6 @@ mod tests {
             }),
             serde_json::json!({
                 "role": "user",
-                "content": format!("{}\nold tool round", crate::turn::agentic_loop::execution_phase::TOOL_ROUND_HARD_STOP_MARKER),
-            }),
-            serde_json::json!({
-                "role": "user",
                 "content": format!("{}\nold redundant reads", crate::turn::agentic_loop::execution_phase::REDUNDANT_READS_MARKER),
             }),
             serde_json::json!({
@@ -1143,7 +1141,7 @@ mod tests {
                 "role": "user",
                 "content": format!(
                     "{}\nold exploration family lockout",
-                    crate::turn::agentic_loop::execution_phase::EXPLORATION_FAMILY_LOCKOUT_MARKER
+                    crate::turn::agentic_loop::execution_phase::EXPLORATION_FAMILY_PHASE2_MARKER
                 ),
             }),
         ]);
@@ -1151,13 +1149,11 @@ mod tests {
         state.stall.forced_execution_retry = true;
         state.stall.forced_execution_escalation = true;
         state.stall.forced_parallel_batching = true;
-        state.stall.forced_tool_round_hard_stop = true;
-        state.stall.forced_tool_round_abort = true;
         state.stall.forced_redundant_reads_corrective = true;
         state.stall.forced_cache_waste_corrective = true;
         state.stall.forced_search_fanout_corrective = true;
         state.stall.forced_exploration_family_corrective = true;
-        state.stall.forced_exploration_family_lockout = true;
+        state.stall.forced_exploration_family_phase2 = true;
         state.stall.exploration_family_corrective_family = Some("diff".into());
         state.restricted_tools.insert("git".into());
         state.turn_guard.nudge_count = 5;
@@ -1193,13 +1189,11 @@ mod tests {
         assert!(!state.stall.forced_execution_retry);
         assert!(!state.stall.forced_execution_escalation);
         assert!(!state.stall.forced_parallel_batching);
-        assert!(!state.stall.forced_tool_round_hard_stop);
-        assert!(!state.stall.forced_tool_round_abort);
         assert!(!state.stall.forced_redundant_reads_corrective);
         assert!(!state.stall.forced_cache_waste_corrective);
         assert!(!state.stall.forced_search_fanout_corrective);
         assert!(!state.stall.forced_exploration_family_corrective);
-        assert!(!state.stall.forced_exploration_family_lockout);
+        assert!(!state.stall.forced_exploration_family_phase2);
         assert!(state.stall.exploration_family_corrective_family.is_none());
         assert!(
             state.restricted_tools.is_empty(),

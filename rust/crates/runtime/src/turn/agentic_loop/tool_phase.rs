@@ -16,9 +16,6 @@ use astra_services::evaluation::SessionQualityAssessmentRequest;
 use astra_services::runs::ToolOutputBatchItem;
 use astra_services::session_journal::ToolCallRecord;
 
-use super::super::agentic::adaptive_tuning::{
-    apply_per_turn_adaptation, apply_tactical_actions, maybe_run_tuning_cycle,
-};
 use super::super::agentic::delegate_interception::{
     DelegationInterceptionResult, intercept_delegations, tool_call_arguments_value, tool_call_name,
 };
@@ -31,7 +28,7 @@ use super::execution_phase::{TurnExecutionPhase, observe_turn_end_without_tools}
 use super::host::{
     AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, CONSECUTIVE_ERROR_BUDGET,
     ControlToolRecovery, MAX_TRACKED_FILE_READS, extract_file_path_from_tool, finalize_and_render,
-    finalize_turn_trace, record_edge_tool_observability,
+    finalize_turn_trace, publish_introspect_snapshot, record_edge_tool_observability,
 };
 use super::lifecycle::{TurnIterationPrep, current_agentic_step, session_turn_number};
 use astra_turn_core::agentic_post_tool_policy::{
@@ -193,6 +190,10 @@ fn agent_fanout_reason_from_edge_result(result: &EdgeToolExecResult) -> Option<S
     agent_fanout_reason_from_text(&result.output)
 }
 
+fn tool_allows_host_owned_control_recovery(tool_name: &str) -> bool {
+    matches!(tool_name, "agent_fanout")
+}
+
 async fn recover_missing_control_tool_results<H: AgenticLoopHost>(
     host: &mut H,
     parent_run_id: Option<&str>,
@@ -203,6 +204,9 @@ async fn recover_missing_control_tool_results<H: AgenticLoopHost>(
         let Some(tool_name) = tool_call_name(tool_call) else {
             continue;
         };
+        if !tool_allows_host_owned_control_recovery(tool_name) {
+            continue;
+        }
         let Some(tool_call_id) = tool_call.get("id").and_then(Value::as_str) else {
             tracing::warn!(
                 target: "astra_runtime::agentic_loop_tool_phase",
@@ -565,6 +569,28 @@ fn server_session_state_mutator_in_round(tool_calls: &[Value]) -> bool {
             Some("adjust_config" | "compress_context")
         ) || task_tool_call_is_session_state_mutator(tool_call)
     })
+}
+
+/// Extract a strategy change description from a memory tool call's
+/// `args_preview`. The agent marks strategy changes with
+/// `memory(action='remember', tags=['strategy_change'], content='...')`.
+///
+/// Returns the `content` value if extractable, otherwise a default
+/// description.
+fn extract_strategy_change_desc(args_preview: &str) -> String {
+    // Simple extraction: find "content" key and grab its string value.
+    // The args_preview JSON is truncated to ~80 chars, but the content
+    // field is usually near the beginning for memory calls.
+    if let Some(start) = args_preview.find("\"content\":\"") {
+        let after_key = &args_preview[start + "\"content\":\"".len()..];
+        if let Some(end) = after_key.find('"') {
+            let desc = &after_key[..end];
+            if !desc.is_empty() {
+                return desc.to_string();
+            }
+        }
+    }
+    "Strategy changed".to_string()
 }
 
 fn append_session_journal_event(
@@ -1290,13 +1316,6 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         .map(|r| (tool_dedup_signature(&r.tool, &r.args), r.output.clone()))
         .collect();
 
-    // Update introspect snapshot so the tool can return fresh state.
-    if let Some(executor) = state.server_tool_executor.as_deref() {
-        let lifecycle_summary = host.turn_start_lifecycle_summary(state);
-        let snapshot = build_introspect_snapshot(state, lifecycle_summary);
-        executor.update_introspect_snapshot(snapshot);
-    }
-
     let evo_records_before = state.stall.tool_call_records.len();
     let plan_mode_active = host.plan_mode_active(state);
     let headless_quiet = prep.quiet || state.skill_produced_output;
@@ -1304,6 +1323,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         .turn_event_buffer
         .as_ref()
         .map(|b| b.turn_start_instant());
+    let tool_record_turn_start = obs_turn_start.unwrap_or(prep.turn_start_time);
     let obs_llm_round = state
         .turn_event_buffer
         .as_ref()
@@ -1346,7 +1366,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             progress_emitter: state.messaging.progress_emitter.as_ref(),
             pre_resolved_results: &pre_resolved_results,
             server_tool_executor: state.server_tool_executor.as_deref(),
-            turn_start: obs_turn_start,
+            turn_start: Some(tool_record_turn_start),
             llm_round: obs_llm_round,
             plan_mode_active,
         })
@@ -1370,9 +1390,16 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             if rec.round.is_none() {
                 rec.round = Some(obs_llm_round);
             }
+            if rec.start_offset_ms.is_none() {
+                rec.start_offset_ms = Some(tool_record_turn_start.elapsed().as_millis() as u64);
+            }
         }
         if !new_records.is_empty() && turn_result.accum.tool_calls.len() > 1 {
-            let batch_id = state.turn_event_buffer.as_mut().map(|b| b.next_batch_id());
+            let batch_id = state
+                .turn_event_buffer
+                .as_mut()
+                .map(|b| b.next_batch_id())
+                .or_else(|| Some(format!("b-{obs_llm_round}-0")));
             // Re-borrow after consuming turn_event_buffer's mutable access.
             let new_records = &mut state.stall.tool_call_records[new_records_start..];
             let has_parallel = new_records
@@ -1427,7 +1454,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
 
     // Populate the in-memory round ring unconditionally (regardless of
     // whether `full_llm_capture` / turn_event_buffer is active). This is
-    // what powers `introspect(subtopic=recent)` — the agent can ask
+    // what powers `introspect(facet=recent)` — the agent can ask
     // "what were my last few rounds doing?" without any disk I/O.
     //
     let round_duration_ms = prep.turn_start_time.elapsed().as_millis() as u64;
@@ -1450,6 +1477,54 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         ),
     };
     state.push_recent_round(recent_summary);
+
+    // Publish after the round summary enters the in-memory ring so the next
+    // LLM round sees the same token/cache counters and recent-round view on
+    // CLI and server surfaces.
+    let lifecycle_summary = host.turn_start_lifecycle_summary(state);
+    publish_introspect_snapshot(host, state, lifecycle_summary);
+
+    // ── Record turn metrics into observation journal ──
+    // Feed the sliding window so the next round's auto-injected self-status
+    // block can show trends and strategy verification.
+    {
+        let samples: Vec<astra_core::ToolCallSample<'_>> = state
+            .stall
+            .tool_call_records
+            .iter()
+            .filter(|r| !r.is_synthetic_placeholder())
+            .map(|r| astra_core::ToolCallSample {
+                name: &r.name,
+                ok: r.ok,
+                round: Some(state.llm_rounds_completed),
+                file_path: r.file_path.as_deref(),
+                error: r.error.as_deref(),
+            })
+            .collect();
+        let tokens = state.total_prompt
+            + state.total_completion
+            + state.total_cache_read
+            + state.total_cache_creation;
+        let metrics =
+            astra_core::TurnMetrics::from_samples(&samples, state.llm_rounds_completed, tokens);
+        state.observation_journal.record_turn(&metrics);
+
+        // ── Agent-marked strategy change ──
+        // Scan memory tool calls for `strategy_change` tag so the agent
+        // can explicitly signal "I changed my approach" and later see
+        // before/after verification in the self-status block.
+        for record in &state.stall.tool_call_records {
+            if record.name == "memory" {
+                if let Some(ref args) = record.args_preview {
+                    if args.contains("strategy_change") {
+                        let desc = extract_strategy_change_desc(args);
+                        state.observation_journal.mark_strategy_change(desc);
+                        break;
+                    }
+                }
+            }
+        }
+    }
 
     if let Some(ref mut buf) = state.turn_event_buffer {
         buf.record_llm_round(astra_services::session_journal::LlmRoundRecord {
@@ -1569,14 +1644,6 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                 adapter.advance_step();
             }
         }
-
-        if !step_actions.is_empty() {
-            let hint_parts = apply_tactical_actions(state, &step_actions);
-            if !hint_parts.is_empty() {
-                let hint_text = format!("[Tactical Adaptation]\n{}", hint_parts.join("\n"));
-                state.push_volatile(super::host::VolatileKind::TacticalAdaptation, hint_text);
-            }
-        }
     }
 
     if let Some(ref emitter) = state.messaging.progress_emitter {
@@ -1611,6 +1678,17 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     }
 
     record_edge_tool_observability(state, &edge_tool_round);
+
+    // Feed every executed-tool outcome into the health tracker so that
+    // introspect/reflect and SelfModel can observe tool-level failures
+    // (including bash exit-code errors).  Without this, the
+    // ToolHealthTracker only saw successes and never learned about
+    // failing tools from the agentic-loop path.
+    for edge_result in &edge_tool_round {
+        state
+            .turn_guard
+            .record_tool_result(&edge_result.tool, &edge_result.output);
+    }
 
     if let Some(ref registry) = state.skills.registry_for_activation {
         let mut any_newly_activated = false;
@@ -1731,7 +1809,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             restricted_tools: &mut state.restricted_tools,
             remaining_turns: &mut state.remaining_turns,
             step_recorder: &mut state.step_recorder,
-            current_user_id: state.context_manifest_user_id.as_deref(),
+            current_user_id: state.context_manifest_user_id.as_ref(),
             current_session_id: state.current_session_id.as_ref(),
             max_turns: state.max_turns,
             loop_turn: turn_index,
@@ -1827,10 +1905,13 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             state.step_recorder.end_turn(false);
             finalize_turn_trace(state).await;
             refresh_runtime_promotion_signals_from_db(state).await;
-            state.telemetry.completed_turns_for_tuning += 1;
-            maybe_run_tuning_cycle(state);
-            let turn_tokens = state.last_measured_prompt_tokens.unwrap_or(0);
-            apply_per_turn_adaptation(state, turn_tokens);
+            if let Some(hub) = state.telemetry.observability_hub.as_ref() {
+                let high_failure = state.turn_guard.health.high_failure_tools(3, 0.5);
+                if !high_failure.is_empty() {
+                    hub.record_low_confidence_tools(high_failure);
+                }
+            }
+            let _turn_tokens = state.last_measured_prompt_tokens.unwrap_or(0);
 
             // Context compaction is handled by the single unified pass in
             // lifecycle.rs (compact_tool_results_adaptive) which
@@ -1865,141 +1946,6 @@ fn observe_gate_cancelled(
     }
 }
 
-fn build_introspect_snapshot(
-    state: &super::host::AgenticLoopState,
-    lifecycle_summary: String,
-) -> astra_turn_core::introspect::IntrospectSnapshot {
-    let total_in = state.total_prompt + state.total_cache_read + state.total_cache_creation;
-    let cache_ratio = if total_in > 0 {
-        state.total_cache_read as f64 / total_in as f64
-    } else {
-        0.0
-    };
-    let working_mem = state
-        .pipeline_session
-        .as_ref()
-        .map(|s| s.working_memory().render_prompt_section())
-        .unwrap_or_default();
-
-    // Task #46: populate the in-memory self-awareness fields from state.
-    let recent_rounds = state
-        .recent_rounds
-        .iter()
-        .map(|r| astra_turn_core::introspect::RoundSnapshotEntry {
-            turn: r.turn,
-            round: r.round,
-            provider: r.provider.clone(),
-            model: r.model.clone(),
-            prompt_tokens: r.prompt_tokens,
-            cache_read_tokens: r.cache_read_tokens,
-            cache_creation_tokens: r.cache_creation_tokens,
-            completion_tokens: r.completion_tokens,
-            tool_calls_returned: r.tool_calls_returned,
-            tool_call_names: r.tool_call_names.clone(),
-            duration_ms: r.duration_ms,
-            finish_reason: r.finish_reason.clone(),
-        })
-        .collect();
-    let volatile_pending = state
-        .volatile_pending
-        .iter()
-        .map(|inj| astra_turn_core::introspect::VolatileSnapshotEntry {
-            kind: format!("{:?}", inj.kind),
-            content: inj.content.clone(),
-            round_index: inj.round_index,
-        })
-        .collect();
-    let events: Vec<String> = state
-        .stall
-        .events
-        .iter()
-        .map(|(name, turn)| format!("{name} @ turn {turn}"))
-        .collect();
-    let stall_state = astra_turn_core::introspect::StallSnapshotSummary {
-        nudge_count: state.stall.nudge_count,
-        events,
-        introspection_count: state.stall.introspection_count,
-        forced_execution_escalation: state.stall.forced_execution_escalation,
-        forced_parallel_batching: state.stall.forced_parallel_batching,
-        forced_redundant_reads_corrective: state.stall.forced_redundant_reads_corrective,
-        forced_cache_waste_corrective: state.stall.forced_cache_waste_corrective,
-        forced_search_fanout_corrective: state.stall.forced_search_fanout_corrective,
-        forced_exploration_family_lockout: state.stall.forced_exploration_family_lockout,
-        forced_exploration_family_corrective: state.stall.forced_exploration_family_corrective,
-        forced_completion_soft_stop: state.stall.forced_completion_soft_stop,
-    };
-
-    // Injection-freshness is session-scoped (lives on ObservabilitySession,
-    // not on the per-turn AgenticLoopState). The CLI edge_tools path
-    // overlays it on the snapshot just before rendering — see
-    // `build_self_model_for_agent` companion hook. Server-path builds of
-    // this snapshot (e.g., for server-side introspect API) leave it empty.
-    let current_round = state.current_round_index;
-
-    let bias_map = state.turn_guard.health.outcome_bias_by_tool(3600);
-    let tool_health: Vec<astra_turn_core::introspect::ToolHealthEntry> = state
-        .turn_guard
-        .health
-        .all()
-        .iter()
-        .filter(|(_, h)| h.total_calls > 0)
-        .map(|(name, h)| {
-            let last_fail_cat = bias_map.get(name).and_then(|b| b.last_failure_tag.clone());
-            astra_turn_core::introspect::ToolHealthEntry {
-                name: name.clone(),
-                calls: h.total_calls as u32,
-                errors: h.total_failures as u32,
-                avg_ms: 0,
-                avoidance_advised: h.avoidance_advised,
-                consecutive_failures: h.consecutive_failures as u32,
-                last_failure_category: last_fail_cat,
-            }
-        })
-        .collect();
-
-    let tool_errors = state.turn_guard.health.recent_errors(10);
-
-    let token_pressure = introspect_token_pressure(state);
-
-    astra_turn_core::introspect::IntrospectSnapshot {
-        current_model: state.current_model_identity().map(str::to_string),
-        token_pressure,
-        cache_hit_ratio: cache_ratio,
-        turns_completed: state.llm_rounds_completed,
-        turns_remaining: state.remaining_turns as u32,
-        compaction_tier: format!("{:?}", state.compact_tier_applied),
-        alerts: Vec::new(),
-        tool_health,
-        working_memory_summary: working_mem,
-        lifecycle_summary,
-        total_input_tokens: state.total_prompt + state.total_cache_read,
-        total_output_tokens: state.total_completion,
-        cache_read_tokens: state.total_cache_read,
-        cache_creation_tokens: state.total_cache_creation,
-        recent_rounds,
-        volatile_pending,
-        stall_state,
-        injection_freshness: Vec::new(),
-        current_round,
-        tool_errors,
-        circuit_breaker: None, // populated by bridge when available
-    }
-}
-
-fn introspect_token_pressure(state: &super::host::AgenticLoopState) -> f64 {
-    // Compute token pressure using the same precise estimation as lifecycle.rs.
-    // Falls back to 0.0 when max_turn_input_tokens is 0 (unlimited legacy mode).
-    if state.max_turn_input_tokens == 0 {
-        return 0.0;
-    }
-    let fresh_estimate = crate::prompts::estimate_tokens(
-        &state.messages,
-        state.always_load_tool_schema_tokens as usize,
-        0,
-    ) as u64;
-    fresh_estimate as f64 / state.max_turn_input_tokens as f64
-}
-
 #[cfg(test)]
 #[allow(dead_code, unused_imports, clippy::empty_line_after_doc_comments)]
 mod tests {
@@ -2014,6 +1960,7 @@ mod tests {
 
     use crate::observability::ObservabilityHub;
     use crate::turn::agentic_loop::host::tests::{make_state, text_result};
+    use crate::turn::agentic_loop::host::{build_introspect_snapshot, introspect_token_pressure};
 
     fn summary_tool_record(
         ok: bool,
@@ -2050,7 +1997,7 @@ mod tests {
         record_recent_read_file_path(
             &mut reads,
             "read_file",
-            &json!({"path": "src/lib.rs", "start_line": 10, "end_line": 20}),
+            &json!({"path": "src/lib.rs", "offset": 10, "limit": 11}),
             2,
         );
 
@@ -2151,7 +2098,10 @@ mod tests {
             duration_ms: 7,
         };
         let mut host = crate::turn::agentic_loop::host::tests::MockHost::new(Vec::new())
-            .with_recovered_control_tool_result("call-fanout", recovered);
+            .with_recovered_control_tool_result(
+                "call-fanout",
+                crate::turn::agentic_loop::host::ControlToolRecovery::Recovered(recovered),
+            );
         let tool_calls = vec![json!({
             "id": "call-fanout",
             "type": "function",
@@ -2224,7 +2174,10 @@ mod tests {
             duration_ms: 0,
         };
         let mut host = crate::turn::agentic_loop::host::tests::MockHost::new(Vec::new())
-            .with_recovered_control_tool_result("call-fanout-b", recovered_second);
+            .with_recovered_control_tool_result(
+                "call-fanout-b",
+                crate::turn::agentic_loop::host::ControlToolRecovery::Recovered(recovered_second),
+            );
         let tool_calls = vec![json!({
             "id": "call-fanout-b",
             "type": "function",
@@ -2271,7 +2224,10 @@ mod tests {
             duration_ms: 0,
         };
         let mut host = crate::turn::agentic_loop::host::tests::MockHost::new(Vec::new())
-            .with_recovered_control_tool_result("call-fanout", recovered);
+            .with_recovered_control_tool_result(
+                "call-fanout",
+                crate::turn::agentic_loop::host::ControlToolRecovery::Recovered(recovered),
+            );
         let tool_calls = vec![json!({
             "id": "call-bash",
             "type": "function",
@@ -2353,7 +2309,7 @@ mod tests {
         let mut state = make_state();
         state.max_turn_input_tokens = 0;
         state.messages = vec![json!({"role": "user", "content": "hello world"})];
-        state.always_load_tool_schema_tokens = 50;
+        state.pinned_tool_schema_tokens = 50;
         assert_eq!(introspect_token_pressure(&state), 0.0);
     }
 
@@ -2364,10 +2320,10 @@ mod tests {
             json!({"role": "system", "content": "system prompt"}),
             json!({"role": "user", "content": "hello world"}),
         ];
-        state.always_load_tool_schema_tokens = 120;
+        state.pinned_tool_schema_tokens = 120;
         let expected = crate::prompts::estimate_tokens(
             &state.messages,
-            state.always_load_tool_schema_tokens as usize,
+            state.pinned_tool_schema_tokens as usize,
             0,
         ) as f64
             / 10_000.0;

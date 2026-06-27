@@ -1384,7 +1384,7 @@ mod tests {
             None,
             None,
             None,
-            "<deferred_tools><tool><name>github</name></tool></deferred_tools>",
+            "<deferred-tools>\ngithub\n</deferred-tools>",
             "",
             "2026-05-25",
         );
@@ -1401,8 +1401,8 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap_or_default();
 
-        assert!(primary_text.contains("<deferred_tools>"));
-        assert!(!dynamic_text.contains("<deferred_tools>"));
+        assert!(primary_text.contains("<deferred-tools>"));
+        assert!(!dynamic_text.contains("<deferred-tools>"));
     }
 
     #[test]
@@ -2202,6 +2202,8 @@ mod cache_stability_regression {
             "glob",
             "git",
             "memory",
+            "introspect",
+            "reflect",
         ] {
             assert!(
                 always_load.contains(name),

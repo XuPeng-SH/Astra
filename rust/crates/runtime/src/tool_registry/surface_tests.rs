@@ -159,7 +159,7 @@ fn server_builtin_inventory_is_public_schema_backed() {
     }
 }
 
-/// The default always_load set is the 14-member core.
+/// The default always_load set is the core surface.
 /// See `astra_runtime_env::ToolSpec::load_policy` for the per-tool classification.
 #[test]
 fn always_load_default_members_are_the_core_set() {
@@ -176,9 +176,11 @@ fn always_load_default_members_are_the_core_set() {
         "git",         // VCS observability is part of the coding loop
         "grep",
         "glob",
+        "introspect", // self-observation must be available before the agent knows it needs it
         "list_dir",
-        "memory", // intrinsic per ToolSpec load policy
-        "notify", // non-blocking user communication; pairs with ask_user
+        "memory",  // intrinsic per ToolSpec load policy
+        "notify",  // non-blocking user communication; pairs with ask_user
+        "reflect", // session diagnosis/recovery entrypoint
         "tool_search",
         "skill",
         "task", // session_todos surface — TUI dashboard depends on it
@@ -198,10 +200,6 @@ fn always_load_default_members_are_the_core_set() {
         "exactly {} default always_load, got {}: {always_load_names:?}",
         expected.len(),
         always_load_names.len()
-    );
-    assert!(
-        !always_load_names.iter().any(|n| n == "introspect"),
-        "introspect is diagnostic-only and must remain deferred by default"
     );
 }
 
@@ -338,6 +336,45 @@ fn deferred_list_contains_every_non_always_load_tool() {
 }
 
 #[test]
+fn observation_tools_are_always_load_and_not_deferred() {
+    let cfg = ToolSurfaceConfig::default();
+    let surface = ToolSurface::build(catalog_schemas(), &cfg, &[]);
+
+    let always_load: std::collections::HashSet<String> =
+        names(&surface.always_load_schemas()).into_iter().collect();
+    let deferred: std::collections::HashSet<String> = surface
+        .deferred()
+        .iter()
+        .map(|entry| entry.name.clone())
+        .collect();
+
+    for tool in ["introspect", "reflect"] {
+        assert!(
+            always_load.contains(tool),
+            "{tool} must be visible without deferred activation"
+        );
+        assert!(
+            !deferred.contains(tool),
+            "{tool} must not also appear in deferred discovery"
+        );
+    }
+
+    let manifest = surface
+        .deferred_manifest(Some("gpt-4o"))
+        .expect("default surface should still have other deferred tools");
+    for tool in ["introspect", "reflect"] {
+        assert!(
+            !manifest.names.iter().any(|name| name == tool),
+            "{tool} must not be advertised as deferred"
+        );
+        assert!(
+            !manifest.text.contains(&format!("\n{tool}\n")),
+            "{tool} must not be rendered in the deferred prompt block"
+        );
+    }
+}
+
+#[test]
 fn deferred_catalog_excludes_catalog_tools_that_are_visible() {
     let cfg = ToolSurfaceConfig::default();
     let visible = std::collections::HashSet::from([
@@ -411,7 +448,7 @@ fn deferred_manifest_is_atomic_text_budget_and_names() {
         .deferred_manifest(Some("gpt-4o"))
         .expect("default surface should have deferred tools");
 
-    assert!(manifest.text.contains("<deferred_tools>"));
+    assert!(manifest.text.contains("<deferred-tools>"));
     assert_eq!(
         manifest.context_window,
         crate::prompts::budget_for_model(Some("gpt-4o")).model_limit
@@ -465,7 +502,7 @@ fn deferred_manifest_names_follow_rendered_budget_subset() {
     );
     for name in &manifest.names {
         assert!(
-            manifest.text.contains(&format!("<name>{name}</name>")),
+            manifest.text.contains(&format!("\n{name}\n")),
             "manifest exposed {name}, but the prompt block did not render that name: {}",
             manifest.text
         );
@@ -484,8 +521,15 @@ fn deferred_manifest_names_follow_rendered_budget_subset() {
         "manifest must expose every deferred tool omitted by the rendered budget"
     );
     assert!(
-        !manifest.text.contains(&format!("<name>{omitted}</name>")),
+        !manifest.text.contains(&format!("\n{omitted}\n")),
         "test setup expected {omitted} to be omitted from rendered prompt"
+    );
+    assert!(
+        !manifest.text.contains("<tool>")
+            && !manifest.text.contains("<name>")
+            && !manifest.text.contains("<description>"),
+        "deferred manifest must be a pure name list, not schema-like XML: {}",
+        manifest.text
     );
 }
 

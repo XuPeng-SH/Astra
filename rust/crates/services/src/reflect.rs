@@ -1,31 +1,60 @@
-use astra_core::{ErrorResponse, MatrixOneSettings, SharedPool, error_response, internal_error};
+use std::collections::BTreeSet;
+
+use astra_core::{
+    ErrorResponse, MatrixOneSettings, ObservationActionHint, ObservationBudgetOmitted,
+    ObservationBudgetResult, ObservationConfidence, ObservationDataCoverage, ObservationEvidence,
+    ObservationFailureCluster, ObservationGraphEdgeKind, ObservationGraphLayer,
+    ObservationGraphNode, ObservationGraphNodeKind, ObservationGraphSlice, ObservationRecord,
+    ObservationView, SharedPool, classify_event_kind, error_response, internal_error,
+    push_graph_edge, push_graph_node, truncate_graph_summary,
+};
 use async_trait::async_trait;
 use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, query};
 
+mod observation;
+mod request;
+use observation::{build_observation_envelope, graph_decision_ref, graph_event_ref};
+pub use request::ReflectRequest;
+
 // ── Types ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ReflectReport {
+    pub schema_version: u32,
+    pub tool: String,
     pub session_id: String,
-    pub focus: String,
-    pub overview: SessionOverview,
-    /// Root-cause diagnoses from actual error content analysis
-    pub diagnoses: Vec<Diagnosis>,
-    /// Statistical insights (secondary)
-    pub insights: Vec<Insight>,
-    pub recommendations: Vec<String>,
+    pub analysis_view: String,
+    pub topic: String,
+    pub facet: String,
+    pub depth: String,
+    pub horizon: String,
+    pub source_policy: String,
+    pub include_context: bool,
+    pub data_coverage: ObservationDataCoverage,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reflection_context: Option<serde_json::Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prompt_preview: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub evidence_graph: Option<EvidenceGraph>,
+    pub view: Option<ObservationView>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observations: Vec<ObservationRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<ObservationEvidence>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub action_hints: Vec<ObservationActionHint>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failure_clusters: Vec<ObservationFailureCluster>,
+    #[serde(default)]
+    pub graph_slice: ObservationGraphSlice,
+    #[serde(default)]
+    pub budget_result: ObservationBudgetResult,
 }
 
+// Type aliases removed — use Observation* types from astra_core directly
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct SessionOverview {
+pub(crate) struct SessionOverview {
     pub total_events: i64,
     pub total_decisions: i64,
     pub duration_minutes: Option<f64>,
@@ -47,7 +76,7 @@ pub struct SessionOverview {
 /// (`"resource_limit"`) instead of the old `PascalCase` (`"ResourceLimit"`).
 /// This is intentional — all enum tags in the codebase use snake_case.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Diagnosis {
+pub(crate) struct Diagnosis {
     pub category: astra_core::ErrorKind,
     pub severity: String,
     pub summary: String,
@@ -59,57 +88,11 @@ pub struct Diagnosis {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Insight {
+pub(crate) struct Insight {
     pub severity: String,
     pub category: String,
     pub message: String,
     pub evidence: String,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "snake_case")]
-pub enum EvidenceGraphNodeKind {
-    Decision,
-    Observation,
-    Outcome,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "snake_case")]
-pub enum EvidenceGraphEdgeKind {
-    Causes,
-    Supports,
-    Contradicts,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct EvidenceGraphNode {
-    pub id: String,
-    pub kind: EvidenceGraphNodeKind,
-    pub label: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub summary: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub anchor: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub created_at: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct EvidenceGraphEdge {
-    pub from: String,
-    pub to: String,
-    pub kind: EvidenceGraphEdgeKind,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-pub struct EvidenceGraph {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub nodes: Vec<EvidenceGraphNode>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub edges: Vec<EvidenceGraphEdge>,
 }
 
 /// Raw error record fetched from DB for content analysis.
@@ -157,47 +140,11 @@ struct EvidenceEvent {
     created_at: String,
 }
 
-/// Data completeness assessment for a reflection report.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DataCompleteness {
-    /// Number of events found in local journal.
-    pub journal_events: u32,
-    /// Number of events found in cloud DB (0 if offline/unavailable).
-    pub cloud_events: u32,
-    /// Events in journal but missing from cloud (potential ingestion drops).
-    pub missing_from_cloud: u32,
-    /// Confidence score (0.0 = no data, 1.0 = complete).
-    pub confidence: f64,
-    /// Human-readable warnings about data gaps.
-    pub warnings: Vec<String>,
-}
-fn truncate_graph_summary(value: &str, max_chars: usize) -> Option<String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let snippet: String = trimmed.chars().take(max_chars).collect();
-    Some(snippet)
-}
-
-fn classify_evidence_event_kind(event_type: &str) -> EvidenceGraphNodeKind {
-    if matches!(
-        event_type,
-        "tool_result" | "tool_error" | "error" | "stall_detected"
-    ) || event_type.contains("error")
-        || event_type.contains("fail")
-    {
-        EvidenceGraphNodeKind::Outcome
-    } else {
-        EvidenceGraphNodeKind::Observation
-    }
-}
-
 fn build_evidence_graph(
     decisions: &[EvidenceDecision],
     events: &[EvidenceEvent],
     parent_id_map: &std::collections::HashMap<String, Vec<String>>,
-) -> Option<EvidenceGraph> {
+) -> Option<ObservationGraphSlice> {
     if decisions.is_empty() && events.is_empty() {
         return None;
     }
@@ -205,55 +152,63 @@ fn build_evidence_graph(
     let mut nodes = Vec::new();
     let mut edges = Vec::new();
     let mut event_node_ids = std::collections::HashSet::new();
-    let mut edge_keys = std::collections::HashSet::new();
+    let mut event_refs = std::collections::HashMap::new();
+    let mut decision_refs = std::collections::HashMap::new();
+    let mut edge_keys = BTreeSet::new();
     let event_ids: std::collections::HashSet<&str> =
         events.iter().map(|event| event.event_id.as_str()).collect();
 
     for decision in decisions {
-        nodes.push(EvidenceGraphNode {
-            id: format!("decision:{}", decision.decision_id),
-            kind: EvidenceGraphNodeKind::Decision,
+        let ref_id = graph_decision_ref(&decision.decision_id);
+        decision_refs.insert(decision.decision_id.clone(), ref_id.clone());
+        nodes.push(ObservationGraphNode {
+            ref_id,
+            layer: ObservationGraphLayer::Runtime,
+            kind: ObservationGraphNodeKind::Decision,
             label: decision.decision_type.clone(),
             summary: truncate_graph_summary(&decision.decision_output.to_string(), 140),
-            anchor: Some(decision.event_id.clone()),
-            created_at: Some(decision.created_at.clone()),
             metadata: Some(serde_json::json!({
                 "decision_id": decision.decision_id,
                 "event_id": decision.event_id,
                 "decision_output": decision.decision_output,
+                "created_at": decision.created_at,
             })),
         });
     }
 
     for event in events {
-        let node_id = format!("event:{}", event.event_id);
+        let ref_id = graph_event_ref(&event.event_id);
         event_node_ids.insert(event.event_id.clone());
-        nodes.push(EvidenceGraphNode {
-            id: node_id,
-            kind: classify_evidence_event_kind(&event.event_type),
+        event_refs.insert(event.event_id.clone(), ref_id.clone());
+        nodes.push(ObservationGraphNode {
+            ref_id,
+            layer: ObservationGraphLayer::Runtime,
+            kind: classify_event_kind(&event.event_type),
             label: event.event_type.clone(),
             summary: truncate_graph_summary(&event.content, 140),
-            anchor: Some(event.event_id.clone()),
-            created_at: Some(event.created_at.clone()),
             metadata: Some(serde_json::json!({
+                "event_id": event.event_id,
                 "skill_name": event.skill_name,
                 "causal_chain_id": event.causal_chain_id,
+                "created_at": event.created_at,
             })),
         });
     }
 
     for decision in decisions {
-        if event_node_ids.contains(&decision.event_id) {
-            let from = format!("event:{}", decision.event_id);
-            let to = format!("decision:{}", decision.decision_id);
-            let key = format!("{from}->{to}:supports");
-            if edge_keys.insert(key) {
-                edges.push(EvidenceGraphEdge {
-                    from,
-                    to,
-                    kind: EvidenceGraphEdgeKind::Supports,
-                });
-            }
+        if event_node_ids.contains(&decision.event_id)
+            && let (Some(from), Some(to)) = (
+                event_refs.get(decision.event_id.as_str()),
+                decision_refs.get(decision.decision_id.as_str()),
+            )
+        {
+            push_graph_edge(
+                &mut edges,
+                &mut edge_keys,
+                from.clone(),
+                to.clone(),
+                ObservationGraphEdgeKind::Supports,
+            );
         }
     }
 
@@ -264,90 +219,46 @@ fn build_evidence_graph(
         );
 
         for parent_event_id in full_parent_ids {
-            if event_ids.contains(parent_event_id.as_str()) {
-                let from = format!("event:{parent_event_id}");
-                let to = format!("event:{}", event.event_id);
-                let key = format!("{from}->{to}:causes");
-                if edge_keys.insert(key) {
-                    edges.push(EvidenceGraphEdge {
-                        from,
-                        to,
-                        kind: EvidenceGraphEdgeKind::Causes,
-                    });
-                }
+            if event_ids.contains(parent_event_id.as_str())
+                && let (Some(from), Some(to)) = (
+                    event_refs.get(parent_event_id.as_str()),
+                    event_refs.get(event.event_id.as_str()),
+                )
+            {
+                push_graph_edge(
+                    &mut edges,
+                    &mut edge_keys,
+                    from.clone(),
+                    to.clone(),
+                    ObservationGraphEdgeKind::Causes,
+                );
             }
 
             for decision in decisions {
-                if decision.event_id == parent_event_id {
-                    let from = format!("decision:{}", decision.decision_id);
-                    let to = format!("event:{}", event.event_id);
-                    let key = format!("{from}->{to}:causes");
-                    if edge_keys.insert(key) {
-                        edges.push(EvidenceGraphEdge {
-                            from,
-                            to,
-                            kind: EvidenceGraphEdgeKind::Causes,
-                        });
-                    }
+                if decision.event_id == parent_event_id
+                    && let (Some(from), Some(to)) = (
+                        decision_refs.get(decision.decision_id.as_str()),
+                        event_refs.get(event.event_id.as_str()),
+                    )
+                {
+                    push_graph_edge(
+                        &mut edges,
+                        &mut edge_keys,
+                        from.clone(),
+                        to.clone(),
+                        ObservationGraphEdgeKind::Causes,
+                    );
                 }
             }
         }
     }
 
-    Some(EvidenceGraph { nodes, edges })
+    Some(ObservationGraphSlice {
+        nodes,
+        edges,
+        budget_result: ObservationBudgetResult::default(),
+    })
 }
-/// Request for LLM-powered single-turn analysis.
-#[derive(Debug, Clone)]
-pub struct TurnAnalysisRequest {
-    pub session_id: String,
-    pub turn: u32,
-    pub question: String,
-}
-
-/// Result of LLM-powered turn analysis.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TurnAnalysisReport {
-    pub session_id: String,
-    pub turn: u32,
-    pub question: String,
-    /// LLM-generated root cause analysis.
-    pub diagnosis: String,
-    /// Specific recommendations from the LLM.
-    pub recommendations: Vec<String>,
-    /// Tool surface quality assessment.
-    pub tool_surface_quality: Option<String>,
-    /// Data sources used for the analysis.
-    pub data_sources: Vec<String>,
-}
-
-/// Unified session diagnostic report combining all inspection capabilities.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionDiagnosticReport {
-    pub session_id: String,
-    /// Data completeness assessment.
-    pub data_completeness: DataCompleteness,
-    /// Total turns in session.
-    pub total_turns: u32,
-    /// Count of turn errors.
-    pub error_count: u32,
-    /// Count of stall events.
-    pub stall_count: u32,
-    /// Count of TurnGuard verdict events.
-    pub verdict_count: u32,
-    /// Tools currently avoidance_advised by health feedback.
-    pub health_avoidance_tools: Vec<String>,
-    /// Summary of error types encountered.
-    pub error_summary: Vec<String>,
-    /// Actionable recommendations.
-    pub recommendations: Vec<String>,
-    /// Number of composite snapshots available for this session.
-    #[serde(default)]
-    pub composite_snapshot_count: u32,
-    /// Dimensions covered by the most recent composite snapshot.
-    #[serde(default)]
-    pub latest_snapshot_dimensions: Vec<String>,
-}
-
 pub type ServiceResult<T> = Result<T, (StatusCode, Json<ErrorResponse>)>;
 
 // ── Trait ─────────────────────────────────────────────────────────────────────
@@ -358,9 +269,7 @@ pub trait ReflectService: Send + Sync {
         &self,
         user_id: &str,
         session_id: &str,
-        focus: &str,
-        last_n: i32,
-        question: &str,
+        request: ReflectRequest,
     ) -> ServiceResult<ReflectReport>;
 }
 
@@ -378,7 +287,7 @@ pub fn classify_error(content: &str, event_type: &str) -> astra_core::ErrorKind 
 }
 
 /// Build diagnoses from raw error records by classifying and grouping.
-pub fn build_diagnoses(raw_errors: &[RawError]) -> Vec<Diagnosis> {
+pub(crate) fn build_diagnoses(raw_errors: &[RawError]) -> Vec<Diagnosis> {
     use astra_core::ErrorKind;
     use std::collections::HashMap;
 
@@ -507,7 +416,7 @@ fn summary_for(kind: astra_core::ErrorKind, tool: &str, count: i64) -> String {
 
 // ── Statistical insights (secondary) ─────────────────────────────────────────
 
-pub fn generate_insights(
+pub(crate) fn generate_insights(
     overview: &SessionOverview,
     error_patterns: &[ErrorPattern],
     decision_aggs: &[DecisionAgg],
@@ -587,7 +496,7 @@ pub fn generate_insights(
     insights
 }
 
-pub fn generate_recommendations(
+pub(crate) fn generate_recommendations(
     overview: &SessionOverview,
     diagnoses: &[Diagnosis],
     insights: &[Insight],
@@ -596,8 +505,9 @@ pub fn generate_recommendations(
 
     // Priority: diagnoses first (specific, actionable)
     for d in diagnoses {
-        if d.severity == "critical" || d.severity == "warning" {
-            recs.push(d.fix_hint.clone());
+        let fix_hint = d.fix_hint.trim();
+        if (d.severity == "critical" || d.severity == "warning") && !fix_hint.is_empty() {
+            recs.push(fix_hint.to_string());
         }
     }
 
@@ -625,140 +535,6 @@ pub fn generate_recommendations(
 
     recs.dedup();
     recs
-}
-
-fn build_reflection_context_value(
-    session_id: &str,
-    overview: &SessionOverview,
-    diagnoses: &[Diagnosis],
-    insights: &[Insight],
-    recommendations: &[String],
-) -> serde_json::Value {
-    let mut signals = Vec::new();
-    for diag in diagnoses.iter().take(6) {
-        signals.push(serde_json::json!({
-            "kind": diag.category.to_string(),
-            "detail": diag.summary,
-            "skill_context": if diag.affected_tool.is_empty() || diag.affected_tool == "unknown" {
-                serde_json::Value::Null
-            } else {
-                serde_json::Value::String(diag.affected_tool.clone())
-            },
-            "turn_id": "server",
-        }));
-    }
-    for insight in insights.iter().filter(|insight| insight.severity != "info") {
-        if signals.len() >= 6 {
-            break;
-        }
-        let detail = if insight.evidence.is_empty() {
-            insight.message.clone()
-        } else {
-            format!("{} — {}", insight.message, insight.evidence)
-        };
-        signals.push(serde_json::json!({
-            "kind": insight.category,
-            "detail": detail,
-            "skill_context": serde_json::Value::Null,
-            "turn_id": "server",
-        }));
-    }
-
-    let mut by_tool: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
-    for diag in diagnoses {
-        if diag.affected_tool.is_empty() || diag.affected_tool == "unknown" {
-            continue;
-        }
-        *by_tool.entry(diag.affected_tool.clone()).or_default() += diag.occurrences;
-    }
-    let mut tool_stats = by_tool
-        .into_iter()
-        .map(|(tool_name, failures)| {
-            serde_json::json!({
-                "tool_name": tool_name,
-                "calls": failures,
-                "failures": failures,
-                "avg_latency_ms": 0,
-            })
-        })
-        .collect::<Vec<_>>();
-    tool_stats.sort_by(|a, b| {
-        b["failures"]
-            .as_i64()
-            .unwrap_or_default()
-            .cmp(&a["failures"].as_i64().unwrap_or_default())
-    });
-    tool_stats.truncate(8);
-
-    serde_json::json!({
-        "session_id": session_id,
-        "turns_completed": overview.total_decisions.max(0),
-        "scenario": serde_json::Value::Null,
-        "signals": signals,
-        "active_experiment": serde_json::Value::Null,
-        "tool_stats": tool_stats,
-        "token_utilisation": 0.0,
-        "recent_tactical_actions": recommendations.iter().take(6).cloned().collect::<Vec<_>>(),
-    })
-}
-
-fn render_reflection_prompt_preview(
-    session_id: &str,
-    focus: &str,
-    question: &str,
-    context: &serde_json::Value,
-) -> String {
-    let mut lines = vec![
-        format!("Session: {session_id}"),
-        format!("Focus: {focus}"),
-        format!(
-            "Turns completed: {}",
-            context["turns_completed"].as_i64().unwrap_or_default()
-        ),
-    ];
-    if !question.trim().is_empty() {
-        lines.push(format!("Question: {}", question.trim()));
-    }
-
-    if let Some(tool_stats) = context["tool_stats"]
-        .as_array()
-        .filter(|stats| !stats.is_empty())
-    {
-        lines.push("Tool pressure:".to_string());
-        for stat in tool_stats.iter().take(4) {
-            lines.push(format!(
-                "- {}: {} failures",
-                stat["tool_name"].as_str().unwrap_or("unknown"),
-                stat["failures"].as_i64().unwrap_or_default()
-            ));
-        }
-    }
-
-    if let Some(signals) = context["signals"]
-        .as_array()
-        .filter(|signals| !signals.is_empty())
-    {
-        lines.push("Signals:".to_string());
-        for signal in signals.iter().take(4) {
-            lines.push(format!(
-                "- {}: {}",
-                signal["kind"].as_str().unwrap_or("signal"),
-                signal["detail"].as_str().unwrap_or("")
-            ));
-        }
-    }
-
-    if let Some(actions) = context["recent_tactical_actions"]
-        .as_array()
-        .filter(|actions| !actions.is_empty())
-    {
-        lines.push("Recent tactical actions:".to_string());
-        for action in actions.iter().take(4).filter_map(serde_json::Value::as_str) {
-            lines.push(format!("- {action}"));
-        }
-    }
-
-    lines.join("\n")
 }
 
 // ── Database implementation ──────────────────────────────────────────────────
@@ -793,10 +569,10 @@ impl DatabaseReflectService {
         pool: &sqlx::Pool<sqlx::MySql>,
         user_id: &str,
         session_id: &str,
-        focus: &str,
+        analysis_view: &str,
         last_n: i32,
-    ) -> ServiceResult<Option<EvidenceGraph>> {
-        if !matches!(focus, "auto" | "tool_surface") {
+    ) -> ServiceResult<Option<ObservationGraphSlice>> {
+        if !analysis_view_queries_recent_evidence_graph(analysis_view) {
             return Ok(None);
         }
 
@@ -835,10 +611,6 @@ impl DatabaseReflectService {
             })
             .collect();
 
-        if decisions.is_empty() {
-            return Ok(None);
-        }
-
         let event_limit = std::cmp::max(decision_limit * 10, 50);
         let event_rows = query(
             "SELECT event_id, event_type, \
@@ -869,15 +641,6 @@ impl DatabaseReflectService {
             })
             .collect();
 
-        let decision_event_ids: std::collections::HashSet<String> = decisions
-            .iter()
-            .map(|decision| decision.event_id.clone())
-            .collect();
-        let relevant_chain_ids: std::collections::HashSet<String> = recent_events
-            .iter()
-            .filter(|event| decision_event_ids.contains(&event.event_id))
-            .filter_map(|event| event.causal_chain_id.clone())
-            .collect();
         let parent_id_map = crate::storage::load_agent_event_parent_ids(
             pool,
             &recent_events
@@ -888,30 +651,8 @@ impl DatabaseReflectService {
         .await
         .map_err(|e| internal_error(format!("evidence graph parent query: {e}")))?;
 
-        let filtered_events: Vec<EvidenceEvent> = recent_events
-            .into_iter()
-            .filter(|event| {
-                decision_event_ids.contains(&event.event_id)
-                    || event
-                        .parent_event_id
-                        .as_ref()
-                        .map(|parent_event_id| decision_event_ids.contains(parent_event_id))
-                        .unwrap_or(false)
-                    || event
-                        .causal_chain_id
-                        .as_ref()
-                        .map(|causal_chain_id| relevant_chain_ids.contains(causal_chain_id))
-                        .unwrap_or(false)
-                    || parent_id_map
-                        .get(&event.event_id)
-                        .map(|parent_ids| {
-                            parent_ids
-                                .iter()
-                                .any(|parent_event_id| decision_event_ids.contains(parent_event_id))
-                        })
-                        .unwrap_or(false)
-            })
-            .collect();
+        let filtered_events =
+            filter_evidence_events_for_graph(&decisions, recent_events, &parent_id_map);
 
         Ok(build_evidence_graph(
             &decisions,
@@ -921,15 +662,58 @@ impl DatabaseReflectService {
     }
 }
 
+fn filter_evidence_events_for_graph(
+    decisions: &[EvidenceDecision],
+    recent_events: Vec<EvidenceEvent>,
+    parent_id_map: &std::collections::HashMap<String, Vec<String>>,
+) -> Vec<EvidenceEvent> {
+    if decisions.is_empty() {
+        return recent_events;
+    }
+
+    let decision_event_ids: std::collections::HashSet<String> = decisions
+        .iter()
+        .map(|decision| decision.event_id.clone())
+        .collect();
+    let relevant_chain_ids: std::collections::HashSet<String> = recent_events
+        .iter()
+        .filter(|event| decision_event_ids.contains(&event.event_id))
+        .filter_map(|event| event.causal_chain_id.clone())
+        .collect();
+
+    recent_events
+        .into_iter()
+        .filter(|event| {
+            decision_event_ids.contains(&event.event_id)
+                || event
+                    .parent_event_id
+                    .as_ref()
+                    .map(|parent_event_id| decision_event_ids.contains(parent_event_id))
+                    .unwrap_or(false)
+                || event
+                    .causal_chain_id
+                    .as_ref()
+                    .map(|causal_chain_id| relevant_chain_ids.contains(causal_chain_id))
+                    .unwrap_or(false)
+                || parent_id_map
+                    .get(&event.event_id)
+                    .map(|parent_ids| {
+                        parent_ids
+                            .iter()
+                            .any(|parent_event_id| decision_event_ids.contains(parent_event_id))
+                    })
+                    .unwrap_or(false)
+        })
+        .collect()
+}
+
 #[async_trait]
 impl ReflectService for DatabaseReflectService {
     async fn build_evidence(
         &self,
         user_id: &str,
         session_id: &str,
-        focus: &str,
-        last_n: i32,
-        question: &str,
+        request: ReflectRequest,
     ) -> ServiceResult<ReflectReport> {
         let pool = self
             .get_pool()
@@ -1060,7 +844,7 @@ impl ReflectService for DatabaseReflectService {
             .collect();
 
         // Error patterns (aggregated, for insights)
-        let error_patterns = if matches!(focus, "auto" | "skill_failure" | "tool_surface") {
+        let error_patterns = if analysis_view_queries_error_patterns(&request.analysis_view) {
             let ep_rows = query(
                 "SELECT IFNULL(skill_name, 'unknown') AS skill_name, event_type, COUNT(*) AS fail_count, \
                    SUBSTRING(COALESCE(MIN(content), ''), 1, 100) AS sample_error \
@@ -1133,31 +917,202 @@ impl ReflectService for DatabaseReflectService {
 
         let insights = generate_insights(&overview, &error_patterns, &decision_aggs);
         let recommendations = generate_recommendations(&overview, &diagnoses, &insights);
-        let reflection_context = build_reflection_context_value(
-            session_id,
-            &overview,
-            &diagnoses,
-            &insights,
-            &recommendations,
-        );
-        let prompt_preview =
-            render_reflection_prompt_preview(session_id, focus, question, &reflection_context);
-        let evidence_graph = self
-            .build_recent_evidence_graph(&pool, user_id, session_id, focus, last_n)
+        let raw_evidence_graph = self
+            .build_recent_evidence_graph(
+                &pool,
+                user_id,
+                session_id,
+                &request.analysis_view,
+                request.last_n,
+            )
             .await?;
+        let (evidence_graph, budget_result) = budget_reflect_evidence_graph(raw_evidence_graph);
+        let (summary, observations, evidence, action_hints, failure_clusters) =
+            build_observation_envelope(
+                session_id,
+                &request,
+                &overview,
+                &diagnoses,
+                &insights,
+                &recommendations,
+                evidence_graph.as_ref(),
+            );
+        let graph_slice = build_reflect_graph_slice(
+            evidence_graph,
+            &observations,
+            &evidence,
+            &failure_clusters,
+            &budget_result,
+        );
+        let view = request.view(overview.total_events, overview.total_decisions);
+        let data_coverage = view.data_coverage.clone();
 
         Ok(ReflectReport {
+            schema_version: 1,
+            tool: "reflect".to_string(),
             session_id: session_id.to_string(),
-            focus: focus.to_string(),
-            overview,
-            diagnoses,
-            insights,
-            recommendations,
-            reflection_context: Some(reflection_context),
-            prompt_preview: Some(prompt_preview),
-            evidence_graph,
+            analysis_view: request.analysis_view,
+            topic: request.topic.as_str().to_string(),
+            facet: request.facet.as_str().to_string(),
+            depth: request.depth.as_str().to_string(),
+            horizon: request.horizon.as_str().to_string(),
+            source_policy: request.source_policy.as_str().to_string(),
+            include_context: request.include_context,
+            data_coverage,
+            view: Some(view),
+            summary,
+            observations,
+            evidence,
+            action_hints,
+            failure_clusters,
+            graph_slice,
+            budget_result,
         })
     }
+}
+
+const REFLECT_EVIDENCE_GRAPH_NODE_BUDGET: usize = 50;
+
+fn budget_reflect_evidence_graph(
+    evidence_graph: Option<ObservationGraphSlice>,
+) -> (Option<ObservationGraphSlice>, ObservationBudgetResult) {
+    let Some(mut graph) = evidence_graph else {
+        return (None, ObservationBudgetResult::default());
+    };
+
+    let omitted_nodes = graph
+        .nodes
+        .len()
+        .saturating_sub(REFLECT_EVIDENCE_GRAPH_NODE_BUDGET) as i64;
+    if omitted_nodes > 0 {
+        graph.nodes.truncate(REFLECT_EVIDENCE_GRAPH_NODE_BUDGET);
+        let retained = graph
+            .nodes
+            .iter()
+            .map(|node| node.ref_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        graph.edges.retain(|edge| {
+            retained.contains(edge.from.as_str()) && retained.contains(edge.to.as_str())
+        });
+    }
+
+    (
+        Some(graph),
+        ObservationBudgetResult {
+            truncated: omitted_nodes > 0,
+            next_cursor: None,
+            omitted: ObservationBudgetOmitted {
+                nodes: omitted_nodes,
+                evidence_previews: omitted_nodes,
+                ..Default::default()
+            },
+        },
+    )
+}
+
+fn build_reflect_graph_slice(
+    evidence_graph: Option<ObservationGraphSlice>,
+    observations: &[ObservationRecord],
+    evidence: &[ObservationEvidence],
+    failure_clusters: &[ObservationFailureCluster],
+    budget_result: &ObservationBudgetResult,
+) -> ObservationGraphSlice {
+    let mut nodes = Vec::new();
+    let mut node_refs = BTreeSet::new();
+    let mut edges = Vec::new();
+    let mut edge_keys = BTreeSet::new();
+
+    if let Some(graph) = evidence_graph {
+        for node in graph.nodes {
+            push_graph_node(&mut nodes, &mut node_refs, node);
+        }
+        for edge in graph.edges {
+            push_graph_edge(&mut edges, &mut edge_keys, edge.from, edge.to, edge.kind);
+        }
+    }
+
+    for item in evidence {
+        push_graph_node(
+            &mut nodes,
+            &mut node_refs,
+            ObservationGraphNode {
+                ref_id: item.ref_id.clone(),
+                layer: ObservationGraphLayer::Runtime,
+                kind: ObservationGraphNodeKind::Evidence,
+                label: item.evidence_class.clone(),
+                summary: Some(item.summary.clone()),
+                metadata: None,
+            },
+        );
+    }
+
+    for observation in observations {
+        push_graph_node(
+            &mut nodes,
+            &mut node_refs,
+            ObservationGraphNode {
+                ref_id: observation.ref_id.clone(),
+                layer: ObservationGraphLayer::Observation,
+                kind: ObservationGraphNodeKind::Observation,
+                label: observation.kind.clone(),
+                summary: Some(observation.summary.clone()),
+                metadata: None,
+            },
+        );
+        for evidence_ref in &observation.evidence_refs {
+            push_graph_edge(
+                &mut edges,
+                &mut edge_keys,
+                observation.ref_id.clone(),
+                evidence_ref.clone(),
+                ObservationGraphEdgeKind::DerivedFrom,
+            );
+        }
+    }
+
+    for cluster in failure_clusters {
+        push_graph_node(
+            &mut nodes,
+            &mut node_refs,
+            ObservationGraphNode {
+                ref_id: cluster.cluster_ref.clone(),
+                layer: ObservationGraphLayer::Observation,
+                kind: ObservationGraphNodeKind::FailureCluster,
+                label: cluster.label.clone(),
+                summary: Some(cluster.summary.clone()),
+                metadata: None,
+            },
+        );
+        for observation_ref in &cluster.observation_refs {
+            push_graph_edge(
+                &mut edges,
+                &mut edge_keys,
+                cluster.cluster_ref.clone(),
+                observation_ref.clone(),
+                ObservationGraphEdgeKind::DerivedFrom,
+            );
+        }
+    }
+
+    ObservationGraphSlice {
+        nodes,
+        edges,
+        budget_result: budget_result.clone(),
+    }
+}
+
+fn analysis_view_queries_error_patterns(analysis_view: &str) -> bool {
+    matches!(
+        analysis_view,
+        "overview" | "execution_errors" | "execution_tools" | "execution_trace"
+    )
+}
+
+fn analysis_view_queries_recent_evidence_graph(analysis_view: &str) -> bool {
+    matches!(
+        analysis_view,
+        "overview" | "execution_tools" | "execution_trace"
+    )
 }
 
 /// Parse two datetime strings (e.g. "2026-03-25 08:00:00") and compute
@@ -1191,9 +1146,7 @@ impl ReflectService for UnconfiguredReflectService {
         &self,
         _: &str,
         _: &str,
-        _: &str,
-        _: i32,
-        _: &str,
+        _: ReflectRequest,
     ) -> ServiceResult<ReflectReport> {
         Err(internal_error("reflect service not configured"))
     }
@@ -1202,8 +1155,12 @@ impl ReflectService for UnconfiguredReflectService {
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+use astra_core::ObservationGraphEdge;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use astra_core::EvidenceRef;
 
     fn make_overview(
         total_events: i64,
@@ -1372,33 +1329,50 @@ mod tests {
             Some(120.0),
         );
         let insights = generate_insights(&overview, &[], &[]);
-        // Should not panic, error rate is 0.5% so no error insights
-        assert!(!insights.iter().any(|i| i.category == "error_pattern"));
+        assert!(
+            insights.is_empty(),
+            "large but healthy sessions should not produce low-signal insights: {insights:?}"
+        );
     }
 
     #[test]
-    fn recommendations_for_errors() {
+    fn recommendations_do_not_infer_actions_from_error_count_without_evidence() {
         let overview = make_overview(100, 40, vec![], 5, None);
         let diagnoses = build_diagnoses(&[]); // no raw errors for this test
         let insights = generate_insights(&overview, &[], &[]);
         let recs = generate_recommendations(&overview, &diagnoses, &insights);
-        // With no actual error content, no specific recs generated
-        assert!(recs.is_empty() || recs.iter().any(|r| !r.is_empty()));
+        assert!(
+            recs.is_empty(),
+            "error counts without diagnoses or actionable insights must not create unsupported recommendations: {recs:?}"
+        );
     }
 
     #[test]
-    fn recommendations_for_tool_failure() {
-        let overview = make_overview(50, 5, vec![], 5, None);
-        let patterns = vec![ErrorPattern {
-            skill_name: "bash".into(),
-            event_type: "tool_error".into(),
-            fail_count: 5,
-            sample_error: "permission denied".into(),
+    fn recommendations_skip_empty_diagnosis_fix_hints() {
+        let overview = make_overview(50, 0, vec![], 0, None);
+        let diagnoses = vec![Diagnosis {
+            category: astra_core::ErrorKind::Unknown,
+            severity: "warning".into(),
+            summary: "diagnosis without actionable fix".into(),
+            samples: vec!["ambiguous failure".into()],
+            occurrences: 1,
+            affected_tool: "bash".into(),
+            fix_hint: "   ".into(),
         }];
-        let insights = generate_insights(&overview, &patterns, &[]);
-        let recs = generate_recommendations(&overview, &[], &insights);
-        // No specific diagnosis-driven recs without raw errors
-        let _ = recs;
+        let insights = vec![Insight {
+            severity: "warning".into(),
+            category: "stall".into(),
+            message: "Many events but no decisions — possible routing issue".into(),
+            evidence: "50 events, 0 decisions".into(),
+        }];
+
+        let recs = generate_recommendations(&overview, &diagnoses, &insights);
+
+        assert_eq!(
+            recs,
+            vec!["Review agent routing — events without decisions may be misconfigured"]
+        );
+        assert!(recs.iter().all(|rec| !rec.trim().is_empty()));
     }
 
     #[test]
@@ -1416,6 +1390,469 @@ mod tests {
     }
 
     #[test]
+    fn observation_envelope_maps_diagnoses_to_refs_and_hints() {
+        let request = ReflectRequest::from_observation_params(
+            Some("execution"),
+            Some("errors"),
+            None,
+            None,
+            20,
+            "why did bash fail?",
+        );
+        let overview = make_overview(10, 3, vec![("bash".into(), 5)], 2, Some(3.0));
+        let diagnoses = vec![Diagnosis {
+            category: astra_core::ErrorKind::ToolTimeout,
+            severity: "warning".into(),
+            summary: "Timeout (bash): operation exceeded time limit - 3 occurrences".into(),
+            samples: vec!["command timed out after 30s".into()],
+            occurrences: 3,
+            affected_tool: "bash".into(),
+            fix_hint: "Narrow Command Scope".into(),
+        }];
+        let recommendations = vec![" narrow   command scope ".to_string()];
+
+        let (summary, observations, evidence, action_hints, failure_clusters) =
+            build_observation_envelope(
+                "sess/with spaces",
+                &request,
+                &overview,
+                &diagnoses,
+                &[],
+                &recommendations,
+                None,
+            );
+
+        assert!(summary.contains("Timeout (bash)"));
+        assert_eq!(observations.len(), 1);
+        assert!(
+            observations[0]
+                .ref_id
+                .starts_with("urn:astra:observation:graph:reflect:")
+        );
+        assert_eq!(observations[0].topic, "execution");
+        assert_eq!(observations[0].facet, "errors");
+        assert_eq!(observations[0].kind, "diagnosis:tool_timeout");
+        assert_eq!(observations[0].confidence.evidence, Some(0.90));
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].evidence_class, "observed_evidence");
+        assert_eq!(evidence[0].confidence.evidence, Some(0.90));
+        assert_eq!(evidence[0].confidence.classification, None);
+        assert_eq!(evidence[0].confidence.causal, None);
+        assert!(
+            evidence[0]
+                .ref_id
+                .starts_with("urn:astra:artifact:cloud:reflect:")
+        );
+        assert_eq!(action_hints.len(), 1);
+        assert_eq!(action_hints[0].target_type, "user_guidance");
+        assert_eq!(
+            action_hints[0].observation_refs,
+            vec![observations[0].ref_id.clone()]
+        );
+        assert_eq!(failure_clusters.len(), 1);
+        assert_eq!(failure_clusters[0].label, "tool_timeout_bash");
+        assert_eq!(
+            failure_clusters[0].observation_refs,
+            vec![observations[0].ref_id.clone()]
+        );
+        assert_refs_are_valid(&observations, &evidence, &action_hints, &failure_clusters);
+    }
+
+    #[test]
+    fn observation_envelope_classifies_diagnoses_independent_of_overview_request() {
+        let request =
+            ReflectRequest::from_observation_params(None, None, None, None, 20, "what went wrong?");
+        let overview = make_overview(12, 2, vec![("bash".into(), 5)], 2, Some(3.0));
+        let diagnoses = vec![Diagnosis {
+            category: astra_core::ErrorKind::ResourceLimit,
+            severity: "critical".into(),
+            summary: "Resource limit (bash): fork failed - 2 occurrences".into(),
+            samples: vec!["fork: Resource temporarily unavailable".into()],
+            occurrences: 2,
+            affected_tool: "bash".into(),
+            fix_hint: "check ulimit".into(),
+        }];
+
+        let (_, observations, _, _, _) = build_observation_envelope(
+            "sess-overview",
+            &request,
+            &overview,
+            &diagnoses,
+            &[],
+            &[],
+            None,
+        );
+
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].topic, "execution");
+        assert_eq!(observations[0].facet, "errors");
+        assert_eq!(observations[0].kind, "diagnosis:resource_limit");
+    }
+
+    #[test]
+    fn observation_envelope_maps_insight_topics_and_action_refs_precisely() {
+        let request = ReflectRequest::from_observation_params(
+            None,
+            None,
+            None,
+            None,
+            20,
+            "how is the session going?",
+        );
+        let overview = make_overview(80, 0, vec![("bash".into(), 64)], 0, Some(8.0));
+        let insights = vec![
+            Insight {
+                severity: "warning".into(),
+                category: "stall".into(),
+                message: "Many events but no decisions - possible routing issue".into(),
+                evidence: "80 events, 0 decisions".into(),
+            },
+            Insight {
+                severity: "info".into(),
+                category: "tool_usage".into(),
+                message: "Over-reliance on bash: 80%".into(),
+                evidence: "64/80".into(),
+            },
+        ];
+        let recommendations = vec![
+            "Review agent routing — EVENTS WITHOUT DECISIONS may be misconfigured".to_string(),
+            "Consider using more DIVERSE TOOLS for better coverage".to_string(),
+        ];
+
+        let (_, observations, _, action_hints, failure_clusters) = build_observation_envelope(
+            "sess-insights",
+            &request,
+            &overview,
+            &[],
+            &insights,
+            &recommendations,
+            None,
+        );
+
+        assert_eq!(observations[0].topic, "execution");
+        assert_eq!(observations[0].facet, "stall");
+        assert_eq!(observations[1].topic, "execution");
+        assert_eq!(observations[1].facet, "tools");
+        assert_eq!(action_hints.len(), 2);
+        assert_eq!(
+            action_hints[0].observation_refs,
+            vec![observations[0].ref_id.clone()]
+        );
+        assert_eq!(
+            action_hints[1].observation_refs,
+            vec![observations[1].ref_id.clone()]
+        );
+        assert!(
+            failure_clusters.is_empty(),
+            "statistical insights should not be promoted into failure clusters without diagnosis evidence"
+        );
+    }
+
+    #[test]
+    fn execution_trace_requests_enable_recent_evidence_graph() {
+        let request = ReflectRequest::from_observation_params(
+            Some("execution"),
+            Some("trace"),
+            Some("forensic"),
+            Some("session"),
+            20,
+            "show the causal trace",
+        );
+
+        assert_eq!(request.analysis_view, "execution_trace");
+        assert!(analysis_view_queries_error_patterns(&request.analysis_view));
+        assert!(
+            analysis_view_queries_recent_evidence_graph(&request.analysis_view),
+            "execution/trace must not be blocked by internal analysis-view gating"
+        );
+    }
+
+    #[test]
+    fn non_trace_analysis_views_do_not_enable_recent_evidence_graph() {
+        let knowledge = ReflectRequest::from_observation_params(
+            Some("knowledge"),
+            Some("context"),
+            None,
+            None,
+            20,
+            "",
+        );
+        let performance = ReflectRequest::from_observation_params(
+            Some("runtime"),
+            Some("performance"),
+            None,
+            None,
+            20,
+            "",
+        );
+
+        assert_eq!(knowledge.analysis_view, "knowledge_context");
+        assert_eq!(performance.analysis_view, "runtime_performance");
+        assert!(!analysis_view_queries_recent_evidence_graph(
+            &knowledge.analysis_view
+        ));
+        assert!(!analysis_view_queries_recent_evidence_graph(
+            &performance.analysis_view
+        ));
+    }
+
+    #[test]
+    fn observation_envelope_emits_health_observation_when_no_findings() {
+        let request = ReflectRequest::from_observation_params(None, None, None, None, 20, "");
+        let overview = make_overview(8, 0, vec![("bash".into(), 3)], 2, Some(1.0));
+
+        let (summary, observations, evidence, action_hints, failure_clusters) =
+            build_observation_envelope("sess-healthy", &request, &overview, &[], &[], &[], None);
+
+        assert!(summary.contains("Session healthy"));
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].kind, "session_health");
+        assert_eq!(observations[0].severity, "info");
+        assert!(evidence.is_empty());
+        assert!(action_hints.is_empty());
+        assert!(failure_clusters.is_empty());
+        assert_refs_are_valid(&observations, &evidence, &action_hints, &failure_clusters);
+    }
+
+    #[test]
+    fn observation_envelope_adds_standard_refs_for_evidence_graph_nodes() {
+        let request = ReflectRequest::from_observation_params(None, None, None, None, 20, "");
+        let overview = make_overview(2, 0, vec![], 1, None);
+        let graph = ObservationGraphSlice {
+            nodes: vec![
+                ObservationGraphNode {
+                    ref_id: graph_event_ref("evt-1"),
+                    layer: ObservationGraphLayer::Runtime,
+                    kind: ObservationGraphNodeKind::Event,
+                    label: "user_query".into(),
+                    summary: Some("asked a question".into()),
+                    metadata: None,
+                },
+                ObservationGraphNode {
+                    ref_id: graph_decision_ref("dec-1"),
+                    layer: ObservationGraphLayer::Runtime,
+                    kind: ObservationGraphNodeKind::Decision,
+                    label: "tool_surface".into(),
+                    summary: None,
+                    metadata: None,
+                },
+            ],
+            edges: vec![],
+            budget_result: ObservationBudgetResult::default(),
+        };
+
+        let (_, _, evidence, _, _) = build_observation_envelope(
+            "sess-graph",
+            &request,
+            &overview,
+            &[],
+            &[],
+            &[],
+            Some(&graph),
+        );
+
+        assert!(
+            evidence
+                .iter()
+                .any(|item| item.ref_id == "urn:astra:event:cloud:evt-1")
+        );
+        assert!(
+            evidence
+                .iter()
+                .any(|item| item.ref_id == "urn:astra:decision:cloud:dec-1")
+        );
+        assert_refs_are_valid(&[], &evidence, &[], &[]);
+    }
+
+    #[test]
+    fn reflect_graph_slice_projects_shared_layers_without_dangling_edges() {
+        let request = ReflectRequest::from_observation_params(
+            Some("execution"),
+            Some("trace"),
+            Some("forensic"),
+            Some("session"),
+            20,
+            "show trace",
+        );
+        let overview = make_overview(10, 3, vec![("bash".into(), 5)], 2, Some(3.0));
+        let diagnoses = vec![Diagnosis {
+            category: astra_core::ErrorKind::ToolTimeout,
+            severity: "warning".into(),
+            summary: "Timeout (bash): operation exceeded time limit - 3 occurrences".into(),
+            samples: vec!["command timed out after 30s".into()],
+            occurrences: 3,
+            affected_tool: "bash".into(),
+            fix_hint: "Narrow Command Scope".into(),
+        }];
+        let graph = ObservationGraphSlice {
+            nodes: vec![
+                ObservationGraphNode {
+                    ref_id: graph_event_ref("evt-1"),
+                    layer: ObservationGraphLayer::Runtime,
+                    kind: ObservationGraphNodeKind::Event,
+                    label: "tool_call".into(),
+                    summary: Some("ran bash".into()),
+                    metadata: None,
+                },
+                ObservationGraphNode {
+                    ref_id: graph_event_ref("evt-2"),
+                    layer: ObservationGraphLayer::Runtime,
+                    kind: ObservationGraphNodeKind::Outcome,
+                    label: "tool_error".into(),
+                    summary: Some("timeout".into()),
+                    metadata: None,
+                },
+            ],
+            edges: vec![ObservationGraphEdge {
+                from: graph_event_ref("evt-1"),
+                to: graph_event_ref("evt-2"),
+                kind: ObservationGraphEdgeKind::Causes,
+            }],
+            budget_result: ObservationBudgetResult::default(),
+        };
+        let (_, observations, evidence, _, failure_clusters) = build_observation_envelope(
+            "sess-graph-slice",
+            &request,
+            &overview,
+            &diagnoses,
+            &[],
+            &["narrow command scope".to_string()],
+            Some(&graph),
+        );
+        let graph_slice = build_reflect_graph_slice(
+            Some(graph),
+            &observations,
+            &evidence,
+            &failure_clusters,
+            &ObservationBudgetResult::default(),
+        );
+
+        assert!(graph_slice.nodes.iter().any(|node| {
+            node.ref_id == "urn:astra:event:cloud:evt-1"
+                && node.layer == ObservationGraphLayer::Runtime
+                && node.kind == ObservationGraphNodeKind::Event
+        }));
+        assert!(graph_slice.nodes.iter().any(|node| {
+            node.ref_id == observations[0].ref_id
+                && node.layer == ObservationGraphLayer::Observation
+                && node.kind == ObservationGraphNodeKind::Observation
+        }));
+        assert!(graph_slice.nodes.iter().any(|node| {
+            node.ref_id == failure_clusters[0].cluster_ref
+                && node.kind == ObservationGraphNodeKind::FailureCluster
+        }));
+        assert!(
+            graph_slice
+                .nodes
+                .iter()
+                .any(|node| node.ref_id == evidence[0].ref_id
+                    && node.kind == ObservationGraphNodeKind::Evidence),
+            "materialized evidence previews must be nodes so observation edges are not dangling"
+        );
+
+        let node_refs = graph_slice
+            .nodes
+            .iter()
+            .map(|node| node.ref_id.as_str())
+            .collect::<BTreeSet<_>>();
+        for edge in &graph_slice.edges {
+            assert!(
+                node_refs.contains(edge.from.as_str()),
+                "dangling from edge: {edge:?}"
+            );
+            assert!(
+                node_refs.contains(edge.to.as_str()),
+                "dangling to edge: {edge:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reflect_graph_budget_truncates_nodes_and_prunes_dangling_edges() {
+        let graph = ObservationGraphSlice {
+            nodes: (0..55)
+                .map(|idx| ObservationGraphNode {
+                    ref_id: graph_event_ref(&format!("evt-{idx}")),
+                    layer: ObservationGraphLayer::Runtime,
+                    kind: ObservationGraphNodeKind::Event,
+                    label: format!("event {idx}"),
+                    summary: None,
+                    metadata: None,
+                })
+                .collect(),
+            edges: vec![
+                ObservationGraphEdge {
+                    from: graph_event_ref("evt-0"),
+                    to: graph_event_ref("evt-49"),
+                    kind: ObservationGraphEdgeKind::Supports,
+                },
+                ObservationGraphEdge {
+                    from: graph_event_ref("evt-49"),
+                    to: graph_event_ref("evt-54"),
+                    kind: ObservationGraphEdgeKind::Causes,
+                },
+            ],
+            budget_result: ObservationBudgetResult::default(),
+        };
+
+        let (budgeted_graph, budget) = budget_reflect_evidence_graph(Some(graph));
+        let budgeted_graph = budgeted_graph.expect("budgeted graph");
+        assert!(budget.truncated);
+        assert_eq!(budget.omitted.nodes, 5);
+        assert_eq!(budget.omitted.evidence_previews, 5);
+        assert_eq!(budgeted_graph.nodes.len(), 50);
+        assert_eq!(budgeted_graph.edges.len(), 1);
+        assert_eq!(budgeted_graph.edges[0].to, graph_event_ref("evt-49"));
+    }
+
+    #[test]
+    fn reflect_graph_budget_empty_graph_is_not_truncated() {
+        let (graph, budget) = budget_reflect_evidence_graph(None);
+        assert!(graph.is_none());
+        assert!(!budget.truncated);
+        assert!(budget.omitted.is_empty());
+    }
+
+    fn assert_refs_are_valid(
+        observations: &[ObservationRecord],
+        evidence: &[ObservationEvidence],
+        action_hints: &[ObservationActionHint],
+        failure_clusters: &[ObservationFailureCluster],
+    ) {
+        for observation in observations {
+            EvidenceRef::parse(&observation.ref_id).unwrap_or_else(|err| {
+                panic!("invalid observation ref {}: {err}", observation.ref_id)
+            });
+            for evidence_ref in &observation.evidence_refs {
+                EvidenceRef::parse(evidence_ref).unwrap_or_else(|err| {
+                    panic!("invalid observation evidence ref {evidence_ref}: {err}")
+                });
+            }
+        }
+        for evidence in evidence {
+            EvidenceRef::parse(&evidence.ref_id)
+                .unwrap_or_else(|err| panic!("invalid evidence ref {}: {err}", evidence.ref_id));
+        }
+        for hint in action_hints {
+            for observation_ref in &hint.observation_refs {
+                EvidenceRef::parse(observation_ref).unwrap_or_else(|err| {
+                    panic!("invalid action hint ref {observation_ref}: {err}")
+                });
+            }
+        }
+        for cluster in failure_clusters {
+            EvidenceRef::parse(&cluster.cluster_ref).unwrap_or_else(|err| {
+                panic!("invalid failure cluster ref {}: {err}", cluster.cluster_ref)
+            });
+            for observation_ref in &cluster.observation_refs {
+                EvidenceRef::parse(observation_ref).unwrap_or_else(|err| {
+                    panic!("invalid failure cluster observation ref {observation_ref}: {err}")
+                });
+            }
+        }
+    }
+
+    #[test]
     fn test_compute_duration_minutes() {
         // basic
         let d = compute_duration_minutes(Some("2026-03-25 08:00:00"), Some("2026-03-25 08:18:30"));
@@ -1430,50 +1867,117 @@ mod tests {
 
     #[test]
     fn report_serialization_roundtrip() {
-        let reflection_context = serde_json::json!({
-            "session_id": "test-sess",
-            "turns_completed": 2,
-            "tool_stats": [{"tool_name": "bash", "calls": 3, "failures": 3, "avg_latency_ms": 0}],
-            "signals": [{"kind": "resource_limit", "detail": "fork failed", "skill_context": "bash", "turn_id": "server"}],
-            "recent_tactical_actions": ["check ulimit -u"],
-            "token_utilisation": 0.0
-        });
+        let data_coverage = ObservationDataCoverage {
+            overall: "fresh".into(),
+            source: "server_db".into(),
+            events: 10,
+            decisions: 2,
+            providers: Default::default(),
+            warnings: vec![],
+        };
         let report = ReflectReport {
+            schema_version: 1,
+            tool: "reflect".into(),
             session_id: "test-sess".into(),
-            focus: "auto".into(),
-            overview: make_overview(10, 1, vec![("bash".into(), 8)], 2, Some(5.0)),
-            diagnoses: vec![Diagnosis {
-                category: astra_core::ErrorKind::ResourceLimit,
+            analysis_view: "overview".into(),
+            topic: "overview".into(),
+            facet: "overview".into(),
+            depth: "diagnostic".into(),
+            horizon: "session".into(),
+            source_policy: "auto".into(),
+            include_context: false,
+            data_coverage: data_coverage.clone(),
+            view: Some(ObservationView {
+                topic: "overview".into(),
+                facet: "overview".into(),
+                depth: "diagnostic".into(),
+                horizon: "session".into(),
+                data_coverage,
+            }),
+            summary: "fork failed".into(),
+            observations: vec![ObservationRecord {
+                ref_id: "urn:astra:observation:graph:reflect:test-sess:diagnosis:0".into(),
+                topic: "overview".into(),
+                facet: "overview".into(),
+                kind: "diagnosis:resource_limit".into(),
                 severity: "critical".into(),
                 summary: "fork failed".into(),
-                samples: vec!["fork: Resource temporarily unavailable".into()],
-                occurrences: 3,
-                affected_tool: "bash".into(),
-                fix_hint: "check ulimit -u".into(),
+                confidence: ObservationConfidence::complete(0.90, 0.90, 0.82),
+                evidence_refs: vec![
+                    "urn:astra:artifact:cloud:reflect:test-sess:diagnosis:0:sample:0".into(),
+                ],
             }],
-            insights: vec![Insight {
-                severity: "info".into(),
-                category: "performance".into(),
-                message: "test".into(),
-                evidence: "test evidence".into(),
+            evidence: vec![ObservationEvidence {
+                ref_id: "urn:astra:artifact:cloud:reflect:test-sess:diagnosis:0:sample:0".into(),
+                evidence_class: "observed_evidence".into(),
+                source: "agent_events.error_sample".into(),
+                summary: "fork: Resource temporarily unavailable".into(),
+                confidence: ObservationConfidence::evidence(0.90),
             }],
-            recommendations: vec!["do something".into()],
-            reflection_context: Some(reflection_context),
-            prompt_preview: Some("Session: test-sess".into()),
-            evidence_graph: Some(EvidenceGraph {
-                nodes: vec![EvidenceGraphNode {
-                    id: "decision:d1".into(),
-                    kind: EvidenceGraphNodeKind::Decision,
-                    label: "tool_surface".into(),
-                    summary: Some("picked bash".into()),
-                    anchor: Some("evt-1".into()),
-                    created_at: Some("2026-04-12T10:00:00".into()),
-                    metadata: None,
-                }],
-                edges: vec![],
-            }),
+            action_hints: vec![ObservationActionHint {
+                target_type: "user_guidance".into(),
+                summary: "check ulimit -u".into(),
+                confidence: ObservationConfidence::classification_evidence(0.75, 0.70),
+                observation_refs: vec![
+                    "urn:astra:observation:graph:reflect:test-sess:diagnosis:0".into(),
+                ],
+            }],
+            failure_clusters: vec![ObservationFailureCluster {
+                cluster_ref:
+                    "urn:astra:failure_cluster:graph:reflect:test-sess:resource_limit:bash".into(),
+                label: "resource_limit_bash".into(),
+                summary: "resource_limit affected bash 3 times".into(),
+                observation_refs: vec![
+                    "urn:astra:observation:graph:reflect:test-sess:diagnosis:0".into(),
+                ],
+                evidence_class: "inferred_evidence".into(),
+                confidence: ObservationConfidence::classification_evidence(0.84, 0.90),
+            }],
+            graph_slice: ObservationGraphSlice::default(),
+            budget_result: ObservationBudgetResult::default(),
         };
+        assert_refs_are_valid(
+            &report.observations,
+            &report.evidence,
+            &report.action_hints,
+            &report.failure_clusters,
+        );
         let json = serde_json::to_string(&report).unwrap();
+        let json_value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(json_value["schema_version"], 1);
+        assert_eq!(json_value["tool"], "reflect");
+        assert_eq!(json_value["topic"], json_value["view"]["topic"]);
+        assert_eq!(json_value["facet"], json_value["view"]["facet"]);
+        assert_eq!(json_value["depth"], json_value["view"]["depth"]);
+        assert_eq!(json_value["horizon"], json_value["view"]["horizon"]);
+        assert_eq!(
+            json_value["data_coverage"],
+            json_value["view"]["data_coverage"]
+        );
+        assert!(
+            json_value.get("adaptation_signals").is_none(),
+            "reflect reports must not embed tuning/adaptation signals in the observation report"
+        );
+        assert!(
+            json_value.get("causal_chains").is_none(),
+            "reflect reports must not expose unused causal-chain placeholders"
+        );
+        assert!(
+            json_value.get("graph_slice").is_some(),
+            "reflect reports must expose the shared graph_slice envelope"
+        );
+        assert!(
+            json_value.get("evidence_graph").is_none(),
+            "legacy evidence_graph must not be part of the public reflect report"
+        );
+        assert!(
+            json_value.get("reflection_context").is_none(),
+            "legacy reflection_context must not be part of the public reflect report"
+        );
+        assert!(
+            json_value.get("prompt_preview").is_none(),
+            "legacy prompt_preview must not be part of the public reflect report"
+        );
         let parsed: ReflectReport = serde_json::from_str(&json).unwrap();
         assert_eq!(report, parsed);
     }
@@ -1515,52 +2019,57 @@ mod tests {
         let graph = build_evidence_graph(&decisions, &events, &parent_id_map).expect("graph");
         assert_eq!(graph.nodes.len(), 3);
         assert!(graph.edges.iter().any(|edge| {
-            edge.from == "event:evt-user"
-                && edge.to == "decision:d1"
-                && edge.kind == EvidenceGraphEdgeKind::Supports
+            edge.from == graph_event_ref("evt-user")
+                && edge.to == graph_decision_ref("d1")
+                && edge.kind == ObservationGraphEdgeKind::Supports
         }));
         assert!(graph.edges.iter().any(|edge| {
-            edge.from == "decision:d1"
-                && edge.to == "event:evt-tool"
-                && edge.kind == EvidenceGraphEdgeKind::Causes
+            edge.from == graph_decision_ref("d1")
+                && edge.to == graph_event_ref("evt-tool")
+                && edge.kind == ObservationGraphEdgeKind::Causes
         }));
     }
 
     #[test]
-    fn reflect_shape_helpers_build_local_compatible_fields() {
-        let overview = make_overview(10, 2, vec![("bash".into(), 8)], 3, Some(5.0));
-        let diagnoses = vec![Diagnosis {
-            category: astra_core::ErrorKind::ToolTimeout,
-            severity: "warning".into(),
-            summary: "bash timed out".into(),
-            samples: vec!["command timed out".into()],
-            occurrences: 2,
-            affected_tool: "bash".into(),
-            fix_hint: "narrow the command scope".into(),
-        }];
-        let insights = vec![Insight {
-            severity: "warning".into(),
-            category: "performance".into(),
-            message: "slow turn".into(),
-            evidence: "2 timeouts".into(),
-        }];
-        let recommendations = vec!["narrow the command scope".to_string()];
+    fn evidence_graph_keeps_event_only_failure_chains() {
+        let events = vec![
+            EvidenceEvent {
+                event_id: "evt-call".into(),
+                event_type: "tool_call".into(),
+                content: "run bash".into(),
+                skill_name: Some("bash".into()),
+                parent_event_id: None,
+                causal_chain_id: Some("chain-1".into()),
+                created_at: "2026-04-12T10:00:00".into(),
+            },
+            EvidenceEvent {
+                event_id: "evt-error".into(),
+                event_type: "tool_error".into(),
+                content: "permission denied".into(),
+                skill_name: Some("bash".into()),
+                parent_event_id: Some("evt-call".into()),
+                causal_chain_id: Some("chain-1".into()),
+                created_at: "2026-04-12T10:00:01".into(),
+            },
+        ];
+        let parent_id_map = std::collections::HashMap::from([(
+            "evt-error".to_string(),
+            vec!["evt-call".to_string()],
+        )]);
+        let filtered = filter_evidence_events_for_graph(&[], events, &parent_id_map);
 
-        let context = build_reflection_context_value(
-            "test-sess",
-            &overview,
-            &diagnoses,
-            &insights,
-            &recommendations,
-        );
-        let prompt =
-            render_reflection_prompt_preview("test-sess", "performance", "why so slow?", &context);
-
-        assert_eq!(context["session_id"], "test-sess");
-        assert_eq!(context["tool_stats"][0]["tool_name"], "bash");
-        assert_eq!(context["signals"][0]["kind"], "tool_timeout");
-        assert!(prompt.contains("Focus: performance"));
-        assert!(prompt.contains("Question: why so slow?"));
+        let graph = build_evidence_graph(&[], &filtered, &parent_id_map)
+            .expect("event-only failures still produce graph evidence");
+        assert_eq!(graph.nodes.len(), 2);
+        assert!(graph.nodes.iter().any(|node| {
+            node.ref_id == graph_event_ref("evt-error")
+                && node.kind == ObservationGraphNodeKind::Outcome
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.from == graph_event_ref("evt-call")
+                && edge.to == graph_event_ref("evt-error")
+                && edge.kind == ObservationGraphEdgeKind::Causes
+        }));
     }
 
     /// Validate that all GROUP BY queries only SELECT grouped columns or aggregate functions.
@@ -1797,7 +2306,10 @@ mod tests {
             content: "fork: Resource temporarily unavailable".into(),
         }];
         let diags = build_diagnoses(&errors);
-        assert!(diags[0].fix_hint.contains("ulimit"));
+        assert_eq!(
+            diags[0].fix_hint,
+            astra_core::ErrorKind::ResourceLimit.diagnosis_hint()
+        );
     }
 
     #[test]
@@ -1851,7 +2363,7 @@ mod tests {
             fix_hint: "Check ulimit -u".into(),
         }];
         let recs = generate_recommendations(&overview, &diags, &[]);
-        assert!(recs.iter().any(|r| r.contains("ulimit")));
+        assert_eq!(recs, vec!["Check ulimit -u"]);
     }
 
     #[test]
@@ -1868,8 +2380,10 @@ mod tests {
         let diags = build_diagnoses(&errors);
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].category, astra_core::ErrorKind::ResourceLimit);
-        // Fix hint explains it's a process fork issue, not a general system issue
-        assert!(diags[0].fix_hint.contains("ulimit") || diags[0].fix_hint.contains("procs"));
+        assert_eq!(
+            diags[0].fix_hint,
+            astra_core::ErrorKind::ResourceLimit.diagnosis_hint()
+        );
     }
 
     #[test]
@@ -1909,7 +2423,10 @@ mod tests {
         assert_eq!(diags[0].category, astra_core::ErrorKind::Stall);
         assert_eq!(diags[0].occurrences, 3);
         assert_eq!(diags[0].severity, "warning"); // 3 stalls = warning
-        assert!(diags[0].fix_hint.contains("rewind") || diags[0].fix_hint.contains("/rewind"));
+        assert_eq!(
+            diags[0].fix_hint,
+            astra_core::ErrorKind::Stall.diagnosis_hint()
+        );
     }
 
     #[test]

@@ -57,9 +57,9 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub context_window: ContextWindowConfig,
 
-    /// Adaptive tuning engine parameters (cooldowns, cycle intervals).
+    /// Adaptive runtime dampening parameters.
     #[serde(default)]
-    pub adaptive_tuning: AdaptiveTuningConfig,
+    pub adaptive_runtime: AdaptiveRuntimeConfig,
 
     /// Safety-guard configuration.
     ///
@@ -96,6 +96,67 @@ pub struct RuntimeConfig {
     /// Agent Binding registry limits.
     #[serde(default)]
     pub agent_binding_registry: AgentBindingRegistryConfig,
+
+    /// Budget policy for auto-expansion based on outcome streaks.
+    ///
+    /// Controls when the framework automatically extends the turn budget
+    /// (expand after consecutive productive rounds) and when it injects
+    /// corrective signals (nudge after consecutive unproductive rounds).
+    /// Uses RuntimePolicy::default() when left unset.
+    #[serde(default)]
+    pub budget_policy: Option<BudgetPolicyConfig>,
+}
+
+// ─── Budget Policy Configuration ────────────────────────────────────────────
+
+/// User-configurable budget policy parameters.
+///
+/// All fields have sensible defaults matching
+/// [`astra_runtime::turn::runtime_policy::RuntimePolicy::default()`].
+/// Users may set only the fields they wish to override; omitted
+/// fields fall back to their default via `#[serde(default)]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BudgetPolicyConfig {
+    /// Expand budget after this many consecutive rounds with observable outcome.
+    #[serde(default = "default_expand_after_consecutive_outcomes")]
+    pub expand_after_consecutive_outcomes: u32,
+
+    /// Multiply current max rounds by this factor on expansion.
+    #[serde(default = "default_expand_factor")]
+    pub expand_factor: f64,
+
+    /// Absolute ceiling: budget never exceeds this regardless of expansions.
+    #[serde(default = "default_max_ceiling")]
+    pub max_ceiling: u32,
+
+    /// Inject a corrective signal after this many consecutive rounds with
+    /// zero observable outcome.
+    #[serde(default = "default_reflect_after_consecutive_zero")]
+    pub reflect_after_consecutive_zero: u32,
+}
+
+fn default_expand_after_consecutive_outcomes() -> u32 {
+    2
+}
+fn default_expand_factor() -> f64 {
+    1.5
+}
+fn default_max_ceiling() -> u32 {
+    1000
+}
+fn default_reflect_after_consecutive_zero() -> u32 {
+    3
+}
+
+impl Default for BudgetPolicyConfig {
+    fn default() -> Self {
+        Self {
+            expand_after_consecutive_outcomes: default_expand_after_consecutive_outcomes(),
+            expand_factor: default_expand_factor(),
+            max_ceiling: default_max_ceiling(),
+            reflect_after_consecutive_zero: default_reflect_after_consecutive_zero(),
+        }
+    }
 }
 
 // ─── Runtime Limits Configuration ────────────────────────────────────────────
@@ -310,12 +371,13 @@ impl Default for RuntimeConfig {
             verification: VerificationConfig::default(),
             memory_pressure: MemoryPressureConfig::default(),
             context_window: ContextWindowConfig::default(),
-            adaptive_tuning: AdaptiveTuningConfig::default(),
+            adaptive_runtime: AdaptiveRuntimeConfig::default(),
             safety: SafetyConfig::default(),
             fork_prefix: ForkPrefixConfig::default(),
             tool_surface: ToolSurfaceConfig::default(),
             runtime_limits: RuntimeLimitsConfig::default(),
             agent_binding_registry: AgentBindingRegistryConfig::default(),
+            budget_policy: None,
         }
     }
 }
@@ -1488,7 +1550,7 @@ pub struct ContextWindowConfig {
     pub error_recovery_reserve: u32,
 
     /// Enables the "at 85% usage, lower `max_turn_input_tokens` by ~10%"
-    /// path in `agentic_adaptive_tuning`. Default: OFF.
+    /// path in agentic adaptive runtime. Default: OFF.
     ///
     /// Why off by default: the logic is a self-defeating shrink spiral. At
     /// high pressure it LOWERS the ceiling the next turn must fit under,
@@ -1530,11 +1592,11 @@ impl Default for ContextWindowConfig {
     }
 }
 
-// ─── Adaptive Tuning Configuration ──────────────────────────────────────────
+// ─── Adaptive Runtime Dampening Configuration ───────────────────────────────
 
-/// Parameters controlling the adaptive tuning engine's timing and dampening.
+/// Parameters controlling adaptive runtime dampening.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct AdaptiveTuningConfig {
+pub struct AdaptiveRuntimeConfig {
     /// Minimum turns between scenario changes (anti-flap).
     #[serde(default = "default_scenario_cooldown_turns")]
     pub scenario_cooldown_turns: u32,
@@ -1542,10 +1604,6 @@ pub struct AdaptiveTuningConfig {
     /// Minimum turns between token-budget direction reversals (anti-oscillation).
     #[serde(default = "default_budget_cooldown_turns")]
     pub budget_cooldown_turns: u32,
-
-    /// Number of completed turns between tuning cycle evaluations.
-    #[serde(default = "default_tuning_cycle_interval")]
-    pub tuning_cycle_interval: u32,
 }
 
 fn default_scenario_cooldown_turns() -> u32 {
@@ -1554,16 +1612,11 @@ fn default_scenario_cooldown_turns() -> u32 {
 fn default_budget_cooldown_turns() -> u32 {
     3
 }
-fn default_tuning_cycle_interval() -> u32 {
-    5
-}
-
-impl Default for AdaptiveTuningConfig {
+impl Default for AdaptiveRuntimeConfig {
     fn default() -> Self {
         Self {
             scenario_cooldown_turns: default_scenario_cooldown_turns(),
             budget_cooldown_turns: default_budget_cooldown_turns(),
-            tuning_cycle_interval: default_tuning_cycle_interval(),
         }
     }
 }
@@ -1721,12 +1774,13 @@ impl RuntimeConfig {
             verification,
             memory_pressure,
             context_window,
-            adaptive_tuning,
+            adaptive_runtime,
             safety,
             fork_prefix,
             tool_surface,
             runtime_limits,
             agent_binding_registry,
+            budget_policy,
         } = other;
 
         merge_if_non_default(&mut self.version, version, default_config_version());
@@ -2080,26 +2134,20 @@ impl RuntimeConfig {
             false,
         );
 
-        // ── Adaptive Tuning ──
-        let AdaptiveTuningConfig {
+        // ── Adaptive Runtime ──
+        let AdaptiveRuntimeConfig {
             scenario_cooldown_turns,
             budget_cooldown_turns,
-            tuning_cycle_interval,
-        } = adaptive_tuning;
+        } = adaptive_runtime;
         merge_if_non_default(
-            &mut self.adaptive_tuning.scenario_cooldown_turns,
+            &mut self.adaptive_runtime.scenario_cooldown_turns,
             scenario_cooldown_turns,
             default_scenario_cooldown_turns(),
         );
         merge_if_non_default(
-            &mut self.adaptive_tuning.budget_cooldown_turns,
+            &mut self.adaptive_runtime.budget_cooldown_turns,
             budget_cooldown_turns,
             default_budget_cooldown_turns(),
-        );
-        merge_if_non_default(
-            &mut self.adaptive_tuning.tuning_cycle_interval,
-            tuning_cycle_interval,
-            default_tuning_cycle_interval(),
         );
 
         // SafetyConfig: last layer with an explicit trust_mode wins.
@@ -2144,6 +2192,13 @@ impl RuntimeConfig {
             agent_binding_registry.max_agent_md_bytes,
             default_agent_binding_max_agent_md_bytes(),
         );
+
+        // BudgetPolicyConfig: whole-struct replacement when `other` is
+        // Some. This follows the same pattern as SafetyConfig — a set
+        // value wins outright.
+        if budget_policy.is_some() {
+            self.budget_policy = budget_policy;
+        }
 
         self
     }
@@ -2437,10 +2492,9 @@ mod tests {
                 error_recovery_reserve: 12000,
                 adaptive_budget_reduction: true,
             },
-            adaptive_tuning: AdaptiveTuningConfig {
+            adaptive_runtime: AdaptiveRuntimeConfig {
                 scenario_cooldown_turns: 10,
                 budget_cooldown_turns: 6,
-                tuning_cycle_interval: 8,
             },
             safety: SafetyConfig::default(),
             fork_prefix: ForkPrefixConfig::default(),
@@ -2452,6 +2506,7 @@ mod tests {
             agent_binding_registry: AgentBindingRegistryConfig {
                 max_agent_md_bytes: 4096,
             },
+            budget_policy: None,
         });
 
         assert_eq!(merged.version, "2.0");
@@ -2509,10 +2564,9 @@ mod tests {
         assert!((merged.context_window.remaining_turn_factor - 0.5).abs() < 0.001);
         assert_eq!(merged.context_window.error_recovery_reserve, 12000);
 
-        // Adaptive tuning
-        assert_eq!(merged.adaptive_tuning.scenario_cooldown_turns, 10);
-        assert_eq!(merged.adaptive_tuning.budget_cooldown_turns, 6);
-        assert_eq!(merged.adaptive_tuning.tuning_cycle_interval, 8);
+        // Adaptive dampening
+        assert_eq!(merged.adaptive_runtime.scenario_cooldown_turns, 10);
+        assert_eq!(merged.adaptive_runtime.budget_cooldown_turns, 6);
         assert_eq!(merged.agent_binding_registry.max_agent_md_bytes, 4096);
     }
 
@@ -3365,6 +3419,101 @@ mod tests {
         assert_eq!(
             cfg.enabled_categories,
             TraceCategory::individual_categories().to_vec()
+        );
+    }
+
+    // ─── BudgetPolicyConfig tests ────────────────────────────────────────
+
+    /// BudgetPolicyConfig::default() must produce values identical to
+    /// RuntimePolicy::default() so that a user who writes no config gets
+    /// the same behaviour as a caller who passes `None`.
+    #[test]
+    fn budget_policy_config_default_matches_policy_default() {
+        let cfg = BudgetPolicyConfig::default();
+        // RuntimePolicy defaults (must match):
+        // expand_after_consecutive_outcomes: 2
+        // expand_factor: 1.5
+        // max_ceiling: 1000
+        // reflect_after_consecutive_zero: 3
+        assert_eq!(cfg.expand_after_consecutive_outcomes, 2);
+        assert!((cfg.expand_factor - 1.5).abs() < f64::EPSILON);
+        assert_eq!(cfg.max_ceiling, 1000);
+        assert_eq!(cfg.reflect_after_consecutive_zero, 3);
+    }
+
+    /// BudgetPolicyConfig round-trips through TOML serialization with all
+    /// fields explicitly set.
+    #[test]
+    fn budget_policy_config_toml_round_trip() {
+        let cfg = BudgetPolicyConfig {
+            expand_after_consecutive_outcomes: 4,
+            expand_factor: 2.0,
+            max_ceiling: 500,
+            reflect_after_consecutive_zero: 5,
+        };
+        let toml_str = toml::to_string_pretty(&cfg).unwrap();
+        let restored: BudgetPolicyConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(
+            restored.expand_after_consecutive_outcomes,
+            cfg.expand_after_consecutive_outcomes
+        );
+        assert!((restored.expand_factor - cfg.expand_factor).abs() < f64::EPSILON);
+        assert_eq!(restored.max_ceiling, cfg.max_ceiling);
+        assert_eq!(
+            restored.reflect_after_consecutive_zero,
+            cfg.reflect_after_consecutive_zero
+        );
+    }
+
+    /// When a TOML `[budget_policy]` section is partially populated,
+    /// missing fields must fall back to their serde defaults — not zero.
+    #[test]
+    fn budget_policy_config_partial_toml_uses_defaults() {
+        let toml_str = r#"
+[budget_policy]
+expand_factor = 2.0
+"#;
+        // Wrap in a minimal struct so we can deserialize only the subsection.
+        #[derive(Deserialize)]
+        struct Wrapper {
+            budget_policy: BudgetPolicyConfig,
+        }
+        let w: Wrapper = toml::from_str(toml_str).unwrap();
+        assert!((w.budget_policy.expand_factor - 2.0).abs() < f64::EPSILON);
+        // Unspecified fields → serde defaults, not zero.
+        assert_eq!(
+            w.budget_policy.expand_after_consecutive_outcomes,
+            default_expand_after_consecutive_outcomes()
+        );
+        assert_eq!(w.budget_policy.max_ceiling, default_max_ceiling());
+        assert_eq!(
+            w.budget_policy.reflect_after_consecutive_zero,
+            default_reflect_after_consecutive_zero()
+        );
+    }
+
+    /// An empty `[budget_policy]` section deserialized as part of
+    /// RuntimeConfig must produce the default BudgetPolicyConfig (all
+    /// fields at their serde-default values) — not a deserialization
+    /// error or zero-filled struct.
+    #[test]
+    fn budget_policy_config_empty_section_uses_all_defaults() {
+        let toml_str = "[budget_policy]\n";
+        #[derive(Deserialize)]
+        struct Wrapper {
+            budget_policy: BudgetPolicyConfig,
+        }
+        let w: Wrapper = toml::from_str(toml_str).unwrap();
+        let def = BudgetPolicyConfig::default();
+        assert_eq!(
+            w.budget_policy.expand_after_consecutive_outcomes,
+            def.expand_after_consecutive_outcomes
+        );
+        assert!((w.budget_policy.expand_factor - def.expand_factor).abs() < f64::EPSILON);
+        assert_eq!(w.budget_policy.max_ceiling, def.max_ceiling);
+        assert_eq!(
+            w.budget_policy.reflect_after_consecutive_zero,
+            def.reflect_after_consecutive_zero
         );
     }
 }

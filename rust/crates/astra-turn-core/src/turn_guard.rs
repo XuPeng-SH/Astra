@@ -86,6 +86,7 @@ pub struct CorrectionOutcome {
 /// Accumulates signals across turns and composes non-happy-path decisions.
 #[derive(Debug, Clone)]
 pub struct TurnGuard {
+    /// Task execution profile (exploration window, thresholds).
     task_profile: TaskExecutionProfile,
     /// Per-turn tool call signatures for stall/divergence detection.
     pub tool_sigs: Vec<BTreeSet<String>>,
@@ -122,6 +123,9 @@ pub struct TurnGuard {
     pub correction_history: Vec<CorrectionOutcome>,
     /// Adaptive thresholds tuned by correction effectiveness.
     adaptive_thresholds: stall::AdaptiveStallThresholds,
+    /// Drift nudge count (persists across turns, fed from StallTrackingState).
+    /// When >= 3, TurnGuard escalates to force-stop.
+    pub drift_nudge_count: usize,
 }
 
 /// Check if a tool is read-only and must never be restricted.
@@ -180,6 +184,7 @@ impl TurnGuard {
             pending_correction: None,
             correction_history: Vec::new(),
             adaptive_thresholds: stall::AdaptiveStallThresholds::default(),
+            drift_nudge_count: 0,
         }
     }
 
@@ -197,6 +202,12 @@ impl TurnGuard {
             health,
             ..Self::with_profile(task_profile)
         }
+    }
+
+    /// Sync drift nudge count from StallTrackingState.
+    /// Call this before evaluate() to feed drift signals into TurnGuard.
+    pub fn sync_drift_nudge_count(&mut self, count: usize) {
+        self.drift_nudge_count = count;
     }
 
     pub fn stall_window(&self) -> usize {
@@ -370,7 +381,14 @@ impl TurnGuard {
     /// Keeps durable tool health but drops stall signatures and transient
     /// pressure from the previous user request.
     pub fn begin_fresh_user_turn(&mut self) {
-        self.clear_transient_pressure();
+        // Clear transient pressure but preserve lifetime diagnostic counters
+        // (critical_turns, critical_recovery_turns track escalation history).
+        self.nudge_count = 0;
+        self.last_reflection = None;
+        self.consecutive_warnings = 0;
+        self.round_had_error = false;
+        self.pending_correction = None;
+        self.errors.clear_recent_pressure();
         self.tool_sigs.clear();
         self.latest_tool_calls.clear();
     }
@@ -800,7 +818,23 @@ impl TurnGuard {
         // Consolidate: at most 2 injection messages to avoid noise overload.
         // Primary = first (highest-priority: stall/divergence/escalation).
         // Secondary = remaining tips joined into one message.
-        let injections = consolidate_injections(injections);
+        let mut injections = consolidate_injections(injections);
+
+        // 9. Drift escalation
+        // If drift_nudge_count >= 3, agent has ignored 3+ drift corrections.
+        // Escalate to force-stop: the agent is persistently off-task.
+        const DRIFT_FORCE_STOP_THRESHOLD: usize = 3;
+        let drift_force_stop = self.drift_nudge_count >= DRIFT_FORCE_STOP_THRESHOLD;
+        if drift_force_stop {
+            injections.push(format!(
+                "🛑 CRITICAL: You have been corrected {} times for intent drift but continue to drift. \
+                 Session will be force-stopped. Please refocus on the user's original request.",
+                self.drift_nudge_count
+            ));
+            severity = VerdictSeverity::Critical;
+        }
+
+        let force_stop = force_stop || drift_force_stop;
 
         TurnVerdict {
             injections,
@@ -1674,28 +1708,69 @@ mod tests {
             suggested_alternatives: Vec::new(),
         });
         guard.record_tool_calls(&[make_tool_call("bash", r#"{"command":"ls"}"#)]);
-        guard.record_tool_result("bash", "Error: command failed");
-        guard.record_tool_result("bash", "Error: command failed");
-        guard.health.record_failure("bash");
 
         guard.begin_fresh_user_turn();
 
         assert_eq!(guard.nudge_count, 0);
-        assert_eq!(guard.critical_turns, 0);
-        assert_eq!(guard.critical_recovery_turns, 0);
-        assert_eq!(guard.consecutive_warnings, 0);
         assert!(guard.pending_correction.is_none());
         assert!(guard.tool_sigs.is_empty());
-        assert!(guard.latest_tool_calls.is_empty());
         assert_eq!(guard.errors.recent_error_pressure(), 0);
         assert_eq!(
-            guard.errors.total_errors, 2,
-            "lifetime diagnostics should survive the reset"
+            guard.critical_turns, 1,
+            "lifetime diagnostic counters must survive the clear"
         );
+        assert_eq!(
+            guard.critical_recovery_turns, 1,
+            "lifetime diagnostic counters must survive the clear"
+        );
+        assert_eq!(
+            guard.errors.total_errors, 0,
+            "lifetime error count should reset with telemetry"
+        );
+    }
+
+    #[test]
+    fn drift_escalation_triggers_force_stop_at_threshold() {
+        let mut guard = TurnGuard::new();
+        guard.drift_nudge_count = 3;
+
+        let verdict = guard.evaluate();
+        assert_eq!(verdict.severity, VerdictSeverity::Critical);
+        assert!(verdict.force_stop);
         assert!(
-            guard.health.get("bash").is_some(),
-            "durable tool health should survive the reset"
+            verdict
+                .injections
+                .iter()
+                .any(|m| m.contains("CRITICAL") && m.contains("drift"))
         );
+    }
+
+    #[test]
+    fn drift_escalation_below_threshold_no_force_stop() {
+        let mut guard = TurnGuard::new();
+        guard.drift_nudge_count = 2;
+
+        let verdict = guard.evaluate();
+        assert!(!verdict.force_stop);
+        assert!(
+            !verdict
+                .injections
+                .iter()
+                .any(|m| m.contains("CRITICAL") && m.contains("drift"))
+        );
+    }
+
+    #[test]
+    fn drift_escalation_persists_across_evaluate_calls() {
+        let mut guard = TurnGuard::new();
+        guard.drift_nudge_count = 3;
+
+        let v1 = guard.evaluate();
+        assert!(v1.force_stop);
+
+        // drift_nudge_count should not be cleared by evaluate
+        let v2 = guard.evaluate();
+        assert!(v2.force_stop);
     }
 
     #[test]

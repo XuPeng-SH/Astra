@@ -43,7 +43,7 @@ use astra_runtime::{
     turn::turn_guard::TurnGuard,
 };
 use astra_turn_core::tool::schema::tool_schema_name;
-use astra_turn_core::tool_registry_report::ToolSurfaceReport;
+use astra_turn_core::tool_registry_report::ToolSelectionReport;
 use crossterm::style::Stylize;
 use serde_json::{Value, json};
 
@@ -177,7 +177,7 @@ fn retained_turn_role_priority(role: &str) -> u8 {
 /// First-turn / cross-turn counters updated while building the payload.
 pub(crate) struct PrepareTurnTelemetry<'a> {
     pub first_memoria_ms: &'a mut Option<u64>,
-    pub first_surface_report: &'a mut Option<ToolSurfaceReport>,
+    pub first_selection_report: &'a mut Option<ToolSelectionReport>,
     pub first_budget_pressure: &'a mut f64,
     pub first_context_assembly_ms: &'a mut Option<u64>,
     pub all_selected_skills: &'a mut Vec<String>,
@@ -205,7 +205,7 @@ struct PrepareChatTurnRequest<'a> {
     valid_tool_names: &'a mut HashSet<String>,
     turn_guard: &'a TurnGuard,
     restricted_tools: &'a mut HashSet<String>,
-    widen_surface_pending: &'a mut bool,
+    widen_selection_pending: &'a mut bool,
     step_recorder: &'a mut StepRecorder,
     file_context: &'a [String],
     assembly_start: Instant,
@@ -242,13 +242,16 @@ struct PrepareChatTurnRequest<'a> {
     /// SelfModel Gap 3 surface.
     recent_rejections: Vec<(String, String)>,
     /// Optional shared observability hub, forwarded from the SSE fetch request
-    /// so the per-turn SelfModel ingest can read `hub.tuning().recent_signals()`.
+    /// so the per-turn SelfModel ingest can read recent feedback signals.
     observability_hub: Option<&'a Arc<astra_runtime::observability::ObservabilityHub>>,
     append_system_prompt: Option<&'a str>,
     /// Whether the current permission mode is `Plan`. When true the schema-
     /// preparation step adds every mutating tool to `restricted_tools` so the
     /// model only sees read-only + plan-control tools (`exit_plan_mode` etc.).
     plan_mode_active: bool,
+    /// Pre-formatted lessons text from `session_lessons_snapshot()`.
+    /// Injected into `edge_profile` as `lessons_text` for the bridge/assembler.
+    pub lessons_text: Option<&'a str>,
 }
 
 pub(crate) fn turn_policy_from_payload_edge_tools(
@@ -271,12 +274,12 @@ fn surface_report_from_visible_schemas(
     schemas: &[Value],
     schema_budget_used: u32,
     schema_budget_total: u32,
-) -> ToolSurfaceReport {
+) -> ToolSelectionReport {
     let visible_tools: Vec<String> = schemas
         .iter()
         .filter_map(|schema| tool_schema_name(schema).map(str::to_string))
         .collect();
-    ToolSurfaceReport {
+    ToolSelectionReport {
         visible_count: visible_tools.len() as u32,
         visible_tools,
         schema_budget_used,
@@ -287,7 +290,7 @@ fn surface_report_from_visible_schemas(
 fn runtime_filter_turn_schemas_and_report(
     executor: &crate::edge_tools::ToolExecutor,
     turn_schemas: &mut Vec<Value>,
-    surface_report: &mut ToolSurfaceReport,
+    surface_report: &mut ToolSelectionReport,
 ) -> bool {
     let had_tools_before =
         !turn_schemas.is_empty() || surface_report_has_visible_tools(surface_report);
@@ -301,7 +304,7 @@ fn runtime_filter_turn_schemas_and_report(
     had_tools_before
 }
 
-fn surface_report_has_visible_tools(report: &ToolSurfaceReport) -> bool {
+fn surface_report_has_visible_tools(report: &ToolSelectionReport) -> bool {
     !report.visible_tools.is_empty() || report.visible_count > 0
 }
 
@@ -310,7 +313,7 @@ fn surface_report_has_visible_tools(report: &ToolSurfaceReport) -> bool {
 /// observability only — never branched on by downstream code.
 fn tool_surface_should_inject(
     turn_schemas: &[Value],
-    surface_report: &ToolSurfaceReport,
+    surface_report: &ToolSelectionReport,
     had_tools_before_runtime_filter: bool,
     has_recent_tools: bool,
     has_tool_results: bool,
@@ -502,7 +505,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     let memory_domain_hints = domain_hints_from_boost_terms(&boost_terms);
     // Consume the one-shot strategy/correction reset marker. Tool health is
     // advisory only and never mutates the hard schema restriction set.
-    let _ = std::mem::take(ctx.widen_surface_pending);
+    let _ = std::mem::take(ctx.widen_selection_pending);
     ctx.step_recorder.record_perceive(
         semantic_query_str,
         &[],
@@ -762,7 +765,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     }
 
     capture_first_surface_report_if_empty(
-        ctx.telem.first_surface_report,
+        ctx.telem.first_selection_report,
         ctx.telem.first_budget_pressure,
         final_surface_report,
         budget_pressure,
@@ -781,7 +784,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
 
     record_agentic_step_plan_after_payload_prep(
         ctx.step_recorder,
-        ctx.telem.first_surface_report.as_ref(),
+        ctx.telem.first_selection_report.as_ref(),
         *ctx.telem.first_budget_pressure,
     );
 
@@ -858,7 +861,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             let recent_signals = ctx
                 .observability_hub
                 .as_ref()
-                .map(|hub| hub.tuning().recent_signals())
+                .map(|hub| hub.recent_feedback_signals())
                 .unwrap_or_default();
             session.ingest_self_model_inputs(skills, tool_health_entries, scenario, recent_signals);
 
@@ -904,6 +907,18 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         && let Some(ep_obj) = ep.as_object_mut()
     {
         ep_obj.insert("memoria_insights_text".to_string(), json!(insights));
+    }
+    // ─── Lessons: inject bootstrapped session lessons into edge_profile ───
+    // Fixes the "signal channel blank" bug where lessons were loaded from
+    // Memoria by `ensure_bootstrapped_lessons()` but never injected into the
+    // prompt. Previously lessons only flowed into observability, not into
+    // the LLM context.
+    if let Some(ref lessons) = ctx.lessons_text
+        && let Some(root) = payload.as_object_mut()
+        && let Some(ep) = root.get_mut("edge_profile")
+        && let Some(ep_obj) = ep.as_object_mut()
+    {
+        ep_obj.insert("lessons_text".to_string(), json!(lessons));
     }
     // ─── Gateway context: inject as system message at start of conversation ───
     if let Some(extra) = ctx.append_system_prompt {
@@ -1074,7 +1089,7 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub valid_tool_names: &'a mut HashSet<String>,
     pub turn_guard: &'a astra_turn_core::turn_guard::TurnGuard,
     pub restricted_tools: &'a mut HashSet<String>,
-    pub widen_surface_pending: &'a mut bool,
+    pub widen_selection_pending: &'a mut bool,
     pub step_recorder: &'a mut StepRecorder,
     pub file_context: &'a [String],
     pub assembly_start: Instant,
@@ -1119,7 +1134,7 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub session_turn: u32,
     pub turn_chain_id: Option<&'a str>,
     pub user_query_event_id: Option<&'a str>,
-    /// Optional shared observability hub for reading the auto-tuning feedback
+    /// Optional shared observability hub for reading recent feedback signals
     /// window when publishing SelfModel inputs. Threaded through so the
     /// per-turn ingest can attach `recent_signals` to the session without
     /// needing a global singleton.
@@ -1226,7 +1241,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         valid_tool_names,
         turn_guard,
         restricted_tools,
-        widen_surface_pending,
+        widen_selection_pending,
         step_recorder,
         file_context,
         assembly_start,
@@ -1257,9 +1272,29 @@ pub(crate) async fn fetch_chat_turn_sse(
         incremental_state,
         append_system_prompt,
         semantic_query_override,
+        ..
     } = ctx;
 
     let ui = chat_turn_sse_fetch_ui(render_policy, plan_assemble_line_release.as_ref());
+
+    // Compute lessons text from Memoria-bootstrapped session lessons.
+    // Format: "kind:trigger_signal:action" per lesson, pipe-joined.
+    // Mirrors the format used in cli_loop_host's observability path.
+    let lessons_text: Option<String> = {
+        let lessons = executor.session_lessons_snapshot();
+        if lessons.is_empty() {
+            None
+        } else {
+            Some(
+                lessons
+                    .iter()
+                    .map(|l| format!("{}:{}:{}", l.kind.as_str(), l.trigger_signal, l.action))
+                    .collect::<Vec<_>>()
+                    .join("|"),
+            )
+        }
+    };
+    let lessons_text_ref: Option<&str> = lessons_text.as_deref();
 
     let (resp, prep_line) = chat_turn_post_payload_after_prepare(
         api,
@@ -1289,7 +1324,7 @@ pub(crate) async fn fetch_chat_turn_sse(
             valid_tool_names,
             turn_guard,
             restricted_tools,
-            widen_surface_pending,
+            widen_selection_pending,
             step_recorder,
             file_context,
             assembly_start,
@@ -1314,6 +1349,7 @@ pub(crate) async fn fetch_chat_turn_sse(
             append_system_prompt,
             plan_mode_active: perm_manager.mode()
                 == crate::cli::permission_manager::PermissionMode::Plan,
+            lessons_text: lessons_text_ref,
         },
     )
     .await?;
@@ -1616,7 +1652,7 @@ mod tests {
         assert_eq!(names, vec!["read_file"]);
     }
 
-    /// Regression: the final ToolSurfaceReport's `schema_budget_used` must be derived
+    /// Regression: the final ToolSelectionReport's `schema_budget_used` must be derived
     /// entirely from the explicit `schema_budget_used` argument, NOT from any stale
     /// `schema_budget_used` field on a pre-existing report. This contract is what
     /// permits removing stale intermediate recomputation at the call site (the value
@@ -1650,8 +1686,8 @@ mod tests {
     /// Helper: empty report with the given schema_budget_total.
     fn empty_report(
         schema_budget_total: u32,
-    ) -> astra_turn_core::tool_registry_report::ToolSurfaceReport {
-        astra_turn_core::tool_registry_report::ToolSurfaceReport {
+    ) -> astra_turn_core::tool_registry_report::ToolSelectionReport {
+        astra_turn_core::tool_registry_report::ToolSelectionReport {
             visible_tools: Vec::new(),
             visible_count: 0,
             schema_budget_used: 0,
@@ -1722,7 +1758,7 @@ mod tests {
         };
         struct PriorityCase {
             schemas: Vec<Value>,
-            report: astra_turn_core::tool_registry_report::ToolSurfaceReport,
+            report: astra_turn_core::tool_registry_report::ToolSelectionReport,
             had_tools_before_runtime_filter: bool,
             recent_tool_context: bool,
             tool_results_followup: bool,
@@ -1813,7 +1849,7 @@ mod tests {
     #[test]
     fn tool_surface_decision_edge_cases() {
         // visible_count > 0 with empty vecs
-        let count_only = astra_turn_core::tool_registry_report::ToolSurfaceReport {
+        let count_only = astra_turn_core::tool_registry_report::ToolSelectionReport {
             visible_count: 3,
             schema_budget_total: 100,
             ..empty_report(100)
@@ -1840,7 +1876,7 @@ mod tests {
 
     #[test]
     fn skill_allowed_tools_injected_into_selection() {
-        use astra_turn_core::tool_registry_report::ToolSurfaceReport;
+        use astra_turn_core::tool_registry_report::ToolSelectionReport;
         use astra_turn_core::tool_schema_prune::inject_skill_allowed_tools;
 
         let all_schemas = [
@@ -1852,7 +1888,7 @@ mod tests {
 
         // Surface included bash and read_file, but not grep/glob
         let mut turn_schemas = vec![schema("bash"), schema("read_file")];
-        let mut report = ToolSurfaceReport {
+        let mut report = ToolSelectionReport {
             visible_tools: vec!["bash".into(), "read_file".into()],
             visible_count: 2,
             schema_budget_used: 0,
@@ -1904,12 +1940,12 @@ mod tests {
         let file_context: Vec<String> = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
-        let mut widen_surface_pending = false;
+        let mut widen_selection_pending = false;
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
         let turn_guard = TurnGuard::default();
         let mut turn_policy = TurnInteractionPolicy::default();
         let mut first_memoria_ms = None;
-        let mut first_surface_report = None;
+        let mut first_selection_report = None;
         let mut first_budget_pressure = 0.0;
         let mut first_context_assembly_ms = None;
         let mut all_selected_skills = Vec::new();
@@ -1933,13 +1969,13 @@ mod tests {
             valid_tool_names: &mut valid_tool_names,
             turn_guard: &turn_guard,
             restricted_tools: &mut restricted_tools,
-            widen_surface_pending: &mut widen_surface_pending,
+            widen_selection_pending: &mut widen_selection_pending,
             step_recorder: &mut step_recorder,
             file_context: &file_context,
             assembly_start: Instant::now(),
             telem: PrepareTurnTelemetry {
                 first_memoria_ms: &mut first_memoria_ms,
-                first_surface_report: &mut first_surface_report,
+                first_selection_report: &mut first_selection_report,
                 first_budget_pressure: &mut first_budget_pressure,
                 first_context_assembly_ms: &mut first_context_assembly_ms,
                 all_selected_skills: &mut all_selected_skills,
@@ -1964,6 +2000,7 @@ mod tests {
             observability_hub: None,
             append_system_prompt: None,
             plan_mode_active: true,
+            lessons_text: None,
         })
         .await;
 
@@ -1995,7 +2032,7 @@ mod tests {
             "headless validator must admit exactly the tools sent in edge_tools"
         );
         assert_eq!(
-            first_surface_report
+            first_selection_report
                 .as_ref()
                 .map(|report| report.visible_tools.clone())
                 .unwrap_or_default(),
@@ -2010,7 +2047,7 @@ mod tests {
             .map(|name| registry.token_cost(name))
             .sum();
         assert_eq!(
-            first_surface_report
+            first_selection_report
                 .as_ref()
                 .map(|report| report.schema_budget_used),
             Some(expected_visible_schema_tokens),
@@ -2081,12 +2118,12 @@ mod tests {
         let file_context: Vec<String> = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
-        let mut widen_surface_pending = false;
+        let mut widen_selection_pending = false;
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
         let turn_guard = TurnGuard::default();
         let mut turn_policy = TurnInteractionPolicy::default();
         let mut first_memoria_ms = None;
-        let mut first_surface_report = None;
+        let mut first_selection_report = None;
         let mut first_budget_pressure = 0.0;
         let mut first_context_assembly_ms = None;
         let mut all_selected_skills = Vec::new();
@@ -2110,13 +2147,13 @@ mod tests {
             valid_tool_names: &mut valid_tool_names,
             turn_guard: &turn_guard,
             restricted_tools: &mut restricted_tools,
-            widen_surface_pending: &mut widen_surface_pending,
+            widen_selection_pending: &mut widen_selection_pending,
             step_recorder: &mut step_recorder,
             file_context: &file_context,
             assembly_start: Instant::now(),
             telem: PrepareTurnTelemetry {
                 first_memoria_ms: &mut first_memoria_ms,
-                first_surface_report: &mut first_surface_report,
+                first_selection_report: &mut first_selection_report,
                 first_budget_pressure: &mut first_budget_pressure,
                 first_context_assembly_ms: &mut first_context_assembly_ms,
                 all_selected_skills: &mut all_selected_skills,
@@ -2141,6 +2178,7 @@ mod tests {
             observability_hub: None,
             append_system_prompt: None,
             plan_mode_active: false,
+            lessons_text: None,
         })
         .await;
 
@@ -2161,7 +2199,7 @@ mod tests {
             "exit_plan_mode should always be injected for cache stability"
         );
         assert_eq!(
-            first_surface_report
+            first_selection_report
                 .as_ref()
                 .map(|report| report.visible_tools.clone())
                 .unwrap_or_default(),
@@ -2198,13 +2236,13 @@ mod tests {
         let file_context: Vec<String> = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
-        let mut widen_surface_pending = false;
+        let mut widen_selection_pending = false;
         let mut step_recorder =
             StepRecorder::new("test-user", "session-empty-selector", "task-empty-selector");
         let turn_guard = TurnGuard::default();
         let mut turn_policy = TurnInteractionPolicy::default();
         let mut first_memoria_ms = None;
-        let mut first_surface_report = None;
+        let mut first_selection_report = None;
         let mut first_budget_pressure = 0.0;
         let mut first_context_assembly_ms = None;
         let mut all_selected_skills = Vec::new();
@@ -2228,13 +2266,13 @@ mod tests {
             valid_tool_names: &mut valid_tool_names,
             turn_guard: &turn_guard,
             restricted_tools: &mut restricted_tools,
-            widen_surface_pending: &mut widen_surface_pending,
+            widen_selection_pending: &mut widen_selection_pending,
             step_recorder: &mut step_recorder,
             file_context: &file_context,
             assembly_start: Instant::now(),
             telem: PrepareTurnTelemetry {
                 first_memoria_ms: &mut first_memoria_ms,
-                first_surface_report: &mut first_surface_report,
+                first_selection_report: &mut first_selection_report,
                 first_budget_pressure: &mut first_budget_pressure,
                 first_context_assembly_ms: &mut first_context_assembly_ms,
                 all_selected_skills: &mut all_selected_skills,
@@ -2259,6 +2297,7 @@ mod tests {
             observability_hub: None,
             append_system_prompt: None,
             plan_mode_active: false,
+            lessons_text: None,
         })
         .await;
 
@@ -2282,7 +2321,7 @@ mod tests {
             "executor admission must mirror the tool-free payload"
         );
         assert_eq!(
-            first_surface_report
+            first_selection_report
                 .as_ref()
                 .map(|report| report.visible_count),
             Some(0),
@@ -2310,7 +2349,7 @@ mod tests {
 
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
-        let mut widen_surface_pending = false;
+        let mut widen_selection_pending = false;
         let mut step_recorder = StepRecorder::new(
             "test-user",
             "session-pending-activation",
@@ -2318,7 +2357,7 @@ mod tests {
         );
         let mut turn_policy = TurnInteractionPolicy::default();
         let mut first_memoria_ms = None;
-        let mut first_surface_report = None;
+        let mut first_selection_report = None;
         let mut first_budget_pressure = 0.0;
         let mut first_context_assembly_ms = None;
         let mut all_selected_skills = Vec::new();
@@ -2342,13 +2381,13 @@ mod tests {
             valid_tool_names: &mut valid_tool_names,
             turn_guard: &turn_guard,
             restricted_tools: &mut restricted_tools,
-            widen_surface_pending: &mut widen_surface_pending,
+            widen_selection_pending: &mut widen_selection_pending,
             step_recorder: &mut step_recorder,
             file_context: &file_context,
             assembly_start: Instant::now(),
             telem: PrepareTurnTelemetry {
                 first_memoria_ms: &mut first_memoria_ms,
-                first_surface_report: &mut first_surface_report,
+                first_selection_report: &mut first_selection_report,
                 first_budget_pressure: &mut first_budget_pressure,
                 first_context_assembly_ms: &mut first_context_assembly_ms,
                 all_selected_skills: &mut all_selected_skills,
@@ -2373,6 +2412,7 @@ mod tests {
             observability_hub: None,
             append_system_prompt: None,
             plan_mode_active: false,
+            lessons_text: None,
         })
         .await;
 
@@ -2407,11 +2447,11 @@ mod tests {
         let messages = vec![json!({"role": "user", "content": "inspect the repository"})];
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
-        let mut widen_surface_pending = false;
+        let mut widen_selection_pending = false;
         let mut step_recorder = StepRecorder::new("test-user", "session-empty", "task-empty");
         let mut turn_policy = TurnInteractionPolicy::default();
         let mut first_memoria_ms = None;
-        let mut first_surface_report = None;
+        let mut first_selection_report = None;
         let mut first_budget_pressure = 0.0;
         let mut first_context_assembly_ms = None;
         let mut all_selected_skills = Vec::new();
@@ -2435,13 +2475,13 @@ mod tests {
             valid_tool_names: &mut valid_tool_names,
             turn_guard: &turn_guard,
             restricted_tools: &mut restricted_tools,
-            widen_surface_pending: &mut widen_surface_pending,
+            widen_selection_pending: &mut widen_selection_pending,
             step_recorder: &mut step_recorder,
             file_context: &file_context,
             assembly_start: Instant::now(),
             telem: PrepareTurnTelemetry {
                 first_memoria_ms: &mut first_memoria_ms,
-                first_surface_report: &mut first_surface_report,
+                first_selection_report: &mut first_selection_report,
                 first_budget_pressure: &mut first_budget_pressure,
                 first_context_assembly_ms: &mut first_context_assembly_ms,
                 all_selected_skills: &mut all_selected_skills,
@@ -2466,6 +2506,7 @@ mod tests {
             observability_hub: None,
             append_system_prompt: None,
             plan_mode_active: false,
+            lessons_text: None,
         })
         .await;
 
@@ -2483,7 +2524,7 @@ mod tests {
             payload["edge_profile"]
                 .get(EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT)
                 .and_then(Value::as_str)
-                .is_some_and(|text| text.contains("<deferred_tools>")),
+                .is_some_and(|text| text.contains("<deferred-tools>")),
             "tool_search visibility must be paired with a deferred manifest"
         );
     }
@@ -2516,12 +2557,12 @@ mod tests {
         let file_context: Vec<String> = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
-        let mut widen_surface_pending = false;
+        let mut widen_selection_pending = false;
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
         let turn_guard = TurnGuard::default();
         let mut turn_policy = TurnInteractionPolicy::default();
         let mut first_memoria_ms = None;
-        let mut first_surface_report = None;
+        let mut first_selection_report = None;
         let mut first_budget_pressure = 0.0;
         let mut first_context_assembly_ms = None;
         let mut all_selected_skills = Vec::new();
@@ -2545,13 +2586,13 @@ mod tests {
             valid_tool_names: &mut valid_tool_names,
             turn_guard: &turn_guard,
             restricted_tools: &mut restricted_tools,
-            widen_surface_pending: &mut widen_surface_pending,
+            widen_selection_pending: &mut widen_selection_pending,
             step_recorder: &mut step_recorder,
             file_context: &file_context,
             assembly_start: Instant::now(),
             telem: PrepareTurnTelemetry {
                 first_memoria_ms: &mut first_memoria_ms,
-                first_surface_report: &mut first_surface_report,
+                first_selection_report: &mut first_selection_report,
                 first_budget_pressure: &mut first_budget_pressure,
                 first_context_assembly_ms: &mut first_context_assembly_ms,
                 all_selected_skills: &mut all_selected_skills,
@@ -2576,6 +2617,7 @@ mod tests {
             observability_hub: None,
             append_system_prompt: None,
             plan_mode_active: false,
+            lessons_text: None,
         })
         .await;
 
@@ -2624,12 +2666,12 @@ mod tests {
         let tool_results = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
-        let mut widen_surface_pending = false;
+        let mut widen_selection_pending = false;
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
         let turn_guard = TurnGuard::default();
         let mut turn_policy = TurnInteractionPolicy::default();
         let mut first_memoria_ms = None;
-        let mut first_surface_report = None;
+        let mut first_selection_report = None;
         let mut first_budget_pressure = 0.0;
         let mut first_context_assembly_ms = None;
         let mut all_selected_skills = Vec::new();
@@ -2656,13 +2698,13 @@ mod tests {
             valid_tool_names: &mut valid_tool_names,
             turn_guard: &turn_guard,
             restricted_tools: &mut restricted_tools,
-            widen_surface_pending: &mut widen_surface_pending,
+            widen_selection_pending: &mut widen_selection_pending,
             step_recorder: &mut step_recorder,
             file_context: &file_context,
             assembly_start: Instant::now(),
             telem: PrepareTurnTelemetry {
                 first_memoria_ms: &mut first_memoria_ms,
-                first_surface_report: &mut first_surface_report,
+                first_selection_report: &mut first_selection_report,
                 first_budget_pressure: &mut first_budget_pressure,
                 first_context_assembly_ms: &mut first_context_assembly_ms,
                 all_selected_skills: &mut all_selected_skills,
@@ -2687,6 +2729,7 @@ mod tests {
             observability_hub: None,
             append_system_prompt: None,
             plan_mode_active: false,
+            lessons_text: None,
         })
         .await;
 
@@ -2749,12 +2792,12 @@ mod tests {
         let file_context: Vec<String> = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
-        let mut widen_surface_pending = false;
+        let mut widen_selection_pending = false;
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
         let turn_guard = TurnGuard::default();
         let mut turn_policy = TurnInteractionPolicy::default();
         let mut first_memoria_ms = None;
-        let mut first_surface_report = None;
+        let mut first_selection_report = None;
         let mut first_budget_pressure = 0.0;
         let mut first_context_assembly_ms = None;
         let mut all_selected_skills = Vec::new();
@@ -2778,13 +2821,13 @@ mod tests {
             valid_tool_names: &mut valid_tool_names,
             turn_guard: &turn_guard,
             restricted_tools: &mut restricted_tools,
-            widen_surface_pending: &mut widen_surface_pending,
+            widen_selection_pending: &mut widen_selection_pending,
             step_recorder: &mut step_recorder,
             file_context: &file_context,
             assembly_start: Instant::now(),
             telem: PrepareTurnTelemetry {
                 first_memoria_ms: &mut first_memoria_ms,
-                first_surface_report: &mut first_surface_report,
+                first_selection_report: &mut first_selection_report,
                 first_budget_pressure: &mut first_budget_pressure,
                 first_context_assembly_ms: &mut first_context_assembly_ms,
                 all_selected_skills: &mut all_selected_skills,
@@ -2809,6 +2852,7 @@ mod tests {
             observability_hub: None,
             append_system_prompt: None,
             plan_mode_active: false,
+            lessons_text: None,
         })
         .await;
 
@@ -2871,12 +2915,12 @@ mod tests {
         let file_context: Vec<String> = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
-        let mut widen_surface_pending = false;
+        let mut widen_selection_pending = false;
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
         let turn_guard = TurnGuard::default();
         let mut turn_policy = TurnInteractionPolicy::default();
         let mut first_memoria_ms = None;
-        let mut first_surface_report = None;
+        let mut first_selection_report = None;
         let mut first_budget_pressure = 0.0;
         let mut first_context_assembly_ms = None;
         let mut all_selected_skills = Vec::new();
@@ -2900,13 +2944,13 @@ mod tests {
             valid_tool_names: &mut valid_tool_names,
             turn_guard: &turn_guard,
             restricted_tools: &mut restricted_tools,
-            widen_surface_pending: &mut widen_surface_pending,
+            widen_selection_pending: &mut widen_selection_pending,
             step_recorder: &mut step_recorder,
             file_context: &file_context,
             assembly_start: Instant::now(),
             telem: PrepareTurnTelemetry {
                 first_memoria_ms: &mut first_memoria_ms,
-                first_surface_report: &mut first_surface_report,
+                first_selection_report: &mut first_selection_report,
                 first_budget_pressure: &mut first_budget_pressure,
                 first_context_assembly_ms: &mut first_context_assembly_ms,
                 all_selected_skills: &mut all_selected_skills,
@@ -2931,6 +2975,7 @@ mod tests {
             observability_hub: None,
             append_system_prompt: None,
             plan_mode_active: false,
+            lessons_text: None,
         })
         .await;
 
@@ -2979,12 +3024,12 @@ mod tests {
         let file_context: Vec<String> = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
-        let mut widen_surface_pending = false;
+        let mut widen_selection_pending = false;
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
         let turn_guard = TurnGuard::default();
         let mut turn_policy = TurnInteractionPolicy::default();
         let mut first_memoria_ms = None;
-        let mut first_surface_report = None;
+        let mut first_selection_report = None;
         let mut first_budget_pressure = 0.0;
         let mut first_context_assembly_ms = None;
         let mut all_selected_skills = Vec::new();
@@ -3008,13 +3053,13 @@ mod tests {
             valid_tool_names: &mut valid_tool_names,
             turn_guard: &turn_guard,
             restricted_tools: &mut restricted_tools,
-            widen_surface_pending: &mut widen_surface_pending,
+            widen_selection_pending: &mut widen_selection_pending,
             step_recorder: &mut step_recorder,
             file_context: &file_context,
             assembly_start: Instant::now(),
             telem: PrepareTurnTelemetry {
                 first_memoria_ms: &mut first_memoria_ms,
-                first_surface_report: &mut first_surface_report,
+                first_selection_report: &mut first_selection_report,
                 first_budget_pressure: &mut first_budget_pressure,
                 first_context_assembly_ms: &mut first_context_assembly_ms,
                 all_selected_skills: &mut all_selected_skills,
@@ -3039,6 +3084,7 @@ mod tests {
             observability_hub: None,
             append_system_prompt: None,
             plan_mode_active: false,
+            lessons_text: None,
         })
         .await;
 
@@ -3080,12 +3126,12 @@ mod tests {
         let file_context: Vec<String> = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
-        let mut widen_surface_pending = false;
+        let mut widen_selection_pending = false;
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
         let turn_guard = TurnGuard::default();
         let mut turn_policy = TurnInteractionPolicy::default();
         let mut first_memoria_ms = None;
-        let mut first_surface_report = None;
+        let mut first_selection_report = None;
         let mut first_budget_pressure = 0.0;
         let mut first_context_assembly_ms = None;
         let mut all_selected_skills = Vec::new();
@@ -3109,13 +3155,13 @@ mod tests {
             valid_tool_names: &mut valid_tool_names,
             turn_guard: &turn_guard,
             restricted_tools: &mut restricted_tools,
-            widen_surface_pending: &mut widen_surface_pending,
+            widen_selection_pending: &mut widen_selection_pending,
             step_recorder: &mut step_recorder,
             file_context: &file_context,
             assembly_start: Instant::now(),
             telem: PrepareTurnTelemetry {
                 first_memoria_ms: &mut first_memoria_ms,
-                first_surface_report: &mut first_surface_report,
+                first_selection_report: &mut first_selection_report,
                 first_budget_pressure: &mut first_budget_pressure,
                 first_context_assembly_ms: &mut first_context_assembly_ms,
                 all_selected_skills: &mut all_selected_skills,
@@ -3140,6 +3186,7 @@ mod tests {
             observability_hub: None,
             append_system_prompt: None,
             plan_mode_active: false,
+            lessons_text: None,
         })
         .await;
 
@@ -3189,12 +3236,12 @@ mod tests {
         let file_context: Vec<String> = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
-        let mut widen_surface_pending = false;
+        let mut widen_selection_pending = false;
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
         let turn_guard = TurnGuard::default();
         let mut turn_policy = TurnInteractionPolicy::default();
         let mut first_memoria_ms = None;
-        let mut first_surface_report = None;
+        let mut first_selection_report = None;
         let mut first_budget_pressure = 0.0;
         let mut first_context_assembly_ms = None;
         let mut all_selected_skills = Vec::new();
@@ -3218,13 +3265,13 @@ mod tests {
             valid_tool_names: &mut valid_tool_names,
             turn_guard: &turn_guard,
             restricted_tools: &mut restricted_tools,
-            widen_surface_pending: &mut widen_surface_pending,
+            widen_selection_pending: &mut widen_selection_pending,
             step_recorder: &mut step_recorder,
             file_context: &file_context,
             assembly_start: Instant::now(),
             telem: PrepareTurnTelemetry {
                 first_memoria_ms: &mut first_memoria_ms,
-                first_surface_report: &mut first_surface_report,
+                first_selection_report: &mut first_selection_report,
                 first_budget_pressure: &mut first_budget_pressure,
                 first_context_assembly_ms: &mut first_context_assembly_ms,
                 all_selected_skills: &mut all_selected_skills,
@@ -3249,6 +3296,7 @@ mod tests {
             observability_hub: None,
             append_system_prompt: None,
             plan_mode_active: false,
+            lessons_text: None,
         })
         .await;
 
@@ -3270,7 +3318,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_chat_turn_payload_consumes_widen_surface_pending_once() {
+    async fn prepare_chat_turn_payload_consumes_widen_selection_pending_once() {
         use crate::edge_tools::ToolExecutor;
         use astra_pipeline::step_recorder::StepRecorder;
         use astra_runtime::{
@@ -3291,7 +3339,7 @@ mod tests {
         let file_context: Vec<String> = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut valid_tool_names = HashSet::new();
-        let mut widen_surface_pending = true;
+        let mut widen_selection_pending = true;
         let mut step_recorder = StepRecorder::new("test-user", "session-1", "task-1");
         let mut turn_guard = TurnGuard::default();
         turn_guard.health.record_failure("write_file");
@@ -3299,7 +3347,7 @@ mod tests {
         turn_guard.health.record_failure("write_file");
         let mut turn_policy = TurnInteractionPolicy::default();
         let mut first_memoria_ms = None;
-        let mut first_surface_report = None;
+        let mut first_selection_report = None;
         let mut first_budget_pressure = 0.0;
         let mut first_context_assembly_ms = None;
         let mut all_selected_skills = Vec::new();
@@ -3323,13 +3371,13 @@ mod tests {
             valid_tool_names: &mut valid_tool_names,
             turn_guard: &turn_guard,
             restricted_tools: &mut restricted_tools,
-            widen_surface_pending: &mut widen_surface_pending,
+            widen_selection_pending: &mut widen_selection_pending,
             step_recorder: &mut step_recorder,
             file_context: &file_context,
             assembly_start: Instant::now(),
             telem: PrepareTurnTelemetry {
                 first_memoria_ms: &mut first_memoria_ms,
-                first_surface_report: &mut first_surface_report,
+                first_selection_report: &mut first_selection_report,
                 first_budget_pressure: &mut first_budget_pressure,
                 first_context_assembly_ms: &mut first_context_assembly_ms,
                 all_selected_skills: &mut all_selected_skills,
@@ -3354,6 +3402,7 @@ mod tests {
             observability_hub: None,
             append_system_prompt: None,
             plan_mode_active: false,
+            lessons_text: None,
         })
         .await;
 
@@ -3364,7 +3413,7 @@ mod tests {
             .filter_map(|schema| schema["function"]["name"].as_str())
             .collect();
         assert!(first_tool_names.contains(&"write_file"));
-        assert!(!widen_surface_pending);
+        assert!(!widen_selection_pending);
 
         let second_payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
             messages: &messages,
@@ -3385,13 +3434,13 @@ mod tests {
             valid_tool_names: &mut valid_tool_names,
             turn_guard: &turn_guard,
             restricted_tools: &mut restricted_tools,
-            widen_surface_pending: &mut widen_surface_pending,
+            widen_selection_pending: &mut widen_selection_pending,
             step_recorder: &mut step_recorder,
             file_context: &file_context,
             assembly_start: Instant::now(),
             telem: PrepareTurnTelemetry {
                 first_memoria_ms: &mut first_memoria_ms,
-                first_surface_report: &mut first_surface_report,
+                first_selection_report: &mut first_selection_report,
                 first_budget_pressure: &mut first_budget_pressure,
                 first_context_assembly_ms: &mut first_context_assembly_ms,
                 all_selected_skills: &mut all_selected_skills,
@@ -3416,6 +3465,7 @@ mod tests {
             observability_hub: None,
             append_system_prompt: None,
             plan_mode_active: false,
+            lessons_text: None,
         })
         .await;
 

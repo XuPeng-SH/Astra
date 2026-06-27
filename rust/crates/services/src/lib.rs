@@ -23,7 +23,6 @@ pub mod events;
 pub mod harness;
 pub mod introspection;
 pub mod jobs;
-pub mod learning;
 pub mod llm_trusted_domains;
 pub mod marketplace;
 pub mod marketplace_stats;
@@ -198,10 +197,6 @@ pub use introspection::{
 pub use jobs::{
     InMemoryJobService, JobRecord, JobService, JobSubmitRequestData, UnconfiguredJobService,
 };
-pub use learning::{
-    DatabaseLearningFeedbackService, LearningFeedbackRecord, LearningFeedbackRequestData,
-    LearningFeedbackService, UnconfiguredLearningFeedbackService,
-};
 pub use llm_trusted_domains::{
     DatabaseLlmTrustedDomainService, LlmTrustedDomainDeleteResponse, LlmTrustedDomainRecord,
     LlmTrustedDomainService, LlmTrustedDomainUpsertRequest, LlmTrustedDomainUpsertRequestData,
@@ -260,7 +255,7 @@ pub use prompt_delta::{
     persist_prompt_request, plan_prompt_request,
 };
 pub use reflect::{
-    DatabaseReflectService, Diagnosis, ReflectReport, ReflectService, UnconfiguredReflectService,
+    DatabaseReflectService, ReflectReport, ReflectService, UnconfiguredReflectService,
 };
 pub use replay::{DatabaseReplayService, ReplayService, UnconfiguredReplayService};
 pub use runs::{

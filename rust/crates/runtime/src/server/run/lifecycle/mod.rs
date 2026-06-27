@@ -131,6 +131,20 @@ const RUNTIME_CONTEXT_TRACE_AGENT_ID: &str = "astra-server";
 #[cfg(test)]
 const LLM_TOKEN_SERVICE_TRUSTED_DOMAINS_TABLE: &str = "runtime_llm_trusted_domains";
 
+/// Load RuntimePolicy from RuntimeConfig, converting BudgetPolicyConfig into the
+/// runtime RuntimePolicy type. Returns None when the config section is absent,
+/// causing the caller to fall back to RuntimePolicy::default().
+fn load_budget_policy_from_config() -> Option<crate::turn::runtime_policy::RuntimePolicy> {
+    use crate::turn::runtime_policy::RuntimePolicy;
+    let cfg = astra_config::runtime_config::RuntimeConfig::load().budget_policy?;
+    Some(RuntimePolicy {
+        expand_after_consecutive_outcomes: cfg.expand_after_consecutive_outcomes,
+        expand_factor: cfg.expand_factor,
+        max_ceiling: cfg.max_ceiling,
+        reflect_after_consecutive_zero: cfg.reflect_after_consecutive_zero,
+    })
+}
+
 /// Lazily load deployment-disabled tools from server config.
 /// Reads `[deployment].disabled_tools` from TOML + `ASTRA_DISABLED_TOOLS` env override.
 fn load_deployment_disabled_tools() -> Vec<String> {
@@ -1447,6 +1461,8 @@ pub struct AgenticRunLifecycleService {
     agent_binding_service: Arc<dyn astra_services::AgentBindingService>,
     /// Optional model gateway registry for per-turn model resolution.
     model_gateway_service: Arc<dyn astra_services::ModelGatewayService>,
+    /// Persisted observation reflection service for server-side reflect tool calls.
+    reflect_service: Arc<dyn astra_services::ReflectService>,
     /// Per-run approval request channel receivers (Phase E).
     /// Key: run_id → receiver that the WS handler drains.
     approval_channels: Arc<TokioMutex<HashMap<String, mpsc::Receiver<serde_json::Value>>>>,
@@ -1515,6 +1531,7 @@ impl AgenticRunLifecycleService {
             mcp_registry_service: Arc::new(astra_services::UnconfiguredMcpRegistryService),
             agent_binding_service: Arc::new(astra_services::UnconfiguredAgentBindingService),
             model_gateway_service: Arc::new(astra_services::UnconfiguredModelGatewayService),
+            reflect_service: Arc::new(astra_services::UnconfiguredReflectService),
             approval_channels: Arc::new(TokioMutex::new(HashMap::new())),
             user_prompt_channels: Arc::new(TokioMutex::new(HashMap::new())),
             progress_channels: Arc::new(TokioMutex::new(HashMap::new())),
@@ -1638,6 +1655,14 @@ impl AgenticRunLifecycleService {
         service: Arc<dyn astra_services::ModelGatewayService>,
     ) -> Self {
         self.model_gateway_service = service;
+        self
+    }
+
+    pub fn with_reflect_service(
+        mut self,
+        service: Arc<dyn astra_services::ReflectService>,
+    ) -> Self {
+        self.reflect_service = service;
         self
     }
 
@@ -1801,7 +1826,8 @@ impl AgenticRunLifecycleService {
             .with_pool(self.shared_pool.clone())
             .with_edge_connection_pool(self.edge_connection_pool.clone())
             .with_skill_service(self.skill_service.clone())
-            .with_memory_extraction_service(self.memory_extraction_service.clone()),
+            .with_memory_extraction_service(self.memory_extraction_service.clone())
+            .with_reflect_service(Arc::clone(&self.reflect_service)),
         );
         let executor_for_spawner: Arc<dyn SpawnAgentExecutor> = executor.clone();
         let mut spawner = DynamicAgentSpawner::with_broadcaster(
@@ -3274,13 +3300,15 @@ impl AgenticRunLifecycleService {
             turn_budget_hint_emitted_50: false,
             turn_budget_hint_emitted_20: false,
             agentic_turn_budget,
+            budget_policy: load_budget_policy_from_config(),
+            policy_expanded_this_turn: false,
             current_round_index: 0,
             llm_rounds_completed: 0,
             last_request_message_count: None,
             turn_guard: TurnGuard::with_profile(task_profile),
             restricted_tools,
             boosted_tools: std::collections::HashSet::new(),
-            widen_surface_pending: false,
+            widen_selection_pending: false,
             step_recorder: StepRecorder::new(user_id, session_id, run_id),
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(0.75),
@@ -3332,6 +3360,7 @@ impl AgenticRunLifecycleService {
             ),
             message: request.message.clone(),
             recent_tools: Vec::new(),
+            has_prior_assistant_turn: false,
             task_profile,
             last_turn_policy: crate::turn::agentic_loop::host::TurnInteractionPolicy::default(),
             api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None)
@@ -3350,7 +3379,7 @@ impl AgenticRunLifecycleService {
             last_measured_prompt_tokens: None,
             consecutive_context_window_errors: 0,
             compaction_effectiveness: Default::default(),
-            always_load_tool_schema_tokens: 0,
+            pinned_tool_schema_tokens: 0,
             sticky_tool_schemas: Vec::new(),
             max_turn_input_tokens: astra_core::RuntimeLimits::global().max_turn_input_tokens,
             budget_wrapup_injected: false,
@@ -3364,6 +3393,7 @@ impl AgenticRunLifecycleService {
             permission_handler: None,
             tactical_adapter: None,
             step_signal_collector: None,
+            tool_budget_override: None,
             recent_tactical_actions: Vec::new(),
             server_tool_executor: None,
             interruption: None,
@@ -3423,6 +3453,7 @@ impl AgenticRunLifecycleService {
                     crate::turn::harness_adapter::HarnessSlot::empty()
                 }
             },
+            observation_journal: Default::default(),
         }
     }
 
@@ -4655,6 +4686,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 None,
             )
             .with_cancel_token(loop_state.cancellation.token.clone())
+            .with_reflect_service(Arc::clone(&self.reflect_service))
             .with_task_store(task_store);
             if agent_binding_mode {
                 executor = executor.with_server_builtin_tools_disabled();
@@ -5468,6 +5500,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 None,
             )
             .with_cancel_token(state.cancellation.token.clone())
+            .with_reflect_service(Arc::clone(&self.reflect_service))
             .with_task_store(task_store);
             if agent_binding_mode {
                 executor = executor.with_server_builtin_tools_disabled();
@@ -6452,6 +6485,7 @@ pub struct ServerSpawnAgentExecutor {
     edge_registry_service: Option<Arc<dyn astra_services::multi_agent::EdgeRegistryService>>,
     skill_service: Option<Arc<dyn SkillService>>,
     memory_extraction_service: Option<Arc<crate::session_memory::MemoryExtractionService>>,
+    reflect_service: Arc<dyn astra_services::ReflectService>,
     runtime_contexts: Arc<RwLock<HashMap<String, ServerSpawnRuntimeContext>>>,
 }
 
@@ -6471,6 +6505,7 @@ impl ServerSpawnAgentExecutor {
             edge_registry_service: None,
             skill_service: None,
             memory_extraction_service: None,
+            reflect_service: Arc::new(astra_services::UnconfiguredReflectService),
             runtime_contexts: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -6514,6 +6549,14 @@ impl ServerSpawnAgentExecutor {
         svc: Option<Arc<crate::session_memory::MemoryExtractionService>>,
     ) -> Self {
         self.memory_extraction_service = svc;
+        self
+    }
+
+    pub fn with_reflect_service(
+        mut self,
+        service: Arc<dyn astra_services::ReflectService>,
+    ) -> Self {
+        self.reflect_service = service;
         self
     }
 
@@ -6576,6 +6619,7 @@ impl ServerSpawnAgentExecutor {
         if let Some(svc) = self.memory_extraction_service.clone() {
             executor = executor.with_memory_extraction_service(svc);
         }
+        executor = executor.with_reflect_service(Arc::clone(&self.reflect_service));
         executor
     }
 }
@@ -6840,6 +6884,7 @@ pub struct ServerSubRunExecutor {
     edge_registry_service: Option<Arc<dyn astra_services::multi_agent::EdgeRegistryService>>,
     skill_service: Option<Arc<dyn SkillService>>,
     memory_extraction_service: Option<Arc<crate::session_memory::MemoryExtractionService>>,
+    reflect_service: Arc<dyn astra_services::ReflectService>,
     inherited_permissions: InheritedPermissions,
     /// Shared ToolExecutionService so executors share the same disabled_tools set.
     pub tool_execution_service: Option<ToolExecutionService>,
@@ -6863,6 +6908,7 @@ impl ServerSubRunExecutor {
             edge_registry_service: None,
             skill_service: None,
             memory_extraction_service: None,
+            reflect_service: Arc::new(astra_services::UnconfiguredReflectService),
             inherited_permissions: InheritedPermissions::auto_approve(),
             tool_execution_service: None,
             #[cfg(feature = "bridge-e2e-hooks")]
@@ -6880,6 +6926,14 @@ impl ServerSubRunExecutor {
         svc: Arc<crate::session_memory::MemoryExtractionService>,
     ) -> Self {
         self.memory_extraction_service = Some(svc);
+        self
+    }
+
+    pub fn with_reflect_service(
+        mut self,
+        service: Arc<dyn astra_services::ReflectService>,
+    ) -> Self {
+        self.reflect_service = service;
         self
     }
 
@@ -7141,13 +7195,15 @@ impl SubRunExecutor for ServerSubRunExecutor {
             turn_budget_hint_emitted_50: false,
             turn_budget_hint_emitted_20: false,
             agentic_turn_budget,
+            budget_policy: load_budget_policy_from_config(),
+            policy_expanded_this_turn: false,
             current_round_index: 0,
             llm_rounds_completed: 0,
             last_request_message_count: None,
             turn_guard: TurnGuard::new(),
             restricted_tools,
             boosted_tools: std::collections::HashSet::new(),
-            widen_surface_pending: false,
+            widen_selection_pending: false,
             step_recorder: StepRecorder::new(&config.user_id, &config.session_id, &config.run_id),
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(0.75),
@@ -7203,6 +7259,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             ),
             message: full_task,
             recent_tools: Vec::new(),
+            has_prior_assistant_turn: false,
             task_profile,
             last_turn_policy: crate::turn::agentic_loop::host::TurnInteractionPolicy::default(),
             api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None)
@@ -7221,7 +7278,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             last_measured_prompt_tokens: None,
             consecutive_context_window_errors: 0,
             compaction_effectiveness: Default::default(),
-            always_load_tool_schema_tokens: 0,
+            pinned_tool_schema_tokens: 0,
             sticky_tool_schemas: Vec::new(),
             max_turn_input_tokens: astra_core::RuntimeLimits::global().max_turn_input_tokens,
             budget_wrapup_injected: false,
@@ -7235,6 +7292,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             permission_handler: None,
             tactical_adapter: None,
             step_signal_collector: None,
+            tool_budget_override: None,
             recent_tactical_actions: Vec::new(),
             server_tool_executor: None,
             interruption: None,
@@ -7265,6 +7323,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                     crate::turn::harness_adapter::HarnessSlot::empty()
                 }
             },
+            observation_journal: Default::default(),
         };
         if let Some(trace_context) = trace_context_from_subrun_context(&config.context) {
             loop_state.session_turn = u32::try_from(trace_context.turn_seq).unwrap_or(0);
@@ -7290,6 +7349,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 self.shared_pool.is_some(),
             ))
             .with_cancel_token(config.cancel_token.clone())
+            .with_reflect_service(Arc::clone(&self.reflect_service))
             .with_task_store(task_store);
 
             // Enable exactly-once tool execution for crash recovery dedup.

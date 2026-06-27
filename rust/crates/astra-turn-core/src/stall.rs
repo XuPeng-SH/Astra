@@ -302,13 +302,6 @@ pub fn assess_reward_hacking(
     })
 }
 
-pub fn dampen_quality_for_reward_hacking(
-    quality: f64,
-    assessment: &RewardHackingAssessment,
-) -> f64 {
-    (quality * (1.0 - assessment.risk)).clamp(0.0, 1.0)
-}
-
 pub fn reward_hacking_avoid_tools(tool_calls: &[Value]) -> Vec<String> {
     let tool_names = ordered_tool_call_names(tool_calls);
     if tool_names.is_empty() {
@@ -721,100 +714,16 @@ pub enum IntentDrift {
 /// Minimum consecutive off-task turns before flagging drift.
 pub const INTENT_DRIFT_WINDOW: usize = 3;
 
-/// Tools that are always considered on-task (utility/meta tools).
-const ALWAYS_ON_TASK_TOOLS: &[&str] = &["memory", "reflect", "get_agent_info"];
-
-/// Extract keywords from user query for intent matching.
-/// Lowercases and splits on whitespace/punctuation, filters short words.
-fn extract_intent_keywords(query: &str) -> Vec<String> {
-    query
-        .to_lowercase()
-        .split(|c: char| c.is_whitespace() || c.is_ascii_punctuation())
-        .filter(|w| w.len() >= 2)
-        .map(String::from)
-        .collect()
-}
-
-/// Check if a set of tool names + their arguments have any relevance to
-/// the user's original query keywords.
-fn tools_relate_to_intent(
-    tool_names: &[String],
-    tool_args_text: &str,
-    intent_keywords: &[String],
-) -> bool {
-    if intent_keywords.is_empty() || tool_names.is_empty() {
-        return true; // can't judge → assume on-task
-    }
-    // Always-on-task tools are by definition relevant
-    if tool_names
-        .iter()
-        .any(|n| ALWAYS_ON_TASK_TOOLS.contains(&n.as_str()))
-    {
-        return true;
-    }
-
-    let combined = format!("{} {}", tool_names.join(" "), tool_args_text.to_lowercase());
-
-    // Check if any intent keyword appears in tool names or args
-    let match_count = intent_keywords
-        .iter()
-        .filter(|kw| combined.contains(kw.as_str()))
-        .count();
-
-    // At least 1 keyword match, or >20% overlap
-    match_count > 0 || {
-        // Fallback: check if tool names themselves suggest the right domain
-        let query_lower = intent_keywords.join(" ");
-        // Git-related queries match git tools
-        (query_lower.contains("commit")
-            || query_lower.contains("git")
-            || query_lower.contains("review")
-            || query_lower.contains("diff")
-            || query_lower.contains("blame"))
-            && tool_names.iter().any(|n| n == "git" || n == "bash")
-    }
-}
-
-/// Detect if the agent has drifted from the user's original intent.
-///
-/// `user_query`: the original user message.
-/// `recent_tool_turns`: for each recent turn, the (tool_names, concatenated_args) used.
-///
-/// Returns `IntentDrift::Drifting` if the last N turns used tools
-/// unrelated to the user's query.
-pub fn detect_intent_drift(
-    user_query: &str,
-    recent_tool_turns: &[(Vec<String>, String)],
-) -> IntentDrift {
-    let keywords = extract_intent_keywords(user_query);
-    if keywords.is_empty() || recent_tool_turns.is_empty() {
-        return IntentDrift::OnTask;
-    }
-
-    // Count consecutive off-task turns from the end
-    let mut consecutive_off_task = 0;
-    for (names, args_text) in recent_tool_turns.iter().rev() {
-        if tools_relate_to_intent(names, args_text, &keywords) {
-            break;
-        }
-        consecutive_off_task += 1;
-    }
-
-    if consecutive_off_task >= INTENT_DRIFT_WINDOW {
-        let original_snippet: String = user_query.chars().take(100).collect();
-        IntentDrift::Drifting {
-            consecutive_off_task,
-            correction: format!(
-                "⚠ INTENT DRIFT DETECTED — you have spent {} consecutive turns on tools \
-                 unrelated to the user's request: \"{}\". \
-                 STOP your current approach and refocus on what the user asked. \
-                 If you cannot accomplish the original task, explain why and ask for guidance.",
-                consecutive_off_task, original_snippet
-            ),
-        }
-    } else {
-        IntentDrift::OnTask
-    }
+/// Format correction message for intent drift.
+pub fn format_drift_correction(user_query: &str, consecutive_off_task: usize) -> String {
+    let original_snippet: String = user_query.chars().take(100).collect();
+    format!(
+        "⚠ INTENT DRIFT DETECTED — you have spent {} consecutive turns on tools \
+         unrelated to the user's request: \"{}\". \
+         STOP your current approach and refocus on what the user asked. \
+         If you cannot accomplish the original task, explain why and ask for guidance.",
+        consecutive_off_task, original_snippet
+    )
 }
 
 #[cfg(test)]
@@ -1153,15 +1062,6 @@ mod tests {
     }
 
     #[test]
-    fn reward_hacking_dampens_quality() {
-        let assessment = RewardHackingAssessment {
-            risk: 0.6,
-            flags: vec!["repeated identical tool call x3".into()],
-        };
-        assert!((dampen_quality_for_reward_hacking(0.9, &assessment) - 0.36).abs() < 0.01);
-    }
-
-    #[test]
     fn reward_hacking_avoid_tools_prefers_repeated_or_exploration_tools() {
         let tool_calls = vec![
             serde_json::json!({"name": "read_file", "arguments": {"path": "src/lib.rs"}}),
@@ -1359,8 +1259,9 @@ mod tests {
         assert!(ignored.is_empty());
     }
 
-    // ── Intent drift detection ──
+    // ─── IntentDrift and format_drift_correction tests ─────────────────────
 
+    #[allow(dead_code)]
     fn make_intent_turns(turns: &[(&[&str], &str)]) -> Vec<(Vec<String>, String)> {
         turns
             .iter()
@@ -1374,154 +1275,40 @@ mod tests {
     }
 
     #[test]
-    fn intent_drift_on_task_when_tools_match_query() {
-        let turns = make_intent_turns(&[
-            (&["git"], r#"{"action":"log"}"#),
-            (&["git"], r#"{"action":"show","revision":"abc123"}"#),
-            (&["git"], r#"{"action":"diff","ref":"abc123"}"#),
-        ]);
-        let result = detect_intent_drift("review 最新的commit", &turns);
-        assert_eq!(result, IntentDrift::OnTask);
+    fn format_drift_correction_truncates_long_query() {
+        let long_query = "a".repeat(200);
+        let correction = format_drift_correction(&long_query, 5);
+        assert!(correction.contains("INTENT DRIFT"));
+        assert!(correction.contains("5 consecutive turns"));
+        // Query should be truncated to 100 chars
+        assert!(correction.len() < 200 + 200);
     }
 
     #[test]
-    fn intent_drift_detected_when_unrelated_tools() {
-        // User asked to review a commit, but agent writes a skill file
-        let turns = make_intent_turns(&[
-            (&["git"], r#"{"action":"log"}"#),
-            (&["write_file"], r#"{"path":"skills/web_search.py"}"#),
-            (&["list_dir"], r#"{"path":"skills/"}"#),
-            (&["write_file"], r#"{"path":"skills/test.py"}"#),
-        ]);
-        let result = detect_intent_drift("review 最新的commit", &turns);
-        assert!(matches!(result, IntentDrift::Drifting { .. }));
+    fn format_drift_correction_includes_consecutive_count() {
+        let correction = format_drift_correction("fix auth bug", 3);
+        assert!(correction.contains("3 consecutive turns"));
+        assert!(correction.contains("fix auth bug"));
     }
 
     #[test]
-    fn intent_drift_not_triggered_below_window() {
-        // Only 2 off-task turns (below INTENT_DRIFT_WINDOW=3)
-        let turns = make_intent_turns(&[
-            (&["git"], r#"{"action":"log"}"#),
-            (&["write_file"], r#"{"path":"random.txt"}"#),
-            (&["list_dir"], r#"{"path":"random/"}"#),
-        ]);
-        let result = detect_intent_drift("review 最新的commit", &turns);
-        assert_eq!(result, IntentDrift::OnTask);
-    }
+    fn intent_drift_variants_constructible() {
+        let on_task = IntentDrift::OnTask;
+        assert_eq!(on_task, IntentDrift::OnTask);
 
-    #[test]
-    fn intent_drift_reset_by_on_task_tool() {
-        // 2 off-task, then 1 on-task, then 2 off-task → no drift (reset in middle)
-        let turns = make_intent_turns(&[
-            (&["write_file"], r#"{"path":"random.txt"}"#),
-            (&["list_dir"], r#"{"path":"random/"}"#),
-            (&["git"], r#"{"action":"show","revision":"abc"}"#), // on-task: resets counter
-            (&["write_file"], r#"{"path":"random2.txt"}"#),
-            (&["list_dir"], r#"{"path":"random2/"}"#),
-        ]);
-        let result = detect_intent_drift("review 最新的commit", &turns);
-        assert_eq!(result, IntentDrift::OnTask);
-    }
-
-    /// P1-G: Realistic scenario — user asks to fix a specific bug, agent
-    /// goes off to refactor unrelated code for 4 turns.
-    #[test]
-    fn intent_drift_correction_references_original_request() {
-        let turns = make_intent_turns(&[
-            // Agent drifts to refactoring unrelated module
-            (&["write_file"], r#"{"path":"src/telemetry.rs"}"#),
-            (&["str_replace"], r#"{"path":"src/telemetry.rs"}"#),
-            (&["write_file"], r#"{"path":"src/metrics.rs"}"#),
-            (&["bash"], r#"{"command":"cargo clippy"}"#),
-        ]);
-        let result =
-            detect_intent_drift("fix authentication timeout when password expires", &turns);
-        match result {
-            IntentDrift::Drifting {
-                consecutive_off_task,
-                correction,
-            } => {
-                assert!(
-                    consecutive_off_task >= 3,
-                    "must detect 3+ off-task turns, got {consecutive_off_task}"
-                );
-                assert!(
-                    correction.contains("authentication") || correction.contains("password"),
-                    "correction must reference original request: {correction}"
-                );
-            }
-            IntentDrift::OnTask => {
-                panic!(
-                    "drift must be detected when agent refactors telemetry instead of fixing auth"
-                )
-            }
-        }
-    }
-
-    /// P1-G: Chinese query — intent drift detection must work with CJK.
-    #[test]
-    fn intent_drift_works_with_chinese_query() {
-        let turns = make_intent_turns(&[
-            (&["read_file"], r#"{"path":"src/database.rs"}"#),
-            (&["write_file"], r#"{"path":"docs/readme.md"}"#),
-            (&["write_file"], r#"{"path":"docs/guide.md"}"#),
-            (&["bash"], r#"{"command":"mdbook build"}"#),
-        ]);
-        let result = detect_intent_drift("修复数据库连接超时的问题", &turns);
-        assert!(
-            matches!(result, IntentDrift::Drifting { .. }),
-            "drift must be detected for Chinese query when agent writes docs instead of fixing DB"
-        );
-    }
-
-    #[test]
-    fn intent_drift_meta_tools_always_on_task() {
-        let turns = make_intent_turns(&[
-            (&["write_file"], "random"),
-            (&["write_file"], "random"),
-            (&["memory"], "anything"), // meta tool: always on-task
-        ]);
-        let result = detect_intent_drift("review 最新的commit", &turns);
-        assert_eq!(result, IntentDrift::OnTask);
-    }
-
-    #[test]
-    fn intent_drift_keyword_in_args_counts() {
-        // Tools are generic but args contain keywords from the query
-        let turns = make_intent_turns(&[
-            (&["bash"], r#"{"command":"cat commit.txt"}"#),
-            (&["read_file"], r#"{"path":"review_notes.md"}"#),
-            (&["bash"], r#"{"command":"echo review done"}"#),
-        ]);
-        let result = detect_intent_drift("review 最新的commit", &turns);
-        assert_eq!(result, IntentDrift::OnTask);
-    }
-
-    #[test]
-    fn intent_drift_empty_query_is_on_task() {
-        let turns = make_intent_turns(&[
-            (&["write_file"], "random"),
-            (&["write_file"], "random"),
-            (&["write_file"], "random"),
-        ]);
-        let result = detect_intent_drift("", &turns);
-        assert_eq!(result, IntentDrift::OnTask);
-    }
-
-    #[test]
-    fn intent_drift_correction_includes_user_query() {
-        let turns = make_intent_turns(&[
-            (&["write_file"], "SKILL.md"),
-            (&["write_file"], "test.py"),
-            (&["list_dir"], "skills/"),
-        ]);
-        if let IntentDrift::Drifting { correction, .. } =
-            detect_intent_drift("review 最新的commit", &turns)
+        let drifting = IntentDrift::Drifting {
+            consecutive_off_task: 4,
+            correction: "test".to_string(),
+        };
+        if let IntentDrift::Drifting {
+            consecutive_off_task,
+            correction,
+        } = drifting
         {
-            assert!(correction.contains("review"));
-            assert!(correction.contains("INTENT DRIFT"));
+            assert_eq!(consecutive_off_task, 4);
+            assert_eq!(correction, "test");
         } else {
-            panic!("Expected Drifting");
+            panic!("Expected Drifting variant");
         }
     }
 
@@ -2094,136 +1881,8 @@ mod tests {
         assert!(msg.contains("tool_x"));
     }
 
-    // ══════════════════════════════════════════════════════════════════════
-    //  detect_intent_drift — additional cases
-    // ══════════════════════════════════════════════════════════════════════
-
     #[test]
-    fn intent_drift_empty_turns() {
-        assert_eq!(
-            detect_intent_drift("review commit", &[]),
-            IntentDrift::OnTask
-        );
-    }
-
-    #[test]
-    fn intent_drift_all_on_task_git_tools() {
-        let turns = make_intent_turns(&[
-            (&["git"], r#"{"action":"log"}"#),
-            (&["git"], r#"{"action":"diff","ref":"abc"}"#),
-            (&["git"], r#"{"action":"show","revision":"def"}"#),
-            (&["bash"], r#"git blame file.rs"#),
-        ]);
-        assert_eq!(
-            detect_intent_drift("review commit diff", &turns),
-            IntentDrift::OnTask
-        );
-    }
-
-    #[test]
-    fn intent_drift_long_query_truncated_in_correction() {
-        // Build a long query with real keywords (>=2 chars each)
-        let long_query = "deploy kubernetes cluster ".repeat(20); // 500 chars
-        let turns = make_intent_turns(&[
-            (&["write_file"], "random"),
-            (&["write_file"], "random"),
-            (&["write_file"], "random"),
-        ]);
-        if let IntentDrift::Drifting { correction, .. } = detect_intent_drift(&long_query, &turns) {
-            // Correction should contain the query truncated to 100 chars
-            assert!(correction.len() < long_query.len() + 200);
-            assert!(correction.contains("INTENT DRIFT"));
-        } else {
-            panic!("Expected Drifting for unrelated tools");
-        }
-    }
-
-    #[test]
-    fn intent_drift_short_keywords_filtered() {
-        // Query with only 1-char words should be treated as empty → OnTask
-        let turns = make_intent_turns(&[
-            (&["write_file"], "x"),
-            (&["write_file"], "y"),
-            (&["write_file"], "z"),
-        ]);
-        assert_eq!(detect_intent_drift("a b c", &turns), IntentDrift::OnTask);
-    }
-
-    #[test]
-    fn intent_drift_always_on_task_tools_at_end() {
-        // Off-task tools then a meta-tool at the very end → resets counter
-        let turns = make_intent_turns(&[
-            (&["write_file"], "random"),
-            (&["write_file"], "random"),
-            (&["reflect"], "anything"),
-        ]);
-        assert_eq!(
-            detect_intent_drift("review commit", &turns),
-            IntentDrift::OnTask
-        );
-    }
-
-    #[test]
-    fn intent_drift_exactly_at_window_boundary() {
-        // Exactly INTENT_DRIFT_WINDOW off-task turns → triggers drift
-        let mut turns = Vec::new();
-        for _ in 0..INTENT_DRIFT_WINDOW {
-            turns.push((vec!["write_file".to_string()], "random".to_string()));
-        }
-        assert!(matches!(
-            detect_intent_drift("review commit", &turns),
-            IntentDrift::Drifting { .. }
-        ));
-    }
-
-    // ══════════════════════════════════════════════════════════════════════
-    //  round_tool_call_sig_and_names — additional cases
-    // ══════════════════════════════════════════════════════════════════════
-
-    #[test]
-    fn round_sig_and_names_empty_calls() {
-        let (sigs, names) = round_tool_call_sig_and_names(&[]);
-        assert!(sigs.is_empty());
-        assert!(names.is_empty());
-    }
-
-    #[test]
-    fn round_sig_and_names_multiple_tools() {
-        let calls = vec![
-            serde_json::json!({"name": "bash", "arguments": {"cmd": "ls"}}),
-            serde_json::json!({"name": "read_file", "arguments": {"path": "a.rs"}}),
-        ];
-        let (sigs, names) = round_tool_call_sig_and_names(&calls);
-        assert_eq!(sigs.len(), 2);
-        assert!(names.contains("bash"));
-        assert!(names.contains("read_file"));
-    }
-
-    #[test]
-    fn round_sig_and_names_dedup_names() {
-        // Two calls to bash with different args → 2 sigs but 1 unique name
-        let calls = vec![
-            serde_json::json!({"name": "bash", "arguments": {"cmd": "ls"}}),
-            serde_json::json!({"name": "bash", "arguments": {"cmd": "pwd"}}),
-        ];
-        let (sigs, names) = round_tool_call_sig_and_names(&calls);
-        assert_eq!(sigs.len(), 2, "different args → different sigs");
-        assert_eq!(names.len(), 1, "same tool name → one entry in HashSet");
-    }
-
-    #[test]
-    fn round_sig_and_names_missing_fields() {
-        let calls = vec![serde_json::json!({})];
-        let (sigs, names) = round_tool_call_sig_and_names(&calls);
-        assert_eq!(sigs.len(), 1);
-        assert!(names.contains(""));
-    }
-
-    /// P0-A: A text-only turn (empty tool_calls) between repeated tool turns
-    /// must NOT wipe stall detection history. The stall window should survive
-    /// interleaved text responses.
-    #[test]
-    fn text_only_turn_does_not_wipe_stall_history() {
+    fn server_stall_text_turn_does_not_clear_history() {
         let bash_ls = vec![serde_json::json!({
             "function": {"name": "bash", "arguments": "{\"cmd\":\"ls\"}"}
         })];
@@ -2308,10 +1967,10 @@ mod tests {
 
     // ── P1-E: Reward-hacking detection behavioral tests ─────────────
 
-    /// Scenario: Agent calls the same tool with the same args 3 times in one
-    /// turn, and reports high quality. This is classic reward hacking.
+    /// Scenario: Agent makes 3 identical tool calls with high quality.
+    /// This should trigger reward hacking detection.
     #[test]
-    fn reward_hacking_detected_on_identical_calls_with_high_quality() {
+    fn reward_hacking_assessment_high_risk_on_identical_calls() {
         let calls = vec![
             serde_json::json!({"name": "bash", "arguments": "{\"command\": \"echo ok\"}"}),
             serde_json::json!({"name": "bash", "arguments": "{\"command\": \"echo ok\"}"}),
@@ -2324,13 +1983,6 @@ mod tests {
             assessment.risk
         );
         assert!(!assessment.flags.is_empty(), "must have diagnostic flags");
-
-        // Quality must be dampened
-        let dampened = dampen_quality_for_reward_hacking(0.9, &assessment);
-        assert!(
-            dampened < 0.9,
-            "quality must be dampened from 0.9, got {dampened}"
-        );
     }
 
     /// Scenario: Agent calls the same tool with DIFFERENT args (e.g.,

@@ -21,7 +21,7 @@ use astra_turn_core::headless_tool_stderr_lines::{
 };
 use astra_turn_core::tool::deferred_activation::{
     DirectDeferredCallAdmission, classify_direct_deferred_call,
-    deferred_tool_not_activatable_message, direct_deferred_call_activated_message,
+    deferred_tool_not_activatable_message, direct_deferred_call_activation_message,
     tool_not_admitted_message,
 };
 use astra_turn_core::tool_result_semantics::tool_dedup_signature;
@@ -71,7 +71,7 @@ fn emit_blocked_tool_result(
 /// Decide which denial body to emit for a name the validator rejected.
 ///
 /// First-principle: the model can only act on what we have already told it
-/// about. If `name` appears in this turn's `<deferred_tools>` manifest, it
+/// about. If `name` appears in this turn's `<deferred-tools>` manifest, it
 /// has been advertised — denying with the bare "Unknown tool" copy contradicts
 /// the prompt. Surface the activation hint instead. Otherwise the name is
 /// truly hallucinated; return the unknown-tool body so the model can
@@ -588,22 +588,40 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                         exec.record_direct_deferred_call_activation(&name);
                     }
                     (
-                        direct_deferred_call_activated_message(&name),
+                        direct_deferred_call_activation_message(&name),
                         "direct_deferred_call_activated",
                     )
                 }
-                DirectDeferredCallAdmission::NotAdmitted => (
-                    astra_turn_core::tool::runtime_binding::runtime_binding_denial_message(
+                DirectDeferredCallAdmission::NotAdmitted => {
+                    if astra_turn_core::tool::runtime_binding::tool_name_requires_runtime_binding(
                         &execution.name,
-                        action,
-                    ),
-                    "tool_not_admitted",
-                ),
+                    ) {
+                        (
+                            astra_turn_core::tool::runtime_binding::runtime_binding_denial_message(
+                                &execution.name,
+                                action,
+                            ),
+                            "tool_not_admitted",
+                        )
+                    } else {
+                        (
+                            tool_not_admitted_message(&execution.name, true),
+                            "tool_not_admitted",
+                        )
+                    }
+                }
                 DirectDeferredCallAdmission::Unknown => {
                     if is_prompt_deferred {
                         if has_runtime_binding(&execution.name) {
                             (
                                 deferred_tool_not_activatable_message(&execution.name),
+                                "tool_not_admitted",
+                            )
+                        } else if !astra_turn_core::tool::runtime_binding::tool_name_requires_runtime_binding(
+                            &execution.name,
+                        ) {
+                            (
+                                tool_not_admitted_message(&execution.name, true),
                                 "tool_not_admitted",
                             )
                         } else {
@@ -638,7 +656,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 );
             }
             let (tool_msg, err_tr) =
-                openai_tool_roundtrip_values(&execution.id, &execution.name, err_msg.as_str());
+                openai_tool_roundtrip_values(&execution.id, &execution.name, &err_msg);
             trace_short_circuit_tool_skip(
                 self.ctx.step_recorder,
                 &execution.id,
@@ -786,62 +804,67 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             return HeadlessPipelineStage::ShortCircuit;
         }
 
-        let args_str = serde_json::to_string(&execution.args).ok();
-        let permission_context = self.ctx.permission_context;
-        let effective_permission_timeout = self.ctx.effective_permission_timeout;
-        let mailbox = self.ctx.mailbox.as_deref_mut();
-        let plan_mode_active = self.ctx.plan_mode_active;
-        match crate::turn::permission_gate::check_tool_permission_in_plan_mode(
-            &execution.name,
-            args_str.as_deref(),
-            permission_context,
-            mailbox,
-            effective_permission_timeout,
-            plan_mode_active,
-        )
-        .await
-        {
-            PermissionCheckResult::Allowed => {}
-            PermissionCheckResult::AllowedImplicit { reason } => {
-                if !self.ctx.quiet {
-                    self.ctx.term.emit_line(
-                        HeadlessStderrStyle::Yellow,
-                        astra_turn_core::permission::notice::format_auto_approved_permission(
-                            &execution.name,
-                            &reason,
-                        ),
-                    );
+        if !execution.is_edge_tool {
+            let args_str = serde_json::to_string(&execution.args).ok();
+            let permission_context = self.ctx.permission_context;
+            let effective_permission_timeout = self.ctx.effective_permission_timeout;
+            let mailbox = self.ctx.mailbox.as_deref_mut();
+            let plan_mode_active = self.ctx.plan_mode_active;
+            match crate::turn::permission_gate::check_tool_permission_in_plan_mode(
+                &execution.name,
+                args_str.as_deref(),
+                permission_context,
+                mailbox,
+                effective_permission_timeout,
+                plan_mode_active,
+            )
+            .await
+            {
+                PermissionCheckResult::Allowed => {}
+                PermissionCheckResult::AllowedImplicit { reason } => {
+                    if !self.ctx.quiet {
+                        self.ctx.term.emit_line(
+                            HeadlessStderrStyle::Yellow,
+                            astra_turn_core::permission::notice::format_auto_approved_permission(
+                                &execution.name,
+                                &reason,
+                            ),
+                        );
+                    }
                 }
-            }
-            PermissionCheckResult::AllowedViaRequest { .. } => {
-                if !self.ctx.quiet {
-                    self.ctx.term.emit_line(
-                        HeadlessStderrStyle::Yellow,
-                        format!("  🔓 Permission granted by parent: {}", execution.name),
-                    );
+                PermissionCheckResult::AllowedViaRequest { .. } => {
+                    if !self.ctx.quiet {
+                        self.ctx.term.emit_line(
+                            HeadlessStderrStyle::Yellow,
+                            format!("  🔓 Permission granted by parent: {}", execution.name),
+                        );
+                    }
                 }
-            }
-            PermissionCheckResult::Denied { reason } => {
-                let err_msg = permission_denied_error_result(&execution.name, &reason);
-                emit_blocked_tool_result(
-                    HeadlessBlockedTool {
-                        id: &execution.id,
-                        name: &execution.name,
-                        args: &execution.args,
-                        reason_code: "permission_denied",
-                        err_msg,
-                        journal_reason: reason,
-                        early_exit_ms: execution.early_exit_ms,
-                        status_line: Some(format!("  🔒 Permission denied: {}", execution.name)),
-                    },
-                    self.ctx.step_recorder,
-                    self.ctx.quiet,
-                    self.ctx.term,
-                    self.ctx.messages,
-                    self.ctx.tool_results,
-                    self.ctx.tool_call_records,
-                );
-                return HeadlessPipelineStage::ShortCircuit;
+                PermissionCheckResult::Denied { reason } => {
+                    let err_msg = permission_denied_error_result(&execution.name, &reason);
+                    emit_blocked_tool_result(
+                        HeadlessBlockedTool {
+                            id: &execution.id,
+                            name: &execution.name,
+                            args: &execution.args,
+                            reason_code: "permission_denied",
+                            err_msg,
+                            journal_reason: reason,
+                            early_exit_ms: execution.early_exit_ms,
+                            status_line: Some(format!(
+                                "  🔒 Permission denied: {}",
+                                execution.name
+                            )),
+                        },
+                        self.ctx.step_recorder,
+                        self.ctx.quiet,
+                        self.ctx.term,
+                        self.ctx.messages,
+                        self.ctx.tool_results,
+                        self.ctx.tool_call_records,
+                    );
+                    return HeadlessPipelineStage::ShortCircuit;
+                }
             }
         }
 
@@ -1027,7 +1050,7 @@ mod tests {
         let body = validator_denial_body("grep", &valid, &deferred);
 
         assert!(body.contains("not available in this turn yet"));
-        assert!(body.contains("`<deferred_tools>`"));
+        assert!(body.contains("`<deferred-tools>`"));
         assert!(body.contains("tool_search"));
         assert!(body.contains("query=\"select:grep\""));
         assert!(!body.contains("Unknown tool"));

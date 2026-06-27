@@ -102,6 +102,41 @@ mod turn_guard_integration {
         json!({"function": {"name": name, "arguments": args}})
     }
 
+    /// Proves: drift escalation triggers force-stop when nudge count >= 3
+    #[test]
+    fn drift_escalation_force_stops_after_three_nudges() {
+        let mut guard = TurnGuard::new();
+        guard.drift_nudge_count = 3;
+
+        let verdict = guard.evaluate();
+        assert_eq!(verdict.severity, VerdictSeverity::Critical);
+        assert!(verdict.force_stop, "drift count >= 3 must force-stop");
+        assert!(
+            verdict
+                .injections
+                .iter()
+                .any(|m| m.contains("CRITICAL") && m.contains("drift")),
+            "must inject drift critical message"
+        );
+    }
+
+    /// Proves: drift escalation does NOT trigger below threshold
+    #[test]
+    fn drift_below_threshold_stays_healthy() {
+        let mut guard = TurnGuard::new();
+        guard.drift_nudge_count = 2;
+
+        let verdict = guard.evaluate();
+        assert!(!verdict.force_stop, "drift count < 3 must not force-stop");
+        assert!(
+            !verdict
+                .injections
+                .iter()
+                .any(|m| m.contains("CRITICAL") && m.contains("drift")),
+            "must not inject drift critical message"
+        );
+    }
+
     /// Proves: normal session produces no injections
     #[test]
     fn normal_session_stays_healthy() {
@@ -300,7 +335,7 @@ mod turn_guard_integration {
 //    with different arguments (legitimate multi-file edits)
 
 mod multi_file_edit_regression {
-    use astra_turn_core::tool_registry_report::ToolSurfaceReport;
+    use astra_turn_core::tool_registry_report::ToolSelectionReport;
     use astra_turn_core::tool_schema_prune::retain_invoked_tool_schemas;
     use astra_turn_core::turn_guard::{TurnGuard, VerdictSeverity};
     use serde_json::{Value, json};
@@ -331,7 +366,7 @@ mod multi_file_edit_regression {
 
         // Initial selection: bash + read_file (git NOT selected)
         let mut selected = vec![tool_schema("bash"), tool_schema("read_file")];
-        let mut report = ToolSurfaceReport {
+        let mut report = ToolSelectionReport {
             visible_tools: vec!["bash".into(), "read_file".into()],
             visible_count: 2,
             schema_budget_used: 0,

@@ -614,6 +614,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
         );
 
         let mut state = AgenticLoopState {
+            observation_journal: Default::default(),
             messages,
             volatile_pending: Vec::new(),
             recent_rounds: Vec::new(),
@@ -650,9 +651,11 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             llm_rounds_completed: 0,
             last_request_message_count: None,
             turn_guard: TurnGuard::with_profile(task_profile),
+            budget_policy: None,
+            policy_expanded_this_turn: false,
             restricted_tools,
             boosted_tools: HashSet::new(),
-            widen_surface_pending: false,
+            widen_selection_pending: false,
             step_recorder,
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(
@@ -698,6 +701,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             ),
             message: task_context.to_string(),
             recent_tools: Vec::new(),
+            has_prior_assistant_turn: false,
             task_profile: infer_task_execution_profile(task_context),
             last_turn_policy: TurnInteractionPolicy::default(),
             api: self.api.clone(),
@@ -715,7 +719,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             last_measured_prompt_tokens: None,
             consecutive_context_window_errors: 0,
             compaction_effectiveness: Default::default(),
-            always_load_tool_schema_tokens: 0,
+            pinned_tool_schema_tokens: 0,
             sticky_tool_schemas: Vec::new(),
             max_turn_input_tokens: astra_core::RuntimeLimits::global().max_turn_input_tokens,
             budget_wrapup_injected: false,
@@ -729,6 +733,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             permission_handler: None,
             tactical_adapter: None,
             step_signal_collector: None,
+            tool_budget_override: None,
             recent_tactical_actions: Vec::new(),
             server_tool_executor: None,
             interruption: None,
@@ -800,10 +805,10 @@ fn resolve_subrun_schemas(
 
 fn empty_surface_report_for_schemas(
     schemas: &[Value],
-) -> astra_turn_core::tool_registry_report::ToolSurfaceReport {
+) -> astra_turn_core::tool_registry_report::ToolSelectionReport {
     let mut visible_tools: Vec<String> = tool_names_from_schemas(schemas).into_iter().collect();
     visible_tools.sort();
-    astra_turn_core::tool_registry_report::ToolSurfaceReport {
+    astra_turn_core::tool_registry_report::ToolSelectionReport {
         visible_count: visible_tools.len() as u32,
         visible_tools,
         schema_budget_used: 0,

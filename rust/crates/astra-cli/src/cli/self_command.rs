@@ -1,5 +1,6 @@
 use chrono::Utc;
 use serde::Serialize;
+use std::collections::BTreeMap;
 
 use crate::cli::cli_config::cli_args::{
     SelfCmd, SelfJournalArgs, SelfMutateCmd, SelfMutateConfigArgs, SelfReflectArgs,
@@ -7,8 +8,16 @@ use crate::cli::cli_config::cli_args::{
 use crate::cli::cli_config::cli_utils::local_resumable_last_session_id;
 use crate::cli::session::session_continuation::extract_text_content;
 use astra_config::runtime_config::RuntimeConfig;
+use astra_core::observation::SourcePolicy;
+use astra_core::{
+    ObservationBudgetResult, ObservationConfidence, ObservationDataCoverage, ObservationEvidence,
+    ObservationGraphEdge, ObservationGraphEdgeKind, ObservationGraphLayer, ObservationGraphNode,
+    ObservationGraphNodeKind, ObservationGraphSlice, ObservationProviderCoverage,
+    ObservationRecord, ObservationView, Urn,
+};
 use astra_runtime::self_model::ConstraintSet;
 use astra_runtime::tool_registry::ToolRegistry;
+use astra_services::reflect::{ReflectReport, ReflectRequest};
 use astra_services::self_surface::LoadedSelfSurfaceArtifacts;
 use astra_services::session_journal::{self, JournalEvent, JournalEventType};
 use astra_services::session_workspace::{self, WorkspaceMetadata};
@@ -24,21 +33,7 @@ pub(crate) struct IdentityView {
     runtime: &'static str,
 }
 
-#[derive(Debug, Serialize)]
-struct ReflectResponse {
-    session_id: String,
-    focus: String,
-    question: Option<String>,
-    persistence_warning: Option<String>,
-    /// Placeholder: the old liquid-reflection subsystem was removed. The CLI now
-    /// returns a minimal reflection surface so callers can still inspect the
-    /// recent journal turns under the chosen focus.
-    reflection_context: serde_json::Value,
-    prompt_preview: String,
-    recent_turns: Vec<EventPreview>,
-}
-
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct EventPreview {
     event_type: String,
     ts: String,
@@ -85,15 +80,24 @@ pub(crate) async fn execute_self_command(
         }
         SelfCmd::Reflect(SelfReflectArgs {
             session_id,
-            focus,
+            topic,
+            facet,
             question,
             last_n,
         }) => {
+            let request = ReflectRequest::from_observation_params(
+                Some(topic.as_str()),
+                facet.as_deref(),
+                None,
+                None,
+                i32::try_from(*last_n).unwrap_or(i32::MAX),
+                question.as_deref().unwrap_or(""),
+            );
+            let journal_limit = usize::try_from(request.last_n).unwrap_or(20);
             render_reflect_surface_for_session_with_profile(
                 &resolve_target_session_id(session_id.as_deref(), profile).await?,
-                *last_n,
-                Some(focus.as_str()),
-                question.as_deref(),
+                journal_limit,
+                request,
                 profile,
             )
             .await
@@ -209,31 +213,32 @@ pub(crate) async fn render_surface_for_session_with_profile(
 pub(crate) async fn render_reflect_surface_for_session(
     session_id: &str,
     journal_limit: usize,
-    focus: Option<&str>,
+    topic: Option<&str>,
+    facet: Option<&str>,
     question: Option<&str>,
 ) -> Result<String, String> {
-    render_reflect_surface_for_session_with_profile(
-        session_id,
-        journal_limit,
-        focus,
-        question,
+    let request = ReflectRequest::from_observation_params(
+        topic,
+        facet,
         None,
-    )
-    .await
+        None,
+        i32::try_from(journal_limit).unwrap_or(i32::MAX),
+        question.unwrap_or(""),
+    );
+    let bounded_limit = usize::try_from(request.last_n).unwrap_or(20);
+    render_reflect_surface_for_session_with_profile(session_id, bounded_limit, request, None).await
 }
 
 pub(crate) async fn try_render_reflect_surface_for_session_with_profile(
     session_id: &str,
-    journal_limit: usize,
-    focus: Option<&str>,
-    question: Option<&str>,
+    request: ReflectRequest,
     profile: Option<&str>,
 ) -> Result<Option<String>, String> {
+    let bounded_limit = usize::try_from(request.last_n).unwrap_or(20);
     match render_reflect_surface_for_session_with_profile(
         session_id,
-        journal_limit,
-        focus,
-        question,
+        bounded_limit,
+        request,
         profile,
     )
     .await
@@ -252,22 +257,12 @@ fn reflect_surface_missing_state(error: &str) -> bool {
 pub(crate) async fn render_reflect_surface_for_session_with_profile(
     session_id: &str,
     journal_limit: usize,
-    focus: Option<&str>,
-    question: Option<&str>,
+    request: ReflectRequest,
     profile: Option<&str>,
 ) -> Result<String, String> {
     let artifacts = self_surface::load_artifacts(session_id, profile).await?;
-    to_json(
-        &build_reflect_response(
-            &artifacts,
-            journal_limit.max(1),
-            normalize_reflect_focus(focus),
-            question
-                .map(str::trim)
-                .filter(|question| !question.is_empty()),
-        )
-        .await,
-    )
+    let bounded_limit = usize::try_from(request.last_n).unwrap_or(journal_limit.max(1));
+    to_json(&build_reflect_response(&artifacts, bounded_limit, request).await)
 }
 
 pub(crate) fn agent_info_surface_alias(dimension: &str) -> Option<&'static str> {
@@ -374,25 +369,9 @@ async fn resolve_default_session_id(profile: Option<&str>) -> Result<String, Str
 async fn build_reflect_response(
     artifacts: &SessionArtifacts,
     journal_limit: usize,
-    focus: &str,
-    question: Option<&str>,
-) -> ReflectResponse {
-    // The old liquid-reflection subsystem has been removed. Callers now get a
-    // trimmed surface: the session id, the requested focus/question, and a
-    // journal preview filtered by the focus kind. Downstream UIs should read
-    // `recent_turns` directly; `reflection_context` is intentionally minimal.
-    let turns_completed = artifacts
-        .journal_events
-        .iter()
-        .filter_map(|event| event.turn)
-        .max()
-        .or_else(|| {
-            artifacts
-                .restored
-                .as_ref()
-                .map(|restored| restored.turn_count)
-        })
-        .unwrap_or_default();
+    request: ReflectRequest,
+) -> ReflectReport {
+    let analysis_view = request.analysis_view.clone();
     let persistence_warning = artifacts
         .workspace
         .as_ref()
@@ -400,31 +379,286 @@ async fn build_reflect_response(
         .map(str::trim)
         .filter(|error| !error.is_empty())
         .map(|error| format!("session persistence degraded: {error}"));
-    let reflection_context = serde_json::json!({
-        "session_id": artifacts.session_id,
-        "turns_completed": turns_completed,
-        "focus": focus,
-        "question": question,
-        "persistence_warning": persistence_warning.clone(),
-        "note": "liquid-reflection subsystem removed; see recent_turns for journal signals",
-    });
-    let prompt_preview = match question {
-        Some(q) => format!("Focus: {focus}\nQuestion: {q}"),
-        None => format!("Focus: {focus}"),
+    let recent_events = if artifacts.journal_events.is_empty() {
+        restored_recent_turn_previews(artifacts, journal_limit)
+    } else {
+        analysis_view_recent_event_previews(
+            &artifacts.journal_events,
+            journal_limit,
+            &analysis_view,
+        )
     };
-    ReflectResponse {
-        session_id: artifacts.session_id.clone(),
-        focus: focus.to_string(),
-        question: question.map(str::to_string),
-        persistence_warning,
-        reflection_context,
-        prompt_preview,
-        recent_turns: if artifacts.journal_events.is_empty() {
-            restored_recent_turn_previews(artifacts, journal_limit)
-        } else {
-            focused_recent_event_previews(&artifacts.journal_events, journal_limit, focus)
-        },
+    let mut warnings = local_reflect_warnings(&request);
+    if let Some(warning) = persistence_warning {
+        warnings.push(warning);
     }
+    let total_events = if !artifacts.journal_events.is_empty() {
+        artifacts.journal_events.len() as i64
+    } else {
+        recent_events.len() as i64
+    };
+    let mut error_count = 0i64;
+    for event in &recent_events {
+        if event.error.is_some()
+            || event.event_type.contains("error")
+            || event.event_type.contains("stall")
+        {
+            error_count += 1;
+        }
+    }
+    let data_coverage =
+        local_reflect_data_coverage(&request, total_events, warnings.clone(), &recent_events);
+    let summary = if total_events == 0 {
+        "No local session observations are available yet.".to_string()
+    } else if error_count > 0 {
+        format!(
+            "Local session artifacts show {} recent error/stall event{} across {} observed event{}.",
+            error_count,
+            if error_count == 1 { "" } else { "s" },
+            total_events,
+            if total_events == 1 { "" } else { "s" }
+        )
+    } else if data_coverage.overall == "partial" {
+        format!(
+            "Local session artifacts are available with partial provider coverage: {} event{} observed.",
+            total_events,
+            if total_events == 1 { "" } else { "s" }
+        )
+    } else {
+        format!(
+            "Local session artifacts show {} observed event{} with no local errors detected.",
+            total_events,
+            if total_events == 1 { "" } else { "s" }
+        )
+    };
+    let (observations, evidence, graph_slice) =
+        local_reflect_observation_graph(&artifacts.session_id, &request, &summary, &recent_events);
+    let view = ObservationView {
+        topic: request.topic.as_str().to_string(),
+        facet: request.facet.as_str().to_string(),
+        depth: request.depth.as_str().to_string(),
+        horizon: request.horizon.as_str().to_string(),
+        data_coverage: data_coverage.clone(),
+    };
+
+    ReflectReport {
+        schema_version: 1,
+        tool: "reflect".to_string(),
+        session_id: artifacts.session_id.clone(),
+        analysis_view,
+        topic: request.topic.as_str().to_string(),
+        facet: request.facet.as_str().to_string(),
+        depth: request.depth.as_str().to_string(),
+        horizon: request.horizon.as_str().to_string(),
+        source_policy: request.source_policy.as_str().to_string(),
+        include_context: request.include_context,
+        data_coverage,
+        view: Some(view),
+        summary,
+        observations,
+        evidence,
+        action_hints: Vec::new(),
+        failure_clusters: Vec::new(),
+        graph_slice,
+        budget_result: ObservationBudgetResult::default(),
+    }
+}
+
+fn local_reflect_warnings(request: &ReflectRequest) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if matches!(request.horizon.as_str(), "cross_session") {
+        warnings.push(
+            "cross_session horizon is not available from a single local session surface"
+                .to_string(),
+        );
+    }
+    if matches!(request.source_policy, SourcePolicy::CloudOnly) {
+        warnings
+            .push("cloud_only source policy is not available from local CLI artifacts".to_string());
+    }
+    if matches!(request.source_policy, SourcePolicy::LiveOnly) {
+        warnings.push(
+            "live_only source policy is bounded to persisted local turn artifacts in CLI mode"
+                .to_string(),
+        );
+    }
+    if request.include_context {
+        warnings.push(
+            "include_context requested, but local reflect only exposes persisted context summaries"
+                .to_string(),
+        );
+    }
+    warnings
+}
+
+fn local_reflect_data_coverage(
+    request: &ReflectRequest,
+    total_events: i64,
+    warnings: Vec<String>,
+    recent_events: &[EventPreview],
+) -> ObservationDataCoverage {
+    let mut providers = BTreeMap::new();
+    let has_local_journal = recent_events
+        .iter()
+        .any(|event| event_preview_evidence_source(event) == "local_journal");
+    let has_cloud_resume = recent_events
+        .iter()
+        .any(|event| event_preview_evidence_source(event) == "cloud_resume");
+    if has_local_journal || recent_events.is_empty() {
+        providers.insert(
+            "local_journal".to_string(),
+            ObservationProviderCoverage {
+                status: "fresh".to_string(),
+                freshness_ms: None,
+                reason: None,
+            },
+        );
+    }
+    if has_cloud_resume {
+        providers.insert(
+            "cloud_resume".to_string(),
+            ObservationProviderCoverage {
+                status: "fresh".to_string(),
+                freshness_ms: None,
+                reason: None,
+            },
+        );
+    }
+    if matches!(request.source_policy, SourcePolicy::CloudOnly) {
+        providers.insert(
+            "cloud_events".to_string(),
+            ObservationProviderCoverage {
+                status: "unavailable".to_string(),
+                freshness_ms: None,
+                reason: Some("local CLI reflect cannot read cloud-only data directly".to_string()),
+            },
+        );
+    }
+    if request.include_context {
+        providers.insert(
+            "visible_context".to_string(),
+            ObservationProviderCoverage {
+                status: "partial".to_string(),
+                freshness_ms: None,
+                reason: Some("local reflect exposes persisted context summaries only".to_string()),
+            },
+        );
+    }
+
+    ObservationDataCoverage {
+        overall: if warnings.is_empty() {
+            "fresh".to_string()
+        } else {
+            "partial".to_string()
+        },
+        source: "local_session_artifacts".to_string(),
+        events: total_events,
+        decisions: 0,
+        providers,
+        warnings,
+    }
+}
+
+fn local_reflect_observation_graph(
+    session_id: &str,
+    request: &ReflectRequest,
+    summary: &str,
+    recent_events: &[EventPreview],
+) -> (
+    Vec<ObservationRecord>,
+    Vec<ObservationEvidence>,
+    ObservationGraphSlice,
+) {
+    let observation_ref = Urn::new("observation", "local", "reflect")
+        .seg(session_id)
+        .seg(request.topic.as_str())
+        .seg(request.facet.as_str())
+        .build();
+    let mut evidence = Vec::new();
+    let mut nodes = vec![ObservationGraphNode {
+        ref_id: observation_ref.clone(),
+        layer: ObservationGraphLayer::Observation,
+        kind: ObservationGraphNodeKind::Observation,
+        label: "local_reflect_summary".to_string(),
+        summary: Some(summary.to_string()),
+        metadata: Some(serde_json::json!({
+            "topic": request.topic.as_str(),
+            "facet": request.facet.as_str(),
+            "depth": request.depth.as_str(),
+            "horizon": request.horizon.as_str(),
+            "source_policy": request.source_policy.as_str(),
+        })),
+    }];
+    let mut edges = Vec::new();
+    let mut evidence_refs = Vec::new();
+
+    for (idx, event) in recent_events.iter().enumerate() {
+        let event_source = event_preview_evidence_source(event);
+        let event_namespace = event_preview_ref_namespace(event);
+        let event_ref = Urn::new("event", event_namespace, session_id)
+            .idx(idx + 1)
+            .build();
+        let event_summary = event_preview_summary(event);
+        evidence_refs.push(event_ref.clone());
+        evidence.push(ObservationEvidence {
+            ref_id: event_ref.clone(),
+            evidence_class: "observed_evidence".to_string(),
+            source: event_source.to_string(),
+            summary: event_summary.clone(),
+            confidence: ObservationConfidence::evidence(0.80),
+        });
+        nodes.push(ObservationGraphNode {
+            ref_id: event_ref.clone(),
+            layer: ObservationGraphLayer::Runtime,
+            kind: if event.error.is_some() || event.event_type.contains("error") {
+                ObservationGraphNodeKind::Outcome
+            } else {
+                ObservationGraphNodeKind::Event
+            },
+            label: event.event_type.clone(),
+            summary: Some(event_summary),
+            metadata: Some(serde_json::json!({
+                "turn": event.turn,
+                "ts": event.ts,
+                "tools_used": event.tools_used,
+                "source": event_source,
+            })),
+        });
+        edges.push(ObservationGraphEdge {
+            from: observation_ref.clone(),
+            to: event_ref,
+            kind: ObservationGraphEdgeKind::DerivedFrom,
+        });
+    }
+
+    let observation = ObservationRecord {
+        ref_id: observation_ref,
+        topic: request.topic.as_str().to_string(),
+        facet: request.facet.as_str().to_string(),
+        kind: "local_session_summary".to_string(),
+        severity: if recent_events.iter().any(|event| {
+            event.error.is_some()
+                || event.event_type.contains("error")
+                || event.event_type.contains("stall")
+        }) {
+            "warning".to_string()
+        } else {
+            "info".to_string()
+        },
+        summary: summary.to_string(),
+        confidence: ObservationConfidence::classification_evidence(0.75, 0.80),
+        evidence_refs,
+    };
+
+    (
+        vec![observation],
+        evidence,
+        ObservationGraphSlice {
+            nodes,
+            edges,
+            budget_result: ObservationBudgetResult::default(),
+        },
+    )
 }
 
 fn preview_config_mutation(
@@ -578,43 +812,31 @@ fn event_preview(event: &JournalEvent) -> EventPreview {
     }
 }
 
-fn normalize_reflect_focus(focus: Option<&str>) -> &'static str {
-    match focus.unwrap_or("auto").trim().to_ascii_lowercase().as_str() {
-        "skill_failure" => "skill_failure",
-        "unexpected_result" => "unexpected_result",
-        "data_quality" => "data_quality",
-        "tool_surface" => "tool_surface",
-        "history" => "history",
-        "performance" => "performance",
-        _ => "auto",
-    }
-}
-
-fn focused_recent_event_previews(
+fn analysis_view_recent_event_previews(
     events: &[JournalEvent],
     journal_limit: usize,
-    focus: &str,
+    analysis_view: &str,
 ) -> Vec<EventPreview> {
-    let event_types: &[JournalEventType] = match focus {
-        "skill_failure" => &[
+    let event_types: &[JournalEventType] = match analysis_view {
+        "execution_errors" => &[
             JournalEventType::TurnError,
             JournalEventType::Error,
             JournalEventType::StallDetected,
             JournalEventType::VerificationCompleted,
             JournalEventType::Turn,
         ],
-        "performance" => &[
+        "runtime_performance" => &[
             JournalEventType::Turn,
             JournalEventType::TurnError,
             JournalEventType::StallDetected,
             JournalEventType::AdaptivePerTurnApplied,
         ],
-        "tool_surface" => &[
+        "execution_tools" => &[
             JournalEventType::Turn,
             JournalEventType::AdaptiveScenarioApplied,
             JournalEventType::AdaptivePerTurnApplied,
         ],
-        "history" => &[
+        "execution_trace" => &[
             JournalEventType::Turn,
             JournalEventType::TurnError,
             JournalEventType::Error,
@@ -859,7 +1081,6 @@ fn event_type_name(event_type: &JournalEventType) -> String {
         JournalEventType::DelegationSubRunCompleted => "delegation_sub_run_completed",
         JournalEventType::DelegationRetry => "delegation_retry",
         JournalEventType::DelegationCompleted => "delegation_completed",
-        JournalEventType::AdaptiveBaselinePromoted => "adaptive_baseline_promoted",
         JournalEventType::AgentSpawned => "agent_spawned",
         JournalEventType::AgentTerminated => "agent_terminated",
         JournalEventType::VerificationCompleted => "verification_completed",
@@ -878,7 +1099,6 @@ fn event_type_name(event_type: &JournalEventType) -> String {
         JournalEventType::DriftDetected => "drift_detected",
         JournalEventType::AdaptiveScenarioApplied => "adaptive_scenario_applied",
         JournalEventType::AdaptivePerTurnApplied => "adaptive_per_turn_applied",
-        JournalEventType::AdaptiveTuningRuleTriggered => "adaptive_tuning_rule_triggered",
         JournalEventType::InterruptionRecorded => "interruption_recorded",
         JournalEventType::CompactionRetry => "compaction_retry",
         JournalEventType::LlmRound => "llm_round",
@@ -890,6 +1110,7 @@ fn event_type_name(event_type: &JournalEventType) -> String {
         JournalEventType::PipelineCompactionAudit => "pipeline_compaction_audit",
         JournalEventType::Bootstrap => "bootstrap",
         JournalEventType::TraceSpan => "trace_span",
+        JournalEventType::ToolCallError => "tool_call_error",
     }
     .to_string()
 }
@@ -911,6 +1132,37 @@ fn compact_json_value(value: &serde_json::Value) -> String {
     }
 }
 
+fn event_preview_summary(event: &EventPreview) -> String {
+    event
+        .error
+        .as_deref()
+        .or(event.user_input_preview.as_deref())
+        .or(event.assistant_output_preview.as_deref())
+        .map(|detail| format!("{}: {}", event.event_type, truncate(detail, 180)))
+        .unwrap_or_else(|| event.event_type.clone())
+}
+
+fn event_preview_evidence_source(event: &EventPreview) -> &'static str {
+    if event
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("source"))
+        .and_then(serde_json::Value::as_str)
+        == Some("cloud_resume")
+    {
+        "cloud_resume"
+    } else {
+        "local_journal"
+    }
+}
+
+fn event_preview_ref_namespace(event: &EventPreview) -> &'static str {
+    match event_preview_evidence_source(event) {
+        "cloud_resume" => "cloud",
+        _ => "local",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -921,6 +1173,7 @@ mod tests {
     use crate::cli::cli_config::cli_utils::{
         CredentialsFile, Profile, load_credentials, save_credentials,
     };
+    use astra_services::reflect::ReflectRequest;
     use astra_services::self_surface::LoadedSelfSurfaceArtifacts;
     use astra_services::session_journal::{
         self, JournalDirGuard, JournalEvent, JournalEventType, ToolCallRecord,
@@ -1488,7 +1741,8 @@ mod tests {
         let body = execute_self_command(
             &SelfCmd::Reflect(SelfReflectArgs {
                 session_id: Some(session_id.to_string()),
-                focus: "history".to_string(),
+                topic: "execution".to_string(),
+                facet: Some("trace".to_string()),
                 question: None,
                 last_n: 4,
             }),
@@ -1499,15 +1753,87 @@ mod tests {
 
         let value: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(value["session_id"], session_id);
-        assert_eq!(value["reflection_context"]["turns_completed"], 2);
-        let recent_turns = value["recent_turns"].as_array().unwrap();
-        assert_eq!(recent_turns.len(), 1);
-        assert_eq!(recent_turns[0]["metadata"]["source"], "cloud_resume");
-        assert_eq!(recent_turns[0]["user_input_preview"], "check history");
-        assert_eq!(
-            recent_turns[0]["assistant_output_preview"],
-            "history restored"
+        assert!(value.get("reflection_context").is_none());
+        assert!(value.get("recent_turns").is_none());
+        assert_eq!(value["data_coverage"]["events"], 1);
+        assert_eq!(value["data_coverage"]["source"], "local_session_artifacts");
+        let evidence = value["evidence"].as_array().unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0]["source"], "cloud_resume");
+        assert!(
+            evidence[0]["summary"]
+                .as_str()
+                .is_some_and(|summary| summary.contains("check history")),
+            "{value}"
         );
+        assert_eq!(
+            value["data_coverage"]["providers"]["cloud_resume"]["status"],
+            "fresh"
+        );
+        assert!(
+            evidence[0]["ref_id"]
+                .as_str()
+                .is_some_and(|ref_id| ref_id.starts_with("urn:astra:event:cloud:")),
+            "{value}"
+        );
+        assert_eq!(
+            value["graph_slice"]["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|node| node["layer"] == "runtime")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn reflect_marks_local_journal_events_with_local_provenance() {
+        let session_id = "reflect-local-provenance-session";
+        let mut event = astra_services::session_journal::JournalEvent::turn(
+            Some(session_id),
+            1,
+            Some("gpt-5.4"),
+            "inspect local",
+            "local response",
+            1,
+            100,
+            25,
+            300,
+        );
+        event.tools_used = Some(vec!["read_file".to_string()]);
+        let artifacts = LoadedSelfSurfaceArtifacts {
+            session_id: session_id.to_string(),
+            workspace: None,
+            restored: None,
+            journal_events: vec![event],
+            latest_full_context_trace: None,
+        };
+        let request = ReflectRequest::from_observation_params(
+            Some("execution"),
+            Some("trace"),
+            None,
+            None,
+            4,
+            "",
+        );
+
+        let response = build_reflect_response(&artifacts, 4, request).await;
+
+        assert_eq!(
+            response.data_coverage.providers["local_journal"].status,
+            "fresh"
+        );
+        assert_eq!(response.evidence.len(), 1);
+        assert_eq!(response.evidence[0].source, "local_journal");
+        assert!(
+            response.evidence[0]
+                .ref_id
+                .starts_with("urn:astra:event:local:"),
+            "{:?}",
+            response.evidence[0]
+        );
+        assert_eq!(response.observations.len(), 1);
     }
 
     #[tokio::test]
@@ -1524,16 +1850,27 @@ mod tests {
             latest_full_context_trace: None,
         };
 
-        let response = build_reflect_response(&artifacts, 4, "history", None).await;
+        let request = ReflectRequest::from_observation_params(
+            Some("execution"),
+            Some("trace"),
+            None,
+            None,
+            4,
+            "",
+        );
+        let response = build_reflect_response(&artifacts, 4, request).await;
 
-        assert_eq!(
-            response.persistence_warning.as_deref(),
-            Some("session persistence degraded: failed to append turn event")
+        assert!(
+            response
+                .data_coverage
+                .warnings
+                .iter()
+                .any(|warning| warning
+                    == "session persistence degraded: failed to append turn event"),
+            "{:?}",
+            response.data_coverage.warnings
         );
-        assert_eq!(
-            response.reflection_context["persistence_warning"].as_str(),
-            Some("session persistence degraded: failed to append turn event")
-        );
+        assert_eq!(response.data_coverage.overall, "partial");
     }
 
     #[serial_test::serial]

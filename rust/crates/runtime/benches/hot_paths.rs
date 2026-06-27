@@ -66,8 +66,8 @@ fn bench_inject_required_tool_names(c: &mut Criterion) {
             .cloned()
             .unwrap(),
     ];
-    use astra_turn_core::tool_registry_report::ToolSurfaceReport;
-    let report = ToolSurfaceReport {
+    use astra_turn_core::tool_registry_report::ToolSelectionReport;
+    let report = ToolSelectionReport {
         visible_count: surface.len() as u32,
         visible_tools: surface
             .iter()
@@ -121,8 +121,8 @@ fn bench_retain_invoked_tool_schemas(c: &mut Criterion) {
             .cloned()
             .unwrap(),
     ];
-    use astra_turn_core::tool_registry_report::ToolSurfaceReport;
-    let report = ToolSurfaceReport {
+    use astra_turn_core::tool_registry_report::ToolSelectionReport;
+    let report = ToolSelectionReport {
         visible_count: surface.len() as u32,
         visible_tools: surface
             .iter()

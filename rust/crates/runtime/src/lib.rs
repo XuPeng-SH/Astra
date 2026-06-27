@@ -171,10 +171,6 @@ pub use astra_services::{
     jobs::{
         InMemoryJobService, JobRecord, JobService, JobSubmitRequestData, UnconfiguredJobService,
     },
-    learning::{
-        DatabaseLearningFeedbackService, LearningFeedbackRecord, LearningFeedbackRequestData,
-        LearningFeedbackService, UnconfiguredLearningFeedbackService,
-    },
     marketplace::{DatabaseMarketplaceService, MarketplaceService, UnconfiguredMarketplaceService},
     marketplace_stats::{
         DatabaseMarketplaceStatsService, MarketplaceStatsService, NoopMarketplaceStatsService,
@@ -193,10 +189,7 @@ pub use astra_services::{
         TaskLeaseService, UnconfiguredEdgeDispatchService, UnconfiguredEdgeRegistryService,
         UnconfiguredTaskLeaseService,
     },
-    reflect::{
-        DatabaseReflectService, Diagnosis, ReflectReport, ReflectService,
-        UnconfiguredReflectService,
-    },
+    reflect::{DatabaseReflectService, ReflectReport, ReflectService, UnconfiguredReflectService},
     replay::{DatabaseReplayService, ReplayService, UnconfiguredReplayService},
     runs::{
         CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, RunLifecycleService,
@@ -361,7 +354,6 @@ pub use turn::{
 
 pub use astra_config::runtime_config;
 pub use astra_config::user_profile;
-pub use astra_learning::auto_tuning;
 pub use astra_text_utils::semantic_dedup;
 pub use astra_text_utils::text_tokenize;
 pub use astra_turn_core::cloud_session_facts::update_from_journal_event;

@@ -200,7 +200,7 @@ pub(crate) struct HeadlessToolExecutionCtx<'a, E: EdgeToolRoundRow> {
     pub messages: &'a mut Vec<Value>,
     pub tool_results: &'a mut Vec<Value>,
     pub valid_tool_names: &'a HashSet<String>,
-    /// Names listed in this turn's rendered `<deferred_tools>` manifest.
+    /// Names listed in this turn's rendered `<deferred-tools>` manifest.
     /// Used by the validator to differentiate "unknown" denials (truly
     /// hallucinated) from prompt-advertised names whose activation may still
     /// be blocked by runtime binding or fail-closed surface policy. When
@@ -729,6 +729,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deferred_control_plane_tool_reports_activation_not_runtime_missing() {
+        let mut harness = PipelineHarness::new();
+        harness.tool_calls = vec![json!({
+            "id": "call-session",
+            "type": "function",
+            "function": {
+                "name": "session",
+                "arguments": "{}",
+            }
+        })];
+        harness.edge_tool_round.clear();
+        harness.valid_tool_names = HashSet::from(["tool_search".to_string()]);
+        harness.deferred_tool_names = HashSet::from(["session".to_string()]);
+        begin_recorded_turn(&mut harness, 1);
+
+        {
+            let mut pipeline = harness.pipeline();
+            match pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)) {
+                HeadlessPipelineStage::ShortCircuit => {}
+                _ => panic!("direct deferred session call must be rejected before execution"),
+            }
+        }
+
+        let result = harness
+            .tool_results
+            .last()
+            .expect("rejection must append a tool result")
+            .to_string();
+        assert!(
+            result.contains("not available in this turn yet"),
+            "deferred control-plane tool should produce an activation/admission hint, got: {result}"
+        );
+        assert!(
+            !result.contains("required runtime capability is not connected"),
+            "control-plane deferred tools are not executor-gated runtime tools: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_agent_without_executor_still_reports_runtime_missing() {
+        let mut harness = PipelineHarness::new();
+        harness.tool_calls = vec![json!({
+            "id": "call-agent",
+            "type": "function",
+            "function": {
+                "name": "agent",
+                "arguments": r#"{"action":"spawn","prompt":"review"}"#,
+            }
+        })];
+        harness.edge_tool_round.clear();
+        harness.valid_tool_names = HashSet::from(["tool_search".to_string()]);
+        harness.deferred_tool_names = HashSet::from(["agent".to_string()]);
+        begin_recorded_turn(&mut harness, 1);
+
+        {
+            let mut pipeline = harness.pipeline();
+            match pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)) {
+                HeadlessPipelineStage::ShortCircuit => {}
+                _ => panic!("direct deferred agent call must be rejected without executor"),
+            }
+        }
+
+        let result = harness
+            .tool_results
+            .last()
+            .expect("rejection must append a tool result")
+            .to_string();
+        assert!(
+            result.contains("multi-agent runtime is not connected"),
+            "executor-gated agent must still fail closed, got: {result}"
+        );
+    }
+
+    #[tokio::test]
     async fn permit_execution_returns_permitted_execution_for_allowed_tool() {
         let mut harness = PipelineHarness::new();
         let mut pipeline = harness.pipeline();
@@ -750,11 +824,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn permit_execution_without_permission_context_denies() {
+    async fn permit_server_execution_without_permission_context_denies() {
         let mut harness = PipelineHarness::new();
         harness.permission_context = None;
+        harness.tool_calls = vec![json!({
+            "id": "call-grep",
+            "type": "function",
+            "function": {
+                "name": "grep",
+                "arguments": r#"{"pattern":"headless"}"#
+            }
+        })];
+        harness.edge_tool_round.clear();
         let mut pipeline = harness.pipeline();
-        let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::SyntheticEdge(0)) {
+        let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)) {
             HeadlessPipelineStage::Continue(validated) => validated,
             _ => panic!("expected validated execution"),
         };
@@ -773,6 +856,25 @@ mod tests {
             error.contains("no permission context configured"),
             "expected actionable missing-context denial, got {error:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn permit_edge_execution_without_local_permission_context_uses_edge_result() {
+        let mut harness = PipelineHarness::new();
+        harness.permission_context = None;
+        let mut pipeline = harness.pipeline();
+        let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::SyntheticEdge(0)) {
+            HeadlessPipelineStage::Continue(validated) => validated,
+            _ => panic!("expected validated edge execution"),
+        };
+
+        match pipeline.permit_execution(validated).await {
+            HeadlessPipelineStage::Continue(permitted) => {
+                assert_eq!(permitted.execution.name, "grep");
+                assert!(permitted.execution.is_edge_tool);
+            }
+            _ => panic!("edge results with runtime advertisement must not be denied locally"),
+        }
     }
 
     #[tokio::test]
@@ -1612,7 +1714,7 @@ mod tests {
             executed.execution.result_str
         );
         assert!(
-            executed.execution.result_str.contains("start_line"),
+            executed.execution.result_str.contains("offset"),
             "got: {}",
             executed.execution.result_str
         );
@@ -1767,7 +1869,7 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap_or_default();
         assert!(
-            body.contains("called directly")
+            body.contains("requires `tool_search` activation first")
                 && body.contains("select:github")
                 && body.contains("not executed"),
             "direct deferred call must become a non-executing activation hint; got: {body}"

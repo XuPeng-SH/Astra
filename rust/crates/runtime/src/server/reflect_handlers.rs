@@ -2,17 +2,24 @@ use super::*;
 
 #[derive(Deserialize)]
 pub(super) struct ReflectQuery {
-    #[serde(default = "default_reflect_focus")]
-    pub focus: String,
+    #[serde(default)]
+    pub topic: String,
+    #[serde(default)]
+    pub facet: String,
+    #[serde(default)]
+    pub depth: String,
+    #[serde(default)]
+    pub horizon: String,
+    #[serde(default)]
+    pub source_policy: String,
+    #[serde(default)]
+    pub include_context: bool,
     #[serde(default = "default_reflect_last_n")]
     pub last_n: i32,
     #[serde(default)]
     pub question: String,
 }
 
-fn default_reflect_focus() -> String {
-    "auto".into()
-}
 fn default_reflect_last_n() -> i32 {
     20
 }
@@ -24,15 +31,19 @@ pub(super) async fn reflect_session_handler(
     Query(params): Query<ReflectQuery>,
 ) -> Result<Json<ReflectReport>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
+    let request = astra_services::reflect::ReflectRequest::from_observation_params_with_source(
+        non_empty(&params.topic),
+        non_empty(&params.facet),
+        non_empty(&params.depth),
+        non_empty(&params.horizon),
+        non_empty(&params.source_policy),
+        params.include_context,
+        params.last_n,
+        &params.question,
+    );
     state
         .reflect_service
-        .build_evidence(
-            &user.user_id,
-            &session_id,
-            &params.focus,
-            params.last_n,
-            &params.question,
-        )
+        .build_evidence(&user.user_id, &session_id, request)
         .await
         .map(Json)
 }
@@ -44,47 +55,16 @@ pub(super) async fn decision_trace_handler(
     Query(params): Query<ReflectQuery>,
 ) -> Result<Json<ReflectReport>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
+    let request =
+        astra_services::reflect::ReflectRequest::decision_trace(params.last_n, &params.question);
     state
         .reflect_service
-        .build_evidence(
-            &user.user_id,
-            &session_id,
-            "tool_surface",
-            params.last_n,
-            &params.question,
-        )
+        .build_evidence(&user.user_id, &session_id, request)
         .await
         .map(Json)
 }
 
-#[derive(Deserialize)]
-pub(super) struct LearningFeedbackRequest {
-    pub event_id: String,
-    pub satisfaction_score: Option<i64>,
-}
-
-#[derive(Serialize)]
-pub(super) struct LearningFeedbackResponse {
-    pub status: String,
-    pub message: String,
-}
-
-pub(super) async fn learning_feedback_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(request): Json<LearningFeedbackRequest>,
-) -> Result<Json<LearningFeedbackResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let user = state.auth_service.current_user(&headers).await?;
-    let record = state
-        .learning_feedback_service
-        .submit_feedback(LearningFeedbackRequestData {
-            event_id: request.event_id,
-            user_id: user.user_id,
-            satisfaction_score: request.satisfaction_score,
-        })
-        .await?;
-    Ok(Json(LearningFeedbackResponse {
-        status: record.status,
-        message: record.message,
-    }))
+fn non_empty(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then_some(trimmed)
 }

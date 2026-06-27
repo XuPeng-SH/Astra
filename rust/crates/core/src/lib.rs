@@ -373,12 +373,16 @@ mod connection_quota_tests {
 pub mod composite_snapshot;
 pub mod confidence;
 pub mod config;
+pub mod delegation;
 pub mod drift;
 pub mod durable_task_store;
 pub mod error_kind;
+pub mod feedback;
 pub mod log;
 pub mod model_override;
 pub mod net;
+pub mod observation;
+pub mod observation_journal;
 pub mod runtime_limits;
 pub mod tool_schema;
 
@@ -392,6 +396,21 @@ pub use confidence::ConfidenceInterval;
 pub use config::*;
 pub use drift::{DriftCause, DriftEvidence, EvidenceType};
 pub use error_kind::{ClassifiedError, ErrorKind, classify_tool_output};
+pub use observation::{
+    ErrorStreak, EvidenceRef, EvidenceRefError, ObservationActionHint, ObservationBudgetOmitted,
+    ObservationBudgetResult, ObservationConfidence, ObservationDataCoverage, ObservationDepth,
+    ObservationEvidence, ObservationFacet, ObservationFailureCluster, ObservationGraphEdge,
+    ObservationGraphEdgeKind, ObservationGraphLayer, ObservationGraphNode,
+    ObservationGraphNodeKind, ObservationGraphSlice, ObservationHorizon,
+    ObservationProviderCoverage, ObservationRecord, ObservationTopic, ObservationView,
+    SourcePolicy, ToolCallSample, ToolFamily, TurnMetrics, Urn, classify_event_kind,
+    classify_tool_family, normalize_observation_arg, push_graph_edge, push_graph_node,
+    truncate_graph_summary, urn_component,
+};
+pub use observation_journal::{
+    JournalEntry, JournalFacts, MetricTrend, ObservationJournal, StrategyVerification,
+    render_compact_status,
+};
 pub use runtime_limits::RuntimeLimits;
 #[cfg(any(test, feature = "dev-defaults"))]
 pub use runtime_limits::{DEV_MATRIXONE_PASSWORD, warn_default_credentials_once};

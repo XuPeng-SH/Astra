@@ -733,6 +733,29 @@ mod tests {
     }
 
     #[test]
+    fn server_executed_surfaces_advertise_server_reflect_tool() {
+        let caps = full_server_capabilities_for_tests();
+        let web = names(server_runtime_tool_schemas(&caps));
+        let remote = names(cli_remote_tool_schemas(Vec::new(), &caps));
+        let local = names(cli_local_tool_schemas(
+            astra_tools::schemas::all_tool_schemas(),
+            Vec::new(),
+            &caps,
+        ));
+
+        for (surface, names) in [("web", web), ("remote", remote)] {
+            assert!(
+                names.contains(&"reflect".to_string()),
+                "{surface} must expose server-side reflect over persisted/cloud observation data: {names:?}"
+            );
+        }
+        assert!(
+            local.contains(&"reflect".to_string()),
+            "local CLI must also retain reflect so it can use local/session artifacts: {local:?}"
+        );
+    }
+
+    #[test]
     fn server_lifecycle_capabilities() {
         use astra_turn_core::capability::Capability;
 

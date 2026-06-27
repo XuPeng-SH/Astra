@@ -139,6 +139,8 @@ pub struct ServerToolExecutor {
     task_manager: Arc<TaskManager>,
     /// Memoria client for memory operations.
     memoria_client: astra_tools::memoria::MemoriaClient,
+    /// Reflect service for persisted server/cloud observation evidence.
+    reflect_service: Arc<dyn astra_services::ReflectService>,
     /// Optional shared pool for context-manifest side events.
     pub(super) context_manifest_pool: Option<SharedPool>,
     /// Budget-adaptive introspection snapshot, updated each turn by the
@@ -297,6 +299,7 @@ impl ServerToolExecutor {
             journal_turn_index: AtomicU32::new(0),
             aggregate_output_bytes: AtomicUsize::new(0),
             memoria_client,
+            reflect_service: Arc::new(astra_services::UnconfiguredReflectService),
             approval_gate: None,
             ask_user_gate: None,
             progress_callback: None,
@@ -342,6 +345,14 @@ impl ServerToolExecutor {
     /// so that multiple executors share the same disabled_tools set.
     pub fn with_tool_execution_service(mut self, service: ToolExecutionService) -> Self {
         self.tool_execution_service = service;
+        self
+    }
+
+    pub fn with_reflect_service(
+        mut self,
+        service: Arc<dyn astra_services::ReflectService>,
+    ) -> Self {
+        self.reflect_service = service;
         self
     }
 
@@ -1723,9 +1734,9 @@ mod tests {
 
         assert!(!result.is_error, "{result:?}");
         assert!(
-            result
-                .output
-                .contains("No introspection data available yet"),
+            result.output.contains("## Session Health")
+                && result.output.contains("Pressure: 0%")
+                && result.output.contains("Cache: 0%"),
             "{result:?}"
         );
         assert!(
@@ -1735,6 +1746,30 @@ mod tests {
                 .is_some_and(|metadata| metadata.contains_key("runtime_environment")),
             "ToolEngine introspect results should still receive execution metadata"
         );
+    }
+
+    #[tokio::test]
+    async fn introspect_json_executes_from_tool_engine_without_snapshot() {
+        let (exec, _dir) = test_executor();
+        let result = exec
+            .execute_with_metadata(
+                "introspect",
+                &json!({"format": "json", "facet": "execution/errors"}),
+            )
+            .await;
+
+        assert!(!result.is_error, "{result:?}");
+        let parsed: Value = serde_json::from_str(&result.output).unwrap_or_else(|error| {
+            panic!("introspect json must parse: {error}; {}", result.output)
+        });
+        assert_eq!(parsed["view"]["topic"], "execution");
+        assert_eq!(parsed["view"]["facet"], "errors");
+        assert!(
+            parsed["summary"]
+                .as_str()
+                .is_some_and(|summary| !summary.is_empty())
+        );
+        assert!(parsed["observations"].as_array().is_some());
     }
 
     #[tokio::test]
@@ -2273,6 +2308,140 @@ esac
             None,
         );
         (exec, dir)
+    }
+
+    #[derive(Default)]
+    struct RecordingReflectService {
+        calls: StdMutex<Vec<(String, String, astra_services::reflect::ReflectRequest)>>,
+    }
+
+    #[async_trait]
+    impl astra_services::ReflectService for RecordingReflectService {
+        async fn build_evidence(
+            &self,
+            user_id: &str,
+            session_id: &str,
+            request: astra_services::reflect::ReflectRequest,
+        ) -> astra_services::reflect::ServiceResult<astra_services::ReflectReport> {
+            self.calls.lock().unwrap().push((
+                user_id.to_string(),
+                session_id.to_string(),
+                request.clone(),
+            ));
+            let data_coverage = astra_core::ObservationDataCoverage {
+                overall: "fresh".to_string(),
+                source: "server_db".to_string(),
+                events: 7,
+                decisions: 2,
+                providers: Default::default(),
+                warnings: vec![],
+            };
+            Ok(astra_services::ReflectReport {
+                schema_version: 1,
+                tool: "reflect".to_string(),
+                session_id: session_id.to_string(),
+                analysis_view: request.analysis_view.clone(),
+                topic: request.topic.to_string(),
+                facet: request.facet.to_string(),
+                depth: request.depth.as_str().to_string(),
+                horizon: request.horizon.as_str().to_string(),
+                source_policy: request.source_policy.as_str().to_string(),
+                include_context: request.include_context,
+                data_coverage,
+                view: None,
+                summary: "fake server/cloud reflect report".to_string(),
+                observations: vec![],
+                evidence: vec![],
+                action_hints: vec![],
+                failure_clusters: vec![],
+                graph_slice: Default::default(),
+                budget_result: Default::default(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn reflect_executes_from_server_tool_engine_with_cloud_service() {
+        let (exec, _dir) = test_executor();
+        let service = Arc::new(RecordingReflectService::default());
+        let service_for_executor: Arc<dyn astra_services::ReflectService> = service.clone();
+        let exec = exec.with_reflect_service(service_for_executor);
+        assert!(
+            exec.tool_engine.contains("reflect"),
+            "reflect should be registered in ToolEngine for server/cloud observation analysis"
+        );
+
+        let result = exec
+            .execute_with_metadata(
+                "reflect",
+                &json!({
+                    "topic": "execution",
+                    "facet": "errors",
+                    "depth": "forensic",
+                    "horizon": "session",
+                    "source_policy": "cloud_only",
+                    "include_context": true,
+                    "last_n": 250,
+                    "question": "why did the command fail?"
+                }),
+            )
+            .await;
+
+        assert!(!result.is_error, "{result:?}");
+        let value: Value = serde_json::from_str(&result.output).expect("reflect JSON");
+        assert_eq!(value["tool"], "reflect");
+        assert_eq!(value["session_id"], "test-session");
+        assert_eq!(value["topic"], "execution");
+        assert_eq!(value["facet"], "errors");
+        assert_eq!(value["depth"], "forensic");
+        assert_eq!(value["source_policy"], "cloud_only");
+        assert_eq!(value["include_context"], true);
+        assert_eq!(value["summary"], "fake server/cloud reflect report");
+
+        let calls = service.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "test-user");
+        assert_eq!(calls[0].1, "test-session");
+        assert_eq!(calls[0].2.topic, astra_core::ObservationTopic::Execution);
+        assert_eq!(calls[0].2.facet, astra_core::ObservationFacet::Errors);
+        assert_eq!(
+            calls[0].2.last_n, 100,
+            "tool path must enforce schema budget"
+        );
+        assert_eq!(calls[0].2.question, "why did the command fail?");
+    }
+
+    #[tokio::test]
+    async fn reflect_without_configured_service_returns_structured_unavailable() {
+        let (exec, _dir) = test_executor();
+        let result = exec
+            .execute_with_metadata(
+                "reflect",
+                &json!({
+                    "topic": "runtime",
+                    "facet": "errors",
+                    "last_n": -5
+                }),
+            )
+            .await;
+
+        assert!(result.is_error, "{result:?}");
+        let value: Value = serde_json::from_str(&result.output).expect("reflect error JSON");
+        assert_eq!(value["tool"], "reflect");
+        assert_eq!(value["status"], "reflect_unavailable");
+        assert_eq!(value["session_id"], "test-session");
+        assert_eq!(value["topic"], "runtime");
+        assert_eq!(value["facet"], "errors");
+        assert_eq!(
+            value["last_n"], 1,
+            "tool path must clamp invalid evidence budgets"
+        );
+        assert!(
+            value["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("reflect service not configured")),
+            "{value}"
+        );
     }
 
     #[test]
@@ -4847,13 +5016,13 @@ esac
     }
 
     #[tokio::test]
-    async fn read_file_respects_start_and_end_line() {
+    async fn read_file_respects_offset_and_limit() {
         let (exec, dir) = test_executor();
         std::fs::write(dir.path().join("f.txt"), "a\nb\nc\nd\ne\n").unwrap();
         let result = exec
             .execute(
                 "read_file",
-                &json!({"path": "f.txt", "start_line": 2, "end_line": 4}),
+                &json!({"path": "f.txt", "offset": 2, "limit": 3}),
             )
             .await;
         assert!(!result.contains("1\ta"));
@@ -4892,7 +5061,7 @@ esac
         std::fs::write(dir.path().join("big.txt"), &large).unwrap();
         let result = exec.execute("read_file", &json!({"path": "big.txt"})).await;
         assert!(result.contains("Large file preview"), "got: {result}");
-        assert!(result.contains("start_line"), "got: {result}");
+        assert!(result.contains("offset"), "got: {result}");
     }
 
     #[tokio::test]
@@ -7897,9 +8066,6 @@ esac
                     compressed_turns: vec![],
                     user_corrections: vec![],
                     context_traces: vec![],
-                    drift_min_severity_threshold: 0.5,
-                    drift_analysis_window: 5,
-                    last_reported_drift_turn: None,
                     last_query_at: None,
                 },
             },

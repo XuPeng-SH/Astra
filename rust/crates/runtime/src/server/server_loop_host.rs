@@ -820,7 +820,7 @@ pub struct ServerAgenticLoopHost {
     capabilities: astra_turn_core::capability::CapabilitySet,
     edge_profile: Map<String, Value>,
     valid_tools: HashSet<String>,
-    /// Names from this turn's rendered `<deferred_tools>` manifest after
+    /// Names from this turn's rendered `<deferred-tools>` manifest after
     /// removing tools that are already visible in the final wire `tools[]`.
     /// This mirrors what the model was told, even if a runtime binding later
     /// makes some names non-activatable.
@@ -2303,7 +2303,7 @@ impl ServerAgenticLoopHost {
                     if let Some(executor) = self.current_server_tool_executor.as_ref() {
                         executor.record_direct_deferred_call_activation(&name);
                     }
-                    astra_turn_core::tool::deferred_activation::direct_deferred_call_activated_message(
+                    astra_turn_core::tool::deferred_activation::direct_deferred_call_activation_message(
                         &name,
                     )
                 }
@@ -2869,7 +2869,7 @@ impl ServerAgenticLoopHost {
     /// 4. boost rescue
     /// 5. activated-deferred-tool rescue
     ///
-    /// `consume_widen` controls whether the `widen_surface_pending` flag is
+    /// `consume_widen` controls whether the `widen_selection_pending` flag is
     /// consumed (authoritative path: main turn / test helper) or merely
     /// peeked (preview path: pre-turn summary, which must not steal the flag
     /// from the main turn that follows it). This is the only legitimate
@@ -2885,7 +2885,7 @@ impl ServerAgenticLoopHost {
         // 1. Consume or peek the widen flag. Soft health diagnostics are not
         // promoted into the hard restricted-tool set.
         if consume_widen {
-            let _ = std::mem::take(&mut state.widen_surface_pending);
+            let _ = std::mem::take(&mut state.widen_selection_pending);
         }
         // 2-5. layered restrictions from the merged base.
         let mut effective = state.restricted_tools.clone();
@@ -3528,7 +3528,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             &final_system_prompt_breakdown,
             state.last_llm_context_manifest_trace.as_ref(),
         );
-        state.always_load_tool_schema_tokens = estimate_tool_schema_tokens(&final_tools);
+        state.pinned_tool_schema_tokens = estimate_tool_schema_tokens(&final_tools);
         state.last_turn_policy =
             TurnInteractionPolicy::from_tool_schemas(self.turn_interaction_mode(), &final_tools);
 
@@ -4993,16 +4993,16 @@ mod tests {
 
     fn deferred_manifest_edge_profile(names: &[&str], model: &str) -> Map<String, Value> {
         let mut edge_profile = Map::new();
-        let tools_xml = names
+        let tools_list = names
             .iter()
             .filter(|name| !name.trim().is_empty())
-            .map(|name| format!("<tool><name>{}</name></tool>", name.trim()))
+            .map(|name| name.trim())
             .collect::<Vec<_>>()
-            .join("");
+            .join("\n");
         edge_profile.insert(
             astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT
                 .to_string(),
-            Value::String(format!("<deferred_tools>{tools_xml}</deferred_tools>")),
+            Value::String(format!("<deferred-tools>\n{tools_list}\n</deferred-tools>")),
         );
         edge_profile.insert(
             astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW
@@ -5052,6 +5052,20 @@ mod tests {
             .map(message_text)
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn deferred_block_body_text(text: &str) -> &str {
+        let open = "<deferred-tools>";
+        let close = "</deferred-tools>";
+        let body_start = text
+            .find(open)
+            .map(|idx| idx + open.len())
+            .unwrap_or_else(|| panic!("missing deferred tools block in {text}"));
+        let body_end = text[body_start..]
+            .find(close)
+            .map(|idx| body_start + idx)
+            .unwrap_or_else(|| panic!("unterminated deferred tools block in {text}"));
+        &text[body_start..body_end]
     }
 
     #[test]
@@ -5536,7 +5550,7 @@ mod tests {
             .expect("server context pipeline should assemble without deferred metadata");
         let text = pipeline_outcome_text(&outcome);
         assert!(
-            !text.contains("<deferred_tools>"),
+            !text.contains("<deferred-tools>"),
             "prompt must not advertise deferred tools that activation/search will reject: {text}"
         );
     }
@@ -5667,7 +5681,7 @@ mod tests {
         let text = pipeline_outcome_text(&outcome);
 
         assert!(
-            text.contains("<deferred_tools>") && text.contains("github"),
+            text.contains("<deferred-tools>") && text.contains("github"),
             "server prompt must include the same deferred manifest that validator/tool_search consume: {text}"
         );
     }
@@ -5807,12 +5821,13 @@ mod tests {
             .expect("server context pipeline should assemble without a partial deferred manifest");
         let text = pipeline_outcome_text(&outcome);
         assert!(
-            text.contains("<deferred_tools>") && text.contains("<name>github</name>"),
+            text.contains("<deferred-tools>") && text.contains("github"),
             "prompt must keep the still-activatable deferred tool: {text}"
         );
+        let deferred_body = deferred_block_body_text(&text);
         assert!(
-            !text.contains("<name>bash</name>"),
-            "prompt must filter names that are already visible in tools[]: {text}"
+            !deferred_body.lines().any(|line| line.trim() == "bash"),
+            "prompt must filter names that are already visible in tools[]: {deferred_body}"
         );
     }
 
@@ -5861,7 +5876,7 @@ mod tests {
             .expect("server context pipeline should assemble without unavailable deferred tools");
         let text = pipeline_outcome_text(&outcome);
         assert!(
-            !text.contains("<deferred_tools>"),
+            !text.contains("<deferred-tools>"),
             "prompt must not advertise a deferred tool whose runtime binding is absent: {text}"
         );
 
@@ -5992,11 +6007,11 @@ mod tests {
             .expect("server context pipeline should assemble with runtime-bound deferred subset");
         let text = pipeline_outcome_text(&outcome);
         assert!(
-            text.contains("<deferred_tools>") && text.contains("<name>github</name>"),
+            text.contains("<deferred-tools>") && text.contains("github"),
             "prompt must keep the still-bound deferred tool: {text}"
         );
         assert!(
-            !text.contains("<name>agent_fanout</name>"),
+            !text.contains("agent_fanout"),
             "prompt must filter deferred tools without a runtime binding: {text}"
         );
 
@@ -6008,15 +6023,11 @@ mod tests {
             })])
             .await;
         assert_eq!(direct_results.len(), 1);
+        assert_eq!(direct_results[0].status, "failed");
         assert!(
-            direct_results[0]
-                .output
-                .contains("full schema has not been loaded yet")
-                && direct_results[0].output.contains("select:github")
-                && direct_results[0]
-                    .output
-                    .contains("The arguments from this attempt were not executed"),
-            "direct call to deferred-only github must recover as activation without executing guessed args: {:?}",
+            direct_results[0].output.contains("select:github")
+                && direct_results[0].output.contains("not executed"),
+            "direct call to deferred-only github must return a non-executing activation hint: {:?}",
             direct_results[0]
         );
         assert_eq!(
@@ -7535,13 +7546,25 @@ mod tests {
             turn_budget_hint_emitted_50: false,
             turn_budget_hint_emitted_20: false,
             agentic_turn_budget: TaskExecutionProfile::default().agentic_turn_budget,
+            budget_policy: astra_config::runtime_config::RuntimeConfig::load()
+                .budget_policy
+                .map(|cfg| {
+                    use crate::turn::runtime_policy::RuntimePolicy;
+                    RuntimePolicy {
+                        expand_after_consecutive_outcomes: cfg.expand_after_consecutive_outcomes,
+                        expand_factor: cfg.expand_factor,
+                        max_ceiling: cfg.max_ceiling,
+                        reflect_after_consecutive_zero: cfg.reflect_after_consecutive_zero,
+                    }
+                }),
+            policy_expanded_this_turn: false,
             current_round_index: 0,
             llm_rounds_completed: 0,
             last_request_message_count: None,
             turn_guard: TurnGuard::new(),
             restricted_tools: HashSet::new(),
             boosted_tools: HashSet::new(),
-            widen_surface_pending: false,
+            widen_selection_pending: false,
             step_recorder: StepRecorder::new("test-user", "test-session", "test-task"),
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(0.75),
@@ -7565,6 +7588,7 @@ mod tests {
                 astra_turn_core::pipeline_config::PipelineConfig::default(),
             )),
             message: "test query".to_string(),
+            has_prior_assistant_turn: false,
             recent_tools: Vec::new(),
             task_profile: TaskExecutionProfile::default(),
             last_turn_policy: crate::turn::agentic_loop::host::TurnInteractionPolicy::default(),
@@ -7583,7 +7607,7 @@ mod tests {
             last_measured_prompt_tokens: None,
             consecutive_context_window_errors: 0,
             compaction_effectiveness: Default::default(),
-            always_load_tool_schema_tokens: 0,
+            pinned_tool_schema_tokens: 0,
             sticky_tool_schemas: Vec::new(),
             max_turn_input_tokens: 0,
             budget_wrapup_injected: false,
@@ -7597,6 +7621,7 @@ mod tests {
             permission_handler: None,
             tactical_adapter: None,
             step_signal_collector: None,
+            tool_budget_override: None,
             recent_tactical_actions: Vec::new(),
             server_tool_executor: None,
             interruption: None,
@@ -7613,6 +7638,7 @@ mod tests {
             bridge_user_query_event_id: None,
             turn_event_buffer: None,
             harness: crate::turn::harness_adapter::HarnessSlot::empty(),
+            observation_journal: Default::default(),
         }
     }
 

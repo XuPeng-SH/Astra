@@ -28,7 +28,7 @@ pub const DEFAULT_TOOL_SCHEMA_BUDGET_TOKENS: u32 = 800;
 mod tests {
     use super::*;
     use astra_turn_core::tool::schema::tool_schema_name;
-    use astra_turn_core::tool_registry_report::ToolSurfaceReport;
+    use astra_turn_core::tool_registry_report::ToolSelectionReport;
     use serde_json::Value;
     use serde_json::json;
 
@@ -71,7 +71,8 @@ mod tests {
             .iter()
             .map(String::as_str)
             .collect();
-        // Runtime default catalog core — file, edit, search, git, memory, and activation.
+        // Runtime default catalog core — file, edit, search, git, memory,
+        // observation, and activation.
         assert!(always_load.contains(&"bash"));
         assert!(always_load.contains(&"read_file"));
         assert!(always_load.contains(&"str_replace"));
@@ -93,9 +94,11 @@ mod tests {
             "consolidated git tool must be always_load — git ops appear in most coding turns"
         );
         assert!(
-            !always_load.contains(&"web_fetch")
-                && !always_load.contains(&"session")
-                && !always_load.contains(&"introspect"),
+            always_load.contains(&"introspect") && always_load.contains(&"reflect"),
+            "observation tools must be always_load — recovery/debug entrypoints cannot require deferred discovery"
+        );
+        assert!(
+            !always_load.contains(&"web_fetch") && !always_load.contains(&"session"),
             "runtime-deferred tools must not stay catalog-always_load"
         );
     }
@@ -322,13 +325,13 @@ mod tests {
     }
 
     #[test]
-    fn reflect_query_leaves_introspect_deferred() {
+    fn observation_tools_are_visible_without_deferred_activation() {
         let registry = ToolRegistry::new(mock_schemas());
         let selected = registry.build_initial_surface("为什么上次选错了工具?");
         let names = ToolRegistry::visible_names(&selected);
         assert!(
-            !names.contains(&"introspect".to_string()),
-            "introspect should stay deferred until explicit activation, got: {:?}",
+            names.contains(&"introspect".to_string()) && names.contains(&"reflect".to_string()),
+            "observation tools should be always visible for recovery/debug use, got: {:?}",
             names
         );
     }
@@ -435,7 +438,7 @@ mod tests {
 
     #[test]
     fn feedback_perfect_precision() {
-        let report = ToolSurfaceReport {
+        let report = ToolSelectionReport {
             visible_tools: vec!["bash".into(), "github".into()],
             visible_count: 2,
             schema_budget_used: 50,
@@ -454,7 +457,7 @@ mod tests {
 
     #[test]
     fn feedback_no_tools_used() {
-        let report = ToolSurfaceReport {
+        let report = ToolSelectionReport {
             visible_tools: vec!["bash".into(), "github".into()],
             visible_count: 2,
             schema_budget_used: 50,
@@ -473,7 +476,7 @@ mod tests {
 
     #[test]
     fn feedback_tool_not_visible() {
-        let report = ToolSurfaceReport {
+        let report = ToolSelectionReport {
             visible_tools: vec!["bash".into()],
             visible_count: 1,
             schema_budget_used: 30,

@@ -998,7 +998,7 @@ pub struct ToolExecutor {
         std::sync::Arc<std::sync::RwLock<Option<astra_turn_core::introspect::IntrospectSnapshot>>>,
     /// Session-memory observatory shared with
     /// [`MemoryExtractionService`] and the compaction path. `None` in
-    /// tests and offline modes — `introspect subtopic=session_memory`
+    /// tests and offline modes — `introspect facet=session_memory`
     /// then renders a short placeholder telling the model the
     /// observatory isn't wired rather than silently returning empty.
     session_memory_observatory:
@@ -1419,7 +1419,7 @@ impl ToolExecutor {
         .clear();
     }
 
-    /// Snapshot of the names that the model's `<deferred_tools>` manifest
+    /// Snapshot of the names that the model's `<deferred-tools>` manifest
     /// currently advertises. Used by the host to keep its validator-side
     /// `deferred_tool_names` set in lockstep with what the prompt rendered.
     pub fn current_activatable_tool_names_snapshot(&self) -> HashSet<String> {
@@ -1596,7 +1596,7 @@ impl ToolExecutor {
         let can_select = surface.activatable_contains(name);
         use astra_turn_core::tool::deferred_activation::{
             DirectDeferredCallAdmission, classify_direct_deferred_call,
-            direct_deferred_call_activated_message, tool_not_admitted_message,
+            direct_deferred_call_activation_message, tool_not_admitted_message,
         };
 
         match classify_direct_deferred_call(name, can_select, |tool_name| {
@@ -1606,7 +1606,7 @@ impl ToolExecutor {
                 name: activated_name,
             } => {
                 // Direct deferred call: the model called a tool advertised in
-                // `<deferred_tools>` without first selecting it via
+                // `<deferred-tools>` without first selecting it via
                 // `tool_search(select:NAME)`. Treat as activation intent —
                 // record the name so the next turn's `tools[]` includes the
                 // full schema, then ask the model to retry. Do NOT execute:
@@ -1619,7 +1619,7 @@ impl ToolExecutor {
                     &mut guard,
                     [activated_name.clone()],
                 );
-                return Some(EdgeToolRun::error(direct_deferred_call_activated_message(
+                return Some(EdgeToolRun::error(direct_deferred_call_activation_message(
                     &activated_name,
                 )));
             }
@@ -1734,7 +1734,7 @@ impl ToolExecutor {
     }
 
     /// Attach the shared session-memory observatory so
-    /// `introspect subtopic=session_memory` can read the rings. Callers
+    /// `introspect facet=session_memory` can read the rings. Callers
     /// supply the same `Arc` they gave to `MemoryExtractionService`.
     pub fn with_session_memory_observatory(
         mut self,
@@ -1884,7 +1884,7 @@ impl ToolExecutor {
         let mut clean_args = args.clone();
         if let Some(obj) = clean_args.as_object_mut() {
             obj.remove("action");
-            // Inject the active session id so focus hints and session-scoped
+            // Inject the active session id so memory targets and session-scoped
             // recalls work. CLI does not own a user_id — leave it to the
             // cloud proxy / Memoria server to fill in via the bearer token.
             if let Some(sid) = self.active_session_id().filter(|sid| !sid.is_empty()) {
@@ -3467,24 +3467,17 @@ impl ToolExecutor {
             return self.capability_info_json().to_string();
         }
 
-        // `subtopic` routes to a specialized diagnostic. Default behavior
-        // (session health: token pressure, tool health, alerts) remains
-        // unchanged when `subtopic` is missing, empty, or "session".
-        let subtopic = args
-            .get("subtopic")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        if subtopic == "cache" {
-            return self.handle_introspect_cache();
-        }
+        let request = astra_turn_core::introspect::IntrospectRequest::from_args(args);
 
-        let detail_arg = args
-            .get("detail")
-            .and_then(Value::as_str)
-            .unwrap_or("summary");
-        let detail = astra_turn_core::introspect::IntrospectDetail::from_arg(detail_arg);
+        if !request.format.is_json() && request.source_policy.allows_edge_local_artifacts() {
+            match request.facet {
+                astra_core::ObservationFacet::Cache => return self.handle_introspect_cache(),
+                astra_core::ObservationFacet::SessionMemory => {
+                    return self.render_session_memory_introspect();
+                }
+                _ => {}
+            }
+        }
 
         let snapshot = self
             .introspect_snapshot
@@ -3518,38 +3511,10 @@ impl ToolExecutor {
             snap.current_round = s.turn_number;
         }
 
-        // Task #46: three new subtopics for fine-grained runtime
-        // self-awareness. All read from `IntrospectSnapshot`, which the
-        // runtime populates every turn — no disk I/O required.
-        match subtopic.as_str() {
-            "recent" | "recent_rounds" | "rounds" => {
-                return astra_turn_core::introspect::render_recent_rounds(&snap);
-            }
-            "volatile" | "volatile_pending" | "pending" => {
-                return astra_turn_core::introspect::render_volatile_pending(&snap);
-            }
-            "stall" | "stall_state" | "loop_guard" => {
-                return astra_turn_core::introspect::render_stall_state(&snap);
-            }
-            "noise" | "injection" | "injections" | "freshness" => {
-                return astra_turn_core::introspect::render_injection_freshness(&snap);
-            }
-            "session_memory" | "session-memory" | "memory" | "extraction" | "extractions" => {
-                return self.render_session_memory_introspect();
-            }
-            "errors" | "tool_errors" | "failures" => {
-                return astra_turn_core::introspect::render_errors(&snap);
-            }
-            "all" => {
-                return astra_turn_core::introspect::render_all(&snap);
-            }
-            _ => {}
-        }
-
-        astra_turn_core::introspect::render_introspect(&snap, detail)
+        astra_turn_core::introspect::render_introspect_request(&snap, &request)
     }
 
-    /// Render `introspect subtopic=session_memory`. Answers the
+    /// Render `introspect facet=session_memory`. Answers the
     /// recurring question "what did astra extract this session, and
     /// what did the last compaction inject?" without dumping enough
     /// content to pressure context.
@@ -3995,7 +3960,7 @@ impl ToolExecutor {
         }
     }
 
-    /// `introspect(subtopic="cache")` — scan recent `llm_capture_*.json`
+    /// `introspect(facet="cache")` — scan recent `llm_capture_*.json`
     /// files for the current session and run the four cache-diagnosis
     /// rules over them. Returns a markdown report.
     ///
@@ -4498,25 +4463,73 @@ impl ToolExecutor {
                 "compress_context" => self.compress_context(args),
                 "get_agent_info" => self.get_agent_info(args).await,
                 "reflect" => {
-                    let focus = args.get("focus").and_then(|v| v.as_str()).unwrap_or("auto");
+                    let topic = args
+                        .get("topic")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty());
+                    let facet = args
+                        .get("facet")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty());
+                    let depth = args
+                        .get("depth")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty());
+                    let horizon = args
+                        .get("horizon")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty());
+                    let source_policy = args
+                        .get("source_policy")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty());
+                    let include_context = args
+                        .get("include_context")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
                     let question = args.get("question").and_then(|v| v.as_str()).unwrap_or("");
-                    let last_n = args.get("last_n").and_then(|v| v.as_i64()).unwrap_or(20);
+                    let last_n = args
+                        .get("last_n")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(20)
+                        .clamp(1, 100) as i32;
+                    let request =
+                        astra_services::reflect::ReflectRequest::from_observation_params_with_source(
+                            topic,
+                            facet,
+                            depth,
+                            horizon,
+                            source_policy,
+                            include_context,
+                            last_n,
+                            question,
+                        );
                     if let Some(session_id) = self.active_session_id().filter(|id| !id.is_empty()) {
-                        let limit = usize::try_from(last_n.max(1)).unwrap_or(20);
-                        match crate::cli::self_command::render_reflect_surface_for_session(
+                        let limit = usize::try_from(request.last_n).unwrap_or(20);
+                        match crate::cli::self_command::render_reflect_surface_for_session_with_profile(
                             &session_id,
                             limit,
-                            Some(focus),
-                            Some(question),
+                            request.clone(),
+                            None,
                         )
                         .await
                         {
                             Ok(surface) => surface,
                             Err(error) => serde_json::json!({
                                 "status": "reflect_unavailable",
-                                "focus": focus,
-                                "question": question,
-                                "last_n": last_n,
+                                "topic": request.topic,
+                                "facet": request.facet,
+                                "depth": request.depth,
+                                "horizon": request.horizon,
+                                "source_policy": request.source_policy,
+                                "include_context": request.include_context,
+                                "question": request.question,
+                                "last_n": request.last_n,
                                 "error": error,
                             })
                             .to_string(),
@@ -4524,9 +4537,14 @@ impl ToolExecutor {
                     } else {
                         serde_json::json!({
                         "status": "reflect_requires_session",
-                        "focus": focus,
-                        "question": question,
-                        "last_n": last_n,
+                        "topic": request.topic,
+                        "facet": request.facet,
+                        "depth": request.depth,
+                        "horizon": request.horizon,
+                        "source_policy": request.source_policy,
+                        "include_context": request.include_context,
+                        "question": request.question,
+                        "last_n": request.last_n,
                         "note": "Reflect data comes from the server API. Use /reflect command for direct access."
                     }).to_string()
                     }
@@ -6196,77 +6214,80 @@ mod tests {
             serde_json::json!({"type": "function", "function": {"name": "bash"}}),
             serde_json::json!({"type": "function", "function": {"name": "tool_search"}}),
         ]);
-        executor.set_current_activatable_tool_names(HashSet::from(["memory".to_string()]));
+        executor.set_current_activatable_tool_names(HashSet::from(["session".to_string()]));
 
         let before = executor
             .execute(
-                "memory",
-                &serde_json::json!({"action": "remember", "content": "do not write"}),
+                "session",
+                &serde_json::json!({"action": "sleep", "seconds": 1}),
             )
             .await;
         assert!(
-            before.contains("called directly")
-                && before.contains("select:memory")
+            before.contains("tool_search")
+                && before.contains("select:session")
                 && before.contains("not executed"),
             "direct deferred call must become a non-executing activation hint; got: {before}"
         );
         assert_eq!(
             executor.activated_deferred_tool_names(),
-            vec!["memory".to_string()],
+            vec!["session".to_string()],
             "direct deferred call must record activation for the next schema-selection round"
         );
 
         let search = executor
             .execute(
                 "tool_search",
-                &serde_json::json!({"query": "select:memory"}),
+                &serde_json::json!({"query": "select:session"}),
             )
             .await;
         let parsed = parse_tool_search_output(&search);
-        assert_eq!(tool_search_match_names(&parsed), vec!["memory".to_string()]);
+        assert_eq!(
+            tool_search_match_names(&parsed),
+            vec!["session".to_string()]
+        );
         assert!(tool_search_string_array(&parsed, "missing").is_empty());
         assert_eq!(
             executor.activated_deferred_tool_names(),
-            vec!["memory".to_string()]
+            vec!["session".to_string()]
         );
 
-        let after = executor.execute("memory", &serde_json::json!({})).await;
+        let after = executor.execute("session", &serde_json::json!({})).await;
         assert!(
-            after.contains("called directly")
-                && after.contains("select:memory")
+            after.contains("tool_search")
+                && after.contains("select:session")
                 && after.contains("not executed"),
             "activation state alone must not bypass current tools[] visibility; got: {after}"
         );
         assert_eq!(
             executor.activated_deferred_tool_names_for_schema_injection(),
-            vec!["memory".to_string()],
+            vec!["session".to_string()],
             "schema assembly should surface the selected deferred tool"
         );
         assert_eq!(
             executor.activated_deferred_tool_names(),
-            vec!["memory".to_string()],
+            vec!["session".to_string()],
             "schema assembly must not consume activation before the tool is called"
         );
         assert_eq!(
             executor.activated_deferred_tool_names_for_schema_injection(),
-            vec!["memory".to_string()],
+            vec!["session".to_string()],
             "repeated schema assembly must keep the selected tool available"
         );
         assert_eq!(
             executor.activated_deferred_tool_names(),
-            vec!["memory".to_string()],
+            vec!["session".to_string()],
             "activation must remain pending until the tool is actually called"
         );
 
         executor.set_current_visible_tool_schemas(&[
             serde_json::json!({"type": "function", "function": {"name": "bash"}}),
             serde_json::json!({"type": "function", "function": {"name": "tool_search"}}),
-            serde_json::json!({"type": "function", "function": {"name": "memory"}}),
+            serde_json::json!({"type": "function", "function": {"name": "session"}}),
         ]);
         executor.set_current_activatable_tool_names(HashSet::new());
-        let injected = executor.execute("memory", &serde_json::json!({})).await;
+        let injected = executor.execute("session", &serde_json::json!({})).await;
         assert!(
-            injected.contains("missing required"),
+            injected.contains("Missing required parameter: action"),
             "visible schema must allow the real executor path; got: {injected}"
         );
         assert_eq!(
@@ -6899,7 +6920,7 @@ mod tests {
     #[test]
     fn introspect_returns_structured_output_on_first_turn() {
         let executor = test_executor();
-        let out = executor.handle_introspect(&serde_json::json!({"detail": "summary"}));
+        let out = executor.handle_introspect(&serde_json::json!({"depth": "summary"}));
         assert!(
             out.contains("Session Health"),
             "expected structured output, got: {out}"
@@ -6911,14 +6932,56 @@ mod tests {
     }
 
     #[test]
-    fn introspect_minimal_first_turn_has_metrics_not_placeholder() {
+    fn introspect_hint_first_turn_has_metrics_not_placeholder() {
         let executor = test_executor();
-        let out = executor.handle_introspect(&serde_json::json!({"detail": "minimal"}));
+        let out = executor.handle_introspect(&serde_json::json!({"depth": "hint"}));
         assert!(
             out.contains("pressure=") && out.contains("turns="),
-            "expected minimal metrics line, got: {out}"
+            "expected hint metrics line, got: {out}"
         );
         assert!(!out.contains("first turn"));
+    }
+
+    #[test]
+    fn introspect_json_session_memory_reports_structured_data_coverage() {
+        let executor = test_executor();
+        let out = executor.handle_introspect(&serde_json::json!({
+            "facet": "session_memory",
+            "format": "json"
+        }));
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|error| {
+            panic!("expected structured json introspect output: {error}; {out}")
+        });
+
+        assert_eq!(parsed["schema_version"], 1);
+        assert_eq!(parsed["tool"], "introspect");
+        assert_eq!(parsed["facet"], "session_memory");
+        assert_eq!(parsed["data_coverage"], parsed["view"]["data_coverage"]);
+        assert_eq!(parsed["view"]["facet"], "session_memory");
+        assert_eq!(
+            parsed["view"]["data_coverage"]["source"],
+            "edge_local_artifacts_unavailable"
+        );
+        assert_eq!(parsed["view"]["data_coverage"]["events"], 0);
+        assert!(
+            parsed["observations"]
+                .as_array()
+                .is_some_and(|observations| observations.iter().any(|observation| {
+                    observation["kind"].as_str() == Some("data_surface_unavailable")
+                })),
+            "expected data-surface observation, got: {parsed}"
+        );
+        assert!(
+            parsed
+                .get("evidence")
+                .and_then(serde_json::Value::as_array)
+                .is_none_or(|evidence| evidence.is_empty()),
+            "unavailable edge-only JSON must not expose unrelated runtime evidence: {parsed}"
+        );
+        assert!(
+            !out.contains("No observatory attached"),
+            "json mode must not return legacy session_memory text: {out}"
+        );
     }
 
     #[test]
@@ -6926,7 +6989,7 @@ mod tests {
         let executor = test_executor();
         executor.set_current_model("deepseek-v4-pro-official(thinking:high)");
 
-        let out = executor.handle_introspect(&serde_json::json!({"detail": "minimal"}));
+        let out = executor.handle_introspect(&serde_json::json!({"depth": "hint"}));
 
         assert!(
             out.contains("model=deepseek-v4-pro-official(thinking:high)"),
@@ -6947,7 +7010,7 @@ mod tests {
             lifecycle_summary: "resume pending: [plan-resume] goal=\"Fix auth\"".to_string(),
             ..Default::default()
         });
-        let out = executor.handle_introspect(&serde_json::json!({"detail": "summary"}));
+        let out = executor.handle_introspect(&serde_json::json!({"depth": "summary"}));
         assert!(out.contains("Turns: 5/15"), "got: {out}");
         assert!(out.contains("12345in"), "got: {out}");
         assert!(out.contains("resume pending"), "got: {out}");
@@ -6978,13 +7041,13 @@ mod tests {
     }
 
     #[test]
-    fn introspect_subtopic_cache_routes_to_cache_diagnosis() {
+    fn introspect_cache_facet_routes_to_cache_diagnosis() {
         let executor = test_executor();
         // No session set → renderer explains the "no data" path.
-        let out = executor.handle_introspect(&serde_json::json!({"subtopic": "cache"}));
+        let out = executor.handle_introspect(&serde_json::json!({"facet": "cache"}));
         assert!(
             out.contains("Cache Diagnosis"),
-            "subtopic=cache must produce the cache section, got: {out}",
+            "facet=cache must produce the cache section, got: {out}",
         );
         assert!(
             out.contains("No per-round cache snapshots"),
@@ -6993,20 +7056,40 @@ mod tests {
     }
 
     #[test]
-    fn introspect_subtopic_session_is_default_behavior() {
-        // Without subtopic the tool still shows Session Health unchanged.
+    fn introspect_cache_cloud_only_does_not_read_edge_artifacts() {
         let executor = test_executor();
-        let out = executor.handle_introspect(&serde_json::json!({"detail": "summary"}));
+        let out = executor.handle_introspect(&serde_json::json!({
+            "facet": "cache",
+            "source_policy": "cloud_only",
+        }));
+
         assert!(
-            out.contains("Session Health"),
-            "default subtopic must preserve legacy output, got: {out}",
+            !out.contains("Cache Diagnosis"),
+            "cloud_only must not route to local cache diagnosis: {out}"
+        );
+        assert!(
+            out.contains("Introspect Unavailable")
+                && out.contains("source_policy=cloud_only")
+                && out.contains("requested source_policy does not allow CLI/Edge-local artifacts"),
+            "cloud_only cache request should report unavailable local coverage: {out}"
         );
     }
 
     #[test]
-    fn introspect_subtopic_cache_is_case_insensitive() {
+    fn introspect_depth_summary_session_is_default_behavior() {
+        // Without facet the tool still shows Session Health unchanged.
         let executor = test_executor();
-        let out = executor.handle_introspect(&serde_json::json!({"subtopic": "Cache"}));
+        let out = executor.handle_introspect(&serde_json::json!({"depth": "summary"}));
+        assert!(
+            out.contains("Session Health"),
+            "default facet must preserve session output, got: {out}",
+        );
+    }
+
+    #[test]
+    fn introspect_cache_facet_is_case_insensitive() {
+        let executor = test_executor();
+        let out = executor.handle_introspect(&serde_json::json!({"facet": "Cache"}));
         assert!(out.contains("Cache Diagnosis"), "got: {out}");
     }
 
@@ -7585,7 +7668,7 @@ mod tests {
         );
     }
 
-    // ── introspect subtopic=session_memory (unhappy first) ────────────
+    // ── introspect facet=session_memory (unhappy first) ───────────────
 
     fn attach_empty_observatory(
         executor: ToolExecutor,
@@ -7607,7 +7690,7 @@ mod tests {
         // a short, honest placeholder rather than silently empty so the
         // model knows the tool works but isn't wired.
         let executor = test_executor();
-        let out = executor.handle_introspect(&serde_json::json!({"subtopic": "session_memory"}));
+        let out = executor.handle_introspect(&serde_json::json!({"facet": "session_memory"}));
         assert!(
             out.contains("No observatory attached"),
             "expected placeholder, got: {out}"
@@ -7650,7 +7733,7 @@ mod tests {
         writer.append(&turn_error).unwrap();
 
         let executor = test_executor().with_active_session_id(session_id);
-        let out = executor.handle_introspect(&serde_json::json!({"subtopic": "session_memory"}));
+        let out = executor.handle_introspect(&serde_json::json!({"facet": "session_memory"}));
         assert!(out.contains("source: local_journal"), "{out}");
         assert!(out.contains("session_end: missing"), "{out}");
         assert!(out.contains("errored reason=llm_error"), "{out}");
@@ -7690,7 +7773,7 @@ mod tests {
             .unwrap();
 
         let executor = test_executor().with_active_session_id(session_id);
-        let out = executor.handle_introspect(&serde_json::json!({"subtopic": "session_memory"}));
+        let out = executor.handle_introspect(&serde_json::json!({"facet": "session_memory"}));
         assert!(out.contains("extracted source=rule_fallback"), "{out}");
         assert!(out.contains("llm_reason=llm_error"), "{out}");
         assert!(
@@ -7733,7 +7816,7 @@ mod tests {
             .unwrap();
 
         let executor = test_executor().with_active_session_id(session_id);
-        let out = executor.handle_introspect(&serde_json::json!({"subtopic": "session_memory"}));
+        let out = executor.handle_introspect(&serde_json::json!({"facet": "session_memory"}));
         assert!(out.contains("## turn-pipeline session memory"), "{out}");
         assert!(
             out.contains(
@@ -7754,7 +7837,7 @@ mod tests {
         .unwrap();
 
         let executor = test_executor().with_active_session_id(session_id);
-        let out = executor.handle_introspect(&serde_json::json!({"subtopic": "session_memory"}));
+        let out = executor.handle_introspect(&serde_json::json!({"facet": "session_memory"}));
         assert!(out.contains("journal unavailable:"), "{out}");
         assert!(
             out.contains("failed to read session journal for sess-introspect-unreadable"),
@@ -7766,7 +7849,7 @@ mod tests {
     #[test]
     fn introspect_session_memory_empty_rings_renders_cleanly() {
         let (executor, _obs) = attach_empty_observatory(test_executor());
-        let out = executor.handle_introspect(&serde_json::json!({"subtopic": "session_memory"}));
+        let out = executor.handle_introspect(&serde_json::json!({"facet": "session_memory"}));
         assert!(out.contains("extractions_ring: 0"));
         assert!(out.contains("injections_ring: 0"));
         assert!(out.contains("(none recorded this session)"));
@@ -7825,7 +7908,7 @@ mod tests {
             narrative_sections_kept: vec!["Task Specification".into()],
         });
 
-        let out = executor.handle_introspect(&serde_json::json!({"subtopic": "session_memory"}));
+        let out = executor.handle_introspect(&serde_json::json!({"facet": "session_memory"}));
         // Extraction line
         assert!(
             out.contains("t3 GrowthGate persisted(Llm,bytes=1234,attempt=2)"),
@@ -7899,7 +7982,7 @@ mod tests {
                 narrative_sections_kept: vec![],
             });
         }
-        let out = executor.handle_introspect(&serde_json::json!({"subtopic": "session_memory"}));
+        let out = executor.handle_introspect(&serde_json::json!({"facet": "session_memory"}));
         assert!(
             out.len() < 8_000,
             "introspect output must stay bounded; got {} bytes",

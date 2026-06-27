@@ -9,13 +9,10 @@ use astra_services::session_workspace::{
 };
 use serde::{Deserialize, Serialize};
 
-use astra_config::runtime_config::RuntimeConfig;
 use astra_config::user_profile::{Scenario, UserProfile, UserProfileManager, UserProfileStore};
-use astra_learning::auto_tuning::{
-    AutoTuningEngine, DelegationOutcomeTracker, FeedbackSignal, SignalType,
-};
+use astra_core::delegation::DelegationOutcomeTracker;
+use astra_core::feedback::{FeedbackSignal, FeedbackSignalStore, SignalType};
 use astra_turn_core::context_assembly_trace::ContextAssemblyTrace;
-use astra_turn_core::decision_explainer::{DriftDetector, FocusDriftAnalysis};
 
 use super::types::*;
 
@@ -23,8 +20,8 @@ pub struct ObservabilityHub {
     /// User profile manager.
     profile_manager: UserProfileManager,
 
-    /// Auto-tuning engine.
-    tuning_engine: AutoTuningEngine,
+    /// Feedback signal store for observation and SelfModel inputs.
+    feedback_signals: FeedbackSignalStore,
 
     /// Delegation outcome tracker for coordination auto-select.
     delegation_outcomes: DelegationOutcomeTracker,
@@ -48,7 +45,7 @@ impl ObservabilityHub {
         let profile_store = Arc::new(UserProfileStore::new());
         Self {
             profile_manager: UserProfileManager::new(profile_store),
-            tuning_engine: AutoTuningEngine::new(),
+            feedback_signals: FeedbackSignalStore::new(),
             delegation_outcomes: DelegationOutcomeTracker::new(),
             sessions: RwLock::new(HashMap::new()),
             low_confidence_tools: Mutex::new(Vec::new()),
@@ -64,12 +61,12 @@ impl ObservabilityHub {
         }
 
         let profile_path = observability_storage_file(&storage_root, "profiles.json");
-        let tuning_path = observability_storage_file(&storage_root, "feedback-aggregator.json");
+        let feedback_path = observability_storage_file(&storage_root, "feedback-signals.json");
         let outcomes_path = observability_storage_file(&storage_root, "delegation-outcomes.json");
         let profile_store = Arc::new(UserProfileStore::with_storage(profile_path));
         Self {
             profile_manager: UserProfileManager::new(profile_store),
-            tuning_engine: AutoTuningEngine::with_storage(tuning_path),
+            feedback_signals: FeedbackSignalStore::with_storage(feedback_path),
             delegation_outcomes: DelegationOutcomeTracker::with_storage(outcomes_path),
             sessions: RwLock::new(HashMap::new()),
             low_confidence_tools: Mutex::new(Vec::new()),
@@ -125,18 +122,15 @@ impl ObservabilityHub {
 
     // ─── Feedback Recording ─────────────────────────────────────────────────
 
-    /// Record a feedback signal for auto-tuning.
+    /// Record a feedback signal for observation and SelfModel inputs.
     pub fn record_feedback(&self, signal: FeedbackSignal) {
-        self.tuning_engine.record_feedback(signal);
+        self.feedback_signals.record(signal);
     }
 
     /// Record a batch of streaming speculative tool execution metrics.
     ///
-    /// Forwards the cumulative counters into the
-    /// [`astra_learning::auto_tuning::AutoTuningEngine`] so that speculation
-    /// hit rate can be tracked across a session and used to auto-gate
-    /// `ASTRA_STREAMING_TOOL_EXEC` via
-    /// [`AutoTuningEngine::should_disable_streaming_speculation`].
+    /// Forwards the cumulative counters into the feedback signal store so that
+    /// speculation hit rate can be observed across a session.
     ///
     /// Also emits a structured `tracing::info!` event on target
     /// `astra::streaming_speculation::metrics` for downstream log consumers.
@@ -144,7 +138,7 @@ impl ObservabilityHub {
         &self,
         metrics: &astra_turn_core::streaming_tool_exec::StreamingSpeculationMetrics,
     ) {
-        self.tuning_engine.record_streaming_speculation(
+        self.feedback_signals.record_streaming_speculation(
             metrics.started,
             metrics.hit,
             metrics.discarded,
@@ -219,7 +213,13 @@ impl ObservabilityHub {
     pub fn record_delegation_outcome(&self, scenario: &str, pattern: &str, succeeded: bool) {
         self.delegation_outcomes
             .record(scenario, pattern, succeeded);
-        self.delegation_outcomes.persist();
+        if let Err(err) = self.delegation_outcomes.persist() {
+            tracing::warn!(
+                target: "astra.observability",
+                error = %err,
+                "delegation_outcomes persist failed"
+            );
+        }
     }
 
     /// Get the historically preferred coordination pattern for a scenario.
@@ -230,32 +230,12 @@ impl ObservabilityHub {
         scenario: &str,
         min_observations: u32,
     ) -> Option<String> {
-        self.delegation_outcomes
-            .preferred_pattern(scenario, min_observations)
-    }
-
-    // ─── Auto-Tuning Cycle ──────────────────────────────────────────────────
-
-    /// Run one auto-tuning cycle and return executed rules.
-    pub fn run_tuning_cycle(&self, config: &mut RuntimeConfig) -> Vec<String> {
-        let executions = self.tuning_engine.run_cycle(config);
-
-        // Persist aggregator state after tuning cycle.
-        if !executions.is_empty() {
-            self.tuning_engine.persist();
-        }
-
-        executions.into_iter().map(|e| e.rule_id).collect()
-    }
-
-    /// Check and execute rollbacks.
-    pub fn check_rollbacks(&self, config: &mut RuntimeConfig) -> Vec<String> {
-        let rollbacks = self.tuning_engine.check_rollbacks(config);
-        // Persist aggregator after rollbacks too (state may have changed).
-        if !rollbacks.is_empty() {
-            self.tuning_engine.persist();
-        }
-        rollbacks
+        let stats = self.delegation_outcomes.stats_for_scenario(scenario);
+        stats
+            .iter()
+            .filter(|(_, s)| s.total() >= min_observations)
+            .max_by(|(_, a), (_, b)| a.success_rate().partial_cmp(&b.success_rate()).unwrap())
+            .map(|(pattern, _)| pattern.clone())
     }
 
     // ─── Query Observation ──────────────────────────────────────────────────
@@ -296,9 +276,14 @@ impl ObservabilityHub {
             .unwrap_or_default()
     }
 
-    /// Get the auto-tuning engine.
-    pub fn tuning(&self) -> &AutoTuningEngine {
-        &self.tuning_engine
+    /// Return retained feedback signals from oldest to newest.
+    pub fn recent_feedback_signals(&self) -> Vec<FeedbackSignal> {
+        self.feedback_signals.recent_signals()
+    }
+
+    /// Flush buffered feedback signals to persistent storage.
+    pub fn flush_feedback(&self) -> std::io::Result<()> {
+        self.feedback_signals.flush()
     }
 
     /// Get the profile manager.
@@ -308,9 +293,6 @@ impl ObservabilityHub {
 }
 
 fn observability_storage_file(root: &std::path::Path, filename: &str) -> std::path::PathBuf {
-    if root.extension().is_some() {
-        return root.to_path_buf();
-    }
     root.join(filename)
 }
 
@@ -523,44 +505,57 @@ pub fn on_tool_executed(hub: &ObservabilityHub, user_id: &str, tool_name: &str) 
 }
 
 /// Hook called at turn end.
-pub fn on_turn_end(hub: &ObservabilityHub, session: &mut ObservabilitySession, timing: TurnTiming) {
-    let detected_at_turn = timing.turn;
+pub fn on_turn_end(
+    _hub: &ObservabilityHub,
+    session: &mut ObservabilitySession,
+    timing: TurnTiming,
+) {
     session.record_turn_timing(timing);
 
-    if let Some(analysis) = session.take_new_drift_signal(detected_at_turn) {
-        let attribution = session_signal_attribution(session);
-        hub.record_feedback(
-            with_signal_attribution(
-                FeedbackSignal::new(SignalType::FocusDrift),
-                Some(&attribution),
-            )
-            .with_context(
-                "drift_detected_at_turn",
-                serde_json::json!(detected_at_turn),
-            )
-            .with_context(
-                "drift_turn",
-                serde_json::json!(analysis.drift_turn.unwrap_or(detected_at_turn)),
-            )
-            .with_context("drift_severity", serde_json::json!(analysis.drift_severity))
-            .with_context(
-                "drift_cause",
-                serde_json::json!(analysis.likely_cause.clone()),
-            )
-            .with_context("evidence_count", serde_json::json!(analysis.evidence.len())),
-        );
-
-        if let Ok(writer) = JournalWriter::new(&session.session_id) {
-            let _ = writer.append(&JournalEvent::drift_detected(
-                Some(&session.session_id),
-                detected_at_turn,
-                analysis.drift_severity,
-                analysis.likely_cause,
-                analysis.evidence,
-                &analysis.recovery_suggestion,
-            ));
-        }
-    }
+    // Drift detection: System A (stall.rs detect_intent_drift) handles hot-path correction.
+    // System B observability drift removed — duplicate signal path, zero integration.
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn with_storage_persists_feedback_signals_across_hub_restart() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let hub = ObservabilityHub::with_storage(dir.path().to_path_buf());
+        hub.record_feedback(FeedbackSignal::new(SignalType::Correction).with_turn("turn-1"));
+        // Batch persist defers writes every BATCH_PERSIST_INTERVAL signals;
+        // flush before dropping so the signal is visible on reload.
+        hub.flush_feedback().expect("flush feedback signals");
+        drop(hub);
+
+        let reloaded = ObservabilityHub::with_storage(dir.path().to_path_buf());
+        let signals = reloaded.recent_feedback_signals();
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(signals[0].signal_type, SignalType::Correction);
+        assert!(
+            dir.path().join("feedback-signals.json").exists(),
+            "feedback signals must be stored beside the other observation-plane files"
+        );
+    }
+
+    #[test]
+    fn observability_storage_files_are_isolated_under_root_directory() {
+        let root = std::path::PathBuf::from("/tmp/observability.json");
+
+        assert_eq!(
+            observability_storage_file(&root, "profiles.json"),
+            root.join("profiles.json")
+        );
+        assert_ne!(
+            observability_storage_file(&root, "profiles.json"),
+            observability_storage_file(&root, "feedback-signals.json"),
+            "profile and feedback stores must never share the same JSON file"
+        );
+    }
+}
