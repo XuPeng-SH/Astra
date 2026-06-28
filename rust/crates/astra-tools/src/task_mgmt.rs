@@ -1986,6 +1986,115 @@ impl TaskManager {
         self.store.load(&self.sid()).await
     }
 
+    /// Build a compact task context string for injection into the agent's
+    /// prompt via the standard `plan_resume_hint` → `ExternalSources.plan_context`
+    /// pipeline. Returns `None` when the task board is empty.
+    ///
+    /// Unlike the old CLI-layer hack that read UI snapshots and polluted
+    /// `append_system_prompt`, this lives at the data layer (TaskManager),
+    /// reads from the durable store, and flows through the context pipeline's
+    /// proper token accounting.
+    pub async fn build_active_task_context(&self) -> Option<String> {
+        fn compact_title(title: &str) -> String {
+            const MAX_CHARS: usize = 120;
+            if title.chars().count() <= MAX_CHARS {
+                return title.to_string();
+            }
+            let mut out: String = title.chars().take(MAX_CHARS.saturating_sub(1)).collect();
+            out.push('…');
+            out
+        }
+
+        fn compact_titles(titles: &[&str]) -> String {
+            const MAX_TITLES: usize = 6;
+            let mut rendered: Vec<String> = titles
+                .iter()
+                .take(MAX_TITLES)
+                .map(|title| compact_title(title))
+                .collect();
+            if titles.len() > MAX_TITLES {
+                rendered.push(format!("+{} more", titles.len() - MAX_TITLES));
+            }
+            rendered.join(", ")
+        }
+
+        let tasks = match self.load_tasks().await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    session_id = %self.sid(),
+                    "build_active_task_context: failed to load tasks, returning None"
+                );
+                return None;
+            }
+        };
+        if tasks.is_empty() {
+            return None;
+        }
+
+        let in_progress: Vec<&str> = tasks
+            .iter()
+            .filter(|t| t.status == SessionTaskStatusKind::InProgress)
+            .map(|t| t.title.as_str())
+            .collect();
+        let pending: Vec<&str> = tasks
+            .iter()
+            .filter(|t| t.status == SessionTaskStatusKind::Pending)
+            .map(|t| t.title.as_str())
+            .collect();
+        let paused: Vec<&str> = tasks
+            .iter()
+            .filter(|t| t.status == SessionTaskStatusKind::Paused)
+            .map(|t| t.title.as_str())
+            .collect();
+
+        if in_progress.is_empty() && pending.is_empty() && paused.is_empty() {
+            return None;
+        }
+
+        let mut hint = String::from("## Active Task Board\n");
+        if let Some(task) = in_progress.first() {
+            hint.push_str(&format!("- 🔄 In progress: {}\n", compact_title(task)));
+        }
+        if in_progress.len() > 1 {
+            hint.push_str(&format!(
+                "- 🔄 Also in progress ({}): {}\n",
+                in_progress.len() - 1,
+                compact_titles(&in_progress[1..])
+            ));
+        }
+        if !pending.is_empty() {
+            hint.push_str(&format!(
+                "- ⏳ Pending ({}): {}\n",
+                pending.len(),
+                compact_titles(&pending)
+            ));
+        }
+        if !paused.is_empty() {
+            hint.push_str(&format!(
+                "- ⏸ Paused ({}): {}\n",
+                paused.len(),
+                compact_titles(&paused)
+            ));
+        }
+        if in_progress.is_empty() && !pending.is_empty() {
+            hint.push_str(&format!(
+                "Focus on the first pending task: {}\n",
+                compact_title(pending[0])
+            ));
+        } else if in_progress.is_empty() && !paused.is_empty() {
+            hint.push_str(&format!(
+                "Resume or reprioritize the first paused task: {}\n",
+                compact_title(paused[0])
+            ));
+        } else if !in_progress.is_empty() {
+            hint.push_str("Focus on completing the in-progress task before starting new work.\n");
+        }
+
+        Some(hint)
+    }
+
     /// Load open-work tasks and surface backend errors to callers that need
     /// completion-critical task-board state.
     pub async fn load_active_tasks(&self) -> Result<Vec<SessionTask>, String> {
@@ -6595,6 +6704,128 @@ mod tests {
         assert!(
             open_task.blocked_by.is_empty(),
             "bulk archive should unblock open dependents: {open_task:?}"
+        );
+    }
+
+    // ── build_active_task_context ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn build_active_task_context_empty_board_returns_none() {
+        let m = mgr();
+        assert!(m.build_active_task_context().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn build_active_task_context_shows_in_progress_task() {
+        let m = mgr();
+        m.create(&json!({"title": "Refactor DB layer", "active_form": "refactoring"}))
+            .await;
+        let tasks = m.load_active_tasks().await.unwrap();
+        let task_id = &tasks[0].id;
+        set_task_status_fixture(&m, task_id, SessionTaskStatusKind::InProgress).await;
+
+        let ctx = m.build_active_task_context().await.unwrap();
+        assert!(ctx.contains("## Active Task Board"), "{ctx}");
+        assert!(ctx.contains("🔄 In progress: Refactor DB layer"), "{ctx}");
+        assert!(ctx.contains("Focus on completing the in-progress"), "{ctx}");
+    }
+
+    #[tokio::test]
+    async fn build_active_task_context_bounds_many_in_progress_tasks() {
+        let m = mgr();
+        for idx in 0..10 {
+            m.create(&json!({"title": format!("Long-running in-progress task {idx}")}))
+                .await;
+        }
+        let tasks = m.load_active_tasks().await.unwrap();
+        for task in &tasks {
+            set_task_status_fixture(&m, &task.id, SessionTaskStatusKind::InProgress).await;
+        }
+
+        let ctx = m.build_active_task_context().await.unwrap();
+        assert_eq!(
+            ctx.matches("Also in progress").count(),
+            1,
+            "many in-progress tasks should be summarized, not rendered as unbounded rows: {ctx}"
+        );
+        assert!(ctx.contains("Also in progress (9):"), "{ctx}");
+        assert!(ctx.contains("+3 more"), "{ctx}");
+        assert!(
+            !ctx.contains("Long-running in-progress task 9"),
+            "summary must be bounded to the first additional titles: {ctx}"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_active_task_context_shows_pending_tasks() {
+        let m = mgr();
+        m.create(&json!({"title": "Add tests", "active_form": "testing"}))
+            .await;
+        m.create(&json!({"title": "Update docs", "active_form": "docs"}))
+            .await;
+
+        let ctx = m.build_active_task_context().await.unwrap();
+        assert!(ctx.contains("## Active Task Board"), "{ctx}");
+        assert!(ctx.contains("⏳ Pending (2):"), "{ctx}");
+        assert!(
+            ctx.contains("Add tests") && ctx.contains("Update docs"),
+            "{ctx}"
+        );
+        assert!(ctx.contains("Focus on the first pending"), "{ctx}");
+    }
+
+    #[tokio::test]
+    async fn build_active_task_context_includes_paused_open_work() {
+        let m = mgr();
+        m.create(
+            &json!({"title": "Investigate flaky resume loop", "active_form": "investigating"}),
+        )
+        .await;
+        let tasks = m.load_active_tasks().await.unwrap();
+        set_task_status_fixture(&m, &tasks[0].id, SessionTaskStatusKind::Paused).await;
+
+        let ctx = m.build_active_task_context().await.unwrap();
+        assert!(
+            ctx.contains("⏸ Paused (1): Investigate flaky resume loop"),
+            "{ctx}"
+        );
+        assert!(
+            ctx.contains("Resume or reprioritize the first paused task"),
+            "{ctx}"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_active_task_context_mixed_in_progress_and_pending() {
+        let m = mgr();
+        m.create(&json!({"title": "Fix bug", "active_form": "fixing"}))
+            .await;
+        m.create(&json!({"title": "Add feature", "active_form": "adding"}))
+            .await;
+        let tasks = m.load_active_tasks().await.unwrap();
+        set_task_status_fixture(&m, &tasks[0].id, SessionTaskStatusKind::InProgress).await;
+
+        let ctx = m.build_active_task_context().await.unwrap();
+        assert!(ctx.contains("🔄 In progress: Fix bug"), "{ctx}");
+        assert!(ctx.contains("⏳ Pending (1): Add feature"), "{ctx}");
+        // in_progress takes priority for focus message
+        assert!(ctx.contains("Focus on completing the in-progress"), "{ctx}");
+    }
+
+    #[tokio::test]
+    async fn build_active_task_context_skips_non_active_statuses() {
+        let m = mgr();
+        m.create(&json!({"title": "Done task", "active_form": "done"}))
+            .await;
+        m.create(&json!({"title": "Failed task", "active_form": "failing"}))
+            .await;
+        let tasks = m.load_active_tasks().await.unwrap();
+        set_task_status_fixture(&m, &tasks[0].id, SessionTaskStatusKind::Completed).await;
+        set_task_status_fixture(&m, &tasks[1].id, SessionTaskStatusKind::Failed).await;
+
+        assert!(
+            m.build_active_task_context().await.is_none(),
+            "completed and failed tasks should not appear in active context"
         );
     }
 }

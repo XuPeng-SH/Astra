@@ -121,7 +121,7 @@ pub(crate) fn record_loop_completion_feedback(
     }
 
     // ── 2. Token usage signal ──
-    let total_tokens = state.total_prompt + state.total_completion;
+    let total_tokens = state.provider_total_tokens();
     // Heuristic threshold: >50k tokens suggests inefficiency for most tasks.
     let token_threshold = 50_000u64;
     if total_tokens > token_threshold {
@@ -246,10 +246,10 @@ pub(crate) fn record_loop_completion_feedback(
     }
 
     // ── 8. Tool health signals ──
-    // Emit signals for health avoidance tools so observation/SelfModel can react.
+    // Emit signals for retry-cautioned tools so observation/SelfModel can react.
     {
-        let avoidance_advised = state.turn_guard.health.health_avoidance_tools();
-        for tool_name in avoidance_advised {
+        let retry_cautioned = state.turn_guard.health.health_avoidance_tools();
+        for tool_name in retry_cautioned {
             hub.record_feedback(enrich_signal(
                 FeedbackSignal::new(SignalType::ToolHealthAvoidance {
                     tool_name: tool_name.to_string(),

@@ -187,6 +187,15 @@ pub(crate) async fn inject_polled_deferred_user_inputs<H: AgenticLoopHost>(
     Ok(())
 }
 
+pub(crate) fn turn_result_tokens_consumed(turn_result: &HostTurnResult) -> u64 {
+    turn_result
+        .accum
+        .prompt_tokens
+        .saturating_add(turn_result.accum.completion_tokens)
+        .saturating_add(turn_result.accum.cache_read_tokens)
+        .saturating_add(turn_result.accum.cache_creation_tokens)
+}
+
 /// Record an `llm_round` event for an early-exit path (no tool calls).
 fn record_early_exit_llm_round(
     state: &mut AgenticLoopState,
@@ -503,10 +512,10 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 if state.stall.nudge_count > 0 {
                     a.push(format!("stall_nudges={}", state.stall.nudge_count));
                 }
-                if !state.turn_guard.health.recent_errors(10).is_empty() {
+                let recent_tool_failures = state.turn_guard.health.recent_errors(10).len();
+                if recent_tool_failures > 0 {
                     a.push(format!(
-                        "tool_errors={}",
-                        state.turn_guard.health.recent_errors(10).len()
+                        "tool_failures={recent_tool_failures}; tools remain available unless an explicit restricted_tool result appears"
                     ));
                 }
                 a
@@ -717,7 +726,6 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                         let added = capped - state.max_turns;
                         state.max_turns = capped;
                         state.remaining_turns += added;
-                        state.policy_expanded_this_turn = true;
                         // Reset self-pacing hint flags so the new budget gets fresh hints
                         state.turn_budget_hint_emitted_90 = false;
                         state.turn_budget_hint_emitted_50 = false;
@@ -855,33 +863,23 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             astra_turn_core::loop_circuit_breaker::BreakerAction::InjectCorrection => {
                 state.stall.forced_round_budget_phase1 = true;
                 state.stall.circuit_breaker.correction_injected();
-                // Physical tool lockout for the upcoming round.
-                //
-                // Historically this path injected a text-only corrective that
-                // said "tools are disabled" but didn't actually restrict them,
-                // so the model sometimes ignored the instruction and kept
-                // calling tools (observed: session 36500dd9 round 13 kept
-                // using bash/read_file despite the message). Adding every
-                // valid tool to `restricted_tools` flips the phase1 promise
-                // from aspirational to enforced: the payload builder filters
-                // these out before the next request is built, so the
-                // model physically cannot emit another tool call this round.
-                for name in host.valid_tool_names() {
-                    state.restricted_tools.insert(name.clone());
-                }
+                // Tool use remains available. The breaker can identify a loop
+                // pattern, but it cannot know whether the failure is a broken
+                // tool, stale arguments, or the model's strategy. Keep the tool
+                // surface stable and inject guidance instead of banning tools.
                 let msg = round_budget_phase1_message(state.llm_rounds_completed, &state.message);
                 state.push_volatile(super::host::VolatileKind::BudgetAdvisory, msg);
                 tracing::warn!(
                     target: "astra::loop_guard",
                     tier = "circuit_breaker_correction",
                     round = state.llm_rounds_completed,
-                    "circuit breaker tripped — injecting correction"
+                    "circuit breaker tripped — injecting guidance"
                 );
                 if !prep.quiet {
                     host.emit_headless_line(
                         HeadlessStderrStyle::Yellow,
                         format!(
-                            "↻ Circuit breaker tripped at round {} (stall/regression detected); forcing finalization…",
+                            "↻ Circuit breaker tripped at round {} (stall/regression detected); injecting convergence guidance…",
                             state.llm_rounds_completed
                         ),
                     );
@@ -1003,25 +1001,26 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     if !suppress_nudges
         && !state.stall.forced_round_budget_phase1
         && !state.stall.forced_completion_soft_stop
-        && let Some((family, blocked_tools)) = exploration_family_phase2_candidate(state)
+        && let Some((family, retry_cautioned_tools)) = exploration_family_phase2_candidate(state)
     {
         state.stall.forced_exploration_family_phase2 = true;
-        let msg = exploration_family_phase2_message(&family, &blocked_tools, &state.message);
+        let msg =
+            exploration_family_phase2_message(&family, &retry_cautioned_tools, &state.message);
         state.push_volatile(super::host::VolatileKind::Corrective, msg);
         tracing::warn!(
             target: "astra::loop_guard",
             tier = "exploration_family_phase2",
             round = state.llm_rounds_completed,
             family = family,
-            blocked_tools = ?blocked_tools,
+            retry_cautioned_tools = ?retry_cautioned_tools,
             "loop guard fired"
         );
         if !prep.quiet {
             host.emit_headless_line(
                 HeadlessStderrStyle::Yellow,
                 format!(
-                    "↻ blocked-only retry on restricted {family} tools [{}]; forcing convergence corrective…",
-                    blocked_tools.join(", ")
+                    "↻ repeated low-yield {family} retry [{}]; injecting convergence corrective…",
+                    retry_cautioned_tools.join(", ")
                 ),
             );
         }
@@ -1040,9 +1039,6 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         let count =
             astra_turn_core::evaluation::count_search_fanout(&state.stall.tool_call_records);
         state.stall.forced_search_fanout_corrective = true;
-        for tool in ["glob", "grep", "rg"] {
-            state.restricted_tools.insert(tool.to_string());
-        }
         let msg = search_fanout_corrective_message(count, &state.message);
         state.push_volatile(super::host::VolatileKind::Corrective, msg);
         tracing::warn!(
@@ -1068,10 +1064,14 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         && let Some((family, streak)) =
             exploration_family_corrective_candidate(state, exploration_family_threshold)
     {
-        let restricted = apply_exploration_family_restrictions(state, &family);
+        let retry_cautioned = mark_exploration_family_corrective(state, &family);
         state.stall.forced_exploration_family_corrective = true;
-        let msg =
-            exploration_family_corrective_message(&family, streak, &restricted, &state.message);
+        let msg = exploration_family_corrective_message(
+            &family,
+            streak,
+            &retry_cautioned,
+            &state.message,
+        );
         state.push_volatile(super::host::VolatileKind::Corrective, msg);
         tracing::warn!(
             target: "astra::loop_guard",
@@ -1079,15 +1079,15 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             round = state.llm_rounds_completed,
             family = family,
             streak = streak,
-            restricted = ?restricted,
+            retry_cautioned = ?retry_cautioned,
             "loop guard fired"
         );
         if !prep.quiet {
-            let restricted_display = restricted.join(", ");
+            let retry_cautioned_display = retry_cautioned.join(", ");
             host.emit_headless_line(
                 HeadlessStderrStyle::Yellow,
                 format!(
-                    "↻ {streak} consecutive low-yield {family} rounds; restricting [{restricted_display}] for the next round…"
+                    "↻ {streak} consecutive low-yield {family} rounds; retry-cautioning [{retry_cautioned_display}] without disabling tools…"
                 ),
             );
         }
@@ -1377,6 +1377,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     turn_index,
                     prep.turn_start_time,
                     turn_result.ttft_ms,
+                    turn_result_tokens_consumed(&turn_result),
                 );
                 state.step_recorder.end_turn(false);
                 finalize_and_render(host, state).await;
@@ -1700,6 +1701,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 turn_index,
                 prep.turn_start_time,
                 turn_result.ttft_ms,
+                turn_result_tokens_consumed(&turn_result),
             );
             finalize_and_render(host, state).await;
             return Ok(TurnExecutionControl::Return(AgenticLoopOutcome::Completed));
@@ -2549,10 +2551,9 @@ pub(crate) fn round_budget_phase1_message(round_index: u32, original_query: &str
         "{ROUND_BUDGET_PHASE1_MARKER}\n\
          Runtime correction: this turn has used {round_index} tool rounds and \
          is past the configured hard limit.\n\n\
-         Tool access for the next round has been restricted by the runtime. \
-         Any tool calls you emit WILL BE DROPPED before execution — the runtime will \
-         not invoke them and you will not receive results. Your next message must \
-         be the final text-only answer.\n\n\
+         The tool surface remains available. Your next message should be the \
+         final text-only answer unless you can name a truly necessary unresolved \
+         fact and a changed plan for obtaining it.\n\n\
          IMPORTANT (anti-hallucination):\n\
          - Synthesize what you DID verify with the tool calls already made.\n\
          - Explicitly list anything you could NOT verify or finish.\n\
@@ -2659,7 +2660,7 @@ pub(crate) fn is_exploration_family_phase2(m: &serde_json::Value) -> bool {
         .is_some_and(|s| s.starts_with(EXPLORATION_FAMILY_PHASE2_MARKER))
 }
 
-fn restricted_tools_for_exploration_family(family: &str) -> &'static [&'static str] {
+fn retry_cautioned_tools_for_exploration_family(family: &str) -> &'static [&'static str] {
     match family {
         "diff" => &["git"],
         "search" => &["glob", "grep", "rg"],
@@ -2690,20 +2691,14 @@ pub(crate) fn exploration_family_corrective_candidate(
     (streak >= threshold).then(|| (family.to_string(), streak))
 }
 
-fn apply_exploration_family_restrictions(
-    state: &mut AgenticLoopState,
-    family: &str,
-) -> Vec<String> {
-    let mut restricted = restricted_tools_for_exploration_family(family)
+fn mark_exploration_family_corrective(state: &mut AgenticLoopState, family: &str) -> Vec<String> {
+    let mut cautioned = retry_cautioned_tools_for_exploration_family(family)
         .iter()
         .map(|tool| (*tool).to_string())
         .collect::<Vec<_>>();
-    restricted.sort();
-    for tool in &restricted {
-        state.restricted_tools.insert(tool.clone());
-    }
+    cautioned.sort();
     state.stall.exploration_family_corrective_family = Some(family.to_string());
-    restricted
+    cautioned
 }
 
 fn latest_non_synthetic_round_records(
@@ -2726,6 +2721,29 @@ fn latest_non_synthetic_round_records(
     Some((last_round, records))
 }
 
+fn tool_call_retry_signature(rec: &astra_services::session_journal::ToolCallRecord) -> String {
+    format!(
+        "{}:{}",
+        rec.name,
+        rec.args_full.as_deref().unwrap_or("<missing-args>")
+    )
+}
+
+fn repeated_prior_signature(
+    state: &AgenticLoopState,
+    latest_round: u32,
+    rec: &astra_services::session_journal::ToolCallRecord,
+) -> bool {
+    let signature = tool_call_retry_signature(rec);
+    state
+        .stall
+        .tool_call_records
+        .iter()
+        .filter(|prior| !prior.is_synthetic_placeholder())
+        .filter(|prior| prior.round.is_some_and(|round| round < latest_round))
+        .any(|prior| tool_call_retry_signature(prior) == signature)
+}
+
 pub(crate) fn exploration_family_phase2_candidate(
     state: &AgenticLoopState,
 ) -> Option<(String, Vec<String>)> {
@@ -2738,23 +2756,29 @@ pub(crate) fn exploration_family_phase2_candidate(
         .stall
         .exploration_family_corrective_family
         .as_deref()?;
-    let restricted = restricted_tools_for_exploration_family(family);
-    let (_, latest_round_records) = latest_non_synthetic_round_records(state)?;
+    let retry_cautioned = retry_cautioned_tools_for_exploration_family(family);
+    let (latest_round, latest_round_records) = latest_non_synthetic_round_records(state)?;
     if latest_round_records.is_empty() {
         return None;
     }
 
-    let mut blocked_tools = latest_round_records
+    let mut repeated_tools = latest_round_records
         .iter()
-        .filter(|rec| rec.was_blocked_by_policy() && restricted.contains(&rec.name.as_str()))
+        .filter(|rec| retry_cautioned.contains(&rec.name.as_str()))
         .map(|rec| rec.name.clone())
         .collect::<Vec<_>>();
-    if blocked_tools.is_empty() || blocked_tools.len() != latest_round_records.len() {
+    if repeated_tools.is_empty() || repeated_tools.len() != latest_round_records.len() {
         return None;
     }
-    blocked_tools.sort();
-    blocked_tools.dedup();
-    Some((family.to_string(), blocked_tools))
+    if !latest_round_records
+        .iter()
+        .all(|rec| repeated_prior_signature(state, latest_round, rec))
+    {
+        return None;
+    }
+    repeated_tools.sort();
+    repeated_tools.dedup();
+    Some((family.to_string(), repeated_tools))
 }
 
 /// Whether to inject the redundant-reads mid-loop corrective on the upcoming
@@ -2837,15 +2861,16 @@ pub(crate) fn search_fanout_corrective_message(count: usize, original_query: &st
 pub(crate) fn exploration_family_corrective_message(
     family: &str,
     streak: usize,
-    restricted_tools: &[String],
+    retry_cautioned_tools: &[String],
     original_query: &str,
 ) -> String {
-    let tool_list = restricted_tools.join(", ");
+    let tool_list = retry_cautioned_tools.join(", ");
     let label = exploration_family_label(family);
     format!(
         "{EXPLORATION_FAMILY_MARKER}\n\
          Runtime correction: the last {streak} consecutive multi-call rounds stayed inside the same {label} family. \
-         That is now classified as low-yield exploration churn, so the runtime has restricted [{tool_list}] for the next round.\n\n\
+         That is now classified as low-yield exploration churn. Retry-cautioned tools: [{tool_list}]. \
+         They remain available, but repeating the same path without changed inputs or a new hypothesis is low value.\n\n\
          REQUIRED next-step behavior:\n\
          - First synthesize the evidence already gathered from prior tool calls.\n\
          - If one fact is still missing, switch to a different tool family that can add genuinely new evidence.\n\
@@ -2858,20 +2883,20 @@ pub(crate) fn exploration_family_corrective_message(
 
 pub(crate) fn exploration_family_phase2_message(
     family: &str,
-    blocked_tools: &[String],
+    retry_cautioned_tools: &[String],
     original_query: &str,
 ) -> String {
-    let blocked_list = blocked_tools.join(", ");
+    let retry_cautioned_list = retry_cautioned_tools.join(", ");
     format!(
         "{EXPLORATION_FAMILY_PHASE2_MARKER}\n\
-         Runtime correction: after the earlier {family}-family restriction, your most recent tool round still attempted ONLY restricted tools [{blocked_list}]. \
-         That produced zero new evidence, so this turn must now converge instead of retrying the same path.\n\n\
+         Runtime correction: after the earlier {family}-family retry caution, your most recent tool round still repeated only the same low-yield path [{retry_cautioned_list}] with already-seen inputs. \
+         That produced little or no new evidence, so this turn must now converge instead of retrying the same path.\n\n\
          REQUIRED next-step behavior:\n\
          - Either write the answer now from the evidence already gathered, OR\n\
          - State the ONE missing fact and use ONE tool from a different family to fetch it.\n\
-         - Do NOT attempt [{blocked_list}] again this turn unless the worktree or target actually changed.\n\
+         - Do not repeat identical calls to [{retry_cautioned_list}] again this turn unless the worktree or target actually changed.\n\
          - If you still cannot finish, explicitly summarize verified facts and remaining gaps instead of continuing exploratory retries.\n\n\
-         Anti-hallucination: a blocked restricted-tool retry does NOT count as new evidence.\n\n\
+         Anti-hallucination: a repeated low-yield retry does NOT count as new evidence.\n\n\
          Original user query: {original_query}"
     )
 }
@@ -2969,6 +2994,7 @@ pub(crate) fn observe_turn_end_without_tools(
     _turn_index: usize,
     turn_start_time: Instant,
     ttft_ms: Option<u64>,
+    tokens_consumed: u64,
 ) {
     // ── Telemetry timing ─────────────────────────────────────────
     if let (Some(hub), Some(session)) = (
@@ -2993,13 +3019,9 @@ pub(crate) fn observe_turn_end_without_tools(
     // need to feed the observation journal and persistence store so the
     // self-status block and cross-session analysis see them.
     {
-        let tokens = state.total_prompt
-            + state.total_completion
-            + state.total_cache_read
-            + state.total_cache_creation;
         let mut metrics = astra_core::TurnMetrics::default();
         metrics.rounds_completed = state.llm_rounds_completed;
-        metrics.tokens_consumed = tokens;
+        metrics.tokens_consumed = tokens_consumed;
 
         state.observation_journal.record_turn(&metrics);
         let facts = state
@@ -3088,6 +3110,7 @@ async fn handle_token_budget<H: AgenticLoopHost>(
             turn_index,
             prep.turn_start_time,
             turn_result.ttft_ms,
+            turn_result_tokens_consumed(turn_result),
         );
         state.step_recorder.end_turn(false);
         finalize_and_render(host, state).await;
@@ -3224,7 +3247,7 @@ fn should_wrap_up_for_cumulative_budget<H: AgenticLoopHost>(
     if state.max_cumulative_tokens == 0 {
         return false;
     }
-    let cumulative = state.total_prompt + state.total_completion;
+    let cumulative = state.provider_total_tokens();
     if cumulative <= state.max_cumulative_tokens || state.budget_wrapup_injected {
         return false;
     }
@@ -3447,17 +3470,29 @@ mod tests {
         state.session_turn = 6;
         state.max_turns = 20;
         state.remaining_turns = 4;
+        state.total_prompt = 10_000;
+        state.total_completion = 20_000;
+        state.total_cache_read = 30_000;
+        state.total_cache_creation = 40_000;
         let hub = ObservabilityHub::new();
         let session = hub.start_session("u1", "s1");
         state.telemetry.observability_hub = Some(Arc::new(hub));
         state.telemetry.observability_session = Some(session.clone());
 
         let turn_start_time = Instant::now() - Duration::from_millis(25);
-        observe_turn_end_without_tools(&mut state, 16, turn_start_time, Some(7));
+        observe_turn_end_without_tools(&mut state, 16, turn_start_time, Some(7), 123);
 
         let guard = session.read().unwrap();
         assert_eq!(guard.turn_timings.len(), 1);
         assert_eq!(guard.turn_timings[0].turn, 6);
+        assert_eq!(
+            state
+                .observation_journal
+                .last_entry()
+                .map(|entry| entry.tokens_consumed),
+            Some(123),
+            "tool-less observation must record the current LLM round cost, not cumulative session tokens"
+        );
     }
 
     #[test]
@@ -5657,23 +5692,24 @@ mod tests {
         });
     }
 
-    fn push_blocked_restricted_round(state: &mut AgenticLoopState, tool: &str, round: u32) {
+    fn push_retry_cautioned_round(
+        state: &mut AgenticLoopState,
+        tool: &str,
+        round: u32,
+        args_full: &str,
+    ) {
         state.stall.tool_call_records.push(ToolCallRecord {
             name: tool.into(),
-            ok: false,
+            ok: true,
             round: Some(round),
-            error: Some(format!(
-                "blocked_tool: Tool '{tool}' is currently restricted."
-            )),
-            result_preview: Some(format!(
-                "Tool '{tool}' is currently restricted and cannot be executed."
-            )),
+            args_full: Some(args_full.to_string()),
+            result_preview: Some("same low-yield evidence".into()),
             ..Default::default()
         });
     }
 
     #[test]
-    fn exploration_family_corrective_fires_at_threshold_and_restricts_explicit_tools() {
+    fn exploration_family_corrective_fires_at_threshold_and_cautions_explicit_tools() {
         let mut state = make_state();
         state.message = "review local changes".into();
         for round in 0..astra_turn_core::evaluation::EXPLORATION_FAMILY_CHURN_THRESHOLD {
@@ -5693,9 +5729,12 @@ mod tests {
             astra_turn_core::evaluation::EXPLORATION_FAMILY_CHURN_THRESHOLD
         );
 
-        let restricted = apply_exploration_family_restrictions(&mut state, &family);
-        assert_eq!(restricted, vec!["git".to_string()]);
-        assert!(state.restricted_tools.contains("git"));
+        let retry_cautioned = mark_exploration_family_corrective(&mut state, &family);
+        assert_eq!(retry_cautioned, vec!["git".to_string()]);
+        assert!(
+            !state.restricted_tools.contains("git"),
+            "exploration-family corrective must not hard-restrict the tool"
+        );
         assert!(
             !state.restricted_tools.contains("bash"),
             "exploration-family corrective must not globally block bash"
@@ -5763,12 +5802,14 @@ mod tests {
     }
 
     #[test]
-    fn exploration_family_phase2_fires_after_blocked_only_retry_round() {
+    fn exploration_family_phase2_fires_after_repeated_retry_signature_round() {
         let mut state = make_state();
         state.message = "review local changes".into();
         state.stall.forced_exploration_family_corrective = true;
         state.stall.exploration_family_corrective_family = Some("diff".into());
-        push_blocked_restricted_round(&mut state, "git", 7);
+        let args = r#"{"action":"diff","path":"src/lib.rs"}"#;
+        push_retry_cautioned_round(&mut state, "git", 6, args);
+        push_retry_cautioned_round(&mut state, "git", 7, args);
 
         let candidate = exploration_family_phase2_candidate(&state);
         assert_eq!(
@@ -5783,7 +5824,9 @@ mod tests {
         state.message = "review local changes".into();
         state.stall.forced_exploration_family_corrective = true;
         state.stall.exploration_family_corrective_family = Some("diff".into());
-        push_blocked_restricted_round(&mut state, "git", 7);
+        let args = r#"{"action":"diff","path":"src/lib.rs"}"#;
+        push_retry_cautioned_round(&mut state, "git", 6, args);
+        push_retry_cautioned_round(&mut state, "git", 7, args);
         state.stall.tool_call_records.push(ToolCallRecord {
             name: "bash".into(),
             ok: true,
@@ -5796,12 +5839,39 @@ mod tests {
     }
 
     #[test]
+    fn exploration_family_phase2_stays_silent_on_changed_retry_signature() {
+        let mut state = make_state();
+        state.message = "review local changes".into();
+        state.stall.forced_exploration_family_corrective = true;
+        state.stall.exploration_family_corrective_family = Some("diff".into());
+        push_retry_cautioned_round(
+            &mut state,
+            "git",
+            6,
+            r#"{"action":"diff","path":"src/lib.rs"}"#,
+        );
+        push_retry_cautioned_round(
+            &mut state,
+            "git",
+            7,
+            r#"{"action":"diff","path":"src/runtime.rs"}"#,
+        );
+
+        assert!(
+            exploration_family_phase2_candidate(&state).is_none(),
+            "changed arguments represent a new hypothesis and must not be treated as repeated wall-hitting"
+        );
+    }
+
+    #[test]
     fn exploration_family_phase2_is_one_shot_per_turn() {
         let mut state = make_state();
         state.message = "review local changes".into();
         state.stall.forced_exploration_family_corrective = true;
         state.stall.exploration_family_corrective_family = Some("diff".into());
-        push_blocked_restricted_round(&mut state, "git", 7);
+        let args = r#"{"action":"diff","path":"src/lib.rs"}"#;
+        push_retry_cautioned_round(&mut state, "git", 6, args);
+        push_retry_cautioned_round(&mut state, "git", 7, args);
 
         assert!(exploration_family_phase2_candidate(&state).is_some());
         state.stall.forced_exploration_family_phase2 = true;
@@ -5825,7 +5895,7 @@ mod tests {
     }
 
     #[test]
-    fn exploration_family_corrective_restricts_search_tools_without_bash() {
+    fn exploration_family_corrective_retry_cautions_search_tools_without_bash() {
         let mut state = make_state();
         state.message = "investigate auth flow".into();
         for round in 0..astra_turn_core::evaluation::EXPLORATION_FAMILY_CHURN_THRESHOLD {
@@ -5845,17 +5915,41 @@ mod tests {
             astra_turn_core::evaluation::EXPLORATION_FAMILY_CHURN_THRESHOLD
         );
 
-        let restricted = apply_exploration_family_restrictions(&mut state, &family);
+        let retry_cautioned = mark_exploration_family_corrective(&mut state, &family);
         assert_eq!(
-            restricted,
+            retry_cautioned,
             vec!["glob".to_string(), "grep".to_string(), "rg".to_string()]
         );
-        assert!(state.restricted_tools.contains("glob"));
-        assert!(state.restricted_tools.contains("grep"));
-        assert!(state.restricted_tools.contains("rg"));
+        assert!(
+            !state.restricted_tools.contains("glob")
+                && !state.restricted_tools.contains("grep")
+                && !state.restricted_tools.contains("rg"),
+            "search-family corrective must not hard-restrict search tools"
+        );
         assert!(
             !state.restricted_tools.contains("bash"),
             "search-family corrective must not globally block bash"
+        );
+    }
+
+    #[test]
+    fn cumulative_budget_counts_cache_buckets() {
+        let mut state = make_state();
+        state.max_cumulative_tokens = 100;
+        state.total_prompt = 5;
+        state.total_completion = 5;
+        state.total_cache_read = 20;
+        state.total_cache_creation = 80;
+        let mut host = MockHost::new(Vec::new());
+
+        assert!(should_wrap_up_for_cumulative_budget(
+            &mut host, &mut state, true
+        ));
+        assert!(state.budget_wrapup_injected);
+        assert!(
+            state.interruption.as_ref().is_some_and(|record| record.kind
+                == astra_turn_core::interruption::InterruptionKind::CumulativeBudgetExceeded),
+            "cache-inclusive cumulative budget should record an interruption"
         );
     }
 

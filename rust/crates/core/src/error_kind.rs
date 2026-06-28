@@ -34,6 +34,13 @@ pub enum ErrorKind {
     /// Connection reset, TLS failure, or other transport error mid-stream.
     StreamTransport,
 
+    // ── Connection pool ──────────────────────────────
+    /// HTTP connection pool exhausted (reqwest/hyper). The client's
+    /// connection pool is saturated — new requests wait for a free
+    /// connection until the pool timeout fires. Distinct from
+    /// [`DatabaseError`] which covers SQLx / MatrixOne pool failures.
+    ConnectionPoolExhausted,
+
     // ── Budget / limits ──────────────────────────────
     /// Total LLM time budget for the turn/session exhausted.
     BudgetExhausted,
@@ -92,6 +99,7 @@ impl ErrorKind {
             Self::InvalidRequest => "invalid_request",
             Self::StreamIdle => "stream_idle",
             Self::StreamTransport => "stream_transport",
+            Self::ConnectionPoolExhausted => "connection_pool_exhausted",
             Self::BudgetExhausted => "budget_exhausted",
             Self::ToolRoundsExhausted => "tool_rounds_exhausted",
             Self::Network => "network",
@@ -118,6 +126,7 @@ impl ErrorKind {
                 | Self::ServerError
                 | Self::StreamIdle
                 | Self::StreamTransport
+                | Self::ConnectionPoolExhausted
                 | Self::Network
         )
     }
@@ -134,6 +143,7 @@ impl ErrorKind {
             Self::ServerError => 2_000,
             Self::StreamIdle => 0,
             Self::StreamTransport => 1_000,
+            Self::ConnectionPoolExhausted => 5_000,
             Self::Network => 3_000,
             _ => return None,
         };
@@ -214,6 +224,11 @@ impl ErrorKind {
                 "System resource limit reached (memory/disk/processes). \
                  This tool is BLOCKED for the rest of this session. \
                  Reduce system load or try a different approach."
+            }
+            Self::ConnectionPoolExhausted => {
+                "HTTP connection pool saturated (reqwest/hyper). \
+                 Reduce parallel LLM requests, check for response body leaks, \
+                 or increase pool_max_size. Retrying with backoff."
             }
             Self::DatabaseError => {
                 "Database query failed (SQL syntax, deadlock, or pool). \
@@ -305,6 +320,11 @@ impl ErrorKind {
                  Kill orphan processes: `ps aux | grep defunct`. May need to restart \
                  the system or increase limits."
             }
+            Self::ConnectionPoolExhausted => {
+                "The reqwest HTTP pool is saturated. Reduce parallel LLM calls, \
+                 check for un-consumed SSE response bodies, and verify \
+                 `pool_max_idle_per_host` / `pool_max_size` settings."
+            }
             Self::DatabaseError => {
                 "Check MatrixOne connectivity and SQL syntax. Use CAST for DATETIME \
                  columns, MIN/MAX for non-grouped columns. For deadlocks, reorder \
@@ -347,6 +367,7 @@ impl ErrorKind {
             "invalid_request" => Some(Self::InvalidRequest),
             "stream_idle" => Some(Self::StreamIdle),
             "stream_transport" => Some(Self::StreamTransport),
+            "connection_pool_exhausted" => Some(Self::ConnectionPoolExhausted),
             "budget_exhausted" => Some(Self::BudgetExhausted),
             "tool_rounds_exhausted" => Some(Self::ToolRoundsExhausted),
             "network" => Some(Self::Network),
@@ -532,7 +553,7 @@ pub fn classify_tool_output(error_str: &str) -> ErrorKind {
         || lower.contains("error returned from database")
         || lower.contains("sqlx")
         || lower.contains("deadlock")
-        || is_database_pool_timeout(&lower)
+        || lower.contains("matrixone pool timed out")
         || (lower.contains("column") && lower.contains("group by"))
     {
         return ErrorKind::DatabaseError;
@@ -766,11 +787,64 @@ pub fn is_workspace_read_before_write(lower: &str) -> bool {
         || lower.contains("read the full file before overwriting")
 }
 
-fn is_database_pool_timeout(lower: &str) -> bool {
+fn is_connection_pool_timeout(lower: &str) -> bool {
     lower.contains("connection pool timed out")
         || lower.contains("pool timed out while waiting for an open connection")
         || lower.contains("pool timed out waiting for an open connection")
         || (lower.contains("pool timed out") && lower.contains("open connection"))
+}
+
+/// Classify an LLM error message into an [`ErrorKind`].
+///
+/// Canonical classifier used by the bridge, turn ingest, and any path that
+/// needs to map LLM-provider error strings to retry/recovery policy.  Keep
+/// this in sync with the actual provider error patterns observed in production.
+pub fn classify_llm_error(msg: &str) -> ErrorKind {
+    let lower = msg.to_lowercase();
+    if is_context_window_error(&lower) {
+        ErrorKind::ContextWindow
+    } else if lower.contains("rate") || lower.contains("429") {
+        ErrorKind::RateLimit
+    } else if is_connection_pool_timeout(&lower) {
+        ErrorKind::ConnectionPoolExhausted
+    } else if lower.contains("timeout") || lower.contains("timed out") {
+        ErrorKind::StreamIdle
+    } else if lower.contains("connect") || lower.contains("transport") || lower.contains("network")
+    {
+        ErrorKind::StreamTransport
+    } else if lower.contains("401 unauthorized")
+        || lower.contains("status: 401")
+        || lower.contains("status code: 401")
+        || lower.contains("http 401")
+        || lower.contains("unauthorized")
+        || lower.contains("api key")
+        || lower.contains("could not validate credentials")
+        || lower.contains("invalid credentials")
+        || lower.contains("bad credentials")
+        || lower.contains("authentication failed")
+        || lower.contains("token expired")
+        || lower.contains("invalid token")
+        || lower.contains("security token included in the request is expired")
+    {
+        ErrorKind::Auth
+    } else if lower.contains("cancelled") || lower.contains("canceled") {
+        ErrorKind::Cancelled
+    } else {
+        ErrorKind::Unknown
+    }
+}
+
+/// Detect context-window / prompt-too-long errors in API response text.
+///
+/// The caller should already lower-case the input.
+pub fn is_context_window_error(lower: &str) -> bool {
+    lower.contains("context_length_exceeded")
+        || lower.contains("maximum context length")
+        || lower.contains("prompt is too long")
+        || lower.contains("too many tokens")
+        || lower.contains("input is too long")
+        || lower.contains("context window")
+        || lower.contains("max_tokens") && (lower.contains("exceed") || lower.contains("limit"))
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -790,6 +864,7 @@ mod tests {
         ErrorKind::InvalidRequest,
         ErrorKind::StreamIdle,
         ErrorKind::StreamTransport,
+        ErrorKind::ConnectionPoolExhausted,
         ErrorKind::BudgetExhausted,
         ErrorKind::ToolRoundsExhausted,
         ErrorKind::Network,
@@ -1164,8 +1239,8 @@ mod tests {
             "SQL syntax error: column must appear in GROUP BY",
             "error returned from database: deadlock found",
             "sqlx: connection pool timed out",
-            "Error: pool timed out while waiting for an open connection",
             "deadlock detected on table x",
+            "matrixone pool timed out: query cancelled",
         ] {
             assert_eq!(classify_tool_output(st), ErrorKind::DatabaseError);
         }
@@ -1195,5 +1270,141 @@ mod tests {
         ] {
             assert_ne!(kind.diagnosis_hint(), kind.guidance());
         }
+    }
+
+    // ── classify_llm_error ──────────────────────────────────────────────────
+
+    #[test]
+    fn classify_llm_error_rate_limit() {
+        assert_eq!(
+            classify_llm_error("rate limit exceeded"),
+            ErrorKind::RateLimit
+        );
+        assert_eq!(
+            classify_llm_error("error 429: too many requests"),
+            ErrorKind::RateLimit
+        );
+        assert_eq!(
+            classify_llm_error("Rate limiting active"),
+            ErrorKind::RateLimit
+        );
+    }
+
+    #[test]
+    fn classify_llm_error_pool_timeout_is_connection_pool_exhausted() {
+        assert_eq!(
+            classify_llm_error("Error: pool timed out while waiting for an open connection"),
+            ErrorKind::ConnectionPoolExhausted
+        );
+        assert_eq!(
+            classify_llm_error("connection pool timed out"),
+            ErrorKind::ConnectionPoolExhausted
+        );
+        assert_eq!(
+            classify_llm_error("pool timed out waiting for an open connection"),
+            ErrorKind::ConnectionPoolExhausted
+        );
+    }
+
+    #[test]
+    fn classify_llm_error_timeout_is_stream_idle() {
+        assert_eq!(
+            classify_llm_error("request timed out"),
+            ErrorKind::StreamIdle
+        );
+        assert_eq!(
+            classify_llm_error("connection timed out"),
+            ErrorKind::StreamIdle
+        );
+    }
+
+    #[test]
+    fn classify_llm_error_transport() {
+        assert_eq!(
+            classify_llm_error("connection refused"),
+            ErrorKind::StreamTransport
+        );
+        assert_eq!(
+            classify_llm_error("transport error"),
+            ErrorKind::StreamTransport
+        );
+        assert_eq!(
+            classify_llm_error("network unreachable"),
+            ErrorKind::StreamTransport
+        );
+    }
+
+    #[test]
+    fn classify_llm_error_auth() {
+        assert_eq!(classify_llm_error("401 unauthorized"), ErrorKind::Auth);
+        assert_eq!(classify_llm_error("HTTP 401"), ErrorKind::Auth);
+        assert_eq!(classify_llm_error("unauthorized access"), ErrorKind::Auth);
+        assert_eq!(classify_llm_error("invalid api key"), ErrorKind::Auth);
+        assert_eq!(
+            classify_llm_error("Error: Could not validate credentials"),
+            ErrorKind::Auth
+        );
+        assert_eq!(
+            classify_llm_error("could not validate credentials for user xyz"),
+            ErrorKind::Auth
+        );
+        assert_eq!(classify_llm_error("invalid credentials"), ErrorKind::Auth);
+        assert_eq!(classify_llm_error("bad credentials"), ErrorKind::Auth);
+        assert_eq!(classify_llm_error("token expired"), ErrorKind::Auth);
+        assert_eq!(classify_llm_error("invalid token"), ErrorKind::Auth);
+        assert_eq!(classify_llm_error("authentication failed"), ErrorKind::Auth);
+        assert_eq!(
+            classify_llm_error("The security token included in the request is expired"),
+            ErrorKind::Auth
+        );
+    }
+
+    #[test]
+    fn classify_llm_error_cancelled() {
+        assert_eq!(
+            classify_llm_error("LLM call cancelled"),
+            ErrorKind::Cancelled
+        );
+        assert_eq!(classify_llm_error("request canceled"), ErrorKind::Cancelled);
+    }
+
+    #[test]
+    fn classify_llm_error_unknown() {
+        assert_eq!(
+            classify_llm_error("something went wrong"),
+            ErrorKind::Unknown
+        );
+        assert_eq!(classify_llm_error(""), ErrorKind::Unknown);
+    }
+
+    #[test]
+    fn classify_llm_error_case_insensitive() {
+        assert_eq!(classify_llm_error("RATE LIMIT"), ErrorKind::RateLimit);
+        assert_eq!(classify_llm_error("Timeout"), ErrorKind::StreamIdle);
+        assert_eq!(classify_llm_error("UNAUTHORIZED"), ErrorKind::Auth);
+    }
+
+    // ── is_context_window_error ─────────────────────────────────────────────
+
+    #[test]
+    fn is_context_window_error_detects_all_patterns() {
+        assert!(is_context_window_error("context_length_exceeded"));
+        assert!(is_context_window_error("maximum context length is 128000"));
+        assert!(is_context_window_error("prompt is too long"));
+        assert!(is_context_window_error("too many tokens in the input"));
+        assert!(is_context_window_error("input is too long for this model"));
+        assert!(is_context_window_error("context window exceeded"));
+        assert!(is_context_window_error("max_tokens limit exceeded"));
+        // Negative cases
+        assert!(!is_context_window_error("rate limit exceeded"));
+        assert!(!is_context_window_error("internal server error"));
+        assert!(!is_context_window_error(""));
+    }
+
+    #[test]
+    fn context_window_error_detected_in_llm_error_format() {
+        let api_body = r#"{"error":{"message":"This model's maximum context length is 128000 tokens","type":"invalid_request_error"}}"#;
+        let err = format!("LLM error 400: {api_body}");
+        assert!(is_context_window_error(&err.to_lowercase()));
     }
 }

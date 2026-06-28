@@ -132,13 +132,8 @@ pub(crate) fn persist_failed_subrun(state: &mut AgenticLoopState, error: &str) -
     state.step_recorder.end_turn(false);
 
     let summary = state.step_recorder.summary();
-    let blocked_tools = state
-        .turn_guard
-        .health
-        .health_avoidance_tools()
-        .iter()
-        .map(|tool| tool.to_string())
-        .collect::<Vec<_>>();
+    let mut blocked_tools = state.restricted_tools.iter().cloned().collect::<Vec<_>>();
+    blocked_tools.sort();
     if let Some(heavy) = state.step_recorder.build_heavy_checkpoint(
         &state.messages,
         state.max_turn_input_tokens,
@@ -655,7 +650,6 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             last_request_message_count: None,
             turn_guard: TurnGuard::with_profile(task_profile),
             budget_policy: None,
-            policy_expanded_this_turn: false,
             restricted_tools,
             boosted_tools: HashSet::new(),
             widen_selection_pending: false,
@@ -760,7 +754,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
         }
 
         let turns = (SUBRUN_MAX_TURNS - state.remaining_turns) as u32;
-        let tokens_used = (state.total_prompt + state.total_completion) as u32;
+        let tokens_used = state.provider_total_tokens().min(u32::MAX as u64) as u32;
 
         Ok(SubRunResult {
             output: state.final_text,

@@ -3311,7 +3311,6 @@ impl AgenticRunLifecycleService {
             turn_budget_hint_emitted_20: false,
             agentic_turn_budget,
             budget_policy: load_budget_policy_from_config(),
-            policy_expanded_this_turn: false,
             current_round_index: 0,
             llm_rounds_completed: 0,
             last_request_message_count: None,
@@ -5077,7 +5076,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 );
                 // Record tokens consumed so check_token_budget sees up-to-date usage.
                 if let Some(ref gov) = bg_resource_governor {
-                    let total = loop_state.total_prompt + loop_state.total_completion;
+                    let total = loop_state.provider_total_tokens();
                     if total > 0 {
                         gov.record_tokens(&bg_user_id, total).await;
                     }
@@ -5774,7 +5773,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 // Record tokens consumed regardless of cancel — cancelled runs still
                 // consumed tokens and must count toward the daily budget.
                 if let Some(ref gov) = bg_resource_governor {
-                    let total = state.total_prompt + state.total_completion;
+                    let total = state.provider_total_tokens();
                     if total > 0 {
                         gov.record_tokens(&bg_user_id, total).await;
                     }
@@ -7209,7 +7208,6 @@ impl SubRunExecutor for ServerSubRunExecutor {
             turn_budget_hint_emitted_20: false,
             agentic_turn_budget,
             budget_policy: load_budget_policy_from_config(),
-            policy_expanded_this_turn: false,
             current_round_index: 0,
             llm_rounds_completed: 0,
             last_request_message_count: None,

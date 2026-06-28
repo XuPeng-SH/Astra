@@ -1019,38 +1019,40 @@ pub fn render_collapsed_summary(tasks: &[SessionTask], columns: u16) -> Option<L
         Style::default().add_modifier(Modifier::DIM),
     ));
 
-    if sub_total > 0 {
-        spans.push(Span::styled(
-            format!(" · {sub_done}/{sub_total} done"),
-            Style::default().add_modifier(Modifier::DIM),
-        ));
+    // Show in-progress task title BEFORE subtask roll-up and toggle hint.
+    // Space priority: title > toggle hint > subtask counts > status breakdown.
+    // The user must always see what's being worked on.
+    if let Some(task) = current_task {
+        let used: usize = spans.iter().map(|s| s.content.width()).sum();
+        let sep = " · ";
+        let title_budget = (columns as usize).saturating_sub(used + sep.width());
+        if title_budget > 0 {
+            let title = truncate_to_width(&task.title, title_budget);
+            spans.push(Span::styled(
+                sep.to_string(),
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+            spans.push(Span::styled(title, Style::default()));
+        }
     }
 
-    let used_before_toggle: usize = spans.iter().map(|s| s.content.width()).sum();
-    let min_title_width = if current_task.is_some() {
-        " · ".width() + 8
-    } else {
-        0
-    };
-    if used_before_toggle + TASK_BOARD_TOGGLE_HINT.width() + min_title_width <= columns as usize {
+    let used: usize = spans.iter().map(|s| s.content.width()).sum();
+    if used + TASK_BOARD_TOGGLE_HINT.width() <= columns as usize {
         spans.push(Span::styled(
             TASK_BOARD_TOGGLE_HINT,
             Style::default().fg(theme.dim).add_modifier(Modifier::DIM),
         ));
     }
 
-    if let Some(task) = current_task {
-        // Trim the title to whatever space is left after the rest of
-        // the line so we don't blow past `columns`.
+    if sub_total > 0 {
+        let label = format!(" · {sub_done}/{sub_total} done");
         let used: usize = spans.iter().map(|s| s.content.width()).sum();
-        let reserved = used + " · ".width();
-        let title_budget = (columns as usize).saturating_sub(reserved).max(8);
-        let title = truncate_to_width(&task.title, title_budget);
-        spans.push(Span::styled(
-            " · ".to_string(),
-            Style::default().add_modifier(Modifier::DIM),
-        ));
-        spans.push(Span::styled(title, Style::default()));
+        if used + label.width() <= columns as usize {
+            spans.push(Span::styled(
+                label,
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+        }
     }
 
     Some(Line::from(spans))
@@ -1362,6 +1364,43 @@ mod tests {
         let line = render_collapsed_summary(&[parent], 100).expect("non-empty");
         let text = spans_text(&line);
         assert!(text.contains("1/2 done"), "{text}");
+    }
+
+    #[test]
+    fn collapsed_summary_never_overflows_columns_with_long_title_and_subtasks() {
+        use astra_tools::task_mgmt::SessionSubtask;
+        let mut parent = mk_task(
+            "task-1",
+            "this is a very long current task title that must be clipped before optional suffixes",
+            "in_progress",
+        );
+        parent.subtasks = vec![
+            SessionSubtask {
+                id: "s1".into(),
+                title: "first".into(),
+                description: None,
+                status: "completed".into(),
+                depends_on: vec![],
+                owner: None,
+                reason: None,
+            },
+            SessionSubtask {
+                id: "s2".into(),
+                title: "second".into(),
+                description: None,
+                status: "pending".into(),
+                depends_on: vec![],
+                owner: None,
+                reason: None,
+            },
+        ];
+
+        let line = render_collapsed_summary(&[parent], 40).expect("non-empty");
+        let text = spans_text(&line);
+        assert!(
+            unicode_width::UnicodeWidthStr::width(text.as_str()) <= 40,
+            "collapsed summary must fit its render width: {text:?}"
+        );
     }
 
     #[test]
