@@ -24,6 +24,7 @@ use crate::turn::agentic_loop::host::{
     AgenticLoopHost as _, AgenticLoopState, CancellationState, RequestConstraints, SkillState,
     StopHookState, TurnInteractionPolicy, run_agentic_loop_with_host, runtime_manifest_for_model,
 };
+use crate::turn::observation_store::default_observation_store;
 use astra_pipeline::step_protocol::InMemoryIdempotencyCache;
 use astra_pipeline::step_recorder::StepRecorder;
 use astra_skills::executor::isolated::{SkillSubRunExecutor, SubRunResult};
@@ -410,6 +411,8 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             total_cache_read: 0,
             total_cache_creation: 0,
             total_tool_calls: 0,
+            textless_stop_retries: 0,
+            last_finish_reason: None,
             total_evidence_tool_calls: 0,
             has_any_usage: false,
             max_turns: SUBRUN_MAX_TURNS,
@@ -543,6 +546,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
                 }
             },
             observation_journal: Default::default(),
+            observation_store: default_observation_store(),
         };
 
         // ── Wire ServerToolExecutor for skill sub-run tool execution ────

@@ -434,8 +434,9 @@ pub(crate) fn publish_introspect_snapshot<H: AgenticLoopHost + ?Sized>(
     host: &mut H,
     state: &AgenticLoopState,
     lifecycle_summary: String,
+    inspection: Option<&crate::turn::inspection_service::InspectionService<'_>>,
 ) {
-    let snapshot = build_introspect_snapshot(state, lifecycle_summary);
+    let snapshot = build_introspect_snapshot(state, lifecycle_summary, inspection);
     host.on_introspect_snapshot(&snapshot);
     if let Some(executor) = state.server_tool_executor.as_deref() {
         executor.update_introspect_snapshot(snapshot);
@@ -445,6 +446,7 @@ pub(crate) fn publish_introspect_snapshot<H: AgenticLoopHost + ?Sized>(
 pub(crate) fn build_introspect_snapshot(
     state: &AgenticLoopState,
     lifecycle_summary: String,
+    inspection: Option<&crate::turn::inspection_service::InspectionService<'_>>,
 ) -> astra_turn_core::introspect::IntrospectSnapshot {
     let total_in = state.total_prompt + state.total_cache_read + state.total_cache_creation;
     let cache_ratio = if total_in > 0 {
@@ -577,14 +579,14 @@ pub(crate) fn build_introspect_snapshot(
     let circuit_breaker = {
         let cb = &state.stall.circuit_breaker;
         Some(astra_turn_core::introspect::CircuitBreakerSnapshot {
-            state: format!("{:?}", cb.state()).to_lowercase(),
+            state: cb.state().operator_label().to_string(),
             failure_count: cb.rounds_completed() as u64,
             success_count: 0, // LoopCircuitBreaker does not expose success count
             consecutive_failures: cb.consecutive_read_only() as u64,
         })
     };
 
-    astra_turn_core::introspect::IntrospectSnapshot {
+    let mut snapshot = astra_turn_core::introspect::IntrospectSnapshot {
         current_model: state.current_model_identity().map(str::to_string),
         token_pressure: introspect_token_pressure(state),
         cache_hit_ratio: cache_ratio,
@@ -606,7 +608,14 @@ pub(crate) fn build_introspect_snapshot(
         current_round,
         tool_errors: state.turn_guard.health.recent_errors(10),
         circuit_breaker,
+    };
+
+    // Enrich live-metric fields from provider data when available.
+    if let Some(inspection) = inspection {
+        inspection.enrich_snapshot(&mut snapshot);
     }
+
+    snapshot
 }
 
 pub(crate) fn introspect_token_pressure(state: &AgenticLoopState) -> f64 {
@@ -1095,8 +1104,13 @@ pub struct MessagingState {
 /// Point-in-time summary of the active session task board.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TaskBoardSnapshot {
+    /// Non-archived tasks visible in the current board snapshot.
+    pub tracked_count: usize,
     pub pending_count: usize,
     pub in_progress_count: usize,
+    pub paused_count: usize,
+    pub completed_count: usize,
+    pub terminal_non_success_count: usize,
     /// Count of active (pending/in_progress) tasks that have at least one
     /// blocker in their `blocked_by` list.  This counts tasks waiting on
     /// dependencies, *not* tasks whose status is literally "blocked"
@@ -1110,18 +1124,41 @@ impl TaskBoardSnapshot {
     pub fn from_active_tasks(tasks: &[SessionTask]) -> Self {
         let mut snapshot = Self::default();
         for task in tasks {
-            if !task.status.is_active() {
+            if matches!(
+                task.status,
+                astra_tools::task_mgmt::SessionTaskStatusKind::Archived
+                    | astra_tools::task_mgmt::SessionTaskStatusKind::Deleted
+                    | astra_tools::task_mgmt::SessionTaskStatusKind::Migrated
+            ) {
                 continue;
             }
-            if task.status.is_in_progress() {
-                snapshot.in_progress_count += 1;
-            } else {
-                snapshot.pending_count += 1;
+            snapshot.tracked_count += 1;
+            match task.status {
+                astra_tools::task_mgmt::SessionTaskStatusKind::InProgress => {
+                    snapshot.in_progress_count += 1;
+                }
+                astra_tools::task_mgmt::SessionTaskStatusKind::Pending => {
+                    snapshot.pending_count += 1;
+                }
+                astra_tools::task_mgmt::SessionTaskStatusKind::Paused => {
+                    snapshot.paused_count += 1;
+                }
+                astra_tools::task_mgmt::SessionTaskStatusKind::Completed => {
+                    snapshot.completed_count += 1;
+                }
+                astra_tools::task_mgmt::SessionTaskStatusKind::Failed
+                | astra_tools::task_mgmt::SessionTaskStatusKind::Cancelled => {
+                    snapshot.terminal_non_success_count += 1;
+                }
+                astra_tools::task_mgmt::SessionTaskStatusKind::Other
+                | astra_tools::task_mgmt::SessionTaskStatusKind::Archived
+                | astra_tools::task_mgmt::SessionTaskStatusKind::Deleted
+                | astra_tools::task_mgmt::SessionTaskStatusKind::Migrated => {}
             }
             if !task.blocked_by.is_empty() {
                 snapshot.blocked_count += 1;
             }
-            if snapshot.active_tasks.len() < 3 {
+            if task.status.is_open_work() && snapshot.active_tasks.len() < 3 {
                 snapshot
                     .active_tasks
                     .push(format!("{} {} [{}]", task.id, task.title, task.status));
@@ -1132,7 +1169,17 @@ impl TaskBoardSnapshot {
 
     #[must_use]
     pub fn has_unfinished_tasks(&self) -> bool {
-        self.pending_count > 0 || self.in_progress_count > 0
+        self.pending_count > 0 || self.in_progress_count > 0 || self.paused_count > 0
+    }
+
+    #[must_use]
+    pub fn has_any_tracked_tasks(&self) -> bool {
+        self.tracked_count > 0
+    }
+
+    #[must_use]
+    pub fn all_tracked_tasks_completed(&self) -> bool {
+        self.tracked_count > 0 && self.completed_count == self.tracked_count
     }
 
     #[must_use]
@@ -1166,6 +1213,9 @@ impl TaskBoardSnapshot {
         }
         if self.pending_count > 0 {
             parts.push(format!("{} pending", self.pending_count));
+        }
+        if self.paused_count > 0 {
+            parts.push(format!("{} paused", self.paused_count));
         }
         parts
     }
@@ -1335,6 +1385,10 @@ pub enum VolatileKind {
     DeferredUserInput,
     /// Budget-review acknowledgment.
     BudgetReview,
+    /// Context-pressure guidance from [`RuntimePolicy`]. Singleton so repeated
+    /// pressure checks replace the prior guidance instead of stacking prompt
+    /// noise inside the same LLM call.
+    ContextPressure,
     /// Open-ended exploration budget reminder.
     ExplorationBudget,
     /// Execution retry with corrective reason.
@@ -1383,6 +1437,7 @@ impl VolatileKind {
             Self::WorkingSet
                 | Self::AlreadyFetched
                 | Self::ExplorationBudget
+                | Self::ContextPressure
                 | Self::Mailbox
                 | Self::CompactResume
                 | Self::TaskBoardCompletionGate
@@ -1412,6 +1467,7 @@ impl VolatileKind {
             | Self::TaskBoardStartGate
             | Self::ExecutionRetry
             | Self::ExplorationBudget
+            | Self::ContextPressure
             | Self::DeferredUserInput
             | Self::BudgetReview
             | Self::IntentDrift => "user",
@@ -1478,6 +1534,16 @@ pub struct AgenticLoopState {
     // ── Turn management ──
     pub max_turns: usize,
     pub remaining_turns: usize,
+    /// Retry counter: model stopped producing text but had called tools
+    /// in prior rounds. Incremented by `execute_turn_and_ingest_phase`
+    /// when it retries the stop; capped by `RuntimePolicy::textless.max_retries`.
+    pub textless_stop_retries: u32,
+    /// The `finish_reason` from the most recent LLM turn. `Some("length")`
+    /// when the model hit its output token limit (prose truncated by the API);
+    /// `Some("stop")` for natural completion; `None` on the first turn.
+    /// Used by textless-stop retry and terminal-text logic to distinguish
+    /// true silence from forced truncation.
+    pub last_finish_reason: Option<String>,
     /// Latches for the per-budget self-pacing hints emitted at
     /// 50 % / 20 % remaining. Reset when a budget extension
     /// lands so the newly-extended budget gets the hint sequence
@@ -1814,6 +1880,13 @@ pub struct AgenticLoopState {
     /// verification. Updated after each tool phase; read before each LLM
     /// round to auto-inject a compact self-status block into the prompt.
     pub observation_journal: ObservationJournal,
+
+    // ── Observation store (persistent cross-session storage) ──
+    /// Optional persistence backend. When set, each turn's metrics and
+    /// journal facts are write-through persisted after the in-memory
+    /// journal is updated. `None` disables persistence (default).
+    pub observation_store:
+        Option<std::sync::Arc<crate::turn::observation_store::FileObservationStore>>,
 }
 
 /// Build the stable runtime manifest carried through context metadata.
@@ -1855,11 +1928,12 @@ impl AgenticLoopState {
         };
         let load = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            task_manager.load_active_tasks(),
+            task_manager.try_snapshot_state(),
         );
         match load.await {
-            Ok(Ok(tasks)) => {
-                self.hooks.task_board_snapshot = TaskBoardSnapshot::from_active_tasks(&tasks);
+            Ok(Ok(snapshot)) => {
+                self.hooks.task_board_snapshot =
+                    TaskBoardSnapshot::from_active_tasks(&snapshot.tasks);
             }
             Ok(Err(error)) => {
                 tracing::warn!(
@@ -2679,7 +2753,10 @@ mod synthesise_finish_reason_tests {
 ///
 /// Delegates to [`make_test_loop_state_for_model`] with `None`, which
 /// resolves workflow-guard thresholds from the global config defaults.
-#[cfg(any(test, feature = "bridge-e2e-hooks"))]
+///
+/// Always available (not cfg-gated) so integration tests can construct
+/// a minimal `AgenticLoopState` without the full session lifecycle.
+#[doc(hidden)]
 pub fn make_test_loop_state() -> AgenticLoopState {
     make_test_loop_state_for_model(None)
 }
@@ -2688,7 +2765,7 @@ pub fn make_test_loop_state() -> AgenticLoopState {
 /// thresholds (`max_identical_tool_calls`, `max_tools_per_turn`) through
 /// [`astra_config::runtime_config::ToolSelectionConfig::resolve_for_model`], so a
 /// request carrying a specific model id sees that model's profile.
-#[cfg(any(test, feature = "bridge-e2e-hooks"))]
+#[doc(hidden)]
 pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
     let policy = astra_config::runtime_config::RuntimeConfig::load()
         .tool_policy
@@ -2713,6 +2790,8 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         total_tool_calls: 0,
         total_evidence_tool_calls: 0,
         has_any_usage: false,
+        textless_stop_retries: 0,
+        last_finish_reason: None,
         max_turns: 10,
         remaining_turns: 10,
         turn_budget_hint_emitted_90: false,
@@ -2805,6 +2884,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         turn_event_buffer: None,
         harness: super::super::harness_adapter::HarnessSlot::empty(),
         observation_journal: Default::default(),
+        observation_store: None,
     }
 }
 
@@ -3239,6 +3319,8 @@ pub(crate) mod tests {
             has_prior_assistant_turn: false,
             recent_tools: Vec::new(),
             task_profile: TaskExecutionProfile::default(),
+            textless_stop_retries: 0,
+            last_finish_reason: None,
             last_turn_policy: TurnInteractionPolicy::default(),
             api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             api_token: String::new(),
@@ -3289,6 +3371,7 @@ pub(crate) mod tests {
             turn_event_buffer: None,
             harness: crate::turn::harness_adapter::HarnessSlot::empty(),
             observation_journal: Default::default(),
+            observation_store: None,
         }
     }
 
@@ -3372,8 +3455,12 @@ pub(crate) mod tests {
             },
         ]);
 
+        assert_eq!(snapshot.tracked_count, 3);
         assert_eq!(snapshot.pending_count, 1);
         assert_eq!(snapshot.in_progress_count, 1);
+        assert_eq!(snapshot.paused_count, 0);
+        assert_eq!(snapshot.completed_count, 1);
+        assert_eq!(snapshot.terminal_non_success_count, 0);
         assert_eq!(snapshot.blocked_count, 1);
         assert_eq!(
             snapshot.active_tasks,
@@ -3383,6 +3470,7 @@ pub(crate) mod tests {
             ]
         );
         assert!(snapshot.has_unfinished_tasks());
+        assert!(!snapshot.all_tracked_tasks_completed());
         assert!(snapshot.short_summary().contains("task(s) remain"));
         assert_eq!(
             snapshot.status_count_summary(),
@@ -3393,7 +3481,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn task_board_snapshot_ignores_terminal_and_archived_tasks() {
+    fn task_board_snapshot_counts_terminal_and_excludes_archived_tasks() {
         let snapshot = TaskBoardSnapshot::from_active_tasks(&[
             SessionTask {
                 archived_at: None,
@@ -3457,13 +3545,67 @@ pub(crate) mod tests {
             },
         ]);
 
+        assert_eq!(snapshot.tracked_count, 3);
         assert_eq!(snapshot.pending_count, 1);
         assert_eq!(snapshot.in_progress_count, 0);
+        assert_eq!(snapshot.paused_count, 0);
+        assert_eq!(snapshot.completed_count, 1);
+        assert_eq!(snapshot.terminal_non_success_count, 1);
         assert_eq!(snapshot.blocked_count, 0);
         assert_eq!(
             snapshot.active_tasks,
             vec!["task-1 waiting [pending]".to_string()]
         );
+        assert!(!snapshot.all_tracked_tasks_completed());
+    }
+
+    #[test]
+    fn task_board_snapshot_completed_only_is_explicitly_complete() {
+        let snapshot = TaskBoardSnapshot::from_active_tasks(&[SessionTask {
+            archived_at: None,
+            id: "task-1".to_string(),
+            title: "done".to_string(),
+            description: None,
+            status: astra_tools::task_mgmt::SessionTaskStatusKind::Completed,
+            subtasks: Vec::new(),
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+            updated_at: "2025-01-01T00:00:00Z".to_string(),
+            active_form: None,
+            owner: None,
+            metadata: None,
+            blocks: Vec::new(),
+            blocked_by: Vec::new(),
+        }]);
+
+        assert_eq!(snapshot.tracked_count, 1);
+        assert_eq!(snapshot.completed_count, 1);
+        assert!(!snapshot.has_unfinished_tasks());
+        assert!(snapshot.all_tracked_tasks_completed());
+    }
+
+    #[test]
+    fn task_board_snapshot_paused_is_unfinished_work() {
+        let snapshot = TaskBoardSnapshot::from_active_tasks(&[SessionTask {
+            archived_at: None,
+            id: "task-1".to_string(),
+            title: "paused follow-up".to_string(),
+            description: None,
+            status: astra_tools::task_mgmt::SessionTaskStatusKind::Paused,
+            subtasks: Vec::new(),
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+            updated_at: "2025-01-01T00:00:00Z".to_string(),
+            active_form: None,
+            owner: None,
+            metadata: None,
+            blocks: Vec::new(),
+            blocked_by: Vec::new(),
+        }]);
+
+        assert_eq!(snapshot.tracked_count, 1);
+        assert_eq!(snapshot.paused_count, 1);
+        assert!(snapshot.has_unfinished_tasks());
+        assert!(!snapshot.all_tracked_tasks_completed());
+        assert_eq!(snapshot.status_count_summary(), "1 paused task(s) remain");
     }
 
     #[tokio::test]
@@ -8840,15 +8982,34 @@ mod parallel_execution_tests {
         let mut state = make_state();
         state.push_volatile(VolatileKind::IntentDrift, "first correction");
         state.push_volatile(VolatileKind::IntentDrift, "second correction");
+        state.push_volatile(VolatileKind::ContextPressure, "pressure 70");
+        state.push_volatile(VolatileKind::ContextPressure, "pressure 71");
         assert_eq!(
             state.volatile_pending.len(),
-            1,
+            2,
             "singleton kind must replace, not append — cache invariant violated"
         );
-        let content = state.volatile_pending[0].content.as_str();
+        let content = state
+            .volatile_pending
+            .iter()
+            .find(|entry| entry.kind == VolatileKind::IntentDrift)
+            .expect("intent drift singleton")
+            .content
+            .as_str();
         assert!(
             content.contains("second"),
             "replacement must keep the LATEST correction, got: {content}"
+        );
+        let pressure_content = state
+            .volatile_pending
+            .iter()
+            .find(|entry| entry.kind == VolatileKind::ContextPressure)
+            .expect("context pressure singleton")
+            .content
+            .as_str();
+        assert!(
+            pressure_content.contains("71"),
+            "context pressure singleton must keep the latest guidance, got: {pressure_content}"
         );
     }
 

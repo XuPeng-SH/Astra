@@ -731,6 +731,135 @@ fn ensure_terminal_text(state: &mut AgenticLoopState) {
         return;
     }
     if !state.final_text.trim().is_empty() {
+        // ── Truncation marker: finish_reason == "length" ─────────────
+        // The model produced output but the API cut it off at max_tokens.
+        // Append a visible marker so the user sees the text is incomplete.
+        // Skip exploration tasks (they tolerate truncation naturally).
+        if !state.task_profile.exploratory_task {
+            let default_policy = crate::turn::runtime_policy::RuntimePolicy::default();
+            let policy = state.budget_policy.as_ref().unwrap_or(&default_policy);
+            if let Some(marker) = policy.truncation_marker(state.last_finish_reason.as_deref()) {
+                state.final_text.push_str("\n\n");
+                state.final_text.push_str(marker);
+                state.final_text_streamed = false;
+                tracing::info!(
+                    finish_reason = "length",
+                    "ensure_terminal_text: appended truncation marker"
+                );
+            }
+        }
+        return;
+    }
+    // When the model produced tool calls (reads, edits, etc.) but no summary
+    // text, the turn was doing active work — not a truly empty completion.
+    // Use EmptyCompletion (semantically correct: loop ended, no final answer)
+    // but provide rich context so the user sees progress, not silence.
+    if state.total_tool_calls > 0 {
+        // ── Trace: textless_stop_retry was attempted but failed ──
+        if state.textless_stop_retries > 0 {
+            tracing::info!(
+                textless_stop_retries = state.textless_stop_retries,
+                total_tool_calls = state.total_tool_calls,
+                "textless_stop_retries_exhausted: model called {} tools but stopped without text after {} retry attempts",
+                state.total_tool_calls,
+                state.textless_stop_retries,
+            );
+        }
+        // ── Build tool summary (include failed tools marked as such) ──
+        let recent_tools: Vec<String> = state
+            .stall
+            .tool_call_records
+            .iter()
+            .filter_map(|r| {
+                if r.result_preview.as_deref() == Some("") {
+                    return None;
+                }
+                if r.error.is_some() {
+                    Some(format!("{}(failed)", r.name))
+                } else {
+                    Some(r.name.clone())
+                }
+            })
+            .collect();
+        let tool_summary = if recent_tools.is_empty() {
+            String::new()
+        } else {
+            let mut seen = std::collections::HashSet::new();
+            let unique: Vec<&str> = recent_tools
+                .iter()
+                .filter(|n| seen.insert(n.as_str()))
+                .map(|s| s.as_str())
+                .collect();
+            format!(
+                " Recent tools: {}. You can continue without re-reading — results are above.",
+                unique.join(", ")
+            )
+        };
+        let checkpoint_note = if state.stall.last_heavy_checkpoint.is_some() {
+            " A checkpoint was saved."
+        } else {
+            ""
+        };
+        // ── Surface pre-existing interruption reason (e.g. circuit breaker) ──
+        // When the loop was aborted by BudgetExhausted, GuardAbort, etc.
+        // the user deserves to know *why*, not just that tools ran.
+        let reason_note = match state.interruption.as_ref() {
+            Some(i)
+                if !matches!(
+                    i.kind,
+                    astra_turn_core::interruption::InterruptionKind::EmptyCompletion
+                ) =>
+            {
+                let mut note = format!(" Interruption: {}.", i.kind.label());
+                append_interruption_detail(&mut note, i);
+                note
+            }
+            _ => String::new(),
+        };
+        let textless_note = if state.last_finish_reason.as_deref() == Some("tool_calls") {
+            " The model was still requesting tools and did not produce final text."
+        } else {
+            " The loop ended without final text."
+        };
+        let rounds_completed = state.max_turns.saturating_sub(state.remaining_turns);
+        let budget_note = if state.max_turns > 0 {
+            format!(
+                " Rounds: {rounds_completed}/{} completed, {} remaining.",
+                state.max_turns, state.remaining_turns
+            )
+        } else {
+            String::new()
+        };
+        let next_step_note = " Continue to resume from the preserved state; first summarize the evidence already gathered, then choose the next targeted action or provide the final answer.";
+        // Set final_text BEFORE interruption so settlement_interruption_summary
+        // sees the populated value (avoid coupling trap).
+        state.final_text = format!(
+            "[turn_interrupted] {} tool call(s) completed.{}{}{} Work preserved above.{}{}{}",
+            state.total_tool_calls,
+            reason_note,
+            textless_note,
+            budget_note,
+            checkpoint_note,
+            tool_summary,
+            next_step_note,
+        );
+        state.final_text_streamed = false;
+
+        let detail = format!(
+            "turn ended while working: {} tool call(s) completed, last_finish_reason={}, rounds_completed={}, remaining_turns={}, max_turns={}",
+            state.total_tool_calls,
+            state.last_finish_reason.as_deref().unwrap_or("unknown"),
+            rounds_completed,
+            state.remaining_turns,
+            state.max_turns,
+        );
+        if state.interruption.is_none() {
+            state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
+                astra_turn_core::interruption::InterruptionKind::EmptyCompletion,
+                astra_turn_core::interruption::ResumeAction::ContinueImmediately,
+                settlement_interruption_summary(state, Some(detail)),
+            ));
+        }
         return;
     }
     if state.interruption.is_none() {
@@ -825,6 +954,11 @@ fn reset_per_turn_corrective_state(state: &mut AgenticLoopState) {
     // which was exactly the stale-state bug the code-review called out.
     state.budget_wrapup_injected = false;
     state.budget_wrapup_ignored_rounds = 0;
+    state.textless_stop_retries = 0;
+    // Defensive reset: last_finish_reason is rewritten before every LLM call
+    // in execution_phase.rs, but resetting here prevents stale leakage if a
+    // future early-exit path reads it before the next LLM invocation.
+    state.last_finish_reason = None;
 }
 
 /// Build a synthetic JournalEvent from the current turn's tool_call_records
@@ -1338,7 +1472,10 @@ mod tests {
             Vec::<String>::new(),
             "empty completion should preserve the user's full tool surface; settlement is guidance/state, not a tool denylist"
         );
-        assert!(state.final_text.contains("without a final answer"));
+        assert!(state.final_text.contains("[turn_interrupted]"));
+        assert!(state.final_text.contains("tool call(s) completed"));
+        assert!(state.final_text.contains("Rounds:"));
+        assert!(state.final_text.contains("Continue to resume"));
         assert_eq!(host.rendered_final_text, vec![state.final_text.clone()]);
     }
 

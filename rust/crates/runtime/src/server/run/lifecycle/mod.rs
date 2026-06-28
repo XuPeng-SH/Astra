@@ -76,6 +76,7 @@ use crate::turn::agentic_loop::host::{
     RequestConstraints, SkillState, StopHookState, run_agentic_loop_with_host,
     runtime_manifest_for_model,
 };
+use crate::turn::observation_store::default_observation_store;
 use crate::{
     DatabaseEvaluationService, DatabaseEventService, DatabaseTraceEventWriter,
     EventCreateRequestData, EventService,
@@ -142,6 +143,10 @@ fn load_budget_policy_from_config() -> Option<crate::turn::runtime_policy::Runti
         expand_factor: cfg.expand_factor,
         max_ceiling: cfg.max_ceiling,
         reflect_after_consecutive_zero: cfg.reflect_after_consecutive_zero,
+        context_pressure: Default::default(),
+        circuit: Default::default(),
+        textless: Default::default(),
+        tuning: Default::default(),
     })
 }
 
@@ -669,23 +674,26 @@ fn build_server_skill_executor(
 
     // Wire skill checkpoint manager for crash recovery resume.
     // This allows skills to resume from their last checkpoint instead of starting over.
-    #[cfg(feature = "crash-recovery")]
-    {
-        let checkpoint_dir = astra_services::session_journal::journal_file_path(session_id)
-            .parent()
-            .unwrap_or(std::path::Path::new("."))
-            .join("skill_checkpoints");
-        let checkpoint_manager = Arc::new(std::sync::Mutex::new(
-            astra_pipeline::skill_checkpoint::SkillCheckpointManager::new(checkpoint_dir),
-        ));
-        let isolated = IsolatedSkillExecutor::with_checkpoint_manager(
-            Arc::new(subrun_executor),
-            checkpoint_manager,
-        );
-        let isolated = Arc::new(isolated);
-    }
-    #[cfg(not(feature = "crash-recovery"))]
-    let isolated = Arc::new(IsolatedSkillExecutor::new(Arc::new(subrun_executor)));
+    let isolated = {
+        #[cfg(feature = "crash-recovery")]
+        {
+            let checkpoint_dir = astra_services::session_journal::journal_file_path(session_id)
+                .parent()
+                .unwrap_or(std::path::Path::new("."))
+                .join("skill_checkpoints");
+            let checkpoint_manager = Arc::new(TokioMutex::new(
+                astra_pipeline::skill_checkpoint::SkillCheckpointManager::new(checkpoint_dir),
+            ));
+            Arc::new(IsolatedSkillExecutor::with_checkpoint_manager(
+                Arc::new(subrun_executor),
+                checkpoint_manager,
+            ))
+        }
+        #[cfg(not(feature = "crash-recovery"))]
+        {
+            Arc::new(IsolatedSkillExecutor::new(Arc::new(subrun_executor)))
+        }
+    };
 
     let router = SkillExecutionRouter::new(Some(isolated));
     Some(Arc::new(router))
@@ -3292,6 +3300,8 @@ impl AgenticRunLifecycleService {
             total_cache_read: 0,
             total_cache_creation: 0,
             total_tool_calls: 0,
+            textless_stop_retries: 0,
+            last_finish_reason: None,
             total_evidence_tool_calls: 0,
             has_any_usage: false,
             max_turns,
@@ -3454,6 +3464,7 @@ impl AgenticRunLifecycleService {
                 }
             },
             observation_journal: Default::default(),
+            observation_store: default_observation_store(),
         }
     }
 
@@ -7187,6 +7198,8 @@ impl SubRunExecutor for ServerSubRunExecutor {
             total_cache_read: 0,
             total_cache_creation: 0,
             total_tool_calls: 0,
+            textless_stop_retries: 0,
+            last_finish_reason: None,
             total_evidence_tool_calls: 0,
             has_any_usage: false,
             max_turns,
@@ -7324,6 +7337,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 }
             },
             observation_journal: Default::default(),
+            observation_store: default_observation_store(),
         };
         if let Some(trace_context) = trace_context_from_subrun_context(&config.context) {
             loop_state.session_turn = u32::try_from(trace_context.turn_seq).unwrap_or(0);

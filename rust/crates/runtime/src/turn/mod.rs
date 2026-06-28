@@ -20,12 +20,17 @@ pub mod implicit_feedback {
         implicit_feedback_context_injection, implicit_feedback_rating,
     };
 }
+pub mod inspection_service;
 pub(crate) mod llm;
+pub mod local_provider;
 pub mod loop_dispatcher;
 pub mod memory_prefetch;
+pub mod observation_dispatcher;
+pub mod observation_store;
 pub mod permission_gate;
 pub(crate) mod plan_mode_guard;
 pub mod prompt_cache;
+pub mod providers;
 pub mod run_control;
 pub mod runtime_policy;
 pub mod session_current_date;
@@ -38,6 +43,7 @@ pub(crate) mod services;
 pub mod skill_tool;
 pub mod token_usage;
 pub mod tool_side_effects;
+pub mod tuning_consumer;
 pub mod turn_trace_collector;
 pub(crate) mod wire_assembly;
 

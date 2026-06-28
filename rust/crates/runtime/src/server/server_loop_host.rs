@@ -7555,6 +7555,10 @@ mod tests {
                         expand_factor: cfg.expand_factor,
                         max_ceiling: cfg.max_ceiling,
                         reflect_after_consecutive_zero: cfg.reflect_after_consecutive_zero,
+                        context_pressure: Default::default(),
+                        circuit: Default::default(),
+                        textless: Default::default(),
+                        tuning: Default::default(),
                     }
                 }),
             policy_expanded_this_turn: false,
@@ -7591,6 +7595,8 @@ mod tests {
             has_prior_assistant_turn: false,
             recent_tools: Vec::new(),
             task_profile: TaskExecutionProfile::default(),
+            textless_stop_retries: 0,
+            last_finish_reason: None,
             last_turn_policy: crate::turn::agentic_loop::host::TurnInteractionPolicy::default(),
             api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             api_token: "test-token".to_string(),
@@ -7639,6 +7645,7 @@ mod tests {
             turn_event_buffer: None,
             harness: crate::turn::harness_adapter::HarnessSlot::empty(),
             observation_journal: Default::default(),
+            observation_store: None,
         }
     }
 

@@ -31,6 +31,11 @@ use super::host::{
     finalize_turn_trace, publish_introspect_snapshot, record_edge_tool_observability,
 };
 use super::lifecycle::{TurnIterationPrep, current_agentic_step, session_turn_number};
+use crate::turn::inspection_service::InspectionService;
+use crate::turn::local_provider::LocalSessionProvider;
+use crate::turn::observation_dispatcher::TuningSink;
+use crate::turn::providers::{LiveRuntimeProvider, ObservationProvider, SessionStateProvider};
+use crate::turn::runtime_policy::RuntimePolicy;
 use astra_turn_core::agentic_post_tool_policy::{
     AgenticPostToolIterationControl, AgenticPostToolPolicyRequest, apply_agentic_post_tool_policy,
     map_post_tool_policy_outcome,
@@ -1466,7 +1471,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         model,
         prompt_tokens: turn_result.accum.prompt_tokens,
         cache_read_tokens: turn_result.accum.cache_read_tokens,
-        cache_creation_tokens: 0,
+        cache_creation_tokens: turn_result.accum.cache_creation_tokens,
         completion_tokens: turn_result.accum.completion_tokens,
         tool_calls_returned: turn_result.accum.tool_calls.len() as u32,
         tool_call_names: tool_names.clone(),
@@ -1478,25 +1483,27 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     };
     state.push_recent_round(recent_summary);
 
-    // Publish after the round summary enters the in-memory ring so the next
-    // LLM round sees the same token/cache counters and recent-round view on
-    // CLI and server surfaces.
-    let lifecycle_summary = host.turn_start_lifecycle_summary(state);
-    publish_introspect_snapshot(host, state, lifecycle_summary);
+    // ── Publish introspect snapshot ──
+    // Scoped so provider + inspection borrows are released before the
+    // mutable observation_journal access below.
+    {
+        let lifecycle_summary = host.turn_start_lifecycle_summary(state);
+        let provider = LocalSessionProvider::new(state);
+        let inspection = InspectionService::new(&provider, &provider, &provider);
+        publish_introspect_snapshot(host, state, lifecycle_summary, Some(&inspection));
+    } // provider + inspection dropped — releases immutable borrow of state
 
     // ── Record turn metrics into observation journal ──
     // Feed the sliding window so the next round's auto-injected self-status
     // block can show trends and strategy verification.
     {
-        let samples: Vec<astra_core::ToolCallSample<'_>> = state
-            .stall
-            .tool_call_records
+        let samples: Vec<astra_core::ToolCallSample<'_>> = round_tool_calls
             .iter()
             .filter(|r| !r.is_synthetic_placeholder())
             .map(|r| astra_core::ToolCallSample {
                 name: &r.name,
                 ok: r.ok,
-                round: Some(state.llm_rounds_completed),
+                round: r.round.or(Some(state.llm_rounds_completed)),
                 file_path: r.file_path.as_deref(),
                 error: r.error.as_deref(),
             })
@@ -1507,13 +1514,71 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             + state.total_cache_creation;
         let metrics =
             astra_core::TurnMetrics::from_samples(&samples, state.llm_rounds_completed, tokens);
+
+        // ── Observation pipeline: journal first, then persist updated facts ──
         state.observation_journal.record_turn(&metrics);
+        let facts = state
+            .observation_journal
+            .extract_facts(state.remaining_turns as u32, state.max_turns as u32);
+
+        if let Some(ref store) = state.observation_store {
+            let mut dispatcher = crate::turn::observation_dispatcher::ObservationDispatcher::new();
+            dispatcher.register(crate::turn::observation_dispatcher::FileSink::new(
+                Some(store.clone()),
+                state
+                    .current_session_id
+                    .as_deref()
+                    .unwrap_or_default()
+                    .to_string(),
+            ));
+            dispatcher.dispatch(
+                crate::turn::observation_dispatcher::ObservationEvent::TurnCompleted {
+                    metrics: Box::new(metrics),
+                    facts,
+                },
+            );
+        } // dispatcher dropped here — releases &mut observation_journal
+
+        // ── Tuning signal generation ──
+        // Generate adaptation signals from observation state and persist
+        // them via the TuningSink. Non-blocking: failures are logged only.
+        // Re-create provider + inspection now that the mutable borrow is released.
+        {
+            let provider = LocalSessionProvider::new(state);
+            let inspection = InspectionService::new(&provider, &provider, &provider);
+            let default_policy = crate::turn::runtime_policy::RuntimePolicy::default();
+            let policy = state.budget_policy.as_ref().unwrap_or(&default_policy);
+            let tuning_jobs = inspection.generate_tuning_signals(
+                state.llm_rounds_completed,
+                state.current_session_id.as_deref().unwrap_or_default(),
+                &policy.tuning,
+            );
+            if !tuning_jobs.is_empty() {
+                if let Some(ref store) = state.observation_store {
+                    let mut tuning_sink = crate::turn::observation_dispatcher::FileTuningSink::new(
+                        Some(store.clone()),
+                        state
+                            .current_session_id
+                            .as_deref()
+                            .unwrap_or_default()
+                            .to_string(),
+                    );
+                    if let Err(e) = tuning_sink.consume_batch(&tuning_jobs) {
+                        tracing::warn!(
+                            error = %e,
+                            count = tuning_jobs.len(),
+                            "tuning sink failure (non-fatal)"
+                        );
+                    }
+                }
+            }
+        }
 
         // ── Agent-marked strategy change ──
         // Scan memory tool calls for `strategy_change` tag so the agent
         // can explicitly signal "I changed my approach" and later see
         // before/after verification in the self-status block.
-        for record in &state.stall.tool_call_records {
+        for record in &round_tool_calls {
             if record.name == "memory" {
                 if let Some(ref args) = record.args_preview {
                     if args.contains("strategy_change") {
@@ -1533,7 +1598,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             prompt_tokens: turn_result.accum.prompt_tokens,
             completion_tokens: turn_result.accum.completion_tokens,
             cache_read_tokens: turn_result.accum.cache_read_tokens,
-            cache_creation_tokens: 0,
+            cache_creation_tokens: turn_result.accum.cache_creation_tokens,
             tool_calls_returned: turn_result.accum.tool_calls.len() as u32,
             tool_call_names: tool_names,
             // Synthesise per OpenAI protocol when upstream leaves the field
@@ -1986,7 +2051,7 @@ mod tests {
     #[test]
     fn introspect_snapshot_includes_host_lifecycle_summary() {
         let state = make_state();
-        let snapshot = build_introspect_snapshot(&state, "turn-start lifecycle".to_string());
+        let snapshot = build_introspect_snapshot(&state, "turn-start lifecycle".to_string(), None);
         assert_eq!(snapshot.lifecycle_summary, "turn-start lifecycle");
     }
 
@@ -3085,5 +3150,190 @@ esac
         assert!(dir.path().join("persist.txt").exists());
 
         cleanup_session_artifacts(&session_id);
+    }
+
+    // ── Observation Plane integration tests ──────────────────────────
+
+    use crate::turn::inspection_service::InspectionService;
+    use crate::turn::local_provider::LocalSessionProvider;
+    use crate::turn::providers::{LiveRuntimeProvider, ObservationProvider, SessionStateProvider};
+    use crate::turn::runtime_policy::RuntimePolicy;
+
+    /// Verify that InspectionService enriches snapshot with live metrics.
+    #[test]
+    fn inspection_service_enriches_introspect_snapshot() {
+        let mut state = make_state();
+        state.total_prompt = 1000;
+        state.total_cache_read = 500;
+        state.total_completion = 200;
+        state.remaining_turns = 8;
+        state.max_turns = 10;
+        state
+            .stall
+            .circuit_breaker
+            .observe(astra_turn_core::loop_circuit_breaker::RoundSignal {
+                tool_signatures: std::iter::once("read_file:/tmp/test".to_string()).collect(),
+                produced_mutation: false,
+                task_completed: false,
+                tool_count: 1,
+            });
+
+        let _policy = RuntimePolicy::default();
+        let provider = LocalSessionProvider::new(&state);
+        let inspection = InspectionService::new(&provider, &provider, &provider);
+
+        let snapshot =
+            build_introspect_snapshot(&state, "lifecycle-first".to_string(), Some(&inspection));
+
+        // Live metrics should be enriched from provider data.
+        assert!(
+            snapshot.cache_hit_ratio > 0.0,
+            "cache_hit_ratio should be enriched: got {}",
+            snapshot.cache_hit_ratio
+        );
+        assert_eq!(
+            snapshot.turns_remaining, 8,
+            "turns_remaining should be enriched"
+        );
+        assert!(
+            snapshot.circuit_breaker.is_some(),
+            "circuit_breaker should be enriched"
+        );
+        assert_eq!(snapshot.lifecycle_summary, "lifecycle-first");
+    }
+
+    /// Verify enrichment with zero state returns safe defaults.
+    #[test]
+    fn inspection_service_zero_state_returns_safe_defaults() {
+        let state = make_state();
+        let _policy = RuntimePolicy::default();
+        let provider = LocalSessionProvider::new(&state);
+        let inspection = InspectionService::new(&provider, &provider, &provider);
+
+        let snapshot =
+            build_introspect_snapshot(&state, "zero-state".to_string(), Some(&inspection));
+
+        assert_eq!(snapshot.cache_hit_ratio, 0.0);
+        assert_eq!(snapshot.turns_remaining, 10);
+        assert!(snapshot.circuit_breaker.is_some());
+        // Alerts should be empty when no errors/no pressure.
+        assert!(
+            snapshot.alerts.is_empty(),
+            "alerts should be empty for zero state, got: {:?}",
+            snapshot.alerts
+        );
+    }
+
+    /// Verify that budget_policy=None falls back to default RuntimePolicy.
+    #[test]
+    fn inspection_service_uses_default_policy_when_none() {
+        let state = make_state();
+        let _policy = RuntimePolicy::default();
+        let provider = LocalSessionProvider::new(&state);
+        let inspection = InspectionService::new(&provider, &provider, &provider);
+
+        let snapshot =
+            build_introspect_snapshot(&state, "default-policy".to_string(), Some(&inspection));
+
+        assert!(snapshot.circuit_breaker.is_some());
+    }
+
+    /// Verify ObservationDispatcher writes to memory sink.
+    #[test]
+    fn observation_dispatcher_writes_to_memory_sink() {
+        use crate::turn::observation_dispatcher::MemorySink;
+        use crate::turn::observation_dispatcher::ObservationDispatcher;
+        use crate::turn::observation_dispatcher::ObservationEvent;
+
+        let mut metrics = astra_core::TurnMetrics::default();
+        metrics.tool_calls_total = 3; // record_turn skips when tool_calls_total == 0
+        let facts = astra_core::observation_journal::JournalFacts::default();
+
+        let mut journal = astra_core::observation_journal::ObservationJournal::default();
+        assert!(journal.is_empty());
+
+        let mut dispatcher = ObservationDispatcher::new();
+        dispatcher.register(MemorySink::new(&mut journal));
+        dispatcher.dispatch(ObservationEvent::TurnCompleted {
+            metrics: Box::new(metrics),
+            facts,
+        });
+        drop(dispatcher); // release &mut journal borrow
+
+        assert!(
+            !journal.is_empty(),
+            "journal should have entries after dispatch"
+        );
+    }
+
+    /// Verify provider trait methods return safe defaults for empty state.
+    #[test]
+    fn provider_traits_return_safe_defaults_for_empty_state() {
+        let state = make_state();
+        let _policy = RuntimePolicy::default();
+        let provider = LocalSessionProvider::new(&state);
+
+        // LiveRuntimeProvider
+        assert_eq!(provider.token_pressure(), 0.0);
+        assert_eq!(provider.cache_hit_ratio(), 0.0);
+        assert_eq!(provider.current_error_rate(), 0.0);
+        assert_eq!(provider.budget_remaining(), 10);
+        assert_eq!(provider.budget_max(), 10);
+
+        // ObservationProvider
+        assert!(provider.journal_is_empty());
+        assert_eq!(provider.journal_len(), 0);
+        let facts = provider.extract_facts();
+        assert_eq!(facts.streaks.consecutive_rounds_with_outcome, 0);
+        assert_eq!(facts.streaks.consecutive_rounds_without_outcome, 0);
+
+        // SessionStateProvider
+        // Empty board means no authoritative task-progress signal.
+        assert_eq!(provider.task_completion_ratio(), 0.0);
+        assert_eq!(provider.current_phase_label(), "execution");
+        assert_eq!(provider.circuit_breaker_state(), "monitoring");
+        assert_eq!(provider.remaining_turns(), 10);
+        assert_eq!(provider.max_turns(), 10);
+    }
+
+    /// Unhappy path: InspectionService reports errors in alerts when
+    /// tool health tracker records failures via record_outcome_with_preview.
+    #[test]
+    fn inspection_service_reports_errors_in_alerts() {
+        use astra_turn_core::tool::health::ToolOutcome;
+
+        let mut state = make_state();
+        state.total_prompt = 1000;
+        // Record a failed tool outcome (record_failure only updates counters,
+        // not the outcome_cache that recent_errors() reads).
+        let failed = ToolOutcome::new(false, 100, "command not found: bash");
+        state.turn_guard.health.record_outcome_with_preview(
+            "bash:{}",
+            failed,
+            Some("command not found: bash"),
+        );
+        state.turn_guard.health.record_failure("bash");
+        // Record a successful outcome
+        let success = ToolOutcome::new(true, 50, "file content here");
+        state
+            .turn_guard
+            .health
+            .record_outcome_with_preview("read_file:/tmp/test", success, None);
+        state.turn_guard.health.record_success("read_file");
+
+        let _policy = RuntimePolicy::default();
+        let provider = LocalSessionProvider::new(&state);
+        let inspection = InspectionService::new(&provider, &provider, &provider);
+
+        let snapshot =
+            build_introspect_snapshot(&state, "errors-test".to_string(), Some(&inspection));
+
+        // Should have error alert
+        let has_error_alert = snapshot.alerts.iter().any(|a| a.contains("error_rate"));
+        assert!(
+            has_error_alert,
+            "alerts should contain error_rate when errors exist, got: {:?}",
+            snapshot.alerts
+        );
     }
 }
