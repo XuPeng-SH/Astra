@@ -60,8 +60,8 @@ help:
 	@echo "  make build-debug        - Build entire Rust workspace (debug, fast)"
 	@echo "  make build-server       - Build astra-server (release)"
 	@echo "  make build-server-debug - Build astra-server (debug, fast)"
-	@echo "  make build-cli          - Build astra + astra-admin (release)"
-	@echo "  make build-cli-debug    - Build astra + astra-admin (debug, fast)"
+	@echo "  make build-cli          - Build astra CLI (release)"
+	@echo "  make build-cli-debug    - Build astra CLI (debug, fast)"
 	@echo ""
 	@echo "Cleanup:"
 	@echo "  make clean              - Remove ALL Rust build artifacts (target/)"
@@ -76,10 +76,19 @@ help:
 	@echo "  make memoria-status     - Show Memoria status"
 	@echo "  make memoria-clean      - Stop and remove Memoria data"
 	@echo ""
+	@echo "All-in-One Docker Deployment:"
+	@echo "  make stack-env          - Create .env and generate stack secrets"
+	@echo "  make stack-up           - Start MatrixOne + Memoria + API"
+	@echo "  make stack-down         - Stop compose stack"
+	@echo "  make stack-clean        - Stop compose stack and remove MatrixOne data"
+	@echo "  make stack-status       - Show compose stack status"
+	@echo "  make stack-logs         - Follow stack logs (SERVICE=api optional)"
+	@echo ""
 	@echo "Docker API (alternative to source mode):"
 	@echo "  make dev-start-docker   - Start deps + API in Docker"
 	@echo "  make dev-api-docker-up  - Start API server in Docker"
 	@echo "  make dev-api-docker-down - Stop API server Docker container"
+	@echo "  make release-docker     - Build and push Docker image (VERSION=..., CONFIRM=yes)"
 
 # ============================================================================
 # Variables
@@ -93,7 +102,23 @@ RUST_TARGET_DIR := rust/target
 RUST_DEBUG_BIN_DIR := $(RUST_TARGET_DIR)/debug
 RUST_RELEASE_BIN_DIR := $(RUST_TARGET_DIR)/release
 API_SERVER_BIN := astra-server
-CLI_BINS := astra astra-admin
+CLI_BINS := astra
+CLI_RELEASE_FLAGS ?= --no-default-features
+IMAGE_NAME ?= matrixorigin/astra
+DOCKER_BUILD_ARGS ?=
+DOCKER_PROXY_BUILD_ARGS := --build-arg http_proxy --build-arg https_proxy --build-arg no_proxy --build-arg HTTP_PROXY --build-arg HTTPS_PROXY --build-arg NO_PROXY
+IMAGE_VERSION ?= $(if $(VERSION),$(VERSION),dev)
+IMAGE_REVISION ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
+IMAGE_BRANCH ?= $(shell git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)
+DOCKER_METADATA_BUILD_ARGS := --build-arg IMAGE_VERSION=$(IMAGE_VERSION) --build-arg IMAGE_REVISION=$(IMAGE_REVISION) --build-arg IMAGE_BRANCH=$(IMAGE_BRANCH)
+# Project-wide default for every API server mode. Compose may remap the
+# host-facing port, but the container listens on this value.
+DEFAULT_API_PORT := 17001
+STACK_DIR := deployment/all-in-one
+STACK_ENV := $(STACK_DIR)/.env
+STACK_COMPOSE := cd $(STACK_DIR) && docker compose --env-file $(abspath $(STACK_ENV))
+STACK_SECRET_ENV := ASTRA_JWT_SECRET ASTRA_TOKEN_ENCRYPTION_KEY ASTRA_BRIDGE_SECRET MEMORIA_MASTER_KEY
+STACK_REQUIRED_ENV := $(STACK_SECRET_ENV) MEMORIA_EMBEDDING_API_KEY MEMORIA_EMBEDDING_BASE_URL
 
 # Per-test-case hard budget. Any case running longer than the budget is
 # killed and counted as FAIL. Nextest has no CLI override for slow-timeout
@@ -293,10 +318,11 @@ dev-api-status:
 	@echo "=================="
 	@if [ -f api_server.pid ] && kill -0 $$(cat api_server.pid) 2>/dev/null; then \
 		echo "  ✅ Running (PID: $$(cat api_server.pid))"; \
+		API_PORT=$${ASTRA_API_PORT:-$(DEFAULT_API_PORT)}; \
 		if command -v jq >/dev/null 2>&1; then \
-			NO_PROXY=localhost curl -s http://localhost:8000/health 2>/dev/null | jq . || echo "  ⚠️  Health check failed"; \
+			NO_PROXY=localhost curl -s http://localhost:$$API_PORT/health 2>/dev/null | jq . || echo "  ⚠️  Health check failed"; \
 		else \
-			NO_PROXY=localhost curl -s http://localhost:8000/health 2>/dev/null || echo "  ⚠️  Health check failed"; \
+			NO_PROXY=localhost curl -s http://localhost:$$API_PORT/health 2>/dev/null || echo "  ⚠️  Health check failed"; \
 		fi; \
 	else \
 		echo "  ❌ Not running"; \
@@ -378,24 +404,24 @@ dev-web-status:
 .PHONY: dev-api-docker-build
 dev-api-docker-build:
 	@echo "Building API server image..."
-	@docker build -t astra-engine:latest .
+	@docker build $(DOCKER_PROXY_BUILD_ARGS) $(DOCKER_METADATA_BUILD_ARGS) $(DOCKER_BUILD_ARGS) -t $(IMAGE_NAME):latest .
 	@echo "✅ Image built"
 
 .PHONY: dev-api-docker-up
 dev-api-docker-up:
 	@echo "Starting API server (Docker mode)..."
-	@cd deployment/all-in-one && docker compose --profile app up -d --build api
+	@cd deployment/all-in-one && docker compose --env-file ../../.env up -d --no-deps api
 	@echo "✅ API server container started"
 
 .PHONY: dev-api-docker-down
 dev-api-docker-down:
 	@echo "Stopping API server containers..."
-	@cd deployment/all-in-one && docker compose --profile app down
+	@cd deployment/all-in-one && docker compose --env-file ../../.env stop api && docker compose --env-file ../../.env rm -f api
 	@echo "✅ API server containers stopped"
 
 .PHONY: dev-api-docker-logs
 dev-api-docker-logs:
-	@cd deployment/all-in-one && docker compose logs -f api
+	@cd deployment/all-in-one && docker compose --env-file ../../.env logs -f api
 
 .PHONY: dev-api-docker-scale
 dev-api-docker-scale:
@@ -404,8 +430,158 @@ dev-api-docker-scale:
 		exit 1; \
 	fi
 	@echo "Scaling API server to $(REPLICAS) replicas..."
-	@cd deployment/all-in-one && docker compose --profile app up -d --scale api=$(REPLICAS)
+	@cd deployment/all-in-one && docker compose --env-file ../../.env up -d --no-deps --scale api=$(REPLICAS) api
 	@echo "✅ Scaled to $(REPLICAS) replicas"
+
+.PHONY: release-docker
+release-docker:
+	@if [ -z "$(VERSION)" ]; then \
+		echo "❌ VERSION is required, for example: make release-docker VERSION=0.1.0 CONFIRM=yes"; \
+		exit 1; \
+	fi
+	@if [ "$(CONFIRM)" != "yes" ]; then \
+		echo "❌ Refusing to push Docker image without explicit confirmation."; \
+		echo "   Run: make release-docker VERSION=$(VERSION) CONFIRM=yes"; \
+		exit 1; \
+	fi
+	@echo "Building Docker image $(IMAGE_NAME):latest..."
+	@docker build $(DOCKER_PROXY_BUILD_ARGS) $(DOCKER_METADATA_BUILD_ARGS) $(DOCKER_BUILD_ARGS) -t $(IMAGE_NAME):latest .
+	@if [ -n "$(VERSION)" ]; then docker tag $(IMAGE_NAME):latest $(IMAGE_NAME):$(VERSION); fi
+	@docker push $(IMAGE_NAME):latest
+	@if [ -n "$(VERSION)" ]; then docker push $(IMAGE_NAME):$(VERSION); fi
+	@echo "✅ Pushed Docker image $(IMAGE_NAME)"
+
+# ============================================================================
+# Compose Stack Deployment
+# ============================================================================
+
+.PHONY: stack-env
+stack-env:
+	@if [ -f "$(STACK_ENV)" ]; then \
+		echo "✅ $(STACK_ENV) already exists"; \
+	else \
+		cp $(STACK_DIR)/.env.example $(STACK_ENV); \
+		echo "✅ Created $(STACK_ENV)"; \
+	fi; \
+	if ! command -v openssl >/dev/null 2>&1; then \
+		echo "❌ openssl is required to generate stack secrets"; \
+		exit 1; \
+	fi; \
+	has_env_value() { \
+		key="$$1"; \
+		awk -v key="$$key" ' \
+			/^[[:space:]]*#/ { next } \
+			{ \
+				line = $$0; \
+				sub(/^[[:space:]]*/, "", line); \
+				if (line ~ "^" key "[[:space:]]*=") { \
+					sub(/^[^=]*=/, "", line); \
+					sub(/^[[:space:]]*/, "", line); \
+					lower = tolower(line); \
+					if (line != "" && lower !~ /(change[-_]?me|change-in-production|astra-dev-|dev-master-key|your-)/) found = 1; \
+				} \
+			} \
+			END { exit found ? 0 : 1 } \
+		' "$(STACK_ENV)"; \
+	}; \
+	set_env_value() { \
+		key="$$1"; \
+		value="$$2"; \
+		tmp="$$(mktemp)"; \
+		awk -v key="$$key" -v value="$$value" ' \
+			BEGIN { done = 0 } \
+			{ \
+				line = $$0; \
+				sub(/^[[:space:]]*/, "", line); \
+				if (line ~ "^" key "[[:space:]]*=") { \
+					print key "=" value; \
+					done = 1; \
+					next; \
+				} \
+				print; \
+			} \
+			END { if (!done) print key "=" value } \
+		' "$(STACK_ENV)" > "$$tmp"; \
+		mv "$$tmp" "$(STACK_ENV)"; \
+	}; \
+	ensure_secret() { \
+		key="$$1"; \
+		if has_env_value "$$key"; then \
+			echo "✅ $$key already configured"; \
+			return 0; \
+		fi; \
+		value="$$(openssl rand -hex 32)"; \
+		set_env_value "$$key" "$$value"; \
+		echo "✅ Generated $$key"; \
+	}; \
+	ensure_secret ASTRA_JWT_SECRET; \
+	ensure_secret ASTRA_TOKEN_ENCRYPTION_KEY; \
+	ensure_secret ASTRA_BRIDGE_SECRET; \
+	ensure_secret MEMORIA_MASTER_KEY; \
+	echo "Edit required embedding config before running: make stack-up"
+
+.PHONY: stack-check-env
+stack-check-env:
+	@if [ ! -f "$(STACK_ENV)" ]; then \
+		echo "❌ Missing $(STACK_ENV)"; \
+		echo "   Run: make stack-env"; \
+		exit 1; \
+	fi
+	@missing=""; \
+	for key in $(STACK_REQUIRED_ENV); do \
+		if ! awk -v key="$$key" ' \
+			/^[[:space:]]*#/ { next } \
+			{ \
+				line = $$0; \
+				sub(/^[[:space:]]*/, "", line); \
+				if (line ~ "^" key "[[:space:]]*=") { \
+					sub(/^[^=]*=/, "", line); \
+					sub(/^[[:space:]]*/, "", line); \
+					lower = tolower(line); \
+					if (line != "" && lower !~ /(change[-_]?me|change-in-production|astra-dev-|dev-master-key|your-)/) found = 1; \
+				} \
+			} \
+			END { exit found ? 0 : 1 } \
+		' "$(STACK_ENV)"; then \
+			missing="$$missing $$key"; \
+		fi; \
+	done; \
+	if [ -n "$$missing" ]; then \
+		echo "❌ Missing or insecure required config in $(STACK_ENV):$$missing"; \
+		echo "   Run make stack-env to generate secrets, then fill embedding config."; \
+		exit 1; \
+	fi
+
+.PHONY: stack-config
+stack-config: stack-check-env
+	@$(STACK_COMPOSE) config --quiet
+	@echo "✅ Compose stack config OK"
+
+.PHONY: stack-up
+stack-up: stack-config
+	@echo "Starting compose stack..."
+	@$(STACK_COMPOSE) up -d
+	@echo "✅ Compose stack started"
+	@API_PORT=$$(sed -n 's/^ASTRA_API_PORT=//p' $(STACK_ENV) | tail -1); \
+	echo "   API: http://localhost:$${API_PORT:-$(DEFAULT_API_PORT)}"
+
+.PHONY: stack-down
+stack-down:
+	@$(STACK_COMPOSE) down
+	@echo "✅ Compose stack stopped"
+
+.PHONY: stack-clean
+stack-clean:
+	@$(STACK_COMPOSE) down -v
+	@echo "✅ Compose stack stopped and volumes removed"
+
+.PHONY: stack-status
+stack-status: stack-check-env
+	@$(STACK_COMPOSE) ps
+
+.PHONY: stack-logs
+stack-logs: stack-check-env
+	@$(STACK_COMPOSE) logs -f $(SERVICE)
 
 # ============================================================================
 # Composite Commands
@@ -415,7 +591,7 @@ dev-api-docker-scale:
 dev-start: dev-deps-up dev-deps-wait dev-api-start dev-web-start
 	@echo ""
 	@echo "✅ Development environment started!"
-	@echo "   API: http://localhost:8000"
+	@echo "   API: http://localhost:$${ASTRA_API_PORT:-$(DEFAULT_API_PORT)}"
 	@echo "   Web: http://localhost:$${ASTRA_WEB_PORT:-$${WEB_PORT:-3536}}"
 	@echo ""
 	@echo "Next steps:"
@@ -424,11 +600,12 @@ dev-start: dev-deps-up dev-deps-wait dev-api-start dev-web-start
 	@echo "  astra chat"
 
 .PHONY: dev-start-docker
+# Docker API mode reuses the dev dependency stack; dev-api-docker-up starts only api.
 dev-start-docker: dev-deps-up dev-deps-wait dev-api-docker-up
 	@sleep 3
 	@echo ""
 	@echo "✅ Development environment ready (Docker mode)!"
-	@echo "   API: http://localhost:8000"
+	@echo "   API: http://localhost:$${ASTRA_API_PORT:-$(DEFAULT_API_PORT)}"
 
 .PHONY: dev-stop
 dev-stop: dev-web-stop dev-api-stop dev-deps-down
@@ -487,13 +664,13 @@ dev-seed:
 	@$(MAKE) dev-api-restart-debug build-cli-debug
 	@sleep 2
 	@echo "Registering admin (admin@mo.com)..."
-	@NO_PROXY=localhost ./rust/target/debug/astra-admin register \
+	@NO_PROXY=localhost ./rust/target/debug/astra admin register \
 		--username admin --password 11111111 --email admin@mo.com
 	@echo "Logging in as admin..."
-	@NO_PROXY=localhost ./rust/target/debug/astra-admin login \
+	@NO_PROXY=localhost ./rust/target/debug/astra admin login \
 		--username admin --password 11111111
 	@echo "Loading models from .models.yaml..."
-	@NO_PROXY=localhost ./rust/target/debug/astra-admin model load .models.yaml
+	@NO_PROXY=localhost ./rust/target/debug/astra admin model load .models.yaml
 	@echo ""
 	@echo "✅ Seed complete — admin@mo.com / 11111111"
 
@@ -515,8 +692,8 @@ build-cli: build-cli-release
 
 .PHONY: build-cli-release
 build-cli-release: sweep
-	@echo "Building astra + astra-admin (release)..."
-	@$(CARGO) build $(CARGO_MANIFEST_FLAG) -p astra-cli -p astra-admin-cli --release
+	@echo "Building astra CLI (release)..."
+	@$(CARGO) build $(CARGO_MANIFEST_FLAG) -p astra-cli --release --bin astra $(CLI_RELEASE_FLAGS)
 	@echo "Binaries:"
 	@for bin in $(CLI_BINS); do echo "  $(RUST_RELEASE_BIN_DIR)/$$bin"; done
 
@@ -539,8 +716,8 @@ build-debug:
 
 .PHONY: build-cli-debug
 build-cli-debug:
-	@echo "Building astra + astra-admin (debug)..."
-	@$(CARGO) build $(CARGO_MANIFEST_FLAG) -p astra-cli -p astra-admin-cli
+	@echo "Building astra CLI (debug)..."
+	@$(CARGO) build $(CARGO_MANIFEST_FLAG) -p astra-cli --bin astra
 	@echo "Binaries:"
 	@for bin in $(CLI_BINS); do echo "  $(RUST_DEBUG_BIN_DIR)/$$bin"; done
 
@@ -701,7 +878,7 @@ test-ignored-integration:
 	fi
 
 # Online (MatrixOne): opt-in #[ignore] integration binaries (see test-ignored-integration).
-# @astra/sdk remote E2E is opt-in (ASTRA_SDK_ONLINE_E2E=1) so CI make test-online has no API on :8000.
+# @astra/sdk remote E2E is opt-in (ASTRA_SDK_ONLINE_E2E=1) so CI make test-online has no API on :$(DEFAULT_API_PORT).
 # Args for test-online's helper `run_mysql_ddl`: $$1 = SQL to execute; remaining args = optional mysql flags.
 .PHONY: test-online
 test-online:
@@ -795,7 +972,7 @@ test-saas:
 		-- --ignored --nocapture reaper_marks_stale --test-threads=1 \
 	|| { echo "❌ test-saas failed (Rust)"; exit 1; }; \
 	echo "Rust SaaS E2E passed"; \
-	API_PORT=$${ASTRA_API_PORT:-8000}; \
+		API_PORT=$${ASTRA_API_PORT:-$(DEFAULT_API_PORT)}; \
 	HEALTH=$$(curl -sf -o /dev/null -w '%{http_code}' "http://127.0.0.1:$$API_PORT/health" 2>/dev/null || echo 000); \
 	if [ "$$HEALTH" = "200" ]; then \
 		if command -v npm >/dev/null 2>&1; then \
@@ -904,7 +1081,7 @@ test-sdk-online:
 	@cd packages/sdk && npm install --no-audit --no-fund --ignore-scripts
 	@bash -ec 'set -a; [ -f "$(CURDIR)/.env" ] && . "$(CURDIR)/.env"; set +a; \
 		export ASTRA_SDK_E2E=1; \
-		export ASTRA_SDK_BASE_URL="$${ASTRA_SDK_BASE_URL:-http://127.0.0.1:$${ASTRA_API_PORT:-8000}}"; \
+		export ASTRA_SDK_BASE_URL="$${ASTRA_SDK_BASE_URL:-http://127.0.0.1:$${ASTRA_API_PORT:-$(DEFAULT_API_PORT)}}"; \
 		cd "$(CURDIR)/packages/sdk" && npm run test:integration:local && npm run test:online'
 
 .PHONY: test-contract

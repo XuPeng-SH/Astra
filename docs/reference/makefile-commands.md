@@ -17,7 +17,7 @@
 | --- | --- |
 | `make test` | `test-offline` + `test-online` (see rows below; SDK **remote** E2E only if `ASTRA_SDK_ONLINE_E2E=1`) |
 | `make test-offline` | Rust: workspace + `bridge-e2e-hooks`. JS SDK (`packages/sdk`): `typecheck`, `ASTRA_SDK_E2E=1` Jest with coverage (unit + in-process Mode A), `build` |
-| `make test-online` | Rust: astra-runtime `#[ignore]` + Matrix / services ignored suites (needs **live DB** e.g. `dev-deps` in CI). **JS SDK** remote Jest/smoke runs **only** when `ASTRA_SDK_ONLINE_E2E=1` (and a live API, e.g. `make dev-start`); otherwise skipped so CI does not need HTTP on :8000 |
+| `make test-online` | Rust: astra-runtime `#[ignore]` + Matrix / services ignored suites (needs **live DB** e.g. `dev-deps` in CI). **JS SDK** remote Jest/smoke runs **only** when `ASTRA_SDK_ONLINE_E2E=1` (and a live API, e.g. `make dev-start`); otherwise skipped so CI does not need HTTP on :17001 |
 | `make test-sdk-offline` | `@astra/sdk` only — same SDK steps as the SDK portion of `test-offline` |
 | `make test-sdk-online` | `@astra/sdk` only — Jest remote integration + `test:online` smoke; **requires a running API**; also invoked from `test-online` when `ASTRA_SDK_ONLINE_E2E=1` |
 | `make test-contract` | Run `http_contract` / `admin_contract` (astra-runtime) + settings JSON contract (`astra-core` `settings_contract_tests`) |
@@ -42,8 +42,8 @@
 | `make build-release` | Build the Rust workspace in release mode (`rust/target/release`) |
 | `make build-server` | Build `astra-server` in release mode (same as `build-server-release`) |
 | `make build-server-release` | Build `astra-server` in release mode |
-| `make build-cli` | Build `astra` and `astra-admin` in release mode (same as `build-cli-release`) |
-| `make build-cli-release` | Build `astra` and `astra-admin` in release mode |
+| `make build-cli` | Build the `astra` CLI in release mode (same as `build-cli-release`) |
+| `make build-cli-release` | Build the `astra` CLI in release mode |
 
 ## Memoria
 

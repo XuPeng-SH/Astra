@@ -37,9 +37,8 @@ astra-engine/
 │   ├── git_for_data.py     # Snapshot, time-travel, clone
 │   └── validation.py       # Input validation utilities
 │
-├── cli/                    # Command-line interfaces
-│   ├── astra_cli (Rust)    # User CLI (chat, skill, session, replay) — `rust/crates/astra-cli`
-│   └── astra-admin (Rust)  # Admin CLI — `rust/crates/astra-admin`
+├── cli/                    # Command-line interface
+│   └── astra (Rust)        # Chat, skill, session, replay, and admin commands — `rust/crates/astra-cli`
 │
 ├── config/                 # Configuration
 │   └── settings.py         # Environment-based settings
@@ -57,10 +56,10 @@ astra-engine/
 
 ```bash
 # Development
-ASTRA_API_HOST=0.0.0.0 ASTRA_API_PORT=8000 astra-server
+ASTRA_API_HOST=0.0.0.0 ASTRA_API_PORT=17001 astra-server
 
 # Production
-ASTRA_API_HOST=0.0.0.0 ASTRA_API_PORT=8000 astra-server
+ASTRA_API_HOST=0.0.0.0 ASTRA_API_PORT=17001 astra-server
 ```
 
 Features: structured JSON logging, JWT auth, rate limiting (60 req/min), health checks, Prometheus metrics.
@@ -102,13 +101,13 @@ cd deployment/all-in-one && docker-compose --profile full up -d
 LLM provider configuration is managed server-side via the admin CLI, not env vars:
 
 ```bash
-astra-admin model add gpt-4o-mini openai --api-key sk-... --base-url https://api.openai.com/v1
-astra-admin model check gpt-4o-mini                       # activate if reachable
-astra-admin config set reasoning_model_name gpt-4o-mini   # (optional) judge/summary model
+astra admin model add gpt-4o-mini openai --api-key sk-... --base-url https://api.openai.com/v1
+astra admin model check gpt-4o-mini                       # activate if reachable
+astra admin config set reasoning_model_name gpt-4o-mini   # (optional) judge/summary model
 ```
 
 Without an explicit reasoning model, the server picks the cheapest active model by `pricing.completion`.
 
 ## Database Initialization
 
-Tables auto-initialize on first API start or `astra-admin init`. Schema is defined in `api/database.py` and `scripts/init-db.sh`.
+Tables auto-initialize on first API start or `astra admin init`. Schema is defined in `api/database.py` and `scripts/init-db.sh`.

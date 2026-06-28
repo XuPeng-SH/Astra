@@ -25,13 +25,13 @@ make dev-deps-up      # MatrixOne + Memoria
 make dev-api-start    # API server (auto-creates database schema)
 ```
 
-Open `http://localhost:8000/health` to verify.
+Open `http://localhost:17001/health` to verify.
 
 You can also start the runtime directly from the CLI:
 
 ```bash
-astra serve                         # HTTP API server, defaults to 127.0.0.1:8000
-astra serve http --port 8000        # explicit HTTP mode
+astra serve                         # HTTP API server, defaults to 127.0.0.1:17001
+astra serve http --port 17001        # explicit HTTP mode
 astra serve stdio                   # stdio JSON-RPC app-server mode
 ```
 
@@ -49,9 +49,9 @@ astra serve stdio                   # stdio JSON-RPC app-server mode
 ### 4. Load Models & Login
 
 ```bash
-astra-admin register
-astra-admin login
-astra-admin model load .models.yaml
+astra admin register
+astra admin login
+astra admin model load .models.yaml
 
 astra chat -m "hello"   # prompts login/register on first run
 ```
@@ -133,8 +133,7 @@ rust/crates/
   core/        shared types and config
   services/    sessions, journals, durable tasks
   runtime/     Axum HTTP server + contract tests
-  astra-cli/   CLI, plan executor, code intel
-  astra-admin/ admin CLI
+  astra-cli/   single CLI, admin commands, plan executor, code intel
 deployment/
   all-in-one/  Docker Compose (deps + app)
 skills/        Agent skill definitions

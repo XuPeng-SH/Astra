@@ -255,9 +255,10 @@ pub const CHAT_ROUTE: &str = "/chat/route";
 /// Lightweight LLM proxy for verification judge / edge components.
 pub const COMPLETIONS: &str = "/v1/chat/completions";
 
-// ── Admin API (`astra-admin-cli` → same server) ───────────────────────────────
+// ── Admin API (`astra-cli` → same server) ───────────────────────────────
 
 pub const ADMIN_INIT: &str = "/admin/init";
+pub const ADMIN_REGISTER: &str = "/admin/register";
 pub const ADMIN_AUDIT: &str = "/admin/audit";
 pub const ADMIN_USERS_GRANT_ROLE: &str = "/admin/users/grant-role";
 pub const ADMIN_USERS_REVOKE_ROLE: &str = "/admin/users/revoke-role";
@@ -396,6 +397,7 @@ mod tests {
             CHAT_ROUTE,
             COMPLETIONS,
             ADMIN_INIT,
+            ADMIN_REGISTER,
             ADMIN_AUDIT,
             ADMIN_USERS_GRANT_ROLE,
             ADMIN_USERS_REVOKE_ROLE,

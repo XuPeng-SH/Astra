@@ -28,6 +28,10 @@ Use these files as the canonical configuration references:
 
 - `ASTRA_API_HOST`, `ASTRA_API_PORT`, `ASTRA_CORS_ORIGINS`
 
+`ASTRA_API_PORT` defaults to `17001` across source, Docker API, and all-in-one
+stack modes. In the all-in-one compose stack, this value controls the
+host-facing published port; the API container listens on port `17001`.
+
 ### Auth secrets (REQUIRED in production)
 
 - `ASTRA_JWT_SECRET`
@@ -44,10 +48,10 @@ Use these files as the canonical configuration references:
 LLM models are **not** configured via env vars. Use the admin CLI:
 
 ```bash
-astra-admin model add <name> <provider> --api-key ... --base-url ...
-astra-admin model check <name>                    # probe + activate
-astra-admin model list                            # see all configured models
-astra-admin config set reasoning_model_name <n>   # optional: pin the judge/summary model
+astra admin model add <name> <provider> --api-key ... --base-url ...
+astra admin model check <name>                    # probe + activate
+astra admin model list                            # see all configured models
+astra admin config set reasoning_model_name <n>   # optional: pin the judge/summary model
 ```
 
 If `reasoning_model_name` is not set, the server falls back to the cheapest active model by `pricing.completion`.
