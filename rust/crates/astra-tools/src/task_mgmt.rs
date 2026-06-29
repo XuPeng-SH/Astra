@@ -1255,75 +1255,6 @@ pub(crate) fn prefix_summary(summary: impl Into<String>, json_body: String) -> S
     format!("{}\n{}", summary.into(), json_body)
 }
 
-fn task_board_summary_value(tasks: &[SessionTask]) -> Value {
-    const ACTIVE_TASK_PREVIEW_LIMIT: usize = 20;
-
-    let mut pending = 0usize;
-    let mut in_progress = 0usize;
-    let mut paused = 0usize;
-    let mut completed = 0usize;
-    let mut failed = 0usize;
-    let mut cancelled = 0usize;
-    let mut archived = 0usize;
-    let mut active_tasks = Vec::new();
-
-    for task in tasks {
-        match task.status {
-            SessionTaskStatusKind::Pending => pending += 1,
-            SessionTaskStatusKind::InProgress => in_progress += 1,
-            SessionTaskStatusKind::Paused => paused += 1,
-            SessionTaskStatusKind::Completed => completed += 1,
-            SessionTaskStatusKind::Failed => failed += 1,
-            SessionTaskStatusKind::Cancelled => cancelled += 1,
-            SessionTaskStatusKind::Archived => archived += 1,
-            SessionTaskStatusKind::Deleted
-            | SessionTaskStatusKind::Migrated
-            | SessionTaskStatusKind::Other => {}
-        }
-        if matches!(
-            task.status,
-            SessionTaskStatusKind::Pending
-                | SessionTaskStatusKind::InProgress
-                | SessionTaskStatusKind::Paused
-        ) && active_tasks.len() < ACTIVE_TASK_PREVIEW_LIMIT
-        {
-            active_tasks.push(json!({
-                "id": task.id,
-                "title": task.title,
-                "status": task.status,
-            }));
-        }
-    }
-
-    let open = pending + in_progress + paused;
-    json!({
-        "board_counts": {
-            "total": tasks.len(),
-            "open": open,
-            "pending": pending,
-            "in_progress": in_progress,
-            "paused": paused,
-            "completed": completed,
-            "failed": failed,
-            "cancelled": cancelled,
-            "archived": archived,
-        },
-        "active_tasks": active_tasks,
-        "active_tasks_truncated": open > ACTIVE_TASK_PREVIEW_LIMIT,
-    })
-}
-
-fn mutation_json_with_board(mut body: Value, tasks: &[SessionTask]) -> String {
-    if let Value::Object(map) = &mut body
-        && let Value::Object(summary) = task_board_summary_value(tasks)
-    {
-        for (key, value) in summary {
-            map.insert(key, value);
-        }
-    }
-    body.to_string()
-}
-
 const VALID_UPDATE_STATUSES: &[&str] = &[
     "pending",
     "in_progress",
@@ -2420,7 +2351,7 @@ impl TaskManager {
                                 "Refused: open task #{} already has this title — use update / get instead",
                                 dup.id
                             ),
-                            mutation_json_with_board(json!({
+                            json!({
                                 "success": false,
                                 "duplicate_of": dup.id,
                                 "duplicate_title": dup.title,
@@ -2429,7 +2360,8 @@ impl TaskManager {
                                     "Refused: an open task with the same normalized title already exists (id={}). Use task(action='update') or task(action='get') instead of creating a duplicate.",
                                     dup.id
                                 ),
-                            }), &tasks),
+                            })
+                            .to_string(),
                         );
                         return Ok(TaskMutationResult {
                             tasks,
@@ -2453,7 +2385,7 @@ impl TaskManager {
                                  Contact support or use `task(action='list')` to see the \
                                  current task list and manually continue from the last id."
                             ),
-                            mutation_json_with_board(json!({
+                            json!({
                                 "success": false,
                                 "error": "counter_desync",
                                 "conflicting_id": task_id,
@@ -2461,7 +2393,8 @@ impl TaskManager {
                                     "Task id '{task_id}' already exists in this session; \
                                      counter is out of sync with the task list."
                                 ),
-                            }), &tasks),
+                            })
+                            .to_string(),
                         );
                         return Ok(TaskMutationResult {
                             tasks,
@@ -2493,13 +2426,14 @@ impl TaskManager {
                     }
                     let response = prefix_summary(
                         format!("Task #{task_id} created: {mutation_title}"),
-                        mutation_json_with_board(json!({
+                        json!({
                             "success": true,
                             "task_id": task_id,
                             "blocks": proposed_blocks,
                             "blocked_by": proposed_blocked_by,
                             "message": format!("Task '{}' created successfully", mutation_title)
-                        }), &tasks),
+                        })
+                        .to_string(),
                     );
                     let next_task_id = next.checked_add(1).ok_or_else(|| {
                         "task id counter overflow for session during create".to_string()
@@ -2922,7 +2856,7 @@ impl TaskManager {
                             format!(
                                 "Subtask {st_id} of #{task_id}: {previous_status} → {final_subtask_status}"
                             ),
-                            mutation_json_with_board(json!({
+                            json!({
                                 "success": true,
                                 "task_id": task_id,
                                 "subtask_id": st_id,
@@ -2930,7 +2864,8 @@ impl TaskManager {
                                 "status": final_subtask_status,
                                 "reason": reason,
                                 "message": format!("Subtask '{}' updated to '{}'", st_id, final_subtask_status)
-                            }), &tasks),
+                            })
+                            .to_string(),
                         );
                         return Ok(TaskMutationResult {
                             tasks,
@@ -2952,13 +2887,14 @@ impl TaskManager {
                         detach_task_dependency_edges(&mut tasks, &deleted_ids);
                         let response = prefix_summary(
                             format!("Task #{task_id} deleted (was: {previous_status})"),
-                            mutation_json_with_board(json!({
+                            json!({
                                 "success": true,
                                 "task_id": task_id,
                                 "previous_status": previous_status,
                                 "status": "deleted",
                                 "message": format!("Task '{}' deleted", task_id)
-                            }), &tasks),
+                            })
+                            .to_string(),
                         );
                         return Ok(TaskMutationResult {
                             tasks,
@@ -2987,7 +2923,7 @@ impl TaskManager {
                                     "Refused: open task #{} already has this title — keep task titles distinct or update the existing task",
                                     dup.id
                                 ),
-                                mutation_json_with_board(json!({
+                                json!({
                                     "success": false,
                                     "duplicate_of": dup.id,
                                     "duplicate_title": dup.title,
@@ -2999,7 +2935,8 @@ impl TaskManager {
                                         dup.title,
                                         dup.id
                                     ),
-                                }), &tasks),
+                                })
+                                .to_string(),
                             );
                             return Ok(TaskMutationResult {
                                 tasks,
@@ -3213,13 +3150,14 @@ impl TaskManager {
 
                     let response = prefix_summary(
                         format!("Task #{task_id}: {previous_status} → {final_status}"),
-                        mutation_json_with_board(json!({
+                        json!({
                             "success": true,
                             "task_id": task_id,
                             "previous_status": previous_status,
                             "status": final_status,
                             "message": format!("Task '{}' updated to '{}'", task_id, final_status)
-                        }), &tasks),
+                        })
+                        .to_string(),
                     );
                     Ok(TaskMutationResult {
                         tasks,
@@ -3343,21 +3281,21 @@ impl TaskManager {
                     let task_status = tasks[task_idx].status;
 
                     if !task_status.can_be_stopped() {
-                        let response = prefix_summary(
-                            format!(
-                                "Refused: task #{task_id} is '{task_status}' — only pending, in_progress, or paused tasks can be stopped"
-                            ),
-                            mutation_json_with_board(json!({
-                                "success": false,
-                                "task_id": task_id,
-                                "status": task_status,
-                                "message": format!("Cannot stop task '{}': status is '{}' (only 'pending', 'in_progress', or 'paused' can be stopped)", task_id, task_status)
-                            }), &tasks),
-                        );
                         return Ok(TaskMutationResult {
                             tasks,
                             next_task_id: None,
-                            response,
+                            response: prefix_summary(
+                                format!(
+                                    "Refused: task #{task_id} is '{task_status}' — only pending, in_progress, or paused tasks can be stopped"
+                                ),
+                                json!({
+                                    "success": false,
+                                    "task_id": task_id,
+                                    "status": task_status,
+                                    "message": format!("Cannot stop task '{}': status is '{}' (only 'pending', 'in_progress', or 'paused' can be stopped)", task_id, task_status)
+                                })
+                                .to_string(),
+                            ),
                         });
                     }
 
@@ -3389,14 +3327,15 @@ impl TaskManager {
                     };
                     let response = prefix_summary(
                         summary,
-                        mutation_json_with_board(json!({
+                        json!({
                             "success": true,
                             "task_id": task_id,
                             "previous_status": previous_status,
                             "reason": reason,
                             "cancelled_subtasks": cancelled_subtasks,
                             "message": format!("Task '{}' cancelled (was: {})", task_id, previous_status)
-                        }), &tasks),
+                        })
+                        .to_string(),
                     );
                     Ok(TaskMutationResult {
                         tasks,
@@ -3605,45 +3544,9 @@ mod tests {
             .await;
         let created: Value = serde_json::from_str(out.split_once('\n').unwrap().1).unwrap();
         assert_eq!(created["success"], true, "create: {out}");
-        assert_eq!(created["board_counts"]["open"], 1, "create: {out}");
-        assert_eq!(
-            created["active_tasks"][0]["title"], "a",
-            "create should return a verifiable active-board snapshot: {out}"
-        );
         let list: Value =
             serde_json::from_str(&m.list(&json!({"status_filter": "all"})).await).unwrap();
         assert_eq!(list["count"], 1, "list: {list}");
-    }
-
-    #[tokio::test]
-    async fn mutation_responses_prove_board_has_no_open_tasks_after_completion() {
-        let m = mgr();
-        m.create(&json!({"title": "running"})).await;
-        m.create(&json!({"title": "queued"})).await;
-        let start = m
-            .update(&json!({"task_id": "task-1", "new_status": "in_progress"}))
-            .await;
-        let start_value: Value = serde_json::from_str(start.split_once('\n').unwrap().1).unwrap();
-        assert_eq!(start_value["board_counts"]["in_progress"], 1, "{start}");
-        assert_eq!(start_value["board_counts"]["pending"], 1, "{start}");
-
-        m.update(&json!({"task_id": "task-1", "new_status": "completed"}))
-            .await;
-        let done = m
-            .update(&json!({"task_id": "task-2", "new_status": "completed"}))
-            .await;
-        let done_value: Value = serde_json::from_str(done.split_once('\n').unwrap().1).unwrap();
-        assert_eq!(done_value["success"], true, "{done}");
-        assert_eq!(done_value["board_counts"]["open"], 0, "{done}");
-        assert_eq!(done_value["board_counts"]["in_progress"], 0, "{done}");
-        assert_eq!(done_value["board_counts"]["pending"], 0, "{done}");
-        assert_eq!(done_value["board_counts"]["completed"], 2, "{done}");
-        assert!(
-            done_value["active_tasks"]
-                .as_array()
-                .is_some_and(|items| items.is_empty()),
-            "completed board should not claim active work remains: {done}"
-        );
     }
 
     #[tokio::test]

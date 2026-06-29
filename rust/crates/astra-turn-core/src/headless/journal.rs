@@ -132,7 +132,7 @@ pub fn journal_record_tool_not_admitted(
     let preview: String = format!("Deferred: {reason}").chars().take(500).collect();
     ToolCallRecord {
         name,
-        ok: false,
+        ok: true,
         ms: tool_elapsed_ms,
         error: Some("tool_not_admitted".to_string()),
         input_bytes: None,
@@ -443,14 +443,14 @@ mod tests {
     }
 
     #[test]
-    fn tool_not_admitted_record_is_synthetic_non_execution() {
+    fn tool_not_admitted_record_is_synthetic_success() {
         let r = journal_record_tool_not_admitted(
             "agent_fanout".into(),
             Some("{}".into()),
             "Tool 'agent_fanout' must be activated first",
             3,
         );
-        assert!(!r.ok);
+        assert!(r.ok);
         assert_eq!(r.ms, 3);
         assert_eq!(r.error.as_deref(), Some("tool_not_admitted"));
         assert_eq!(r.args_preview.as_deref(), Some("{}"));

@@ -465,7 +465,6 @@ fn tool_execution_outcome_from_output(output: String) -> ToolExecutionOutcome {
 
 struct EdgeToolRun {
     output: String,
-    is_error: bool,
     error_kind: Option<astra_core::ErrorKind>,
 }
 
@@ -473,7 +472,6 @@ impl EdgeToolRun {
     fn ok(output: String) -> Self {
         Self {
             output,
-            is_error: false,
             error_kind: None,
         }
     }
@@ -481,7 +479,6 @@ impl EdgeToolRun {
     fn error(output: String) -> Self {
         Self {
             output,
-            is_error: true,
             error_kind: None,
         }
     }
@@ -489,7 +486,6 @@ impl EdgeToolRun {
     fn classified_error(output: String, kind: astra_core::ErrorKind) -> Self {
         Self {
             output,
-            is_error: true,
             error_kind: Some(kind),
         }
     }
@@ -499,13 +495,11 @@ impl EdgeToolRun {
             return outcome;
         }
 
-        let mut outcome =
-            if self.is_error || self.error_kind.is_some() || cli_tool_output_is_error(&self.output)
-            {
-                ToolExecutionOutcome::error(self.output)
-            } else {
-                ToolExecutionOutcome::ok(self.output)
-            };
+        let mut outcome = if self.error_kind.is_some() || cli_tool_output_is_error(&self.output) {
+            ToolExecutionOutcome::error(self.output)
+        } else {
+            ToolExecutionOutcome::ok(self.output)
+        };
         if let Some(kind) = self.error_kind {
             let metadata = outcome
                 .tool_result_fields
@@ -6320,20 +6314,6 @@ mod tests {
             executor.activated_deferred_tool_names(),
             vec!["session".to_string()],
             "direct deferred call must record activation for the next schema-selection round"
-        );
-        let before_outcome = executor
-            .execute_with_metadata(
-                "session",
-                &serde_json::json!({"action": "sleep", "seconds": 1}),
-            )
-            .await;
-        assert!(
-            before_outcome.is_error,
-            "not-executed deferred activation must be an error outcome, got: {before_outcome:?}"
-        );
-        assert!(
-            before_outcome.output.contains("not executed"),
-            "error outcome must keep the recovery hint visible: {before_outcome:?}"
         );
 
         let search = executor

@@ -368,7 +368,7 @@ pub struct DecisionEnvelope {
 
 pub(crate) fn plan_mode_denial_reason(tool_name: &str) -> String {
     format!(
-        "Tool '{tool_name}' denied by permission mode. Plan mode allows only structured read tools (read_file, grep, glob, list_dir, symbols, web_fetch) plus `enter_plan_mode` / `exit_plan_mode`; shell commands such as bash/sed are blocked even when used for reading. Author the plan, then call `exit_plan_mode(plan=...)`."
+        "Tool '{tool_name}' denied by permission mode. Plan mode allows read-only tools plus `enter_plan_mode` / `exit_plan_mode`; author the plan, then call `exit_plan_mode(plan=...)`."
     )
 }
 
@@ -1905,8 +1905,7 @@ mod tests {
     fn plan_mode_denial_reason_does_not_special_case_unsupported_plan_tool_shapes() {
         for tool_name in ["session", "agent"] {
             let reason = plan_mode_denial_reason(tool_name);
-            assert!(reason.contains("structured read tools"));
-            assert!(reason.contains("shell commands"));
+            assert!(reason.contains("Plan mode allows read-only tools"));
             assert!(reason.contains("exit_plan_mode(plan=...)"));
             assert!(!reason.contains("no longer routes through"));
             assert!(!reason.contains("Use `exit_plan_mode` directly"));
@@ -1916,9 +1915,7 @@ mod tests {
     #[test]
     fn generic_plan_mode_denial_reason_points_to_exit_tool() {
         let reason = plan_mode_denial_reason("bash");
-        assert!(reason.contains("structured read tools"));
-        assert!(reason.contains("bash/sed"));
-        assert!(reason.contains("blocked even when used for reading"));
+        assert!(reason.contains("Plan mode allows read-only tools"));
         assert!(reason.contains("exit_plan_mode(plan=...)"));
     }
 
