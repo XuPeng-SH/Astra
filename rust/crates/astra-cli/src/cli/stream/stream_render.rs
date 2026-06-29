@@ -280,26 +280,7 @@ fn approval_has_stable_memory_target(tool: &str, args: &Value) -> bool {
 fn approval_default_always_scope(
     ctx: &astra_turn_core::permission::scope::ScopeAvailabilityContext,
 ) -> astra_turn_core::permission::scope::AllowScope {
-    use astra_turn_core::permission::scope::{AllowScope, permitted_scopes};
-
-    let scopes = permitted_scopes(ctx);
-    let is_available = |target| {
-        scopes
-            .iter()
-            .any(|entry| entry.scope == target && entry.available)
-    };
-
-    if is_available(AllowScope::Project) {
-        return AllowScope::Project;
-    }
-    if is_available(AllowScope::RestOfSession) {
-        return AllowScope::RestOfSession;
-    }
-    if is_available(AllowScope::RestOfTurn) {
-        return AllowScope::RestOfTurn;
-    }
-
-    AllowScope::OnceThisCall
+    astra_turn_core::permission::scope::default_always_scope(ctx)
 }
 
 fn approval_memory_preview(tool: &str, args: &Value, scope_label: Option<&str>) -> String {
