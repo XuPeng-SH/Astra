@@ -326,36 +326,35 @@ impl PendingApproval {
             .any(|entry| entry.scope == scope && entry.available)
     }
 
-    fn default_always_scope(&self) -> AllowScope {
-        astra_turn_core::permission::scope::default_always_scope(&self.scope_context())
-    }
-
     fn always_action_disabled(&self) -> bool {
-        self.default_always_scope() == AllowScope::OnceThisCall
+        use astra_turn_core::permission::engine::RiskTag;
+
+        if self.source_agent.is_some()
+            || self.is_compound_command
+            || self.has_dynamic_eval
+            || self.unsafe_rule_shape
+            || self.risk_tags.contains(&RiskTag::WritesSensitiveFile)
+            || self.risk_tags.contains(&RiskTag::GitDestructive)
+            || self.risk_tags.contains(&RiskTag::WritesOutsideWorkspace)
+            || self.risk_tags.contains(&RiskTag::CredentialAccess)
+            || self.risk_tags.contains(&RiskTag::MCPUnknownCapability)
+        {
+            return true;
+        }
+
+        !self.workspace_untrusted && !self.scope_available(AllowScope::Project)
     }
 
     fn always_uses_session_fallback(&self) -> bool {
-        self.default_always_scope() == AllowScope::RestOfSession
-    }
-
-    fn always_uses_turn_fallback(&self) -> bool {
-        self.default_always_scope() == AllowScope::RestOfTurn
+        self.workspace_untrusted
+            && !self.always_action_disabled()
+            && !self.scope_available(AllowScope::Project)
     }
 
     fn selection_hint(&self) -> Option<String> {
         if self.always_uses_session_fallback() {
-            if self.workspace_untrusted && !self.scope_available(AllowScope::Project) {
-                return Some(
-                    "Don't ask again is session-only until this workspace is trusted.".to_string(),
-                );
-            }
             return Some(
-                "Don't ask again is session-only; no reusable rule will be saved.".to_string(),
-            );
-        }
-        if self.always_uses_turn_fallback() {
-            return Some(
-                "Don't ask again is turn-only; this request cannot be safely remembered."
+                "Don't ask again stays session-only until you trust this workspace. Choose Trust Workspace or run `/allow trust` to save workspace rules."
                     .to_string(),
             );
         }
@@ -1268,7 +1267,7 @@ mod tests {
     }
 
     #[test]
-    fn focused_button_action_allows_session_fallback_for_untrusted_workspace() {
+    fn focused_button_action_blocks_unavailable_workspace_always() {
         let mut q = ApprovalQueue::new();
         let (tx, _rx) = oneshot::channel();
         q.push_with_metadata(
@@ -1302,7 +1301,7 @@ mod tests {
     }
 
     #[test]
-    fn focused_button_action_allows_turn_scoped_always_for_compound_commands() {
+    fn focused_button_action_blocks_always_for_compound_commands() {
         let mut q = ApprovalQueue::new();
         let (tx, _rx) = oneshot::channel();
         q.push_with_metadata(
@@ -1316,22 +1315,14 @@ mod tests {
         );
 
         q.focused_button_move_right();
-        assert_eq!(
-            q.focused_button_action(),
-            Some(super::super::button_row::ButtonAction::Respond(
-                ApprovalResponse::AlwaysAllow
-            )),
-            "compound shell commands should degrade don't-ask-again to turn-scoped memory"
-        );
-        let view = q.focused_view().unwrap();
-        assert_eq!(
-            view.selection_hint.as_deref(),
-            Some("Don't ask again is turn-only; this request cannot be safely remembered.")
+        assert!(
+            q.focused_button_action().is_none(),
+            "compound shell commands must keep Always disabled"
         );
     }
 
     #[test]
-    fn focused_button_action_allows_turn_scoped_always_for_unsafe_rule_shape() {
+    fn focused_button_action_blocks_always_for_unsafe_rule_shape() {
         let mut q = ApprovalQueue::new();
         let (tx, _rx) = oneshot::channel();
         q.push_with_metadata(
@@ -1345,48 +1336,9 @@ mod tests {
         );
 
         q.focused_button_move_right();
-        assert_eq!(
-            q.focused_button_action(),
-            Some(super::super::button_row::ButtonAction::Respond(
-                ApprovalResponse::AlwaysAllow
-            )),
-            "requests without a stable persistent rule should still offer turn-scoped Always"
-        );
-        let view = q.focused_view().unwrap();
-        assert_eq!(
-            view.selection_hint.as_deref(),
-            Some("Don't ask again is turn-only; this request cannot be safely remembered.")
-        );
-    }
-
-    #[test]
-    fn focused_button_action_allows_session_scoped_always_for_git_risk() {
-        use astra_turn_core::permission::engine::RiskTag;
-
-        let mut q = ApprovalQueue::new();
-        let (tx, _rx) = oneshot::channel();
-        q.push_with_metadata(
-            "bash".into(),
-            "git diff origin/main...HEAD --stat".into(),
-            None,
-            "execute".into(),
-            serde_json::Value::Null,
-            tx,
-            ApprovalMetadata::default().with_risk_tags(vec![RiskTag::GitDestructive]),
-        );
-
-        q.focused_button_move_right();
-        assert_eq!(
-            q.focused_button_action(),
-            Some(super::super::button_row::ButtonAction::Respond(
-                ApprovalResponse::AlwaysAllow
-            )),
-            "git-risk approvals should allow bounded session memory instead of a dead button"
-        );
-        let view = q.focused_view().unwrap();
-        assert_eq!(
-            view.selection_hint.as_deref(),
-            Some("Don't ask again is session-only; no reusable rule will be saved.")
+        assert!(
+            q.focused_button_action().is_none(),
+            "requests without a safe match target must not offer Always"
         );
     }
 
@@ -1411,7 +1363,9 @@ mod tests {
             .expect("pending approval should exist");
         assert_eq!(
             view.selection_hint.as_deref(),
-            Some("Don't ask again is session-only until this workspace is trusted.")
+            Some(
+                "Don't ask again stays session-only until you trust this workspace. Choose Trust Workspace or run `/allow trust` to save workspace rules."
+            )
         );
     }
 

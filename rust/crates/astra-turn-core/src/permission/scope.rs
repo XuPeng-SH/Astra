@@ -130,35 +130,6 @@ pub fn permitted_scopes(ctx: &ScopeAvailabilityContext) -> Vec<ScopeAvailability
     .collect()
 }
 
-/// Pick the strongest safe default for the single "Don't ask again"
-/// button.
-///
-/// UI surfaces that do not expose a full scope picker should call this
-/// instead of reimplementing risk checks. The important invariant is
-/// that a request that cannot be persisted should still degrade to a
-/// bounded memory scope when policy allows it.
-#[must_use]
-pub fn default_always_scope(ctx: &ScopeAvailabilityContext) -> AllowScope {
-    let scopes = permitted_scopes(ctx);
-    let is_available = |target| {
-        scopes
-            .iter()
-            .any(|entry| entry.scope == target && entry.available)
-    };
-
-    if is_available(AllowScope::Project) {
-        return AllowScope::Project;
-    }
-    if is_available(AllowScope::RestOfSession) {
-        return AllowScope::RestOfSession;
-    }
-    if is_available(AllowScope::RestOfTurn) {
-        return AllowScope::RestOfTurn;
-    }
-
-    AllowScope::OnceThisCall
-}
-
 fn unavailable_reason_for(
     scope: AllowScope,
     ctx: &ScopeAvailabilityContext,
@@ -263,13 +234,6 @@ mod tests {
     }
 
     #[test]
-    fn default_scope_degrades_destructive_risks_to_session_memory() {
-        let mut c = ctx();
-        c.risk_tags.push(RiskTag::GitDestructive);
-        assert_eq!(default_always_scope(&c), AllowScope::RestOfSession);
-    }
-
-    #[test]
     fn writes_outside_workspace_blocks_persistence() {
         let mut c = ctx();
         c.risk_tags.push(RiskTag::WritesOutsideWorkspace);
@@ -289,7 +253,6 @@ mod tests {
         assert!(!availability(&scopes, AllowScope::RestOfSession).available);
         assert!(!availability(&scopes, AllowScope::Project).available);
         assert!(!availability(&scopes, AllowScope::User).available);
-        assert_eq!(default_always_scope(&c), AllowScope::RestOfTurn);
     }
 
     #[test]

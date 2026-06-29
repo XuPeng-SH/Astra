@@ -271,7 +271,7 @@ impl ApprovalCell {
     /// [`astra_turn_core::permission::scope::permitted_scopes`]
     /// using only the labels we render in the cell — keeps the
     /// view layer free of the engine's `RiskTag` enum.
-    pub fn always_bounded_reason(&self) -> Option<&'static str> {
+    pub fn always_disabled_reason(&self) -> Option<&'static str> {
         // Sub-agent requests can never persist on the parent's
         // permissions.json.
         if self.source_agent.is_some() {
@@ -299,39 +299,10 @@ impl ApprovalCell {
         None
     }
 
-    fn default_always_scope(&self) -> astra_turn_core::permission::scope::AllowScope {
-        astra_turn_core::permission::scope::default_always_scope(&self.scope_context())
-    }
-
-    pub fn always_disabled_reason(&self) -> Option<&'static str> {
-        if self.default_always_scope()
-            == astra_turn_core::permission::scope::AllowScope::OnceThisCall
-        {
-            return self.always_bounded_reason();
-        }
-        None
-    }
-
     fn always_action_disabled(&self) -> bool {
-        self.default_always_scope() == astra_turn_core::permission::scope::AllowScope::OnceThisCall
-    }
-
-    fn always_scope_hint(&self) -> Option<String> {
-        use astra_turn_core::permission::scope::AllowScope;
-
-        match self.default_always_scope() {
-            AllowScope::RestOfSession if self.workspace_untrusted => {
-                Some("Don't ask again is session-only until this workspace is trusted.".to_string())
-            }
-            AllowScope::RestOfSession => {
-                Some("Don't ask again is session-only; no reusable rule will be saved.".to_string())
-            }
-            AllowScope::RestOfTurn => Some(
-                "Don't ask again is turn-only; this request cannot be safely remembered."
-                    .to_string(),
-            ),
-            _ => None,
-        }
+        self.always_disabled_reason().is_some()
+            || (!self.workspace_untrusted
+                && !self.scope_available(astra_turn_core::permission::scope::AllowScope::Project))
     }
 
     fn risk_tags_for_scope(&self) -> Vec<astra_turn_core::permission::engine::RiskTag> {
@@ -384,6 +355,12 @@ impl ApprovalCell {
             has_dynamic_eval: self.has_dynamic_eval,
             unsafe_rule_shape: self.unsafe_rule_shape,
         }
+    }
+
+    fn scope_available(&self, scope: astra_turn_core::permission::scope::AllowScope) -> bool {
+        astra_turn_core::permission::scope::permitted_scopes(&self.scope_context())
+            .into_iter()
+            .any(|entry| entry.scope == scope && entry.available)
     }
 
     fn button_disabled(&self, btn: &crate::tui::approval::Button) -> bool {
@@ -592,21 +569,16 @@ impl HistoryCell for ApprovalCell {
             ]));
         }
 
-        let selection_hint = self
-            .selection_hint
-            .clone()
-            .or_else(|| self.always_scope_hint());
-        if let Some(hint) = selection_hint {
+        if let Some(hint) = &self.selection_hint {
             lines.push(Line::from(vec![
                 bar.clone(),
                 Span::styled("Note · ".to_string(), muted),
-                Span::styled(hint, body_style),
+                Span::styled(hint.clone(), body_style),
             ]));
         }
 
-        // Only show a disabled-memory line when no bounded scope is
-        // available. Non-persistent fallbacks render as Note lines
-        // above so the button does not look dead.
+        // Keep high-risk persistence disabled in plain language; the
+        // UI should not expose old scope internals.
         if let Some(reason_text) = self.always_disabled_reason() {
             lines.push(Line::from(vec![
                 bar.clone(),
@@ -890,7 +862,7 @@ mod tests {
     // ── Issue #326 P3 / R2 Major 1: scope-picker policy ──────
 
     #[test]
-    fn always_session_bounded_for_destructive_risk() {
+    fn always_disabled_for_destructive_risk() {
         let cell = ApprovalCell::new(
             1,
             "edit_file".into(),
@@ -900,13 +872,11 @@ mod tests {
             true,
         )
         .with_risk_tag_labels(vec!["WritesOutsideWorkspace".into()]);
-        assert_eq!(cell.always_bounded_reason(), Some("outside workspace"));
-        assert!(cell.always_disabled_reason().is_none());
-        assert!(!cell.always_action_disabled());
+        assert_eq!(cell.always_disabled_reason(), Some("outside workspace"));
     }
 
     #[test]
-    fn always_session_bounded_for_sensitive_path() {
+    fn always_disabled_for_sensitive_path() {
         let cell = ApprovalCell::new(
             1,
             "write_file".into(),
@@ -916,13 +886,11 @@ mod tests {
             true,
         )
         .with_risk_tag_labels(vec!["WritesSensitiveFile".into()]);
-        assert_eq!(cell.always_bounded_reason(), Some("sensitive path"));
-        assert!(cell.always_disabled_reason().is_none());
-        assert!(!cell.always_action_disabled());
+        assert_eq!(cell.always_disabled_reason(), Some("sensitive path"));
     }
 
     #[test]
-    fn always_session_bounded_for_sub_agent_request() {
+    fn always_disabled_for_sub_agent_request() {
         let cell = ApprovalCell::new(
             1,
             "bash".into(),
@@ -932,13 +900,11 @@ mod tests {
             true,
         )
         .with_source_agent("review-subagent");
-        assert_eq!(cell.always_bounded_reason(), Some("sub-agent request"));
-        assert!(cell.always_disabled_reason().is_none());
-        assert!(!cell.always_action_disabled());
+        assert_eq!(cell.always_disabled_reason(), Some("sub-agent request"));
     }
 
     #[test]
-    fn always_turn_bounded_reason_mentions_runtime_built_shell_command() {
+    fn always_disabled_reason_mentions_runtime_built_shell_command() {
         let cell = ApprovalCell::new(
             1,
             "bash".into(),
@@ -949,11 +915,9 @@ mod tests {
         )
         .with_scope_context(false, false, true, false);
         assert_eq!(
-            cell.always_bounded_reason(),
+            cell.always_disabled_reason(),
             Some("shell command built at runtime")
         );
-        assert!(cell.always_disabled_reason().is_none());
-        assert!(!cell.always_action_disabled());
     }
 
     #[test]
@@ -990,7 +954,7 @@ mod tests {
     }
 
     #[test]
-    fn always_turn_bounded_reason_mentions_multi_step_shell_command() {
+    fn always_disabled_reason_mentions_multi_step_shell_command() {
         let cell = ApprovalCell::new(
             1,
             "bash".into(),
@@ -1002,15 +966,13 @@ mod tests {
         .with_risk_tag_labels(vec!["BashExecute".into()])
         .with_scope_context(false, true, false, false);
         assert_eq!(
-            cell.always_bounded_reason(),
+            cell.always_disabled_reason(),
             Some("multi-step shell command")
         );
-        assert!(cell.always_disabled_reason().is_none());
-        assert!(!cell.always_action_disabled());
     }
 
     #[test]
-    fn always_turn_bounded_reason_mentions_unsafe_rule_shape() {
+    fn always_disabled_reason_mentions_unsafe_rule_shape() {
         let cell = ApprovalCell::new(
             1,
             "bash".into(),
@@ -1022,15 +984,14 @@ mod tests {
         .with_scope_context(false, false, false, true);
 
         assert_eq!(
-            cell.always_bounded_reason(),
+            cell.always_disabled_reason(),
             Some("command shape too broad to remember")
         );
-        assert!(cell.always_disabled_reason().is_none());
-        assert!(!cell.always_action_disabled());
+        assert!(cell.always_action_disabled());
     }
 
     #[test]
-    fn always_bounded_renders_session_note_in_card() {
+    fn always_disabled_renders_in_card() {
         let cell = ApprovalCell::new(
             1,
             "bash".into(),
@@ -1042,12 +1003,8 @@ mod tests {
         .with_risk_tag_labels(vec!["GitDestructive".into()]);
         let rendered = render(&cell);
         assert!(
-            rendered.contains("Note · Don't ask again is session-only"),
-            "destructive cell must advertise session-bounded Always, got:\n{rendered}"
-        );
-        assert!(
-            !rendered.contains("Can't remember"),
-            "destructive cell must not present a dead Always button, got:\n{rendered}"
+            rendered.contains("Can't remember · git destructive"),
+            "destructive cell must advertise the disabled-Always state, got:\n{rendered}"
         );
     }
 
@@ -1148,9 +1105,9 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_destructive_card_shows_session_bounded_memory() {
+    fn snapshot_destructive_card_disables_persistent_scopes_visually() {
         // Destructive risk + sensitive-path file: the card must
-        // stay RED-coded while making bounded memory explicit.
+        // make this read as RED-coded.
         let cell = ApprovalCell::new(
             7,
             "edit_file".into(),
