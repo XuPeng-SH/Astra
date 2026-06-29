@@ -484,7 +484,8 @@ mod handler_tests {
 
         assert!(!response.approved);
         let reason = response.reason.as_deref().expect("denial reason");
-        assert!(reason.contains("Plan mode allows read-only tools"));
+        assert!(reason.contains("Plan mode allows only structured read tools"));
+        assert!(reason.contains("exit_plan_mode(plan=...)"));
         assert!(!reason.contains("Use `exit_plan_mode` directly"));
         assert!(!reason.contains("no longer routes through"));
     }

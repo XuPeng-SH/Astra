@@ -121,7 +121,52 @@ pub(crate) fn looks_like_implicit_plan_request(text: &str) -> bool {
 }
 
 pub(crate) fn slash_plan_goal(text: &str) -> Option<&str> {
-    let rest = text.trim().strip_prefix("/plan")?;
+    let trimmed = text.trim();
+    let rest = trimmed.strip_prefix("/plan")?;
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
     let goal = rest.trim();
     (!goal.is_empty()).then_some(goal)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        PlanModeUiSnapshot, looks_like_implicit_plan_request, plan_transition_notice,
+        slash_plan_goal,
+    };
+
+    #[test]
+    fn slash_plan_goal_requires_plan_command_boundary() {
+        assert_eq!(slash_plan_goal("/plan ship the cli"), Some("ship the cli"));
+        assert_eq!(
+            slash_plan_goal("  /plan   ship the cli  "),
+            Some("ship the cli")
+        );
+        assert_eq!(slash_plan_goal("/plan"), None);
+        assert_eq!(slash_plan_goal("/plans ship the cli"), None);
+        assert_eq!(slash_plan_goal("/planet"), None);
+        assert_eq!(slash_plan_goal("/plan-mode"), None);
+    }
+
+    #[test]
+    fn implicit_plan_request_detector_rejects_slash_and_meta_queries() {
+        assert!(looks_like_implicit_plan_request("规划一下怎么发布cli"));
+        assert!(looks_like_implicit_plan_request(
+            "help me plan how to refactor auth"
+        ));
+        assert!(!looks_like_implicit_plan_request("/plan ship the cli"));
+        assert!(!looks_like_implicit_plan_request("what is /plan mode?"));
+        assert!(!looks_like_implicit_plan_request("现在plan是怎么工作的?"));
+    }
+
+    #[test]
+    fn plan_transition_notice_does_not_report_noop_as_delivery() {
+        let inactive = PlanModeUiSnapshot::default();
+        assert!(
+            plan_transition_notice(&inactive, &inactive, true).is_none(),
+            "failed or no-op plan requests must not fabricate a delivered planning response"
+        );
+    }
 }

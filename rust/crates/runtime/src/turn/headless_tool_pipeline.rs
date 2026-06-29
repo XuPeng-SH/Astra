@@ -2068,7 +2068,10 @@ mod tests {
             .last()
             .expect("direct deferred activation should record a journal placeholder");
         assert_eq!(record.name, "github");
-        assert!(record.ok);
+        assert!(
+            !record.ok,
+            "not-executed deferred activation must not be recorded as a successful tool execution"
+        );
         assert_eq!(record.error.as_deref(), Some("tool_not_admitted"));
         assert!(record.is_synthetic_placeholder());
         assert!(

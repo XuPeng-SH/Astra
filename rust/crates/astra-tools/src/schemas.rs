@@ -1783,6 +1783,10 @@ mod tests {
             "plan tool UX guidance should remain semantic and example-driven: {plan_desc}"
         );
         assert!(
+            plan_desc.contains("shell commands") && plan_desc.contains("blocked"),
+            "plan schema must clearly say shell/bash-style reads are blocked: {plan_desc}"
+        );
+        assert!(
             !plan_desc.contains("ACTIVATION RULE"),
             "plan schema must not expose matcher-style activation rules: {plan_desc}"
         );
