@@ -1,6 +1,6 @@
 //! Plan-mode UI helpers extracted from `event_loop.rs`.
 //!
-//! Handles plan-mode transitions, implicit plan request detection,
+//! Handles plan-mode transition notices, explicit `/plan <goal>` parsing,
 //! and UI snapshotting when entering/exiting plan mode.
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -73,51 +73,6 @@ pub(crate) fn commit_plan_transition_notice(
     if let Some(msg) = plan_transition_notice(before, &after, triggered_by_plan_request) {
         chat_widget.commit_system(super::history_cell::system::SystemCell::response(msg));
     }
-}
-
-pub(crate) fn looks_like_implicit_plan_request(text: &str) -> bool {
-    let trimmed = text.trim();
-    if trimmed.is_empty() || trimmed.starts_with('/') {
-        return false;
-    }
-
-    let lowered = trimmed.to_lowercase();
-    let meta_queries = [
-        "what is /plan",
-        "how does /plan",
-        "what does /plan",
-        "plan mode",
-        "plan模式",
-        "现在plan是怎么",
-        "什么是/plan",
-        "/plan是什么意思",
-        "怎么进入plan",
-    ];
-    if meta_queries.iter().any(|needle| lowered.contains(needle)) {
-        return false;
-    }
-
-    let planning_requests = [
-        "help me plan",
-        "please plan",
-        "plan how to",
-        "make a plan",
-        "draft a plan",
-        "come up with a plan",
-        "plan out",
-        "帮我计划",
-        "帮我规划",
-        "给我一个计划",
-        "给我个计划",
-        "做个计划",
-        "规划一下",
-        "计划一下",
-        "制定计划",
-        "先计划",
-    ];
-    planning_requests
-        .iter()
-        .any(|needle| lowered.contains(needle))
 }
 
 pub(crate) fn slash_plan_goal(text: &str) -> Option<&str> {

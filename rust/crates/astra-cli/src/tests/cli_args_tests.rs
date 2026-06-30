@@ -419,6 +419,8 @@ fn cli_chat_subcommand() {
     // Permission modes
     for (input, expected) in [
         ("auto", "auto"),
+        ("bypass", "bypass"),
+        ("skip", "bypass"),
         ("accept_edits", "accept_edits"),
         ("plan", "plan"),
     ] {
@@ -441,6 +443,7 @@ fn cli_permissions_subcommand() {
         ("accept_edits", |s| {
             matches!(s, PermissionsSubcommand::AcceptEdits)
         }),
+        ("bypass", |s| matches!(s, PermissionsSubcommand::Bypass)),
         ("plan", |s| matches!(s, PermissionsSubcommand::Plan)),
     ];
     for (mode, check) in cases {

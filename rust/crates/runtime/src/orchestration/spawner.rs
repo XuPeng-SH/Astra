@@ -399,7 +399,7 @@ pub enum WaitForAgentOutcome {
 /// Permission summary for display purposes.
 #[derive(Debug, Clone, Default)]
 pub struct PermissionSummary {
-    /// Permission mode (auto, plan, accept_edits, prompt, deny).
+    /// Permission mode (auto, bypass, plan, accept_edits, prompt, deny).
     pub mode: String,
     /// Number of explicit allow rules.
     pub allow_rules: u32,
@@ -2887,6 +2887,7 @@ fn build_permission_summary(context: &SpawnContext) -> PermissionSummary {
     let inherited = &context.inherited_permissions;
     summary.mode = match inherited.mode {
         super::permission_sync::PermissionMode::Auto => "auto".to_string(),
+        super::permission_sync::PermissionMode::Bypass => "bypass".to_string(),
         super::permission_sync::PermissionMode::Plan => "plan".to_string(),
         super::permission_sync::PermissionMode::AcceptEdits => "accept_edits".to_string(),
         super::permission_sync::PermissionMode::Prompt => "prompt".to_string(),

@@ -94,8 +94,11 @@ astra chat -m "summarize recent changes" --quiet
 # Continue an existing session
 astra chat -m "follow up" --session-id <id>
 
-# Auto-approve all tool calls (CI mode)
+# Auto-approve normal tool risk; some git/sensitive gates may still stop
 astra chat -m "run tests and fix failures" --permission-mode auto
+
+# Skip approval prompts; catastrophic and policy hard-denies still apply
+astra chat -m "run tests and fix failures" --permission-mode bypass
 
 # Session management
 astra session list

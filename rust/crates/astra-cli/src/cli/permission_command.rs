@@ -4,7 +4,7 @@ use crate::cli::theme;
 use crossterm::style::Stylize;
 
 pub(crate) const PERMISSION_COMMAND_USAGE: &str =
-    "auto, plan, accept_edits, prompt, deny, rules, trust, untrust, trace";
+    "auto, bypass, plan, accept_edits, prompt, deny, rules, trust, untrust, trace";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PermissionCommandAction<'a> {
@@ -51,12 +51,11 @@ pub(crate) fn parse_permission_command(arg: &str) -> PermissionCommandAction<'_>
 
 /// Next mode when cycling `/allow` with no argument.
 ///
-/// `Deny` is intentionally sticky under the cycle: it is the most restrictive
-/// mode and must only be exited by an explicit `/allow prompt` (or another
-/// named mode). Cycling must never silently move a session out of `Deny`,
-/// because that would widen permissions without an explicit user action.
-/// `Deny` is likewise never a cycle *target* — it is reachable only via
-/// `/allow deny`.
+/// `Deny` and `Bypass` are intentionally not cycle targets. `Deny` is sticky:
+/// it must only be exited by an explicit `/allow prompt` (or another named
+/// mode). `Bypass` is reachable only via explicit `/allow bypass` / CLI flag;
+/// cycling from it returns to Prompt. This keeps Shift+Tab from adjacent
+/// Auto → Bypass escalation.
 pub(crate) fn next_permission_mode_for_cycle(current: PermissionMode) -> PermissionMode {
     match current {
         PermissionMode::Deny => PermissionMode::Deny,
@@ -64,6 +63,7 @@ pub(crate) fn next_permission_mode_for_cycle(current: PermissionMode) -> Permiss
         PermissionMode::AcceptEdits => PermissionMode::Plan,
         PermissionMode::Plan => PermissionMode::Auto,
         PermissionMode::Auto => PermissionMode::Prompt,
+        PermissionMode::Bypass => PermissionMode::Prompt,
     }
 }
 
@@ -73,7 +73,12 @@ pub(crate) fn permission_mode_display_label(mode: PermissionMode) -> &'static st
 
 pub(crate) fn permission_mode_cli_detail(mode: PermissionMode) -> Option<&'static str> {
     match mode {
-        PermissionMode::Auto => Some("all tools auto-approved"),
+        PermissionMode::Auto => {
+            Some("normal tool risk auto-approved; some git/sensitive gates may still stop")
+        }
+        PermissionMode::Bypass => {
+            Some("skip approval prompts; catastrophic and policy hard-denies still apply")
+        }
         PermissionMode::Plan => Some("read-only investigation mode"),
         PermissionMode::AcceptEdits => Some("workspace-local edits auto-approved"),
         PermissionMode::Prompt | PermissionMode::Deny => None,
@@ -174,6 +179,8 @@ mod tests {
     fn parser_accepts_only_canonical_permission_modes() {
         let cases = [
             ("auto", PermissionMode::Auto),
+            ("bypass", PermissionMode::Bypass),
+            ("skip", PermissionMode::Bypass),
             ("plan", PermissionMode::Plan),
             ("accept_edits", PermissionMode::AcceptEdits),
             ("prompt", PermissionMode::Prompt),
@@ -247,8 +254,12 @@ mod tests {
             next_permission_mode_for_cycle(PermissionMode::Auto),
             PermissionMode::Prompt
         );
-        // `Deny` is sticky under the cycle: it must only be exited by an
-        // explicit `/allow <mode>`, never by a bare `/allow`.
+        assert_eq!(
+            next_permission_mode_for_cycle(PermissionMode::Bypass),
+            PermissionMode::Prompt
+        );
+        // `Bypass` is explicit-only, and `Deny` is sticky under the cycle:
+        // neither can be reached by a bare `/allow`.
         assert_eq!(
             next_permission_mode_for_cycle(PermissionMode::Deny),
             PermissionMode::Deny

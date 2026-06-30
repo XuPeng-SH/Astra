@@ -2119,14 +2119,14 @@ total_tokens_out: 500
 
     #[test]
     fn permission_mode_roundtrip_parse() {
-        for mode_str in &["auto", "accept_edits", "plan", "prompt", "deny"] {
+        for mode_str in &["auto", "bypass", "accept_edits", "plan", "prompt", "deny"] {
             let mode: permission_manager::PermissionMode = mode_str.parse().unwrap();
             assert_eq!(mode.to_string().to_lowercase(), *mode_str);
         }
     }
 
     #[test]
-    fn session_state_cli_context_auto_approve_activates_auto_mode() {
+    fn session_state_cli_context_auto_approve_activates_bypass_mode() {
         let state = initialize_session_state(
             None,
             None,
@@ -2144,8 +2144,27 @@ total_tokens_out: 500
         );
         assert_eq!(
             state.perm_manager.mode(),
-            permission_manager::PermissionMode::Auto
+            permission_manager::PermissionMode::Bypass
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid permission mode in CliContext")]
+    fn session_state_invalid_permission_mode_does_not_fallback_to_prompt() {
+        let context = cli::cli_config::cli_context::CliContext::from_launch_options(
+            false,
+            None,
+            &[],
+            &[],
+            &[],
+            false,
+            None,
+            None,
+        )
+        .expect("cli context")
+        .with_permission_mode(Some("bogus".into()));
+
+        let _ = initialize_session_state(None, None, &context);
     }
 
     #[test]

@@ -23,8 +23,10 @@ use std::path::{Path, PathBuf};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionMode {
-    /// Auto-approve all tools (except bypass-immune safety checks).
+    /// Auto-resolve ordinary approval prompts; git/sensitive gates may still stop.
     Auto,
+    /// Skip human approval prompts; absolute safety denies and policy allowlists still apply.
+    Bypass,
     /// Read-only investigation/planning mode: allow read tools, deny mutations.
     Plan,
     /// Auto-approve safe workspace-local edit/write operations only.
@@ -36,11 +38,131 @@ pub enum PermissionMode {
     Deny,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ManualApprovalPolicy {
+    Plan,
+    AcceptEdits,
+    Prompt,
+    Deny,
+}
+
+/// Permission mode safe for child-agent inheritance.
+///
+/// `Bypass` is intentionally excluded: root-user interaction choices
+/// must not become transitive child-agent safety policy. The compiler
+/// guarantees that no match on this type can ever receive a Bypass
+/// variant, unlike the previous approach where an `unreachable!()` arm
+/// served the same guarantee at runtime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ChildPermissionMode {
+    Auto,
+    Plan,
+    AcceptEdits,
+    Prompt,
+    Deny,
+}
+
+impl From<ChildPermissionMode> for PermissionMode {
+    fn from(m: ChildPermissionMode) -> Self {
+        match m {
+            ChildPermissionMode::Auto => Self::Auto,
+            ChildPermissionMode::Plan => Self::Plan,
+            ChildPermissionMode::AcceptEdits => Self::AcceptEdits,
+            ChildPermissionMode::Prompt => Self::Prompt,
+            ChildPermissionMode::Deny => Self::Deny,
+        }
+    }
+}
+
 impl PermissionMode {
+    /// True when ordinary approval prompts can be resolved without blocking.
+    ///
+    /// This is the approval-interaction axis, not the safety-policy axis:
+    /// hard denies and explicit deny/allowlist policy can still apply.
+    pub fn auto_resolves_approval_prompts(self) -> bool {
+        matches!(self, Self::Auto | Self::Bypass)
+    }
+
+    /// True for the explicit "do not interrupt me for approval" mode.
+    ///
+    /// This skips git/sensitive approval gates, but not absolute safety
+    /// denies, explicit deny rules, or child-agent allowlists.
+    pub fn skips_human_approval_prompts(self) -> bool {
+        matches!(self, Self::Bypass)
+    }
+
+    /// True when soft, noisy shell-obfuscation guards are treated as advisory.
+    pub fn relaxes_soft_shell_obfuscation(self) -> bool {
+        matches!(self, Self::Auto | Self::Bypass)
+    }
+
+    /// True when soft git policy findings may be auto-allowed.
+    pub fn auto_allows_soft_git_policy(self) -> bool {
+        matches!(self, Self::Auto)
+    }
+
+    /// Permission mode to export into child agents.
+    ///
+    /// `Bypass` is a root user-interaction choice: skip approval prompts in
+    /// the current UI session. It must not become a transitive child-agent
+    /// safety policy because spawned/fan-out agents have no direct user in the
+    /// loop and should not inherit the root session's broad prompt bypass.
+    ///
+    /// Returns a [`ChildPermissionMode`] that cannot represent Bypass,
+    /// making the downgrade a compile-time guarantee.
+    #[must_use]
+    pub fn child_inherited_mode(self) -> ChildPermissionMode {
+        match self {
+            Self::Bypass => ChildPermissionMode::Auto,
+            Self::Auto => ChildPermissionMode::Auto,
+            Self::Plan => ChildPermissionMode::Plan,
+            Self::AcceptEdits => ChildPermissionMode::AcceptEdits,
+            Self::Prompt => ChildPermissionMode::Prompt,
+            Self::Deny => ChildPermissionMode::Deny,
+        }
+    }
+
+    pub fn manual_approval_policy(self) -> Option<ManualApprovalPolicy> {
+        match self {
+            Self::Auto => None,
+            Self::Bypass => None,
+            Self::Plan => Some(ManualApprovalPolicy::Plan),
+            Self::AcceptEdits => Some(ManualApprovalPolicy::AcceptEdits),
+            Self::Prompt => Some(ManualApprovalPolicy::Prompt),
+            Self::Deny => Some(ManualApprovalPolicy::Deny),
+        }
+    }
+
+    /// Stable compact encoding used by CLI/TUI atomic mirrors.
+    pub fn mirror_code(self) -> u8 {
+        match self {
+            Self::Prompt => 0,
+            Self::Auto => 1,
+            Self::Plan => 2,
+            Self::AcceptEdits => 3,
+            Self::Deny => 4,
+            Self::Bypass => 5,
+        }
+    }
+
+    /// Decode the compact CLI/TUI mirror encoding. Unknown values fail closed
+    /// to Prompt rather than inheriting an accidentally permissive mode.
+    pub fn from_mirror_code(value: u8) -> Self {
+        match value {
+            1 => Self::Auto,
+            2 => Self::Plan,
+            3 => Self::AcceptEdits,
+            4 => Self::Deny,
+            5 => Self::Bypass,
+            _ => Self::Prompt,
+        }
+    }
+
     /// Human label for the status-line mode chip.
     pub fn chip_text(self) -> &'static str {
         match self {
             Self::Auto => "Auto",
+            Self::Bypass => "Bypass",
             Self::Plan => "Plan",
             Self::AcceptEdits => "Edits",
             Self::Prompt => "Ask",
@@ -51,9 +173,11 @@ impl PermissionMode {
     /// Color hint for the status-line mode chip.
     /// Returns `(red, green, blue)` for a ratatui-style `Color::Rgb`.
     pub fn chip_color_rgb(self) -> (u8, u8, u8) {
-        // Blue for plan, cyan for edit, yellow for auto, red for deny, white for default.
+        // Blue for plan, cyan for edit, yellow for auto, magenta for bypass,
+        // red for deny, white for default.
         match self {
             Self::Auto => (255, 255, 0),
+            Self::Bypass => (255, 0, 255),
             Self::Plan => (100, 149, 237),
             Self::AcceptEdits => (0, 255, 255),
             Self::Prompt => (255, 255, 255),
@@ -66,6 +190,7 @@ impl std::fmt::Display for PermissionMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Auto => write!(f, "auto"),
+            Self::Bypass => write!(f, "bypass"),
             Self::Plan => write!(f, "plan"),
             Self::AcceptEdits => write!(f, "accept_edits"),
             Self::Prompt => write!(f, "prompt"),
@@ -79,12 +204,13 @@ impl std::str::FromStr for PermissionMode {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "auto" => Ok(Self::Auto),
+            "bypass" | "skip" => Ok(Self::Bypass),
             "plan" => Ok(Self::Plan),
             "accept_edits" => Ok(Self::AcceptEdits),
             "prompt" => Ok(Self::Prompt),
             "deny" => Ok(Self::Deny),
             _ => Err(format!(
-                "invalid permission mode '{s}': expected auto, plan, accept_edits, prompt, or deny"
+                "invalid permission mode '{s}': expected auto, bypass, plan, accept_edits, prompt, or deny"
             )),
         }
     }
@@ -620,8 +746,11 @@ impl std::fmt::Display for PermissionRule {
 
 /// Permission context inherited from parent to child agent.
 ///
-/// Contains the parent's permission mode and rules that the child should honor.
-/// Child agents cannot escalate permissions beyond what parent allows.
+/// Contains the parent's effective permission mode and rules that the child
+/// should honor. Child agents cannot escalate permissions beyond what parent
+/// allows. Root-only interaction choices such as `Bypass` are projected to the
+/// child-safe execution mode by [`PermissionMode::child_inherited_mode`], which returns
+/// a [`ChildPermissionMode`] that cannot represent `Bypass`.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct InheritedPermissions {
     /// Permission mode inherited from parent.
@@ -1064,6 +1193,7 @@ impl PermissionSyncContext {
     /// Create inherited permissions for a child agent.
     pub fn for_child(&self, is_background: bool) -> InheritedPermissions {
         let mut inherited = self.inherited.clone();
+        inherited.mode = PermissionMode::from(inherited.mode.child_inherited_mode());
         inherited.is_background = is_background;
         // Add session rules to inherited rules for child
         for rule in &self.session_allow {
@@ -1181,6 +1311,74 @@ mod tests {
         let parsed = "plan".parse::<PermissionMode>().unwrap();
         assert_eq!(parsed, PermissionMode::Plan);
         assert_eq!(parsed.to_string(), "plan");
+    }
+
+    #[test]
+    fn permission_mode_roundtrip_includes_bypass() {
+        let parsed = "bypass".parse::<PermissionMode>().unwrap();
+        assert_eq!(parsed, PermissionMode::Bypass);
+        assert_eq!(parsed.to_string(), "bypass");
+        assert_eq!(parsed.chip_text(), "Bypass");
+        assert_eq!(
+            "skip".parse::<PermissionMode>().unwrap(),
+            PermissionMode::Bypass
+        );
+    }
+
+    #[test]
+    fn permission_mode_policy_helpers_are_explicit_axes() {
+        assert!(PermissionMode::Auto.auto_resolves_approval_prompts());
+        assert!(PermissionMode::Bypass.auto_resolves_approval_prompts());
+        assert!(!PermissionMode::Auto.skips_human_approval_prompts());
+        assert!(PermissionMode::Bypass.skips_human_approval_prompts());
+        assert!(PermissionMode::Auto.auto_allows_soft_git_policy());
+        assert!(!PermissionMode::Bypass.auto_allows_soft_git_policy());
+        assert!(!PermissionMode::Prompt.auto_resolves_approval_prompts());
+        assert_eq!(
+            PermissionMode::from(PermissionMode::Bypass.child_inherited_mode()),
+            PermissionMode::Auto
+        );
+        assert_eq!(
+            PermissionMode::from(PermissionMode::Prompt.child_inherited_mode()),
+            PermissionMode::Prompt
+        );
+
+        assert_eq!(PermissionMode::Auto.manual_approval_policy(), None);
+        assert_eq!(PermissionMode::Bypass.manual_approval_policy(), None);
+        assert_eq!(
+            PermissionMode::Plan.manual_approval_policy(),
+            Some(ManualApprovalPolicy::Plan)
+        );
+        assert_eq!(
+            PermissionMode::AcceptEdits.manual_approval_policy(),
+            Some(ManualApprovalPolicy::AcceptEdits)
+        );
+        assert_eq!(
+            PermissionMode::Prompt.manual_approval_policy(),
+            Some(ManualApprovalPolicy::Prompt)
+        );
+        assert_eq!(
+            PermissionMode::Deny.manual_approval_policy(),
+            Some(ManualApprovalPolicy::Deny)
+        );
+    }
+
+    #[test]
+    fn permission_mode_mirror_code_roundtrip() {
+        for mode in [
+            PermissionMode::Prompt,
+            PermissionMode::Auto,
+            PermissionMode::Bypass,
+            PermissionMode::Plan,
+            PermissionMode::AcceptEdits,
+            PermissionMode::Deny,
+        ] {
+            assert_eq!(PermissionMode::from_mirror_code(mode.mirror_code()), mode);
+        }
+        assert_eq!(
+            PermissionMode::from_mirror_code(u8::MAX),
+            PermissionMode::Prompt
+        );
     }
 
     #[test]
@@ -1461,6 +1659,16 @@ mod tests {
         assert!(child_perms.is_background);
         assert!(child_perms.is_allowed("bash", Some("git status")));
         assert!(child_perms.is_allowed("bash", Some("npm install")));
+    }
+
+    #[test]
+    fn permission_sync_context_downgrades_bypass_for_child() {
+        let ctx = PermissionSyncContext::root(PermissionMode::Bypass);
+
+        let child_perms = ctx.for_child(true);
+
+        assert_eq!(child_perms.mode, PermissionMode::Auto);
+        assert!(child_perms.is_background);
     }
 
     #[tokio::test]

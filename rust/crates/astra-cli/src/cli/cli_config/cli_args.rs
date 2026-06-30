@@ -75,7 +75,7 @@ pub(crate) struct Cli {
     /// Resume a specific session by ID (or prefix)
     #[arg(short = 'r', long = "resume")]
     pub resume: Option<String>,
-    /// Auto-approve tool calls without prompting
+    /// Skip approval prompts; hard safety denies still apply
     #[arg(short = 'y', long = "yes")]
     pub yes: bool,
     /// System prompt to prepend (useful with --print for scripting)
@@ -378,10 +378,10 @@ pub(crate) struct ChatArgs {
         value_parser = parse_explain_mode_arg
     )]
     pub explain: Option<crate::cli::session::session_state::ExplainMode>,
-    /// Auto-approve tool calls
+    /// Skip approval prompts; hard safety denies still apply
     #[arg(short = 'y', long = "auto-approve", default_value_t = false)]
     pub auto_approve: bool,
-    /// Permission mode: auto, plan, accept_edits, prompt (interactive, default), or deny.
+    /// Permission mode: auto, bypass, plan, accept_edits, prompt (interactive, default), or deny.
     #[arg(long = "permission-mode", value_parser = parse_permission_mode_arg)]
     pub permission_mode: Option<String>,
     /// Suppress spinner and progress output (result still printed)
@@ -721,7 +721,7 @@ pub(crate) struct GrepPatternArgs {
 
 #[derive(Args, Debug)]
 #[command(
-    after_help = "Examples:\n  astra permissions rules\n  astra permissions auto\n  astra permissions plan\n  astra permissions accept_edits\n  astra permissions prompt\n  astra permissions trust\n  astra permissions trace"
+    after_help = "Examples:\n  astra permissions rules\n  astra permissions auto\n  astra permissions bypass\n  astra permissions plan\n  astra permissions accept_edits\n  astra permissions prompt\n  astra permissions trust\n  astra permissions trace"
 )]
 pub(crate) struct PermissionsArgs {
     #[command(subcommand)]
@@ -732,6 +732,8 @@ pub(crate) struct PermissionsArgs {
 pub(crate) enum PermissionsSubcommand {
     /// Auto-approve allowed tool calls
     Auto,
+    /// Skip approval prompts; catastrophic and policy hard-denies still apply
+    Bypass,
     /// Auto-approve workspace-local edits while still prompting for shell and external writes
     #[command(name = "accept_edits")]
     AcceptEdits,

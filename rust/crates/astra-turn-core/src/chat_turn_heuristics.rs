@@ -29,6 +29,44 @@ const STANDARD_MUTATING_EXPLORATORY_TURN_BUDGET: AgenticTurnBudget =
 const COMPLEX_MUTATING_EXPLORATORY_TURN_BUDGET: AgenticTurnBudget =
     AgenticTurnBudget::new(140, 280, 35, 4);
 
+const WORKSPACE_EVIDENCE_PHRASES: &[&str] = &[
+    "working tree",
+    "local changes",
+    "current changes",
+    "pull request",
+    "test failure",
+    "build failure",
+    "仓库",
+    "工作区",
+    "改动",
+    "修改",
+    "变更",
+    "提交",
+    "分支",
+    "代码",
+    "文件",
+    "函数",
+    "测试失败",
+    "构建失败",
+];
+
+const WORKSPACE_EVIDENCE_WORDS: &[&str] = &[
+    "repo",
+    "repository",
+    "workspace",
+    "changes",
+    "diff",
+    "commit",
+    "branch",
+    "pr",
+    "ci",
+    "github",
+    "codebase",
+    "code",
+    "file",
+    "function",
+];
+
 const MUTATING_TERMS: &[&str] = &[
     "fix",
     "修改代码",
@@ -55,6 +93,37 @@ const MUTATING_TERMS: &[&str] = &[
     "更新文件",
     "修复",
     "修正",
+];
+
+const EXPLICIT_MUTATION_DIRECTIVE_TERMS: &[&str] = &[
+    "fix",
+    "fix issues",
+    "fix failures",
+    "implement",
+    "write",
+    "edit",
+    "update code",
+    "create",
+    "add ",
+    "remove",
+    "delete",
+    "patch",
+    "refactor",
+    "apply",
+    "cleanup",
+    "clean up",
+    "修改代码",
+    "修改文件",
+    "重构",
+    "实现",
+    "新增",
+    "删除",
+    "更新代码",
+    "更新文件",
+    "修复",
+    "修正",
+    "清理",
+    "合理采纳",
 ];
 
 const ANALYSIS_TERMS: &[&str] = &[
@@ -186,7 +255,7 @@ impl Default for TaskExecutionProfile {
         Self {
             mutates_workspace: false,
             verification_required: false,
-            allow_factual_retry: true,
+            allow_factual_retry: false,
             exploration_round_window: DEFAULT_EXPLORATION_ROUND_WINDOW,
             stall_window: DEFAULT_STALL_WINDOW,
             complexity: TaskComplexity::Standard,
@@ -200,10 +269,24 @@ fn contains_any_keyword(q: &str, keywords: &[&str]) -> bool {
     keywords.iter().any(|kw| q.contains(kw))
 }
 
+fn contains_ascii_word(q: &str, word: &str) -> bool {
+    q.split(|ch: char| !ch.is_ascii_alphanumeric())
+        .any(|part| part == word)
+}
+
+fn contains_workspace_evidence_signal(q: &str) -> bool {
+    contains_any_keyword(q, WORKSPACE_EVIDENCE_PHRASES)
+        || WORKSPACE_EVIDENCE_WORDS
+            .iter()
+            .any(|word| contains_ascii_word(q, word))
+}
+
 #[must_use]
 pub fn infer_task_execution_profile(input: &str) -> TaskExecutionProfile {
     let q = input.to_lowercase();
     let has_mutating = contains_any_keyword(&q, MUTATING_TERMS);
+    let has_explicit_mutation_directive =
+        contains_any_keyword(&q, EXPLICIT_MUTATION_DIRECTIVE_TERMS);
     let has_analysis = contains_any_keyword(&q, ANALYSIS_TERMS);
     let exploratory = contains_any_keyword(&q, EXPLORATION_TERMS);
     let complexity = if contains_any_keyword(&q, COMPLEXITY_TERMS) {
@@ -221,14 +304,18 @@ pub fn infer_task_execution_profile(input: &str) -> TaskExecutionProfile {
     } else {
         DEFAULT_STALL_WINDOW
     };
-    // When both mutating and analysis terms are present, analysis wins —
-    // the user is asking to *review/inspect* something that involves changes,
-    // not asking to *make* changes. E.g. "评审当前修改" = review changes.
-    if has_mutating && !has_analysis {
+    // When both mutating and analysis terms are present, an explicit mutation
+    // directive wins ("review and fix", "评审并修复", "清理过时测试"). Otherwise
+    // analysis wins for object descriptions such as "评审当前修改" / "review
+    // current changes".
+    let should_mutate = has_explicit_mutation_directive || has_mutating && !has_analysis;
+    let needs_workspace_evidence =
+        should_mutate || exploratory || contains_workspace_evidence_signal(&q);
+    if should_mutate {
         TaskExecutionProfile {
             mutates_workspace: true,
             verification_required: true,
-            allow_factual_retry: true,
+            allow_factual_retry: needs_workspace_evidence,
             exploration_round_window,
             stall_window,
             complexity,
@@ -239,24 +326,12 @@ pub fn infer_task_execution_profile(input: &str) -> TaskExecutionProfile {
         TaskExecutionProfile {
             mutates_workspace: false,
             verification_required: false,
-            allow_factual_retry: true,
+            allow_factual_retry: needs_workspace_evidence,
             exploration_round_window,
             stall_window,
             complexity,
             exploratory_task: exploratory,
             agentic_turn_budget: default_agentic_turn_budget(false, exploratory, complexity),
-        }
-    } else if has_mutating {
-        // Mutating without analysis context
-        TaskExecutionProfile {
-            mutates_workspace: true,
-            verification_required: true,
-            allow_factual_retry: true,
-            exploration_round_window,
-            stall_window,
-            complexity,
-            exploratory_task: exploratory,
-            agentic_turn_budget: default_agentic_turn_budget(true, exploratory, complexity),
         }
     } else {
         TaskExecutionProfile {
@@ -264,6 +339,7 @@ pub fn infer_task_execution_profile(input: &str) -> TaskExecutionProfile {
             stall_window,
             complexity,
             exploratory_task: exploratory,
+            allow_factual_retry: needs_workspace_evidence,
             agentic_turn_budget: default_agentic_turn_budget(false, exploratory, complexity),
             ..TaskExecutionProfile::default()
         }
@@ -343,123 +419,6 @@ pub fn is_session_not_found_error(error: &str) -> bool {
     error.to_lowercase().contains("session not found")
 }
 
-/// Detect queries that refer to the conversation itself rather than
-/// external data.  These should NOT be forced into tool-retry because
-/// the answer is already in the LLM's context window.
-fn references_conversation_context(input: &str) -> bool {
-    let q = input.to_lowercase();
-    [
-        "上面",
-        "上一个",
-        "上个问题",
-        "之前说的",
-        "刚才说的",
-        "前面说的",
-        "你说的",
-        "我说的",
-        "我的问题",
-        "my question",
-        "you said",
-        "i said",
-        "above",
-        "previous message",
-        "previous question",
-        "previous answer",
-    ]
-    .iter()
-    .any(|kw| q.contains(kw))
-}
-
-/// Detect queries that almost certainly need tool calls to answer correctly.
-/// Used for the hallucination guard: if LLM answers these with 0 tool calls,
-/// the response is likely fabricated.
-pub fn looks_like_factual_query(input: &str) -> bool {
-    // Queries about the conversation itself never need tools — the LLM
-    // already has the full chat history in context.
-    if references_conversation_context(input) {
-        return false;
-    }
-
-    let q = input.to_lowercase();
-    // NOTE: bare "问题" removed — it means both "question" and "issue" in
-    // Chinese, causing false positives on conversational queries like
-    // "我上面一个问题？".  "issue" (English) is specific enough.
-    let github_keywords = [
-        "pr",
-        "pull request",
-        "issue",
-        "拉取请求",
-        "commit",
-        "提交",
-        "ci ",
-        " ci?",
-        "ci状态",
-        "最新的一个ci",
-        "workflow",
-        "工作流",
-        "pipeline",
-        "merge",
-        "branch",
-        "分支",
-        "release",
-        "tag",
-        "star",
-        "stars",
-        "多少star",
-    ];
-    let has_github = github_keywords.iter().any(|kw| q.contains(kw));
-    let memory_keywords = ["记忆", "memory", "memories", "存了什么", "记住了什么"];
-    let has_memory = memory_keywords.iter().any(|kw| q.contains(kw));
-    let git_live_keywords = [
-        "git status",
-        "git diff",
-        "改了什么",
-        "有哪些修改",
-        "当前有哪些修改",
-    ];
-    let has_git_live = git_live_keywords.iter().any(|kw| q.contains(kw));
-    let code_keywords = [
-        "read file",
-        "cat ",
-        "show me the code",
-        "what's in",
-        "file content",
-    ];
-    let has_code = code_keywords.iter().any(|kw| q.contains(kw));
-    let web_keywords = ["http", "url", "api ", "endpoint", "fetch", "download"];
-    let has_web = web_keywords.iter().any(|kw| q.contains(kw));
-
-    // Workspace-state queries: anything asking about local changes, diffs,
-    // file contents, or repo state that the model cannot know without tools.
-    // NOTE: bare "看一下" / "看看" removed — they are generic Chinese for
-    // "take a look" and trigger on non-workspace queries like "看看你说的对不对".
-    // They remain in ANALYSIS_TERMS for task-profile classification.
-    let workspace_keywords = [
-        "review",
-        "diff",
-        "changes",
-        "changed",
-        "local",
-        "改动",
-        "修改",
-        "变更",
-        "审查",
-        "审阅",
-        "评审",
-        "什么文件",
-        "哪些文件",
-        "this repo",
-        "this project",
-        "codebase",
-        "这个项目",
-        "这个仓库",
-        "代码库",
-    ];
-    let has_workspace = workspace_keywords.iter().any(|kw| q.contains(kw));
-
-    has_github || has_memory || has_git_live || has_code || has_web || has_workspace
-}
-
 /// Detect requests that are likely to mutate the workspace and therefore
 /// benefit from verification stop hooks before the agent completes.
 ///
@@ -470,22 +429,15 @@ pub fn looks_like_mutating_task(input: &str) -> bool {
     let q = input.to_lowercase();
     let has_mutating = contains_any_keyword(&q, MUTATING_TERMS);
     let has_read_only = contains_any_keyword(&q, ANALYSIS_TERMS);
-    // Analysis context overrides mutating terms — user is reviewing/inspecting
-    // something that involves changes, not requesting changes themselves.
-    if has_read_only {
-        return false;
-    }
-    has_mutating
-}
-
-pub fn looks_like_live_query_with_context(input: &str, _recent_tools: &[String]) -> bool {
-    looks_like_factual_query(input)
+    let has_explicit_mutation_directive =
+        contains_any_keyword(&q, EXPLICIT_MUTATION_DIRECTIVE_TERMS);
+    has_explicit_mutation_directive || has_mutating && !has_read_only
 }
 
 pub fn should_force_factual_tool_retry(
     profile: TaskExecutionProfile,
-    input: &str,
-    recent_tools: &[String],
+    _input: &str,
+    _recent_tools: &[String],
     total_evidence_tool_calls: u32,
     already_retried: bool,
     policy: &TurnInteractionPolicy,
@@ -494,7 +446,6 @@ pub fn should_force_factual_tool_retry(
         && !already_retried
         && total_evidence_tool_calls == 0
         && policy.has_evidence_tools()
-        && looks_like_live_query_with_context(input, recent_tools)
 }
 
 pub fn factual_tool_retry_message(original_query: &str, policy: &TurnInteractionPolicy) -> String {
@@ -523,12 +474,13 @@ Only call tools from this list to gather evidence — do not use bash to work ar
     format!(
         "Runtime correction: your previous response answered without using any tools. \
         This query requires live data from the workspace, repository, or external sources \
-        that you cannot know from training data alone. Retry from scratch and call tools first.\n\
+        that you cannot know from training data alone. Validate the answer with tools first.\n\
         \n\
         {tools_hint}\n\
         {clarification_hint}\n\
         \n\
-        Discard your previous draft and gather evidence with tools before answering.\n\
+        If the available tools do not provide relevant evidence for the user's actual question, \
+        answer the question directly instead of writing task-progress commentary.\n\
         \n\
         Original user query: {original_query}"
     )
@@ -624,48 +576,12 @@ mod tests {
     use crate::interaction_types::TurnInteractionMode;
 
     #[test]
-    fn factual_query_detects_github_keywords() {
-        assert!(looks_like_factual_query("show me the latest PR"));
-        assert!(looks_like_factual_query("list open issues"));
-        assert!(looks_like_factual_query("check CI status"));
-        assert!(looks_like_factual_query("what's in the commit?"));
-        assert!(looks_like_factual_query("workflow status"));
-        assert!(looks_like_factual_query("最新的一个ci?"));
-        assert!(looks_like_factual_query("多少star了？"));
-        assert!(looks_like_factual_query("pr呢？"));
-    }
-
-    #[test]
-    fn factual_query_detects_file_keywords() {
-        assert!(looks_like_factual_query("read file src/main.rs"));
-        assert!(looks_like_factual_query("cat the config"));
-        assert!(looks_like_factual_query("show me the code in lib.rs"));
-    }
-
-    #[test]
-    fn factual_query_detects_web_keywords() {
-        assert!(looks_like_factual_query("fetch the API endpoint"));
-        assert!(looks_like_factual_query("check http://example.com"));
-    }
-
-    #[test]
-    fn factual_query_detects_memory_and_git_live_queries() {
-        assert!(looks_like_factual_query("我有哪些记忆？"));
-        assert!(looks_like_factual_query("当前有哪些修改？"));
-        assert!(looks_like_factual_query("改了什么，看一眼"));
-    }
-
-    #[test]
     fn mutating_task_detection_distinguishes_read_only_flows() {
         assert!(!looks_like_mutating_task("review 最新的commit"));
         assert!(!looks_like_mutating_task(
             "what changed in the latest commit?"
         ));
         assert!(!looks_like_mutating_task("explain this diff"));
-        // Analysis context overrides even when mutating terms are present
-        assert!(!looks_like_mutating_task(
-            "review the latest commit and fix any issues"
-        ));
         assert!(!looks_like_mutating_task("评审当前修改"));
         assert!(!looks_like_mutating_task("审查修改"));
         assert!(!looks_like_mutating_task("看一下修改"));
@@ -673,6 +589,16 @@ mod tests {
         assert!(looks_like_mutating_task("implement the feature"));
         assert!(looks_like_mutating_task("fix the bug"));
         assert!(looks_like_mutating_task("修复这个问题"));
+        // Mixed review + explicit mutation should still get a mutating profile.
+        assert!(looks_like_mutating_task(
+            "review the latest commit and fix any issues"
+        ));
+        assert!(looks_like_mutating_task(
+            "review the current changes and fix any issues"
+        ));
+        assert!(looks_like_mutating_task(
+            "多角度review这个分支changes，清理过时测试"
+        ));
     }
 
     #[test]
@@ -704,6 +630,7 @@ mod tests {
                 >= implementation.agentic_turn_budget.hard_turn_limit
         );
         assert!(exploratory.exploratory_task);
+        assert!(exploratory.allow_factual_retry);
     }
 
     #[test]
@@ -748,9 +675,16 @@ mod tests {
     }
 
     #[test]
-    fn analysis_wins_over_mutating_when_both_present() {
-        // "review and fix" → analysis wins (user is reviewing, not just fixing)
+    fn explicit_mutation_wins_over_analysis_when_both_present() {
+        // "review and fix" is a mixed request: inspect first, then mutate.
         let profile = infer_task_execution_profile("review the code and fix issues");
+        assert!(profile.verification_required);
+        assert!(profile.mutates_workspace);
+        let profile = infer_task_execution_profile("多角度review这个分支changes，清理过时测试");
+        assert!(profile.verification_required);
+        assert!(profile.mutates_workspace);
+        // Describing changes as the object of review remains read-only.
+        let profile = infer_task_execution_profile("review current changes");
         assert!(!profile.verification_required);
         // Pure mutating still works
         let profile = infer_task_execution_profile("fix the compilation error");
@@ -758,118 +692,53 @@ mod tests {
     }
 
     #[test]
-    fn factual_query_rejects_general_questions() {
-        assert!(!looks_like_factual_query("what is Rust?"));
-        assert!(!looks_like_factual_query("explain monads"));
-        assert!(!looks_like_factual_query("write a function"));
-        assert!(!looks_like_factual_query("hello"));
-    }
-
-    #[test]
-    fn factual_query_rejects_conversation_references() {
-        // Queries about the conversation itself should NOT trigger factual retry
-        // — the answer is already in the LLM's context window.
-        assert!(!looks_like_factual_query("我上面一个问题？"));
-        assert!(!looks_like_factual_query("上一个问题是什么"));
-        assert!(!looks_like_factual_query("之前说的那个"));
-        assert!(!looks_like_factual_query("你说的对吗"));
-        assert!(!looks_like_factual_query("what you said above"));
-        assert!(!looks_like_factual_query("my previous question"));
-    }
-
-    #[test]
-    fn factual_query_rejects_ambiguous_chinese_keywords() {
-        // "问题" alone should NOT trigger (means "question" not just "issue")
-        assert!(!looks_like_factual_query("什么问题？"));
-        assert!(!looks_like_factual_query("你有什么问题？"));
-        assert!(!looks_like_factual_query("这个有问题吗"));
-        // "看一下" / "看看" alone should NOT trigger (too generic)
-        assert!(!looks_like_factual_query("看一下这个公式"));
-        assert!(!looks_like_factual_query("看看你说的对不对"));
-        assert!(!looks_like_factual_query("帮我看看这段话"));
-    }
-
-    #[test]
-    fn force_retry_only_for_first_zero_tool_factual_answer() {
+    fn force_retry_requires_explicit_profile_signal() {
         let none: Vec<String> = vec![];
         let policy = TurnInteractionPolicy::from_visible_tool_names(
             TurnInteractionMode::Deny,
             vec!["github".into()],
         );
+        assert!(!should_force_factual_tool_retry(
+            TaskExecutionProfile::default(),
+            "最新的一个ci?",
+            &none,
+            0,
+            false,
+            &policy,
+        ));
+
+        let explicit = TaskExecutionProfile {
+            allow_factual_retry: true,
+            ..TaskExecutionProfile::default()
+        };
         assert!(should_force_factual_tool_retry(
-            TaskExecutionProfile::default(),
-            "最新的一个ci?",
-            &none,
-            0,
-            false,
-            &policy,
+            explicit, "hello", &none, 0, false, &policy,
         ));
         assert!(!should_force_factual_tool_retry(
-            TaskExecutionProfile::default(),
-            "最新的一个ci?",
-            &none,
-            1,
-            false,
-            &policy,
+            explicit, "hello", &none, 1, false, &policy,
         ));
         assert!(!should_force_factual_tool_retry(
-            TaskExecutionProfile::default(),
-            "最新的一个ci?",
-            &none,
-            0,
-            true,
-            &policy,
-        ));
-        // Analysis tasks now also allow factual retry
-        assert!(should_force_factual_tool_retry(
-            infer_task_execution_profile("review 最新的commit"),
-            "最新的一个ci?",
-            &none,
-            0,
-            false,
-            &policy,
-        ));
-        assert!(!should_force_factual_tool_retry(
-            TaskExecutionProfile::default(),
-            "hello",
-            &none,
-            0,
-            false,
-            &policy,
+            explicit, "hello", &none, 0, true, &policy,
         ));
     }
 
     #[test]
-    fn workspace_queries_detected_as_factual() {
-        // Any query about workspace state should be detected as needing tools
-        assert!(looks_like_factual_query("review local changes"));
-        assert!(looks_like_factual_query("what changed"));
-        assert!(looks_like_factual_query("评审当前修改"));
-        assert!(looks_like_factual_query("看改动"));
-        assert!(looks_like_factual_query("diff the code"));
-        assert!(looks_like_factual_query("what's in this repo"));
-        assert!(looks_like_factual_query("这个项目有什么"));
-        // Generic non-workspace queries should NOT trigger
-        assert!(!looks_like_factual_query("hello"));
-        assert!(!looks_like_factual_query("explain quicksort"));
-        assert!(!looks_like_factual_query("write a poem"));
-    }
-
-    #[test]
-    fn analysis_tasks_allow_factual_retry() {
+    fn heuristic_profiles_enable_factual_retry_only_for_workspace_evidence() {
         let profile = infer_task_execution_profile("review local changes");
         assert!(profile.allow_factual_retry);
         let profile2 = infer_task_execution_profile("explain this function");
         assert!(profile2.allow_factual_retry);
-    }
-
-    #[test]
-    fn live_query_detection_ignores_recent_tools_for_short_followups() {
-        let recent = vec!["github".to_string()];
-        assert!(!looks_like_live_query_with_context("最新的", &recent));
-        assert!(looks_like_live_query_with_context("pr呢？", &recent));
-        assert!(!looks_like_live_query_with_context("hello", &recent));
-        assert!(!looks_like_live_query_with_context("然后呢", &recent));
+        let profile3 = infer_task_execution_profile("implement the feature");
+        assert!(profile3.allow_factual_retry);
+        let profile4 =
+            infer_task_execution_profile("what do 59% and 117k mean in the status line?");
+        assert!(!profile4.allow_factual_retry);
+        let profile5 = infer_task_execution_profile("what is Rust?");
+        assert!(!profile5.allow_factual_retry);
+        let profile6 = infer_task_execution_profile("explain recursion conceptually");
+        assert!(!profile6.allow_factual_retry);
+        let profile7 = infer_task_execution_profile("explain prompt profile settings");
+        assert!(!profile7.allow_factual_retry);
     }
 
     #[test]
@@ -881,18 +750,24 @@ mod tests {
         let msg = factual_tool_retry_message("memoria 最新的一个ci?", &policy);
         assert!(msg.contains("mo_query"));
         assert!(msg.contains("cannot pause for user clarification"));
-        assert!(msg.contains("Discard your previous draft"));
+        assert!(msg.contains("If the available tools do not provide relevant evidence"));
+        assert!(!msg.contains("Discard your previous draft"));
     }
 
     #[test]
     fn factual_retry_message_lists_visible_tools_when_provided() {
         let policy = TurnInteractionPolicy::from_visible_tool_names(
             TurnInteractionMode::Deny,
-            vec!["mo_query".to_string(), "read_file".to_string()],
+            vec![
+                "mo_query".to_string(),
+                "introspect".to_string(),
+                "read_file".to_string(),
+            ],
         );
         let msg = factual_tool_retry_message("看session指标", &policy);
         assert!(msg.contains("mo_query"));
         assert!(msg.contains("read_file"));
+        assert!(!msg.contains("introspect"));
         assert!(msg.contains("Only call tools from this list"));
     }
 
@@ -927,8 +802,12 @@ mod tests {
             TurnInteractionMode::Prompt,
             vec!["ask_user".into()],
         );
+        let explicit = TaskExecutionProfile {
+            allow_factual_retry: true,
+            ..TaskExecutionProfile::default()
+        };
         assert!(!should_force_factual_tool_retry(
-            TaskExecutionProfile::default(),
+            explicit,
             "latest CI?",
             &[],
             0,

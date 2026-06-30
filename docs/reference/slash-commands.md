@@ -523,19 +523,23 @@ Set permission mode for tool execution.
 
 | Mode                                     | Description                   |
 | ---------------------------------------- | ----------------------------- |
-| `auto`                                   | Auto-approve all tool use     |
-| `all`                                    | Alias for auto                |
-| `plan`                                   | Read-only investigation mode  |
-| `accept_edits` / `accept-edits` / `edit` | Auto-approve local file edits |
-| `prompt`                                 | Prompt before each tool       |
-| `deny`                                   | Deny all tool use             |
-| `rules`                                  | Show current permission rules |
+| `auto`            | Auto-approve normal tool risk; some git/sensitive gates may still stop |
+| `bypass` / `skip` | Skip approval prompts; catastrophic and policy hard-denies still apply |
+| `plan`            | Read-only investigation mode  |
+| `accept_edits`    | Auto-approve local file edits |
+| `prompt`          | Prompt before each tool       |
+| `deny`            | Deny all tool use             |
+| `rules`           | Show current permission rules |
 
 ```
-/allow auto      # Trust all tools
+/allow auto      # Auto-approve normal tool risk
+/allow bypass    # Skip approval prompts
 /allow prompt    # Ask before each
 /allow rules     # Show rules
 ```
+
+Bare `/allow` and Shift+Tab cycle `prompt → accept_edits → plan → auto → prompt`.
+Use `/allow bypass` explicitly when you want to skip approval prompts.
 
 ### `/instructions [subcommand]`
 
