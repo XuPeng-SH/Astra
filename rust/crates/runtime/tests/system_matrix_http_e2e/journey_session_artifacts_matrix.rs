@@ -847,6 +847,7 @@ async fn spawn_http_app_server(app: axum::Router) -> String {
 
 async fn wait_for_artifact_count(
     pool: &sqlx::MySqlPool,
+    user_id: &str,
     session_id: &str,
     artifact_kind: &str,
     min_count: i64,
@@ -855,8 +856,9 @@ async fn wait_for_artifact_count(
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let n: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM session_artifacts WHERE session_id = ? AND artifact_kind = ?",
+            "SELECT COUNT(*) FROM session_artifacts WHERE user_id = ? AND session_id = ? AND artifact_kind = ?",
         )
+        .bind(user_id)
         .bind(session_id)
         .bind(artifact_kind)
         .fetch_one(pool)
@@ -867,11 +869,30 @@ async fn wait_for_artifact_count(
         }
         if tokio::time::Instant::now() >= deadline {
             panic!(
-                "timeout ({timeout:?}) waiting for >= {min_count} artifacts of kind={artifact_kind} for session_id={session_id} (got {n})"
+                "timeout ({timeout:?}) waiting for >= {min_count} artifacts of kind={artifact_kind} for user_id={user_id} session_id={session_id} (got {n})"
             );
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
+}
+
+async fn latest_llm_capture_artifact_id(
+    pool: &sqlx::MySqlPool,
+    user_id: &str,
+    session_id: &str,
+    expect: &str,
+) -> String {
+    let row = sqlx::query(
+        "SELECT artifact_id \
+         FROM session_artifacts WHERE user_id = ? AND session_id = ? AND artifact_kind = 'llm_capture' \
+         ORDER BY created_at DESC, artifact_id DESC LIMIT 1",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .fetch_one(pool)
+    .await
+    .expect(expect);
+    row.try_get("artifact_id").expect("artifact_id")
 }
 
 pub async fn run_session_artifact_http_matches_session_artifacts_rows() {
@@ -939,12 +960,14 @@ pub async fn run_session_artifact_http_matches_session_artifacts_rows() {
     .await
     .expect("insert composite artifact");
 
-    let artifact_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM session_artifacts WHERE session_id = ?")
-            .bind(&ctx.session_id)
-            .fetch_one(&ctx.pool)
-            .await
-            .expect("artifact count");
+    let artifact_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM session_artifacts WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&ctx.user_id)
+    .bind(&ctx.session_id)
+    .fetch_one(&ctx.pool)
+    .await
+    .expect("artifact count");
     assert_eq!(artifact_count, 2);
 
     let list_path = format!(
@@ -1061,10 +1084,11 @@ pub async fn run_session_artifact_http_matches_session_artifacts_rows() {
 
     let db_row = sqlx::query(
         "SELECT artifact_kind, source, CAST(metadata AS CHAR) AS metadata_json \
-         FROM session_artifacts WHERE artifact_id = ? AND session_id = ?",
+         FROM session_artifacts WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
     )
-    .bind(&workspace_artifact_id)
+    .bind(&ctx.user_id)
     .bind(&ctx.session_id)
+    .bind(&workspace_artifact_id)
     .fetch_one(&ctx.pool)
     .await
     .expect("workspace artifact row");
@@ -1080,7 +1104,8 @@ pub async fn run_session_artifact_http_matches_session_artifacts_rows() {
             .as_deref(),
         Some("workspace_metadata")
     );
-
+    cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &ctx.session_id).await;
+    cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &other_session_id).await;
     ctx.pool.close().await;
 }
 
@@ -1102,8 +1127,9 @@ pub async fn run_published_session_artifact_round_trip() {
     let session_id = sess["session_id"].as_str().expect("session_id").to_string();
 
     let before_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM session_artifacts WHERE session_id = ? AND artifact_kind = 'llm_capture'",
+        "SELECT COUNT(*) FROM session_artifacts WHERE user_id = ? AND session_id = ? AND artifact_kind = 'llm_capture'",
     )
+    .bind(&ctx.user_id)
     .bind(&session_id)
     .fetch_one(pool)
     .await
@@ -1130,6 +1156,7 @@ pub async fn run_published_session_artifact_round_trip() {
 
     wait_for_artifact_count(
         pool,
+        &ctx.user_id,
         &session_id,
         "llm_capture",
         1,
@@ -1139,9 +1166,10 @@ pub async fn run_published_session_artifact_round_trip() {
 
     let row = sqlx::query(
         "SELECT artifact_id, source, turn, round, content_json, CAST(metadata AS CHAR) AS metadata_json \
-         FROM session_artifacts WHERE session_id = ? AND artifact_kind = 'llm_capture' \
-         ORDER BY created_at DESC LIMIT 1",
+         FROM session_artifacts WHERE user_id = ? AND session_id = ? AND artifact_kind = 'llm_capture' \
+         ORDER BY created_at DESC, artifact_id DESC LIMIT 1",
     )
+    .bind(&ctx.user_id)
     .bind(&session_id)
     .fetch_one(pool)
     .await
@@ -1207,12 +1235,7 @@ pub async fn run_published_session_artifact_round_trip() {
         StatusCode::NOT_FOUND,
         "published artifact should still be session-scoped over HTTP: {wrong_session_j}"
     );
-
-    let _ = sqlx::query("DELETE FROM session_artifacts WHERE session_id = ?")
-        .bind(&session_id)
-        .execute(pool)
-        .await;
-    cleanup_session_data(pool, &session_id).await;
+    cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &session_id).await;
     ctx.pool.close().await;
 }
 
@@ -1250,6 +1273,7 @@ pub async fn run_session_artifact_latest_and_download_routes() {
 
     wait_for_artifact_count(
         pool,
+        &ctx.user_id,
         &session_id,
         "llm_capture",
         1,
@@ -1257,16 +1281,9 @@ pub async fn run_session_artifact_latest_and_download_routes() {
     )
     .await;
 
-    let row = sqlx::query(
-        "SELECT artifact_id \
-         FROM session_artifacts WHERE session_id = ? AND artifact_kind = 'llm_capture' \
-         ORDER BY created_at DESC LIMIT 1",
-    )
-    .bind(&session_id)
-    .fetch_one(pool)
-    .await
-    .expect("latest llm_capture row");
-    let artifact_id: String = row.try_get("artifact_id").expect("artifact_id");
+    let artifact_id =
+        latest_llm_capture_artifact_id(pool, &ctx.user_id, &session_id, "latest llm_capture row")
+            .await;
 
     let latest_path = format!("/sessions/{session_id}/artifacts/latest/llm_capture");
     let (st_latest, latest_j) = get_json(app, &latest_path, Some(auth), &[]).await;
@@ -1392,14 +1409,8 @@ pub async fn run_session_artifact_latest_and_download_routes() {
         "foreign user must not download another user's artifact: {}",
         String::from_utf8_lossy(&foreign_download_body)
     );
-
-    let _ = sqlx::query("DELETE FROM session_artifacts WHERE session_id IN (?, ?)")
-        .bind(&session_id)
-        .bind(&other_session_id)
-        .execute(pool)
-        .await;
-    cleanup_session_data(pool, &session_id).await;
-    cleanup_session_data(pool, &other_session_id).await;
+    cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &session_id).await;
+    cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &other_session_id).await;
     ctx.pool.close().await;
 }
 
@@ -1452,6 +1463,7 @@ pub async fn run_failed_session_artifact_latest_and_download_routes() {
 
     wait_for_artifact_count(
         pool,
+        &ctx.user_id,
         &session_id,
         "llm_capture",
         1,
@@ -1459,16 +1471,13 @@ pub async fn run_failed_session_artifact_latest_and_download_routes() {
     )
     .await;
 
-    let row = sqlx::query(
-        "SELECT artifact_id \
-         FROM session_artifacts WHERE session_id = ? AND artifact_kind = 'llm_capture' \
-         ORDER BY created_at DESC, artifact_id DESC LIMIT 1",
+    let artifact_id = latest_llm_capture_artifact_id(
+        pool,
+        &ctx.user_id,
+        &session_id,
+        "latest failed llm_capture row",
     )
-    .bind(&session_id)
-    .fetch_one(pool)
-    .await
-    .expect("latest failed llm_capture row");
-    let artifact_id: String = row.try_get("artifact_id").expect("artifact_id");
+    .await;
 
     let latest_path = format!("/sessions/{session_id}/artifacts/latest/llm_capture");
     let (st_latest, latest_j) = get_json(app, &latest_path, Some(auth), &[]).await;
@@ -1545,12 +1554,7 @@ pub async fn run_failed_session_artifact_latest_and_download_routes() {
         download_j["content"]["response"]["usage"]["output_tokens"].as_i64(),
         Some(3)
     );
-
-    let _ = sqlx::query("DELETE FROM session_artifacts WHERE session_id = ?")
-        .bind(&session_id)
-        .execute(pool)
-        .await;
-    cleanup_session_data(pool, &session_id).await;
+    cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &session_id).await;
     ctx.pool.close().await;
 }
 
@@ -1600,6 +1604,7 @@ async fn run_bridge_failure_session_artifact_latest_and_download_routes(
 
     wait_for_artifact_count(
         pool,
+        &ctx.user_id,
         &session_id,
         "llm_capture",
         1,
@@ -1607,16 +1612,13 @@ async fn run_bridge_failure_session_artifact_latest_and_download_routes(
     )
     .await;
 
-    let row = sqlx::query(
-        "SELECT artifact_id \
-         FROM session_artifacts WHERE session_id = ? AND artifact_kind = 'llm_capture' \
-         ORDER BY created_at DESC, artifact_id DESC LIMIT 1",
+    let artifact_id = latest_llm_capture_artifact_id(
+        pool,
+        &ctx.user_id,
+        &session_id,
+        "latest bridge failed llm_capture row",
     )
-    .bind(&session_id)
-    .fetch_one(pool)
-    .await
-    .expect("latest bridge failed llm_capture row");
-    let artifact_id: String = row.try_get("artifact_id").expect("artifact_id");
+    .await;
 
     let latest_path = format!("/sessions/{session_id}/artifacts/latest/llm_capture");
     let (st_latest, latest_j) = get_json(app, &latest_path, Some(auth), &[]).await;
@@ -1658,12 +1660,7 @@ async fn run_bridge_failure_session_artifact_latest_and_download_routes(
         download_j["content"]["response"]["partial_full_text"].as_str(),
         Some(partial_text)
     );
-
-    let _ = sqlx::query("DELETE FROM session_artifacts WHERE session_id = ?")
-        .bind(&session_id)
-        .execute(pool)
-        .await;
-    cleanup_session_data(pool, &session_id).await;
+    cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &session_id).await;
     ctx.pool.close().await;
 }
 
@@ -1687,6 +1684,7 @@ pub async fn run_server_loop_block_parse_recovery_session_artifact_latest_and_do
         json!({
             "name": model_name,
             "provider": "openai",
+            "context_window": 200000,
             "api_key": "server-loop-block-parse-e2e-key",
             "base_url": base_url
         }),
@@ -1746,6 +1744,7 @@ pub async fn run_server_loop_block_parse_recovery_session_artifact_latest_and_do
 
     wait_for_artifact_count(
         pool,
+        &ctx.user_id,
         &session_id,
         "llm_capture",
         1,
@@ -1753,16 +1752,13 @@ pub async fn run_server_loop_block_parse_recovery_session_artifact_latest_and_do
     )
     .await;
 
-    let row = sqlx::query(
-        "SELECT artifact_id \
-         FROM session_artifacts WHERE session_id = ? AND artifact_kind = 'llm_capture' \
-         ORDER BY created_at DESC, artifact_id DESC LIMIT 1",
+    let artifact_id = latest_llm_capture_artifact_id(
+        pool,
+        &ctx.user_id,
+        &session_id,
+        "latest server-loop block-parse llm_capture row",
     )
-    .bind(&session_id)
-    .fetch_one(pool)
-    .await
-    .expect("latest server-loop block-parse llm_capture row");
-    let artifact_id: String = row.try_get("artifact_id").expect("artifact_id");
+    .await;
 
     let latest_path = format!("/sessions/{session_id}/artifacts/latest/llm_capture");
     let (st_latest, latest_j) = get_json(app, &latest_path, Some(auth), &[]).await;
@@ -1795,16 +1791,11 @@ pub async fn run_server_loop_block_parse_recovery_session_artifact_latest_and_do
         hits.nonstream_hits.load(Ordering::SeqCst) >= 1,
         "malformed provider block after progress should trigger at least one non-stream fallback request"
     );
-
-    let _ = sqlx::query("DELETE FROM session_artifacts WHERE session_id = ?")
-        .bind(&session_id)
-        .execute(pool)
-        .await;
     let _ = sqlx::query("DELETE FROM infra_llm_models WHERE model_name = ?")
         .bind(&model_name)
         .execute(pool)
         .await;
-    cleanup_session_data(pool, &session_id).await;
+    cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &session_id).await;
     ctx.pool.close().await;
 }
 
@@ -1827,6 +1818,7 @@ pub async fn run_server_loop_block_parse_failure_session_artifact_latest_and_dow
         json!({
             "name": model_name,
             "provider": "openai",
+            "context_window": 200000,
             "api_key": "server-loop-block-parse-fail-e2e-key",
             "base_url": base_url
         }),
@@ -1886,6 +1878,7 @@ pub async fn run_server_loop_block_parse_failure_session_artifact_latest_and_dow
 
     wait_for_artifact_count(
         pool,
+        &ctx.user_id,
         &session_id,
         "llm_capture",
         1,
@@ -1893,16 +1886,13 @@ pub async fn run_server_loop_block_parse_failure_session_artifact_latest_and_dow
     )
     .await;
 
-    let row = sqlx::query(
-        "SELECT artifact_id \
-         FROM session_artifacts WHERE session_id = ? AND artifact_kind = 'llm_capture' \
-         ORDER BY created_at DESC, artifact_id DESC LIMIT 1",
+    let artifact_id = latest_llm_capture_artifact_id(
+        pool,
+        &ctx.user_id,
+        &session_id,
+        "latest server-loop block-parse failure llm_capture row",
     )
-    .bind(&session_id)
-    .fetch_one(pool)
-    .await
-    .expect("latest server-loop block-parse failure llm_capture row");
-    let artifact_id: String = row.try_get("artifact_id").expect("artifact_id");
+    .await;
 
     let latest_path = format!("/sessions/{session_id}/artifacts/latest/llm_capture");
     let (st_latest, latest_j) = get_json(app, &latest_path, Some(auth), &[]).await;
@@ -1957,16 +1947,11 @@ pub async fn run_server_loop_block_parse_failure_session_artifact_latest_and_dow
         hits.nonstream_hits.load(Ordering::SeqCst) >= 1,
         "malformed provider block after progress should trigger at least one non-stream fallback request before failing"
     );
-
-    let _ = sqlx::query("DELETE FROM session_artifacts WHERE session_id = ?")
-        .bind(&session_id)
-        .execute(pool)
-        .await;
     let _ = sqlx::query("DELETE FROM infra_llm_models WHERE model_name = ?")
         .bind(&model_name)
         .execute(pool)
         .await;
-    cleanup_session_data(pool, &session_id).await;
+    cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &session_id).await;
     ctx.pool.close().await;
 }
 
@@ -1997,6 +1982,7 @@ pub async fn run_server_loop_client_disconnect_session_artifact_latest_and_downl
         json!({
             "name": model_name,
             "provider": "openai",
+            "context_window": 200000,
             "api_key": "server-loop-disconnect-e2e-key",
             "base_url": base_url
         }),
@@ -2038,6 +2024,7 @@ pub async fn run_server_loop_client_disconnect_session_artifact_latest_and_downl
 
     wait_for_artifact_count(
         pool,
+        &ctx.user_id,
         &session_id,
         "llm_capture",
         1,
@@ -2045,16 +2032,13 @@ pub async fn run_server_loop_client_disconnect_session_artifact_latest_and_downl
     )
     .await;
 
-    let row = sqlx::query(
-        "SELECT artifact_id \
-         FROM session_artifacts WHERE session_id = ? AND artifact_kind = 'llm_capture' \
-         ORDER BY created_at DESC, artifact_id DESC LIMIT 1",
+    let artifact_id = latest_llm_capture_artifact_id(
+        pool,
+        &ctx.user_id,
+        &session_id,
+        "latest server-loop disconnect llm_capture row",
     )
-    .bind(&session_id)
-    .fetch_one(pool)
-    .await
-    .expect("latest server-loop disconnect llm_capture row");
-    let artifact_id: String = row.try_get("artifact_id").expect("artifact_id");
+    .await;
 
     let latest_path = format!("/sessions/{session_id}/artifacts/latest/llm_capture");
     let (st_latest, latest_j) = get_json(app, &latest_path, Some(auth), &[]).await;
@@ -2105,16 +2089,11 @@ pub async fn run_server_loop_client_disconnect_session_artifact_latest_and_downl
         hits.stream_hits.load(Ordering::SeqCst) >= 1,
         "disconnect proof must hit the raw streaming provider at least once"
     );
-
-    let _ = sqlx::query("DELETE FROM session_artifacts WHERE session_id = ?")
-        .bind(&session_id)
-        .execute(pool)
-        .await;
     let _ = sqlx::query("DELETE FROM infra_llm_models WHERE model_name = ?")
         .bind(&model_name)
         .execute(pool)
         .await;
-    cleanup_session_data(pool, &session_id).await;
+    cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &session_id).await;
     ctx.pool.close().await;
 }
 
@@ -2145,6 +2124,7 @@ pub async fn run_server_loop_transport_recovery_session_artifact_latest_and_down
         json!({
             "name": model_name,
             "provider": "openai",
+            "context_window": 200000,
             "api_key": "server-loop-transport-recovery-e2e-key",
             "base_url": base_url
         }),
@@ -2197,6 +2177,7 @@ pub async fn run_server_loop_transport_recovery_session_artifact_latest_and_down
 
     wait_for_artifact_count(
         pool,
+        &ctx.user_id,
         &session_id,
         "llm_capture",
         1,
@@ -2204,16 +2185,13 @@ pub async fn run_server_loop_transport_recovery_session_artifact_latest_and_down
     )
     .await;
 
-    let row = sqlx::query(
-        "SELECT artifact_id \
-         FROM session_artifacts WHERE session_id = ? AND artifact_kind = 'llm_capture' \
-         ORDER BY created_at DESC, artifact_id DESC LIMIT 1",
+    let artifact_id = latest_llm_capture_artifact_id(
+        pool,
+        &ctx.user_id,
+        &session_id,
+        "latest server-loop transport recovery llm_capture row",
     )
-    .bind(&session_id)
-    .fetch_one(pool)
-    .await
-    .expect("latest server-loop transport recovery llm_capture row");
-    let artifact_id: String = row.try_get("artifact_id").expect("artifact_id");
+    .await;
 
     let latest_path = format!("/sessions/{session_id}/artifacts/latest/llm_capture");
     let (st_latest, latest_j) = get_json(app, &latest_path, Some(auth), &[]).await;
@@ -2246,16 +2224,11 @@ pub async fn run_server_loop_transport_recovery_session_artifact_latest_and_down
         hits.nonstream_hits.load(Ordering::SeqCst) >= 2,
         "transport recovery should perform one probe and one non-stream fallback request"
     );
-
-    let _ = sqlx::query("DELETE FROM session_artifacts WHERE session_id = ?")
-        .bind(&session_id)
-        .execute(pool)
-        .await;
     let _ = sqlx::query("DELETE FROM infra_llm_models WHERE model_name = ?")
         .bind(&model_name)
         .execute(pool)
         .await;
-    cleanup_session_data(pool, &session_id).await;
+    cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &session_id).await;
     ctx.pool.close().await;
 }
 
@@ -2283,6 +2256,7 @@ pub async fn run_server_loop_transport_failure_session_artifact_latest_and_downl
         json!({
             "name": model_name,
             "provider": "openai",
+            "context_window": 200000,
             "api_key": "server-loop-transport-failure-e2e-key",
             "base_url": base_url
         }),
@@ -2335,6 +2309,7 @@ pub async fn run_server_loop_transport_failure_session_artifact_latest_and_downl
 
     wait_for_artifact_count(
         pool,
+        &ctx.user_id,
         &session_id,
         "llm_capture",
         1,
@@ -2342,16 +2317,13 @@ pub async fn run_server_loop_transport_failure_session_artifact_latest_and_downl
     )
     .await;
 
-    let row = sqlx::query(
-        "SELECT artifact_id \
-         FROM session_artifacts WHERE session_id = ? AND artifact_kind = 'llm_capture' \
-         ORDER BY created_at DESC, artifact_id DESC LIMIT 1",
+    let artifact_id = latest_llm_capture_artifact_id(
+        pool,
+        &ctx.user_id,
+        &session_id,
+        "latest server-loop transport failure llm_capture row",
     )
-    .bind(&session_id)
-    .fetch_one(pool)
-    .await
-    .expect("latest server-loop transport failure llm_capture row");
-    let artifact_id: String = row.try_get("artifact_id").expect("artifact_id");
+    .await;
 
     let latest_path = format!("/sessions/{session_id}/artifacts/latest/llm_capture");
     let (st_latest, latest_j) = get_json(app, &latest_path, Some(auth), &[]).await;
@@ -2406,16 +2378,11 @@ pub async fn run_server_loop_transport_failure_session_artifact_latest_and_downl
         hits.nonstream_hits.load(Ordering::SeqCst) >= 2,
         "transport failure should perform one probe and one non-stream fallback request"
     );
-
-    let _ = sqlx::query("DELETE FROM session_artifacts WHERE session_id = ?")
-        .bind(&session_id)
-        .execute(pool)
-        .await;
     let _ = sqlx::query("DELETE FROM infra_llm_models WHERE model_name = ?")
         .bind(&model_name)
         .execute(pool)
         .await;
-    cleanup_session_data(pool, &session_id).await;
+    cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &session_id).await;
     ctx.pool.close().await;
 }
 
@@ -2448,6 +2415,7 @@ pub async fn run_server_loop_idle_recovery_session_artifact_latest_and_download_
         json!({
             "name": model_name,
             "provider": "openai",
+            "context_window": 200000,
             "api_key": "server-loop-idle-recovery-e2e-key",
             "base_url": base_url
         }),
@@ -2500,6 +2468,7 @@ pub async fn run_server_loop_idle_recovery_session_artifact_latest_and_download_
 
     wait_for_artifact_count(
         pool,
+        &ctx.user_id,
         &session_id,
         "llm_capture",
         1,
@@ -2507,16 +2476,13 @@ pub async fn run_server_loop_idle_recovery_session_artifact_latest_and_download_
     )
     .await;
 
-    let row = sqlx::query(
-        "SELECT artifact_id \
-         FROM session_artifacts WHERE session_id = ? AND artifact_kind = 'llm_capture' \
-         ORDER BY created_at DESC, artifact_id DESC LIMIT 1",
+    let artifact_id = latest_llm_capture_artifact_id(
+        pool,
+        &ctx.user_id,
+        &session_id,
+        "latest server-loop idle recovery llm_capture row",
     )
-    .bind(&session_id)
-    .fetch_one(pool)
-    .await
-    .expect("latest server-loop idle recovery llm_capture row");
-    let artifact_id: String = row.try_get("artifact_id").expect("artifact_id");
+    .await;
 
     let latest_path = format!("/sessions/{session_id}/artifacts/latest/llm_capture");
     let (st_latest, latest_j) = get_json(app, &latest_path, Some(auth), &[]).await;
@@ -2549,16 +2515,11 @@ pub async fn run_server_loop_idle_recovery_session_artifact_latest_and_download_
         hits.nonstream_hits.load(Ordering::SeqCst) >= 2,
         "idle recovery should perform one probe and one non-stream fallback request"
     );
-
-    let _ = sqlx::query("DELETE FROM session_artifacts WHERE session_id = ?")
-        .bind(&session_id)
-        .execute(pool)
-        .await;
     let _ = sqlx::query("DELETE FROM infra_llm_models WHERE model_name = ?")
         .bind(&model_name)
         .execute(pool)
         .await;
-    cleanup_session_data(pool, &session_id).await;
+    cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &session_id).await;
     ctx.pool.close().await;
 }
 
@@ -2588,6 +2549,7 @@ pub async fn run_server_loop_idle_failure_session_artifact_latest_and_download_r
         json!({
             "name": model_name,
             "provider": "openai",
+            "context_window": 200000,
             "api_key": "server-loop-idle-failure-e2e-key",
             "base_url": base_url
         }),
@@ -2640,6 +2602,7 @@ pub async fn run_server_loop_idle_failure_session_artifact_latest_and_download_r
 
     wait_for_artifact_count(
         pool,
+        &ctx.user_id,
         &session_id,
         "llm_capture",
         1,
@@ -2647,16 +2610,13 @@ pub async fn run_server_loop_idle_failure_session_artifact_latest_and_download_r
     )
     .await;
 
-    let row = sqlx::query(
-        "SELECT artifact_id \
-         FROM session_artifacts WHERE session_id = ? AND artifact_kind = 'llm_capture' \
-         ORDER BY created_at DESC, artifact_id DESC LIMIT 1",
+    let artifact_id = latest_llm_capture_artifact_id(
+        pool,
+        &ctx.user_id,
+        &session_id,
+        "latest server-loop idle failure llm_capture row",
     )
-    .bind(&session_id)
-    .fetch_one(pool)
-    .await
-    .expect("latest server-loop idle failure llm_capture row");
-    let artifact_id: String = row.try_get("artifact_id").expect("artifact_id");
+    .await;
 
     let latest_path = format!("/sessions/{session_id}/artifacts/latest/llm_capture");
     let (st_latest, latest_j) = get_json(app, &latest_path, Some(auth), &[]).await;
@@ -2711,16 +2671,11 @@ pub async fn run_server_loop_idle_failure_session_artifact_latest_and_download_r
         hits.nonstream_hits.load(Ordering::SeqCst) >= 2,
         "idle failure should perform one probe and one non-stream fallback request"
     );
-
-    let _ = sqlx::query("DELETE FROM session_artifacts WHERE session_id = ?")
-        .bind(&session_id)
-        .execute(pool)
-        .await;
     let _ = sqlx::query("DELETE FROM infra_llm_models WHERE model_name = ?")
         .bind(&model_name)
         .execute(pool)
         .await;
-    cleanup_session_data(pool, &session_id).await;
+    cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &session_id).await;
     ctx.pool.close().await;
 }
 
@@ -2743,6 +2698,7 @@ pub async fn run_server_loop_rate_limit_failure_session_artifact_latest_and_down
         json!({
             "name": model_name,
             "provider": "openai",
+            "context_window": 200000,
             "api_key": "server-loop-rate-limit-e2e-key",
             "base_url": base_url
         }),
@@ -2794,6 +2750,7 @@ pub async fn run_server_loop_rate_limit_failure_session_artifact_latest_and_down
 
     wait_for_artifact_count(
         pool,
+        &ctx.user_id,
         &session_id,
         "llm_capture",
         1,
@@ -2801,16 +2758,13 @@ pub async fn run_server_loop_rate_limit_failure_session_artifact_latest_and_down
     )
     .await;
 
-    let row = sqlx::query(
-        "SELECT artifact_id \
-         FROM session_artifacts WHERE session_id = ? AND artifact_kind = 'llm_capture' \
-         ORDER BY created_at DESC, artifact_id DESC LIMIT 1",
+    let artifact_id = latest_llm_capture_artifact_id(
+        pool,
+        &ctx.user_id,
+        &session_id,
+        "latest server-loop rate-limit llm_capture row",
     )
-    .bind(&session_id)
-    .fetch_one(pool)
-    .await
-    .expect("latest server-loop rate-limit llm_capture row");
-    let artifact_id: String = row.try_get("artifact_id").expect("artifact_id");
+    .await;
 
     let latest_path = format!("/sessions/{session_id}/artifacts/latest/llm_capture");
     let (st_latest, latest_j) = get_json(app, &latest_path, Some(auth), &[]).await;
@@ -2862,16 +2816,11 @@ pub async fn run_server_loop_rate_limit_failure_session_artifact_latest_and_down
         &hits,
         "repeated stream 429s plus cooldown reject should not issue a non-stream fallback",
     );
-
-    let _ = sqlx::query("DELETE FROM session_artifacts WHERE session_id = ?")
-        .bind(&session_id)
-        .execute(pool)
-        .await;
     let _ = sqlx::query("DELETE FROM infra_llm_models WHERE model_name = ?")
         .bind(&model_name)
         .execute(pool)
         .await;
-    cleanup_session_data(pool, &session_id).await;
+    cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &session_id).await;
     ctx.pool.close().await;
 }
 
@@ -2894,6 +2843,7 @@ pub async fn run_server_loop_rate_limit_retry_success_session_artifact_latest_an
         json!({
             "name": model_name,
             "provider": "openai",
+            "context_window": 200000,
             "api_key": "server-loop-rate-limit-retry-e2e-key",
             "base_url": base_url
         }),
@@ -2941,6 +2891,7 @@ pub async fn run_server_loop_rate_limit_retry_success_session_artifact_latest_an
 
     wait_for_artifact_count(
         pool,
+        &ctx.user_id,
         &session_id,
         "llm_capture",
         1,
@@ -2948,16 +2899,13 @@ pub async fn run_server_loop_rate_limit_retry_success_session_artifact_latest_an
     )
     .await;
 
-    let row = sqlx::query(
-        "SELECT artifact_id \
-         FROM session_artifacts WHERE session_id = ? AND artifact_kind = 'llm_capture' \
-         ORDER BY created_at DESC, artifact_id DESC LIMIT 1",
+    let artifact_id = latest_llm_capture_artifact_id(
+        pool,
+        &ctx.user_id,
+        &session_id,
+        "latest server-loop rate-limit retry llm_capture row",
     )
-    .bind(&session_id)
-    .fetch_one(pool)
-    .await
-    .expect("latest server-loop rate-limit retry llm_capture row");
-    let artifact_id: String = row.try_get("artifact_id").expect("artifact_id");
+    .await;
 
     let latest_path = format!("/sessions/{session_id}/artifacts/latest/llm_capture");
     let (st_latest, latest_j) = get_json(app, &latest_path, Some(auth), &[]).await;
@@ -2990,16 +2938,11 @@ pub async fn run_server_loop_rate_limit_retry_success_session_artifact_latest_an
         &hits,
         "successful stream retry should not require a non-stream fallback",
     );
-
-    let _ = sqlx::query("DELETE FROM session_artifacts WHERE session_id = ?")
-        .bind(&session_id)
-        .execute(pool)
-        .await;
     let _ = sqlx::query("DELETE FROM infra_llm_models WHERE model_name = ?")
         .bind(&model_name)
         .execute(pool)
         .await;
-    cleanup_session_data(pool, &session_id).await;
+    cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &session_id).await;
     ctx.pool.close().await;
 }
 
@@ -3086,6 +3029,7 @@ pub async fn run_bridge_tail_parse_error_artifact_preserves_partial_state_routes
 
     wait_for_artifact_count(
         pool,
+        &ctx.user_id,
         &session_id,
         "llm_capture",
         1,
@@ -3093,16 +3037,13 @@ pub async fn run_bridge_tail_parse_error_artifact_preserves_partial_state_routes
     )
     .await;
 
-    let row = sqlx::query(
-        "SELECT artifact_id \
-         FROM session_artifacts WHERE session_id = ? AND artifact_kind = 'llm_capture' \
-         ORDER BY created_at DESC, artifact_id DESC LIMIT 1",
+    let artifact_id = latest_llm_capture_artifact_id(
+        pool,
+        &ctx.user_id,
+        &session_id,
+        "latest bridge tail parse llm_capture row",
     )
-    .bind(&session_id)
-    .fetch_one(pool)
-    .await
-    .expect("latest bridge tail parse llm_capture row");
-    let artifact_id: String = row.try_get("artifact_id").expect("artifact_id");
+    .await;
 
     let latest_path = format!("/sessions/{session_id}/artifacts/latest/llm_capture");
     let (st_latest, latest_j) = get_json(app, &latest_path, Some(auth), &[]).await;
@@ -3179,12 +3120,7 @@ pub async fn run_bridge_tail_parse_error_artifact_preserves_partial_state_routes
         download_j["content"]["response"]["usage"]["output_tokens"].as_i64(),
         Some(5)
     );
-
-    let _ = sqlx::query("DELETE FROM session_artifacts WHERE session_id = ?")
-        .bind(&session_id)
-        .execute(pool)
-        .await;
-    cleanup_session_data(pool, &session_id).await;
+    cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &session_id).await;
     ctx.pool.close().await;
 }
 
@@ -3211,6 +3147,7 @@ pub async fn run_bridge_transport_failure_session_artifact_latest_and_download_r
         json!({
             "name": model_name,
             "provider": "openai",
+            "context_window": 200000,
             "api_key": "transport-e2e-key",
             "base_url": base_url
         }),
@@ -3256,6 +3193,7 @@ pub async fn run_bridge_transport_failure_session_artifact_latest_and_download_r
 
     wait_for_artifact_count(
         pool,
+        &ctx.user_id,
         &session_id,
         "llm_capture",
         1,
@@ -3263,16 +3201,13 @@ pub async fn run_bridge_transport_failure_session_artifact_latest_and_download_r
     )
     .await;
 
-    let row = sqlx::query(
-        "SELECT artifact_id \
-         FROM session_artifacts WHERE session_id = ? AND artifact_kind = 'llm_capture' \
-         ORDER BY created_at DESC, artifact_id DESC LIMIT 1",
+    let artifact_id = latest_llm_capture_artifact_id(
+        pool,
+        &ctx.user_id,
+        &session_id,
+        "latest bridge transport llm_capture row",
     )
-    .bind(&session_id)
-    .fetch_one(pool)
-    .await
-    .expect("latest bridge transport llm_capture row");
-    let artifact_id: String = row.try_get("artifact_id").expect("artifact_id");
+    .await;
 
     let latest_path = format!("/sessions/{session_id}/artifacts/latest/llm_capture");
     let (st_latest, latest_j) = get_json(app, &latest_path, Some(auth), &[]).await;
@@ -3310,16 +3245,11 @@ pub async fn run_bridge_transport_failure_session_artifact_latest_and_download_r
         2,
         "expected one model-connectivity probe and one fallback request"
     );
-
-    let _ = sqlx::query("DELETE FROM session_artifacts WHERE session_id = ?")
-        .bind(&session_id)
-        .execute(pool)
-        .await;
     let _ = sqlx::query("DELETE FROM infra_llm_models WHERE model_name = ?")
         .bind(&model_name)
         .execute(pool)
         .await;
-    cleanup_session_data(pool, &session_id).await;
+    cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &session_id).await;
     ctx.pool.close().await;
 }
 
@@ -3341,6 +3271,7 @@ pub async fn run_bridge_client_disconnect_session_artifact_latest_and_download_r
         json!({
             "name": model_name,
             "provider": "openai",
+            "context_window": 200000,
             "api_key": "disconnect-e2e-key",
             "base_url": base_url
         }),
@@ -3412,6 +3343,7 @@ pub async fn run_bridge_client_disconnect_session_artifact_latest_and_download_r
 
     wait_for_artifact_count(
         pool,
+        &ctx.user_id,
         &session_id,
         "llm_capture",
         1,
@@ -3419,16 +3351,13 @@ pub async fn run_bridge_client_disconnect_session_artifact_latest_and_download_r
     )
     .await;
 
-    let row = sqlx::query(
-        "SELECT artifact_id \
-         FROM session_artifacts WHERE session_id = ? AND artifact_kind = 'llm_capture' \
-         ORDER BY created_at DESC, artifact_id DESC LIMIT 1",
+    let artifact_id = latest_llm_capture_artifact_id(
+        pool,
+        &ctx.user_id,
+        &session_id,
+        "latest bridge disconnect llm_capture row",
     )
-    .bind(&session_id)
-    .fetch_one(pool)
-    .await
-    .expect("latest bridge disconnect llm_capture row");
-    let artifact_id: String = row.try_get("artifact_id").expect("artifact_id");
+    .await;
 
     let latest_path = format!("/sessions/{session_id}/artifacts/latest/llm_capture");
     let (st_latest, latest_j) = get_json(app, &latest_path, Some(auth), &[]).await;
@@ -3467,16 +3396,11 @@ pub async fn run_bridge_client_disconnect_session_artifact_latest_and_download_r
     );
 
     assert_eq!(hits.stream_hits.load(Ordering::SeqCst), 1);
-
-    let _ = sqlx::query("DELETE FROM session_artifacts WHERE session_id = ?")
-        .bind(&session_id)
-        .execute(pool)
-        .await;
     let _ = sqlx::query("DELETE FROM infra_llm_models WHERE model_name = ?")
         .bind(&model_name)
         .execute(pool)
         .await;
-    cleanup_session_data(pool, &session_id).await;
+    cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &session_id).await;
     ctx.pool.close().await;
 }
 
@@ -3505,6 +3429,7 @@ pub async fn run_bridge_idle_failure_session_artifact_latest_and_download_routes
         json!({
             "name": model_name,
             "provider": "openai",
+            "context_window": 200000,
             "api_key": "idle-e2e-key",
             "base_url": base_url
         }),
@@ -3554,6 +3479,7 @@ pub async fn run_bridge_idle_failure_session_artifact_latest_and_download_routes
 
     wait_for_artifact_count(
         pool,
+        &ctx.user_id,
         &session_id,
         "llm_capture",
         1,
@@ -3561,16 +3487,13 @@ pub async fn run_bridge_idle_failure_session_artifact_latest_and_download_routes
     )
     .await;
 
-    let row = sqlx::query(
-        "SELECT artifact_id \
-         FROM session_artifacts WHERE session_id = ? AND artifact_kind = 'llm_capture' \
-         ORDER BY created_at DESC, artifact_id DESC LIMIT 1",
+    let artifact_id = latest_llm_capture_artifact_id(
+        pool,
+        &ctx.user_id,
+        &session_id,
+        "latest bridge idle llm_capture row",
     )
-    .bind(&session_id)
-    .fetch_one(pool)
-    .await
-    .expect("latest bridge idle llm_capture row");
-    let artifact_id: String = row.try_get("artifact_id").expect("artifact_id");
+    .await;
 
     let latest_path = format!("/sessions/{session_id}/artifacts/latest/llm_capture");
     let (st_latest, latest_j) = get_json(app, &latest_path, Some(auth), &[]).await;
@@ -3608,16 +3531,11 @@ pub async fn run_bridge_idle_failure_session_artifact_latest_and_download_routes
         2,
         "expected one model-connectivity probe and one fallback request"
     );
-
-    let _ = sqlx::query("DELETE FROM session_artifacts WHERE session_id = ?")
-        .bind(&session_id)
-        .execute(pool)
-        .await;
     let _ = sqlx::query("DELETE FROM infra_llm_models WHERE model_name = ?")
         .bind(&model_name)
         .execute(pool)
         .await;
-    cleanup_session_data(pool, &session_id).await;
+    cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &session_id).await;
     ctx.pool.close().await;
 }
 
@@ -3640,6 +3558,7 @@ pub async fn run_bridge_rate_limit_failure_session_artifact_latest_and_download_
         json!({
             "name": model_name,
             "provider": "openai",
+            "context_window": 200000,
             "api_key": "rate-limit-e2e-key",
             "base_url": base_url
         }),
@@ -3684,6 +3603,7 @@ pub async fn run_bridge_rate_limit_failure_session_artifact_latest_and_download_
 
     wait_for_artifact_count(
         pool,
+        &ctx.user_id,
         &session_id,
         "llm_capture",
         1,
@@ -3691,16 +3611,13 @@ pub async fn run_bridge_rate_limit_failure_session_artifact_latest_and_download_
     )
     .await;
 
-    let row = sqlx::query(
-        "SELECT artifact_id \
-         FROM session_artifacts WHERE session_id = ? AND artifact_kind = 'llm_capture' \
-         ORDER BY created_at DESC, artifact_id DESC LIMIT 1",
+    let artifact_id = latest_llm_capture_artifact_id(
+        pool,
+        &ctx.user_id,
+        &session_id,
+        "latest bridge rate-limit llm_capture row",
     )
-    .bind(&session_id)
-    .fetch_one(pool)
-    .await
-    .expect("latest bridge rate-limit llm_capture row");
-    let artifact_id: String = row.try_get("artifact_id").expect("artifact_id");
+    .await;
 
     let latest_path = format!("/sessions/{session_id}/artifacts/latest/llm_capture");
     let (st_latest, latest_j) = get_json(app, &latest_path, Some(auth), &[]).await;
@@ -3748,16 +3665,11 @@ pub async fn run_bridge_rate_limit_failure_session_artifact_latest_and_download_
         &hits,
         "repeated stream 429s plus cooldown reject should not issue a non-stream fallback",
     );
-
-    let _ = sqlx::query("DELETE FROM session_artifacts WHERE session_id = ?")
-        .bind(&session_id)
-        .execute(pool)
-        .await;
     let _ = sqlx::query("DELETE FROM infra_llm_models WHERE model_name = ?")
         .bind(&model_name)
         .execute(pool)
         .await;
-    cleanup_session_data(pool, &session_id).await;
+    cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &session_id).await;
     ctx.pool.close().await;
 }
 
@@ -3779,6 +3691,7 @@ pub async fn run_bridge_rate_limit_retry_success_session_artifact_latest_and_dow
         json!({
             "name": model_name,
             "provider": "openai",
+            "context_window": 200000,
             "api_key": "rate-limit-retry-e2e-key",
             "base_url": base_url
         }),
@@ -3827,6 +3740,7 @@ pub async fn run_bridge_rate_limit_retry_success_session_artifact_latest_and_dow
 
     wait_for_artifact_count(
         pool,
+        &ctx.user_id,
         &session_id,
         "llm_capture",
         1,
@@ -3834,16 +3748,13 @@ pub async fn run_bridge_rate_limit_retry_success_session_artifact_latest_and_dow
     )
     .await;
 
-    let row = sqlx::query(
-        "SELECT artifact_id \
-         FROM session_artifacts WHERE session_id = ? AND artifact_kind = 'llm_capture' \
-         ORDER BY created_at DESC, artifact_id DESC LIMIT 1",
+    let artifact_id = latest_llm_capture_artifact_id(
+        pool,
+        &ctx.user_id,
+        &session_id,
+        "latest bridge rate-limit retry llm_capture row",
     )
-    .bind(&session_id)
-    .fetch_one(pool)
-    .await
-    .expect("latest bridge rate-limit retry llm_capture row");
-    let artifact_id: String = row.try_get("artifact_id").expect("artifact_id");
+    .await;
 
     let latest_path = format!("/sessions/{session_id}/artifacts/latest/llm_capture");
     let (st_latest, latest_j) = get_json(app, &latest_path, Some(auth), &[]).await;
@@ -3876,16 +3787,11 @@ pub async fn run_bridge_rate_limit_retry_success_session_artifact_latest_and_dow
         &hits,
         "successful stream retry should not require a non-stream fallback",
     );
-
-    let _ = sqlx::query("DELETE FROM session_artifacts WHERE session_id = ?")
-        .bind(&session_id)
-        .execute(pool)
-        .await;
     let _ = sqlx::query("DELETE FROM infra_llm_models WHERE model_name = ?")
         .bind(&model_name)
         .execute(pool)
         .await;
-    cleanup_session_data(pool, &session_id).await;
+    cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &session_id).await;
     ctx.pool.close().await;
 }
 
@@ -3906,6 +3812,7 @@ pub async fn run_bridge_tool_call_block_parse_recovery_preserves_arguments_route
         json!({
             "name": model_name,
             "provider": "openai",
+            "context_window": 200000,
             "api_key": "tool-call-block-recovery-e2e-key",
             "base_url": base_url
         }),
@@ -3967,6 +3874,7 @@ pub async fn run_bridge_tool_call_block_parse_recovery_preserves_arguments_route
 
     wait_for_artifact_count(
         pool,
+        &ctx.user_id,
         &session_id,
         "llm_capture",
         1,
@@ -3974,16 +3882,13 @@ pub async fn run_bridge_tool_call_block_parse_recovery_preserves_arguments_route
     )
     .await;
 
-    let row = sqlx::query(
-        "SELECT artifact_id \
-         FROM session_artifacts WHERE session_id = ? AND artifact_kind = 'llm_capture' \
-         ORDER BY created_at DESC, artifact_id DESC LIMIT 1",
+    let artifact_id = latest_llm_capture_artifact_id(
+        pool,
+        &ctx.user_id,
+        &session_id,
+        "latest bridge tool-call block recovery llm_capture row",
     )
-    .bind(&session_id)
-    .fetch_one(pool)
-    .await
-    .expect("latest bridge tool-call block recovery llm_capture row");
-    let artifact_id: String = row.try_get("artifact_id").expect("artifact_id");
+    .await;
 
     let latest_path = format!("/sessions/{session_id}/artifacts/latest/llm_capture");
     let (st_latest, latest_j) = get_json(app, &latest_path, Some(auth), &[]).await;
@@ -4022,16 +3927,11 @@ pub async fn run_bridge_tool_call_block_parse_recovery_preserves_arguments_route
         2,
         "invalid provider block after progress should trigger exactly one successful non-stream fallback, plus at most one optional connectivity probe",
     );
-
-    let _ = sqlx::query("DELETE FROM session_artifacts WHERE session_id = ?")
-        .bind(&session_id)
-        .execute(pool)
-        .await;
     let _ = sqlx::query("DELETE FROM infra_llm_models WHERE model_name = ?")
         .bind(&model_name)
         .execute(pool)
         .await;
-    cleanup_session_data(pool, &session_id).await;
+    cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &session_id).await;
     ctx.pool.close().await;
 }
 
@@ -4060,11 +3960,6 @@ pub async fn run_session_artifact_latest_route_uses_stable_tiebreaker() {
         }
     };
     let tied_ts = "2026-10-01 12:34:56.123456";
-
-    let _ = sqlx::query("DELETE FROM session_artifacts WHERE session_id = ?")
-        .bind(&session_id)
-        .execute(pool)
-        .await;
 
     for (artifact_id, turn, marker) in [
         (older_id.as_str(), 1_i32, "older"),
@@ -4105,11 +4000,6 @@ pub async fn run_session_artifact_latest_route_uses_stable_tiebreaker() {
         Some("newer"),
         "latest route should surface the newest payload under a tied timestamp"
     );
-
-    let _ = sqlx::query("DELETE FROM session_artifacts WHERE session_id = ?")
-        .bind(&session_id)
-        .execute(pool)
-        .await;
-    cleanup_session_data(pool, &session_id).await;
+    cleanup_session_data(&ctx.shared_pool, &user_id, &session_id).await;
     ctx.pool.close().await;
 }

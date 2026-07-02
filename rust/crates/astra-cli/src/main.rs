@@ -500,7 +500,24 @@ mod tests {
     use cli::slash::slash_memory::handle_memory_domain_command;
     use cli::slash::{slash_health, slash_stats, slash_task, slash_tools};
 
-    async fn spawn_mock(app: Router) -> String {
+    async fn mock_models_response() -> axum::Json<serde_json::Value> {
+        axum::Json(serde_json::json!({
+            "models": [
+                {
+                    "name": "test-model",
+                    "is_active": true,
+                    "context_window": 200_000
+                },
+                {
+                    "name": "mock-model",
+                    "is_active": true,
+                    "context_window": 200_000
+                }
+            ]
+        }))
+    }
+
+    async fn spawn_mock_app(app: Router) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let base = format!("http://{addr}");
@@ -509,6 +526,10 @@ mod tests {
         });
         tokio::task::yield_now().await;
         base
+    }
+
+    async fn spawn_mock(app: Router) -> String {
+        spawn_mock_app(app.route("/models", get(mock_models_response))).await
     }
 
     mod auth_tests;
@@ -537,7 +558,7 @@ mod tests {
                 }))
             }),
         );
-        let base = spawn_mock(app).await;
+        let base = spawn_mock_app(app).await;
         let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
         let result = do_login(&api, Some("__test__"), "user1", "pass1").await;
         assert_eq!(result.unwrap(), "tok-abc");
@@ -556,7 +577,7 @@ mod tests {
                 )
             }),
         );
-        let base = spawn_mock(app).await;
+        let base = spawn_mock_app(app).await;
         let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
         let result = do_login(&api, Some("test-profile"), "user1", "wrong").await;
         assert!(result.is_err());
@@ -582,7 +603,7 @@ mod tests {
                 }))
             }),
         );
-        let base = spawn_mock(app).await;
+        let base = spawn_mock_app(app).await;
         let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
         let result = do_register(&api, Some("test-profile"), "newuser", "a@b.com", "pass").await;
         assert_eq!(result.unwrap(), "tok-new");
@@ -607,7 +628,7 @@ mod tests {
                 )
             }),
         );
-        let base = spawn_mock(app).await;
+        let base = spawn_mock_app(app).await;
         let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
         let result = do_register(&api, Some("test-profile"), "taken", "a@b.com", "pass").await;
         assert!(result.is_err());
@@ -630,7 +651,7 @@ mod tests {
             "/sessions",
             post(|| async { axum::Json(serde_json::json!({"session_id": "new-sess-42"})) }),
         );
-        let base = spawn_mock(app).await;
+        let base = spawn_mock_app(app).await;
         let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
         let mut state = SessionState {
             session_id: Some("old-sess".to_string()),
@@ -647,6 +668,7 @@ mod tests {
         assert!(state.history.is_empty());
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn slash_model_with_arg_sets_model() {
         let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
@@ -673,7 +695,7 @@ mod tests {
                 }))
             }),
         );
-        let base = spawn_mock(app).await;
+        let base = spawn_mock_app(app).await;
         let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
         let mut state = SessionState::default();
         cli::slash::slash_config::set_active_model_id_for_request(None);
@@ -708,7 +730,7 @@ mod tests {
                 )
             }),
         );
-        let base = spawn_mock(app).await;
+        let base = spawn_mock_app(app).await;
         let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
         let mut state = SessionState {
             model: Some("old-model".to_string()),
@@ -741,7 +763,7 @@ mod tests {
             "/models",
             get(|| async { axum::Json(serde_json::json!({"models": []})) }),
         );
-        let base = spawn_mock(app).await;
+        let base = spawn_mock_app(app).await;
         let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
         let mut state = SessionState {
             model: Some("old-model".to_string()),
@@ -865,7 +887,7 @@ mod tests {
             "/health",
             get(|| async { axum::Json(serde_json::json!({"status": "ok"})) }),
         );
-        let base = spawn_mock(app).await;
+        let base = spawn_mock_app(app).await;
         let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
         let result = execute_cli_command(
             Some(Command::Health),
@@ -926,7 +948,7 @@ mod tests {
             "/sessions/{id}/close",
             post(|| async { axum::Json(serde_json::json!({ "status": "closed" })) }),
         );
-        let base = spawn_mock(app).await;
+        let base = spawn_mock_app(app).await;
         let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
 
         let result = execute_cli_command(
@@ -1796,6 +1818,7 @@ total_tokens_out: 500
             preferences_last_sync: Some(chrono::Utc::now().to_rfc3339()),
             pending_pushes: 2,
             last_error: Some("connection reset by peer".into()),
+            ..Default::default()
         };
         slash_health::display_sync_status(&status);
     }
@@ -2326,7 +2349,7 @@ total_tokens_out: 500
             .unwrap();
 
         // Mark in-progress
-        svc.update_status(&tid, astra_services::TaskStatus::InProgress)
+        svc.update_status("test-user", &tid, astra_services::TaskStatus::InProgress)
             .await
             .unwrap();
 
@@ -2341,6 +2364,7 @@ total_tokens_out: 500
         state_map.insert("tool_calls_count".to_string(), serde_json::json!(3));
 
         svc.save_checkpoint(
+            "test-user",
             &tid,
             &TaskCheckpoint {
                 active_subtask_id: None,
@@ -2353,10 +2377,10 @@ total_tokens_out: 500
         .unwrap();
 
         // Complete the task
-        svc.complete_task(&tid).await.unwrap();
+        svc.complete_task("test-user", &tid).await.unwrap();
 
         // Read back and verify (simulates `astra task result`).
-        let record = svc.get_task(&tid).await.unwrap().unwrap();
+        let record = svc.get_task("test-user", &tid).await.unwrap().unwrap();
         assert_eq!(record.status, astra_services::TaskStatus::Completed);
         let cp = record.checkpoint.unwrap();
         assert_eq!(

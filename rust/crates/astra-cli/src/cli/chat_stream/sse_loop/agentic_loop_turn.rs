@@ -24,7 +24,7 @@ use astra_runtime::{
     turn::chat_turn_api_error::{
         CHAT_TURN_POST_MAX_RETRIES, chat_turn_http_error_with_compact_body,
     },
-    turn::chat_turn_budget_pressure::budget_pressure_for_chat_turn,
+    turn::chat_turn_budget_pressure::budget_pressure_for_chat_turn_with_input_budget,
     turn::chat_turn_edge_profile::{
         EDGE_PROFILE_KEY_ALWAYS_LOAD_TOOL_NAMES, EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES,
         EDGE_PROFILE_KEY_DEFERRED_TOOL_OMITTED_NAMES,
@@ -88,6 +88,22 @@ fn touch_prep_ui_phase(phase: &Option<ChatPrepPhaseLabel>, label: &str) {
         && let Ok(mut w) = a.write()
     {
         *w = label.to_string();
+    }
+}
+
+fn trace_token_count_u32(value: u64, field: &'static str) -> u32 {
+    match u32::try_from(value) {
+        Ok(value) => value,
+        Err(_) => {
+            tracing::warn!(
+                target: "astra_cli::turn_trace",
+                field,
+                value,
+                max = u32::MAX,
+                "token trace value exceeded u32 range; saturating"
+            );
+            u32::MAX
+        }
     }
 }
 
@@ -192,6 +208,8 @@ struct PrepareChatTurnRequest<'a> {
     current_session_id: Option<&'a str>,
     model_id: Option<&'a str>,
     model: Option<&'a str>,
+    context_window_tokens: u32,
+    effective_input_budget_tokens: u64,
     explain: AgenticChatExplainFlags,
     project_root: &'a Path,
     message: &'a str,
@@ -345,6 +363,19 @@ fn tool_surface_should_inject(
     (false, "")
 }
 
+fn chat_turn_budget_pressure(
+    messages: &[Value],
+    registry: &ToolRegistry,
+    effective_input_budget_tokens: u64,
+) -> f64 {
+    let schema_tokens = registry.total_always_load_token_cost();
+    budget_pressure_for_chat_turn_with_input_budget(
+        messages,
+        schema_tokens as usize,
+        effective_input_budget_tokens,
+    )
+}
+
 async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     let timing = ctx.timing_phases;
     let mut mark = Instant::now();
@@ -436,10 +467,11 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
 
     touch_prep_ui_phase(&ctx.prep_ui_phase, "Recalling memory…");
 
-    let budget_pressure = {
-        let schema_tokens = ctx.registry.total_always_load_token_cost();
-        budget_pressure_for_chat_turn(ctx.messages, requested_model, schema_tokens as usize)
-    };
+    let budget_pressure = chat_turn_budget_pressure(
+        ctx.messages,
+        ctx.registry,
+        ctx.effective_input_budget_tokens,
+    );
 
     let semantic_query_str = ctx.semantic_query_override.unwrap_or(ctx.message);
     let mut boost_terms =
@@ -700,6 +732,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         &final_visible_tool_names,
     );
     let mut activatable_tool_names = HashSet::new();
+    let mut omitted_deferred_tool_names: Vec<String> = Vec::new();
     // Always send always_load tool names so the server can place cache_control
     // markers at the correct always_load/dynamic boundary. User TOML can add
     // tools to the declaration defaults, so this must be the resolved runtime
@@ -715,8 +748,10 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     }
     if !final_visible_tool_names.is_empty()
         && final_visible_tool_names.contains("tool_search")
-        && let Some(manifest) = tool_surface.deferred_manifest(requested_model)
+        && let Some(manifest) =
+            tool_surface.deferred_manifest_with_context_window(Some(ctx.context_window_tokens))
     {
+        omitted_deferred_tool_names = manifest.omitted_names.clone();
         activatable_tool_names = manifest.names.iter().cloned().collect();
         merge_edge_profile_extensions(
             &mut payload,
@@ -742,7 +777,12 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             tool_schema_name(schema).map(|name| (name.to_string(), ctx.registry.token_cost(name)))
         })
         .collect();
-    let visible_tool_tokens_total: u32 = visible_tool_costs.iter().map(|(_, cost)| *cost).sum();
+    let visible_tool_tokens_total_u64: u64 = visible_tool_costs
+        .iter()
+        .map(|(_, cost)| u64::from(*cost))
+        .sum();
+    let visible_tool_tokens_total =
+        trace_token_count_u32(visible_tool_tokens_total_u64, "visible_tool_tokens_total");
     let final_surface_report = surface_report_from_visible_schemas(
         &final_visible_schemas,
         visible_tool_tokens_total,
@@ -758,12 +798,15 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             .collect();
         deferred_active_tools.sort();
         collector.record_tool_surface_with_deferred(
-            &final_surface_report.visible_tools,
-            &visible_tool_costs,
-            final_visible_schemas.len() as u32,
-            surface_latency_ms,
-            &deferred_active_tools,
-            deferred_available,
+            astra_runtime::turn::turn_trace_collector::ToolSurfaceDeferredInput {
+                visible_tools: &final_surface_report.visible_tools,
+                per_tool_costs: &visible_tool_costs,
+                tools_available: final_visible_schemas.len() as u32,
+                latency_ms: surface_latency_ms,
+                deferred_active_tools: &deferred_active_tools,
+                deferred_available,
+                deferred_omitted_tools: &omitted_deferred_tool_names,
+            },
         );
     }
 
@@ -952,43 +995,52 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     // stream completes (see `post_turn_observe_bridge_injections` in
     // `cli_loop_host.rs`), so we can merge the 5 bridge-generated
     // channels (captured via the `injection_freshness` SSE event into
-    // `ChatTurnSseAccum.bridge_injection_texts`) with the CLI-owned
+    // `ChatTurnSseAccum.bridge_injection_fingerprints`) with the CLI-owned
     // `lessons` snapshot.
 
     // ─── Record token budget estimate to trace collector (M1 observability) ───
     if let Some(collector) = ctx.telem.trace_collector {
-        let schema_tokens = visible_tool_tokens_total;
-        let budget = prompts::budget_for_model(requested_model);
-        let max_tokens = budget.model_limit as u32;
+        let schema_tokens =
+            trace_token_count_u32(visible_tool_tokens_total_u64, "tool_schema_tokens");
+        let max_tokens = trace_token_count_u32(ctx.effective_input_budget_tokens, "max_tokens");
         let history_messages = retained_history_messages(ctx.messages);
 
         // Estimate retained history tokens from prior messages only.
-        let history_tokens: u32 = history_messages
+        let history_tokens_u64: u64 = history_messages
             .iter()
-            .map(|m| prompts::estimate_str_tokens(&msg_content(m)) as u32)
+            .map(|m| prompts::estimate_str_tokens(&msg_content(m)) as u64)
             .sum();
+        let history_tokens = trace_token_count_u32(history_tokens_u64, "history_tokens");
 
         // Record per-turn history breakdown
         let turns_retained = build_retained_history_turns(history_messages);
         collector.set_history_retained(&turns_retained);
 
         // Estimate user message tokens
-        let user_message_tokens = prompts::estimate_str_tokens(ctx.message) as u32;
+        let user_message_tokens_u64 = prompts::estimate_str_tokens(ctx.message) as u64;
+        let user_message_tokens =
+            trace_token_count_u32(user_message_tokens_u64, "user_message_tokens");
 
         // System prompt tokens: the system prompt is assembled by the runtime
         // (`bridge/inprocess.rs`) and sent back via `context_meta` SSE event.
         // Use 0 here as placeholder — runtime will overwrite via record_token_budget.
-        let system_prompt_tokens = 0u32;
+        let system_prompt_tokens_u64 = 0u64;
+        let system_prompt_tokens =
+            trace_token_count_u32(system_prompt_tokens_u64, "system_prompt_tokens");
 
         // Memory tokens are tracked in memory retrieval trace, use 0 here
         // (would need to be passed from memory boost search results)
-        let memory_tokens = 0u32;
+        let memory_tokens_u64 = 0u64;
+        let memory_tokens = trace_token_count_u32(memory_tokens_u64, "memory_tokens");
 
-        let estimated_total = system_prompt_tokens
-            + history_tokens
-            + memory_tokens
-            + schema_tokens
-            + user_message_tokens;
+        let estimated_total = trace_token_count_u32(
+            system_prompt_tokens_u64
+                + history_tokens_u64
+                + memory_tokens_u64
+                + visible_tool_tokens_total_u64
+                + user_message_tokens_u64,
+            "estimated_total",
+        );
 
         collector.record_token_budget_estimate(
             system_prompt_tokens,
@@ -1076,6 +1128,8 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub auth_profile: Option<&'a str>,
     pub model_id: Option<&'a str>,
     pub model: Option<&'a str>,
+    pub context_window_tokens: u32,
+    pub effective_input_budget_tokens: u64,
     pub explain: ExplainMode,
     pub render_md: bool,
     pub term_width: usize,
@@ -1242,6 +1296,8 @@ pub(crate) async fn fetch_chat_turn_sse(
         auth_profile,
         model_id,
         model,
+        context_window_tokens,
+        effective_input_budget_tokens,
         explain,
         render_md,
         term_width,
@@ -1329,6 +1385,8 @@ pub(crate) async fn fetch_chat_turn_sse(
             current_session_id,
             model_id,
             model,
+            context_window_tokens,
+            effective_input_budget_tokens,
             explain: AgenticChatExplainFlags::from_explain_ui_mode(match explain {
                 ExplainMode::Off => AgenticExplainUiMode::Off,
                 ExplainMode::On => AgenticExplainUiMode::On,
@@ -1448,8 +1506,9 @@ pub(crate) async fn fetch_chat_turn_sse(
 mod tests {
     use super::{
         PrepareChatTurnRequest, PrepareTurnTelemetry, build_retained_history_turns,
-        inject_bridge_turn_identity, inject_runtime_turn_overrides, msg_content,
-        prepare_chat_turn_payload, retained_history_messages, should_skip_memory_boost,
+        chat_turn_budget_pressure, inject_bridge_turn_identity, inject_runtime_turn_overrides,
+        msg_content, prepare_chat_turn_payload, retained_history_messages,
+        should_skip_memory_boost,
     };
     use astra_runtime::turn::agentic_loop::host::{ASK_USER_TOOL_NAME, TurnInteractionMode};
     use astra_turn_core::chat_history_openai::merge_skill_names_track;
@@ -1465,6 +1524,17 @@ mod tests {
             "function": {
                 "name": name,
                 "description": format!("{name} tool"),
+                "parameters": { "type": "object", "properties": {} }
+            }
+        })
+    }
+
+    fn schema_with_description(name: &str, description: &str) -> serde_json::Value {
+        json!({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": description,
                 "parameters": { "type": "object", "properties": {} }
             }
         })
@@ -1505,6 +1575,41 @@ mod tests {
         assert_eq!(payload["turn_chain_id"], json!("root-chain"));
         assert_eq!(payload["user_query_event_id"], json!("root-query"));
     }
+
+    #[test]
+    fn chat_turn_budget_pressure_uses_effective_input_budget_for_large_context_models() {
+        use astra_runtime::{
+            tool_registry::ToolRegistry,
+            turn::chat_turn_budget_pressure::budget_pressure_for_chat_turn_with_context_window,
+        };
+
+        let mut registry = ToolRegistry::new(Vec::new());
+        let large_description = "x".repeat(360_000);
+        registry.inject_schema_always_load(
+            schema_with_description("large_always_load", &large_description),
+            true,
+        );
+        let messages: Vec<Value> = Vec::new();
+        let schema_tokens = registry.total_always_load_token_cost() as usize;
+
+        let effective_budget_pressure = chat_turn_budget_pressure(&messages, &registry, 100_000);
+        let raw_context_window_pressure =
+            budget_pressure_for_chat_turn_with_context_window(&messages, schema_tokens, 800_000);
+
+        assert!(
+            effective_budget_pressure >= 0.6,
+            "100K effective input budget should see {schema_tokens} schema tokens as compact pressure, got {effective_budget_pressure}"
+        );
+        assert!(
+            raw_context_window_pressure < 0.3,
+            "raw 800K context-window pressure would hide the same schema load, got {raw_context_window_pressure}"
+        );
+        assert!(
+            effective_budget_pressure > raw_context_window_pressure,
+            "turn preparation must be governed by effective input budget, not raw context window"
+        );
+    }
+
     #[test]
     fn msg_content_extracts_string_and_array_formats() {
         // String content (OpenAI format)
@@ -1980,6 +2085,8 @@ mod tests {
             current_session_id: Some("session-1"),
             model_id: Some("model-qwen"),
             model: Some("qwen3.7-max"),
+            context_window_tokens: 200_000,
+            effective_input_budget_tokens: 200_000,
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message: "inspect the repo state",
@@ -2162,6 +2269,8 @@ mod tests {
             current_session_id: Some("session-1"),
             model_id: None,
             model: None,
+            context_window_tokens: 200_000,
+            effective_input_budget_tokens: 200_000,
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message: "inspect the repo state",
@@ -2283,6 +2392,8 @@ mod tests {
             current_session_id: Some("session-empty-surface"),
             model_id: None,
             model: None,
+            context_window_tokens: 200_000,
+            effective_input_budget_tokens: 200_000,
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message: empty_surface_message,
@@ -2400,6 +2511,8 @@ mod tests {
             current_session_id: Some("session-pending-activation"),
             model_id: None,
             model: None,
+            context_window_tokens: 200_000,
+            effective_input_budget_tokens: 200_000,
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message: empty_surface_message,
@@ -2496,6 +2609,8 @@ mod tests {
             current_session_id: Some("session-empty"),
             model_id: None,
             model: None,
+            context_window_tokens: 200_000,
+            effective_input_budget_tokens: 200_000,
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message: "inspect the repository",
@@ -2609,6 +2724,8 @@ mod tests {
             current_session_id: Some("session-1"),
             model_id: None,
             model: None,
+            context_window_tokens: 200_000,
+            effective_input_budget_tokens: 200_000,
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message: "run make check",
@@ -2723,6 +2840,8 @@ mod tests {
             current_session_id: Some("session-1"),
             model_id: None,
             model: None,
+            context_window_tokens: 200_000,
+            effective_input_budget_tokens: 200_000,
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message,
@@ -2848,6 +2967,8 @@ mod tests {
             current_session_id: Some("session-1"),
             model_id: None,
             model: None,
+            context_window_tokens: 200_000,
+            effective_input_budget_tokens: 200_000,
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message: "implement the approved plan",
@@ -2973,6 +3094,8 @@ mod tests {
             current_session_id: Some("session-1"),
             model_id: None,
             model: None,
+            context_window_tokens: 200_000,
+            effective_input_budget_tokens: 200_000,
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message: "remember this",
@@ -3084,6 +3207,8 @@ mod tests {
             current_session_id: Some("session-1"),
             model_id: None,
             model: None,
+            context_window_tokens: 200_000,
+            effective_input_budget_tokens: 200_000,
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message: "no deferred tools",
@@ -3188,6 +3313,8 @@ mod tests {
             current_session_id: Some("session-1"),
             model_id: None,
             model: None,
+            context_window_tokens: 200_000,
+            effective_input_budget_tokens: 200_000,
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message: "delegate review with parallel agents",
@@ -3300,6 +3427,8 @@ mod tests {
             current_session_id: Some("session-1"),
             model_id: None,
             model: None,
+            context_window_tokens: 200_000,
+            effective_input_budget_tokens: 200_000,
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message: "fan out this work",
@@ -3408,6 +3537,8 @@ mod tests {
             current_session_id: Some("session-1"),
             model_id: None,
             model: None,
+            context_window_tokens: 200_000,
+            effective_input_budget_tokens: 200_000,
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message: "update the file",
@@ -3473,6 +3604,8 @@ mod tests {
             current_session_id: Some("session-1"),
             model_id: None,
             model: None,
+            context_window_tokens: 200_000,
+            effective_input_budget_tokens: 200_000,
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message: "update the file",
@@ -3576,6 +3709,8 @@ mod tests {
             current_session_id: Some("session-1"),
             model_id: None,
             model: None,
+            context_window_tokens: 200_000,
+            effective_input_budget_tokens: 200_000,
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message: "fix the bug",
@@ -3675,6 +3810,8 @@ mod tests {
             current_session_id: Some("session-1"),
             model_id: None,
             model: None,
+            context_window_tokens: 200_000,
+            effective_input_budget_tokens: 200_000,
             explain: AgenticChatExplainFlags::from_explain_ui_mode(AgenticExplainUiMode::Off),
             project_root: temp_dir.path(),
             message: "hi",
