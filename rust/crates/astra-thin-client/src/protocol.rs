@@ -215,7 +215,7 @@ impl ToolResultRequest {
         let is_error = v
             .get("status")
             .and_then(|v| v.as_str())
-            .map(|s| s == "error")
+            .map(|s| matches!(s, "error" | "failed"))
             .unwrap_or(false);
         (output, is_error)
     }
@@ -228,8 +228,8 @@ pub struct ApprovalRespondRequest {
     pub decision: ApprovalDecision,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
+    pub session_id: String,
+    pub run_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -759,12 +759,13 @@ mod tests {
     }
 
     #[test]
-    fn approval_respond_request_roundtrip_preserves_optional_context() {
+    fn approval_respond_request_roundtrip_preserves_context() {
         let req = ApprovalRespondRequest {
             request_id: "ap-1".into(),
             decision: ApprovalDecision::Allow,
             reason: Some("looks good".into()),
-            session_id: Some("sess-1".into()),
+            session_id: "sess-1".into(),
+            run_id: "run-1".into(),
             tool_name: Some("write_file".into()),
             approval_kind: Some(ApprovalKind::Standard),
         };
@@ -774,16 +775,24 @@ mod tests {
     }
 
     #[test]
-    fn approval_respond_request_backwards_compatible_without_optional_context() {
+    fn approval_respond_request_requires_session_and_run_id() {
         let json = serde_json::json!({
             "request_id": "ap-legacy",
             "decision": "deny",
             "reason": "no"
         });
-        let back: ApprovalRespondRequest = serde_json::from_value(json).unwrap();
-        assert_eq!(back.session_id, None);
-        assert_eq!(back.tool_name, None);
-        assert_eq!(back.approval_kind, None);
+        assert!(serde_json::from_value::<ApprovalRespondRequest>(json).is_err());
+    }
+
+    #[test]
+    fn approval_respond_request_rejects_missing_session_id() {
+        let json = serde_json::json!({
+            "request_id": "ap-minimal",
+            "decision": "deny",
+            "reason": "no",
+            "run_id": "run-minimal"
+        });
+        assert!(serde_json::from_value::<ApprovalRespondRequest>(json).is_err());
     }
 
     #[test]
@@ -1242,6 +1251,14 @@ mod tests {
     #[test]
     fn tool_result_parse_output_and_error_error_status() {
         let json = r#"{"request_id":"r1","edge_agent_id":"agt","status":"error","output":"fail"}"#;
+        let (output, is_error) = ToolResultRequest::parse_output_and_error(json);
+        assert_eq!(output, "fail");
+        assert!(is_error);
+    }
+
+    #[test]
+    fn tool_result_parse_output_and_error_legacy_failed_status() {
+        let json = r#"{"request_id":"r1","edge_agent_id":"agt","status":"failed","output":"fail"}"#;
         let (output, is_error) = ToolResultRequest::parse_output_and_error(json);
         assert_eq!(output, "fail");
         assert!(is_error);

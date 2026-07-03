@@ -28,7 +28,10 @@ import type {
   PublishSkillBody,
   RunInputRequestBody,
   RunInputResponse,
+  RunListCursor,
+  RunListParams,
   RunListResponse,
+  RunProjectionRepairResponse,
   RunProjectionResponse,
   RunStatus,
   RuntimeChatResponse,
@@ -95,6 +98,7 @@ import {
   chatRunPath,
   chatRunPausePath,
   chatRunProjectionPath,
+  chatRunProjectionRepairPath,
   chatRunResumePath,
   chatRunStreamPath,
   chatSessionDecisionTracePath,
@@ -140,9 +144,14 @@ type RunStatusWire = {
 
 type RunListWire = {
   runs: RunStatusWire[];
-  total: number;
+  total?: number | null;
   limit: number;
-  offset: number;
+  next_cursor?: RunListCursorWire | null;
+};
+
+type RunListCursorWire = {
+  updated_at: string;
+  run_id: string;
 };
 
 type RunInputResponseWire = {
@@ -182,9 +191,19 @@ function normalizeRunStatus(w: RunStatusWire): RunStatus {
 function normalizeRunList(w: RunListWire): RunListResponse {
   return {
     runs: w.runs.map(normalizeRunStatus),
-    total: w.total,
+    total: w.total ?? null,
     limit: w.limit,
-    offset: w.offset,
+    nextCursor: normalizeRunListCursor(w.next_cursor),
+  };
+}
+
+function normalizeRunListCursor(
+  cursor: RunListCursorWire | null | undefined,
+): RunListCursor | null {
+  if (!cursor) return null;
+  return {
+    updatedAt: cursor.updated_at,
+    runId: cursor.run_id,
   };
 }
 
@@ -783,14 +802,33 @@ export class AstraClient {
     );
   }
 
+  /**
+   * Rebuild the durable projection for a run from authoritative facts.
+   */
+  async repairRunProjection(
+    runId: string,
+    opts?: { recentLimit?: number },
+  ): Promise<RunProjectionRepairResponse> {
+    const q = buildQueryString({
+      ...(opts?.recentLimit !== undefined
+        ? { recent_limit: opts.recentLimit }
+        : {}),
+    });
+    return this.post<RunProjectionRepairResponse>(
+      `${chatRunProjectionRepairPath(runId)}${q}`,
+    );
+  }
+
   /** `GET /runs` — list durable runs for the current user. */
-  async listRuns(opts?: {
-    limit?: number;
-    offset?: number;
-  }): Promise<RunListResponse> {
+  async listRuns(opts: RunListParams = {}): Promise<RunListResponse> {
     const q = buildQueryString({
       ...(opts?.limit !== undefined ? { limit: opts.limit } : {}),
-      ...(opts?.offset !== undefined ? { offset: opts.offset } : {}),
+      ...(opts.cursor
+        ? {
+            after_updated_at: opts.cursor.updatedAt,
+            after_run_id: opts.cursor.runId,
+          }
+        : {}),
     });
     const raw = await this.fetch<RunListWire>(`${PATH_RUNS}${q}`);
     return normalizeRunList(raw);

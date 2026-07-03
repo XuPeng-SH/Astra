@@ -330,7 +330,6 @@ describe('queueDeferredRunInput', () => {
       ],
       total: 1,
       limit: 200,
-      offset: 0,
     });
     const submitRunInput = vi.fn().mockResolvedValue({
       runId: 'run-recovered',
@@ -382,7 +381,7 @@ describe('queueDeferredRunInput', () => {
     });
 
     expect(listRuntimeSessions).toHaveBeenCalledWith({ limit: 200 });
-    expect(listRuns).toHaveBeenCalledWith({ limit: 200, offset: 0 });
+    expect(listRuns).toHaveBeenCalledWith({ limit: 200 });
     expect(submitRunInput).toHaveBeenCalledWith('run-recovered', {
       idempotencyKey: expect.any(String),
       input: {
@@ -430,7 +429,6 @@ describe('queueDeferredRunInput', () => {
       ],
       total: 1,
       limit: 200,
-      offset: 0,
     });
     const getSessionTranscript = vi.fn().mockResolvedValue({
       items: [],
@@ -450,7 +448,7 @@ describe('queueDeferredRunInput', () => {
     const result = await getChatHydrated('user-a', 'chat-open');
 
     expect(listRuntimeSessions).toHaveBeenCalledWith({ limit: 200 });
-    expect(listRuns).toHaveBeenCalledWith({ limit: 200, offset: 0 });
+    expect(listRuns).toHaveBeenCalledWith({ limit: 200 });
     expect(getSessionTranscript).toHaveBeenCalledWith('chat-open', {
       limit: 200,
     });
@@ -491,7 +489,6 @@ describe('queueDeferredRunInput', () => {
       ],
       total: 1,
       limit: 200,
-      offset: 0,
     });
     const cancelRun = vi.fn().mockResolvedValue(undefined);
 
@@ -803,7 +800,6 @@ describe('queueDeferredRunInput', () => {
       ],
       total: 1,
       limit: 200,
-      offset: 0,
     });
     const getSessionTranscript = vi.fn().mockResolvedValue({
       items: [],
@@ -885,7 +881,6 @@ describe('queueDeferredRunInput', () => {
       ],
       total: 1,
       limit: 200,
-      offset: 0,
     });
     const getSessionTranscript = vi.fn().mockResolvedValue({
       items: [],
@@ -959,7 +954,6 @@ describe('queueDeferredRunInput', () => {
       ],
       total: 1,
       limit: 200,
-      offset: 0,
     });
     const resumeRun = vi.fn().mockResolvedValue(undefined);
 

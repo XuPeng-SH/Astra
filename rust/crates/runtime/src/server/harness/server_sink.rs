@@ -1,7 +1,9 @@
-//! DB-backed + SSE broadcast snapshot sink for web/server agent sessions.
+//! In-memory + SSE broadcast snapshot sink for web/server agent sessions.
 //!
-//! Writes every snapshot to `harness_snapshots` and broadcasts via tokio channel
-//! so SSE subscribers receive real-time harness updates.
+//! The default path keeps snapshots in memory and broadcasts them via tokio
+//! channel so SSE subscribers receive real-time harness updates. Durable DB
+//! persistence follows the trace profile because every hook snapshot is
+//! observability data, not part of the run's success path.
 
 #[cfg(feature = "harness")]
 pub use enabled::ServerSnapshotSink;
@@ -29,12 +31,13 @@ mod enabled {
         causal_chain_id: Option<String>,
     }
 
-    /// Server-side snapshot sink: in-memory ring + broadcast + bounded DB worker.
+    /// Server-side snapshot sink: in-memory ring + broadcast + optional bounded DB worker.
     ///
     /// The in-memory ring provides fast `latest()` / `history()` queries.
     /// The broadcast channel pushes snapshots to SSE subscribers.
-    /// DB persistence uses a bounded mpsc channel with a single worker task
-    /// to prevent unbounded spawn storms under load.
+    /// DB persistence is disabled by default. When explicitly enabled, it uses
+    /// a bounded mpsc channel with a single worker task to prevent unbounded
+    /// spawn storms under load.
     pub struct ServerSnapshotSink {
         session_id: String,
         user_id: RwLock<String>,
@@ -75,12 +78,32 @@ mod enabled {
             }
         }
 
-        pub fn with_pool(mut self, pool: sqlx::Pool<sqlx::MySql>) -> Self {
+        pub fn with_pool(self, pool: sqlx::Pool<sqlx::MySql>) -> Self {
+            self.with_pool_if_enabled(pool, harness_snapshot_db_persistence_enabled())
+        }
+
+        fn with_pool_if_enabled(
+            mut self,
+            pool: sqlx::Pool<sqlx::MySql>,
+            persistence_enabled: bool,
+        ) -> Self {
+            if !persistence_enabled {
+                tracing::debug!(
+                    session_id = %self.session_id,
+                    trace_category = "harness_snapshots",
+                    "harness snapshot DB persistence disabled by trace profile"
+                );
+                return self;
+            }
             let (tx, rx) = tokio::sync::mpsc::channel(DB_WRITE_CHANNEL_CAPACITY);
             let handle = tokio::spawn(db_write_worker(rx, pool));
             self.db_tx = Some(tx);
             self._db_worker = Some(handle);
             self
+        }
+
+        pub fn db_persistence_is_active(&self) -> bool {
+            self.db_tx.is_some()
         }
 
         /// Number of snapshot writes dropped before DB persistence.
@@ -169,6 +192,18 @@ mod enabled {
     fn serialize_snapshot_json<T: Serialize>(snapshot: &T) -> Result<String, String> {
         serde_json::to_string(snapshot)
             .map_err(|source| format!("serialize harness snapshot: {source}"))
+    }
+
+    fn harness_snapshot_db_persistence_enabled() -> bool {
+        harness_snapshot_db_persistence_enabled_for_trace(
+            &astra_config::runtime_config::RuntimeConfig::cached().trace,
+        )
+    }
+
+    fn harness_snapshot_db_persistence_enabled_for_trace(
+        trace: &astra_config::runtime_config::SessionTraceConfig,
+    ) -> bool {
+        trace.category_enabled(astra_config::runtime_config::TraceCategory::HarnessSnapshots)
     }
 
     async fn db_write_worker(
@@ -362,6 +397,48 @@ mod enabled {
         fn dropped_write_count_starts_at_zero() {
             let sink = ServerSnapshotSink::new("s1".into(), "test-user".into());
             assert_eq!(sink.dropped_write_count(), 0);
+        }
+
+        #[test]
+        fn db_persistence_is_inactive_without_pool() {
+            let sink = ServerSnapshotSink::new("s1".into(), "test-user".into());
+            assert!(!sink.db_persistence_is_active());
+        }
+
+        #[tokio::test]
+        async fn disabled_db_persistence_policy_does_not_start_worker_with_pool() {
+            let pool = sqlx::mysql::MySqlPoolOptions::new()
+                .connect_lazy("mysql://root:pass@127.0.0.1:1/astra_runtime")
+                .expect("lazy MySQL pool should not connect");
+            let sink = ServerSnapshotSink::new("s1".into(), "test-user".into())
+                .with_pool_if_enabled(pool, false);
+
+            assert!(!sink.db_persistence_is_active());
+        }
+
+        #[test]
+        fn harness_snapshot_db_persistence_follows_harness_trace_category() {
+            use astra_config::runtime_config::{SessionTraceConfig, TraceCategory, TraceProfile};
+
+            let production = SessionTraceConfig::default();
+            assert!(
+                !harness_snapshot_db_persistence_enabled_for_trace(&production),
+                "production/default trace profile must not persist harness snapshots"
+            );
+
+            let dev = SessionTraceConfig::default().apply_profile(TraceProfile::Dev);
+            assert!(
+                harness_snapshot_db_persistence_enabled_for_trace(&dev),
+                "dev trace profile enables all diagnostic persistence categories"
+            );
+
+            let custom = SessionTraceConfig {
+                profile: TraceProfile::Custom,
+                enabled_categories: vec![TraceCategory::HarnessSnapshots],
+                ..SessionTraceConfig::default()
+            }
+            .normalize();
+            assert!(harness_snapshot_db_persistence_enabled_for_trace(&custom));
         }
     }
 }

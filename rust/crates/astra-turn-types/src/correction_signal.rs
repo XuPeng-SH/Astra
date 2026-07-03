@@ -64,19 +64,11 @@ fn is_direct_correction(lower: &str) -> bool {
         "wrong answer",
         "wrong approach",
         "incorrect",
-        "actually,",
-        "actually i",
-        "wait, hold on",
-        "instead,",
-        "forget that",
-        "ignore that",
         "不对",
         "错了",
         "不是这样",
         "你搞错",
         "不正确",
-        "等等",
-        "停一下",
     ]
     .iter()
     .any(|pattern| lower.contains(pattern))
@@ -95,6 +87,10 @@ fn is_english_reanchor_nudge(lower: &str) -> bool {
         "what i need is",
         "what i want is",
         "what i want",
+        "actually, i wanted",
+        "actually i wanted",
+        "actually, i want",
+        "actually i want",
         "i asked for",
         "i need you to",
         "i meant",
@@ -102,6 +98,9 @@ fn is_english_reanchor_nudge(lower: &str) -> bool {
         "let me clarify",
         "to clarify",
         "my point is",
+        "instead,",
+        "forget that",
+        "ignore that",
     ]
     .iter()
     .any(|pattern| lower.contains(pattern))
@@ -249,6 +248,10 @@ mod tests {
             ),
             Some(UserCorrectionSignalKind::Reanchor)
         );
+        assert_eq!(
+            classify_user_correction_signal("actually, i wanted the other implementation"),
+            Some(UserCorrectionSignalKind::Reanchor)
+        );
     }
 
     #[test]
@@ -265,11 +268,28 @@ mod tests {
             "wait, can you show the logs first?",
             "hold on while I check the branch name",
             "stop, collaborate and listen",
+            "actually, can you show the diff first?",
         ] {
             assert_eq!(
                 classify_user_correction_signal(message),
                 None,
                 "{message:?} should not become durable correction pressure"
+            );
+        }
+    }
+
+    #[test]
+    fn normal_collaboration_messages_are_not_correction_pressure() {
+        for message in [
+            "commit and push",
+            "还有看一下/tmp/astra-dev/",
+            "方便astra的也可以保留",
+            "需要看skill的内容",
+        ] {
+            assert_eq!(
+                classify_user_correction_signal(message),
+                None,
+                "{message:?} should not become a correction or reanchor signal"
             );
         }
     }

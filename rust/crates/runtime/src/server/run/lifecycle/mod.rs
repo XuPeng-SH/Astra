@@ -7,9 +7,13 @@
 //! Run status, listing, and replay are backed by durable run state. The
 //! process-local map only keeps live control handles for in-flight runs.
 
+mod admission;
 mod persistence;
+mod projection;
 mod run_state;
 
+use admission::*;
+use projection::*;
 use std::any::Any;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
@@ -24,13 +28,13 @@ use axum::http::StatusCode;
 use futures_util::FutureExt;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex as TokioMutex, RwLock, broadcast, mpsc, oneshot};
+use tokio::sync::{Mutex as TokioMutex, OwnedSemaphorePermit, RwLock, broadcast, mpsc, oneshot};
 
 use astra_server_types::ws_progress_callback::ProgressEvent;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::turn::run_control::RunInputProvider;
+use crate::turn::run_control::{RunControlProvider, RunControlStatus, RunInputProvider};
 use astra_core::{
     ErrorResponse, SharedPool, connect_matrixone, error_response, error_response_coded,
 };
@@ -39,9 +43,10 @@ use astra_services::coordination::{AgentProfile, AgentTier};
 use astra_services::runs::{
     AgentBindingRuntimeRequest, CancelRunRecord, CapabilityServerRefs, ChatRequestData,
     ChatRunRecord, ChatStreamRecord, DurableRunRecord, DurableRunStatusKind,
-    RequestedTurnInteractionMode, RunInputData, RunInputRecord, RunLifecycleService, RunListRecord,
-    RunMutationRecord, RunProjectionCheckpointRecord, RunProjectionRecord, RunStatusRecord,
-    RuntimeAuthRequest, RuntimeProfileRequest, SelectedModelRequest, durable_run_status_kind,
+    RequestedTurnInteractionMode, RunInputData, RunInputRecord, RunLifecycleService, RunListCursor,
+    RunListRecord, RunMutationRecord, RunProjectionCheckpointRecord, RunProjectionRecord,
+    RunStatusRecord, RuntimeAuthRequest, RuntimeProfileRequest, SelectedModelRequest,
+    durable_run_status_kind,
 };
 use astra_services::session_audit::{RUNTIME_PROMOTION_EVENT_TYPE, RuntimePromotionEventData};
 use astra_services::skills::SkillService;
@@ -127,6 +132,7 @@ const MAX_DEFERRED_INPUT_CHARS: usize = 20_000;
 const MAX_DURABLE_RUN_PROJECTION_RECENT_EVENTS: u32 = 500;
 const MAX_ACTIVE_RUN_LIVE_EVENTS: usize = MAX_DURABLE_RUN_PROJECTION_RECENT_EVENTS as usize;
 const AGENT_PROGRESS_STREAM_DRAIN_GRACE: Duration = Duration::from_millis(25);
+const ACTIVE_RUN_DURABLE_CONTROL_WATCH_INTERVAL: Duration = Duration::from_secs(2);
 
 const RUNTIME_CONTEXT_TRACE_AGENT_ID: &str = "astra-server";
 #[cfg(test)]
@@ -264,7 +270,7 @@ type ServerSkillResolverBundle = (
 );
 
 /// Post-loop session-memory cleanup shared by `create_run` and
-/// `stream_chat`. Runs session-end governance (purge working memory +
+/// `stream_chat`. Schedules session-end governance (purge working memory +
 /// persist episodic overview + Memoria reflect) when the per-session
 /// debounce window allows, and always clears the bridge seen-ledger +
 /// extraction-service debounce so long-lived servers don't accumulate
@@ -277,24 +283,107 @@ async fn post_loop_memory_cleanup(
     session_facts: &astra_turn_types::session_facts::SessionFacts,
     extraction_service: Option<&Arc<crate::session_memory::MemoryExtractionService>>,
     final_extract_request: Option<crate::session_memory::ExtractionRequest>,
+    metrics_registry: Option<Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
+) {
+    post_loop_memory_cleanup_with_limits(
+        session_id,
+        session_facts,
+        extraction_service,
+        final_extract_request,
+        metrics_registry,
+        DEFAULT_POST_LOOP_MEMORY_CLEANUP_CONCURRENCY,
+        Duration::from_millis(DEFAULT_SESSION_MEMORY_POST_LOOP_DRAIN_TIMEOUT_MS),
+    )
+    .await;
+}
+
+async fn post_loop_memory_cleanup_with_limits(
+    session_id: &str,
+    session_facts: &astra_turn_types::session_facts::SessionFacts,
+    extraction_service: Option<&Arc<crate::session_memory::MemoryExtractionService>>,
+    final_extract_request: Option<crate::session_memory::ExtractionRequest>,
+    metrics_registry: Option<Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
+    async_concurrency_limit: usize,
+    drain_timeout: Duration,
 ) {
     if session_id.is_empty() {
         return;
     }
-    if let (Some(svc), Some(req)) = (extraction_service, final_extract_request) {
+
+    let session_id = session_id.to_string();
+    let session_facts = session_facts.clone();
+    let extraction_service = extraction_service.cloned();
+
+    let Some(permit) = try_acquire_post_loop_memory_cleanup_permit(async_concurrency_limit) else {
+        record_post_loop_memory_cleanup_dispatch_metrics(
+            metrics_registry.as_ref(),
+            "inline",
+            "saturated",
+        );
+        tracing::warn!(
+            session_id = %session_id,
+            concurrency_limit = async_concurrency_limit,
+            "post-loop memory cleanup concurrency full; running inline"
+        );
+        run_post_loop_memory_cleanup_work(
+            session_id,
+            session_facts,
+            extraction_service,
+            final_extract_request,
+            metrics_registry,
+            drain_timeout,
+        )
+        .await;
+        return;
+    };
+    record_post_loop_memory_cleanup_dispatch_metrics(
+        metrics_registry.as_ref(),
+        "async",
+        "scheduled",
+    );
+    tokio::spawn(async move {
+        let _permit = permit;
+        run_post_loop_memory_cleanup_work(
+            session_id,
+            session_facts,
+            extraction_service,
+            final_extract_request,
+            metrics_registry,
+            drain_timeout,
+        )
+        .await;
+    });
+}
+
+async fn run_post_loop_memory_cleanup_work(
+    session_id: String,
+    session_facts: astra_turn_types::session_facts::SessionFacts,
+    extraction_service: Option<Arc<crate::session_memory::MemoryExtractionService>>,
+    final_extract_request: Option<crate::session_memory::ExtractionRequest>,
+    metrics_registry: Option<Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
+    drain_timeout: Duration,
+) {
+    if let (Some(svc), Some(req)) = (extraction_service.as_ref(), final_extract_request) {
         let _ = svc.maybe_spawn_shutdown_flush(req);
     }
-    if let Some(svc) = extraction_service {
-        let leftover = svc
-            .wait_for_pending(std::time::Duration::from_secs(10))
-            .await;
+    if let Some(svc) = extraction_service.as_ref() {
+        let leftover = if drain_timeout.is_zero() {
+            svc.pending_drain()
+        } else {
+            svc.wait_for_pending(drain_timeout).await
+        };
         if leftover > 0 {
+            record_session_memory_post_loop_drain_metrics(metrics_registry.as_ref(), "leftover");
             tracing::warn!(
                 session_id = %session_id,
                 leftover,
                 "session-memory extraction still in flight after post-loop drain timeout"
             );
+        } else {
+            record_session_memory_post_loop_drain_metrics(metrics_registry.as_ref(), "clean");
         }
+    } else {
+        record_session_memory_post_loop_drain_metrics(metrics_registry.as_ref(), "no_service");
     }
     // ── Governance, debounced ──
     //
@@ -308,12 +397,12 @@ async fn post_loop_memory_cleanup(
     {
         let debouncer = crate::turn::session_end_debounce::global();
         if matches!(
-            debouncer.should_run(session_id),
+            debouncer.should_run(&session_id),
             crate::turn::session_end_debounce::DebounceDecision::Run
         ) {
             match crate::turn::cloud::session_end_governance::run_session_end_governance(
-                session_facts,
-                session_id,
+                &session_facts,
+                &session_id,
                 memoria_client,
             )
             .await
@@ -336,7 +425,7 @@ async fn post_loop_memory_cleanup(
                             "session-end governance complete"
                         );
                     }
-                    debouncer.record(session_id);
+                    debouncer.record(&session_id);
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -369,7 +458,7 @@ async fn post_loop_memory_cleanup(
         // the tool dispatch layer to report success/failure per recall,
         // which is a bigger refactor. The episode-level heuristic is
         // the smallest step that closes the loop in production.
-        let snapshots = astra_tools::memoria::MemoriaClient::drain_recalls(session_id, None);
+        let snapshots = astra_tools::memoria::MemoriaClient::drain_recalls(&session_id, None);
         if !snapshots.is_empty() && episode_was_written {
             use crate::turn::cloud::memoria_compact::MemoriaClient as ServerMemoriaClient;
             for snap in &snapshots {
@@ -396,6 +485,14 @@ async fn post_loop_memory_cleanup(
             );
         }
     }
+    reset_post_loop_memory_process_state(&session_id, extraction_service.as_ref());
+    record_post_loop_memory_cleanup_worker_metrics(metrics_registry.as_ref(), "completed");
+}
+
+fn reset_post_loop_memory_process_state(
+    session_id: &str,
+    extraction_service: Option<&Arc<crate::session_memory::MemoryExtractionService>>,
+) {
     // ── Always: clear canonical memory process state for this session ──
     //
     // A single process-global set in `astra_tools::memoria` holds both
@@ -760,12 +857,26 @@ fn flush_turn_observability(state: &mut AgenticLoopState, session_id: &str, inte
         return;
     }
     let Ok(writer) = astra_services::session_journal::JournalWriter::new(session_id) else {
+        tracing::warn!(
+            session_id,
+            "flush_turn_observability: failed to create journal writer"
+        );
         return;
     };
     if interrupted {
-        let _ = buf.flush_interrupted(&writer);
-    } else {
-        let _ = buf.flush(&writer);
+        if let Err(e) = buf.flush_interrupted(&writer) {
+            tracing::warn!(
+                session_id,
+                error = %e,
+                "flush_turn_observability: flush_interrupted failed"
+            );
+        }
+    } else if let Err(e) = buf.flush(&writer) {
+        tracing::warn!(
+            session_id,
+            error = %e,
+            "flush_turn_observability: flush failed"
+        );
     }
 }
 
@@ -834,16 +945,16 @@ async fn persist_runtime_promotion_events(
     session_id: &str,
     run_id: &str,
     promotions: &[RuntimePromotionEventData],
-) {
+) -> Result<(), String> {
     if promotions.is_empty() {
-        return;
+        return Ok(());
     }
     let Some(pool) = shared_pool else {
         tracing::debug!(
             session_id,
             "runtime promotion persistence skipped: shared_pool not configured"
         );
-        return;
+        return Ok(());
     };
 
     let service = build_runtime_event_service(matrixone, pool);
@@ -889,439 +1000,17 @@ async fn persist_runtime_promotion_events(
             );
         }
     }
-}
-
-fn should_emit_stream_turn_complete(final_status: &RunStatus) -> bool {
-    matches!(final_status, RunStatus::Completed | RunStatus::Paused)
+    Ok(())
 }
 
 pub(crate) use persistence::{
     PostLoopPersistContext, TranscriptPersistItem, build_run_turn_complete_event_with_interruption,
     format_task_board_resume_hint, persist_server_loop_core_events,
     persist_server_loop_trace_events, persist_session_transcript_items,
-    restore_session_state_compact, restore_step_checkpoint_runtime_state, server_trace_context,
-    trace_context_from_subrun_context,
+    restore_session_state_compact, restore_step_checkpoint_runtime_state,
+    server_loop_causal_chain_id, server_trace_context, trace_context_from_subrun_context,
 };
 use run_state::*;
-
-struct AgentProgressStreamBridge {
-    stop_tx: oneshot::Sender<()>,
-    join: tokio::task::JoinHandle<()>,
-    sent_lifecycle_events: AgentProgressLifecycleLedger,
-}
-
-impl AgentProgressStreamBridge {
-    async fn stop_and_drain(self) -> AgentProgressLifecycleLedger {
-        let _ = self.stop_tx.send(());
-        let _ = self.join.await;
-        self.sent_lifecycle_events
-    }
-}
-
-type AgentProgressLifecycleLedger = Arc<std::sync::Mutex<HashSet<AgentProgressLifecycleEventKey>>>;
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct AgentProgressLifecycleEventKey {
-    agent_id: String,
-    kind: AgentProgressLifecycleEventKind,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum AgentProgressLifecycleEventKind {
-    Spawned { run_id: String },
-    Completed,
-    Interrupted,
-    Failed,
-    Waiting,
-    Cancelled,
-}
-
-fn agent_progress_lifecycle_event_key(
-    event: &AgentProgressEvent,
-) -> Option<AgentProgressLifecycleEventKey> {
-    let kind = match &event.event_type {
-        ProgressEventType::AgentSpawned { run_id, .. } => {
-            AgentProgressLifecycleEventKind::Spawned {
-                run_id: run_id.clone(),
-            }
-        }
-        ProgressEventType::Completed { .. } => AgentProgressLifecycleEventKind::Completed,
-        ProgressEventType::Interrupted { .. } => AgentProgressLifecycleEventKind::Interrupted,
-        ProgressEventType::Failed { .. } => AgentProgressLifecycleEventKind::Failed,
-        ProgressEventType::Waiting { .. } => AgentProgressLifecycleEventKind::Waiting,
-        ProgressEventType::Cancelled { .. } => AgentProgressLifecycleEventKind::Cancelled,
-        _ => return None,
-    };
-    Some(AgentProgressLifecycleEventKey {
-        agent_id: event.agent_id.clone(),
-        kind,
-    })
-}
-
-fn mark_agent_progress_lifecycle_event_sent(
-    sent_lifecycle_events: &AgentProgressLifecycleLedger,
-    key: AgentProgressLifecycleEventKey,
-) {
-    sent_lifecycle_events
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(key);
-}
-
-fn has_agent_progress_lifecycle_event_sent(
-    sent_lifecycle_events: &AgentProgressLifecycleLedger,
-    key: &AgentProgressLifecycleEventKey,
-) -> bool {
-    sent_lifecycle_events
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .contains(key)
-}
-
-#[derive(Debug, Clone)]
-struct WorkSurfaceAgentLiveEventSink {
-    tx: mpsc::Sender<Value>,
-    execution_metadata: Option<Value>,
-}
-
-impl WorkSurfaceAgentLiveEventSink {
-    fn new(tx: mpsc::Sender<Value>, execution_metadata: Option<Value>) -> Self {
-        Self {
-            tx,
-            execution_metadata,
-        }
-    }
-}
-
-impl AgentLiveEventSink for WorkSurfaceAgentLiveEventSink {
-    fn send(&self, event: AgentLiveEvent) -> Result<(), AgentLiveSendError> {
-        let value = agent_live_event_to_work_surface_sse(&event, self.execution_metadata.as_ref());
-        match self.tx.try_send(value) {
-            Ok(()) => Ok(()),
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                // Work surface receiver is behind — drop rather than block the
-                // SSE emitter thread. The frontend will catch up on the next
-                // poll / refresh.
-                Err(AgentLiveSendError::Dropped)
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                Err(AgentLiveSendError::Closed)
-            }
-        }
-    }
-}
-
-fn agent_live_event_to_work_surface_sse(
-    event: &AgentLiveEvent,
-    execution_metadata: Option<&Value>,
-) -> Value {
-    let timestamp = SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0);
-    let mut value = match &event.kind {
-        AgentLiveEventKind::OutputDelta(content) => json!({
-            "type": "agent_live_event",
-            "agent_id": event.agent_id.as_str(),
-            "event_kind": "output_delta",
-            "content": content,
-            "timestamp": timestamp,
-        }),
-        AgentLiveEventKind::ThinkingDelta(content) => json!({
-            "type": "agent_live_event",
-            "agent_id": event.agent_id.as_str(),
-            "event_kind": "thinking_delta",
-            "content": content,
-            "timestamp": timestamp,
-        }),
-        AgentLiveEventKind::Status(content) => json!({
-            "type": "agent_live_event",
-            "agent_id": event.agent_id.as_str(),
-            "event_kind": "status",
-            "content": content,
-            "timestamp": timestamp,
-        }),
-        AgentLiveEventKind::ToolStarted {
-            name,
-            description,
-            tool_use_id,
-        } => json!({
-            "type": "agent_live_event",
-            "agent_id": event.agent_id.as_str(),
-            "event_kind": "tool_started",
-            "name": name,
-            "description": description,
-            "tool_use_id": tool_use_id,
-            "timestamp": timestamp,
-        }),
-        AgentLiveEventKind::ToolCompleted {
-            name,
-            description,
-            status,
-            duration_ms,
-            output_summary,
-            output,
-            tool_use_id,
-        } => json!({
-            "type": "agent_live_event",
-            "agent_id": event.agent_id.as_str(),
-            "event_kind": "tool_completed",
-            "name": name,
-            "description": description,
-            "status": status,
-            "duration_ms": duration_ms,
-            "output_summary": output_summary,
-            "output": output,
-            "tool_use_id": tool_use_id,
-            "timestamp": timestamp,
-        }),
-        AgentLiveEventKind::AgentTerminated {
-            termination,
-            duration_ms,
-            reason,
-        } => {
-            let termination = match termination {
-                AgentLiveTermination::Completed => "completed",
-                AgentLiveTermination::Failed => "failed",
-                AgentLiveTermination::Cancelled => "cancelled",
-            };
-            json!({
-                "type": "agent_live_event",
-                "agent_id": event.agent_id.as_str(),
-                "event_kind": "agent_terminated",
-                "termination": termination,
-                "status": termination,
-                "duration_ms": duration_ms,
-                "reason": reason,
-                "timestamp": timestamp,
-            })
-        }
-    };
-    merge_agent_live_execution_metadata(&mut value, execution_metadata);
-    value
-}
-
-fn merge_agent_live_execution_metadata(event: &mut Value, execution_metadata: Option<&Value>) {
-    let Some(event_obj) = event.as_object_mut() else {
-        return;
-    };
-    let Some(metadata_obj) = execution_metadata.and_then(Value::as_object) else {
-        return;
-    };
-    for key in ["workspace", "executor", "transport", "fallback_policy"] {
-        if let Some(value) = metadata_obj.get(key).cloned() {
-            event_obj.entry(key.to_string()).or_insert(value);
-        }
-    }
-}
-
-async fn forward_agent_progress_event_to_stream(
-    filter: &mut server_loop_host::RunScopedAgentProgressFilter,
-    event_tx: &mpsc::Sender<Value>,
-    sent_lifecycle_events: &AgentProgressLifecycleLedger,
-    evt: AgentProgressEvent,
-) -> bool {
-    for evt in filter.accept(evt) {
-        let lifecycle_key = agent_progress_lifecycle_event_key(&evt);
-        let Some(event) = server_loop_host::progress_event_to_sse(&evt) else {
-            continue;
-        };
-        if event_tx.send(event).await.is_err() {
-            return false;
-        }
-        if let Some(key) = lifecycle_key {
-            mark_agent_progress_lifecycle_event_sent(sent_lifecycle_events, key);
-        }
-    }
-    true
-}
-
-async fn drain_ready_agent_progress_events(
-    progress_rx: &mut broadcast::Receiver<AgentProgressEvent>,
-    filter: &mut server_loop_host::RunScopedAgentProgressFilter,
-    event_tx: &mpsc::Sender<Value>,
-    sent_lifecycle_events: &AgentProgressLifecycleLedger,
-) -> bool {
-    loop {
-        match progress_rx.try_recv() {
-            Ok(evt) => {
-                if !forward_agent_progress_event_to_stream(
-                    filter,
-                    event_tx,
-                    sent_lifecycle_events,
-                    evt,
-                )
-                .await
-                {
-                    return false;
-                }
-            }
-            Err(broadcast::error::TryRecvError::Lagged(dropped)) => {
-                tracing::warn!(
-                    target: "astra_runtime::work_surface",
-                    dropped,
-                    "agent progress live stream lagged while draining ready events"
-                );
-                continue;
-            }
-            Err(broadcast::error::TryRecvError::Empty) => return true,
-            Err(broadcast::error::TryRecvError::Closed) => return true,
-        }
-    }
-}
-
-fn system_time_epoch_ms(time: SystemTime) -> u64 {
-    time.duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-fn agent_spawned_progress_event_from_state(state: &SpawnedAgentState) -> AgentProgressEvent {
-    AgentProgressEvent {
-        agent_id: state.agent_id.clone(),
-        event_type: ProgressEventType::AgentSpawned {
-            run_id: state.run_id.clone(),
-            parent_run_id: state.parent_run_id.clone(),
-            agent_type: state.agent_type.clone(),
-            description: state.description.clone(),
-            fanout_slot: state.fanout_slot.clone(),
-        },
-        timestamp_epoch_ms: system_time_epoch_ms(state.started_at),
-        metadata: state.execution_metadata.clone(),
-    }
-}
-
-fn agent_lifecycle_progress_event_from_state(
-    state: &SpawnedAgentState,
-) -> Option<AgentProgressEvent> {
-    let event_type =
-        agent_status_to_progress_event(&state.status, &state.metrics, state.started_at)?;
-    if !event_type.is_terminal() && !matches!(event_type, ProgressEventType::Waiting { .. }) {
-        return None;
-    }
-    Some(AgentProgressEvent {
-        agent_id: state.agent_id.clone(),
-        event_type,
-        timestamp_epoch_ms: SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_millis() as u64)
-            .unwrap_or(0),
-        metadata: state.execution_metadata.clone(),
-    })
-}
-
-fn missing_agent_lifecycle_sse_event(
-    sent_lifecycle_events: &AgentProgressLifecycleLedger,
-    event: AgentProgressEvent,
-) -> Option<Value> {
-    let key = agent_progress_lifecycle_event_key(&event)?;
-    if has_agent_progress_lifecycle_event_sent(sent_lifecycle_events, &key) {
-        return None;
-    }
-    let sse = server_loop_host::progress_event_to_sse(&event)?;
-    mark_agent_progress_lifecycle_event_sent(sent_lifecycle_events, key);
-    Some(sse)
-}
-
-async fn collect_missing_agent_lifecycle_events(
-    spawner: &DynamicAgentSpawner,
-    root_run_id: &str,
-    sent_lifecycle_events: &AgentProgressLifecycleLedger,
-) -> Vec<Value> {
-    let states = spawner.get_agent_states_for_run_tree(root_run_id).await;
-    let mut events = Vec::new();
-    for state in states {
-        if let Some(event) = missing_agent_lifecycle_sse_event(
-            sent_lifecycle_events,
-            agent_spawned_progress_event_from_state(&state),
-        ) {
-            events.push(event);
-        }
-        if let Some(event) = agent_lifecycle_progress_event_from_state(&state)
-            .and_then(|event| missing_agent_lifecycle_sse_event(sent_lifecycle_events, event))
-        {
-            events.push(event);
-        }
-    }
-    events
-}
-
-async fn collect_agent_lifecycle_events_for_persistence(
-    spawner: &DynamicAgentSpawner,
-    root_run_id: &str,
-) -> Vec<Value> {
-    let states = spawner.get_agent_states_for_run_tree(root_run_id).await;
-    let mut events = Vec::new();
-    for state in states {
-        if let Some(event) = server_loop_host::progress_event_to_sse(
-            &agent_spawned_progress_event_from_state(&state),
-        ) {
-            events.push(event);
-        }
-        if let Some(event) = agent_lifecycle_progress_event_from_state(&state)
-            .and_then(|event| server_loop_host::progress_event_to_sse(&event))
-        {
-            events.push(event);
-        }
-    }
-    events
-}
-
-fn agent_lifecycle_dedupe_key(event: &Value) -> Option<String> {
-    let event_type = durable_event_type(event)?;
-    if !matches!(
-        event_type,
-        "agent_spawned"
-            | "agent_completed"
-            | "agent_failed"
-            | "agent_waiting"
-            | "agent_cancelled"
-            | "agent_interrupted"
-    ) {
-        return None;
-    }
-    let agent_id = event.get("agent_id").and_then(Value::as_str)?;
-    let status = event
-        .get("status")
-        .or_else(|| event.get("reason"))
-        .or_else(|| event.get("termination"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    Some(format!("{event_type}:{agent_id}:{status}"))
-}
-
-fn merge_agent_lifecycle_before_terminal_events(
-    final_events: &[Value],
-    agent_lifecycle_events: &[Value],
-) -> Vec<Value> {
-    let mut out = Vec::new();
-    let existing_lifecycle_keys: HashSet<String> = final_events
-        .iter()
-        .filter_map(agent_lifecycle_dedupe_key)
-        .collect();
-    let agent_lifecycle_events: Vec<Value> = agent_lifecycle_events
-        .iter()
-        .filter(|event| match agent_lifecycle_dedupe_key(event) {
-            Some(key) => !existing_lifecycle_keys.contains(&key),
-            None => true,
-        })
-        .cloned()
-        .collect();
-    let mut inserted_lifecycle = false;
-    for event in final_events {
-        if streaming_final_event_for_replay(event) && !inserted_lifecycle {
-            out.extend(agent_lifecycle_events.iter().cloned());
-            inserted_lifecycle = true;
-        }
-        if streaming_event_for_persistence(event) {
-            out.push(event.clone());
-        }
-    }
-    if !inserted_lifecycle {
-        out.extend(agent_lifecycle_events);
-    }
-    out
-}
 
 #[cfg(test)]
 async fn stream_missing_agent_lifecycle_events(
@@ -1407,6 +1096,72 @@ pub(crate) fn spawn_observed(
     });
 }
 
+struct ActiveRunControlWatcher {
+    stop_tx: Option<oneshot::Sender<()>>,
+    join: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ActiveRunControlWatcher {
+    fn drop(&mut self) {
+        if let Some(stop_tx) = self.stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
+        self.join.abort();
+    }
+}
+
+fn start_active_run_control_watcher(
+    run_control: Option<Arc<dyn RunControlProvider>>,
+    user_id: String,
+    run_id: String,
+    cancel_flag: Arc<AtomicBool>,
+    pause_flag: Arc<AtomicBool>,
+    cancel_token: Arc<CancellationToken>,
+) -> Option<ActiveRunControlWatcher> {
+    let run_control = run_control?;
+    let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
+    let join = tokio::spawn(async move {
+        let mut poll = tokio::time::interval_at(
+            tokio::time::Instant::now() + ACTIVE_RUN_DURABLE_CONTROL_WATCH_INTERVAL,
+            ACTIVE_RUN_DURABLE_CONTROL_WATCH_INTERVAL,
+        );
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = &mut stop_rx => break,
+                _ = poll.tick() => {
+                    if cancel_flag.load(Ordering::Acquire) || cancel_token.is_cancelled() {
+                        break;
+                    }
+                    match run_control.control_status(&user_id, &run_id).await {
+                        Ok(Some(RunControlStatus::Cancelled)) => {
+                            cancel_flag.store(true, Ordering::SeqCst);
+                            cancel_token.cancel();
+                            break;
+                        }
+                        Ok(Some(RunControlStatus::Paused)) => {
+                            pause_flag.store(true, Ordering::SeqCst);
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            tracing::warn!(
+                                target: "astra_runtime::run_lifecycle",
+                                run_id = %run_id,
+                                error = %error,
+                                "active run control watcher failed to poll durable status"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    });
+    Some(ActiveRunControlWatcher {
+        stop_tx: Some(stop_tx),
+        join,
+    })
+}
+
 /// Production [`RunLifecycleService`] that executes agentic loops via
 /// [`ServerAgenticLoopHost`].
 ///
@@ -1484,6 +1239,8 @@ pub struct AgenticRunLifecycleService {
     /// agentic loop tasks across all users. A permit is acquired before
     /// spawn and automatically released when the task completes.
     run_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Shared metrics registry for capacity/admission signals exposed via /metrics.
+    metrics_registry: Option<Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
     /// Harness sink registry for server-side harness observation (Phase 2A).
     #[cfg(feature = "harness")]
     harness_registry: Option<crate::server::harness::handlers::HarnessSinkRegistry>,
@@ -1539,6 +1296,7 @@ impl AgenticRunLifecycleService {
             auxiliary_event_writer: None,
             background_task_count: Arc::new(AtomicUsize::new(0)),
             run_semaphore: Arc::new(tokio::sync::Semaphore::new(50)),
+            metrics_registry: None,
             #[cfg(feature = "harness")]
             harness_registry: None,
             memory_extraction_service: None,
@@ -1700,9 +1458,63 @@ impl AgenticRunLifecycleService {
         self
     }
 
+    pub fn with_metrics_registry(
+        mut self,
+        registry: Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>,
+    ) -> Self {
+        register_run_admission_metrics(&registry);
+        register_durable_run_event_metrics(&registry);
+        self.metrics_registry = Some(registry);
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn test_run_semaphore(&self) -> Arc<tokio::sync::Semaphore> {
         self.run_semaphore.clone()
+    }
+
+    async fn remove_run_channels(&self, run_id: &str) {
+        self.approval_channels.lock().await.remove(run_id);
+        self.user_prompt_channels.lock().await.remove(run_id);
+        self.progress_channels.lock().await.remove(run_id);
+    }
+
+    async fn acquire_run_permit(
+        &self,
+        timeout: Duration,
+    ) -> Result<OwnedSemaphorePermit, RunAdmissionError> {
+        let start = Instant::now();
+        match tokio::time::timeout(timeout, self.run_semaphore.clone().acquire_owned()).await {
+            Ok(Ok(permit)) => {
+                self.record_run_admission("acquired", start.elapsed());
+                Ok(permit)
+            }
+            Ok(Err(_closed)) => {
+                self.record_run_admission("closed", start.elapsed());
+                Err(RunAdmissionError::Closed)
+            }
+            Err(_elapsed) => {
+                self.record_run_admission("timeout", start.elapsed());
+                Err(RunAdmissionError::Timeout)
+            }
+        }
+    }
+
+    fn record_run_admission(&self, outcome: &'static str, wait: Duration) {
+        let Some(registry) = self.metrics_registry.as_ref() else {
+            return;
+        };
+        register_run_admission_metrics(registry);
+        registry.increment_counter(
+            METRIC_RUN_ADMISSION_ATTEMPTS_TOTAL,
+            &[("outcome", outcome)],
+            1,
+        );
+        registry.increment_counter(
+            METRIC_RUN_ADMISSION_WAIT_MS_TOTAL,
+            &[("outcome", outcome)],
+            duration_millis_u64(wait),
+        );
     }
 
     fn dynamic_agent_progress_broadcaster(&self) -> Arc<ProgressBroadcaster> {
@@ -2319,15 +2131,29 @@ impl AgenticRunLifecycleService {
     }
 
     async fn fail_started_run_before_spawn(&self, user_id: &str, run_id: &str, message: &str) {
-        self.runs.write().await.remove(run_id);
+        let terminal_events = pre_spawn_failure_terminal_events(message);
         astra_core::log_persist!(
             self.run_engine
-                .persist_status(user_id, run_id, STATUS_FAILED, None, Some(message))
+                .transition_status_with_events_if_current(
+                    user_id,
+                    run_id,
+                    &[
+                        STATUS_RUNNING,
+                        STATUS_PAUSED,
+                        STATUS_WAITING,
+                        STATUS_INPUT_QUEUED,
+                    ],
+                    STATUS_FAILED,
+                    None,
+                    Some(message),
+                    &terminal_events,
+                )
                 .await,
             "run_lifecycle",
             run_id,
-            "pre_spawn_failure"
+            "pre_spawn_failure_transition"
         );
+        self.runs.write().await.remove(run_id);
     }
 
     fn finalize_run_events(
@@ -2406,15 +2232,35 @@ impl AgenticRunLifecycleService {
                         (RunStatus::Completed, None)
                     }
                 }
-                Ok(AgenticLoopOutcome::Cancelled) => unreachable!("handled by cancellation gate"),
-                Ok(AgenticLoopOutcome::Error(e)) => {
-                    events.push(json!({
-                        "event_type": "run_error",
-                        "data": {"error": e.clone()}
-                    }));
+                Ok(AgenticLoopOutcome::Cancelled) => {
+                    // This branch should be handled by the cancellation gate check above,
+                    // but handle it gracefully instead of panicking in production.
+                    let mut data = usage;
+                    data["cancelled"] = Value::Bool(true);
                     events.push(json!({
                         "event_type": "run_finished",
-                        "data": usage.clone(),
+                        "data": data,
+                    }));
+                    (RunStatus::Cancelled, None)
+                }
+                Ok(AgenticLoopOutcome::Error(e)) => {
+                    let classified = astra_core::ClassifiedError::from(e.clone());
+                    let error_kind = classified.kind.as_str();
+                    events.push(json!({
+                        "event_type": "run_error",
+                        "data": {
+                            "error": e.clone(),
+                            "error_code": error_kind,
+                            "error_kind": error_kind,
+                        }
+                    }));
+                    let mut finished = usage.clone();
+                    finished["error"] = Value::String(e.clone());
+                    finished["error_code"] = Value::String(error_kind.to_string());
+                    finished["error_kind"] = Value::String(error_kind.to_string());
+                    events.push(json!({
+                        "event_type": "run_finished",
+                        "data": finished,
                     }));
                     (RunStatus::Failed, Some(e))
                 }
@@ -2428,13 +2274,23 @@ impl AgenticRunLifecycleService {
                 }
                 Err(err) => {
                     let msg = err.to_string();
+                    let error_kind = err.kind.as_str();
+                    let error_code = classified_terminal_error_code(&err);
                     events.push(json!({
                         "event_type": "run_error",
-                        "data": {"error": &msg, "error_kind": err.kind.as_str()}
+                        "data": {
+                            "error": &msg,
+                            "error_code": &error_code,
+                            "error_kind": error_kind,
+                        }
                     }));
+                    let mut finished = usage;
+                    finished["error"] = Value::String(msg.clone());
+                    finished["error_code"] = Value::String(error_code);
+                    finished["error_kind"] = Value::String(error_kind.to_string());
                     events.push(json!({
                         "event_type": "run_finished",
-                        "data": usage,
+                        "data": finished,
                     }));
                     (RunStatus::Failed, Some(msg))
                 }
@@ -3153,6 +3009,9 @@ impl AgenticRunLifecycleService {
         if let Some(pool) = &self.shared_pool {
             builder = builder.with_pool(pool.clone());
         }
+        if let Some(svc) = &self.edge_dispatch_service {
+            builder = builder.with_edge_dispatch_service(Arc::clone(svc));
+        }
         if let Some(snapshot) = execution_bindings {
             builder = builder.with_execution_binding_snapshot(snapshot.clone());
         }
@@ -3183,6 +3042,33 @@ impl AgenticRunLifecycleService {
             builder = builder.with_test_llm_rounds(rounds);
         }
         builder.build()
+    }
+
+    fn configure_host_approval_audit_context(
+        &self,
+        host: &mut server_loop_host::ServerAgenticLoopHost,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        turn: u32,
+        agent_id: Option<String>,
+    ) {
+        let Some(writer) = self.auxiliary_event_writer.clone() else {
+            return;
+        };
+        host.set_approval_audit_context(
+            astra_turn_core::cloud_tool_delivery::ApprovalAuditContext {
+                user_id: user_id.to_string(),
+                session_id: session_id.to_string(),
+                run_id: run_id.to_string(),
+                turn,
+                agent_id,
+                parent_event_id: None,
+                parent_event_ids: Vec::new(),
+                causal_chain_id: server_loop_causal_chain_id("server-loop-tools"),
+                auxiliary_event_writer: writer,
+            },
+        );
     }
 
     async fn task_board_resume_hint_for_session(
@@ -3955,6 +3841,68 @@ impl AgenticRunLifecycleService {
         }
     }
 
+    async fn persist_started_run_quota_rejection(
+        run_engine: &RunEngine,
+        runs: &Arc<RwLock<HashMap<String, RunState>>>,
+        user_id: &str,
+        run_id: &str,
+        limit: astra_services::resource_governor::ResourceLimitKind,
+        reason: &str,
+    ) -> Option<Vec<Value>> {
+        let terminal_events = per_user_run_quota_terminal_events(limit, reason);
+        let committed = match run_engine
+            .transition_status_with_events_if_current(
+                user_id,
+                run_id,
+                &[
+                    STATUS_RUNNING,
+                    STATUS_PAUSED,
+                    STATUS_WAITING,
+                    STATUS_INPUT_QUEUED,
+                ],
+                STATUS_FAILED,
+                None,
+                Some(reason),
+                &terminal_events,
+            )
+            .await
+        {
+            Ok(true) => true,
+            Ok(false) => {
+                tracing::warn!(
+                    target: "astra_runtime::run_lifecycle",
+                    run_id,
+                    limit = %limit.as_str(),
+                    "skipping quota rejection terminal events after stale status CAS"
+                );
+                false
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra_runtime::run_lifecycle",
+                    run_id,
+                    limit = %limit.as_str(),
+                    error = %error,
+                    "failed to persist quota rejection status/events transition"
+                );
+                false
+            }
+        };
+        if !committed {
+            return None;
+        }
+
+        let terminal_events = terminal_events.to_vec();
+        if let Some(run) = runs.write().await.get_mut(run_id) {
+            if run.status.try_transition(&RunStatus::Failed).is_ok() {
+                run.status = RunStatus::Failed;
+            }
+            run.events.extend(terminal_events.iter().cloned());
+            run.live_tx = None;
+        }
+        Some(terminal_events)
+    }
+
     fn durable_recent_events(run: &DurableRunRecord, limit: u32) -> Vec<Value> {
         let capped = limit.clamp(1, MAX_DURABLE_RUN_PROJECTION_RECENT_EVENTS) as usize;
         let offset = run.events.len().saturating_sub(capped);
@@ -4033,8 +3981,10 @@ impl AgenticRunLifecycleService {
 fn build_shutdown_extraction_request(
     state: &AgenticLoopState,
 ) -> Option<crate::session_memory::ExtractionRequest> {
+    let user_id = state.context_manifest_user_id.clone()?;
     state.current_session_id.as_ref().map(|session_id| {
         crate::session_memory::ExtractionRequest {
+            user_id,
             session_id: session_id.clone(),
             messages: state.messages.clone(),
             session_facts: state.session_facts.clone(),
@@ -4045,7 +3995,7 @@ fn build_shutdown_extraction_request(
                 as usize,
             current_tool_calls: state.total_tool_calls as usize,
             had_error: state.error_recovery.consecutive_same_error > 0,
-            had_user_correction: astra_turn_core::input_classifier::is_correction_signal(
+            had_user_correction: astra_turn_core::input_classifier::is_reanchor_signal(
                 &state.message,
             ),
             turn_number: state.max_turns.saturating_sub(state.remaining_turns) as u32,
@@ -4577,13 +4527,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
         // ── Resource governance check (Phase 5) ─────────────────────
         if let Some(ref gov) = self.resource_governor {
-            if let astra_services::resource_governor::LimitCheck::Denied { reason } =
+            if let astra_services::resource_governor::LimitCheck::Denied { limit, reason } =
                 gov.check_run_start(&user_id).await
             {
-                return Err(error_response(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    format!("Resource limit exceeded: {reason}"),
-                ));
+                return Err(per_user_run_quota_response(limit, reason));
             }
         }
 
@@ -4779,6 +4726,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
         loop_state.session_turn =
             infer_session_turn(self.shared_pool.as_ref(), &user_id, &session_id).await;
+        self.configure_host_approval_audit_context(
+            &mut host,
+            &user_id,
+            &session_id,
+            &run_id,
+            loop_state.session_turn,
+            request.agent_id.clone(),
+        );
         let fresh_session_current_date = loop_state
             .pipeline_session
             .as_ref()
@@ -4962,10 +4917,15 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .await;
 
             if request.interactive_client {
+                use astra_turn_core::ws_approval_gate::WebSocketApprovalGate;
+
                 // ── Phase E: Wire WebSocket approval and ask_user gates ───
                 let (approval_tx, approval_rx) = mpsc::channel::<Value>(64);
-                let approval_gate = astra_turn_core::ws_approval_gate::WebSocketApprovalGate::new(
+                let approval_gate = WebSocketApprovalGate::new_with_journal_context(
                     user_id.clone(),
+                    session_id.clone(),
+                    run_id.clone(),
+                    Some(loop_state.session_turn),
                     self.edge_callback_ledger.clone(),
                     approval_tx,
                 );
@@ -4979,6 +4939,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 let user_prompt_gate =
                     astra_turn_core::ws_user_prompt_gate::WebSocketUserPromptGate::new(
                         user_id.clone(),
+                        session_id.clone(),
+                        run_id.clone(),
+                        Some(loop_state.session_turn),
                         self.edge_callback_ledger.clone(),
                         user_prompt_tx,
                     );
@@ -5018,9 +4981,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let bg_user_id = user_id.clone();
         let bg_cloud_workspace_record = cloud_workspace_record.clone();
         let bg_workspace_record_store = self.workspace_record_store.clone();
-        let _bg_cancel_flag = cancel_flag.clone();
-        let _bg_pause_flag = pause_flag.clone();
-        let _bg_llm_cancel_token = llm_cancel_token.clone();
+        let bg_metrics_registry = self.metrics_registry.clone();
+        let bg_cancel_flag = cancel_flag.clone();
+        let bg_pause_flag = pause_flag.clone();
+        let bg_llm_cancel_token = llm_cancel_token.clone();
         let persist_ctx = PostLoopPersistContext {
             matrixone: self.matrixone.clone(),
             shared_pool: self.shared_pool.clone(),
@@ -5033,40 +4997,37 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             hook_db_writer: self.hook_db_writer.clone(),
             observer_worker: self.observer_worker.clone(),
             tool_event_writer: self.tool_event_writer.clone(),
+            metrics_registry: self.metrics_registry.clone(),
             csl_manager: csl_manager.map(tokio::sync::Mutex::new),
         };
 
         // ── Global admission control: limit concurrent agentic loop tasks ──
-        // Wait up to 30 s for a slot (previously immediate 503);
-        // if no slot frees up, return 503.
-        let permit = match tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            self.run_semaphore.clone().acquire_owned(),
-        )
-        .await
-        {
+        // Wait for a configured interval before returning a structured 503.
+        let permit = match self.acquire_run_permit(run_admission_timeout()).await {
             Ok(permit) => permit,
-            Err(_elapsed) => {
-                self.fail_started_run_before_spawn(
-                    &user_id,
-                    &run_id,
-                    "server capacity timeout before agentic loop start",
-                )
-                .await;
+            Err(error) => {
+                let failure_reason = match error {
+                    RunAdmissionError::Timeout => {
+                        "server capacity timeout before agentic loop start"
+                    }
+                    RunAdmissionError::Closed => {
+                        "server capacity admission closed before agentic loop start"
+                    }
+                };
+                self.fail_started_run_before_spawn(&user_id, &run_id, failure_reason)
+                    .await;
+                self.remove_run_channels(&run_id).await;
                 if let Some(record) = cloud_workspace_record.as_ref() {
                     self.cleanup_cloud_workspace_after_failed_start(
                         &user_id,
                         &session_id,
                         &run_id,
                         record,
-                        "server capacity timeout before agentic loop start".to_string(),
+                        failure_reason.to_string(),
                     )
                     .await;
                 }
-                return Err(error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "server at capacity, please retry",
-                ));
+                return Err(run_admission_capacity_response(error));
             }
         };
 
@@ -5086,53 +5047,40 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     }
                 }
                 let _guard = TaskCountGuard(bg_task_count_1);
+                let _owner_lease_heartbeat =
+                    run_engine.start_owner_lease_heartbeat(bg_user_id.clone(), bg_run_id.clone());
 
                 // Pre-flight: check daily token budget before starting the agentic loop.
                 if let Some(ref gov) = bg_resource_governor {
                     use astra_services::resource_governor::LimitCheck;
-                    if let LimitCheck::Denied { reason } = gov.check_token_budget(&bg_user_id).await
+                    if let LimitCheck::Denied { limit, reason } =
+                        gov.check_token_budget(&bg_user_id).await
                     {
                         tracing::warn!(
                             target: "astra_runtime::run_lifecycle",
                             user_id = %bg_user_id,
                             run_id = %bg_run_id,
+                            limit = %limit.as_str(),
                             reason = %reason,
                             "run rejected: daily token budget exhausted"
                         );
-                        if let Some(run) = runs.write().await.get_mut(&bg_run_id) {
-                            if run.status.try_transition(&RunStatus::Failed).is_ok() {
-                                run.status = RunStatus::Failed;
-                            }
-                            // Push terminal events so SSE clients see the failure.
-                            run.events.push(json!({
-                                "event_type": "run_error",
-                                "data": {"error": reason.clone()}
-                            }));
-                            run.events.push(json!({
-                                "event_type": "run_finished",
-                                "data": {"total_prompt_tokens": 0, "total_completion_tokens": 0}
-                            }));
-                            run.live_tx = None;
-                        }
+                        let budget_reject_committed = Self::persist_started_run_quota_rejection(
+                            &run_engine,
+                            &runs,
+                            &bg_user_id,
+                            &bg_run_id,
+                            limit,
+                            &reason,
+                        )
+                        .await
+                        .is_some();
                         // Clean up channels for this run.
                         bg_approval_channels.lock().await.remove(&bg_run_id);
                         bg_user_prompt_channels.lock().await.remove(&bg_run_id);
                         bg_progress_channels.lock().await.remove(&bg_run_id);
-                        astra_core::log_persist!(
-                            run_engine
-                                .persist_status(
-                                    &bg_user_id,
-                                    &bg_run_id,
-                                    astra_core::STATUS_FAILED,
-                                    None,
-                                    Some(&reason),
-                                )
-                                .await,
-                            "run_lifecycle",
-                            &bg_run_id,
-                            "budget_reject"
-                        );
-                        if let Some(record) = bg_cloud_workspace_record.as_ref() {
+                        if budget_reject_committed
+                            && let Some(record) = bg_cloud_workspace_record.as_ref()
+                        {
                             Self::cleanup_cloud_workspace_with_debt(
                             bg_workspace_record_store.clone(),
                             &bg_user_id,
@@ -5146,10 +5094,20 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         )
                         .await;
                         }
-                        Self::schedule_run_eviction(&runs, bg_run_id.clone());
+                        if budget_reject_committed {
+                            Self::schedule_run_eviction(&runs, bg_run_id.clone());
+                        }
                         return;
                     }
                 }
+                let _control_watcher = start_active_run_control_watcher(
+                    loop_state.run_control.clone(),
+                    bg_user_id.clone(),
+                    bg_run_id.clone(),
+                    bg_cancel_flag.clone(),
+                    bg_pause_flag.clone(),
+                    bg_llm_cancel_token.clone(),
+                );
 
                 let outcome =
                     run_agentic_loop_with_host_panic_safe(&mut host, &mut loop_state).await;
@@ -5161,12 +5119,20 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 bg_approval_channels.lock().await.remove(&bg_run_id);
                 bg_user_prompt_channels.lock().await.remove(&bg_run_id);
                 bg_progress_channels.lock().await.remove(&bg_run_id);
-                let terminal_events = terminal_events_for_persistence(&events);
+                let terminal_events = enforce_durable_run_event_batch_budget(
+                    terminal_events_for_persistence(&events),
+                );
+                record_durable_run_event_batch_metrics(
+                    bg_metrics_registry.as_ref(),
+                    "non_streaming_terminal",
+                    "planned",
+                    &terminal_events,
+                );
 
                 // Publish terminal run state before best-effort post-run side effects
                 // so background observers do not stay stuck in "running" because a
                 // hook, event write, or learning save is slow.
-                let mut persisted_status = final_status.clone();
+                let mut persisted_status = final_status;
                 let mut persist_status_update = true;
                 let mut persist_terminal_events = true;
 
@@ -5188,7 +5154,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                                 .get_or_insert_with(|| "user_resume".to_string());
                             run.live_tx = None;
                         } else if run.status.try_transition(&final_status).is_ok() {
-                            run.status = final_status.clone();
+                            run.status = final_status;
                         }
                         if !run.status.is_resumable() {
                             run.live_tx = None;
@@ -5222,21 +5188,78 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     Self::schedule_run_eviction(&runs, bg_run_id.clone());
                 }
 
-                if persist_status_update {
-                    astra_core::log_persist!(
-                        run_engine
-                            .persist_status(
-                                &bg_user_id,
-                                &bg_run_id,
-                                persisted_status.as_str(),
-                                None,
-                                error_msg.as_deref()
-                            )
-                            .await,
-                        "run_lifecycle",
-                        &bg_run_id,
-                        "status"
+                let mut durable_status_committed = !persist_status_update;
+                let mut terminal_events_committed = false;
+                if !persist_terminal_events {
+                    record_durable_run_event_batch_metrics(
+                        bg_metrics_registry.as_ref(),
+                        "non_streaming_terminal",
+                        "skipped",
+                        &terminal_events,
                     );
+                }
+                if persist_status_update {
+                    let events_for_transition: &[Value] = if persist_terminal_events {
+                        terminal_events.as_slice()
+                    } else {
+                        &[]
+                    };
+                    match run_engine
+                        .transition_terminal_status_with_events_if_current(
+                            &bg_user_id,
+                            &bg_run_id,
+                            &[STATUS_RUNNING, STATUS_WAITING, STATUS_INPUT_QUEUED],
+                            persisted_status.as_str(),
+                            None,
+                            error_msg.as_deref(),
+                            events_for_transition,
+                        )
+                        .await
+                    {
+                        Ok(true) => {
+                            durable_status_committed = true;
+                            terminal_events_committed =
+                                persist_terminal_events && !terminal_events.is_empty();
+                            if terminal_events_committed {
+                                record_durable_run_event_batch_metrics(
+                                    bg_metrics_registry.as_ref(),
+                                    "non_streaming_terminal",
+                                    "committed",
+                                    &terminal_events,
+                                );
+                            }
+                        }
+                        Ok(false) => {
+                            persist_terminal_events = false;
+                            record_durable_run_event_batch_metrics(
+                                bg_metrics_registry.as_ref(),
+                                "non_streaming_terminal",
+                                "stale",
+                                &terminal_events,
+                            );
+                            tracing::warn!(
+                                target: "astra_runtime::run_lifecycle",
+                                run_id = %bg_run_id,
+                                status = persisted_status.as_str(),
+                                "skipping terminal transition after stale terminal status CAS"
+                            );
+                        }
+                        Err(error) => {
+                            persist_terminal_events = false;
+                            record_durable_run_event_batch_metrics(
+                                bg_metrics_registry.as_ref(),
+                                "non_streaming_terminal",
+                                "error",
+                                &terminal_events,
+                            );
+                            tracing::warn!(
+                                target: "astra_runtime::run_lifecycle",
+                                run_id = %bg_run_id,
+                                error = %error,
+                                "failed to persist terminal status/events transition"
+                            );
+                        }
+                    }
                 }
                 astra_core::log_persist!(
                     run_engine
@@ -5259,15 +5282,38 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         gov.record_tokens(&bg_user_id, total).await;
                     }
                 }
-                if persist_terminal_events && !terminal_events.is_empty() {
-                    astra_core::log_persist!(
-                        run_engine
-                            .append_events_batch(&bg_user_id, &bg_run_id, &terminal_events)
-                            .await,
-                        "run_lifecycle",
-                        &bg_run_id,
-                        "append_terminal_events_batch"
-                    );
+                if durable_status_committed
+                    && persist_terminal_events
+                    && !terminal_events.is_empty()
+                    && !terminal_events_committed
+                {
+                    match run_engine
+                        .append_events_batch(&bg_user_id, &bg_run_id, &terminal_events)
+                        .await
+                    {
+                        Ok(()) => {
+                            record_durable_run_event_batch_metrics(
+                                bg_metrics_registry.as_ref(),
+                                "non_streaming_terminal",
+                                "committed",
+                                &terminal_events,
+                            );
+                        }
+                        Err(error) => {
+                            record_durable_run_event_batch_metrics(
+                                bg_metrics_registry.as_ref(),
+                                "non_streaming_terminal",
+                                "error",
+                                &terminal_events,
+                            );
+                            astra_core::agent_warn!(
+                                "run_lifecycle",
+                                "persist append_terminal_events_batch for run {}: {}",
+                                bg_run_id,
+                                error
+                            );
+                        }
+                    }
                 }
 
                 if persist_terminal_events {
@@ -5277,17 +5323,24 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
                 // Best-effort post-loop persistence (core events, tool events,
                 // hook DB, observer, session-end hooks, promotion events).
-                persist_ctx.run(&loop_state, loop_success).await;
+                if let Err(e) = persist_ctx.run(&loop_state, loop_success).await {
+                    tracing::error!(
+                        session_id = %bg_session_id,
+                        run_id = %bg_run_id,
+                        error = %e,
+                        "post-loop persistence failed"
+                    );
+                }
 
                 // Post-loop memory cleanup — shared with the streaming path
-                // (see `stream_chat`). Runs governance once per session
-                // debounce window, clears bridge seen-ledger, and forgets
-                // extraction debounce.
+                // (see `stream_chat`). By default this only schedules external
+                // Memoria work so the run permit can be released promptly.
                 post_loop_memory_cleanup(
                     loop_state.current_session_id.as_deref().unwrap_or(""),
                     &loop_state.session_facts,
                     loop_state.memory_extraction_service.as_ref(),
                     build_shutdown_extraction_request(&loop_state),
+                    bg_metrics_registry.clone(),
                 )
                 .await;
 
@@ -5335,13 +5388,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
         // ── Resource governance check ────────────────────────────────
         if let Some(ref gov) = self.resource_governor {
-            if let astra_services::resource_governor::LimitCheck::Denied { reason } =
+            if let astra_services::resource_governor::LimitCheck::Denied { limit, reason } =
                 gov.check_run_start(&user_id).await
             {
-                return Err(error_response(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    format!("Resource limit exceeded: {reason}"),
-                ));
+                return Err(per_user_run_quota_response(limit, reason));
             }
         }
 
@@ -5526,6 +5576,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             execution_bindings.as_ref(),
             plan_resume_hint,
             task_board_resume_hint,
+        );
+        self.configure_host_approval_audit_context(
+            &mut host,
+            &user_id,
+            &session_id,
+            &run_id,
+            state.session_turn,
+            request.agent_id.clone(),
         );
         host.set_event_tx(event_tx.clone());
         host.set_client_cancel(cancel_flag.clone(), llm_cancel_token.clone());
@@ -5797,6 +5855,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let bg_cloud_workspace_record = cloud_workspace_record.clone();
         let bg_workspace_record_store = self.workspace_record_store.clone();
         let missing_lifecycle_spawner = Arc::clone(&stream_agent_spawner);
+        let bg_metrics_registry = self.metrics_registry.clone();
+        let bg_cancel_flag = cancel_flag.clone();
+        let bg_pause_flag = pause_flag.clone();
+        let bg_llm_cancel_token = llm_cancel_token.clone();
         let persist_ctx = PostLoopPersistContext {
             matrixone: self.matrixone.clone(),
             shared_pool: self.shared_pool.clone(),
@@ -5809,39 +5871,37 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             hook_db_writer: self.hook_db_writer.clone(),
             observer_worker: self.observer_worker.clone(),
             tool_event_writer: self.tool_event_writer.clone(),
+            metrics_registry: self.metrics_registry.clone(),
             csl_manager: csl_manager.map(tokio::sync::Mutex::new),
         };
 
         // ── Global admission control: limit concurrent agentic loop tasks ──
-        // Wait up to 30 s for a slot; if no slot frees up, return 503.
-        let permit = match tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            self.run_semaphore.clone().acquire_owned(),
-        )
-        .await
-        {
+        // Wait for a configured interval before returning a structured 503.
+        let permit = match self.acquire_run_permit(run_admission_timeout()).await {
             Ok(permit) => permit,
-            Err(_elapsed) => {
-                self.fail_started_run_before_spawn(
-                    &user_id,
-                    &run_id,
-                    "server capacity timeout before streaming agentic loop start",
-                )
-                .await;
+            Err(error) => {
+                let failure_reason = match error {
+                    RunAdmissionError::Timeout => {
+                        "server capacity timeout before streaming agentic loop start"
+                    }
+                    RunAdmissionError::Closed => {
+                        "server capacity admission closed before streaming agentic loop start"
+                    }
+                };
+                self.fail_started_run_before_spawn(&user_id, &run_id, failure_reason)
+                    .await;
+                self.remove_run_channels(&run_id).await;
                 if let Some(record) = cloud_workspace_record.as_ref() {
                     self.cleanup_cloud_workspace_after_failed_start(
                         &user_id,
                         &session_id,
                         &run_id,
                         record,
-                        "server capacity timeout before streaming agentic loop start".to_string(),
+                        failure_reason.to_string(),
                     )
                     .await;
                 }
-                return Err(error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "server at capacity, please retry",
-                ));
+                return Err(run_admission_capacity_response(error));
             }
         };
 
@@ -5860,13 +5920,78 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     }
                 }
                 let _guard = TaskCountGuard(bg_task_count_2);
+                let _owner_lease_heartbeat =
+                    run_engine.start_owner_lease_heartbeat(bg_user_id.clone(), bg_run_id.clone());
+                if let Some(ref gov) = bg_resource_governor {
+                    use astra_services::resource_governor::LimitCheck;
+                    if let LimitCheck::Denied { limit, reason } =
+                        gov.check_token_budget(&bg_user_id).await
+                    {
+                        tracing::warn!(
+                            target: "astra_runtime::run_lifecycle",
+                            user_id = %bg_user_id,
+                            run_id = %bg_run_id,
+                            limit = %limit.as_str(),
+                            reason = %reason,
+                            "streaming run rejected: daily token budget exhausted"
+                        );
+                        let terminal_events = Self::persist_started_run_quota_rejection(
+                            &run_engine,
+                            &runs,
+                            &bg_user_id,
+                            &bg_run_id,
+                            limit,
+                            &reason,
+                        )
+                        .await;
+                        if let Some(terminal_events) = terminal_events {
+                            for event in run_handlers::transform_stream_run_events_for_client(
+                                &bg_run_id,
+                                terminal_events,
+                            ) {
+                                if event_tx.send(event).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Self::schedule_run_eviction(&runs, bg_run_id.clone());
+                            if let Some(record) = bg_cloud_workspace_record.as_ref() {
+                                Self::cleanup_cloud_workspace_after_terminal_run(
+                                    bg_workspace_record_store.clone(),
+                                    &bg_user_id,
+                                    &bg_session_id,
+                                    &bg_run_id,
+                                    record,
+                                    &RunStatus::Failed,
+                                )
+                                .await;
+                            }
+                        }
+                        drop(event_tx);
+                        return;
+                    }
+                }
+                let _control_watcher = start_active_run_control_watcher(
+                    state.run_control.clone(),
+                    bg_user_id.clone(),
+                    bg_run_id.clone(),
+                    bg_cancel_flag.clone(),
+                    bg_pause_flag.clone(),
+                    bg_llm_cancel_token.clone(),
+                );
                 let loop_result =
                     run_agentic_loop_with_host_panic_safe(&mut host, &mut state).await;
                 let loop_success = loop_result.is_ok();
 
                 // Best-effort post-loop persistence (core events, tool events,
                 // hook DB, observer, session-end hooks, promotion events).
-                persist_ctx.run(&state, loop_success).await;
+                if let Err(e) = persist_ctx.run(&state, loop_success).await {
+                    tracing::error!(
+                        session_id = %bg_session_id,
+                        run_id = %bg_run_id,
+                        error = %e,
+                        "post-loop persistence failed"
+                    );
+                }
 
                 let (final_events, final_status, error_msg) =
                     Self::finalize_run_events(loop_result, host.take_emitted_events(), &state);
@@ -5897,14 +6022,22 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     &bg_run_id,
                     streaming_final_events.clone(),
                 );
-                let streaming_events_for_durable = merge_agent_lifecycle_before_terminal_events(
-                    &final_events,
-                    &archived_lifecycle_events,
+                let streaming_events_for_durable = enforce_durable_run_event_batch_budget(
+                    merge_agent_lifecycle_before_terminal_events(
+                        &final_events,
+                        &archived_lifecycle_events,
+                    ),
+                );
+                record_durable_run_event_batch_metrics(
+                    bg_metrics_registry.as_ref(),
+                    "streaming_terminal",
+                    "planned",
+                    &streaming_events_for_durable,
                 );
                 persist_turn_evaluation_journal(&bg_session_id, "server_runtime", &state);
                 let mut terminal_state_events = streaming_final_events;
 
-                let mut persisted_status = final_status.clone();
+                let mut persisted_status = final_status;
                 let mut persist_status_update = true;
                 let mut persist_streaming_events = true;
                 if let Some(run) = runs.write().await.get_mut(&bg_run_id) {
@@ -5925,7 +6058,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                                 .get_or_insert_with(|| "user_resume".to_string());
                             run.live_tx = None;
                         } else if run.status.try_transition(&final_status).is_ok() {
-                            run.status = final_status.clone();
+                            run.status = final_status;
                         }
                         if !run.status.is_resumable() {
                             run.live_tx = None;
@@ -5969,21 +6102,78 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     }
                 }
 
-                if persist_status_update {
-                    astra_core::log_persist!(
-                        run_engine
-                            .persist_status(
-                                &bg_user_id,
-                                &bg_run_id,
-                                persisted_status.as_str(),
-                                None,
-                                error_msg.as_deref()
-                            )
-                            .await,
-                        "run_lifecycle",
-                        &bg_run_id,
-                        "status"
+                let mut durable_status_committed = !persist_status_update;
+                let mut streaming_events_committed = false;
+                if !persist_streaming_events {
+                    record_durable_run_event_batch_metrics(
+                        bg_metrics_registry.as_ref(),
+                        "streaming_terminal",
+                        "skipped",
+                        &streaming_events_for_durable,
                     );
+                }
+                if persist_status_update {
+                    let events_for_transition: &[Value] = if persist_streaming_events {
+                        streaming_events_for_durable.as_slice()
+                    } else {
+                        &[]
+                    };
+                    match run_engine
+                        .transition_terminal_status_with_events_if_current(
+                            &bg_user_id,
+                            &bg_run_id,
+                            &[STATUS_RUNNING, STATUS_WAITING, STATUS_INPUT_QUEUED],
+                            persisted_status.as_str(),
+                            None,
+                            error_msg.as_deref(),
+                            events_for_transition,
+                        )
+                        .await
+                    {
+                        Ok(true) => {
+                            durable_status_committed = true;
+                            streaming_events_committed = persist_streaming_events
+                                && !streaming_events_for_durable.is_empty();
+                            if streaming_events_committed {
+                                record_durable_run_event_batch_metrics(
+                                    bg_metrics_registry.as_ref(),
+                                    "streaming_terminal",
+                                    "committed",
+                                    &streaming_events_for_durable,
+                                );
+                            }
+                        }
+                        Ok(false) => {
+                            persist_streaming_events = false;
+                            record_durable_run_event_batch_metrics(
+                                bg_metrics_registry.as_ref(),
+                                "streaming_terminal",
+                                "stale",
+                                &streaming_events_for_durable,
+                            );
+                            tracing::warn!(
+                                target: "astra_runtime::run_lifecycle",
+                                run_id = %bg_run_id,
+                                status = persisted_status.as_str(),
+                                "skipping streaming terminal transition after stale terminal status CAS"
+                            );
+                        }
+                        Err(error) => {
+                            persist_streaming_events = false;
+                            record_durable_run_event_batch_metrics(
+                                bg_metrics_registry.as_ref(),
+                                "streaming_terminal",
+                                "error",
+                                &streaming_events_for_durable,
+                            );
+                            tracing::warn!(
+                                target: "astra_runtime::run_lifecycle",
+                                run_id = %bg_run_id,
+                                error = %error,
+                                "failed to persist streaming terminal status/events transition"
+                            );
+                        }
+                    }
                 }
 
                 // Persist usage unconditionally — cancelled runs still consumed tokens
@@ -6004,19 +6194,38 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 );
 
                 // Persist terminal events to durable store in a single batch.
-                if persist_streaming_events && !streaming_events_for_durable.is_empty() {
-                    astra_core::log_persist!(
-                        run_engine
-                            .append_events_batch(
-                                &bg_user_id,
-                                &bg_run_id,
+                if durable_status_committed
+                    && persist_streaming_events
+                    && !streaming_events_for_durable.is_empty()
+                    && !streaming_events_committed
+                {
+                    match run_engine
+                        .append_events_batch(&bg_user_id, &bg_run_id, &streaming_events_for_durable)
+                        .await
+                    {
+                        Ok(()) => {
+                            record_durable_run_event_batch_metrics(
+                                bg_metrics_registry.as_ref(),
+                                "streaming_terminal",
+                                "committed",
                                 &streaming_events_for_durable,
-                            )
-                            .await,
-                        "run_lifecycle",
-                        &bg_run_id,
-                        "append_streaming_events_batch"
-                    );
+                            );
+                        }
+                        Err(error) => {
+                            record_durable_run_event_batch_metrics(
+                                bg_metrics_registry.as_ref(),
+                                "streaming_terminal",
+                                "error",
+                                &streaming_events_for_durable,
+                            );
+                            astra_core::agent_warn!(
+                                "run_lifecycle",
+                                "persist append_streaming_events_batch for run {}: {}",
+                                bg_run_id,
+                                error
+                            );
+                        }
+                    }
                 }
 
                 for event in missing_lifecycle_events {
@@ -6048,13 +6257,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 drop(event_tx);
 
                 // Post-loop memory cleanup — identical to `create_run`. Runs
-                // AFTER event_tx drops so the client sees the terminal event promptly
-                // and doesn't wait on governance RTT.
+                // AFTER event_tx drops; default async mode schedules external
+                // Memoria work without holding the run permit on governance RTT.
                 post_loop_memory_cleanup(
                     state.current_session_id.as_deref().unwrap_or(""),
                     &state.session_facts,
                     state.memory_extraction_service.as_ref(),
                     build_shutdown_extraction_request(&state),
+                    bg_metrics_registry.clone(),
                 )
                 .await;
 
@@ -6148,6 +6358,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         created_at: checkpoint.created_at,
                     }
                 }),
+                has_durable_projection: true,
                 recent_events,
             })
         } else {
@@ -6195,9 +6406,33 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         created_at: checkpoint.created_at,
                     }
                 }),
+                has_durable_projection: false,
                 recent_events,
             })
         }
+    }
+
+    async fn repair_run_projection(
+        &self,
+        run_id: String,
+        user_id: String,
+        recent_limit: u32,
+    ) -> Result<RunProjectionRecord, (StatusCode, Json<ErrorResponse>)> {
+        self.require_durable_run_for_user(&run_id, &user_id).await?;
+        let rebuilt = self
+            .run_engine
+            .rebuild_run_projection(&user_id, &run_id)
+            .await
+            .map_err(|error| {
+                error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("Failed to rebuild run projection: {error}"),
+                )
+            })?;
+        if rebuilt.is_none() {
+            return Err(error_response(StatusCode::NOT_FOUND, "Run not found"));
+        }
+        self.get_run_projection(run_id, user_id, recent_limit).await
     }
 
     async fn stream_run(
@@ -6349,70 +6584,28 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .try_transition(&RunStatus::InputQueued)
             .map_err(|_| Self::run_state_conflict("submit input to", &durable.status))?;
 
-        self.run_engine
-            .append_event(&user_id, &run_id, event.clone())
-            .await
-            .map_err(|error| Self::durable_persist_error("input", error))?;
-
-        let durable_after_append = self.require_durable_run_for_user(&run_id, &user_id).await?;
-        let durable_status_after_append =
-            Self::run_status_from_durable(&durable_after_append.status)?;
-        if matches!(
-            durable_status_after_append,
-            RunStatus::Paused | RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled
-        ) {
-            if let Some(event_index) = durable_after_append.events.iter().enumerate().find_map(
-                |(index, persisted_event)| {
-                    (persisted_event
-                        .get("idempotency_key")
-                        .and_then(Value::as_str)
-                        == Some(idempotency_key.as_str()))
-                    .then_some(index)
-                },
-            ) {
-                self.run_engine
-                    .mark_user_inputs_released(&user_id, &run_id, &[event_index])
-                    .await
-                    .map_err(|error| {
-                        Self::durable_persist_error("input release rollback", error)
-                    })?;
-            }
-            return Err(Self::run_state_conflict(
-                "submit input to",
-                &durable_after_append.status,
-            ));
-        }
         let status_updated = self
             .run_engine
-            .persist_status_if_current(
+            .transition_status_with_events_if_current(
                 &user_id,
                 &run_id,
                 &[STATUS_RUNNING, STATUS_INPUT_QUEUED, STATUS_WAITING],
                 STATUS_INPUT_QUEUED,
                 Some("user_input"),
                 None,
+                &[
+                    event.clone(),
+                    json!({
+                        "event_type": "run_input_queued",
+                        "data": { "waiting_for": "user_input" },
+                    }),
+                ],
             )
             .await
-            .map_err(|error| Self::durable_persist_error("input status", error))?;
+            .map_err(|error| Self::durable_persist_error("input transition", error))?;
         if !status_updated {
             let durable_after_conflict =
                 self.require_durable_run_for_user(&run_id, &user_id).await?;
-            if let Some(event_index) = durable_after_conflict.events.iter().enumerate().find_map(
-                |(index, persisted_event)| {
-                    (persisted_event
-                        .get("idempotency_key")
-                        .and_then(Value::as_str)
-                        == Some(idempotency_key.as_str()))
-                    .then_some(index)
-                },
-            ) {
-                self.run_engine
-                    .mark_user_inputs_released(&user_id, &run_id, &[event_index])
-                    .await
-                    .map_err(|error| {
-                        Self::durable_persist_error("input release rollback", error)
-                    })?;
-            }
             return Err(Self::run_state_conflict(
                 "submit input to",
                 &durable_after_conflict.status,
@@ -6422,16 +6615,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             "event_type": "run_input_queued",
             "data": { "waiting_for": "user_input" },
         });
-        self.run_engine
-            .append_event(&user_id, &run_id, input_queued_event.clone())
-            .await
-            .map_err(|error| Self::durable_persist_error("input queued event", error))?;
         let mut stream_input_queued_event = input_queued_event.clone();
         if let Some(obj) = stream_input_queued_event.as_object_mut() {
-            obj.insert(
-                "index".to_string(),
-                json!(durable_after_append.events.len()),
-            );
+            obj.insert("index".to_string(), json!(durable.events.len() + 1));
         }
         let live_events = run_handlers::transform_stream_run_events_for_client(
             &run_id,
@@ -6448,7 +6634,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         };
         if let Some(live_tx) = live_tx {
             for event in live_events {
-                let _ = live_tx.send(event);
+                if live_tx.send(event).is_err() {
+                    tracing::warn!(
+                        target: "astra_runtime::lifecycle",
+                        run_id = %run_id,
+                        "live event channel closed; event fanout may be incomplete"
+                    );
+                    break;
+                }
             }
         }
 
@@ -6481,14 +6674,38 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         }
 
         let cancel_event = json!({"event_type": "run_finished", "data": {"cancelled": true}});
-        self.run_engine
-            .persist_status(&user_id, &run_id, STATUS_CANCELLED, None, None)
-            .await
-            .map_err(|error| Self::durable_persist_error("cancel status", error))?;
-        let append_result = self
+        let status_updated = self
             .run_engine
-            .append_event(&user_id, &run_id, cancel_event.clone())
-            .await;
+            .transition_status_with_event_if_current(
+                &user_id,
+                &run_id,
+                &[
+                    STATUS_RUNNING,
+                    STATUS_PAUSED,
+                    STATUS_WAITING,
+                    STATUS_INPUT_QUEUED,
+                ],
+                STATUS_CANCELLED,
+                None,
+                None,
+                cancel_event.clone(),
+            )
+            .await
+            .map_err(|error| Self::durable_persist_error("cancel transition", error))?;
+        if !status_updated {
+            let current = self.require_durable_run_for_user(&run_id, &user_id).await?;
+            let current_status = Self::run_status_from_durable(&current.status)?;
+            if matches!(
+                current_status,
+                RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled
+            ) {
+                return Ok(CancelRunRecord {
+                    run_id,
+                    status: current.status,
+                });
+            }
+            return Err(Self::run_state_conflict("cancel", &current.status));
+        }
 
         {
             let mut runs = self.runs.write().await;
@@ -6505,7 +6722,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         if let Some(de) = &self.delegation_engine {
             de.cancel_children_of(&user_id, &run_id).await;
         }
-        append_result.map_err(|error| Self::durable_persist_error("cancel event", error))?;
         Self::schedule_run_eviction(&self.runs, run_id.clone());
 
         Ok(CancelRunRecord {
@@ -6550,16 +6766,16 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         Ok(cancelled)
     }
 
-    async fn list_runs(
+    async fn list_runs_cursor(
         &self,
         user_id: String,
         limit: u32,
-        offset: u32,
+        cursor: Option<RunListCursor>,
     ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
-        let (limit, offset) = astra_services::pagination::clamp_api_list_pagination(limit, offset);
-        let (durable_runs, total) = self
+        let limit = astra_services::runs::validate_run_list_limit(limit);
+        let durable_page = self
             .run_engine
-            .list_user_runs(&user_id, limit, offset)
+            .list_user_runs_cursor(&user_id, limit, cursor)
             .await
             .map_err(|error| {
                 error_response(
@@ -6567,15 +6783,16 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     format!("Failed to list durable run state: {error}"),
                 )
             })?;
-        let page = durable_runs
+        let page = durable_page
+            .runs
             .iter()
             .map(Self::durable_status_record)
             .collect();
         Ok(RunListRecord {
             runs: page,
-            total,
+            total: durable_page.total,
             limit,
-            offset,
+            next_cursor: durable_page.next_cursor,
         })
     }
 
@@ -6591,30 +6808,24 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
         let pause_event = json!({"event_type": "run_paused", "data": {}});
         // Always write to DB first — the source of truth for cross-pod control.
-        if let Err(error) = self
+        let status_updated = self
             .run_engine
-            .persist_status(&user_id, &run_id, STATUS_PAUSED, Some("user_resume"), None)
+            .transition_status_with_event_if_current(
+                &user_id,
+                &run_id,
+                &[STATUS_RUNNING],
+                STATUS_PAUSED,
+                Some("user_resume"),
+                None,
+                pause_event.clone(),
+            )
             .await
-        {
-            return Err(Self::durable_persist_error("pause status", error));
-        }
-        if let Err(error) = self
-            .run_engine
-            .append_event(&user_id, &run_id, pause_event.clone())
-            .await
-        {
-            // Rollback DB status. Ignore rollback failures — durable state
-            // still says PAUSED, but the event was never written, so the run
-            // is in a safe state (no partial event). On pod restart, the
-            // LR/checkpoint logic handles reconciliation.
-            let _ = self
-                .run_engine
-                .persist_status(&user_id, &run_id, STATUS_RUNNING, None, None)
-                .await;
-            return Err(Self::durable_persist_error("pause event", error));
+            .map_err(|error| Self::durable_persist_error("pause transition", error))?;
+        if !status_updated {
+            let current = self.require_durable_run_for_user(&run_id, &user_id).await?;
+            return Err(Self::run_state_conflict("pause", &current.status));
         }
 
-        // Only update in-memory state after both DB writes succeeded.
         {
             let mut runs = self.runs.write().await;
             if let Some(run) = runs.get_mut(&run_id) {
@@ -6645,10 +6856,33 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         }
 
         if has_buffered_terminal_completion(&durable.events) {
-            self.run_engine
-                .persist_status(&user_id, &run_id, STATUS_COMPLETED, None, None)
+            let status_updated = self
+                .run_engine
+                .persist_status_if_current(
+                    &user_id,
+                    &run_id,
+                    &[STATUS_PAUSED],
+                    STATUS_COMPLETED,
+                    None,
+                    None,
+                )
                 .await
                 .map_err(|error| Self::durable_persist_error("resume completed status", error))?;
+            if !status_updated {
+                let current = self.require_durable_run_for_user(&run_id, &user_id).await?;
+                let current_status = Self::run_status_from_durable(&current.status)?;
+                if matches!(
+                    current_status,
+                    RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled
+                ) {
+                    return Ok(RunMutationRecord {
+                        run_id,
+                        status: current.status,
+                        previous_status: durable.status,
+                    });
+                }
+                return Err(Self::run_state_conflict("resume", &current.status));
+            }
             {
                 let mut runs = self.runs.write().await;
                 if let Some(run) = runs.get_mut(&run_id) {
@@ -6668,26 +6902,24 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
         let resume_event = json!({"event_type": "run_resumed", "data": {}});
         // Always write to DB first — the source of truth for cross-pod control.
-        if let Err(error) = self
+        let status_updated = self
             .run_engine
-            .persist_status(&user_id, &run_id, STATUS_RUNNING, None, None)
+            .transition_status_with_event_if_current(
+                &user_id,
+                &run_id,
+                &[STATUS_PAUSED],
+                STATUS_RUNNING,
+                None,
+                None,
+                resume_event.clone(),
+            )
             .await
-        {
-            return Err(Self::durable_persist_error("resume status", error));
-        }
-        if let Err(error) = self
-            .run_engine
-            .append_event(&user_id, &run_id, resume_event.clone())
-            .await
-        {
-            let _ = self
-                .run_engine
-                .persist_status(&user_id, &run_id, STATUS_PAUSED, Some("user_resume"), None)
-                .await;
-            return Err(Self::durable_persist_error("resume event", error));
+            .map_err(|error| Self::durable_persist_error("resume transition", error))?;
+        if !status_updated {
+            let current = self.require_durable_run_for_user(&run_id, &user_id).await?;
+            return Err(Self::run_state_conflict("resume", &current.status));
         }
 
-        // Only update in-memory state after both DB writes succeeded.
         {
             let mut runs = self.runs.write().await;
             if let Some(run) = runs.get_mut(&run_id) {
@@ -7323,6 +7555,9 @@ impl SubRunExecutor for ServerSubRunExecutor {
         if let Some(pool) = &self.shared_pool {
             builder = builder.with_pool(pool.clone());
         }
+        if let Some(svc) = &self.edge_dispatch_service {
+            builder = builder.with_edge_dispatch_service(Arc::clone(svc));
+        }
         if let Some(snapshot) = execution_bindings.as_ref() {
             builder = builder.with_execution_binding_snapshot(snapshot.clone());
         }
@@ -7652,7 +7887,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             &config.run_id,
             &loop_state.telemetry.promotion_events,
         )
-        .await;
+        .await?;
         persist_turn_evaluation_journal(&config.session_id, "server_subrun", &loop_state);
         flush_turn_observability(&mut loop_state, &config.session_id, false);
 
@@ -7781,6874 +8016,4 @@ impl SubRunExecutor for ServerSubRunExecutor {
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::server::run::lifecycle::persistence::{
-        build_tool_trace_events, extract_prev_assistant_text, extract_session_state_compact,
-        redact_trace_value, server_loop_causal_chain_id, transcript_page_bounds,
-        transcript_page_seq,
-    };
-    use astra_services::runs::{
-        DurableRunCheckpointRecord, DurableRunDisplayProjectionRecord, DurableRunRecord,
-        InMemoryRunStateStore, RunStateStore, RuntimeMcpBindingRequest, RuntimeSkillBindingRequest,
-    };
-    use astra_services::session_journal::{JournalEventType, ToolCallRecord};
-    use astra_services::workspace_records::{
-        InMemoryWorkspaceRecordStore, WorkspaceCleanupDebtStore, WorkspaceCleanupDebtStoreError,
-        WorkspaceRecordStore,
-    };
-    use serde_json::json;
-    use sqlx::Row;
-    use std::collections::HashSet;
-    use std::sync::Mutex as StdMutex;
-    use uuid::Uuid;
-
-    struct ActiveTestModelService;
-
-    fn test_model_record(name: String) -> astra_services::ModelRecord {
-        astra_services::ModelRecord {
-            model_id: format!("model-{name}"),
-            name,
-            provider: "openai".to_string(),
-            base_url: Some("https://models.example.com/v1".to_string()),
-            description: None,
-            is_active: true,
-            context_window: 128_000,
-            max_completion_tokens: None,
-            input_modalities: Vec::new(),
-            output_modalities: Vec::new(),
-            supported_parameters: Vec::new(),
-            pricing: Default::default(),
-            architecture: None,
-            tags: Vec::new(),
-            quirks: Default::default(),
-            connectivity: None,
-            thinking_capability: None,
-            thinking_probe: None,
-        }
-    }
-
-    #[async_trait]
-    impl astra_services::ModelService for ActiveTestModelService {
-        async fn create_model(
-            &self,
-            _user_id: String,
-            _request: astra_services::ModelCreateRequestData,
-        ) -> Result<astra_services::ModelRecord, (StatusCode, Json<ErrorResponse>)> {
-            unimplemented!()
-        }
-
-        async fn list_models(
-            &self,
-            _user_id: String,
-            _is_admin: bool,
-        ) -> Result<Vec<astra_services::ModelListItem>, (StatusCode, Json<ErrorResponse>)> {
-            unimplemented!()
-        }
-
-        async fn get_model(
-            &self,
-            model_name: String,
-        ) -> Result<astra_services::ModelRecord, (StatusCode, Json<ErrorResponse>)> {
-            if model_name == "test-model" {
-                return Ok(test_model_record(model_name));
-            }
-            Err(error_response_coded(
-                StatusCode::NOT_FOUND,
-                "model not found",
-                "model_not_found",
-            ))
-        }
-
-        async fn update_model(
-            &self,
-            _model_name: String,
-            _request: astra_services::ModelUpdateRequestData,
-        ) -> Result<astra_services::ModelRecord, (StatusCode, Json<ErrorResponse>)> {
-            unimplemented!()
-        }
-
-        async fn delete_model(
-            &self,
-            _model_name: String,
-        ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-            unimplemented!()
-        }
-
-        async fn check_model(
-            &self,
-            _model_name: String,
-        ) -> Result<astra_services::ModelRecord, (StatusCode, Json<ErrorResponse>)> {
-            unimplemented!()
-        }
-    }
-
-    fn test_session_task(
-        id: &str,
-        title: &str,
-        status: astra_tools::task_mgmt::SessionTaskStatusKind,
-    ) -> SessionTask {
-        SessionTask {
-            archived_at: None,
-            id: id.to_string(),
-            title: title.to_string(),
-            description: None,
-            status,
-            subtasks: vec![],
-            created_at: String::new(),
-            updated_at: String::new(),
-            active_form: None,
-            owner: None,
-            metadata: None,
-            blocks: vec![],
-            blocked_by: vec![],
-        }
-    }
-
-    fn test_agent_progress_event(
-        agent_id: &str,
-        timestamp_epoch_ms: u64,
-        event_type: ProgressEventType,
-    ) -> AgentProgressEvent {
-        AgentProgressEvent {
-            agent_id: agent_id.to_string(),
-            event_type,
-            timestamp_epoch_ms,
-            metadata: None,
-        }
-    }
-
-    fn test_agent_spawned(
-        agent_id: &str,
-        run_id: &str,
-        parent_run_id: &str,
-        timestamp_epoch_ms: u64,
-    ) -> AgentProgressEvent {
-        test_agent_progress_event(
-            agent_id,
-            timestamp_epoch_ms,
-            ProgressEventType::AgentSpawned {
-                run_id: run_id.to_string(),
-                parent_run_id: parent_run_id.to_string(),
-                agent_type: "reviewer".to_string(),
-                description: "review code".to_string(),
-                fanout_slot: None,
-            },
-        )
-    }
-
-    #[test]
-    fn restore_session_state_compact_ignores_runtime_control_state() {
-        let svc = test_service();
-        let request = test_request("resume");
-        let mut state = svc.build_initial_state(
-            "test-user",
-            &request,
-            "session-1",
-            "run-1",
-            None,
-            None,
-            None,
-        );
-        state.max_turn_input_tokens = 123_456;
-        state.remaining_turns = 9;
-
-        restore_session_state_compact(
-            astra_turn_core::conversation_log::SessionStateCompact {
-                approval_overrides: Some(json!({"approval": "stale"})),
-                budget_remaining_tokens: 42_000,
-                budget_remaining_rounds: 3,
-                consecutive_ctx_errors: 3,
-                interruption: Some(json!({
-                    "kind": "budget_exhausted",
-                    "resume_action": "continue_immediately"
-                })),
-                compaction_tracker: Some(json!({
-                    "attempt_count": 4,
-                    "cumulative_tokens_freed": 18_000,
-                    "last_tokens_freed": 2_000,
-                    "last_was_insufficient": true,
-                    "consecutive_futile_attempts": 2,
-                })),
-                ..Default::default()
-            },
-            &mut state,
-        );
-
-        assert!(state.approval_overrides.is_none());
-        assert!(state.interruption.is_none());
-        assert_eq!(state.max_turn_input_tokens, 123_456);
-        assert_eq!(state.remaining_turns, 9);
-        assert_eq!(state.consecutive_context_window_errors, 0);
-        assert_eq!(state.compaction_effectiveness.attempt_count, 0);
-    }
-
-    #[test]
-    fn csl_session_state_does_not_persist_runtime_control_state() {
-        let svc = test_service();
-        let request = test_request("resume");
-        let mut state = svc.build_initial_state(
-            "test-user",
-            &request,
-            "session-1",
-            "run-1",
-            None,
-            None,
-            None,
-        );
-        state.restricted_tools.insert("write_file".to_string());
-        state.max_turn_input_tokens = 50_000;
-        state.remaining_turns = 2;
-        state.consecutive_context_window_errors = 5;
-        state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
-            astra_turn_core::interruption::InterruptionKind::BudgetExhausted,
-            astra_turn_core::interruption::ResumeAction::ContinueImmediately,
-            astra_turn_core::interruption::InterruptionStateSummary {
-                has_checkpoint: true,
-                tool_calls_completed: 1,
-                turns_completed: 1,
-                remaining_turns: 0,
-                error_detail: Some("stale interruption".to_string()),
-                stall_signal: None,
-                resume_restricted_tools: vec![],
-            },
-        ));
-        state.compaction_effectiveness.attempt_count = 7;
-
-        let compact = extract_session_state_compact(&state);
-
-        assert!(
-            compact.blocked_tools.is_empty(),
-            "conversation-log state must not persist transient runtime restrictions"
-        );
-        assert!(compact.approval_overrides.is_none());
-        assert!(compact.interruption.is_none());
-        assert_eq!(compact.budget_remaining_tokens, 0);
-        assert_eq!(compact.budget_remaining_rounds, 0);
-        assert_eq!(compact.consecutive_ctx_errors, 0);
-        assert!(compact.compaction_tracker.is_none());
-    }
-
-    #[test]
-    fn csl_session_state_restore_ignores_legacy_blocked_tools() {
-        let svc = test_service();
-        let request = test_request("resume");
-        let mut state = svc.build_initial_state(
-            "test-user",
-            &request,
-            "session-1",
-            "run-1",
-            None,
-            None,
-            None,
-        );
-
-        restore_session_state_compact(
-            astra_turn_core::conversation_log::SessionStateCompact {
-                blocked_tools: vec!["legacy_stale_tool".into()],
-                recent_tools: vec!["read_file".into()],
-                ..Default::default()
-            },
-            &mut state,
-        );
-
-        assert!(
-            state.restricted_tools.is_empty(),
-            "legacy CSL blocked_tools must not restore as hard runtime restrictions"
-        );
-        assert_eq!(state.recent_tools, vec!["read_file"]);
-    }
-
-    #[test]
-    fn restore_step_checkpoint_runtime_state_restores_replay_guards_and_runtime_state() {
-        let svc = test_service();
-        let request = test_request("resume");
-        let mut state = svc.build_initial_state(
-            "test-user",
-            &request,
-            "session-1",
-            "run-1",
-            None,
-            None,
-            None,
-        );
-        let idem_key = astra_pipeline::step_protocol::IdempotencyKey::semantic(
-            "read_file",
-            &json!({"path": "src/lib.rs"}),
-        );
-        let mut idempotency_cache = astra_pipeline::step_protocol::InMemoryIdempotencyCache::new();
-        idempotency_cache.record(
-            &idem_key,
-            astra_pipeline::step_protocol::CachedToolResult {
-                tool_name: "read_file".into(),
-                output: "cached contents".into(),
-                is_error: false,
-                cached_at: 123,
-                context_signature: None,
-            },
-        );
-        let restored = astra_pipeline::step_restore::RestoredSession {
-            messages: Vec::new(),
-            budget_remaining_tokens: 0,
-            budget_remaining_rounds: 0,
-            blocked_tools: vec!["flaky_tool".into()],
-            recent_tools: vec!["read_file".into(), "bash".into()],
-            idempotency_cache,
-            resume_turn: 0,
-            protocol_version: astra_pipeline::step_protocol::PROTOCOL_VERSION,
-            completed_tool_results: HashMap::new(),
-            interruption: None,
-            approval_overrides: None,
-            consecutive_context_window_errors: 5,
-            compaction_state: Some(json!({
-                "attempt_count": 6,
-                "cumulative_tokens_freed": 24_000,
-                "last_tokens_freed": 1_500,
-                "last_was_insufficient": false,
-                "consecutive_futile_attempts": 1,
-            })),
-            pipeline_state: None,
-        };
-
-        restore_step_checkpoint_runtime_state(restored, "2026-06-13", &mut state);
-
-        assert!(state.restricted_tools.contains("flaky_tool"));
-        assert_eq!(state.recent_tools, vec!["read_file", "bash"]);
-        let cached = state
-            .idempotency_cache
-            .check(&idem_key)
-            .expect("idempotency cache should be restored");
-        assert_eq!(cached.output, "cached contents");
-        assert_eq!(state.consecutive_context_window_errors, 5);
-        assert_eq!(state.compaction_effectiveness.attempt_count, 6);
-        assert_eq!(
-            state.compaction_effectiveness.cumulative_tokens_freed,
-            24_000
-        );
-        assert_eq!(state.compaction_effectiveness.last_tokens_freed, 1_500);
-        assert!(!state.compaction_effectiveness.last_was_insufficient);
-        assert_eq!(
-            state.compaction_effectiveness.consecutive_futile_attempts,
-            1
-        );
-    }
-
-    #[test]
-    fn run_scoped_agent_progress_filter_replays_early_events_after_spawn() {
-        let mut filter =
-            server_loop_host::RunScopedAgentProgressFilter::new("root-run".to_string());
-
-        let accepted = filter.accept(test_agent_progress_event(
-            "agent-a",
-            1,
-            ProgressEventType::Started {
-                description: "review code".to_string(),
-            },
-        ));
-        assert!(accepted.is_empty());
-
-        let accepted = filter.accept(test_agent_spawned("agent-a", "child-run", "root-run", 2));
-        assert_eq!(accepted.len(), 2);
-        assert!(matches!(
-            accepted[0].event_type,
-            ProgressEventType::Started { .. }
-        ));
-        assert!(matches!(
-            accepted[1].event_type,
-            ProgressEventType::AgentSpawned { .. }
-        ));
-
-        let accepted = filter.accept(test_agent_progress_event(
-            "agent-a",
-            3,
-            ProgressEventType::ToolExecuting {
-                tool_name: "rg".to_string(),
-                turn: 1,
-            },
-        ));
-        assert_eq!(accepted.len(), 1);
-    }
-
-    #[test]
-    fn run_scoped_agent_progress_filter_replays_bounded_latest_early_events_in_order() {
-        let mut filter =
-            server_loop_host::RunScopedAgentProgressFilter::new("root-run".to_string());
-
-        for timestamp in 1..=10 {
-            assert!(
-                filter
-                    .accept(test_agent_progress_event(
-                        "agent-a",
-                        timestamp,
-                        ProgressEventType::ToolExecuting {
-                            tool_name: format!("tool-{timestamp}"),
-                            turn: timestamp as u32,
-                        },
-                    ))
-                    .is_empty()
-            );
-        }
-
-        let accepted = filter.accept(test_agent_spawned("agent-a", "child-run", "root-run", 11));
-
-        assert_eq!(
-            accepted
-                .iter()
-                .map(|event| event.timestamp_epoch_ms)
-                .collect::<Vec<_>>(),
-            vec![3, 4, 5, 6, 7, 8, 9, 10, 11]
-        );
-    }
-
-    #[test]
-    fn run_scoped_agent_progress_filter_blocks_foreign_root_events() {
-        let mut filter = server_loop_host::RunScopedAgentProgressFilter::new("root-a".to_string());
-
-        assert!(
-            filter
-                .accept(test_agent_progress_event(
-                    "agent-b",
-                    1,
-                    ProgressEventType::Started {
-                        description: "other run".to_string(),
-                    },
-                ))
-                .is_empty()
-        );
-        assert!(
-            filter
-                .accept(test_agent_spawned("agent-b", "child-b", "root-b", 2))
-                .is_empty()
-        );
-        assert!(
-            !filter.agent_ids.contains("agent-b"),
-            "foreign agent must not be admitted"
-        );
-        assert!(
-            !filter.pending_by_agent.contains_key("agent-b"),
-            "foreign spawn should clear cached early events"
-        );
-    }
-
-    #[test]
-    fn run_scoped_agent_progress_filter_allows_nested_child_runs() {
-        let mut filter =
-            server_loop_host::RunScopedAgentProgressFilter::new("root-run".to_string());
-
-        assert_eq!(
-            filter
-                .accept(test_agent_spawned("agent-a", "child-a", "root-run", 1))
-                .len(),
-            1
-        );
-        assert_eq!(
-            filter
-                .accept(test_agent_spawned("agent-b", "grandchild-b", "child-a", 2))
-                .len(),
-            1
-        );
-        assert!(filter.agent_ids.contains("agent-b"));
-        assert!(filter.run_ids.contains("grandchild-b"));
-    }
-
-    #[tokio::test]
-    async fn agent_progress_stream_bridge_drains_progress_on_stop() {
-        let svc = test_service();
-        let (event_tx, mut event_rx) = mpsc::channel::<Value>(16);
-        let bridge = svc.spawn_agent_progress_stream_bridge("root-run".to_string(), event_tx);
-
-        let emitter = svc
-            .server_agent_progress_broadcaster
-            .for_agent("agent-a".to_string());
-        emitter.started("review code");
-        emitter.agent_spawned("child-run", "root-run", "reviewer", "review code");
-        emitter.completed("done", 0, (0, 0), 7);
-
-        bridge.stop_and_drain().await;
-
-        let mut events = Vec::new();
-        while let Ok(event) = event_rx.try_recv() {
-            events.push(event);
-        }
-
-        assert!(
-            events
-                .iter()
-                .any(|event| event["type"].as_str() == Some("agent_spawned")),
-            "bridge should drain agent_spawned before stopping: {events:?}"
-        );
-        assert!(
-            events
-                .iter()
-                .any(|event| event["type"].as_str() == Some("agent_completed")),
-            "bridge should drain agent_completed before stopping: {events:?}"
-        );
-    }
-
-    struct ImmediateLifecycleExecutor;
-
-    #[async_trait]
-    impl SpawnAgentExecutor for ImmediateLifecycleExecutor {
-        async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
-            Ok(SpawnRunResult {
-                agent_id: config.agent_id,
-                run_id: config.run_id,
-                status: "completed".to_string(),
-                finish_reason: "normal".to_string(),
-                cancelled_by_user: None,
-                output: Some("child done".to_string()),
-                error: None,
-                prompt_tokens: 3,
-                completion_tokens: 5,
-                tool_calls: 1,
-                permission_summary: None,
-                permission_requests: 0,
-                permission_requests_approved: 0,
-                tools_blocked: 0,
-            })
-        }
-    }
-
-    struct WaitingLifecycleExecutor;
-
-    #[async_trait]
-    impl SpawnAgentExecutor for WaitingLifecycleExecutor {
-        async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
-            Ok(SpawnRunResult {
-                agent_id: config.agent_id,
-                run_id: config.run_id,
-                status: "waiting".to_string(),
-                finish_reason: "waiting".to_string(),
-                cancelled_by_user: None,
-                output: Some("executor_offline".to_string()),
-                error: None,
-                prompt_tokens: 3,
-                completion_tokens: 5,
-                tool_calls: 1,
-                permission_summary: None,
-                permission_requests: 0,
-                permission_requests_approved: 0,
-                tools_blocked: 1,
-            })
-        }
-    }
-
-    #[tokio::test]
-    async fn missing_agent_lifecycle_stream_uses_spawner_archive() {
-        let router = Arc::new(astra_messaging::AgentMailboxRouter::new(
-            Arc::new(astra_messaging::InProcessTransport::new()),
-            Arc::new(crate::server::delegation::engine::DelegationTracker::new()),
-        ));
-        let spawner =
-            DynamicAgentSpawner::new(router).with_executor(Arc::new(ImmediateLifecycleExecutor));
-        let execution_metadata = json!({
-            "workspace": {"kind": "server_sandbox", "cwd": "/tmp/astra"},
-            "executor": {"kind": "server_local"},
-            "transport": "server_local"
-        });
-        let context = crate::orchestration::SpawnContext {
-            parent_run_id: "root-run".to_string(),
-            parent_agent_id: "root-agent".to_string(),
-            recursion_depth: 0,
-            parent_is_fork_child: false,
-            inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
-            inherited_skills: vec![],
-            working_dir: PathBuf::from("/tmp/astra"),
-            live_event_sink: None,
-            trace_context: None,
-            spawn_tool_call_id: Some("call-spawn".to_string()),
-            execution_metadata: Some(execution_metadata),
-            delegation_chain: Vec::new(),
-        };
-        let input = astra_turn_core::orchestration_spawn_tool::SpawnAgentInput {
-            description: "review code".to_string(),
-            prompt: "review".to_string(),
-            agent_type: "explore".to_string(),
-            run_in_background: false,
-            ..Default::default()
-        };
-        let spawn_output = spawner.spawn(input, &context).await.unwrap();
-        assert!(
-            matches!(
-                spawn_output,
-                astra_turn_core::orchestration_spawn_tool::SpawnAgentOutput::Completed { .. }
-            ),
-            "test setup must archive a synchronous completed child: {spawn_output:?}"
-        );
-
-        let sent_lifecycle_events = Arc::new(std::sync::Mutex::new(HashSet::new()));
-        let (event_tx, mut event_rx) = mpsc::channel::<Value>(8);
-        assert!(
-            stream_missing_agent_lifecycle_events(
-                &spawner,
-                "root-run",
-                &event_tx,
-                &sent_lifecycle_events
-            )
-            .await
-        );
-
-        let mut events = Vec::new();
-        while let Ok(event) = event_rx.try_recv() {
-            events.push(event);
-        }
-        assert_eq!(events.len(), 2, "expected spawned + completed: {events:?}");
-        assert_eq!(events[0]["type"], "agent_spawned");
-        assert_eq!(events[0]["workspace"]["kind"], "server_sandbox");
-        assert_eq!(events[0]["executor"]["kind"], "server_local");
-        assert_eq!(events[0]["transport"], "server_local");
-        assert_eq!(events[1]["type"], "agent_completed");
-        assert_eq!(events[1]["status"], "completed");
-        assert_eq!(events[1]["workspace"]["kind"], "server_sandbox");
-
-        let (second_tx, mut second_rx) = mpsc::channel::<Value>(8);
-        assert!(
-            stream_missing_agent_lifecycle_events(
-                &spawner,
-                "root-run",
-                &second_tx,
-                &sent_lifecycle_events
-            )
-            .await
-        );
-        assert!(
-            second_rx.try_recv().is_err(),
-            "already-sent lifecycle events must not be replayed twice"
-        );
-    }
-
-    #[tokio::test]
-    async fn missing_agent_lifecycle_stream_reconstructs_waiting_child() {
-        let router = Arc::new(astra_messaging::AgentMailboxRouter::new(
-            Arc::new(astra_messaging::InProcessTransport::new()),
-            Arc::new(crate::server::delegation::engine::DelegationTracker::new()),
-        ));
-        let spawner =
-            DynamicAgentSpawner::new(router).with_executor(Arc::new(WaitingLifecycleExecutor));
-        let context = crate::orchestration::SpawnContext {
-            parent_run_id: "root-run".to_string(),
-            parent_agent_id: "root-agent".to_string(),
-            recursion_depth: 0,
-            parent_is_fork_child: false,
-            inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
-            inherited_skills: vec![],
-            working_dir: PathBuf::from("/tmp/astra"),
-            live_event_sink: None,
-            trace_context: None,
-            spawn_tool_call_id: Some("call-spawn".to_string()),
-            execution_metadata: Some(json!({
-                "workspace": {"kind": "edge_workspace", "cwd": "/Users/test/repo"},
-                "executor": {"kind": "edge_agent", "status": "offline"},
-                "transport": "edge_ws"
-            })),
-            delegation_chain: Vec::new(),
-        };
-        let input = astra_turn_core::orchestration_spawn_tool::SpawnAgentInput {
-            description: "review code".to_string(),
-            prompt: "review".to_string(),
-            agent_type: "explore".to_string(),
-            run_in_background: false,
-            ..Default::default()
-        };
-        let spawn_output = spawner.spawn(input, &context).await.unwrap();
-        assert!(
-            matches!(
-                spawn_output,
-                astra_turn_core::orchestration_spawn_tool::SpawnAgentOutput::Waiting { .. }
-            ),
-            "test setup must archive a synchronous waiting child: {spawn_output:?}"
-        );
-
-        let sent_lifecycle_events = Arc::new(std::sync::Mutex::new(HashSet::new()));
-        let (event_tx, mut event_rx) = mpsc::channel::<Value>(8);
-        assert!(
-            stream_missing_agent_lifecycle_events(
-                &spawner,
-                "root-run",
-                &event_tx,
-                &sent_lifecycle_events
-            )
-            .await
-        );
-
-        let mut events = Vec::new();
-        while let Ok(event) = event_rx.try_recv() {
-            events.push(event);
-        }
-        assert_eq!(events.len(), 2, "expected spawned + waiting: {events:?}");
-        assert_eq!(events[0]["type"], "agent_spawned");
-        assert_eq!(events[1]["type"], "agent_waiting");
-        assert_eq!(events[1]["reason"], "executor_offline");
-        assert_eq!(events[1]["workspace"]["kind"], "edge_workspace");
-        assert_eq!(events[1]["executor"]["kind"], "edge_agent");
-    }
-
-    #[test]
-    fn agent_live_event_to_work_surface_sse_maps_output_and_terminal() {
-        let metadata = json!({
-            "workspace": {
-                "kind": "edge_workspace",
-                "display_name": "MacBook Pro",
-                "cwd": "/Users/test/project",
-                "authority": "read_write",
-                "fallback_policy": "disabled"
-            },
-            "executor": {
-                "kind": "edge_agent",
-                "executor_id": "edge-macbook-1",
-                "display_name": "MacBook Pro",
-                "transport": "edge_ws",
-                "status": "online"
-            },
-            "transport": "edge_ws",
-            "fallback_policy": "disabled"
-        });
-        let output = super::agent_live_event_to_work_surface_sse(
-            &AgentLiveEvent {
-                agent_id: "agent-1".to_string(),
-                kind: AgentLiveEventKind::OutputDelta("child output".to_string()),
-            },
-            Some(&metadata),
-        );
-        assert_eq!(output["type"], "agent_live_event");
-        assert_eq!(output["agent_id"], "agent-1");
-        assert_eq!(output["event_kind"], "output_delta");
-        assert_eq!(output["content"], "child output");
-        assert_eq!(output["workspace"]["kind"], "edge_workspace");
-        assert_eq!(output["executor"]["kind"], "edge_agent");
-        assert_eq!(output["transport"], "edge_ws");
-        assert_eq!(output["fallback_policy"], "disabled");
-
-        let terminal = super::agent_live_event_to_work_surface_sse(
-            &AgentLiveEvent {
-                agent_id: "agent-1".to_string(),
-                kind: AgentLiveEventKind::AgentTerminated {
-                    termination: AgentLiveTermination::Completed,
-                    duration_ms: 12,
-                    reason: None,
-                },
-            },
-            Some(&metadata),
-        );
-        assert_eq!(terminal["event_kind"], "agent_terminated");
-        assert_eq!(terminal["termination"], "completed");
-        assert_eq!(terminal["status"], "completed");
-        assert_eq!(terminal["duration_ms"], 12);
-        assert_eq!(terminal["workspace"]["kind"], "edge_workspace");
-        assert_eq!(terminal["executor"]["executor_id"], "edge-macbook-1");
-    }
-
-    // ── extract_prev_assistant_text + implicit feedback wiring ──
-
-    #[test]
-    fn task_board_resume_hint_is_bounded_and_prefers_running_work() {
-        use astra_tools::task_mgmt::SessionTaskStatusKind;
-
-        let tasks = vec![
-            test_session_task("task-1", "pending setup", SessionTaskStatusKind::Pending),
-            test_session_task(
-                "task-2",
-                "active implementation",
-                SessionTaskStatusKind::InProgress,
-            ),
-            test_session_task("task-3", "already done", SessionTaskStatusKind::Completed),
-            test_session_task("task-4", "waiting review", SessionTaskStatusKind::Paused),
-        ];
-
-        let hint = format_task_board_resume_hint(&tasks).expect("open task hint");
-
-        assert_eq!(
-            hint,
-            "open=3 · next=[in_progress] task-2: active implementation · +2 more open"
-        );
-    }
-
-    #[test]
-    fn task_board_resume_hint_is_absent_without_open_work() {
-        use astra_tools::task_mgmt::SessionTaskStatusKind;
-
-        let tasks = vec![test_session_task(
-            "task-1",
-            "already done",
-            SessionTaskStatusKind::Completed,
-        )];
-
-        assert!(format_task_board_resume_hint(&tasks).is_none());
-    }
-
-    #[test]
-    fn trace_redaction_removes_nested_secrets_and_truncates_long_text() {
-        let redacted = redact_trace_value(&json!({
-            "Authorization": "Bearer secret",
-            "nested": {
-                "api_key": "abc123",
-                "safe": "visible"
-            },
-            "items": [
-                {"cookie": "session=abc"},
-                {"text": "x".repeat(2_050)}
-            ]
-        }));
-
-        assert_eq!(redacted["Authorization"], "[REDACTED]");
-        assert_eq!(redacted["nested"]["api_key"], "[REDACTED]");
-        assert_eq!(redacted["nested"]["safe"], "visible");
-        assert_eq!(redacted["items"][0]["cookie"], "[REDACTED]");
-        assert!(
-            redacted["items"][1]["text"]
-                .as_str()
-                .expect("string")
-                .ends_with("...")
-        );
-    }
-
-    #[test]
-    fn tool_trace_events_populate_columns_and_redacted_payloads() {
-        let trace = TraceContext {
-            session_id: "session-1".to_string(),
-            user_id: "user-1".to_string(),
-            turn_id: "turn-1".to_string(),
-            turn_seq: 7,
-            causal_chain_id: "chain-1".to_string(),
-            root_event_id: "trace:root".to_string(),
-        };
-        let record = ToolCallRecord {
-            tool_call_id: Some("tool-call-1".to_string()),
-            name: "agent".to_string(),
-            ok: true,
-            ms: 42,
-            args_preview: Some("agent(action='spawn'): child".to_string()),
-            result_preview: Some("launched child".to_string()),
-            round: Some(2),
-            args_full: Some(r#"{"action":"spawn","token":"secret"}"#.to_string()),
-            result_full: Some(
-                r#"{"agent_id":"child@run","run_id":"child-run","result":"ok"}"#.to_string(),
-            ),
-            ..Default::default()
-        };
-
-        let events = build_tool_trace_events(
-            &trace,
-            "root-run",
-            None,
-            Some("root-agent"),
-            None,
-            &[record],
-        );
-
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].event_type, "tool_call_started");
-        assert_eq!(events[0].tool_call_id.as_deref(), Some("tool-call-1"));
-        assert_eq!(events[0].round_index, Some(2));
-        assert_eq!(events[0].meta_tool_name.as_deref(), Some("agent"));
-        assert_eq!(
-            events[0].metadata["tool_args_json_redacted"]["token"],
-            "[REDACTED]"
-        );
-        assert_eq!(events[1].event_type, "tool_call_completed");
-        assert_eq!(events[1].meta_duration_ms, Some(42));
-        assert_eq!(events[1].metadata["action"], "spawn");
-        assert_eq!(events[1].metadata["child_run_id"], "child-run");
-    }
-
-    #[test]
-    fn extract_prev_assistant_text_picks_latest_assistant_string() {
-        let messages = vec![
-            serde_json::json!({"role": "user", "content": "hi"}),
-            serde_json::json!({"role": "assistant", "content": "first answer"}),
-            serde_json::json!({"role": "user", "content": "follow up"}),
-            serde_json::json!({"role": "assistant", "content": "latest answer"}),
-        ];
-        assert_eq!(
-            extract_prev_assistant_text(&messages).as_deref(),
-            Some("latest answer")
-        );
-    }
-
-    #[test]
-    fn extract_prev_assistant_text_handles_content_parts_array() {
-        let messages = vec![
-            serde_json::json!({"role": "user", "content": "hi"}),
-            serde_json::json!({
-                "role": "assistant",
-                "content": [
-                    {"type": "text", "text": "part one"},
-                    {"type": "text", "text": "part two"},
-                ],
-            }),
-        ];
-        assert_eq!(
-            extract_prev_assistant_text(&messages).as_deref(),
-            Some("part one\npart two")
-        );
-    }
-
-    #[test]
-    fn extract_prev_assistant_text_returns_none_when_no_assistant_turn() {
-        let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
-        assert!(extract_prev_assistant_text(&messages).is_none());
-    }
-
-    #[test]
-    fn extract_prev_assistant_text_skips_empty_assistant_bodies() {
-        let messages = vec![
-            serde_json::json!({"role": "assistant", "content": "real answer"}),
-            serde_json::json!({"role": "user", "content": "ok"}),
-            serde_json::json!({"role": "assistant", "content": "   "}),
-        ];
-        assert_eq!(
-            extract_prev_assistant_text(&messages).as_deref(),
-            Some("real answer")
-        );
-    }
-
-    #[test]
-    fn build_run_turn_complete_event_carries_authoritative_assistant_text() {
-        let event =
-            build_run_turn_complete_event_with_interruption(0, "recovered final answer", None);
-        assert_eq!(event["type"], "turn_complete");
-        assert_eq!(event["assistant_text"], "recovered final answer");
-        assert_eq!(event["has_tool_calls"], false);
-    }
-
-    #[test]
-    fn build_run_turn_complete_event_omits_empty_assistant_text() {
-        let event = build_run_turn_complete_event_with_interruption(1, "", None);
-        assert_eq!(event["type"], "turn_complete");
-        assert_eq!(event["has_tool_calls"], true);
-        assert!(event.get("assistant_text").is_none());
-    }
-
-    #[test]
-    fn stream_turn_complete_is_only_for_completed_or_paused_turns() {
-        assert!(should_emit_stream_turn_complete(&RunStatus::Completed));
-        assert!(should_emit_stream_turn_complete(&RunStatus::Paused));
-        assert!(!should_emit_stream_turn_complete(&RunStatus::Failed));
-        assert!(!should_emit_stream_turn_complete(&RunStatus::Cancelled));
-        assert!(!should_emit_stream_turn_complete(&RunStatus::Waiting));
-        assert!(!should_emit_stream_turn_complete(&RunStatus::InputQueued));
-        assert!(!should_emit_stream_turn_complete(&RunStatus::Running));
-    }
-
-    #[test]
-    fn transcript_page_seq_rolls_over_every_fifty_items() {
-        assert_eq!(transcript_page_seq(1), 1);
-        assert_eq!(transcript_page_seq(50), 1);
-        assert_eq!(transcript_page_seq(51), 2);
-        assert_eq!(transcript_page_seq(101), 3);
-    }
-
-    #[test]
-    fn transcript_page_bounds_cover_exact_page_window() {
-        assert_eq!(transcript_page_bounds(1), (1, 50));
-        assert_eq!(transcript_page_bounds(2), (51, 100));
-        assert_eq!(transcript_page_bounds(3), (101, 150));
-    }
-
-    #[test]
-    fn budget_exhausted_paused_run_does_not_block_next_session_turn() {
-        let (mut run, _, _, _) = AgenticRunLifecycleService::build_tracked_run_state(
-            "run-1".to_string(),
-            "session-1".to_string(),
-            "user-1".to_string(),
-        );
-
-        run.status = RunStatus::Running;
-        assert!(
-            AgenticRunLifecycleService::blocks_new_session_run(&run, "session-1"),
-            "running run must block a concurrent turn"
-        );
-
-        run.status = RunStatus::Paused;
-        run.waiting_for = Some("user_resume".to_string());
-        assert!(
-            AgenticRunLifecycleService::blocks_new_session_run(&run, "session-1"),
-            "manual/user-wait paused run must block until resumed or cancelled"
-        );
-
-        run.waiting_for = None;
-        assert!(
-            !AgenticRunLifecycleService::blocks_new_session_run(&run, "session-1"),
-            "budget-exhausted paused run has no waiting_for and must allow the next message"
-        );
-
-        run.status = RunStatus::Waiting;
-        assert!(
-            AgenticRunLifecycleService::blocks_new_session_run(&run, "session-1"),
-            "waiting run must still block a concurrent turn"
-        );
-    }
-
-    fn test_spawn_run_config(allowed_tools: Vec<&str>, read_only: bool) -> SpawnRunConfig {
-        let inherited_permissions = crate::orchestration::InheritedPermissions::auto_approve();
-        let permission_context =
-            crate::orchestration::PermissionSyncContext::shared(inherited_permissions.clone());
-        SpawnRunConfig {
-            run_id: "child-run".to_string(),
-            agent_id: "child@1234".to_string(),
-            recursion_depth: 1,
-            agent_type: "test".to_string(),
-            task: "do work".to_string(),
-            system_prompt_addendum: String::new(),
-            model: Some("test-model".to_string()),
-            max_turns: 3,
-            allowed_tools: allowed_tools.into_iter().map(String::from).collect(),
-            read_only,
-            working_dir: std::path::PathBuf::from("/tmp"),
-            mailbox: None,
-            progress_emitter: None,
-            context_cache: None,
-            inherited_permissions,
-            parent_address: None,
-            permission_context,
-            inherited_skills: Vec::new(),
-            live_event_sink: None,
-            inherited_prefix: None,
-            execution_metadata: None,
-            is_fork_child: false,
-            delegation_chain: Vec::new(),
-        }
-    }
-
-    fn test_spawn_runtime_context(parent_run_id: &str, user_id: &str) -> ServerSpawnRuntimeContext {
-        ServerSpawnRuntimeContext {
-            parent_run_id: parent_run_id.to_string(),
-            user_id: user_id.to_string(),
-            session_id: "session-1".to_string(),
-            forward_headers: HashMap::new(),
-            llm_token_service: None,
-            request_constraints: RequestConstraints::default(),
-            execution_metadata: None,
-            pause_flag: None,
-            cancel_token: None,
-            trace_context: server_trace_context(user_id, "session-1", parent_run_id, 1),
-            #[cfg(feature = "bridge-e2e-hooks")]
-            test_child_llm_rounds: Vec::new(),
-            #[cfg(feature = "harness")]
-            harness_sink: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn server_spawn_runtime_context_is_keyed_by_parent_run() {
-        let executor = ServerSpawnAgentExecutor::new(
-            test_settings(),
-            test_encryptor(),
-            Arc::new(TokioMutex::new(HashMap::new())),
-        );
-        executor
-            .set_runtime_context(test_spawn_runtime_context("parent-run-a", "user-a"))
-            .await;
-        executor
-            .set_runtime_context(test_spawn_runtime_context("parent-run-b", "user-b"))
-            .await;
-
-        let mut config = test_spawn_run_config(vec!["*"], false);
-        config.parent_address = Some(astra_messaging::types::AgentAddress::new(
-            "parent-run-b",
-            "root-agent",
-        ));
-
-        let context = executor.runtime_context_for_config(&config).await.unwrap();
-
-        assert_eq!(context.parent_run_id, "parent-run-b");
-        assert_eq!(context.user_id, "user-b");
-    }
-
-    #[tokio::test]
-    async fn server_spawn_runtime_context_requires_parent_lineage() {
-        let executor = ServerSpawnAgentExecutor::new(
-            test_settings(),
-            test_encryptor(),
-            Arc::new(TokioMutex::new(HashMap::new())),
-        );
-        executor
-            .set_runtime_context(test_spawn_runtime_context("parent-run-a", "user-a"))
-            .await;
-
-        let config = test_spawn_run_config(vec!["*"], false);
-        let err = match executor.runtime_context_for_config(&config).await {
-            Ok(_) => panic!("server dynamic spawn must not run without parent lineage"),
-            Err(err) => err,
-        };
-
-        assert!(err.contains("parent run lineage"), "{err}");
-    }
-
-    #[test]
-    fn subrun_turn_budget_uses_explicit_spawn_max_turns() {
-        let profile = astra_turn_core::chat_turn_heuristics::infer_task_execution_profile(
-            "explore the codebase and implement the fix",
-        );
-        let budget = resolve_subrun_agentic_turn_budget(profile, Some(3));
-
-        assert_eq!(budget.initial_turns, 3);
-        assert_eq!(budget.hard_turn_limit, 3);
-        assert_eq!(budget.max_extensions, 0);
-    }
-
-    #[test]
-    fn spawn_child_constraints_intersect_parent_and_agent_allowlists() {
-        let parent = RequestConstraints::new(
-            Some(
-                ["bash", "read_file", "write_file"]
-                    .into_iter()
-                    .map(String::from)
-                    .collect(),
-            ),
-            Some(["review"].into_iter().map(String::from).collect()),
-            Some(
-                [
-                    crate::skills::manifest::SkillSourceKind::Local,
-                    crate::skills::manifest::SkillSourceKind::Database,
-                ]
-                .into_iter()
-                .collect(),
-            ),
-        );
-        let config = test_spawn_run_config(vec!["bash", "read_file"], true);
-
-        let constraints = spawn_child_request_constraints(&parent, &config);
-
-        assert_eq!(
-            constraints.allowed_tools.unwrap(),
-            ["bash", "read_file"]
-                .into_iter()
-                .map(String::from)
-                .collect()
-        );
-        assert_eq!(
-            constraints.allowed_skills.unwrap(),
-            ["review"].into_iter().map(String::from).collect()
-        );
-        assert_eq!(
-            constraints.allowed_skill_sources.unwrap(),
-            [
-                crate::skills::manifest::SkillSourceKind::Local,
-                crate::skills::manifest::SkillSourceKind::Database,
-            ]
-            .into_iter()
-            .collect()
-        );
-    }
-
-    #[test]
-    fn spawn_child_constraints_preserve_parent_when_child_allows_all() {
-        let parent = RequestConstraints::new(
-            Some(
-                ["bash", "write_file"]
-                    .into_iter()
-                    .map(String::from)
-                    .collect(),
-            ),
-            None,
-            None,
-        );
-        let config = test_spawn_run_config(vec!["*"], false);
-
-        let constraints = spawn_child_request_constraints(&parent, &config);
-
-        assert_eq!(
-            constraints.allowed_tools.unwrap(),
-            ["bash", "write_file"]
-                .into_iter()
-                .map(String::from)
-                .collect()
-        );
-    }
-
-    #[test]
-    fn spawn_child_constraints_read_only_wildcard_gets_read_only_tools() {
-        let parent = RequestConstraints::default();
-        let config = test_spawn_run_config(vec!["*"], true);
-
-        let constraints = spawn_child_request_constraints(&parent, &config);
-        let allowed = constraints.allowed_tools.unwrap();
-
-        assert!(allowed.contains("read_file"));
-        assert!(allowed.contains("grep"));
-        assert!(!allowed.contains("write_file"));
-        assert!(!allowed.contains("str_replace"));
-    }
-
-    #[test]
-    fn build_run_turn_complete_event_marks_interrupted_turns() {
-        let interruption = astra_turn_core::interruption::InterruptionRecord::new(
-            astra_turn_core::interruption::InterruptionKind::BudgetExhausted,
-            astra_turn_core::interruption::ResumeAction::ContinueImmediately,
-            astra_turn_core::interruption::InterruptionStateSummary {
-                has_checkpoint: true,
-                tool_calls_completed: 7,
-                turns_completed: 15,
-                remaining_turns: 0,
-                error_detail: Some("Round budget hard-limit reached".to_string()),
-                stall_signal: None,
-                resume_restricted_tools: vec![],
-            },
-        );
-
-        let event = build_run_turn_complete_event_with_interruption(
-            7,
-            "[Round budget hard-limit reached]",
-            Some(&interruption),
-        );
-
-        assert_eq!(event["type"], "turn_complete");
-        assert_eq!(event["has_tool_calls"], false);
-        assert_eq!(event["stall_detected"], true);
-        assert_eq!(event["execution_state"]["status"], "interrupted");
-        assert_eq!(event["execution_state"]["interrupted"], true);
-        assert_eq!(
-            event["execution_state"]["interruption_kind"],
-            "budget_exhausted"
-        );
-        assert_eq!(event["execution_state"]["tool_calls_completed"], 7);
-        assert_eq!(event["execution_state"]["remaining_turns"], 0);
-        assert_eq!(event["assistant_text"], "[Round budget hard-limit reached]");
-    }
-
-    #[test]
-    fn correction_keywords_trigger_was_corrected_via_implicit_feedback() {
-        // Sanity-check that the detect_implicit_feedback_signal contract used in
-        // record_server_loop_learning_outcome still recognizes Chinese-language
-        // user corrections.
-        let signal = astra_turn_types::detect_implicit_feedback_signal(
-            "不对，你搞错了",
-            Some("previous assistant reply"),
-        );
-        assert!(
-            matches!(signal.signal_type.as_str(), "correction" | "frustration"),
-            "expected correction/frustration, got {:?}",
-            signal.signal_type
-        );
-    }
-
-    #[test]
-    fn neutral_user_turn_does_not_flag_was_corrected() {
-        let signal = astra_turn_types::detect_implicit_feedback_signal(
-            "再列一下 docs 目录",
-            Some("previous assistant reply"),
-        );
-        assert!(
-            !matches!(signal.signal_type.as_str(), "correction" | "frustration"),
-            "expected non-correction, got {:?}",
-            signal.signal_type
-        );
-    }
-
-    /// Unwrap a `Result<T, (StatusCode, Json<ErrorResponse>)>` in tests.
-    fn ok<T>(result: Result<T, (StatusCode, Json<ErrorResponse>)>) -> T {
-        match result {
-            Ok(v) => v,
-            Err((status, body)) => panic!("expected Ok, got {status}: {}", body.0.detail),
-        }
-    }
-
-    /// Unwrap the error side.
-    fn err<T>(
-        result: Result<T, (StatusCode, Json<ErrorResponse>)>,
-    ) -> (StatusCode, Json<ErrorResponse>) {
-        match result {
-            Ok(_) => panic!("expected Err, got Ok"),
-            Err(e) => e,
-        }
-    }
-
-    fn test_settings() -> MatrixOneSettings {
-        MatrixOneSettings::from_env_with_database("test_astra_runtime")
-    }
-
-    fn test_encryptor() -> Arc<FernetTokenEncryptor> {
-        Arc::new(FernetTokenEncryptor::new("cJ8pxr3t6iJmSYqe6wD7vu2rN_C3ovGUxkC5H3NXFNY=").unwrap())
-    }
-
-    #[derive(Default)]
-    struct FaultInjectedRunStoreCounters {
-        status_calls: usize,
-        append_calls: usize,
-    }
-
-    struct FaultInjectedRunStateStore {
-        inner: InMemoryRunStateStore,
-        fail_status_calls: HashSet<usize>,
-        fail_append_calls: HashSet<usize>,
-        counters: StdMutex<FaultInjectedRunStoreCounters>,
-    }
-
-    impl FaultInjectedRunStateStore {
-        fn new(fail_status_calls: &[usize], fail_append_calls: &[usize]) -> Self {
-            Self {
-                inner: InMemoryRunStateStore::new(),
-                fail_status_calls: fail_status_calls.iter().copied().collect(),
-                fail_append_calls: fail_append_calls.iter().copied().collect(),
-                counters: StdMutex::new(FaultInjectedRunStoreCounters::default()),
-            }
-        }
-
-        fn next_status_call(&self) -> usize {
-            let mut counters = self.counters.lock().expect("status counter lock");
-            counters.status_calls += 1;
-            counters.status_calls
-        }
-
-        fn next_append_call(&self) -> usize {
-            let mut counters = self.counters.lock().expect("append counter lock");
-            counters.append_calls += 1;
-            counters.append_calls
-        }
-    }
-
-    #[async_trait]
-    impl RunStateStore for FaultInjectedRunStateStore {
-        async fn insert_run(&self, record: DurableRunRecord) -> Result<(), String> {
-            self.inner.insert_run(record).await
-        }
-
-        async fn load_run(
-            &self,
-            user_id: &str,
-            run_id: &str,
-        ) -> Result<Option<DurableRunRecord>, String> {
-            self.inner.load_run(user_id, run_id).await
-        }
-
-        async fn update_run_status(
-            &self,
-            user_id: &str,
-            run_id: &str,
-            status: &str,
-            waiting_for: Option<&str>,
-            error_message: Option<&str>,
-        ) -> Result<bool, String> {
-            let call = self.next_status_call();
-            if self.fail_status_calls.contains(&call) {
-                return Err(format!("injected update_run_status failure on call {call}"));
-            }
-            self.inner
-                .update_run_status(user_id, run_id, status, waiting_for, error_message)
-                .await
-        }
-
-        async fn update_run_status_if_current(
-            &self,
-            user_id: &str,
-            run_id: &str,
-            expected_statuses: &[&str],
-            status: &str,
-            waiting_for: Option<&str>,
-            error_message: Option<&str>,
-        ) -> Result<bool, String> {
-            let call = self.next_status_call();
-            if self.fail_status_calls.contains(&call) {
-                return Err(format!(
-                    "injected update_run_status_if_current failure on call {call}"
-                ));
-            }
-            self.inner
-                .update_run_status_if_current(
-                    user_id,
-                    run_id,
-                    expected_statuses,
-                    status,
-                    waiting_for,
-                    error_message,
-                )
-                .await
-        }
-
-        async fn update_run_usage(
-            &self,
-            user_id: &str,
-            run_id: &str,
-            prompt_tokens: u64,
-            completion_tokens: u64,
-            tool_calls: u32,
-        ) -> Result<bool, String> {
-            self.inner
-                .update_run_usage(
-                    user_id,
-                    run_id,
-                    prompt_tokens,
-                    completion_tokens,
-                    tool_calls,
-                )
-                .await
-        }
-
-        async fn save_checkpoint(
-            &self,
-            user_id: &str,
-            run_id: &str,
-            checkpoint_json: &str,
-        ) -> Result<bool, String> {
-            self.inner
-                .save_checkpoint(user_id, run_id, checkpoint_json)
-                .await
-        }
-
-        async fn load_latest_checkpoint(
-            &self,
-            user_id: &str,
-            run_id: &str,
-            checkpoint_kind: Option<&str>,
-        ) -> Result<Option<DurableRunCheckpointRecord>, String> {
-            self.inner
-                .load_latest_checkpoint(user_id, run_id, checkpoint_kind)
-                .await
-        }
-
-        async fn load_run_projection(
-            &self,
-            user_id: &str,
-            run_id: &str,
-        ) -> Result<Option<DurableRunDisplayProjectionRecord>, String> {
-            self.inner.load_run_projection(user_id, run_id).await
-        }
-
-        async fn append_events_batch(
-            &self,
-            user_id: &str,
-            run_id: &str,
-            events: &[serde_json::Value],
-        ) -> Result<(), String> {
-            let call = self.next_append_call();
-            if self.fail_append_calls.contains(&call) {
-                return Err(format!("injected append_event failure on call {call}"));
-            }
-            self.inner
-                .append_events_batch(user_id, run_id, events)
-                .await
-        }
-
-        async fn list_user_runs(
-            &self,
-            user_id: &str,
-            limit: u32,
-            offset: u32,
-        ) -> Result<(Vec<DurableRunRecord>, i64), String> {
-            self.inner.list_user_runs(user_id, limit, offset).await
-        }
-
-        async fn find_waiting_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
-            self.inner.find_waiting_runs().await
-        }
-
-        async fn find_running_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
-            self.inner.find_running_runs().await
-        }
-
-        async fn find_blocking_session_run(
-            &self,
-            user_id: &str,
-            session_id: &str,
-        ) -> Result<Option<DurableRunRecord>, String> {
-            self.inner
-                .find_blocking_session_run(user_id, session_id)
-                .await
-        }
-
-        async fn find_sub_runs(
-            &self,
-            user_id: &str,
-            delegation_id: &str,
-        ) -> Result<Vec<DurableRunRecord>, String> {
-            self.inner.find_sub_runs(user_id, delegation_id).await
-        }
-
-        async fn update_retry_count(
-            &self,
-            user_id: &str,
-            run_id: &str,
-            retry_count: u32,
-        ) -> Result<bool, String> {
-            self.inner
-                .update_retry_count(user_id, run_id, retry_count)
-                .await
-        }
-    }
-
-    fn test_service() -> AgenticRunLifecycleService {
-        let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
-        AgenticRunLifecycleService::new(
-            test_settings(),
-            test_encryptor(),
-            Arc::new(TokioMutex::new(HashMap::new())),
-            engine,
-        )
-        .with_model_service(Arc::new(ActiveTestModelService))
-    }
-
-    fn test_service_with_store(store: Arc<dyn RunStateStore>) -> AgenticRunLifecycleService {
-        let engine = RunEngine::new(store);
-        AgenticRunLifecycleService::new(
-            test_settings(),
-            test_encryptor(),
-            Arc::new(TokioMutex::new(HashMap::new())),
-            engine,
-        )
-        .with_model_service(Arc::new(ActiveTestModelService))
-    }
-
-    fn test_request(message: &str) -> ChatRequestData {
-        ChatRequestData {
-            message: message.to_string(),
-            parts: Vec::new(),
-            attachments: Vec::new(),
-            runtime_system_prompt: None,
-            session_id: None,
-            full_llm_capture: false,
-            agent_id: None,
-            model: Some("test-model".to_string()),
-            selected_model: Some(SelectedModelRequest {
-                id: None,
-                model: "test-model".to_string(),
-                gateway: None,
-            }),
-            capability_descriptors: None,
-            provider_runtime_authorized: false,
-            agent_binding: None,
-            runtime_auth: None,
-            runtime_skill_binding: None,
-            runtime_profile: None,
-            llm_token_service: None,
-            skill_search: None,
-            allow_skills: None,
-            allow_skill_sources: None,
-            allow_tools: None,
-            workspace_binding: None,
-            executor_binding: None,
-            runtime_mcp_bindings: Vec::new(),
-            mcp_binding_ids: None,
-            context: None,
-            edge_executor_id: None,
-            capabilities: Vec::new(),
-            forward_headers: HashMap::new(),
-            execution_budget: None,
-            explain: false,
-            interaction_mode: None,
-            interactive_client: false,
-        }
-    }
-
-    fn test_runtime_mcp_binding() -> RuntimeMcpBindingRequest {
-        RuntimeMcpBindingRequest {
-            id: "request_tools".to_string(),
-            transport: "streamable_http".to_string(),
-            url: "https://tools.example.test/mcp/http".to_string(),
-            auth_token: None,
-            headers: HashMap::new(),
-        }
-    }
-
-    #[derive(Clone)]
-    struct StaticSkillResolver {
-        skills: Vec<crate::turn::skill_tool::SkillToolInfo>,
-    }
-
-    impl crate::turn::skill_tool::SkillResolver for StaticSkillResolver {
-        fn resolve(
-            &self,
-            name: &str,
-        ) -> Result<crate::turn::skill_tool::ResolvedSkill, crate::skills::SkillError> {
-            Err(crate::skills::SkillError::NotFound(name.to_string()))
-        }
-
-        fn available_skills(&self) -> Vec<crate::turn::skill_tool::SkillToolInfo> {
-            self.skills.clone()
-        }
-    }
-
-    fn static_skill_resolver(name: &str) -> Arc<dyn crate::turn::skill_tool::SkillResolver> {
-        Arc::new(StaticSkillResolver {
-            skills: vec![crate::turn::skill_tool::SkillToolInfo {
-                name: name.to_string(),
-                description: "Binding-scoped skill".to_string(),
-                when_to_use: None,
-                source: crate::skills::manifest::SkillSourceKind::Plugin,
-                aliases: Vec::new(),
-                category: None,
-                tags: Vec::new(),
-            }],
-        })
-    }
-
-    fn test_agent_binding_record(max_steps: Option<u32>) -> astra_services::AgentBindingRecord {
-        astra_services::AgentBindingRecord {
-            id: "abnd_test1234567890".to_string(),
-            binding_name: "test-binding".to_string(),
-            idempotency_key: "idem-test-binding".to_string(),
-            status: astra_services::AgentBindingStatus::Active,
-            agent_md: "Always follow the binding contract.".to_string(),
-            capability_servers: vec![
-                astra_services::CapabilityServerEndpoint {
-                    id: "mcp-main".to_string(),
-                    server_type: astra_services::CapabilityServerType::Mcp,
-                    transport: astra_services::CapabilityServerTransport::StreamableHttp,
-                    endpoint_url: "https://cap.example.com/mcp".to_string(),
-                },
-                astra_services::CapabilityServerEndpoint {
-                    id: "skills-main".to_string(),
-                    server_type: astra_services::CapabilityServerType::Skill,
-                    transport: astra_services::CapabilityServerTransport::StreamableHttp,
-                    endpoint_url: "https://cap.example.com/skills".to_string(),
-                },
-            ],
-            runtime_policy: astra_services::RuntimePolicy {
-                max_steps,
-                tool_mode: astra_services::ToolMode::McpGateway,
-            },
-            metadata: None,
-            binding_schema_version: "v1".to_string(),
-            created_at: "2026-06-19T00:00:00Z".to_string(),
-            disabled_at: None,
-        }
-    }
-
-    fn test_agent_binding_create_request() -> astra_services::AgentBindingCreateRequestData {
-        astra_services::AgentBindingCreateRequestData {
-            idempotency_key: "idem-runtime-binding".to_string(),
-            binding: astra_services::AgentBindingPayload {
-                binding_name: "runtime-binding".to_string(),
-                agent_md: "Always follow the binding contract.".to_string(),
-                capability_servers: vec![
-                    astra_services::CapabilityServerEndpoint {
-                        id: "tools".to_string(),
-                        server_type: astra_services::CapabilityServerType::Mcp,
-                        transport: astra_services::CapabilityServerTransport::StreamableHttp,
-                        endpoint_url: "https://cap.example.com/mcp".to_string(),
-                    },
-                    astra_services::CapabilityServerEndpoint {
-                        id: "skills".to_string(),
-                        server_type: astra_services::CapabilityServerType::Skill,
-                        transport: astra_services::CapabilityServerTransport::StreamableHttp,
-                        endpoint_url: "https://cap.example.com/skills".to_string(),
-                    },
-                ],
-                runtime_policy: astra_services::RuntimePolicy {
-                    max_steps: Some(5),
-                    tool_mode: astra_services::ToolMode::McpGateway,
-                },
-                metadata: None,
-                binding_schema_version: "v1".to_string(),
-            },
-        }
-    }
-
-    fn runtime_binding_request(id: String, mcp: &str, skills: &str) -> AgentBindingRuntimeRequest {
-        AgentBindingRuntimeRequest {
-            id,
-            capability_server_refs: CapabilityServerRefs {
-                mcp: mcp.to_string(),
-                skills: skills.to_string(),
-            },
-        }
-    }
-
-    async fn service_with_in_memory_binding() -> (
-        AgenticRunLifecycleService,
-        Arc<astra_services::InMemoryAgentBindingService>,
-        astra_services::AgentBindingRecord,
-    ) {
-        let binding_service = Arc::new(astra_services::InMemoryAgentBindingService::new());
-        let record = astra_services::AgentBindingService::create_binding(
-            binding_service.as_ref(),
-            test_agent_binding_create_request(),
-        )
-        .await
-        .expect("binding create");
-        let service = test_service().with_agent_binding_service(binding_service.clone());
-        (service, binding_service, record)
-    }
-
-    #[tokio::test]
-    async fn resolve_agent_binding_runtime_rejects_disabled_binding() {
-        let (service, binding_service, record) = service_with_in_memory_binding().await;
-        astra_services::AgentBindingService::disable_binding(
-            binding_service.as_ref(),
-            record.id.clone(),
-        )
-        .await
-        .expect("binding disable");
-
-        let err = match service
-            .resolve_agent_binding_runtime(&runtime_binding_request(record.id, "tools", "skills"))
-            .await
-        {
-            Ok(_) => panic!("disabled binding should not start new turns"),
-            Err(err) => err,
-        };
-
-        assert_eq!(err.0, StatusCode::CONFLICT);
-        assert_eq!(
-            err.1.0.error_code.as_deref(),
-            Some("agent_binding_disabled")
-        );
-    }
-
-    #[tokio::test]
-    async fn resolve_agent_binding_runtime_rejects_missing_capability_ref() {
-        let (service, _binding_service, record) = service_with_in_memory_binding().await;
-
-        let err = match service
-            .resolve_agent_binding_runtime(&runtime_binding_request(
-                record.id,
-                "missing-tools",
-                "skills",
-            ))
-            .await
-        {
-            Ok(_) => panic!("missing mcp ref should fail before discovery"),
-            Err(err) => err,
-        };
-
-        assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        assert_eq!(
-            err.1.0.error_code.as_deref(),
-            Some("agent_binding_capability_ref_missing")
-        );
-    }
-
-    #[tokio::test]
-    async fn resolve_agent_binding_runtime_rejects_capability_ref_type_mismatch() {
-        let (service, _binding_service, record) = service_with_in_memory_binding().await;
-
-        let err = match service
-            .resolve_agent_binding_runtime(&runtime_binding_request(record.id, "skills", "skills"))
-            .await
-        {
-            Ok(_) => panic!("mcp ref must resolve to an mcp server"),
-            Err(err) => err,
-        };
-
-        assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        assert_eq!(
-            err.1.0.error_code.as_deref(),
-            Some("agent_binding_capability_ref_invalid")
-        );
-    }
-
-    #[test]
-    fn server_root_permissions_default_to_auto_for_server_approval_gate() {
-        let mut request = test_request("edit files");
-        request.interaction_mode = Some(RequestedTurnInteractionMode::Prompt);
-        let constraints = RequestConstraints::default();
-
-        let inherited =
-            AgenticRunLifecycleService::inherited_permissions_from_request(&request, &constraints);
-
-        assert_eq!(inherited.mode, PermissionMode::Auto);
-        assert!(inherited.allowed_tools.is_none());
-    }
-
-    #[test]
-    fn server_root_permissions_map_deny_and_preserve_tool_allowlist() {
-        let mut request = test_request("no tools");
-        request.interaction_mode = Some(RequestedTurnInteractionMode::Deny);
-        let constraints = RequestConstraints {
-            allowed_tools: Some(["read_file".to_string()].into_iter().collect()),
-            ..Default::default()
-        };
-
-        let inherited =
-            AgenticRunLifecycleService::inherited_permissions_from_request(&request, &constraints);
-
-        assert_eq!(inherited.mode, PermissionMode::Deny);
-        assert!(
-            inherited
-                .allowed_tools
-                .as_ref()
-                .is_some_and(|tools| tools.contains("read_file"))
-        );
-    }
-
-    #[test]
-    fn server_subrun_executor_keeps_inherited_permissions() {
-        let inherited_permissions = InheritedPermissions::new(PermissionMode::Deny);
-        let executor = ServerSubRunExecutor::new(
-            test_settings(),
-            test_encryptor(),
-            Arc::new(TokioMutex::new(HashMap::new())),
-        )
-        .with_inherited_permissions(inherited_permissions);
-
-        assert_eq!(executor.inherited_permissions.mode, PermissionMode::Deny);
-    }
-
-    #[test]
-    fn provision_subrun_workspace_rejects_unsafe_identity_components() {
-        let executor = ServerSubRunExecutor::new(
-            test_settings(),
-            test_encryptor(),
-            Arc::new(TokioMutex::new(HashMap::new())),
-        );
-
-        let session_error = executor
-            .provision_subrun_workspace("session/123", "run-123")
-            .expect_err("unsafe session id must fail instead of being sanitized");
-        assert!(
-            session_error.contains("invalid sub-run session_id"),
-            "unexpected session error: {session_error}"
-        );
-
-        let run_error = executor
-            .provision_subrun_workspace("session-123", "run/123")
-            .expect_err("unsafe run id must fail instead of being sanitized");
-        assert!(
-            run_error.contains("invalid sub-run run_id"),
-            "unexpected run error: {run_error}"
-        );
-    }
-
-    struct FailingWorkspaceRecordStore;
-
-    #[async_trait]
-    impl WorkspaceRecordStore for FailingWorkspaceRecordStore {
-        async fn upsert_workspace_record(
-            &self,
-            _entry: StoredWorkspaceRecordEntry,
-        ) -> Result<(), WorkspaceRecordStoreError> {
-            Err(WorkspaceRecordStoreError::Unavailable(
-                "injected workspace store failure".to_string(),
-            ))
-        }
-
-        async fn load_workspace_record(
-            &self,
-            _owner_id: &str,
-            _workspace_id: &str,
-        ) -> Result<Option<StoredWorkspaceRecordEntry>, WorkspaceRecordStoreError> {
-            Ok(None)
-        }
-
-        async fn list_workspace_records(
-            &self,
-            _owner_id: &str,
-            _limit: u32,
-        ) -> Result<Vec<StoredWorkspaceRecordEntry>, WorkspaceRecordStoreError> {
-            Ok(Vec::new())
-        }
-
-        async fn delete_workspace_record(
-            &self,
-            _owner_id: &str,
-            _workspace_id: &str,
-        ) -> Result<bool, WorkspaceRecordStoreError> {
-            Err(WorkspaceRecordStoreError::Unavailable(
-                "injected workspace store failure".to_string(),
-            ))
-        }
-    }
-
-    #[async_trait]
-    impl WorkspaceCleanupDebtStore for FailingWorkspaceRecordStore {
-        async fn record_cleanup_debt(
-            &self,
-            _entry: WorkspaceCleanupDebtEntry,
-        ) -> Result<(), WorkspaceCleanupDebtStoreError> {
-            Err(WorkspaceCleanupDebtStoreError::Unavailable(
-                "injected cleanup debt store failure".to_string(),
-            ))
-        }
-
-        async fn list_cleanup_debts(
-            &self,
-            _owner_id: &str,
-            _limit: u32,
-        ) -> Result<Vec<WorkspaceCleanupDebtEntry>, WorkspaceCleanupDebtStoreError> {
-            Ok(Vec::new())
-        }
-
-        async fn resolve_cleanup_debt(
-            &self,
-            _owner_id: &str,
-            _debt_id: &str,
-        ) -> Result<bool, WorkspaceCleanupDebtStoreError> {
-            Ok(false)
-        }
-
-        async fn list_all_unresolved_debts(
-            &self,
-        ) -> Result<Vec<WorkspaceCleanupDebtEntry>, WorkspaceCleanupDebtStoreError> {
-            Err(WorkspaceCleanupDebtStoreError::Unavailable(
-                "injected cleanup debt store failure".to_string(),
-            ))
-        }
-
-        async fn increment_debt_attempts(
-            &self,
-            _debt_id: &str,
-        ) -> Result<(), WorkspaceCleanupDebtStoreError> {
-            Err(WorkspaceCleanupDebtStoreError::Unavailable(
-                "injected cleanup debt store failure".to_string(),
-            ))
-        }
-    }
-
-    fn test_cloud_workspace_record(workspace_id: &str) -> RuntimeWorkspaceRecord {
-        RuntimeWorkspaceRecord {
-            workspace_id: workspace_id.to_string(),
-            owner_scope: RuntimeWorkspaceOwnerScope::Tenant,
-            kind: astra_runtime_env::WorkspaceBindingKind::CloudWorkspace,
-            authority: astra_runtime_env::WorkspaceAuthority::ReadWrite,
-            root_or_volume_ref: "/cloud/volumes/team-volume-1".to_string(),
-            source: RuntimeWorkspaceSource::PersistentVolume {
-                volume_id: "team-volume-1".to_string(),
-            },
-            persistence: RuntimeWorkspacePersistence::Persistent,
-            revision: "1".to_string(),
-            display_name: "Team workspace".to_string(),
-        }
-    }
-
-    #[tokio::test]
-    async fn lifecycle_persists_workspace_record_with_owner_session_and_run() {
-        let store = Arc::new(InMemoryWorkspaceRecordStore::new());
-        let svc = test_service().with_workspace_record_store(store.clone());
-        let record = test_cloud_workspace_record("workspace-1");
-
-        ok(svc
-            .persist_workspace_record(
-                "00000000-0000-0000-0000-000000000001",
-                "session-1",
-                "run-1",
-                &record,
-            )
-            .await);
-
-        let loaded = store
-            .load_workspace_record("00000000-0000-0000-0000-000000000001", "workspace-1")
-            .await
-            .expect("load workspace record")
-            .expect("record");
-        assert_eq!(loaded.owner_id, "00000000-0000-0000-0000-000000000001");
-        assert_eq!(loaded.session_id.as_deref(), Some("session-1"));
-        assert_eq!(loaded.run_id.as_deref(), Some("run-1"));
-        assert_eq!(loaded.record, record);
-        assert!(
-            store
-                .load_workspace_record("00000000-0000-0000-0000-000000000002", "workspace-1")
-                .await
-                .expect("load workspace record")
-                .is_none(),
-            "workspace records must stay owner scoped"
-        );
-    }
-
-    #[tokio::test]
-    async fn lifecycle_workspace_record_store_failure_fails_closed() {
-        let svc = test_service().with_workspace_record_store(Arc::new(FailingWorkspaceRecordStore));
-        let record = test_cloud_workspace_record("workspace-1");
-
-        let error = err(svc
-            .persist_workspace_record(
-                "00000000-0000-0000-0000-000000000001",
-                "session-1",
-                "run-1",
-                &record,
-            )
-            .await);
-
-        assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
-        assert!(
-            error
-                .1
-                .0
-                .detail
-                .contains("Failed to persist workspace record"),
-            "{}",
-            error.1.0.detail
-        );
-    }
-
-    #[tokio::test]
-    async fn lifecycle_workspace_record_source_conflict_returns_conflict() {
-        let store = Arc::new(InMemoryWorkspaceRecordStore::new());
-        store
-            .upsert_workspace_record(StoredWorkspaceRecordEntry::new(
-                "00000000-0000-0000-0000-000000000002",
-                Some("session-2".to_string()),
-                Some("run-2".to_string()),
-                test_cloud_workspace_record("workspace-2"),
-            ))
-            .await
-            .expect("store existing workspace owner");
-        let svc = test_service().with_workspace_record_store(store);
-        let record = test_cloud_workspace_record("workspace-1");
-
-        let error = err(svc
-            .persist_workspace_record(
-                "00000000-0000-0000-0000-000000000001",
-                "session-1",
-                "run-1",
-                &record,
-            )
-            .await);
-
-        assert_eq!(error.0, StatusCode::CONFLICT);
-        assert!(
-            error.1.0.detail.contains("Workspace ownership conflict"),
-            "{}",
-            error.1.0.detail
-        );
-    }
-
-    #[tokio::test]
-    async fn lifecycle_records_cleanup_debt_when_failed_start_cleanup_fails() {
-        let store = Arc::new(InMemoryWorkspaceRecordStore::new());
-        let svc = test_service().with_workspace_record_store(store.clone());
-        let mut record = test_cloud_workspace_record("workspace-cleanup-debt");
-        record.persistence = RuntimeWorkspacePersistence::Session;
-        record.source = RuntimeWorkspaceSource::Scratch;
-        record.root_or_volume_ref = "/definitely/missing/astra-cleanup-debt".to_string();
-
-        svc.cleanup_cloud_workspace_after_failed_start(
-            "00000000-0000-0000-0000-000000000001",
-            "session-1",
-            "run-1",
-            &record,
-            "injected start failure".to_string(),
-        )
-        .await;
-
-        let debts = store
-            .list_cleanup_debts("00000000-0000-0000-0000-000000000001", 10)
-            .await
-            .expect("list cleanup debts");
-        assert_eq!(debts.len(), 1);
-        assert_eq!(debts[0].workspace_id, "workspace-cleanup-debt");
-        assert_eq!(debts[0].reason, RuntimeCleanupReason::Failed);
-        assert!(debts[0].message.contains("injected start failure"));
-        assert_eq!(debts[0].session_id.as_deref(), Some("session-1"));
-        assert_eq!(debts[0].run_id.as_deref(), Some("run-1"));
-    }
-
-    #[tokio::test]
-    async fn lifecycle_records_cleanup_debt_when_terminal_cleanup_fails() {
-        let store = Arc::new(InMemoryWorkspaceRecordStore::new());
-        let mut record = test_cloud_workspace_record("workspace-terminal-cleanup-debt");
-        record.persistence = RuntimeWorkspacePersistence::Session;
-        record.source = RuntimeWorkspaceSource::Scratch;
-        record.root_or_volume_ref = "/definitely/missing/astra-terminal-cleanup-debt".to_string();
-
-        AgenticRunLifecycleService::cleanup_cloud_workspace_after_terminal_run(
-            Some(store.clone()),
-            "00000000-0000-0000-0000-000000000001",
-            "session-1",
-            "run-1",
-            &record,
-            &RunStatus::Completed,
-        )
-        .await;
-
-        let debts = store
-            .list_cleanup_debts("00000000-0000-0000-0000-000000000001", 10)
-            .await
-            .expect("list cleanup debts");
-        assert_eq!(debts.len(), 1);
-        assert_eq!(debts[0].workspace_id, "workspace-terminal-cleanup-debt");
-        assert_eq!(debts[0].reason, RuntimeCleanupReason::Completed);
-        assert!(debts[0].message.contains("run ended with status completed"));
-        assert_eq!(debts[0].session_id.as_deref(), Some("session-1"));
-        assert_eq!(debts[0].run_id.as_deref(), Some("run-1"));
-    }
-
-    #[tokio::test]
-    async fn lifecycle_removes_workspace_record_after_successful_terminal_cleanup() {
-        let store = Arc::new(InMemoryWorkspaceRecordStore::new());
-        let record = test_cloud_workspace_record("workspace-terminal-cleanup-success");
-        store
-            .upsert_workspace_record(StoredWorkspaceRecordEntry::new(
-                "00000000-0000-0000-0000-000000000001",
-                Some("session-1".to_string()),
-                Some("run-1".to_string()),
-                record.clone(),
-            ))
-            .await
-            .expect("store workspace record");
-
-        AgenticRunLifecycleService::cleanup_cloud_workspace_after_terminal_run(
-            Some(store.clone()),
-            "00000000-0000-0000-0000-000000000001",
-            "session-1",
-            "run-1",
-            &record,
-            &RunStatus::Completed,
-        )
-        .await;
-
-        assert!(
-            store
-                .load_workspace_record(
-                    "00000000-0000-0000-0000-000000000001",
-                    "workspace-terminal-cleanup-success"
-                )
-                .await
-                .expect("load workspace record")
-                .is_none(),
-            "successful cleanup must remove the workspace record"
-        );
-        assert!(
-            store
-                .list_cleanup_debts("00000000-0000-0000-0000-000000000001", 10)
-                .await
-                .expect("list cleanup debts")
-                .is_empty(),
-            "successful cleanup must not create cleanup debt"
-        );
-    }
-
-    #[tokio::test]
-    async fn lifecycle_skips_cloud_workspace_cleanup_for_resumable_status() {
-        let store = Arc::new(InMemoryWorkspaceRecordStore::new());
-        let mut record = test_cloud_workspace_record("workspace-waiting-no-cleanup");
-        record.persistence = RuntimeWorkspacePersistence::Session;
-        record.root_or_volume_ref = "/definitely/missing/astra-waiting-no-cleanup".to_string();
-
-        AgenticRunLifecycleService::cleanup_cloud_workspace_after_terminal_run(
-            Some(store.clone()),
-            "00000000-0000-0000-0000-000000000001",
-            "session-1",
-            "run-1",
-            &record,
-            &RunStatus::Waiting,
-        )
-        .await;
-
-        assert!(
-            store
-                .list_cleanup_debts("00000000-0000-0000-0000-000000000001", 10)
-                .await
-                .expect("list cleanup debts")
-                .is_empty(),
-            "resumable runs must keep their workspace for continuation"
-        );
-    }
-
-    #[test]
-    fn cloud_git_source_maps_to_workspace_record_contract() {
-        let mut request = test_request("checkout this repo");
-        request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
-            kind: astra_services::runs::WorkspaceBindingRequestKind::CloudWorkspace,
-            display_name: Some("Repo checkout".to_string()),
-            root: None,
-            source: Some(astra_services::runs::WorkspaceSourceRequest::GitCheckout {
-                repository: "https://example.com/org/repo.git".to_string(),
-                reference: None,
-            }),
-            authority: None,
-            fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
-        });
-
-        let provision_request = ok(cloud_workspace_provision_request_from_request(
-            &request, "123",
-        ))
-        .expect("cloud workspace request");
-
-        assert_eq!(provision_request.workspace_id, "run-123");
-        assert_eq!(
-            provision_request.kind,
-            astra_runtime_env::WorkspaceBindingKind::CloudWorkspace
-        );
-        assert_eq!(
-            provision_request.authority,
-            astra_runtime_env::WorkspaceAuthority::ReadWrite
-        );
-        assert_eq!(
-            provision_request.persistence,
-            RuntimeWorkspacePersistence::Session
-        );
-        assert_eq!(
-            provision_request.source,
-            RuntimeWorkspaceSource::GitCheckout {
-                repository: "https://example.com/org/repo.git".to_string(),
-                reference: None,
-            }
-        );
-
-        let record = RuntimeWorkspaceRecord {
-            workspace_id: provision_request.workspace_id,
-            owner_scope: provision_request.owner_scope,
-            kind: provision_request.kind,
-            authority: provision_request.authority,
-            root_or_volume_ref: "/cloud/checkouts/run-123".to_string(),
-            source: provision_request.source,
-            persistence: provision_request.persistence,
-            revision: "1".to_string(),
-            display_name: "Repo checkout".to_string(),
-        };
-        let snapshot = execution_bindings_from_workspace_record(&record);
-        let workspace = &snapshot.workspace;
-        let executor = &snapshot.executor;
-
-        assert_eq!(workspace.kind, WorkspaceBindingKind::CloudWorkspace);
-        assert_eq!(workspace.cwd.as_deref(), Some("/cloud/checkouts/run-123"));
-        assert_eq!(executor.kind, ExecutorBindingKind::OrchestratorManaged);
-        assert_eq!(executor.transport, ToolTransportKind::SandboxResidentAgent);
-        assert_eq!(
-            snapshot
-                .runtime
-                .as_ref()
-                .map(|runtime| runtime.launch_driver),
-            Some(astra_runtime_env::RuntimeLaunchDriver::Kubernetes)
-        );
-    }
-
-    #[test]
-    fn cloud_persistent_volume_binding_maps_to_workspace_record_contract() {
-        let mut request = test_request("use my workspace");
-        request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
-            kind: astra_services::runs::WorkspaceBindingRequestKind::CloudWorkspace,
-            display_name: Some("Team workspace".to_string()),
-            root: None,
-            source: Some(
-                astra_services::runs::WorkspaceSourceRequest::PersistentVolume {
-                    volume_id: "team-volume-1".to_string(),
-                },
-            ),
-            authority: None,
-            fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
-        });
-
-        let provision_request = ok(cloud_workspace_provision_request_from_request(
-            &request,
-            "volume-run",
-        ))
-        .expect("cloud workspace request");
-
-        assert_eq!(provision_request.workspace_id, "run-volume-run");
-        assert_eq!(
-            provision_request.kind,
-            astra_runtime_env::WorkspaceBindingKind::CloudWorkspace
-        );
-        assert_eq!(
-            provision_request.authority,
-            astra_runtime_env::WorkspaceAuthority::ReadWrite
-        );
-        assert_eq!(
-            provision_request.persistence,
-            RuntimeWorkspacePersistence::Persistent
-        );
-        assert_eq!(
-            provision_request.source,
-            RuntimeWorkspaceSource::PersistentVolume {
-                volume_id: "team-volume-1".to_string(),
-            }
-        );
-
-        let record = RuntimeWorkspaceRecord {
-            workspace_id: provision_request.workspace_id,
-            owner_scope: provision_request.owner_scope,
-            kind: provision_request.kind,
-            authority: provision_request.authority,
-            root_or_volume_ref: "/cloud/volumes/team-volume-1".to_string(),
-            source: provision_request.source,
-            persistence: provision_request.persistence,
-            revision: "1".to_string(),
-            display_name: "Team workspace".to_string(),
-        };
-        let snapshot = execution_bindings_from_workspace_record(&record);
-        let workspace = &snapshot.workspace;
-        let executor = &snapshot.executor;
-
-        assert_eq!(workspace.kind, WorkspaceBindingKind::CloudWorkspace);
-        assert_eq!(
-            workspace.cwd.as_deref(),
-            Some("/cloud/volumes/team-volume-1")
-        );
-        assert_eq!(executor.kind, ExecutorBindingKind::OrchestratorManaged);
-        assert_eq!(executor.transport, ToolTransportKind::SandboxResidentAgent);
-        assert_eq!(
-            snapshot
-                .runtime
-                .as_ref()
-                .map(|runtime| runtime.session_manager),
-            Some(astra_runtime_env::RuntimeSessionManager::ProviderManaged)
-        );
-    }
-
-    #[test]
-    fn cloud_scratch_source_maps_to_generic_workspace_record_contract() {
-        let mut request = test_request("create scratch workspace");
-        request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
-            kind: astra_services::runs::WorkspaceBindingRequestKind::CloudWorkspace,
-            display_name: Some("Scratch workspace".to_string()),
-            root: None,
-            source: Some(astra_services::runs::WorkspaceSourceRequest::Scratch),
-            authority: None,
-            fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
-        });
-
-        let provision_request = ok(cloud_workspace_provision_request_from_request(
-            &request,
-            "scratch-run",
-        ))
-        .expect("scratch cloud workspace request");
-
-        assert_eq!(provision_request.workspace_id, "run-scratch-run");
-        assert_eq!(
-            provision_request.kind,
-            astra_runtime_env::WorkspaceBindingKind::CloudWorkspace
-        );
-        assert_eq!(provision_request.source, RuntimeWorkspaceSource::Scratch);
-        assert_eq!(
-            provision_request.persistence,
-            RuntimeWorkspacePersistence::Session
-        );
-    }
-
-    #[test]
-    fn cloud_uploaded_snapshot_source_defaults_to_immutable_read_only() {
-        let mut request = test_request("inspect snapshot");
-        request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
-            kind: astra_services::runs::WorkspaceBindingRequestKind::CloudWorkspace,
-            display_name: None,
-            root: None,
-            source: Some(
-                astra_services::runs::WorkspaceSourceRequest::UploadedSnapshot {
-                    artifact_id: "artifact-1".to_string(),
-                    root: None,
-                },
-            ),
-            authority: None,
-            fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
-        });
-
-        let provision_request = ok(cloud_workspace_provision_request_from_request(
-            &request, "456",
-        ))
-        .expect("cloud workspace request");
-
-        assert_eq!(
-            provision_request.kind,
-            astra_runtime_env::WorkspaceBindingKind::CloudWorkspace
-        );
-        assert_eq!(
-            provision_request.authority,
-            astra_runtime_env::WorkspaceAuthority::ReadOnly
-        );
-        assert_eq!(
-            provision_request.persistence,
-            RuntimeWorkspacePersistence::ImmutableSnapshot
-        );
-        assert_eq!(
-            provision_request.source,
-            RuntimeWorkspaceSource::UploadedSnapshot {
-                artifact_id: "artifact-1".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn cloud_template_source_defaults_to_read_write_session_workspace() {
-        let mut request = test_request("start from template");
-        request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
-            kind: astra_services::runs::WorkspaceBindingRequestKind::CloudWorkspace,
-            display_name: None,
-            root: Some("/cloud/templates/template-1".to_string()),
-            source: Some(astra_services::runs::WorkspaceSourceRequest::Template {
-                template_id: "template-1".to_string(),
-            }),
-            authority: None,
-            fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
-        });
-
-        let provision_request = ok(cloud_workspace_provision_request_from_request(
-            &request,
-            "template-run",
-        ))
-        .expect("template workspace request");
-
-        assert_eq!(
-            provision_request.authority,
-            astra_runtime_env::WorkspaceAuthority::ReadWrite
-        );
-        assert_eq!(
-            provision_request.persistence,
-            RuntimeWorkspacePersistence::Session
-        );
-        assert_eq!(
-            provision_request.source,
-            RuntimeWorkspaceSource::Template {
-                template_id: "template-1".to_string(),
-            }
-        );
-        assert_eq!(
-            provision_request.requested_root.as_deref(),
-            Some("/cloud/templates/template-1")
-        );
-    }
-
-    #[test]
-    fn cloud_dataset_and_artifact_sources_default_to_immutable_read_only() {
-        let cases = [
-            (
-                astra_services::runs::WorkspaceSourceRequest::DatasetBundle {
-                    dataset_id: "dataset-1".to_string(),
-                },
-                RuntimeWorkspaceSource::DatasetBundle {
-                    dataset_id: "dataset-1".to_string(),
-                },
-            ),
-            (
-                astra_services::runs::WorkspaceSourceRequest::ArtifactBundle {
-                    artifact_id: "artifact-1".to_string(),
-                },
-                RuntimeWorkspaceSource::ArtifactBundle {
-                    artifact_id: "artifact-1".to_string(),
-                },
-            ),
-        ];
-
-        for (source, expected_source) in cases {
-            let mut request = test_request("inspect materialized source");
-            request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
-                kind: astra_services::runs::WorkspaceBindingRequestKind::CloudWorkspace,
-                display_name: None,
-                root: None,
-                source: Some(source),
-                authority: None,
-                fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
-            });
-
-            let provision_request = ok(cloud_workspace_provision_request_from_request(
-                &request,
-                "bundle-run",
-            ))
-            .expect("bundle workspace request");
-
-            assert_eq!(
-                provision_request.authority,
-                astra_runtime_env::WorkspaceAuthority::ReadOnly
-            );
-            assert_eq!(
-                provision_request.persistence,
-                RuntimeWorkspacePersistence::ImmutableSnapshot
-            );
-            assert_eq!(provision_request.source, expected_source);
-        }
-    }
-
-    #[test]
-    fn cloud_materialized_source_rejects_relative_root_before_provisioning() {
-        let mut request = test_request("bad template root");
-        request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
-            kind: astra_services::runs::WorkspaceBindingRequestKind::CloudWorkspace,
-            display_name: None,
-            root: Some("relative/template".to_string()),
-            source: Some(astra_services::runs::WorkspaceSourceRequest::Template {
-                template_id: "template-1".to_string(),
-            }),
-            authority: None,
-            fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
-        });
-
-        let error = err(cloud_workspace_provision_request_from_request(
-            &request,
-            "bad-template",
-        ));
-
-        assert_eq!(error.0, StatusCode::BAD_REQUEST);
-        assert!(
-            error
-                .1
-                .0
-                .detail
-                .contains("absolute materialized source path"),
-            "{}",
-            error.1.0.detail
-        );
-    }
-
-    #[test]
-    fn cloud_materialized_source_rejects_empty_identifier() {
-        let mut request = test_request("bad dataset");
-        request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
-            kind: astra_services::runs::WorkspaceBindingRequestKind::CloudWorkspace,
-            display_name: None,
-            root: None,
-            source: Some(
-                astra_services::runs::WorkspaceSourceRequest::DatasetBundle {
-                    dataset_id: "   ".to_string(),
-                },
-            ),
-            authority: None,
-            fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
-        });
-
-        let error = err(cloud_workspace_provision_request_from_request(
-            &request,
-            "bad-dataset",
-        ));
-
-        assert_eq!(error.0, StatusCode::BAD_REQUEST);
-        assert!(
-            error.1.0.detail.contains("non-empty source.dataset_id"),
-            "{}",
-            error.1.0.detail
-        );
-    }
-
-    #[test]
-    fn cloud_workspace_binding_requires_materialized_source() {
-        let mut request = test_request("checkout");
-        request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
-            kind: astra_services::runs::WorkspaceBindingRequestKind::CloudWorkspace,
-            display_name: None,
-            root: None,
-            source: Some(astra_services::runs::WorkspaceSourceRequest::GitCheckout {
-                repository: "   ".to_string(),
-                reference: None,
-            }),
-            authority: None,
-            fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
-        });
-
-        let error = err(cloud_workspace_provision_request_from_request(
-            &request, "789",
-        ));
-
-        assert_eq!(error.0, StatusCode::BAD_REQUEST);
-        assert!(
-            error
-                .1
-                .0
-                .detail
-                .contains("Git checkout workspace requires a non-empty source.repository"),
-            "{}",
-            error.1.0.detail
-        );
-    }
-
-    #[test]
-    fn cloud_workspace_binding_rejects_missing_source() {
-        let mut request = test_request("use cloud workspace");
-        request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
-            kind: astra_services::runs::WorkspaceBindingRequestKind::CloudWorkspace,
-            display_name: None,
-            root: None,
-            source: None,
-            authority: None,
-            fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
-        });
-
-        let error = err(cloud_workspace_provision_request_from_request(
-            &request,
-            "bad-volume",
-        ));
-
-        assert_eq!(error.0, StatusCode::BAD_REQUEST);
-        assert!(
-            error
-                .1
-                .0
-                .detail
-                .contains("Cloud workspace requires an explicit source"),
-            "{}",
-            error.1.0.detail
-        );
-    }
-
-    #[test]
-    fn cloud_workspace_runtime_kind_projects_to_server_binding() {
-        let record = RuntimeWorkspaceRecord {
-            workspace_id: "workspace-1".to_string(),
-            owner_scope: RuntimeWorkspaceOwnerScope::Tenant,
-            kind: astra_runtime_env::WorkspaceBindingKind::CloudWorkspace,
-            authority: astra_runtime_env::WorkspaceAuthority::ReadWrite,
-            root_or_volume_ref: "/cloud/volumes/team-volume-1".to_string(),
-            source: RuntimeWorkspaceSource::PersistentVolume {
-                volume_id: "team-volume-1".to_string(),
-            },
-            persistence: RuntimeWorkspacePersistence::Persistent,
-            revision: "1".to_string(),
-            display_name: "Team workspace".to_string(),
-        };
-
-        let workspace = server_workspace_binding_from_workspace_record(&record);
-
-        assert_eq!(workspace.kind, WorkspaceBindingKind::CloudWorkspace);
-        assert_eq!(
-            workspace.cwd.as_deref(),
-            Some("/cloud/volumes/team-volume-1")
-        );
-    }
-
-    #[test]
-    fn request_execution_bindings_use_actual_server_workspace_for_server_sandbox() {
-        let mut request = test_request("hello");
-        request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
-            kind: astra_services::runs::WorkspaceBindingRequestKind::ServerSandbox,
-            display_name: Some("Requested server".to_string()),
-            root: Some("/client/claimed/path".to_string()),
-            source: None,
-            authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
-            fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
-        });
-        request.executor_binding = Some(astra_services::runs::ExecutorBindingRequest {
-            kind: astra_services::runs::ExecutorBindingRequestKind::ServerLocal,
-            executor_id: Some("server-local".to_string()),
-            display_name: Some("Requested executor".to_string()),
-            transport: Some(astra_services::runs::ToolTransportKindRequest::ServerLocal),
-            status: Some(astra_services::runs::ExecutorStatusRequest::Online),
-        });
-
-        let server_workspace = Path::new("/tmp/astra-runtime-workspace");
-        let (workspace, executor) = resolve_request_execution_bindings(&request, server_workspace);
-
-        assert_eq!(workspace.kind, WorkspaceBindingKind::ServerSandbox);
-        assert_eq!(workspace.display_name, "Requested server");
-        assert_eq!(
-            workspace.cwd.as_deref(),
-            Some("/tmp/astra-runtime-workspace")
-        );
-        assert_eq!(workspace.authority, WorkspaceAuthority::ReadWrite);
-        assert_eq!(workspace.fallback_policy, FallbackPolicy::Disabled);
-        assert_eq!(executor.kind, ExecutorBindingKind::ServerLocal);
-        assert_eq!(executor.executor_id, "server-local");
-        assert_eq!(executor.display_name, "Requested executor");
-        assert_eq!(executor.transport, ToolTransportKind::ServerLocal);
-        assert_eq!(executor.status, ExecutorStatus::Online);
-    }
-
-    #[test]
-    fn server_workspace_binding_decision_respects_explicit_binding_and_edge_tools() {
-        let mut request = test_request("hello");
-
-        assert!(request_uses_server_workspace(&request, false));
-        assert!(!request_uses_server_workspace(&request, true));
-
-        request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
-            kind: astra_services::runs::WorkspaceBindingRequestKind::ServerSandbox,
-            display_name: None,
-            root: None,
-            source: None,
-            authority: None,
-            fallback_policy: None,
-        });
-        assert!(request_uses_server_workspace(&request, true));
-
-        request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
-            kind: astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace,
-            display_name: Some("Edge".to_string()),
-            root: Some("/repo".to_string()),
-            source: Some(astra_services::runs::WorkspaceSourceRequest::EdgePath {
-                path: "/repo".to_string(),
-            }),
-            authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
-            fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
-        });
-        assert!(!request_uses_server_workspace(&request, false));
-        assert!(!request_uses_server_workspace(&request, true));
-    }
-
-    #[test]
-    fn request_execution_bindings_keep_edge_workspace_without_server_fallback() {
-        let mut request = test_request("review this repo");
-        request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
-            kind: astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace,
-            display_name: Some("MacBook Pro".to_string()),
-            root: Some("/Users/xupeng/github/astra".to_string()),
-            source: Some(astra_services::runs::WorkspaceSourceRequest::EdgePath {
-                path: "/Users/xupeng/github/astra".to_string(),
-            }),
-            authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
-            fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
-        });
-        request.executor_binding = Some(astra_services::runs::ExecutorBindingRequest {
-            kind: astra_services::runs::ExecutorBindingRequestKind::EdgeAgent,
-            executor_id: Some("edge-macbook-1".to_string()),
-            display_name: Some("MacBook Pro".to_string()),
-            transport: Some(astra_services::runs::ToolTransportKindRequest::EdgeWs),
-            status: Some(astra_services::runs::ExecutorStatusRequest::Online),
-        });
-
-        let (workspace, executor) =
-            resolve_request_execution_bindings(&request, Path::new("/tmp/server-workspace"));
-
-        assert_eq!(workspace.kind, WorkspaceBindingKind::EdgeWorkspace);
-        assert_eq!(workspace.display_name, "MacBook Pro");
-        assert_eq!(workspace.cwd.as_deref(), Some("/Users/xupeng/github/astra"));
-        assert_eq!(workspace.fallback_policy, FallbackPolicy::Disabled);
-        assert_eq!(executor.kind, ExecutorBindingKind::EdgeAgent);
-        assert_eq!(executor.executor_id, "edge-macbook-1");
-        assert_eq!(executor.transport, ToolTransportKind::EdgeWs);
-        assert_eq!(executor.status, ExecutorStatus::Online);
-    }
-
-    #[test]
-    fn workspace_binding_request_accepts_legacy_cwd_alias() {
-        let mut request = test_request("review this repo");
-        request.workspace_binding = Some(
-            serde_json::from_value(json!({
-                "kind": "edge_workspace",
-                "display_name": "MacBook Pro",
-                "cwd": "/Users/test/repo",
-                "authority": "read_write",
-                "fallback_policy": "disabled"
-            }))
-            .expect("legacy cwd alias should deserialize"),
-        );
-        request.executor_binding = Some(astra_services::runs::ExecutorBindingRequest {
-            kind: astra_services::runs::ExecutorBindingRequestKind::EdgeAgent,
-            executor_id: Some("edge-1".to_string()),
-            display_name: Some("MacBook Pro".to_string()),
-            transport: Some(astra_services::runs::ToolTransportKindRequest::EdgeWs),
-            status: Some(astra_services::runs::ExecutorStatusRequest::Online),
-        });
-
-        let (workspace, executor) =
-            resolve_request_execution_bindings(&request, Path::new("/tmp/server-workspace"));
-
-        assert_eq!(workspace.kind, WorkspaceBindingKind::EdgeWorkspace);
-        assert_eq!(workspace.cwd.as_deref(), Some("/Users/test/repo"));
-        assert_eq!(executor.kind, ExecutorBindingKind::EdgeAgent);
-        assert_eq!(executor.transport, ToolTransportKind::EdgeWs);
-    }
-
-    #[test]
-    fn edge_profile_execution_bindings_make_legacy_edge_tools_explicit() {
-        let mut edge_profile = Map::new();
-        edge_profile.insert("cwd".to_string(), json!("/Users/xupeng/github/astra"));
-        edge_profile.insert("edge_agent_id".to_string(), json!("edge-macbook-1"));
-        edge_profile.insert("hostname".to_string(), json!("MacBook Pro"));
-
-        let (workspace, executor) = resolve_request_execution_bindings_without_server_workspace(
-            &test_request("review this repo"),
-            &edge_profile,
-            true,
-        )
-        .expect("legacy edge profile should produce explicit bindings");
-
-        assert_eq!(workspace.kind, WorkspaceBindingKind::EdgeWorkspace);
-        assert_eq!(workspace.display_name, "MacBook Pro");
-        assert_eq!(workspace.cwd.as_deref(), Some("/Users/xupeng/github/astra"));
-        assert_eq!(workspace.authority, WorkspaceAuthority::ReadWrite);
-        assert_eq!(workspace.fallback_policy, FallbackPolicy::Disabled);
-        assert_eq!(executor.kind, ExecutorBindingKind::EdgeAgent);
-        assert_eq!(executor.executor_id, "edge-macbook-1");
-        assert_eq!(executor.display_name, "MacBook Pro");
-        assert_eq!(executor.transport, ToolTransportKind::EdgeLedger);
-        assert_eq!(executor.status, ExecutorStatus::Online);
-    }
-
-    #[test]
-    fn missing_edge_profile_execution_bindings_emit_no_workspace() {
-        let (workspace, executor) = resolve_request_execution_bindings_without_server_workspace(
-            &test_request("hello"),
-            &Map::new(),
-            false,
-        )
-        .expect("missing edge profile should still produce an explicit no-workspace binding");
-
-        assert_eq!(workspace.kind, WorkspaceBindingKind::None);
-        assert_eq!(workspace.display_name, "No workspace");
-        assert_eq!(workspace.authority, WorkspaceAuthority::None);
-        assert_eq!(workspace.fallback_policy, FallbackPolicy::Disabled);
-        assert_eq!(executor.kind, ExecutorBindingKind::ServerLocal);
-        assert_eq!(executor.executor_id, "server-control-plane");
-        assert_eq!(executor.display_name, "Server control plane");
-        assert_eq!(executor.transport, ToolTransportKind::ServerLocal);
-        assert_eq!(executor.status, ExecutorStatus::Online);
-    }
-
-    #[test]
-    fn missing_edge_profile_with_edge_tools_uses_edge_ledger() {
-        let (workspace, executor) = resolve_request_execution_bindings_without_server_workspace(
-            &test_request("run client tool"),
-            &Map::new(),
-            true,
-        )
-        .expect("edge tools should produce an explicit edge-ledger binding");
-
-        assert_eq!(workspace.kind, WorkspaceBindingKind::EdgeWorkspace);
-        assert_eq!(workspace.display_name, "Edge workspace");
-        assert_eq!(workspace.cwd, None);
-        assert_eq!(workspace.authority, WorkspaceAuthority::ReadWrite);
-        assert_eq!(executor.kind, ExecutorBindingKind::EdgeAgent);
-        assert_eq!(executor.executor_id, "edge-ledger");
-        assert_eq!(executor.transport, ToolTransportKind::EdgeLedger);
-        assert_eq!(executor.status, ExecutorStatus::Online);
-    }
-
-    #[test]
-    fn explicit_no_workspace_binding_uses_server_control_plane_executor() {
-        let mut request = test_request("plan only");
-        request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
-            kind: astra_services::runs::WorkspaceBindingRequestKind::None,
-            display_name: None,
-            root: None,
-            source: None,
-            authority: None,
-            fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
-        });
-
-        let (workspace, executor) =
-            resolve_request_execution_bindings(&request, Path::new("/tmp/server-workspace"));
-
-        assert_eq!(workspace.kind, WorkspaceBindingKind::None);
-        assert_eq!(workspace.display_name, "No workspace");
-        assert_eq!(workspace.authority, WorkspaceAuthority::None);
-        assert_eq!(workspace.fallback_policy, FallbackPolicy::Disabled);
-        assert_eq!(executor.kind, ExecutorBindingKind::ServerLocal);
-        assert_eq!(executor.executor_id, "server-control-plane");
-        assert_eq!(executor.display_name, "Server control plane");
-        assert_eq!(executor.transport, ToolTransportKind::ServerLocal);
-        assert_eq!(executor.status, ExecutorStatus::Online);
-    }
-
-    #[test]
-    fn execution_bindings_from_metadata_rebases_server_sandbox_cwd() {
-        let metadata = json!({
-            "workspace": {
-                "kind": "server_sandbox",
-                "display_name": "Server sandbox",
-                "cwd": "/tmp/parent-workspace",
-                "authority": "read_write",
-                "fallback_policy": "disabled"
-            },
-            "executor": {
-                "kind": "server_local",
-                "executor_id": "server-local",
-                "display_name": "Server sandbox",
-                "transport": "server_local",
-                "status": "online"
-            }
-        });
-
-        let snapshot =
-            execution_bindings_from_metadata(Some(&metadata), Path::new("/tmp/child-workspace"))
-                .expect("metadata bindings");
-        let workspace = &snapshot.workspace;
-        let executor = &snapshot.executor;
-
-        assert_eq!(workspace.kind, WorkspaceBindingKind::ServerSandbox);
-        assert_eq!(workspace.cwd.as_deref(), Some("/tmp/child-workspace"));
-        assert_eq!(executor.kind, ExecutorBindingKind::ServerLocal);
-        assert!(snapshot.runtime.is_none());
-    }
-
-    #[tokio::test]
-    async fn validate_request_constraints_rejects_legacy_mcp_binding_ids() {
-        let service = test_service();
-        let mut request = test_request("hello");
-        request.mcp_binding_ids = Some(vec![301]);
-
-        let err = service
-            .validate_request_constraints("u1", &request)
-            .await
-            .expect_err("legacy mcp_binding_ids must be rejected on chat stream");
-
-        assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        assert!(
-            err.1
-                .0
-                .detail
-                .contains("mcp_binding_ids is no longer supported")
-        );
-    }
-
-    #[test]
-    fn runtime_bearer_parser_accepts_exact_single_bearer_token() {
-        let parsed =
-            parse_runtime_bearer_authorization("Bearer abc.DEF-123_~+/=").expect("valid bearer");
-        assert_eq!(parsed.token, "abc.DEF-123_~+/=");
-    }
-
-    #[test]
-    fn runtime_bearer_parser_rejects_malformed_or_multiple_credentials() {
-        for value in [
-            "",
-            "Basic abc",
-            "bearer abc",
-            "Bearer ",
-            "Bearer  abc",
-            "Bearer abc ",
-            "Bearer abc def",
-            "Bearer abc,Bearer def",
-            "Bearer abc,def",
-            "Bearer abc;def",
-            "Bearer abc:Bearer:def",
-        ] {
-            let err = parse_runtime_bearer_authorization(value)
-                .expect_err("malformed bearer should be rejected");
-            assert_eq!(err.0, StatusCode::BAD_REQUEST, "{value}");
-            assert_eq!(
-                err.1.0.error_code.as_deref(),
-                Some("agent_binding_runtime_auth_invalid"),
-                "{value}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn validate_request_constraints_rejects_implicit_request_scoped_runtime_mcp_by_default() {
-        let service = test_service();
-        let mut request = test_request("hello");
-        request.runtime_mcp_bindings = vec![test_runtime_mcp_binding()];
-
-        let err = service
-            .validate_request_constraints("u1", &request)
-            .await
-            .expect_err("runtime_mcp_bindings must explicitly select request_scoped profile");
-
-        assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        assert_eq!(
-            err.1.0.error_code.as_deref(),
-            Some("agent_binding_runtime_profile_conflict")
-        );
-        assert!(
-            err.1
-                .0
-                .detail
-                .contains("runtime_profile=request_scoped_runtime_mcp")
-        );
-    }
-
-    #[tokio::test]
-    async fn validate_request_constraints_allows_explicit_request_scoped_runtime_mcp() {
-        let service = test_service();
-        let mut request = test_request("hello");
-        request.runtime_mcp_bindings = vec![test_runtime_mcp_binding()];
-        request.runtime_profile = Some(RuntimeProfileRequest::RequestScopedRuntimeMcp);
-
-        service
-            .validate_request_constraints("u1", &request)
-            .await
-            .expect("explicit request_scoped_runtime_mcp profile should allow runtime MCP");
-    }
-
-    #[tokio::test]
-    async fn validate_request_constraints_allows_implicit_request_scoped_runtime_mcp_when_enabled()
-    {
-        let service = test_service().with_allow_implicit_request_scoped_mcp(true);
-        let mut request = test_request("hello");
-        request.runtime_mcp_bindings = vec![test_runtime_mcp_binding()];
-
-        service
-            .validate_request_constraints("u1", &request)
-            .await
-            .expect("compatibility flag should allow implicit request-scoped runtime MCP");
-    }
-
-    #[tokio::test]
-    async fn validate_request_constraints_requires_selected_model() {
-        let service = test_service();
-        let mut request = test_request("hello");
-        request.model = None;
-        request.selected_model = None;
-
-        let err = service
-            .validate_request_constraints("u1", &request)
-            .await
-            .expect_err("selected_model is required for every chat stream request");
-
-        assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        assert_eq!(
-            err.1.0.error_code.as_deref(),
-            Some("selected_model_missing")
-        );
-    }
-
-    #[tokio::test]
-    async fn validate_request_constraints_allows_native_model_without_gateway_auth() {
-        let service = test_service();
-        let request = test_request("hello");
-
-        service
-            .validate_request_constraints("u1", &request)
-            .await
-            .expect("native selected_model.model should not require runtime_auth");
-    }
-
-    #[tokio::test]
-    async fn validate_request_constraints_rejects_unknown_native_model_without_gateway() {
-        let service = test_service();
-        let mut request = test_request("hello");
-        request.selected_model = Some(SelectedModelRequest {
-            id: None,
-            model: "missing-model".to_string(),
-            gateway: None,
-        });
-
-        let err = service
-            .validate_request_constraints("u1", &request)
-            .await
-            .expect_err("unknown native model should fail without gateway");
-
-        assert_eq!(err.0, StatusCode::NOT_FOUND);
-        assert_eq!(
-            err.1.0.error_code.as_deref(),
-            Some("selected_model_not_configured")
-        );
-    }
-
-    #[tokio::test]
-    async fn validate_request_constraints_requires_runtime_auth_for_gateway() {
-        let service = test_service();
-        let mut request = test_request("hello");
-        request.selected_model = Some(SelectedModelRequest {
-            id: None,
-            model: "external-model".to_string(),
-            gateway: Some("primary-gateway".to_string()),
-        });
-
-        let err = service
-            .validate_request_constraints("u1", &request)
-            .await
-            .expect_err("gateway selected_model must require runtime_auth");
-
-        assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        assert_eq!(
-            err.1.0.error_code.as_deref(),
-            Some("agent_binding_runtime_auth_missing")
-        );
-    }
-
-    #[tokio::test]
-    async fn validate_request_constraints_rejects_unknown_selected_model_gateway() {
-        let service = test_service().with_model_gateway_service(Arc::new(
-            astra_services::InMemoryModelGatewayService::new(),
-        ));
-        let mut request = test_request("hello");
-        request.selected_model = Some(SelectedModelRequest {
-            id: None,
-            model: "external-model".to_string(),
-            gateway: Some("primary-gateway".to_string()),
-        });
-        request.runtime_auth = Some(RuntimeAuthRequest {
-            authorization: "Bearer runtime-grant".to_string(),
-        });
-
-        let err = service
-            .validate_request_constraints("u1", &request)
-            .await
-            .expect_err("unknown selected_model.gateway should fail before loop start");
-
-        assert_eq!(err.0, StatusCode::NOT_FOUND);
-        assert_eq!(
-            err.1.0.error_code.as_deref(),
-            Some("model_gateway_not_found")
-        );
-    }
-
-    #[tokio::test]
-    async fn validate_request_constraints_rejects_disabled_selected_model_gateway() {
-        let gateway_service = astra_services::InMemoryModelGatewayService::new();
-        astra_services::ModelGatewayService::create_gateway(
-            &gateway_service,
-            astra_services::ModelGatewayCreateRequestData {
-                id: "primary-gateway".to_string(),
-                resolve_url: "https://models.example.com/resolve".to_string(),
-                model_protocol: astra_services::ModelProtocol::OpenAiChatCompletions,
-                metadata: None,
-            },
-        )
-        .await
-        .expect("gateway create");
-        astra_services::ModelGatewayService::disable_gateway(
-            &gateway_service,
-            "primary-gateway".to_string(),
-        )
-        .await
-        .expect("gateway disable");
-        let service = test_service().with_model_gateway_service(Arc::new(gateway_service));
-        let mut request = test_request("hello");
-        request.selected_model = Some(SelectedModelRequest {
-            id: None,
-            model: "external-model".to_string(),
-            gateway: Some("primary-gateway".to_string()),
-        });
-        request.runtime_auth = Some(RuntimeAuthRequest {
-            authorization: "Bearer runtime-grant".to_string(),
-        });
-
-        let err = service
-            .validate_request_constraints("u1", &request)
-            .await
-            .expect_err("disabled selected_model.gateway should fail before loop start");
-
-        assert_eq!(err.0, StatusCode::CONFLICT);
-        assert_eq!(
-            err.1.0.error_code.as_deref(),
-            Some("model_gateway_disabled")
-        );
-    }
-
-    fn test_runtime_descriptor(
-        id: &str,
-        descriptor_type: &str,
-        endpoint_url: &str,
-    ) -> astra_services::runs::RuntimeCapabilityDescriptorRequest {
-        astra_services::runs::RuntimeCapabilityDescriptorRequest {
-            id: id.to_string(),
-            descriptor_type: descriptor_type.to_string(),
-            transport: "http".to_string(),
-            endpoint_url: endpoint_url.to_string(),
-            protocol: "openai_responses".to_string(),
-            metadata: serde_json::Map::new(),
-        }
-    }
-
-    #[tokio::test]
-    async fn validate_request_constraints_accepts_provider_descriptor_without_registered_gateway() {
-        let service = test_service();
-        let mut request = test_request("hello");
-        request.provider_runtime_authorized = true;
-        request.selected_model = Some(SelectedModelRequest {
-            id: None,
-            model: "qwen3.7-max".to_string(),
-            gateway: None,
-        });
-        request.runtime_auth = Some(RuntimeAuthRequest {
-            authorization: "Bearer runtime-grant".to_string(),
-        });
-        request.capability_descriptors =
-            Some(astra_services::runs::RuntimeCapabilityDescriptorsRequest {
-                model_gateway: Some(test_runtime_descriptor(
-                    "moi-model-gateway",
-                    "model_gateway",
-                    "http://127.0.0.1/model-gateway",
-                )),
-                mcp: None,
-                skills: None,
-            });
-
-        service
-            .validate_request_constraints("u1", &request)
-            .await
-            .expect("provider descriptor should not require registered model gateway");
-        let prepared = service
-            .prepare_model_gateway_invocation(request)
-            .await
-            .expect("provider descriptor should become llm_token_service");
-        assert_eq!(
-            prepared
-                .llm_token_service
-                .as_ref()
-                .map(|config| &config.url),
-            Some(&"http://127.0.0.1/model-gateway".to_string())
-        );
-    }
-
-    #[tokio::test]
-    async fn validate_request_constraints_rejects_descriptor_without_provider_authorization() {
-        let service = test_service();
-        let mut request = test_request("hello");
-        request.selected_model = Some(SelectedModelRequest {
-            id: Some("model-qwen".to_string()),
-            model: "qwen3.7-max".to_string(),
-            gateway: None,
-        });
-        request.runtime_auth = Some(RuntimeAuthRequest {
-            authorization: "Bearer runtime-grant".to_string(),
-        });
-        request.capability_descriptors =
-            Some(astra_services::runs::RuntimeCapabilityDescriptorsRequest {
-                model_gateway: Some(test_runtime_descriptor(
-                    "moi-model-gateway",
-                    "model_gateway",
-                    "http://127.0.0.1/model-gateway",
-                )),
-                mcp: None,
-                skills: None,
-            });
-
-        let err = service
-            .validate_request_constraints("u1", &request)
-            .await
-            .expect_err("provider descriptors require provider authorization");
-        assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        assert_eq!(
-            err.1.0.error_code.as_deref(),
-            Some("external_runtime_context_required")
-        );
-    }
-
-    #[tokio::test]
-    async fn validate_request_constraints_rejects_agent_binding_registry_profile_without_binding() {
-        let service = test_service();
-        let mut request = test_request("hello");
-        request.runtime_profile = Some(RuntimeProfileRequest::AgentBindingRegistry);
-
-        let err = service
-            .validate_request_constraints("u1", &request)
-            .await
-            .expect_err("agent_binding_registry profile must not be set without agent_binding");
-
-        assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        assert_eq!(
-            err.1.0.error_code.as_deref(),
-            Some("agent_binding_runtime_profile_conflict")
-        );
-    }
-
-    #[tokio::test]
-    async fn validate_request_constraints_allows_agent_binding_with_omitted_runtime_profile() {
-        let service = test_service();
-        let mut request = test_request("hello");
-        request.agent_binding = Some(AgentBindingRuntimeRequest {
-            id: "abnd_test1234567890".to_string(),
-            capability_server_refs: CapabilityServerRefs {
-                mcp: "mcp-main".to_string(),
-                skills: "skills-main".to_string(),
-            },
-        });
-        request.runtime_auth = Some(RuntimeAuthRequest {
-            authorization: "Bearer runtime-grant".to_string(),
-        });
-
-        service
-            .validate_request_constraints("u1", &request)
-            .await
-            .expect("agent_binding itself is the explicit registry opt-in");
-    }
-
-    #[tokio::test]
-    async fn validate_request_constraints_rejects_agent_binding_edge_tools() {
-        let service = test_service();
-        let mut request = test_request("hello");
-        request.agent_binding = Some(AgentBindingRuntimeRequest {
-            id: "abnd_test1234567890".to_string(),
-            capability_server_refs: CapabilityServerRefs {
-                mcp: "mcp-main".to_string(),
-                skills: "skills-main".to_string(),
-            },
-        });
-        request.runtime_auth = Some(RuntimeAuthRequest {
-            authorization: "Bearer runtime-grant".to_string(),
-        });
-        request.context = Some(
-            json!({
-                "edge_tools": [{"function": {"name": "request_tool"}}]
-            })
-            .as_object()
-            .unwrap()
-            .clone(),
-        );
-
-        let err = service
-            .validate_request_constraints("u1", &request)
-            .await
-            .expect_err("agent_binding mode cannot carry request-scoped edge tools");
-
-        assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        assert_eq!(
-            err.1.0.error_code.as_deref(),
-            Some("agent_binding_runtime_profile_conflict")
-        );
-    }
-
-    #[tokio::test]
-    async fn validate_request_constraints_rejects_agent_binding_edge_skills() {
-        let service = test_service();
-        let mut request = test_request("hello");
-        request.agent_binding = Some(AgentBindingRuntimeRequest {
-            id: "abnd_test1234567890".to_string(),
-            capability_server_refs: CapabilityServerRefs {
-                mcp: "mcp-main".to_string(),
-                skills: "skills-main".to_string(),
-            },
-        });
-        request.runtime_auth = Some(RuntimeAuthRequest {
-            authorization: "Bearer runtime-grant".to_string(),
-        });
-        request.context = Some(
-            json!({
-                "edge_skills": [{"name": "request_skill"}]
-            })
-            .as_object()
-            .unwrap()
-            .clone(),
-        );
-
-        let err = service
-            .validate_request_constraints("u1", &request)
-            .await
-            .expect_err("agent_binding mode cannot carry request-scoped edge skills");
-
-        assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        assert_eq!(
-            err.1.0.error_code.as_deref(),
-            Some("agent_binding_runtime_profile_conflict")
-        );
-    }
-
-    #[tokio::test]
-    async fn build_initial_state_includes_database_skill_provider_when_wired() {
-        use astra_services::skills::{
-            SkillInfoRecord, SkillListCursor, SkillListItem, SkillListRecord,
-            SkillPublishRequestData, SkillRecord, SkillService, SkillStatusRecord,
-            SkillVersionRecord,
-        };
-        use async_trait::async_trait;
-
-        #[derive(Default)]
-        struct MockSkillService {
-            unsupported_calls: std::sync::atomic::AtomicUsize,
-        }
-
-        impl MockSkillService {
-            fn unsupported<T>(
-                &self,
-                operation: &str,
-            ) -> Result<T, (StatusCode, Json<ErrorResponse>)> {
-                self.unsupported_calls
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Err((
-                    StatusCode::NOT_IMPLEMENTED,
-                    Json(ErrorResponse::new(format!(
-                        "MockSkillService::{operation} is not implemented in this test"
-                    ))),
-                ))
-            }
-        }
-
-        #[async_trait]
-        impl SkillService for MockSkillService {
-            async fn list_skills(
-                &self,
-                _user_id: String,
-                limit: u32,
-                cursor: Option<SkillListCursor>,
-            ) -> Result<SkillListRecord, (StatusCode, Json<ErrorResponse>)> {
-                if cursor.is_some() {
-                    return Ok(SkillListRecord {
-                        skills: Vec::new(),
-                        total: 1,
-                        limit,
-                        next_cursor: None,
-                    });
-                }
-                Ok(SkillListRecord {
-                    skills: vec![SkillListItem {
-                        skill_id: "remote-db@1.0.0".to_string(),
-                        skill_name: "remote-db".to_string(),
-                        version: "1.0.0".to_string(),
-                        description: Some("Remote DB skill".to_string()),
-                        status: Some("active".to_string()),
-                        source: Some("user".to_string()),
-                        category: Some("integration".to_string()),
-                        created_at: None,
-                    }],
-                    total: 1,
-                    limit,
-                    next_cursor: None,
-                })
-            }
-
-            async fn get_skill(
-                &self,
-                _user_id: String,
-                skill_id: String,
-                _version: Option<String>,
-            ) -> Result<SkillRecord, (StatusCode, Json<ErrorResponse>)> {
-                if skill_id == "remote-db" || skill_id == "remote-db@1.0.0" {
-                    return Ok(SkillRecord {
-                        skill_id: "remote-db@1.0.0".to_string(),
-                        skill_name: "remote-db".to_string(),
-                        version: "1.0.0".to_string(),
-                        description: Some("Remote DB skill".to_string()),
-                        metadata: Some(serde_json::json!({
-                            "skill_type": "remote",
-                            "remote_url": "http://127.0.0.1:18080/remote-skill",
-                            "forward_headers": ["authorization", "x-workspace-id"],
-                            "required_headers": ["x-workspace-id"],
-                            "when_to_use": "when task needs remote orchestration"
-                        })),
-                        created_at: None,
-                    });
-                }
-                Err((
-                    StatusCode::NOT_FOUND,
-                    Json(ErrorResponse::new("not found".to_string())),
-                ))
-            }
-
-            async fn get_skill_info(
-                &self,
-                _: String,
-                _: String,
-            ) -> Result<SkillInfoRecord, (StatusCode, Json<ErrorResponse>)> {
-                self.unsupported("get_skill_info")
-            }
-
-            async fn list_skill_versions(
-                &self,
-                _: String,
-                _: String,
-            ) -> Result<Vec<SkillVersionRecord>, (StatusCode, Json<ErrorResponse>)> {
-                self.unsupported("list_skill_versions")
-            }
-
-            async fn get_skill_status(
-                &self,
-                _: String,
-                _: u32,
-            ) -> Result<SkillStatusRecord, (StatusCode, Json<ErrorResponse>)> {
-                self.unsupported("get_skill_status")
-            }
-
-            async fn publish_skill(
-                &self,
-                _: String,
-                _: SkillPublishRequestData,
-            ) -> Result<serde_json::Value, (StatusCode, Json<ErrorResponse>)> {
-                self.unsupported("publish_skill")
-            }
-
-            async fn unpublish_skill(
-                &self,
-                _: String,
-                _: String,
-            ) -> Result<serde_json::Value, (StatusCode, Json<ErrorResponse>)> {
-                self.unsupported("unpublish_skill")
-            }
-        }
-
-        let skill_service = Arc::new(MockSkillService::default());
-        let svc = test_service().with_skill_service(skill_service.clone());
-
-        let default_request = test_request("hello");
-        let default_state = svc.build_initial_state(
-            "test-user",
-            &default_request,
-            "session-1",
-            "run-1",
-            None,
-            None,
-            None,
-        );
-        let default_resolver = default_state
-            .skills
-            .resolver
-            .as_ref()
-            .expect("default server resolver should include visible catalog");
-        let default_names: Vec<String> = default_resolver
-            .available_skills()
-            .into_iter()
-            .map(|skill| skill.name)
-            .collect();
-        assert!(
-            default_names.iter().any(|name| name == "remote-db"),
-            "expected database skill without request allow_skills filter: {default_names:?}"
-        );
-        assert!(
-            default_state.skills.registry_for_activation.is_some(),
-            "unfiltered server catalog should be available for conditional activation"
-        );
-
-        let mut request = test_request("hello");
-        request.allow_skills = Some(vec!["remote-db".to_string()]);
-        let state = svc.build_initial_state(
-            "test-user",
-            &request,
-            "session-1",
-            "run-1",
-            None,
-            None,
-            None,
-        );
-        let resolver = state
-            .skills
-            .resolver
-            .as_ref()
-            .expect("skill resolver should be configured");
-        let names: Vec<String> = resolver
-            .available_skills()
-            .into_iter()
-            .map(|s| s.name)
-            .collect();
-        assert!(
-            names.iter().any(|name| name == "remote-db"),
-            "expected database skill in available skills: {names:?}"
-        );
-
-        let resolved = resolver
-            .resolve("remote-db")
-            .expect("resolver should load database skill");
-        assert_eq!(
-            resolved.remote_url.as_deref(),
-            Some("http://127.0.0.1:18080/remote-skill")
-        );
-        assert_eq!(
-            resolved.forward_headers,
-            vec!["authorization".to_string(), "x-workspace-id".to_string()]
-        );
-        assert_eq!(
-            resolved.required_headers,
-            vec!["x-workspace-id".to_string()]
-        );
-
-        let mut filtered_request = test_request("hello");
-        filtered_request.allow_skills = Some(vec!["remote-db".to_string()]);
-        let filtered_state = svc.build_initial_state(
-            "test-user",
-            &filtered_request,
-            "session-1",
-            "run-1",
-            None,
-            None,
-            None,
-        );
-        assert!(
-            filtered_state.skills.registry_for_activation.is_none(),
-            "request-scoped allow_skills should disable automatic conditional activation"
-        );
-        let filtered_resolver = filtered_state
-            .skills
-            .resolver
-            .as_ref()
-            .expect("filtered resolver should be configured");
-        let filtered_names: Vec<String> = filtered_resolver
-            .available_skills()
-            .into_iter()
-            .map(|skill| skill.name)
-            .collect();
-        assert_eq!(filtered_names, vec!["remote-db".to_string()]);
-        filtered_resolver
-            .resolve("remote-db")
-            .expect("allowed remote-db skill should resolve");
-        assert_eq!(
-            skill_service
-                .unsupported_calls
-                .load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "build_initial_state should only use list_skills/get_skill on this mock"
-        );
-    }
-
-    #[tokio::test]
-    async fn create_run_rejects_unknown_request_skill_allowlist() {
-        let svc = test_service();
-        let mut request = test_request("hello");
-        request.allow_skills = Some(vec!["__missing_skill__".into()]);
-
-        let err = svc
-            .create_run("user-1".into(), request)
-            .await
-            .expect_err("unknown allow_skills entry should be rejected");
-        assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        assert!(err.1.0.detail.contains("allow_skills"));
-    }
-
-    #[test]
-    fn build_runtime_turn_evaluation_event_uses_loop_state_signals() {
-        let svc = test_service();
-        let request = test_request("git status");
-        let mut state = svc.build_initial_state(
-            "test-user",
-            &request,
-            "session-1",
-            "run-1",
-            None,
-            None,
-            None,
-        );
-        state.recent_tools = vec!["git_status".into()];
-        state.telemetry.first_budget_pressure = 0.27;
-        state.stall.events.push(("repetition_stall".into(), 1));
-        state.stall.verdict_events.push(
-            astra_turn_core::agentic_verdict_audit::AgenticVerdictAuditEvent {
-                turn: 1,
-                severity: "warning".into(),
-                injections: vec!["stall detected".into()],
-                avoid_tools: vec!["git_status".into()],
-                health_avoidance_tools: vec![],
-                force_stop: false,
-                nudge_count: 1,
-                interaction_mode: "prompt".into(),
-                suppressed_loop_nudges: false,
-                recent_error_pressure: 0,
-                recent_timeout_pressure: 0,
-                total_errors: 0,
-                health_avoidance_count: 0,
-                total_timeouts: 0,
-                timeout_dominant_tools: vec![],
-                total_cache_hits: 0,
-                flaky_count: 0,
-            },
-        );
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "git_status".into(),
-            ok: true,
-            ms: 14,
-            error: None,
-            input_bytes: Some(8),
-            output_bytes: Some(180),
-            args_preview: None,
-            result_preview: Some("clean".into()),
-            file_path: None,
-            surgically_removed: None,
-            original_tool_name: None,
-            ..Default::default()
-        });
-
-        let event = build_runtime_turn_evaluation_event("session-1", "server_runtime", &state);
-
-        assert_eq!(event.event_type, JournalEventType::TurnEvaluation);
-        assert_eq!(event.turn, None);
-        let metadata = event.metadata.expect("turn evaluation metadata");
-        assert_eq!(metadata["source"], "server_runtime");
-        assert_eq!(metadata["live_query"], false);
-        assert_eq!(metadata["stall_count"], 1);
-        assert_eq!(metadata["verdict_warning"], true);
-        assert_eq!(metadata["tool_call_count"], 1);
-        assert!(metadata["quality"].as_f64().unwrap() < 0.8);
-        assert_eq!(metadata["signals"][0]["kind"], "tool_error_rate");
-    }
-
-    #[test]
-    fn finalize_run_events_appends_run_finished_for_failures() {
-        let svc = test_service();
-        let request = test_request("boom");
-        let state = svc.build_initial_state(
-            "test-user",
-            &request,
-            "session-1",
-            "run-1",
-            None,
-            None,
-            None,
-        );
-
-        let (events, status, error) = AgenticRunLifecycleService::finalize_run_events(
-            Ok(AgenticLoopOutcome::Error("boom".into())),
-            vec![],
-            &state,
-        );
-
-        assert_eq!(status, RunStatus::Failed);
-        assert_eq!(error.as_deref(), Some("boom"));
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0]["event_type"], "run_error");
-        assert_eq!(events[1]["event_type"], "run_finished");
-    }
-
-    #[test]
-    fn finalize_run_events_cancellation_beats_completed_outcome() {
-        let svc = test_service();
-        let request = test_request("done");
-        let mut state = svc.build_initial_state(
-            "test-user",
-            &request,
-            "session-1",
-            "run-1",
-            None,
-            None,
-            None,
-        );
-        let cancel_flag = Arc::new(AtomicBool::new(true));
-        let cancel_token = Arc::new(CancellationToken::new());
-        cancel_token.cancel();
-        state.cancellation.flag = Some(cancel_flag);
-        state.cancellation.token = Some(cancel_token);
-
-        let (events, status, error) = AgenticRunLifecycleService::finalize_run_events(
-            Ok(AgenticLoopOutcome::Completed),
-            vec![],
-            &state,
-        );
-
-        assert_eq!(status, RunStatus::Cancelled);
-        assert!(error.is_none());
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0]["event_type"], "run_finished");
-        assert_eq!(events[0]["data"]["cancelled"], true);
-    }
-
-    #[test]
-    fn streaming_final_replay_excludes_live_work_surface_events() {
-        let events = vec![
-            json!({"type": "text_delta", "content": "hi"}),
-            json!({"type": "reasoning_delta", "content": "thinking"}),
-            json!({"type": "tool_call", "tool_call": {"id": "call-1"}}),
-            json!({"type": "tool_call_end", "call_id": "call-1", "result": "ok"}),
-            json!({"type": "agent_progress", "agent_id": "agent-1", "status": "started"}),
-            json!({"type": "agent_live_event", "agent_id": "agent-1", "event_kind": "output_delta", "content": "child"}),
-            json!({"type": "run_blocked", "call_id": "call-1", "reason": "transport_disconnected"}),
-            json!({"type": "run_blocked", "call_id": "call-2", "reason": "fallback_disabled"}),
-            json!({"type": "run_blocked", "call_id": "call-3", "reason": "route_mismatch"}),
-            json!({"event_type": "text_done", "data": {"full_text": "hi"}}),
-            json!({"event_type": "run_finished", "data": {"prompt_tokens": 1}}),
-        ];
-
-        let replay: Vec<_> = events
-            .iter()
-            .filter(|event| streaming_final_event_for_replay(event))
-            .cloned()
-            .collect();
-
-        assert_eq!(replay.len(), 2);
-        assert_eq!(replay[0]["event_type"], "text_done");
-        assert_eq!(replay[1]["event_type"], "run_finished");
-        assert!(live_delta_event_for_persistence(&events[1]));
-        assert!(live_delta_event_for_persistence(&events[2]));
-        assert!(live_delta_event_for_persistence(&events[3]));
-        assert!(live_delta_event_for_persistence(&events[4]));
-        assert!(live_delta_event_for_persistence(&events[5]));
-        assert!(live_delta_event_for_persistence(&events[6]));
-        assert!(live_delta_event_for_persistence(&events[7]));
-        assert!(live_delta_event_for_persistence(&events[8]));
-    }
-
-    #[test]
-    fn streaming_durable_persistence_keeps_live_events_before_terminal() {
-        let events = vec![
-            json!({"type": "reasoning_delta", "content": "thinking"}),
-            json!({"type": "tool_call", "tool_call": {"id": "call-1"}}),
-            json!({"type": "tool_call_end", "call_id": "call-1", "result": "ok"}),
-            json!({"event_type": "text_done", "data": {"full_text": "answer"}}),
-            json!({"event_type": "run_finished", "data": {"prompt_tokens": 1}}),
-        ];
-
-        let persisted: Vec<_> = events
-            .iter()
-            .filter(|event| streaming_event_for_persistence(event))
-            .cloned()
-            .collect();
-
-        assert_eq!(persisted.len(), 5);
-        assert_eq!(persisted[0]["type"], "reasoning_delta");
-        assert_eq!(persisted[1]["type"], "tool_call");
-        assert_eq!(persisted[2]["type"], "tool_call_end");
-        assert_eq!(persisted[3]["event_type"], "text_done");
-        assert_eq!(persisted[4]["event_type"], "run_finished");
-    }
-
-    #[test]
-    fn active_run_live_event_projection_is_bounded() {
-        let mut run = RunState {
-            run_id: "run-live-bound".to_string(),
-            user_id: "user-live-bound".to_string(),
-            session_id: "session-live-bound".to_string(),
-            status: RunStatus::Running,
-            events: vec![
-                json!({"event_type": "run_started", "data": {"run_id": "run-live-bound"}}),
-            ],
-            cancel_flag: Arc::new(AtomicBool::new(false)),
-            pause_flag: Arc::new(AtomicBool::new(false)),
-            llm_cancel_token: Arc::new(CancellationToken::new()),
-            live_tx: None,
-            waiting_for: None,
-        };
-
-        for idx in 0..(MAX_ACTIVE_RUN_LIVE_EVENTS + 5) {
-            push_active_run_live_event(
-                &mut run,
-                json!({"type": "text_delta", "content": idx.to_string()}),
-            );
-        }
-
-        let live_events: Vec<_> = run
-            .events
-            .iter()
-            .filter(|event| live_delta_event_for_persistence(event))
-            .collect();
-        assert_eq!(live_events.len(), MAX_ACTIVE_RUN_LIVE_EVENTS);
-        assert_eq!(run.events[0]["event_type"], "run_started");
-        assert_eq!(live_events[0]["content"], "5");
-    }
-
-    #[test]
-    fn finalize_run_events_interrupted_completed_outcome_is_partial_not_completed() {
-        let svc = test_service();
-        let request = test_request("partial");
-        let mut state = svc.build_initial_state(
-            "test-user",
-            &request,
-            "session-1",
-            "run-1",
-            None,
-            None,
-            None,
-        );
-        state.final_text = "[Round budget hard-limit reached]".to_string();
-        state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
-            astra_turn_core::interruption::InterruptionKind::BudgetExhausted,
-            astra_turn_core::interruption::ResumeAction::ContinueImmediately,
-            astra_turn_core::interruption::InterruptionStateSummary {
-                has_checkpoint: true,
-                tool_calls_completed: 5,
-                turns_completed: 15,
-                remaining_turns: 0,
-                error_detail: Some("Round budget hard-limit reached".to_string()),
-                stall_signal: None,
-                resume_restricted_tools: vec![],
-            },
-        ));
-
-        let (events, status, error) = AgenticRunLifecycleService::finalize_run_events(
-            Ok(AgenticLoopOutcome::Completed),
-            vec![],
-            &state,
-        );
-
-        assert_eq!(status, RunStatus::Paused);
-        assert!(
-            error
-                .as_deref()
-                .is_some_and(|msg| msg.to_ascii_lowercase().contains("budget"))
-        );
-        assert_eq!(events[0]["event_type"], "text_done");
-        assert_eq!(events[0]["data"]["partial"], true);
-        assert_eq!(
-            events[0]["data"]["interruption"]["kind"],
-            "budget_exhausted"
-        );
-        assert_eq!(events[1]["event_type"], "run_interrupted");
-        assert_eq!(events[2]["event_type"], "run_finished");
-        assert_eq!(events[2]["data"]["interrupted"], true);
-        assert_eq!(events[2]["data"]["interruption_kind"], "budget_exhausted");
-    }
-
-    #[test]
-    fn merge_cancelled_run_events_preserves_order_and_usage() {
-        let cancel_flag = Arc::new(AtomicBool::new(true));
-        let cancel_token = Arc::new(CancellationToken::new());
-        let mut run = RunState {
-            run_id: "run-1".into(),
-            user_id: "user-1".into(),
-            session_id: "session-1".into(),
-            status: RunStatus::Cancelled,
-            events: vec![
-                json!({"event_type": "run_started", "data": {}}),
-                json!({"event_type": "run_finished", "data": {"cancelled": true}}),
-            ],
-            cancel_flag,
-            pause_flag: Arc::new(AtomicBool::new(false)),
-            llm_cancel_token: cancel_token,
-            live_tx: None,
-            waiting_for: None,
-        };
-
-        merge_cancelled_run_events(
-            &mut run,
-            vec![
-                json!({"event_type": "text_delta", "data": {"chunk": "hi"}}),
-                json!({"event_type": "run_finished", "data": {"cancelled": true, "prompt_tokens": 3}}),
-            ],
-        );
-
-        assert_eq!(run.events.len(), 3);
-        assert_eq!(run.events[1]["event_type"], "text_delta");
-        assert_eq!(run.events[2]["event_type"], "run_finished");
-        assert_eq!(run.events[2]["data"]["cancelled"], true);
-        assert_eq!(run.events[2]["data"]["prompt_tokens"], 3);
-    }
-
-    #[test]
-    fn terminal_events_for_persistence_keeps_only_terminal_lifecycle_events() {
-        let events = vec![
-            json!({"event_type": "text_delta", "data": {"chunk": "hi"}}),
-            json!({"type": "reasoning_delta", "content": "thinking"}),
-            json!({"type": "reasoning_done"}),
-            json!({"event_type": "text_done", "data": {"full_text": "final answer"}}),
-            json!({"event_type": "run_error", "data": {"error": "boom"}}),
-            json!({"event_type": "run_finished", "data": {"prompt_tokens": 1}}),
-        ];
-
-        let persisted = terminal_events_for_persistence(&events);
-        assert_eq!(persisted.len(), 5);
-        assert_eq!(persisted[0]["type"], "reasoning_delta");
-        assert_eq!(persisted[1]["type"], "reasoning_done");
-        assert_eq!(persisted[2]["event_type"], "text_done");
-        assert_eq!(persisted[3]["event_type"], "run_error");
-        assert_eq!(persisted[4]["event_type"], "run_finished");
-    }
-
-    #[tokio::test]
-    async fn create_run_returns_running_status() {
-        let svc = test_service();
-        let result = ok(svc.create_run("user-1".into(), test_request("hello")).await);
-        assert_eq!(result.status, "running");
-        assert!(!result.run_id.is_empty());
-        assert!(!result.session_id.is_empty());
-    }
-
-    #[tokio::test]
-    async fn create_run_uses_provided_session_id() {
-        let svc = test_service();
-        let mut req = test_request("hi");
-        req.session_id = Some("custom-session".into());
-        let result = ok(svc.create_run("user-1".into(), req).await);
-        assert_eq!(result.session_id, "custom-session");
-    }
-
-    #[tokio::test]
-    async fn create_run_rejects_invalid_server_workspace_session_id() {
-        let svc = test_service();
-        let mut req = test_request("hi");
-        req.session_id = Some("../../".into());
-        req.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
-            kind: astra_services::runs::WorkspaceBindingRequestKind::ServerSandbox,
-            display_name: None,
-            root: None,
-            source: None,
-            authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
-            fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
-        });
-
-        let err = err(svc.create_run("user-1".into(), req).await);
-
-        assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        assert_eq!(
-            err.1.0.detail,
-            "Invalid session_id for server workspace provisioning"
-        );
-    }
-
-    #[tokio::test]
-    async fn stream_chat_rejects_invalid_server_workspace_session_id() {
-        let svc = test_service();
-        let mut req = test_request("hi");
-        req.session_id = Some("../../".into());
-        req.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
-            kind: astra_services::runs::WorkspaceBindingRequestKind::ServerSandbox,
-            display_name: None,
-            root: None,
-            source: None,
-            authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
-            fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
-        });
-
-        let err = err(svc.stream_chat("user-1".into(), req).await);
-
-        assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        assert_eq!(
-            err.1.0.detail,
-            "Invalid session_id for server workspace provisioning"
-        );
-    }
-
-    #[tokio::test]
-    async fn create_run_explain_mode_returns_metadata() {
-        let svc = test_service();
-        let mut req = test_request("explain me");
-        req.explain = true;
-        let result = ok(svc.create_run("user-1".into(), req).await);
-        assert!(result.explain.is_some());
-        assert_eq!(result.explain.unwrap()["mode"], "background");
-    }
-
-    #[tokio::test]
-    async fn create_run_conflicts_when_same_session_already_has_active_run() {
-        let svc = test_service();
-        let mut first = test_request("hello");
-        first.session_id = Some("shared-session".into());
-        ok(svc.create_run("user-1".into(), first).await);
-
-        let mut second = test_request("again");
-        second.session_id = Some("shared-session".into());
-        let err = err(svc.create_run("user-1".into(), second).await);
-        assert_eq!(err.0, StatusCode::CONFLICT);
-        assert_eq!(err.1.0.detail, "session already has an active run");
-    }
-
-    #[tokio::test]
-    async fn stream_chat_conflicts_when_same_session_already_has_active_run() {
-        let svc = test_service();
-        let mut first = test_request("hello");
-        first.session_id = Some("shared-session".into());
-        ok(svc.create_run("user-1".into(), first).await);
-
-        let mut second = test_request("again");
-        second.session_id = Some("shared-session".into());
-        let err = err(svc.stream_chat("user-1".into(), second).await);
-        assert_eq!(err.0, StatusCode::CONFLICT);
-        assert_eq!(err.1.0.detail, "session already has an active run");
-    }
-
-    #[tokio::test]
-    #[ignore] // stream_chat runs full agentic loop; needs live DB + LLM or mock
-    async fn stream_chat_tracks_run_for_status_and_replay() {
-        let svc = test_service();
-        let stream = ok(svc
-            .stream_chat("user-1".into(), test_request("hello"))
-            .await);
-
-        let status = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            loop {
-                let status = ok(svc
-                    .get_run_status(stream.run_id.clone(), "user-1".into())
-                    .await);
-                if status.status != "running" {
-                    break status;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            }
-        })
-        .await
-        .expect("timeout waiting for stream_chat status to finish");
-        let replay = ok(svc
-            .stream_run(stream.run_id.clone(), "user-1".into(), 0)
-            .await);
-
-        assert_eq!(status.run_id, stream.run_id);
-        assert!(status.events_count > 0);
-        assert_eq!(replay.len(), status.events_count as usize);
-        assert_eq!(replay[0]["event_type"], "run_started");
-        assert_eq!(
-            svc.test_llm_cancel_token_is_cancelled(&stream.run_id).await,
-            Some(false)
-        );
-    }
-
-    #[tokio::test]
-    async fn get_run_status_returns_state() {
-        let svc = test_service();
-        let run = ok(svc.create_run("user-1".into(), test_request("hello")).await);
-        let status = ok(svc
-            .get_run_status(run.run_id.clone(), "user-1".into())
-            .await);
-        assert_eq!(status.run_id, run.run_id);
-        assert_eq!(status.status, "running");
-        assert_eq!(status.events_count, 1);
-        assert_eq!(status.workspace.as_ref().unwrap()["kind"], "server_sandbox");
-        assert_eq!(status.executor.as_ref().unwrap()["kind"], "server_local");
-        assert_eq!(status.transport.as_deref(), Some("server_local"));
-        assert_eq!(status.fallback_policy.as_deref(), Some("disabled"));
-    }
-
-    #[tokio::test]
-    async fn noninteractive_create_run_does_not_wire_ws_only_channels() {
-        let svc = test_service();
-        let run = ok(svc.create_run("user-1".into(), test_request("hello")).await);
-
-        assert!(!svc.approval_channels.lock().await.contains_key(&run.run_id));
-        assert!(
-            !svc.user_prompt_channels
-                .lock()
-                .await
-                .contains_key(&run.run_id)
-        );
-        assert!(!svc.progress_channels.lock().await.contains_key(&run.run_id));
-    }
-
-    #[tokio::test]
-    async fn noninteractive_approval_gate_denies_required_tools_without_waiting_for_ws() {
-        let gate = NonInteractiveApprovalGate;
-
-        assert!(astra_tools::ToolApprovalGate::requires_approval(
-            &gate, "bash"
-        ));
-        assert!(astra_tools::ToolApprovalGate::requires_approval_for(
-            &gate,
-            "git",
-            &serde_json::json!({"action": "commit"})
-        ));
-        assert!(!astra_tools::ToolApprovalGate::requires_approval_for(
-            &gate,
-            "git",
-            &serde_json::json!({"action": "diff"})
-        ));
-        let decision = astra_tools::ToolApprovalGate::request_approval(
-            &gate,
-            "req-1",
-            "bash",
-            &serde_json::json!({"command": "rm -rf /tmp/example"}),
-        )
-        .await;
-
-        assert!(matches!(
-            decision,
-            astra_tools::ApprovalDecision::Denied { reason: Some(reason) }
-                if reason.contains("no interactive client")
-        ));
-    }
-
-    #[tokio::test]
-    async fn create_run_persists_interaction_mode_into_run_started_event() {
-        let svc = test_service();
-        let mut req = test_request("hello");
-        req.interaction_mode = Some(astra_services::runs::RequestedTurnInteractionMode::Auto);
-        req.interactive_client = true;
-        let run = ok(svc.create_run("user-1".into(), req).await);
-
-        let durable = svc
-            .run_engine
-            .load_run("user-1", &run.run_id)
-            .await
-            .expect("load run")
-            .expect("run exists");
-        assert_eq!(durable.events[0]["event_type"], "run_started");
-        assert_eq!(durable.events[0]["data"]["interaction_mode"], "auto");
-        assert_eq!(durable.events[0]["data"]["suppressed_loop_nudges"], true);
-        assert_eq!(durable.events[0]["data"]["interactive_client"], true);
-        assert_eq!(
-            durable.events[0]["data"]["workspace"]["kind"],
-            "server_sandbox"
-        );
-        assert!(
-            durable.events[0]["data"]["workspace"]["cwd"]
-                .as_str()
-                .is_some_and(|cwd| cwd.contains("astra-workspaces")),
-            "{:?}",
-            durable.events[0]
-        );
-        assert_eq!(
-            durable.events[0]["data"]["executor"]["kind"],
-            "server_local"
-        );
-        assert_eq!(durable.events[0]["data"]["transport"], "server_local");
-        assert_eq!(durable.events[0]["data"]["fallback_policy"], "disabled");
-    }
-
-    #[tokio::test]
-    async fn create_run_persists_edge_binding_into_run_started_event() {
-        let svc = test_service();
-        let mut req = test_request("review this repo");
-        req.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
-            kind: astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace,
-            display_name: Some("MacBook Pro".to_string()),
-            root: Some("/Users/xupeng/github/astra".to_string()),
-            source: Some(astra_services::runs::WorkspaceSourceRequest::EdgePath {
-                path: "/Users/xupeng/github/astra".to_string(),
-            }),
-            authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
-            fallback_policy: Some(astra_services::runs::FallbackPolicyRequest::Disabled),
-        });
-        req.executor_binding = Some(astra_services::runs::ExecutorBindingRequest {
-            kind: astra_services::runs::ExecutorBindingRequestKind::EdgeAgent,
-            executor_id: Some("edge-macbook-1".to_string()),
-            display_name: Some("MacBook Pro".to_string()),
-            transport: Some(astra_services::runs::ToolTransportKindRequest::EdgeWs),
-            status: Some(astra_services::runs::ExecutorStatusRequest::Online),
-        });
-        let run = ok(svc.create_run("user-1".into(), req).await);
-
-        let durable = svc
-            .run_engine
-            .load_run("user-1", &run.run_id)
-            .await
-            .expect("load run")
-            .expect("run exists");
-        assert_eq!(durable.events[0]["event_type"], "run_started");
-        assert_eq!(
-            durable.events[0]["data"]["workspace"]["kind"],
-            "edge_workspace"
-        );
-        assert_eq!(
-            durable.events[0]["data"]["workspace"]["cwd"],
-            "/Users/xupeng/github/astra"
-        );
-        assert_eq!(durable.events[0]["data"]["executor"]["kind"], "edge_agent");
-        assert_eq!(
-            durable.events[0]["data"]["executor"]["executor_id"],
-            "edge-macbook-1"
-        );
-        assert_eq!(durable.events[0]["data"]["transport"], "edge_ws");
-        assert_eq!(durable.events[0]["data"]["fallback_policy"], "disabled");
-
-        let status = ok(svc
-            .get_run_status(run.run_id.clone(), "user-1".into())
-            .await);
-        assert_eq!(status.workspace.as_ref().unwrap()["kind"], "edge_workspace");
-        assert_eq!(
-            status.workspace.as_ref().unwrap()["cwd"],
-            "/Users/xupeng/github/astra"
-        );
-        assert_eq!(status.executor.as_ref().unwrap()["kind"], "edge_agent");
-        assert_eq!(
-            status.executor.as_ref().unwrap()["executor_id"],
-            "edge-macbook-1"
-        );
-        assert_eq!(status.transport.as_deref(), Some("edge_ws"));
-        assert_eq!(status.fallback_policy.as_deref(), Some("disabled"));
-    }
-
-    #[tokio::test]
-    async fn get_run_status_not_found() {
-        let svc = test_service();
-        let e = err(svc
-            .get_run_status("nonexistent".into(), "user-1".into())
-            .await);
-        assert_eq!(e.0, StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn get_run_status_hides_foreign_run() {
-        let svc = test_service();
-        let run = ok(svc.create_run("user-1".into(), test_request("hello")).await);
-        let e = err(svc.get_run_status(run.run_id, "user-2".into()).await);
-        assert_eq!(e.0, StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn cancel_run_sets_cancelled_status() {
-        let svc = test_service();
-        let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
-        let result = ok(svc.cancel_run(run.run_id.clone(), "user-1".into()).await);
-        assert_eq!(result.status, "cancelled");
-        let status = ok(svc.get_run_status(run.run_id, "user-1".into()).await);
-        assert_eq!(status.status, "cancelled");
-        assert!(status.events_count >= 1);
-    }
-
-    #[tokio::test]
-    async fn cancel_run_cancels_llm_token_for_inflight_wake() {
-        let svc = test_service();
-        let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
-        assert_eq!(
-            svc.test_llm_cancel_token_is_cancelled(&run.run_id).await,
-            Some(false)
-        );
-        ok(svc.cancel_run(run.run_id.clone(), "user-1".into()).await);
-        assert_eq!(
-            svc.test_llm_cancel_token_is_cancelled(&run.run_id).await,
-            Some(true)
-        );
-    }
-
-    #[tokio::test]
-    async fn cancel_session_runs_cancels_active_run_for_that_session_only() {
-        let svc = test_service();
-        let mut session_a = test_request("task a");
-        session_a.session_id = Some("session-a".to_string());
-        let run_a = ok(svc.create_run("user-1".into(), session_a).await);
-
-        let mut session_b = test_request("task b");
-        session_b.session_id = Some("session-b".to_string());
-        let run_b = ok(svc.create_run("user-1".into(), session_b).await);
-
-        let cancelled = ok(svc
-            .cancel_session_runs("session-a".to_string(), "user-1".to_string())
-            .await);
-
-        assert_eq!(cancelled.len(), 1);
-        assert_eq!(cancelled[0].run_id, run_a.run_id);
-        assert_eq!(cancelled[0].status, "cancelled");
-        assert_eq!(
-            svc.test_llm_cancel_token_is_cancelled(&run_a.run_id).await,
-            Some(true)
-        );
-        assert_eq!(
-            svc.test_llm_cancel_token_is_cancelled(&run_b.run_id).await,
-            Some(false),
-            "session cancel must not cancel runs from a different session"
-        );
-        let status_b = ok(svc.get_run_status(run_b.run_id, "user-1".into()).await);
-        assert_eq!(status_b.status, "running");
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn cancel_run_schedules_in_memory_eviction() {
-        let svc = test_service();
-        let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
-        assert!(
-            svc.test_llm_cancel_token_is_cancelled(&run.run_id)
-                .await
-                .is_some()
-        );
-
-        ok(svc.cancel_run(run.run_id.clone(), "user-1".into()).await);
-        tokio::time::advance(std::time::Duration::from_secs(301)).await;
-        tokio::task::yield_now().await;
-
-        assert_eq!(
-            svc.test_llm_cancel_token_is_cancelled(&run.run_id).await,
-            None,
-            "cancelled runs must not stay pinned in the process-local run cache"
-        );
-    }
-
-    #[tokio::test]
-    async fn cancel_run_from_paused_sets_cancelled_status_and_clears_pause_flag() {
-        let svc = test_service();
-        let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
-        ok(svc.pause_run(run.run_id.clone(), "user-1".into()).await);
-        assert_eq!(svc.test_pause_flag_is_set(&run.run_id).await, Some(true));
-
-        let result = ok(svc.cancel_run(run.run_id.clone(), "user-1".into()).await);
-        assert_eq!(result.status, "cancelled");
-        assert_eq!(svc.test_pause_flag_is_set(&run.run_id).await, Some(false));
-        assert_eq!(
-            svc.test_llm_cancel_token_is_cancelled(&run.run_id).await,
-            Some(true)
-        );
-    }
-
-    #[tokio::test]
-    async fn pause_run_sets_live_pause_flag_and_resume_clears_it() {
-        let svc = test_service();
-        let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
-        assert_eq!(svc.test_pause_flag_is_set(&run.run_id).await, Some(false));
-        ok(svc.pause_run(run.run_id.clone(), "user-1".into()).await);
-        assert_eq!(svc.test_pause_flag_is_set(&run.run_id).await, Some(true));
-        ok(svc.resume_run(run.run_id.clone(), "user-1".into()).await);
-        assert_eq!(svc.test_pause_flag_is_set(&run.run_id).await, Some(false));
-    }
-
-    #[tokio::test]
-    async fn cancel_run_idempotent_for_non_running() {
-        let svc = test_service();
-        let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
-        ok(svc.cancel_run(run.run_id.clone(), "user-1".into()).await);
-        let result = ok(svc.cancel_run(run.run_id.clone(), "user-1".into()).await);
-        assert_eq!(result.status, "cancelled");
-    }
-
-    #[tokio::test]
-    async fn cancel_run_hides_foreign_run() {
-        let svc = test_service();
-        let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
-        let e = err(svc.cancel_run(run.run_id, "user-2".into()).await);
-        assert_eq!(e.0, StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn stream_run_returns_events_from_offset() {
-        let svc = test_service();
-        let run = ok(svc.create_run("user-1".into(), test_request("hello")).await);
-        let events = ok(svc.stream_run(run.run_id.clone(), "user-1".into(), 0).await);
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0]["event_type"], "run_started");
-        let events = ok(svc.stream_run(run.run_id, "user-1".into(), 1).await);
-        assert!(events.is_empty());
-    }
-
-    #[tokio::test]
-    async fn stream_run_not_found() {
-        let svc = test_service();
-        let e = err(svc
-            .stream_run("nonexistent".into(), "user-1".into(), 0)
-            .await);
-        assert_eq!(e.0, StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn list_runs_empty_initially() {
-        let svc = test_service();
-        let result = ok(svc.list_runs("user-1".into(), 10, 0).await);
-        assert_eq!(result.total, 0);
-        assert!(result.runs.is_empty());
-    }
-
-    #[tokio::test]
-    async fn list_runs_filters_by_user() {
-        let svc = test_service();
-        let u1_a = ok(svc.create_run("user-1".into(), test_request("a")).await);
-        let u2_b = ok(svc.create_run("user-2".into(), test_request("b")).await);
-        let u1_c = ok(svc.create_run("user-1".into(), test_request("c")).await);
-        let for_u1 = ok(svc.list_runs("user-1".into(), 10, 0).await);
-        assert_eq!(for_u1.total, 2);
-        let ids: std::collections::HashSet<_> =
-            for_u1.runs.iter().map(|r| r.run_id.as_str()).collect();
-        assert!(ids.contains(u1_a.run_id.as_str()));
-        assert!(ids.contains(u1_c.run_id.as_str()));
-        assert!(!ids.contains(u2_b.run_id.as_str()));
-        assert!(
-            for_u1
-                .runs
-                .iter()
-                .all(|run| run.workspace.as_ref().unwrap()["kind"] == "server_sandbox")
-        );
-        assert!(
-            for_u1
-                .runs
-                .iter()
-                .all(|run| run.executor.as_ref().unwrap()["kind"] == "server_local")
-        );
-
-        let for_u2 = ok(svc.list_runs("user-2".into(), 10, 0).await);
-        assert_eq!(for_u2.total, 1);
-        assert_eq!(for_u2.runs[0].run_id, u2_b.run_id);
-    }
-
-    #[tokio::test]
-    async fn list_runs_pagination() {
-        let svc = test_service();
-        for i in 0..5 {
-            ok(svc
-                .create_run("user-1".into(), test_request(&format!("msg {i}")))
-                .await);
-        }
-        let page1 = ok(svc.list_runs("user-1".into(), 2, 0).await);
-        assert_eq!(page1.runs.len(), 2);
-        assert_eq!(page1.total, 5);
-        let page2 = ok(svc.list_runs("user-1".into(), 2, 2).await);
-        assert_eq!(page2.runs.len(), 2);
-        let page3 = ok(svc.list_runs("user-1".into(), 2, 4).await);
-        assert_eq!(page3.runs.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn list_runs_orders_by_latest_update() {
-        let svc = test_service();
-        let older = ok(svc.create_run("user-1".into(), test_request("older")).await);
-        let newer = ok(svc.create_run("user-1".into(), test_request("newer")).await);
-
-        let initial = ok(svc.list_runs("user-1".into(), 10, 0).await);
-        assert_eq!(initial.runs[0].run_id, newer.run_id);
-
-        ok(svc.pause_run(older.run_id.clone(), "user-1".into()).await);
-
-        let after_update = ok(svc.list_runs("user-1".into(), 10, 0).await);
-        assert_eq!(
-            after_update.runs[0].run_id, older.run_id,
-            "list_runs should surface the most recently updated run first"
-        );
-    }
-
-    /// P2-B: list_runs must clamp pagination params like other list endpoints.
-    #[tokio::test]
-    async fn list_runs_clamps_pagination() {
-        let svc = test_service();
-        // Absurdly large limit/offset must not panic or produce unbounded queries
-        let result = ok(svc.list_runs("user-clamp".into(), u32::MAX, u32::MAX).await);
-        assert_eq!(result.runs.len(), 0);
-        // Verify the returned limit/offset are clamped
-        assert!(
-            result.limit <= astra_services::pagination::MAX_API_LIST_LIMIT,
-            "limit must be clamped to MAX_API_LIST_LIMIT"
-        );
-    }
-
-    #[test]
-    fn format_run_events_adds_index() {
-        let events = vec![
-            json!({"event_type": "run_started"}),
-            json!({"event_type": "text_delta", "data": {"chunk": "hi"}}),
-        ];
-        let formatted = AgenticRunLifecycleService::format_run_events(&events, 0);
-        assert_eq!(formatted[0]["index"], 0);
-        assert_eq!(formatted[1]["index"], 1);
-        assert_eq!(formatted[1]["event_type"], "text_delta");
-    }
-
-    #[test]
-    fn format_run_events_preserves_global_offset() {
-        let events = vec![
-            json!({"event_type": "text_delta", "data": {"chunk": "a"}}),
-            json!({"event_type": "text_delta", "data": {"chunk": "b"}}),
-        ];
-        let formatted = AgenticRunLifecycleService::format_run_events(&events, 5);
-        assert_eq!(formatted[0]["index"], 5);
-        assert_eq!(formatted[1]["index"], 6);
-    }
-
-    #[test]
-    fn durable_recent_events_honors_work_surface_hydrate_limit() {
-        let events = (0..450)
-            .map(|i| json!({"event_type": "tool_call_end", "data": {"seq": i}}))
-            .collect();
-        let run = DurableRunRecord {
-            run_id: "run-long".to_string(),
-            user_id: "user-1".to_string(),
-            session_id: "session-1".to_string(),
-            parent_run_id: None,
-            root_run_id: None,
-            ancestor_path: None,
-            depth: 0,
-            delegation_id: None,
-            agent_id: None,
-            retry_of: None,
-            retry_scope: None,
-            status: STATUS_RUNNING.to_string(),
-            waiting_for: None,
-            owner_pod_id: None,
-            owner_lease_expires_at: None,
-            run_generation: 0,
-            last_event_idx: 449,
-            checkpoint_version: None,
-            checkpoint_json: None,
-            error_code: None,
-            error_message: None,
-            retry_count: 0,
-            total_prompt_tokens: 0,
-            total_completion_tokens: 0,
-            total_tool_calls: 0,
-            agent_binding_id: None,
-            agent_binding_name: None,
-            agent_binding_schema_version: None,
-            selected_model_json: None,
-            selected_model_name: None,
-            selected_model_gateway: None,
-            capability_server_refs_json: None,
-            runtime_profile: None,
-            events,
-            created_at: "2026-06-13T00:00:00.000Z".to_string(),
-            updated_at: "2026-06-13T00:00:00.000Z".to_string(),
-        };
-
-        let recent_events = AgenticRunLifecycleService::durable_recent_events(&run, 400);
-
-        assert_eq!(recent_events.len(), 400);
-        assert_eq!(recent_events[0]["index"], 50);
-        assert_eq!(recent_events[399]["index"], 449);
-    }
-
-    #[test]
-    fn extract_edge_tools_from_context() {
-        let mut ctx = serde_json::Map::new();
-        ctx.insert(
-            "edge_tools".to_string(),
-            json!([{"function": {"name": "bash"}}]),
-        );
-        let req = ChatRequestData {
-            message: "hi".into(),
-            parts: Vec::new(),
-            attachments: Vec::new(),
-            runtime_system_prompt: None,
-            session_id: None,
-            full_llm_capture: false,
-            agent_id: None,
-            model: None,
-            selected_model: None,
-            capability_descriptors: None,
-            provider_runtime_authorized: false,
-            agent_binding: None,
-            runtime_auth: None,
-            runtime_skill_binding: None,
-            runtime_profile: None,
-            llm_token_service: None,
-            skill_search: None,
-            allow_skills: None,
-            allow_skill_sources: None,
-            allow_tools: None,
-            workspace_binding: None,
-            executor_binding: None,
-            runtime_mcp_bindings: Vec::new(),
-            mcp_binding_ids: None,
-            context: Some(ctx),
-            edge_executor_id: None,
-            capabilities: Vec::new(),
-            forward_headers: HashMap::new(),
-            execution_budget: None,
-            explain: false,
-            interaction_mode: None,
-            interactive_client: false,
-        };
-        let tools = AgenticRunLifecycleService::extract_edge_tools(&req).expect("edge tools");
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0]["function"]["name"], "bash");
-    }
-
-    #[test]
-    fn extract_edge_tools_empty_when_no_context() {
-        assert!(
-            AgenticRunLifecycleService::extract_edge_tools(&test_request("hi"))
-                .expect("empty edge tools")
-                .is_empty()
-        );
-    }
-
-    fn trusted_domains_for_tests() -> Vec<super::TrustedLlmDomain> {
-        vec![super::TrustedLlmDomain {
-            host: "catalog".to_string(),
-            port: Some(8081),
-        }]
-    }
-
-    #[test]
-    fn validate_llm_token_service_config_accepts_http_url() {
-        let config = astra_services::LlmTokenServiceConfig {
-            url: "http://catalog:8081/api/v1/llm-token".to_string(),
-            timeout_ms: Some(2500),
-        };
-        let trusted = trusted_domains_for_tests();
-        assert!(super::validate_llm_token_service_config(Some(&config), &trusted).is_ok());
-    }
-
-    #[test]
-    fn validate_llm_token_service_config_rejects_invalid_url() {
-        let config = astra_services::LlmTokenServiceConfig {
-            url: "not-a-url".to_string(),
-            timeout_ms: Some(2500),
-        };
-        let trusted = trusted_domains_for_tests();
-        let err = super::validate_llm_token_service_config(Some(&config), &trusted)
-            .expect_err("invalid url should fail");
-        assert!(err.contains("valid URL"), "unexpected error: {err}");
-    }
-
-    #[test]
-    fn validate_llm_token_service_config_rejects_untrusted_url() {
-        let config = astra_services::LlmTokenServiceConfig {
-            url: "http://evil.example.com/v1/chat/completions".to_string(),
-            timeout_ms: Some(2500),
-        };
-        let trusted = trusted_domains_for_tests();
-        let err = super::validate_llm_token_service_config(Some(&config), &trusted)
-            .expect_err("untrusted url should fail");
-        assert!(
-            err.contains("trusted domains"),
-            "unexpected error message: {err}"
-        );
-    }
-
-    #[test]
-    fn validate_llm_token_service_config_rejects_when_trusted_domains_unconfigured() {
-        let config = astra_services::LlmTokenServiceConfig {
-            url: "http://catalog:8081/api/v1/llm-token".to_string(),
-            timeout_ms: Some(2500),
-        };
-        let err = super::validate_llm_token_service_config(Some(&config), &[])
-            .expect_err("missing trusted domains should fail");
-        assert!(
-            err.contains(super::LLM_TOKEN_SERVICE_TRUSTED_DOMAINS_TABLE),
-            "unexpected error message: {err}"
-        );
-    }
-
-    #[test]
-    fn validate_llm_token_service_config_enforces_host_port_boundary_for_trusted_domains() {
-        let config = astra_services::LlmTokenServiceConfig {
-            url: "http://catalog:8082/api/v1/chat".to_string(),
-            timeout_ms: Some(2500),
-        };
-        let trusted = trusted_domains_for_tests();
-        let err = super::validate_llm_token_service_config(Some(&config), &trusted)
-            .expect_err("host:port boundary should be enforced");
-        assert!(
-            err.contains("trusted domains"),
-            "unexpected error message: {err}"
-        );
-    }
-
-    #[test]
-    fn trusted_llm_domain_from_db_values_accepts_valid_host_and_port() {
-        let parsed = super::trusted_llm_domain_from_db_values("catalog", 8081)
-            .expect("host+port should parse");
-        assert_eq!(parsed.host, "catalog");
-        assert_eq!(parsed.port, Some(8081));
-        let wildcard = super::trusted_llm_domain_from_db_values("catalog", 0)
-            .expect("sentinel port should represent wildcard");
-        assert_eq!(wildcard.port, None);
-    }
-
-    #[test]
-    fn trusted_llm_domain_from_db_values_rejects_invalid_host_or_port() {
-        let host_err = super::trusted_llm_domain_from_db_values("http://catalog:8081", 8081)
-            .expect_err("host should not include scheme");
-        assert!(host_err.contains("host"));
-        let port_err = super::trusted_llm_domain_from_db_values("catalog", 70000)
-            .expect_err("port out of range should fail");
-        assert!(port_err.contains("port"));
-    }
-
-    #[test]
-    fn normalize_request_allowlists_preserve_explicit_empty_sets() {
-        let empty: Vec<String> = Vec::new();
-        assert_eq!(
-            super::normalize_request_allowlist(Some(&empty), "allow_skills")
-                .expect("empty allow_skills should normalize"),
-            Some(HashSet::new())
-        );
-        assert_eq!(
-            super::normalize_request_skill_sources(Some(&empty), "allow_skill_sources")
-                .expect("empty allow_skill_sources should normalize"),
-            Some(HashSet::new())
-        );
-    }
-
-    #[test]
-    fn extract_edge_profile_from_context() {
-        let mut ctx = serde_json::Map::new();
-        ctx.insert(
-            "edge_profile".to_string(),
-            json!({
-                "cwd": "/tmp",
-                "git_branch": "main",
-                "system_prompt_override": "override text"
-            }),
-        );
-        let req = ChatRequestData {
-            message: "hi".into(),
-            parts: Vec::new(),
-            attachments: Vec::new(),
-            runtime_system_prompt: None,
-            session_id: None,
-            full_llm_capture: false,
-            agent_id: None,
-            model: None,
-            selected_model: None,
-            capability_descriptors: None,
-            provider_runtime_authorized: false,
-            agent_binding: None,
-            runtime_auth: None,
-            runtime_skill_binding: None,
-            runtime_profile: None,
-            llm_token_service: None,
-            skill_search: None,
-            allow_skills: None,
-            allow_skill_sources: None,
-            allow_tools: None,
-            workspace_binding: None,
-            executor_binding: None,
-            runtime_mcp_bindings: Vec::new(),
-            mcp_binding_ids: None,
-            context: Some(ctx),
-            edge_executor_id: None,
-            capabilities: Vec::new(),
-            forward_headers: HashMap::new(),
-            execution_budget: None,
-            explain: false,
-            interaction_mode: None,
-            interactive_client: false,
-        };
-        let profile = AgenticRunLifecycleService::extract_edge_profile(&req).expect("edge profile");
-        assert_eq!(profile["cwd"], "/tmp");
-        assert_eq!(profile["git_branch"], "main");
-        assert_eq!(profile["system_prompt_override"], "override text");
-    }
-
-    #[test]
-    fn build_initial_state_sets_user_message() {
-        let svc = test_service();
-        let req = test_request("write a test");
-        let expected_budget = astra_turn_core::chat_turn_heuristics::resolve_agentic_turn_budget(
-            astra_turn_core::chat_turn_heuristics::infer_task_execution_profile("write a test"),
-            astra_core::RuntimeLimits::global().max_turns,
-            None,
-        );
-        let state = svc.build_initial_state("test-user", &req, "sess-1", "run-1", None, None, None);
-        assert_eq!(state.messages.len(), 1);
-        assert_eq!(state.messages[0]["role"], "user");
-        assert_eq!(state.messages[0]["content"], "write a test");
-        assert_eq!(state.current_session_id, Some("sess-1".to_string()));
-        assert_eq!(state.current_run_id, Some("run-1".to_string()));
-        assert_eq!(state.max_turns, expected_budget.initial_turns);
-        assert_eq!(state.remaining_turns, expected_budget.initial_turns);
-        assert_eq!(state.agentic_turn_budget, expected_budget);
-        assert_eq!(state.message, "write a test");
-        assert!(state.cancellation.token.is_none());
-    }
-
-    #[test]
-    fn build_initial_state_applies_execution_budget_override() {
-        let svc = test_service();
-        let mut req = test_request("go");
-        req.execution_budget = Some(astra_services::runs::ExecutionBudget {
-            initial_turns: Some(4),
-            hard_turn_limit: Some(9),
-        });
-        let state = svc.build_initial_state("test-user", &req, "s", "r", None, None, None);
-        assert_eq!(state.max_turns, 4);
-        assert_eq!(state.remaining_turns, 4);
-        assert_eq!(state.agentic_turn_budget.hard_turn_limit, 9);
-    }
-
-    #[test]
-    fn build_initial_state_clamps_execution_budget_override() {
-        let svc = test_service();
-        let mut req = test_request("go");
-        req.execution_budget = Some(astra_services::runs::ExecutionBudget {
-            initial_turns: Some(0),
-            hard_turn_limit: Some(0),
-        });
-        let state = svc.build_initial_state("test-user", &req, "s", "r", None, None, None);
-        assert_eq!(state.max_turns, 1);
-        assert_eq!(state.agentic_turn_budget.hard_turn_limit, 1);
-    }
-
-    #[test]
-    fn agent_binding_prompt_override_appends_stable_section() {
-        let context = PreparedAgentBindingLoopContext {
-            binding: test_agent_binding_record(Some(3)),
-            skill_resolver: None,
-        };
-        let mut edge_profile = serde_json::Map::from_iter([(
-            "system_prompt_override".to_string(),
-            Value::String("Existing instruction.".to_string()),
-        )]);
-
-        AgenticRunLifecycleService::apply_agent_binding_prompt_override(
-            &mut edge_profile,
-            Some(&context),
-            None,
-        );
-
-        assert_eq!(
-            edge_profile
-                .get("system_prompt_override")
-                .and_then(Value::as_str),
-            Some(
-                "Existing instruction.\n\n## Agent Binding Instruction\nAlways follow the binding contract."
-            )
-        );
-    }
-
-    #[test]
-    fn agent_binding_prompt_override_appends_runtime_system_prompt() {
-        let context = PreparedAgentBindingLoopContext {
-            binding: test_agent_binding_record(Some(3)),
-            skill_resolver: None,
-        };
-        let mut edge_profile = serde_json::Map::new();
-
-        AgenticRunLifecycleService::apply_agent_binding_prompt_override(
-            &mut edge_profile,
-            Some(&context),
-            Some("Runtime SQL scope db_name: retail."),
-        );
-
-        assert_eq!(
-            edge_profile
-                .get("system_prompt_override")
-                .and_then(Value::as_str),
-            Some(
-                "## Agent Binding Instruction\nAlways follow the binding contract.\n\nRuntime SQL scope db_name: retail."
-            )
-        );
-    }
-
-    #[test]
-    fn build_initial_state_agent_binding_uses_binding_skills_and_max_steps() {
-        let svc = test_service();
-        let mut req = test_request("go");
-        req.execution_budget = Some(astra_services::runs::ExecutionBudget {
-            initial_turns: Some(8),
-            hard_turn_limit: Some(12),
-        });
-        let binding_context = PreparedAgentBindingLoopContext {
-            binding: test_agent_binding_record(Some(3)),
-            skill_resolver: Some(static_skill_resolver("binding-only")),
-        };
-        let edge_context =
-            AgenticRunLifecycleService::extract_edge_context(&req).expect("edge context");
-        let mut edge_profile = edge_context.edge_profile.to_map();
-        AgenticRunLifecycleService::apply_agent_binding_prompt_override(
-            &mut edge_profile,
-            Some(&binding_context),
-            None,
-        );
-
-        let state = svc.build_initial_state_inner(
-            "test-user",
-            &req,
-            "s",
-            "r",
-            None,
-            None,
-            None,
-            RequestConstraints::default(),
-            &edge_context,
-            Some(&edge_profile),
-            None,
-            Some(&binding_context),
-        );
-
-        assert_eq!(state.max_turns, 3);
-        assert_eq!(state.remaining_turns, 3);
-        assert_eq!(state.agentic_turn_budget.hard_turn_limit, 3);
-        assert!(state.skills.registry_for_activation.is_none());
-        let names: Vec<String> = state
-            .skills
-            .resolver
-            .as_ref()
-            .expect("binding skill resolver must be installed")
-            .available_skills()
-            .into_iter()
-            .map(|skill| skill.name)
-            .collect();
-        assert_eq!(names, vec!["binding-only".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn request_scoped_runtime_skill_resolver_is_installed_from_provider_capability() {
-        use axum::{Router, extract::State, http::HeaderMap, routing::post};
-        use tokio::sync::Mutex;
-
-        #[derive(Default)]
-        struct Capture {
-            authorization: Mutex<Option<String>>,
-            body: Mutex<Option<Value>>,
-        }
-
-        async fn handler(
-            State(capture): State<Arc<Capture>>,
-            headers: HeaderMap,
-            Json(body): Json<Value>,
-        ) -> Json<Value> {
-            *capture.authorization.lock().await = headers
-                .get(reqwest::header::AUTHORIZATION)
-                .and_then(|value| value.to_str().ok())
-                .map(ToString::to_string);
-            *capture.body.lock().await = Some(body);
-            Json(json!({
-                "jsonrpc": "2.0",
-                "id": "astra-agent-binding-skills-list",
-                "result": {
-                    "skills": [{
-                        "name": "moi-skill",
-                        "description": "Skill from external provider runtime context",
-                        "when_to_use": "when MOI grants this skill for the turn",
-                        "aliases": ["moi-alias"],
-                        "category": "external",
-                        "tags": ["moi"],
-                        "instructions": "Call the provider skill capability server.",
-                        "allowed_tools": [],
-                        "input_schema": {"type": "object"},
-                        "output_schema": {"type": "object"}
-                    }]
-                }
-            }))
-        }
-
-        let capture = Arc::new(Capture::default());
-        let app = Router::new()
-            .route("/skills", post(handler))
-            .with_state(capture.clone());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind local skill capability server");
-        let addr = listener.local_addr().expect("listener addr");
-        let server = tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-        let endpoint = format!("http://{addr}/skills");
-
-        let svc = test_service();
-        let mut request = test_request("use the provider skill");
-        request.allow_skills = Some(vec!["moi-skill".to_string()]);
-        request.runtime_skill_binding = Some(RuntimeSkillBindingRequest {
-            id: "moi-skills".to_string(),
-            url: endpoint.clone(),
-            authorization: "Bearer runtime-grant".to_string(),
-        });
-        request.forward_headers.insert(
-            "authorization".to_string(),
-            "Bearer runtime-grant".to_string(),
-        );
-        let request_constraints = AgenticRunLifecycleService::try_request_constraints(&request)
-            .expect("skill allowlist should parse");
-        let capabilities = svc
-            .prepare_runtime_capabilities(&request, &request_constraints)
-            .await
-            .expect("provider skill capability should prepare a resolver");
-
-        assert!(capabilities.agent_binding.is_none());
-        assert!(capabilities.request_scoped_skill_resolver.is_some());
-        let edge_context =
-            AgenticRunLifecycleService::extract_edge_context(&request).expect("edge context");
-
-        let state = svc.build_initial_state_inner(
-            "external-user",
-            &request,
-            "session-1",
-            "run-1",
-            None,
-            None,
-            None,
-            request_constraints,
-            &edge_context,
-            None,
-            capabilities.request_scoped_skill_resolver.clone(),
-            capabilities.agent_binding.as_ref(),
-        );
-
-        assert!(state.skills.registry_for_activation.is_none());
-        let resolver = state
-            .skills
-            .resolver
-            .as_ref()
-            .expect("runtime-scoped skill resolver must be installed");
-        let available = resolver.available_skills();
-        assert_eq!(available.len(), 1);
-        assert_eq!(available[0].name, "moi-skill");
-        let resolved = resolver
-            .resolve("moi-alias")
-            .expect("runtime-scoped skill alias should resolve");
-        assert_eq!(resolved.remote_url.as_deref(), Some(endpoint.as_str()));
-        assert_eq!(resolved.forward_headers, vec!["authorization".to_string()]);
-        assert_eq!(resolved.required_headers, vec!["authorization".to_string()]);
-
-        let manifest = AgenticRunLifecycleService::build_runtime_manifest(&request, &capabilities)
-            .expect("selected model should produce manifest");
-        assert!(manifest.get("agent_binding").is_none());
-        assert_eq!(
-            manifest["request_scoped_runtime"]["discovered_skills"][0]["name"],
-            "moi-skill"
-        );
-        assert_eq!(
-            capture.authorization.lock().await.as_deref(),
-            Some("Bearer runtime-grant")
-        );
-        assert_eq!(
-            capture.body.lock().await.as_ref(),
-            Some(&json!({
-                "jsonrpc": "2.0",
-                "id": "astra-agent-binding-skills-list",
-                "method": "skills/list"
-            }))
-        );
-        server.abort();
-    }
-
-    #[test]
-    fn runtime_manifest_includes_agent_binding_snapshot_without_runtime_auth() {
-        let mut request = test_request("use binding tools");
-        request.agent_binding = Some(AgentBindingRuntimeRequest {
-            id: "ab_018f05f5-c7dd-7f43-83e6-93d56d9d7391".to_string(),
-            capability_server_refs: CapabilityServerRefs {
-                mcp: "tools".to_string(),
-                skills: "skills".to_string(),
-            },
-        });
-        request.runtime_auth = Some(RuntimeAuthRequest {
-            authorization: "Bearer secret-runtime-token".to_string(),
-        });
-        request.runtime_profile = Some(RuntimeProfileRequest::AgentBindingRegistry);
-        request.parts = vec![json!({"type": "text", "text": "use binding tools"})];
-        request.attachments = vec![json!({"id": "att-1", "kind": "file"})];
-        request.edge_executor_id = Some("edge-1".to_string());
-        request.capabilities = vec!["bash".to_string(), "fs".to_string()];
-        let capabilities = PreparedRuntimeCapabilities {
-            mcp_bundle: Some(runtime_mcp::RuntimeMcpBundle {
-                schemas: vec![json!({
-                    "type": "function",
-                    "function": {
-                        "name": "mcp__tools__query",
-                        "description": "Query data",
-                        "parameters": {"type": "object"}
-                    }
-                })],
-                manager: None,
-                agent_binding_mcp: None,
-            }),
-            request_scoped_skill_resolver: None,
-            agent_binding: Some(PreparedAgentBindingLoopContext {
-                binding: test_agent_binding_record(Some(3)),
-                skill_resolver: Some(static_skill_resolver("binding-only")),
-            }),
-        };
-
-        let manifest = AgenticRunLifecycleService::build_runtime_manifest(&request, &capabilities)
-            .expect("selected_model should produce a runtime manifest");
-
-        assert_eq!(manifest["selected_model"]["model"], "test-model");
-        assert_eq!(manifest["runtime_profile"], "agent_binding_registry");
-        assert_eq!(manifest["turn"]["message"], "use binding tools");
-        assert_eq!(manifest["turn"]["parts"][0]["type"], "text");
-        assert_eq!(manifest["turn"]["attachments"][0]["id"], "att-1");
-        assert_eq!(manifest["turn"]["edge_executor_id"], "edge-1");
-        assert_eq!(manifest["turn"]["capabilities"][0], "bash");
-        assert_eq!(
-            manifest["agent_binding"]["selected_capability_server_refs"]["mcp"],
-            "tools"
-        );
-        assert_eq!(
-            manifest["agent_binding"]["discovered_tools"][0]["function"]["name"],
-            "mcp__tools__query"
-        );
-        assert_eq!(
-            manifest["agent_binding"]["discovered_skills"][0]["name"],
-            "binding-only"
-        );
-        let serialized =
-            serde_json::to_string(&manifest).expect("runtime manifest should serialize");
-        assert!(!serialized.contains("secret-runtime-token"));
-        assert!(!serialized.contains("Bearer"));
-    }
-
-    #[test]
-    fn install_agent_binding_runtime_forward_headers_uses_runtime_auth() {
-        let mut req = test_request("go");
-        req.agent_binding = Some(AgentBindingRuntimeRequest {
-            id: "abnd_test1234567890".to_string(),
-            capability_server_refs: CapabilityServerRefs {
-                mcp: "mcp-main".to_string(),
-                skills: "skills-main".to_string(),
-            },
-        });
-        req.runtime_auth = Some(RuntimeAuthRequest {
-            authorization: "Bearer runtime-grant".to_string(),
-        });
-        req.forward_headers.insert(
-            "authorization".to_string(),
-            "Bearer client-token".to_string(),
-        );
-
-        AgenticRunLifecycleService::install_agent_binding_runtime_forward_headers(&mut req)
-            .expect("runtime auth should be forwarded in memory for binding skills");
-
-        assert_eq!(
-            req.forward_headers.get("authorization").map(String::as_str),
-            Some("Bearer runtime-grant")
-        );
-    }
-
-    #[test]
-    fn build_initial_state_loads_stop_hooks_from_edge_profile_cwd() {
-        let dir = tempfile::tempdir().unwrap();
-        let mo = dir.path().join(".astra");
-        std::fs::create_dir_all(&mo).unwrap();
-        std::fs::write(
-            mo.join("stop-hooks.yaml"),
-            "version: 1\nauto_detect: false\nhooks:\n  - label: cloud_hook\n    command: true\n",
-        )
-        .unwrap();
-
-        let svc = test_service();
-        let mut req = test_request("implement a fix");
-        req.context = Some(
-            serde_json::json!({
-                "edge_profile": { "cwd": dir.path().to_str().unwrap() }
-            })
-            .as_object()
-            .unwrap()
-            .clone(),
-        );
-
-        let state = svc.build_initial_state("test-user", &req, "s", "r", None, None, None);
-        assert_eq!(state.hooks.stop_hooks.len(), 1);
-        assert_eq!(state.hooks.stop_hooks[0].label, "cloud_hook");
-        assert_eq!(
-            state.hooks.workspace_root_hint.as_deref(),
-            Some(dir.path().to_str().unwrap())
-        );
-    }
-
-    #[test]
-    fn build_initial_state_uses_workspace_override_when_no_edge_cwd() {
-        let dir = tempfile::tempdir().unwrap();
-        let mo = dir.path().join(".astra");
-        std::fs::create_dir_all(&mo).unwrap();
-        std::fs::write(
-            mo.join("stop-hooks.yaml"),
-            "version: 1\nauto_detect: false\nhooks:\n  - label: server_hook\n    command: echo ok\n",
-        )
-        .unwrap();
-
-        let svc = test_service();
-        // Request with NO edge_profile.cwd — simulates web-agent mode.
-        let req = test_request("fix a bug");
-        let state =
-            svc.build_initial_state("test-user", &req, "s", "r", Some(dir.path()), None, None);
-        assert_eq!(state.hooks.stop_hooks.len(), 1);
-        assert_eq!(state.hooks.stop_hooks[0].label, "server_hook");
-        assert_eq!(
-            state.hooks.workspace_root_hint.as_deref(),
-            Some(dir.path().to_str().unwrap())
-        );
-    }
-
-    #[test]
-    fn build_initial_state_edge_cwd_takes_priority_over_workspace_override() {
-        // Edge profile with cwd set — workspace_override should be ignored.
-        let edge_dir = tempfile::tempdir().unwrap();
-        let mo = edge_dir.path().join(".astra");
-        std::fs::create_dir_all(&mo).unwrap();
-        std::fs::write(
-            mo.join("stop-hooks.yaml"),
-            "version: 1\nauto_detect: false\nhooks:\n  - label: edge_hook\n    command: true\n",
-        )
-        .unwrap();
-
-        let override_dir = tempfile::tempdir().unwrap();
-        let mo2 = override_dir.path().join(".astra");
-        std::fs::create_dir_all(&mo2).unwrap();
-        std::fs::write(
-            mo2.join("stop-hooks.yaml"),
-            "version: 1\nauto_detect: false\nhooks:\n  - label: override_hook\n    command: true\n",
-        )
-        .unwrap();
-
-        let svc = test_service();
-        let mut req = test_request("deploy");
-        req.context = Some(
-            serde_json::json!({
-                "edge_profile": { "cwd": edge_dir.path().to_str().unwrap() }
-            })
-            .as_object()
-            .unwrap()
-            .clone(),
-        );
-
-        let state = svc.build_initial_state(
-            "test-user",
-            &req,
-            "s",
-            "r",
-            Some(override_dir.path()),
-            None,
-            None,
-        );
-        // Edge profile's cwd wins over the workspace override.
-        assert_eq!(state.hooks.stop_hooks.len(), 1);
-        assert_eq!(state.hooks.stop_hooks[0].label, "edge_hook");
-        assert_eq!(
-            state.hooks.workspace_root_hint.as_deref(),
-            Some(edge_dir.path().to_str().unwrap())
-        );
-    }
-
-    #[test]
-    fn run_status_as_str() {
-        assert_eq!(RunStatus::Running.as_str(), "running");
-        assert_eq!(RunStatus::InputQueued.as_str(), "input-queued");
-        assert_eq!(RunStatus::Completed.as_str(), "completed");
-        assert_eq!(RunStatus::Failed.as_str(), "failed");
-        assert_eq!(RunStatus::Cancelled.as_str(), "cancelled");
-        assert_eq!(RunStatus::Paused.as_str(), "paused");
-    }
-
-    #[test]
-    fn server_loop_causal_chain_ids_fit_agent_event_column() {
-        assert!(server_loop_causal_chain_id("server-loop").len() <= 64);
-        assert!(server_loop_causal_chain_id("server-loop-tools").len() <= 64);
-    }
-
-    #[test]
-    fn has_buffered_terminal_completion_ignores_cancelled_and_interrupted_finishes() {
-        assert!(has_buffered_terminal_completion(&[json!({
-            "event_type": "run_finished",
-            "data": {"total_prompt_tokens": 1, "total_completion_tokens": 1}
-        })]));
-        assert!(!has_buffered_terminal_completion(&[json!({
-            "event_type": "run_finished",
-            "data": {"cancelled": true}
-        })]));
-        assert!(!has_buffered_terminal_completion(&[json!({
-            "event_type": "run_finished",
-            "data": {"interrupted": true}
-        })]));
-    }
-
-    #[test]
-    fn preserve_manual_pause_wins_over_late_completed_status() {
-        assert!(should_preserve_manual_pause_on_completion(
-            &RunStatus::Paused,
-            &RunStatus::Completed
-        ));
-        assert!(!should_preserve_manual_pause_on_completion(
-            &RunStatus::Paused,
-            &RunStatus::Failed
-        ));
-        assert!(!should_preserve_manual_pause_on_completion(
-            &RunStatus::Running,
-            &RunStatus::Completed
-        ));
-    }
-
-    #[tokio::test]
-    async fn durable_paused_state_wins_over_late_completed_status() {
-        let svc = test_service_with_engine();
-        let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
-        svc.run_engine
-            .persist_status(
-                "user-1",
-                &run.run_id,
-                STATUS_PAUSED,
-                Some("user_resume"),
-                None,
-            )
-            .await
-            .unwrap();
-
-        assert!(
-            should_preserve_manual_pause_from_durable(
-                &svc.run_engine,
-                "user-1",
-                &run.run_id,
-                &RunStatus::Completed,
-            )
-            .await
-        );
-        assert!(
-            !should_preserve_manual_pause_from_durable(
-                &svc.run_engine,
-                "user-1",
-                &run.run_id,
-                &RunStatus::Failed,
-            )
-            .await
-        );
-    }
-
-    #[tokio::test]
-    async fn pause_run_transitions_running_to_paused() {
-        let svc = test_service();
-        let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
-        let result = ok(svc.pause_run(run.run_id.clone(), "user-1".into()).await);
-        assert_eq!(result.status, "paused");
-        assert_eq!(result.previous_status, "running");
-        let status = ok(svc.get_run_status(run.run_id, "user-1".into()).await);
-        assert_eq!(status.status, "paused");
-    }
-
-    #[tokio::test]
-    async fn pause_run_conflict_when_not_running() {
-        let svc = test_service();
-        let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
-        ok(svc.cancel_run(run.run_id.clone(), "user-1".into()).await);
-        let e = err(svc.pause_run(run.run_id, "user-1".into()).await);
-        assert_eq!(e.0, StatusCode::CONFLICT);
-    }
-
-    #[tokio::test]
-    async fn pause_run_hides_foreign_run() {
-        let svc = test_service();
-        let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
-        let e = err(svc.pause_run(run.run_id, "user-2".into()).await);
-        assert_eq!(e.0, StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn pause_run_not_found() {
-        let svc = test_service();
-        let e = err(svc.pause_run("nonexistent".into(), "user-1".into()).await);
-        assert_eq!(e.0, StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn resume_run_transitions_paused_to_running() {
-        let svc = test_service();
-        let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
-        ok(svc.pause_run(run.run_id.clone(), "user-1".into()).await);
-        let result = ok(svc.resume_run(run.run_id.clone(), "user-1".into()).await);
-        assert_eq!(result.status, "running");
-        assert_eq!(result.previous_status, "paused");
-        let status = ok(svc.get_run_status(run.run_id, "user-1".into()).await);
-        assert_eq!(status.status, "running");
-    }
-
-    #[tokio::test]
-    async fn resume_run_promotes_buffered_completed_pause_to_completed() {
-        let svc = test_service_with_engine();
-        let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
-        ok(svc.pause_run(run.run_id.clone(), "user-1".into()).await);
-        svc.run_engine
-            .append_event(
-                "user-1",
-                &run.run_id,
-                json!({
-                    "event_type": "run_finished",
-                    "data": {"total_prompt_tokens": 1, "total_completion_tokens": 1}
-                }),
-            )
-            .await
-            .unwrap();
-
-        let result = ok(svc.resume_run(run.run_id.clone(), "user-1".into()).await);
-        assert_eq!(result.status, "completed");
-        assert_eq!(result.previous_status, "paused");
-        let status = ok(svc.get_run_status(run.run_id, "user-1".into()).await);
-        assert_eq!(status.status, "completed");
-    }
-
-    #[tokio::test]
-    async fn resume_run_conflict_when_not_paused() {
-        let svc = test_service();
-        let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
-        let e = err(svc.resume_run(run.run_id, "user-1".into()).await);
-        assert_eq!(e.0, StatusCode::CONFLICT);
-    }
-
-    #[tokio::test]
-    async fn resume_run_hides_foreign_run() {
-        let svc = test_service();
-        let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
-        ok(svc.pause_run(run.run_id.clone(), "user-1".into()).await);
-        let e = err(svc.resume_run(run.run_id, "user-2".into()).await);
-        assert_eq!(e.0, StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn resume_run_not_found() {
-        let svc = test_service();
-        let e = err(svc.resume_run("nonexistent".into(), "user-1".into()).await);
-        assert_eq!(e.0, StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn pause_resume_round_trip_preserves_events() {
-        let svc = test_service();
-        let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
-        ok(svc.pause_run(run.run_id.clone(), "user-1".into()).await);
-        ok(svc.resume_run(run.run_id.clone(), "user-1".into()).await);
-        let status = ok(svc
-            .get_run_status(run.run_id.clone(), "user-1".into())
-            .await);
-        assert_eq!(status.events_count, 3); // run_started + run_paused + run_resumed
-        let events = ok(svc.stream_run(run.run_id, "user-1".into(), 0).await);
-        assert_eq!(events[0]["event_type"], "run_started");
-        assert_eq!(events[1]["event_type"], "run_paused");
-        assert_eq!(events[2]["event_type"], "run_resumed");
-    }
-
-    #[tokio::test]
-    async fn double_pause_is_conflict() {
-        let svc = test_service();
-        let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
-        ok(svc.pause_run(run.run_id.clone(), "user-1".into()).await);
-        let e = err(svc.pause_run(run.run_id, "user-1".into()).await);
-        assert_eq!(e.0, StatusCode::CONFLICT);
-    }
-
-    // ─── Durable persistence integration tests ─────────────────────────
-
-    fn test_service_with_engine() -> AgenticRunLifecycleService {
-        test_service()
-    }
-
-    #[tokio::test]
-    #[ignore] // runs full agentic loop; needs live infra
-    async fn durable_create_run_persists_to_store() {
-        let svc = test_service_with_engine();
-        let run = ok(svc.create_run("user-1".into(), test_request("hello")).await);
-
-        let engine = &svc.run_engine;
-        let durable = engine
-            .load_run("user-1", &run.run_id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(durable.user_id, "user-1");
-        assert_eq!(durable.status, "running");
-        assert_eq!(durable.session_id, run.session_id);
-    }
-
-    #[tokio::test]
-    #[ignore] // runs full agentic loop; needs live infra
-    async fn durable_create_run_eventually_persists_terminal_event() {
-        let svc = test_service_with_engine();
-        let run = ok(svc.create_run("user-1".into(), test_request("hello")).await);
-
-        let engine = &svc.run_engine;
-        let durable = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            loop {
-                let durable = engine
-                    .load_run("user-1", &run.run_id)
-                    .await
-                    .unwrap()
-                    .unwrap();
-                if durable.status != "running"
-                    && matches!(
-                        durable
-                            .events
-                            .last()
-                            .and_then(|event| event["event_type"].as_str()),
-                        Some("run_finished")
-                    )
-                {
-                    break durable;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            }
-        })
-        .await
-        .expect("timeout waiting for durable run to persist terminal event");
-        assert_eq!(durable.events.last().unwrap()["event_type"], "run_finished");
-    }
-
-    #[tokio::test]
-    #[ignore] // runs full agentic loop; needs live infra
-    async fn durable_stream_chat_persists_final_state() {
-        let svc = test_service_with_engine();
-        let stream = ok(svc
-            .stream_chat("user-1".into(), test_request("hello"))
-            .await);
-
-        let engine = &svc.run_engine;
-        let durable = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            loop {
-                let durable = engine
-                    .load_run("user-1", &stream.run_id)
-                    .await
-                    .unwrap()
-                    .unwrap();
-                if durable.status != "running"
-                    && matches!(
-                        durable
-                            .events
-                            .last()
-                            .and_then(|event| event["event_type"].as_str()),
-                        Some("run_finished")
-                    )
-                {
-                    break durable;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            }
-        })
-        .await
-        .expect("timeout waiting for durable stream_chat final state");
-        assert_eq!(durable.user_id, "user-1");
-        assert_eq!(durable.session_id, stream.session_id);
-        assert!(durable.events.len() >= 2);
-        assert_eq!(durable.events.last().unwrap()["event_type"], "run_finished");
-    }
-
-    #[tokio::test]
-    #[ignore] // runs full agentic loop; needs live infra
-    async fn durable_cancel_persists_to_store() {
-        let svc = test_service_with_engine();
-        let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
-        ok(svc.cancel_run(run.run_id.clone(), "user-1".into()).await);
-
-        let engine = &svc.run_engine;
-        let durable = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            loop {
-                let durable = engine
-                    .load_run("user-1", &run.run_id)
-                    .await
-                    .unwrap()
-                    .unwrap();
-                if matches!(
-                    durable
-                        .events
-                        .last()
-                        .and_then(|event| event["event_type"].as_str()),
-                    Some("run_finished")
-                ) {
-                    break durable;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            }
-        })
-        .await
-        .expect("timeout waiting for cancelled run to persist terminal event");
-        assert_eq!(durable.status, "cancelled");
-        assert!(durable.events.len() >= 2); // run_started + run_finished
-    }
-
-    #[tokio::test]
-    #[ignore] // runs full agentic loop; needs live infra
-    async fn durable_pause_resume_round_trip() {
-        let svc = test_service_with_engine();
-        let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
-
-        ok(svc.pause_run(run.run_id.clone(), "user-1".into()).await);
-        let engine = &svc.run_engine;
-        let durable = engine
-            .load_run("user-1", &run.run_id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(durable.status, "paused");
-        assert_eq!(durable.waiting_for.as_deref(), Some("user_resume"));
-
-        ok(svc.resume_run(run.run_id.clone(), "user-1".into()).await);
-        let durable = engine
-            .load_run("user-1", &run.run_id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(durable.status, "running");
-        assert!(durable.waiting_for.is_none());
-    }
-
-    #[tokio::test]
-    async fn cancel_run_returns_durable_terminal_status_on_cache_miss() {
-        let svc = test_service_with_engine();
-        let engine = &svc.run_engine;
-        engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
-        engine
-            .persist_status("user-1", "run-1", STATUS_COMPLETED, None, None)
-            .await
-            .unwrap();
-
-        let result = ok(svc.cancel_run("run-1".into(), "user-1".into()).await);
-        assert_eq!(result.run_id, "run-1");
-        assert_eq!(result.status, STATUS_COMPLETED);
-    }
-
-    #[tokio::test]
-    async fn cancel_run_running_cache_miss_persists_cancelled() {
-        let svc = test_service_with_engine();
-        let engine = &svc.run_engine;
-        engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
-
-        let result = ok(svc.cancel_run("run-1".into(), "user-1".into()).await);
-        assert_eq!(result.status, STATUS_CANCELLED);
-        let durable = engine.load_run("user-1", "run-1").await.unwrap().unwrap();
-        assert_eq!(durable.status, STATUS_CANCELLED);
-        assert_eq!(durable.events.last().unwrap()["event_type"], "run_finished");
-    }
-
-    #[tokio::test]
-    async fn pause_run_running_succeeds_via_db() {
-        let svc = test_service_with_engine();
-        let engine = &svc.run_engine;
-        engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
-
-        let result = ok(svc.pause_run("run-1".into(), "user-1".into()).await);
-        assert_eq!(result.status, STATUS_PAUSED);
-        let durable = engine.load_run("user-1", "run-1").await.unwrap().unwrap();
-        assert_eq!(durable.status, STATUS_PAUSED);
-    }
-
-    #[tokio::test]
-    async fn resume_run_paused_succeeds_via_db() {
-        let svc = test_service_with_engine();
-        let engine = &svc.run_engine;
-        engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
-        engine
-            .persist_status("user-1", "run-1", STATUS_PAUSED, Some("user_resume"), None)
-            .await
-            .unwrap();
-
-        let result = ok(svc.resume_run("run-1".into(), "user-1".into()).await);
-        assert_eq!(result.status, STATUS_RUNNING);
-        let durable = engine.load_run("user-1", "run-1").await.unwrap().unwrap();
-        assert_eq!(durable.status, STATUS_RUNNING);
-    }
-
-    #[tokio::test]
-    async fn pause_run_append_failure_rollback_succeeds_keeps_running() {
-        let store: Arc<dyn RunStateStore> = Arc::new(FaultInjectedRunStateStore::new(&[], &[1]));
-        let svc = test_service_with_store(store);
-        let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
-
-        let e = err(svc.pause_run(run.run_id.clone(), "user-1".into()).await);
-        assert_eq!(e.0, StatusCode::SERVICE_UNAVAILABLE);
-        assert!(e.1.0.detail.contains("pause event"));
-
-        let durable = svc
-            .run_engine
-            .load_run("user-1", &run.run_id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(durable.status, STATUS_RUNNING);
-        assert!(durable.waiting_for.is_none());
-        assert_eq!(durable.events.len(), 1);
-        assert_eq!(durable.events[0]["event_type"], "run_started");
-
-        let runs = svc.runs.read().await;
-        let live = runs.get(&run.run_id).expect("live run state");
-        assert_eq!(live.status, RunStatus::Running);
-        assert!(live.waiting_for.is_none());
-        assert!(!live.pause_flag.load(Ordering::SeqCst));
-        assert_eq!(live.events.len(), 1);
-        assert_eq!(live.events[0]["event_type"], "run_started");
-    }
-
-    #[tokio::test]
-    async fn resume_run_append_failure_rollback_succeeds_keeps_paused() {
-        let store: Arc<dyn RunStateStore> = Arc::new(FaultInjectedRunStateStore::new(&[], &[2]));
-        let svc = test_service_with_store(store);
-        let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
-        ok(svc.pause_run(run.run_id.clone(), "user-1".into()).await);
-
-        let e = err(svc.resume_run(run.run_id.clone(), "user-1".into()).await);
-        assert_eq!(e.0, StatusCode::SERVICE_UNAVAILABLE);
-        assert!(e.1.0.detail.contains("resume event"));
-
-        let durable = svc
-            .run_engine
-            .load_run("user-1", &run.run_id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(durable.status, STATUS_PAUSED);
-        assert_eq!(durable.waiting_for.as_deref(), Some("user_resume"));
-        assert_eq!(durable.events.len(), 2);
-        assert_eq!(durable.events[1]["event_type"], "run_paused");
-
-        let runs = svc.runs.read().await;
-        let live = runs.get(&run.run_id).expect("live run state");
-        assert_eq!(live.status, RunStatus::Paused);
-        assert_eq!(live.waiting_for.as_deref(), Some("user_resume"));
-        assert!(live.pause_flag.load(Ordering::SeqCst));
-        assert_eq!(live.events.len(), 2);
-        assert_eq!(live.events[1]["event_type"], "run_paused");
-    }
-
-    #[tokio::test]
-    async fn cancel_run_paused_cache_miss_persists_cancelled() {
-        let svc = test_service_with_engine();
-        let engine = &svc.run_engine;
-        engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
-        engine
-            .persist_status("user-1", "run-1", STATUS_PAUSED, Some("user_resume"), None)
-            .await
-            .unwrap();
-
-        let result = ok(svc.cancel_run("run-1".into(), "user-1".into()).await);
-        assert_eq!(result.status, STATUS_CANCELLED);
-        let durable = engine.load_run("user-1", "run-1").await.unwrap().unwrap();
-        assert_eq!(durable.status, STATUS_CANCELLED);
-    }
-
-    #[tokio::test]
-    #[ignore] // stream_chat runs full agentic loop; needs live DB + LLM or mock
-    async fn get_run_status_falls_back_to_durable_store_on_cache_miss() {
-        let svc = test_service_with_engine();
-        let stream = ok(svc
-            .stream_chat("user-1".into(), test_request("hello"))
-            .await);
-        let engine = &svc.run_engine;
-        let durable = engine
-            .load_run("user-1", &stream.run_id)
-            .await
-            .unwrap()
-            .unwrap();
-
-        svc.runs.write().await.remove(&stream.run_id);
-
-        let status = ok(svc
-            .get_run_status(stream.run_id.clone(), "user-1".into())
-            .await);
-        assert_eq!(status.run_id, stream.run_id);
-        assert_eq!(status.session_id, stream.session_id);
-        assert_eq!(status.status, durable.status);
-        assert_eq!(status.waiting_for, durable.waiting_for);
-        assert_eq!(status.events_count, durable.events.len() as i64);
-    }
-
-    #[tokio::test]
-    async fn stream_run_cache_miss_replays_durable_text_done() {
-        let svc = test_service_with_engine();
-        let engine = &svc.run_engine;
-        engine
-            .start_run("run-durable-text", "user-1", "session-1")
-            .await
-            .expect("start durable run");
-        engine
-            .append_event(
-                "user-1",
-                "run-durable-text",
-                json!({"event_type": "text_done", "data": {"full_text": "durable final answer"}}),
-            )
-            .await
-            .expect("persist text_done");
-        engine
-            .append_event(
-                "user-1",
-                "run-durable-text",
-                json!({"event_type": "run_finished", "data": {"prompt_tokens": 1}}),
-            )
-            .await
-            .expect("persist run_finished");
-
-        let events = ok(svc
-            .stream_run("run-durable-text".into(), "user-1".into(), 1)
-            .await);
-
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0]["event_type"], "text_done");
-        assert_eq!(events[0]["data"]["full_text"], "durable final answer");
-        assert_eq!(events[1]["event_type"], "run_finished");
-    }
-
-    #[tokio::test]
-    async fn submit_run_input_uses_durable_idempotency_on_cache_miss() {
-        let svc = test_service_with_engine();
-        let engine = &svc.run_engine;
-        engine
-            .start_run("run-input", "user-1", "session-1")
-            .await
-            .unwrap();
-
-        let first = ok(svc
-            .submit_run_input(
-                "run-input".into(),
-                "user-1".into(),
-                RunInputData {
-                    idempotency_key: "key-1".into(),
-                    input: json!({"answer": "yes"}),
-                },
-            )
-            .await);
-        let duplicate = ok(svc
-            .submit_run_input(
-                "run-input".into(),
-                "user-1".into(),
-                RunInputData {
-                    idempotency_key: "key-1".into(),
-                    input: json!({"answer": "yes"}),
-                },
-            )
-            .await);
-
-        let durable = engine
-            .load_run("user-1", "run-input")
-            .await
-            .unwrap()
-            .unwrap();
-        let matching_inputs = durable
-            .events
-            .iter()
-            .filter(|event| event.get("idempotency_key").and_then(Value::as_str) == Some("key-1"))
-            .count();
-        assert!(!first.duplicate);
-        assert!(duplicate.duplicate);
-        assert_eq!(matching_inputs, 1);
-        assert_eq!(durable.status, STATUS_INPUT_QUEUED);
-        assert_eq!(durable.waiting_for.as_deref(), Some("user_input"));
-    }
-
-    #[tokio::test]
-    async fn submit_run_input_rejects_terminal_durable_run() {
-        let svc = test_service_with_engine();
-        let engine = &svc.run_engine;
-        engine
-            .start_run("run-terminal-input", "user-1", "session-1")
-            .await
-            .unwrap();
-        engine
-            .persist_status("user-1", "run-terminal-input", STATUS_COMPLETED, None, None)
-            .await
-            .unwrap();
-
-        let e = err(svc
-            .submit_run_input(
-                "run-terminal-input".into(),
-                "user-1".into(),
-                RunInputData {
-                    idempotency_key: "key-1".into(),
-                    input: json!({"answer": "late"}),
-                },
-            )
-            .await);
-        assert_eq!(e.0, StatusCode::CONFLICT);
-    }
-
-    #[tokio::test]
-    async fn submit_run_input_accepts_repeated_queueing_while_input_already_queued() {
-        let svc = test_service_with_engine();
-        let engine = &svc.run_engine;
-        engine
-            .start_run("run-queued-input", "user-1", "session-1")
-            .await
-            .unwrap();
-        engine
-            .persist_status(
-                "user-1",
-                "run-queued-input",
-                STATUS_INPUT_QUEUED,
-                Some("user_input"),
-                None,
-            )
-            .await
-            .unwrap();
-
-        let result = svc
-            .submit_run_input(
-                "run-queued-input".into(),
-                "user-1".into(),
-                RunInputData {
-                    idempotency_key: "key-queued-1".into(),
-                    input: json!({"answer": "keep queueing"}),
-                },
-            )
-            .await
-            .expect("input-queued runs should accept additional deferred input");
-
-        assert!(result.accepted);
-        assert!(!result.duplicate);
-        let durable = engine
-            .load_run("user-1", "run-queued-input")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(durable.status, STATUS_INPUT_QUEUED);
-        assert_eq!(durable.waiting_for.as_deref(), Some("user_input"));
-        assert!(durable.events.iter().any(|event| {
-            event.get("idempotency_key").and_then(Value::as_str) == Some("key-queued-1")
-        }));
-    }
-
-    #[tokio::test]
-    async fn submit_run_input_rejects_paused_durable_run() {
-        let svc = test_service_with_engine();
-        let engine = &svc.run_engine;
-        engine
-            .start_run("run-paused-input", "user-1", "session-1")
-            .await
-            .unwrap();
-        engine
-            .persist_status("user-1", "run-paused-input", STATUS_PAUSED, None, None)
-            .await
-            .unwrap();
-
-        let e = err(svc
-            .submit_run_input(
-                "run-paused-input".into(),
-                "user-1".into(),
-                RunInputData {
-                    idempotency_key: "key-1".into(),
-                    input: json!({"answer": "late"}),
-                },
-            )
-            .await);
-        assert_eq!(e.0, StatusCode::CONFLICT);
-    }
-
-    #[tokio::test]
-    async fn submit_run_input_rejects_oversized_content() {
-        let svc = test_service_with_engine();
-        let engine = &svc.run_engine;
-        engine
-            .start_run("run-large-input", "user-1", "session-1")
-            .await
-            .unwrap();
-
-        let e = err(svc
-            .submit_run_input(
-                "run-large-input".into(),
-                "user-1".into(),
-                RunInputData {
-                    idempotency_key: "key-large".into(),
-                    input: json!({"content": "x".repeat(MAX_DEFERRED_INPUT_CHARS + 1)}),
-                },
-            )
-            .await);
-
-        assert_eq!(e.0, StatusCode::PAYLOAD_TOO_LARGE);
-        let durable = engine
-            .load_run("user-1", "run-large-input")
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            durable.events.iter().all(|event| {
-                event.get("idempotency_key").and_then(Value::as_str) != Some("key-large")
-            }),
-            "oversized input must not be appended before validation"
-        );
-    }
-
-    #[tokio::test]
-    async fn create_run_conflict_checks_durable_active_session() {
-        let svc = test_service_with_engine();
-        let engine = &svc.run_engine;
-        engine
-            .start_run("existing-run", "user-1", "shared-session")
-            .await
-            .unwrap();
-        let mut request = test_request("second");
-        request.session_id = Some("shared-session".into());
-
-        let e = err(svc.create_run("user-1".into(), request).await);
-        assert_eq!(e.0, StatusCode::CONFLICT);
-    }
-
-    #[tokio::test]
-    #[ignore] // stream_chat runs full agentic loop; needs live DB + LLM or mock
-    async fn stream_run_falls_back_to_durable_store_on_cache_miss() {
-        let svc = test_service_with_engine();
-        let stream = ok(svc
-            .stream_chat("user-1".into(), test_request("hello"))
-            .await);
-        let engine = &svc.run_engine;
-        let durable = engine
-            .load_run("user-1", &stream.run_id)
-            .await
-            .unwrap()
-            .unwrap();
-
-        svc.runs.write().await.remove(&stream.run_id);
-
-        let events = ok(svc
-            .stream_run(stream.run_id.clone(), "user-1".into(), 1)
-            .await);
-        assert_eq!(
-            events,
-            AgenticRunLifecycleService::format_run_events(&durable.events[1..], 1)
-        );
-    }
-
-    #[tokio::test]
-    #[ignore] // stream_chat runs full agentic loop; needs live DB + LLM or mock
-    async fn list_runs_falls_back_to_durable_store_on_cache_miss() {
-        let svc = test_service_with_engine();
-        let first = ok(svc
-            .stream_chat("user-1".into(), test_request("first"))
-            .await);
-        let second = ok(svc
-            .stream_chat("user-1".into(), test_request("second"))
-            .await);
-
-        svc.runs.write().await.remove(&first.run_id);
-
-        let runs = ok(svc.list_runs("user-1".into(), 10, 0).await);
-        let run_ids: Vec<_> = runs.runs.iter().map(|run| run.run_id.as_str()).collect();
-        assert_eq!(runs.total, 2);
-        assert!(run_ids.contains(&first.run_id.as_str()));
-        assert!(run_ids.contains(&second.run_id.as_str()));
-    }
-
-    #[tokio::test]
-    async fn lifecycle_run_creation_is_durable_by_default() {
-        let svc = test_service();
-        let run = ok(svc.create_run("user-1".into(), test_request("hello")).await);
-        let durable = svc
-            .run_engine
-            .load_run("user-1", &run.run_id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(durable.user_id, "user-1");
-        assert_eq!(durable.session_id, run.session_id);
-        assert_eq!(durable.status, STATUS_RUNNING);
-    }
-
-    // ─── EdgeContext integration tests ──────────────────────────────────
-
-    #[test]
-    fn extract_edge_context_from_request_with_tools() {
-        let mut ctx = serde_json::Map::new();
-        ctx.insert(
-            "edge_tools".to_string(),
-            json!([{"function": {"name": "bash", "parameters": {}}}]),
-        );
-        ctx.insert(
-            "edge_profile".to_string(),
-            json!({"cwd": "/tmp", "git_branch": "main"}),
-        );
-        let req = ChatRequestData {
-            context: Some(ctx),
-            ..test_request("hello")
-        };
-
-        let edge_ctx =
-            AgenticRunLifecycleService::extract_edge_context(&req).expect("edge context");
-        assert_eq!(edge_ctx.tool_count(), 1);
-        assert_eq!(edge_ctx.tool_names(), vec!["bash"]);
-        assert_eq!(edge_ctx.edge_profile.cwd.as_deref(), Some("/tmp"));
-        assert_eq!(edge_ctx.edge_profile.git_branch.as_deref(), Some("main"));
-    }
-
-    #[test]
-    fn extract_edge_context_from_empty_request() {
-        let req = test_request("hello");
-        let edge_ctx =
-            AgenticRunLifecycleService::extract_edge_context(&req).expect("edge context");
-        assert!(!edge_ctx.has_tools());
-        assert!(edge_ctx.edge_profile.cwd.is_none());
-    }
-
-    #[test]
-    fn extract_edge_context_rejects_malformed_context() {
-        let mut ctx = serde_json::Map::new();
-        ctx.insert("edge_tools".to_string(), json!({"not": "an array"}));
-        let req = ChatRequestData {
-            context: Some(ctx),
-            ..test_request("hello")
-        };
-
-        let error = AgenticRunLifecycleService::extract_edge_context(&req)
-            .expect_err("malformed edge context must fail loud");
-
-        assert_eq!(error.0, StatusCode::BAD_REQUEST);
-        assert!(
-            error.1.0.detail.contains("invalid edge context"),
-            "unexpected error: {}",
-            error.1.0.detail
-        );
-    }
-
-    #[tokio::test]
-    async fn create_run_rejects_malformed_edge_context_before_agent_start() {
-        let svc = test_service();
-        let mut ctx = serde_json::Map::new();
-        ctx.insert("edge_tools".to_string(), json!({"not": "an array"}));
-        let req = ChatRequestData {
-            context: Some(ctx),
-            ..test_request("hello")
-        };
-
-        let error = err(svc.create_run("user-1".into(), req).await);
-
-        assert_eq!(error.0, StatusCode::BAD_REQUEST);
-        assert!(
-            error.1.0.detail.contains("invalid edge context"),
-            "unexpected error: {}",
-            error.1.0.detail
-        );
-    }
-
-    #[tokio::test]
-    async fn stream_chat_rejects_malformed_edge_context_before_agent_start() {
-        let svc = test_service();
-        let mut ctx = serde_json::Map::new();
-        ctx.insert("edge_profile".to_string(), json!({"cwd": 42}));
-        let req = ChatRequestData {
-            context: Some(ctx),
-            ..test_request("hello")
-        };
-
-        let error = err(svc.stream_chat("user-1".into(), req).await);
-
-        assert_eq!(error.0, StatusCode::BAD_REQUEST);
-        assert!(
-            error.1.0.detail.contains("invalid edge context"),
-            "unexpected error: {}",
-            error.1.0.detail
-        );
-    }
-
-    // ─── Background spawning integration tests ──────────────────────────
-
-    #[tokio::test]
-    #[ignore] // runs full agentic loop; needs live infra
-    async fn create_run_spawns_background_task() {
-        let svc = test_service();
-        let run = ok(svc.create_run("user-1".into(), test_request("hello")).await);
-        assert_eq!(run.status, "running");
-
-        // Deterministic wait: poll until the background task advances state.
-        let status = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            loop {
-                let status = ok(svc
-                    .get_run_status(run.run_id.clone(), "user-1".into())
-                    .await);
-                if status.status != "running" || status.events_count > 1 {
-                    break status;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            }
-        })
-        .await
-        .expect("timeout waiting for background task to advance state");
-        assert!(
-            status.status != "running" || status.events_count > 1,
-            "Expected background task to advance state, but status={} events={}",
-            status.status,
-            status.events_count
-        );
-    }
-
-    #[tokio::test]
-    #[ignore] // runs full agentic loop; needs live infra
-    async fn create_run_with_engine_persists_final_state() {
-        let svc = test_service_with_engine();
-        let run = ok(svc.create_run("user-1".into(), test_request("hello")).await);
-
-        // Deterministic wait: poll durable state until it leaves "running".
-        let engine = &svc.run_engine;
-        let durable = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            loop {
-                let durable = engine
-                    .load_run("user-1", &run.run_id)
-                    .await
-                    .unwrap()
-                    .unwrap();
-                if durable.status != "running" {
-                    break durable;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            }
-        })
-        .await
-        .expect("timeout waiting for durable run status to finalize");
-        assert_ne!(durable.status, "running");
-    }
-
-    // ─── DelegationTracker integration tests ────────────────────────────
-
-    #[tokio::test]
-    async fn delegation_tracker_get_children() {
-        use crate::server::delegation::engine::{DelegationTracker, SubRunRecord, SubRunState};
-
-        let tracker = DelegationTracker::new();
-        tracker
-            .record_sub_run(SubRunRecord {
-                delegation_id: "d1".into(),
-                run_id: "child-1".into(),
-                parent_run_id: "parent-1".into(),
-                agent_id: "agent-a".into(),
-                depth: 1,
-                state: SubRunState::Created,
-                retry_of: None,
-            })
-            .await;
-        tracker
-            .record_sub_run(SubRunRecord {
-                delegation_id: "d1".into(),
-                run_id: "child-2".into(),
-                parent_run_id: "parent-1".into(),
-                agent_id: "agent-b".into(),
-                depth: 1,
-                state: SubRunState::Created,
-                retry_of: None,
-            })
-            .await;
-        tracker
-            .record_sub_run(SubRunRecord {
-                delegation_id: "d2".into(),
-                run_id: "other-child".into(),
-                parent_run_id: "parent-2".into(),
-                agent_id: "agent-c".into(),
-                depth: 1,
-                state: SubRunState::Created,
-                retry_of: None,
-            })
-            .await;
-
-        let mut children = tracker.get_children("parent-1").await;
-        children.sort();
-        assert_eq!(children, vec!["child-1", "child-2"]);
-
-        let children = tracker.get_children("parent-2").await;
-        assert_eq!(children, vec!["other-child"]);
-
-        let children = tracker.get_children("nonexistent").await;
-        assert!(children.is_empty());
-    }
-
-    /// P0-C: The agentic loop spawn must check token budget before starting.
-    #[test]
-    fn run_lifecycle_checks_token_budget_before_loop() {
-        let source = include_str!("mod.rs");
-        let test_start = source.find("mod tests {").unwrap_or(source.len());
-        let prod_code = &source[..test_start];
-        assert!(
-            prod_code.contains("check_token_budget"),
-            "run_lifecycle must call check_token_budget before the agentic loop"
-        );
-    }
-
-    /// P0-C: drain_background_tasks returns true when no tasks are running.
-    #[tokio::test]
-    async fn drain_background_tasks_returns_immediately_when_idle() {
-        // Test the drain logic directly: counter at 0 → drain returns true immediately.
-        let count = Arc::new(AtomicUsize::new(0));
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(100);
-        let drained = loop {
-            if count.load(Ordering::Acquire) == 0 {
-                break true;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                break false;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        };
-        assert!(drained, "counter at 0 — drain must return true immediately");
-    }
-
-    /// P0-C: background_task_count increments on spawn and decrements on exit.
-    #[tokio::test]
-    async fn background_task_count_tracks_spawned_tasks() {
-        use std::sync::atomic::Ordering;
-        let count = Arc::new(AtomicUsize::new(0));
-        let count_clone = Arc::clone(&count);
-
-        // Simulate what the spawn does: increment, spawn, decrement on drop
-        count.fetch_add(1, Ordering::Release);
-        let handle = tokio::spawn(async move {
-            struct Guard(Arc<AtomicUsize>);
-            impl Drop for Guard {
-                fn drop(&mut self) {
-                    self.0.fetch_sub(1, Ordering::Release);
-                }
-            }
-            let _g = Guard(count_clone);
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        });
-
-        assert_eq!(count.load(Ordering::Acquire), 1, "task in flight");
-        handle.await.unwrap();
-        assert_eq!(
-            count.load(Ordering::Acquire),
-            0,
-            "task completed — counter must be 0"
-        );
-    }
-
-    /// P1-A: RunStatus::try_transition enforces valid state machine transitions.
-    #[test]
-    fn run_status_try_transition_valid_and_invalid() {
-        use super::RunStatus::*;
-
-        // Valid transitions
-        assert!(Running.try_transition(&InputQueued).is_ok());
-        assert!(Running.try_transition(&Paused).is_ok());
-        assert!(Running.try_transition(&Completed).is_ok());
-        assert!(Running.try_transition(&Failed).is_ok());
-        assert!(Running.try_transition(&Cancelled).is_ok());
-        assert!(InputQueued.try_transition(&Running).is_ok());
-        assert!(InputQueued.try_transition(&Paused).is_ok());
-        assert!(InputQueued.try_transition(&Waiting).is_ok());
-        assert!(InputQueued.try_transition(&Completed).is_ok());
-        assert!(InputQueued.try_transition(&Failed).is_ok());
-        assert!(InputQueued.try_transition(&Cancelled).is_ok());
-        assert!(Paused.try_transition(&Running).is_ok());
-        assert!(Paused.try_transition(&Cancelled).is_ok());
-        assert!(Paused.try_transition(&Failed).is_ok());
-        assert!(Waiting.try_transition(&InputQueued).is_ok());
-
-        // Terminal states cannot transition
-        let err = Completed.try_transition(&Running);
-        assert!(err.is_err(), "Completed → Running must be rejected");
-        assert!(
-            err.unwrap_err().contains("Completed"),
-            "error must name the source state"
-        );
-
-        let err = Failed.try_transition(&Running);
-        assert!(err.is_err(), "Failed → Running must be rejected");
-
-        let err = Cancelled.try_transition(&Completed);
-        assert!(err.is_err(), "Cancelled → Completed must be rejected");
-
-        // Running cannot go back to Running
-        let err = Running.try_transition(&Running);
-        assert!(err.is_err(), "Running → Running must be rejected");
-
-        assert!(
-            InputQueued.try_transition(&InputQueued).is_ok(),
-            "InputQueued → InputQueued must stay queueable for repeated user input"
-        );
-    }
-
-    /// P1-F: list_runs pagination must be deterministic — all runs appear
-    /// exactly once across pages, with no duplicates or missing entries.
-    #[tokio::test]
-    async fn list_runs_pagination_is_deterministic() {
-        let svc = test_service();
-        for i in 0..5 {
-            ok(svc
-                .create_run("user-pg".into(), test_request(&format!("msg {i}")))
-                .await);
-        }
-        // Collect all run_ids across 3 pages
-        let mut all_ids = Vec::new();
-        let page1 = ok(svc.list_runs("user-pg".into(), 2, 0).await);
-        all_ids.extend(page1.runs.iter().map(|r| r.run_id.clone()));
-        let page2 = ok(svc.list_runs("user-pg".into(), 2, 2).await);
-        all_ids.extend(page2.runs.iter().map(|r| r.run_id.clone()));
-        let page3 = ok(svc.list_runs("user-pg".into(), 2, 4).await);
-        all_ids.extend(page3.runs.iter().map(|r| r.run_id.clone()));
-
-        assert_eq!(all_ids.len(), 5, "all 5 runs must appear across pages");
-        let unique: std::collections::HashSet<_> = all_ids.iter().collect();
-        assert_eq!(
-            unique.len(),
-            5,
-            "no duplicate run_ids across pages — pagination must be deterministic"
-        );
-    }
-
-    /// P1-A: RunStatus must have a Waiting variant that is non-terminal.
-    /// Runs needing external input must not be killed as Failed.
-    #[test]
-    fn waiting_is_non_terminal_status() {
-        // Running → Waiting is valid
-        assert!(
-            RunStatus::Running
-                .try_transition(&RunStatus::Waiting)
-                .is_ok(),
-            "Running → Waiting must be allowed"
-        );
-        // Waiting → Running is valid (resume after input)
-        assert!(
-            RunStatus::Waiting
-                .try_transition(&RunStatus::Running)
-                .is_ok(),
-            "Waiting → Running must be allowed (resume)"
-        );
-        // Waiting → Cancelled is valid
-        assert!(
-            RunStatus::Waiting
-                .try_transition(&RunStatus::Cancelled)
-                .is_ok(),
-            "Waiting → Cancelled must be allowed"
-        );
-        // Waiting → Failed is valid (timeout)
-        assert!(
-            RunStatus::Waiting
-                .try_transition(&RunStatus::Failed)
-                .is_ok(),
-            "Waiting → Failed must be allowed"
-        );
-        // Waiting serializes as "waiting"
-        assert_eq!(RunStatus::Waiting.as_str(), "waiting");
-        assert!(
-            RunStatus::Waiting
-                .try_transition(&RunStatus::InputQueued)
-                .is_ok(),
-            "Waiting → InputQueued must be allowed when user input arrives"
-        );
-    }
-
-    #[test]
-    fn run_status_live_semantics_align_with_durable_owner() {
-        assert_eq!(
-            RunStatus::from_durable_status(STATUS_RUNNING),
-            Some(RunStatus::Running)
-        );
-        assert_eq!(
-            RunStatus::from_durable_status(STATUS_INPUT_QUEUED),
-            Some(RunStatus::InputQueued)
-        );
-        assert_eq!(
-            RunStatus::from_durable_status(STATUS_WAITING),
-            Some(RunStatus::Waiting)
-        );
-        assert_eq!(
-            RunStatus::from_durable_status(STATUS_PAUSED),
-            Some(RunStatus::Paused)
-        );
-        assert_eq!(
-            RunStatus::from_durable_status(STATUS_COMPLETED),
-            Some(RunStatus::Completed)
-        );
-        assert_eq!(
-            RunStatus::from_durable_status(STATUS_FAILED),
-            Some(RunStatus::Failed)
-        );
-        assert_eq!(
-            RunStatus::from_durable_status(STATUS_CANCELLED),
-            Some(RunStatus::Cancelled)
-        );
-        assert_eq!(RunStatus::from_durable_status("mystery"), None);
-
-        assert!(RunStatus::Waiting.is_resumable());
-        assert!(RunStatus::Paused.is_resumable());
-        assert!(!RunStatus::Running.is_resumable());
-        assert!(!RunStatus::Completed.is_resumable());
-
-        assert_eq!(
-            RunStatus::Running.blocks_session(None),
-            astra_services::runs::durable_run_status_blocks_session(STATUS_RUNNING, None)
-        );
-        assert_eq!(
-            RunStatus::Waiting.blocks_session(None),
-            astra_services::runs::durable_run_status_blocks_session(STATUS_WAITING, None)
-        );
-        assert_eq!(
-            RunStatus::Paused.blocks_session(Some("tool_approval")),
-            astra_services::runs::durable_run_status_blocks_session(
-                STATUS_PAUSED,
-                Some("tool_approval")
-            )
-        );
-        assert_eq!(
-            RunStatus::Paused.blocks_session(None),
-            astra_services::runs::durable_run_status_blocks_session(STATUS_PAUSED, None)
-        );
-        assert_eq!(
-            RunStatus::Completed.blocks_session(None),
-            astra_services::runs::durable_run_status_blocks_session(STATUS_COMPLETED, None)
-        );
-    }
-
-    /// P1-A: finalize_run_events must preserve Waiting as a non-error status.
-    #[test]
-    fn finalize_run_events_preserves_waiting_without_error_event() {
-        let svc = test_service();
-        let request = test_request("wait");
-        let state = svc.build_initial_state(
-            "test-user",
-            &request,
-            "session-1",
-            "run-1",
-            None,
-            None,
-            None,
-        );
-
-        let (events, status, error) = AgenticRunLifecycleService::finalize_run_events(
-            Ok(AgenticLoopOutcome::Waiting("tool_approval".into())),
-            vec![],
-            &state,
-        );
-
-        assert_eq!(status, RunStatus::Waiting);
-        assert_eq!(error.as_deref(), Some("waiting: tool_approval"));
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0]["event_type"], "run_waiting");
-        assert_eq!(events[0]["data"]["reason"], "waiting: tool_approval");
-    }
-
-    /// P1-F: stream_chat must persist usage unconditionally.
-    /// Cancelled runs still consumed tokens and must have accurate durable records,
-    /// even when status persistence is skipped.
-    #[test]
-    fn stream_chat_persists_usage_unconditionally() {
-        let source = include_str!("mod.rs");
-        // Find the stream_chat method
-        let fn_start = source
-            .find("async fn stream_chat(")
-            .expect("stream_chat must exist");
-        let fn_end = source[fn_start..]
-            .find("\n    async fn ")
-            .map(|p| fn_start + p)
-            .unwrap_or(source.len());
-        let fn_body = &source[fn_start..fn_end];
-
-        let usage_pos = fn_body
-            .find(".persist_usage(")
-            .expect("stream_chat must call persist_usage");
-
-        // persist_usage must NOT be inside the status-persistence guard.
-        // Cancelled runs skip persist_status, but usage must still be written.
-        let guard_pos = fn_body
-            .find("if persist_status_update {")
-            .expect("persist_status_update guard must exist");
-        let guard_block = &fn_body[guard_pos..];
-        let mut depth = 0;
-        let mut guard_end = 0;
-        for (i, c) in guard_block.char_indices() {
-            if c == '{' {
-                depth += 1;
-            } else if c == '}' {
-                depth -= 1;
-                if depth == 0 {
-                    guard_end = guard_pos + i + 1;
-                    break;
-                }
-            }
-        }
-        assert!(
-            usage_pos > guard_end,
-            "persist_usage must remain outside the persist_status_update guard — \
-             cancelled stream_chat runs must still persist usage for billing/audit"
-        );
-    }
-
-    #[test]
-    fn durable_run_usage_uses_provider_input_tokens() {
-        let source = include_str!("mod.rs");
-        let production = source
-            .split("\n#[cfg(test)]\nmod tests")
-            .next()
-            .expect("production lifecycle source");
-        let mut checked_calls = 0;
-        let mut cursor = production;
-        while let Some(pos) = cursor.find(".persist_usage(") {
-            checked_calls += 1;
-            let snippet = &cursor[pos..cursor.len().min(pos + 360)];
-            assert!(
-                snippet.contains("provider_input_tokens()"),
-                "durable run usage has no cache-specific columns, so prompt totals must include cache read/write buckets: {snippet}"
-            );
-            assert!(
-                !snippet.contains("total_prompt,"),
-                "fresh-input-only totals would under-report prompt-cache-heavy runs: {snippet}"
-            );
-            cursor = &cursor[pos + ".persist_usage(".len()..];
-        }
-        assert!(
-            checked_calls >= 2,
-            "stream_chat must persist usage on terminal paths"
-        );
-    }
-
-    #[test]
-    fn server_subrun_agent_result_prompt_tokens_include_cache_buckets() {
-        let source = include_str!("mod.rs");
-        let fn_start = source
-            .find("impl SubRunExecutor for ServerSubRunExecutor")
-            .expect("server sub-run executor must exist");
-        let fn_end = source[fn_start..]
-            .find("// ─── Tests")
-            .map(|p| fn_start + p)
-            .expect("server sub-run executor body");
-        let fn_body = &source[fn_start..fn_end];
-
-        assert!(
-            fn_body.contains("let prompt_tokens = loop_state.provider_input_tokens();"),
-            "AgentResult has no cache-specific fields; prompt_tokens must represent provider input tokens"
-        );
-        assert!(
-            !fn_body.contains("prompt_tokens: loop_state.total_prompt"),
-            "fresh-input-only totals would under-report prompt-cache-heavy sub-runs"
-        );
-    }
-
-    /// P1-C: build_server_skill_executor must accept and wire a cancel_token.
-    /// Without this, skill sub-runs ignore parent cancellation.
-    #[test]
-    fn build_server_skill_executor_accepts_cancel_token() {
-        let source = include_str!("mod.rs");
-        let fn_start = source
-            .find("fn build_server_skill_executor(")
-            .expect("build_server_skill_executor must exist");
-        let fn_end = source[fn_start..]
-            .find("\npub(crate) fn ")
-            .or_else(|| source[fn_start..].find("\nfn "))
-            .map(|p| fn_start + p)
-            .unwrap_or(source.len());
-        let fn_body = &source[fn_start..fn_end];
-        assert!(
-            fn_body.contains("cancel_token"),
-            "build_server_skill_executor must accept a cancel_token parameter"
-        );
-        assert!(
-            fn_body.contains("with_cancel_token"),
-            "build_server_skill_executor must wire cancel_token via with_cancel_token"
-        );
-    }
-
-    /// Runtime tool surfacing for forked server skills must inherit the parent
-    /// workspace/executor/runtime binding; otherwise sub-runs see raw edge
-    /// schemas without the capability resolver's runtime truth.
-    #[test]
-    fn build_server_skill_executor_wires_execution_binding_snapshot() {
-        let source = include_str!("mod.rs");
-        let fn_start = source
-            .find("fn build_server_skill_executor(")
-            .expect("build_server_skill_executor must exist");
-        let fn_end = source[fn_start..]
-            .find("\npub(crate) fn ")
-            .or_else(|| source[fn_start..].find("\nfn "))
-            .map(|p| fn_start + p)
-            .unwrap_or(source.len());
-        let fn_body = &source[fn_start..fn_end];
-        assert!(
-            fn_body.contains("execution_bindings"),
-            "build_server_skill_executor must accept execution binding metadata"
-        );
-        assert!(
-            fn_body.contains("with_execution_binding_snapshot"),
-            "build_server_skill_executor must pass execution bindings to server skill sub-runs"
-        );
-    }
-
-    #[test]
-    fn build_server_skill_executor_wires_inherited_permissions() {
-        let source = include_str!("mod.rs");
-        let fn_start = source
-            .find("fn build_server_skill_executor(")
-            .expect("build_server_skill_executor must exist");
-        let fn_end = source[fn_start..]
-            .find("\npub(crate) fn ")
-            .or_else(|| source[fn_start..].find("\nfn "))
-            .map(|p| fn_start + p)
-            .unwrap_or(source.len());
-        let fn_body = &source[fn_start..fn_end];
-        assert!(
-            fn_body.contains("inherited_permissions"),
-            "build_server_skill_executor must accept request-level permissions"
-        );
-        assert!(
-            fn_body.contains("with_inherited_permissions"),
-            "build_server_skill_executor must pass request-level permissions to server skill sub-runs"
-        );
-    }
-
-    #[test]
-    fn build_server_skill_executor_wires_reflect_service() {
-        let source = include_str!("mod.rs");
-        let fn_start = source
-            .find("fn build_server_skill_executor(")
-            .expect("build_server_skill_executor must exist");
-        let fn_end = source[fn_start..]
-            .find("\npub(crate) fn ")
-            .or_else(|| source[fn_start..].find("\nfn "))
-            .map(|p| fn_start + p)
-            .unwrap_or(source.len());
-        let fn_body = &source[fn_start..fn_end];
-        assert!(
-            fn_body.contains("reflect_service: Arc<dyn astra_services::ReflectService>"),
-            "build_server_skill_executor must accept the shared reflect service"
-        );
-        assert!(
-            fn_body.contains(".with_reflect_service(reflect_service)"),
-            "build_server_skill_executor must pass reflect service to server skill sub-runs"
-        );
-    }
-
-    #[test]
-    fn lifecycle_executor_construction_wires_reflect_service() {
-        let source = include_str!("mod.rs");
-        let production = source
-            .split("\n#[cfg(test)]\nmod tests")
-            .next()
-            .expect("production lifecycle source");
-        let root_wires = production
-            .matches("wire_reflect_service_into_executor(executor, &self.reflect_service)")
-            .count();
-        assert!(
-            root_wires >= 3,
-            "root/resume/sub-run ServerToolExecutor construction must all inject the shared reflect service"
-        );
-        assert!(
-            production.contains(".with_reflect_service(Arc::clone(&self.reflect_service))"),
-            "dynamic agent spawner/sub-run builders must inherit the shared reflect service"
-        );
-        assert!(
-            production.contains("self.reflect_service.is_configured()"),
-            "capability construction must derive reflect visibility from reflect service readiness"
-        );
-    }
-
-    /// P1-C: build_initial_state must pass cancel_token to skill executor builder.
-    #[test]
-    fn build_initial_state_passes_cancel_token_to_skill_executor() {
-        let source = include_str!("mod.rs");
-        let fn_start = source
-            .find("fn build_initial_state(")
-            .expect("build_initial_state must exist");
-        let fn_end = source[fn_start..]
-            .find("\n    fn ")
-            .or_else(|| source[fn_start..].find("\n    pub"))
-            .map(|p| fn_start + p)
-            .unwrap_or(source.len());
-        let fn_body = &source[fn_start..fn_end];
-        assert!(
-            fn_body.contains("cancel_token"),
-            "build_initial_state must accept and pass cancel_token to skill executor"
-        );
-    }
-
-    #[test]
-    fn build_initial_state_passes_execution_bindings_to_skill_executor() {
-        let source = include_str!("mod.rs");
-        let fn_start = source
-            .find("fn build_initial_state(")
-            .expect("build_initial_state must exist");
-        let fn_end = source[fn_start..]
-            .find("\n    fn ")
-            .or_else(|| source[fn_start..].find("\n    pub"))
-            .map(|p| fn_start + p)
-            .unwrap_or(source.len());
-        let fn_body = &source[fn_start..fn_end];
-        assert!(
-            fn_body.contains("execution_bindings"),
-            "build_initial_state must accept execution bindings"
-        );
-        assert!(
-            fn_body.contains("build_initial_state_inner(")
-                && fn_body.contains("execution_bindings,"),
-            "build_initial_state must pass execution bindings into build_initial_state_inner"
-        );
-
-        let inner_start = source[fn_start..]
-            .find("fn build_initial_state_inner(")
-            .map(|p| fn_start + p)
-            .expect("build_initial_state_inner must exist");
-        let inner_end = source[inner_start..]
-            .find("\n    fn ")
-            .or_else(|| source[inner_start..].find("\n    pub"))
-            .map(|p| inner_start + p)
-            .unwrap_or(source.len());
-        let inner_body = &source[inner_start..inner_end];
-        assert!(
-            inner_body.contains("build_server_skill_executor(")
-                && inner_body.contains("execution_bindings,"),
-            "build_initial_state_inner must pass execution bindings into the skill executor builder"
-        );
-    }
-
-    #[test]
-    fn resumable_run_statuses_stay_live_for_resume() {
-        assert!(RunStatus::Waiting.is_resumable());
-        assert!(RunStatus::Paused.is_resumable());
-        assert!(!RunStatus::Running.is_resumable());
-        assert!(!RunStatus::Completed.is_resumable());
-        assert!(!RunStatus::Failed.is_resumable());
-        assert!(!RunStatus::Cancelled.is_resumable());
-    }
-
-    /// A Waiting run persisted in durable store must be cancellable even after
-    /// the process-local control handle is gone.
-    #[tokio::test]
-    async fn cancel_run_waiting_cache_miss_persists_cancelled() {
-        let svc = test_service_with_engine();
-        let engine = &svc.run_engine;
-        engine
-            .start_run("waiting-run", "user-1", "session-1")
-            .await
-            .unwrap();
-        engine
-            .persist_status(
-                "user-1",
-                "waiting-run",
-                STATUS_WAITING,
-                Some("tool_approval"),
-                None,
-            )
-            .await
-            .unwrap();
-
-        let result = ok(svc.cancel_run("waiting-run".into(), "user-1".into()).await);
-        let durable = engine
-            .load_run("user-1", "waiting-run")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(result.status, STATUS_CANCELLED);
-        assert_eq!(durable.status, STATUS_CANCELLED);
-    }
-
-    /// Admission control: semaphore rejects when at capacity, allows after release.
-    #[tokio::test]
-    async fn run_semaphore_admission_control() {
-        // Limit = 1: only one concurrent run permitted.
-        let svc = AgenticRunLifecycleService::new(
-            test_settings(),
-            test_encryptor(),
-            Arc::new(TokioMutex::new(HashMap::new())),
-            RunEngine::new(Arc::new(InMemoryRunStateStore::new())),
-        )
-        .with_run_concurrency_limit(1);
-        let sem = svc.test_run_semaphore();
-
-        // 1st acquire succeeds.
-        let permit1 = sem.clone().try_acquire_owned().expect("first permit");
-        // 2nd acquire must fail — at capacity.
-        assert!(
-            sem.clone().try_acquire_owned().is_err(),
-            "second acquire must fail when at capacity"
-        );
-
-        // After release, re-acquire succeeds.
-        drop(permit1);
-        let permit2 = sem
-            .clone()
-            .try_acquire_owned()
-            .expect("re-acquire after release");
-        drop(permit2);
-    }
-
-    /// Admission control: limit=2, third acquire must fail, release creates room.
-    #[tokio::test]
-    async fn run_semaphore_limit_two() {
-        let svc = AgenticRunLifecycleService::new(
-            test_settings(),
-            test_encryptor(),
-            Arc::new(TokioMutex::new(HashMap::new())),
-            RunEngine::new(Arc::new(InMemoryRunStateStore::new())),
-        )
-        .with_run_concurrency_limit(2);
-        let sem = svc.test_run_semaphore();
-
-        let p1 = sem.clone().try_acquire_owned().expect("first");
-        let p2 = sem.clone().try_acquire_owned().expect("second");
-        assert!(sem.clone().try_acquire_owned().is_err(), "third must fail");
-
-        drop(p1);
-        // Now one slot open, re-acquire works.
-        let p3 = sem
-            .clone()
-            .try_acquire_owned()
-            .expect("re-acquire after one drop");
-        drop(p2);
-        drop(p3);
-    }
-
-    /// Admission with timeout: `acquire_owned` + `timeout` rejects after
-    /// the deadline while a short release window lets a waiter proceed.
-    #[tokio::test]
-    async fn run_semaphore_admission_timeout_waits_and_proceeds() {
-        let svc = AgenticRunLifecycleService::new(
-            test_settings(),
-            test_encryptor(),
-            Arc::new(TokioMutex::new(HashMap::new())),
-            RunEngine::new(Arc::new(InMemoryRunStateStore::new())),
-        )
-        .with_run_concurrency_limit(1);
-        let sem = svc.test_run_semaphore();
-
-        // 1st acquire: capacity exhausted.
-        let p1 = sem.clone().try_acquire_owned().expect("first");
-        // Spawn a waiter with a short timeout — it will time out.
-        let sem2 = sem.clone();
-        let timeout_result =
-            tokio::time::timeout(std::time::Duration::from_millis(50), sem2.acquire_owned()).await;
-        assert!(
-            timeout_result.is_err(),
-            "waiter should time out when no slot opens"
-        );
-
-        // Now spawn a waiter and release the slot quickly — waiter should get it.
-        let sem3 = sem.clone();
-        let waiter = tokio::spawn(async move {
-            tokio::time::timeout(std::time::Duration::from_secs(5), sem3.acquire_owned())
-                .await
-                .expect("timeout should not fire")
-                .expect("acquire_owned")
-        });
-        // Small yield to let the waiter enter acquire_owned.
-        tokio::task::yield_now().await;
-        drop(p1); // release the slot
-        let p2 = waiter.await.expect("waiter panicked");
-        drop(p2);
-    }
-}
+mod tests;

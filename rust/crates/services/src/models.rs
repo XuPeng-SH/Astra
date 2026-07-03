@@ -3,11 +3,19 @@ use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sqlx::{Row, query};
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{Arc, LazyLock, Mutex},
+    time::{Duration, Instant},
+};
 use uuid::Uuid;
 
 use crate::auth::FernetTokenEncryptor;
-use astra_core::{ErrorResponse, MatrixOneSettings, SharedPool, error_response, internal_error};
+use astra_core::{
+    ErrorKind, ErrorResponse, MatrixOneSettings, SharedPool,
+    classify_model_resolution_error_message, error_response, internal_error,
+};
 
 // ── Data types ───────────────────────────────────────────────────────────────
 
@@ -408,6 +416,139 @@ impl ResolvedActiveLlmModel {
     }
 }
 
+const ACTIVE_LLM_MODEL_RESOLUTION_CACHE_TTL: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ActiveLlmModelCacheKey {
+    host: String,
+    port: u16,
+    user: String,
+    database: String,
+    preferred_model: String,
+}
+
+impl ActiveLlmModelCacheKey {
+    fn new(matrixone: &MatrixOneSettings, preferred_model: &str) -> Self {
+        Self {
+            host: matrixone.host.clone(),
+            port: matrixone.port,
+            user: matrixone.user.clone(),
+            database: matrixone.database.clone(),
+            preferred_model: preferred_model.to_string(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ActiveLlmModelCacheEntry {
+    inserted_at: Instant,
+    model: ResolvedActiveLlmModel,
+}
+
+#[derive(Default)]
+struct ActiveLlmModelResolutionCache {
+    entries: HashMap<ActiveLlmModelCacheKey, ActiveLlmModelCacheEntry>,
+}
+
+impl ActiveLlmModelResolutionCache {
+    fn get_fresh(
+        &self,
+        key: &ActiveLlmModelCacheKey,
+        now: Instant,
+    ) -> Option<ResolvedActiveLlmModel> {
+        let entry = self.entries.get(key)?;
+        if now.saturating_duration_since(entry.inserted_at) <= ACTIVE_LLM_MODEL_RESOLUTION_CACHE_TTL
+        {
+            return Some(entry.model.clone());
+        }
+        None
+    }
+
+    fn get_stale(&self, key: &ActiveLlmModelCacheKey) -> Option<ResolvedActiveLlmModel> {
+        self.entries.get(key).map(|entry| entry.model.clone())
+    }
+
+    fn insert(&mut self, key: ActiveLlmModelCacheKey, model: ResolvedActiveLlmModel, now: Instant) {
+        self.entries.insert(
+            key,
+            ActiveLlmModelCacheEntry {
+                inserted_at: now,
+                model,
+            },
+        );
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
+static ACTIVE_LLM_MODEL_RESOLUTION_CACHE: LazyLock<Mutex<ActiveLlmModelResolutionCache>> =
+    LazyLock::new(|| Mutex::new(ActiveLlmModelResolutionCache::default()));
+
+static ACTIVE_LLM_MODEL_RESOLUTION_LOCKS: LazyLock<
+    Mutex<HashMap<ActiveLlmModelCacheKey, Arc<tokio::sync::Mutex<()>>>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn active_llm_model_resolution_cache_lookup(
+    key: &ActiveLlmModelCacheKey,
+) -> Option<ResolvedActiveLlmModel> {
+    ACTIVE_LLM_MODEL_RESOLUTION_CACHE
+        .lock()
+        .expect("active LLM model resolution cache lock poisoned")
+        .get_fresh(key, Instant::now())
+}
+
+fn active_llm_model_resolution_cache_stale_lookup(
+    key: &ActiveLlmModelCacheKey,
+) -> Option<ResolvedActiveLlmModel> {
+    ACTIVE_LLM_MODEL_RESOLUTION_CACHE
+        .lock()
+        .expect("active LLM model resolution cache lock poisoned")
+        .get_stale(key)
+}
+
+fn active_llm_model_resolution_cache_store(
+    key: ActiveLlmModelCacheKey,
+    model: ResolvedActiveLlmModel,
+) {
+    ACTIVE_LLM_MODEL_RESOLUTION_CACHE
+        .lock()
+        .expect("active LLM model resolution cache lock poisoned")
+        .insert(key, model, Instant::now());
+}
+
+fn active_llm_model_resolution_lock(key: &ActiveLlmModelCacheKey) -> Arc<tokio::sync::Mutex<()>> {
+    ACTIVE_LLM_MODEL_RESOLUTION_LOCKS
+        .lock()
+        .expect("active LLM model resolution lock map poisoned")
+        .entry(key.clone())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+fn remove_active_llm_model_resolution_lock(key: &ActiveLlmModelCacheKey) {
+    ACTIVE_LLM_MODEL_RESOLUTION_LOCKS
+        .lock()
+        .expect("active LLM model resolution lock map poisoned")
+        .remove(key);
+}
+
+fn active_llm_model_resolution_error_allows_stale_cache(error: &str) -> bool {
+    classify_model_resolution_error_message(error) == ErrorKind::DatabaseError
+}
+
+pub fn invalidate_active_llm_model_resolution_cache() {
+    ACTIVE_LLM_MODEL_RESOLUTION_CACHE
+        .lock()
+        .expect("active LLM model resolution cache lock poisoned")
+        .clear();
+    ACTIVE_LLM_MODEL_RESOLUTION_LOCKS
+        .lock()
+        .expect("active LLM model resolution lock map poisoned")
+        .clear();
+}
+
 fn models_yaml_path(working_dir: Option<&Path>) -> Option<PathBuf> {
     let start = match working_dir {
         Some(path) => path.to_path_buf(),
@@ -754,14 +895,55 @@ pub async fn resolve_active_llm_model(
     };
 
     let pool = require_pool(pool, matrixone).await?;
+    let cache_key = ActiveLlmModelCacheKey::new(matrixone, name);
+    if let Some(cached) = active_llm_model_resolution_cache_lookup(&cache_key) {
+        return Ok(cached);
+    }
 
+    let singleflight = active_llm_model_resolution_lock(&cache_key);
+    let _singleflight_guard = singleflight.lock().await;
+    if let Some(cached) = active_llm_model_resolution_cache_lookup(&cache_key) {
+        return Ok(cached);
+    }
+
+    let resolved = resolve_active_llm_model_uncached(encryptor, name, &pool).await;
+    match resolved {
+        Ok(resolved) => {
+            active_llm_model_resolution_cache_store(cache_key.clone(), resolved.clone());
+            remove_active_llm_model_resolution_lock(&cache_key);
+            Ok(resolved)
+        }
+        Err(err) => {
+            if active_llm_model_resolution_error_allows_stale_cache(&err)
+                && let Some(stale) = active_llm_model_resolution_cache_stale_lookup(&cache_key)
+            {
+                tracing::warn!(
+                    target: "astra_services::models",
+                    model = %name,
+                    error = %err,
+                    "active LLM model refresh failed; using stale cached model"
+                );
+                remove_active_llm_model_resolution_lock(&cache_key);
+                return Ok(stale);
+            }
+            remove_active_llm_model_resolution_lock(&cache_key);
+            Err(err)
+        }
+    }
+}
+
+async fn resolve_active_llm_model_uncached(
+    encryptor: &FernetTokenEncryptor,
+    name: &str,
+    pool: &sqlx::Pool<sqlx::MySql>,
+) -> Result<ResolvedActiveLlmModel, String> {
     // Try exact match first — the fast path. If the LLM supplied
     // the fully-qualified name it resolves in one query.
     let exact_row = sqlx::query(&format!(
         "SELECT {RESOLVE_COLS}, is_active FROM infra_llm_models WHERE model_name = ? LIMIT 1"
     ))
     .bind(name)
-    .fetch_optional(&pool)
+    .fetch_optional(pool)
     .await
     .map_err(|e| format!("DB query: {e}"))?;
 
@@ -783,7 +965,7 @@ pub async fn resolve_active_llm_model(
             let active_names: Vec<String> = sqlx::query_scalar::<_, String>(
                 "SELECT model_name FROM infra_llm_models WHERE is_active = 1",
             )
-            .fetch_all(&pool)
+            .fetch_all(pool)
             .await
             .map_err(|e| format!("DB query: {e}"))?;
 
@@ -795,7 +977,7 @@ pub async fn resolve_active_llm_model(
                          FROM infra_llm_models WHERE model_name = ? LIMIT 1"
                     ))
                     .bind(&canonical)
-                    .fetch_optional(&pool)
+                    .fetch_optional(pool)
                     .await
                     .map_err(|e| format!("DB query: {e}"))?
                     .ok_or_else(|| {
@@ -1368,6 +1550,7 @@ impl ModelService for DatabaseModelService {
         .execute(&pool)
         .await
         .map_err(internal_error)?;
+        invalidate_active_llm_model_resolution_cache();
 
         // Thinking probe is NOT run during create — it's a separate
         // concern triggered by `model check`.  create_model only validates
@@ -1466,6 +1649,7 @@ impl ModelService for DatabaseModelService {
         request: ModelUpdateRequestData,
     ) -> Result<ModelRecord, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
+        invalidate_active_llm_model_resolution_cache();
         validate_update_context_window(request.context_window)?;
 
         let existing = query(
@@ -1593,6 +1777,7 @@ impl ModelService for DatabaseModelService {
 
         let mut record = Self::model_record_from_row(row)?;
         record.connectivity = conn_result;
+        invalidate_active_llm_model_resolution_cache();
         Ok(record)
     }
 
@@ -1601,6 +1786,7 @@ impl ModelService for DatabaseModelService {
         model_name: String,
     ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
+        invalidate_active_llm_model_resolution_cache();
         let existing = query("SELECT model_id FROM infra_llm_models WHERE model_name = ?")
             .bind(&model_name)
             .fetch_optional(&pool)
@@ -1617,6 +1803,7 @@ impl ModelService for DatabaseModelService {
             .execute(&pool)
             .await
             .map_err(internal_error)?;
+        invalidate_active_llm_model_resolution_cache();
         Ok(())
     }
 
@@ -1625,6 +1812,7 @@ impl ModelService for DatabaseModelService {
         model_name: String,
     ) -> Result<ModelRecord, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
+        invalidate_active_llm_model_resolution_cache();
         let row = query(
             "SELECT api_key_encrypted, provider, base_url, \
                     CAST(quirks AS CHAR) AS quirks_json \
@@ -1727,6 +1915,7 @@ impl ModelService for DatabaseModelService {
         let mut record = Self::model_record_from_row(result_row)?;
         record.connectivity = Some(check.unwrap_or_else(|| "ok".to_string()));
         record.thinking_probe = thinking_probe;
+        invalidate_active_llm_model_resolution_cache();
         Ok(record)
     }
 }
@@ -2621,6 +2810,87 @@ mod tests {
             .expect_err("missing preferred model must fail before DB fallback");
 
         assert_eq!(err, REQUIRED_MODEL_SELECTION_ERROR);
+    }
+
+    fn sample_resolved_active_model(name: &str) -> ResolvedActiveLlmModel {
+        ResolvedActiveLlmModel {
+            model_name: name.to_string(),
+            wire_model_name: None,
+            api_key: "sk-test".to_string(),
+            base_url: "http://127.0.0.1:18080".to_string(),
+            provider: "openai".to_string(),
+            fallback_chain: Vec::new(),
+            tags: Vec::new(),
+            request_body_overrides: None,
+            prompt_cache_capability: None,
+            thinking_capability: None,
+            context_window: Some(200_000),
+            request_headers: None,
+        }
+    }
+
+    #[test]
+    fn active_llm_model_resolution_cache_hits_until_ttl_then_expires() {
+        let key = ActiveLlmModelCacheKey::new(&MatrixOneSettings::mock(), "capacity-mock");
+        let model = sample_resolved_active_model("capacity-mock");
+        let mut cache = ActiveLlmModelResolutionCache::default();
+        let now = Instant::now();
+
+        assert!(cache.get_fresh(&key, now).is_none());
+        assert!(cache.get_stale(&key).is_none());
+        cache.insert(key.clone(), model.clone(), now);
+
+        assert_eq!(cache.get_fresh(&key, now).as_ref(), Some(&model));
+        assert_eq!(
+            cache
+                .get_fresh(&key, now + ACTIVE_LLM_MODEL_RESOLUTION_CACHE_TTL)
+                .as_ref(),
+            Some(&model)
+        );
+        assert!(
+            cache
+                .get_fresh(
+                    &key,
+                    now + ACTIVE_LLM_MODEL_RESOLUTION_CACHE_TTL + Duration::from_millis(1),
+                )
+                .is_none()
+        );
+        assert_eq!(
+            cache.get_stale(&key).as_ref(),
+            Some(&model),
+            "expired entries remain available for stale-if-DB-error fallback"
+        );
+    }
+
+    #[test]
+    fn active_llm_model_resolution_stale_fallback_only_allows_database_errors() {
+        assert!(active_llm_model_resolution_error_allows_stale_cache(
+            "DB query: error communicating with database: expected to read 4 bytes, got 0 bytes at EOF"
+        ));
+        assert!(active_llm_model_resolution_error_allows_stale_cache(
+            "DB query: pool timed out while waiting for an open connection"
+        ));
+        assert!(!active_llm_model_resolution_error_allows_stale_cache(
+            "Model `capacity-mock` is inactive"
+        ));
+        assert!(!active_llm_model_resolution_error_allows_stale_cache(
+            "Model `unknown-model` is not configured on this server"
+        ));
+    }
+
+    #[test]
+    fn active_llm_model_resolution_cache_key_separates_database_and_model() {
+        let mut astra = MatrixOneSettings::mock();
+        astra.database = "astra".to_string();
+        let mut staging = astra.clone();
+        staging.database = "astra_staging".to_string();
+
+        let astra_key = ActiveLlmModelCacheKey::new(&astra, "capacity-mock");
+        let staging_key = ActiveLlmModelCacheKey::new(&staging, "capacity-mock");
+        let other_model_key = ActiveLlmModelCacheKey::new(&astra, "other-model");
+
+        assert_ne!(astra_key, staging_key);
+        assert_ne!(astra_key, other_model_key);
     }
 
     #[test]

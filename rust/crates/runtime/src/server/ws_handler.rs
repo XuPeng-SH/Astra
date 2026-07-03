@@ -47,6 +47,7 @@ use astra_core::{STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED};
 use astra_server_types::merge_plan_subtask_context;
 use astra_services::runs::durable_run_status_is_terminal;
 use astra_tools::{AskUserAnswers, AskUserPrompt};
+use astra_turn_core::pipeline_metrics::MetricsRegistry;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use serde_json::Value;
@@ -69,13 +70,53 @@ static WS_CONNECTION_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::
 /// Heartbeat interval for keep-alive pings.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Poll cadence for background lifecycle runs streamed over WebSocket.
-/// 500ms keeps per-run DB QPS at 2 (vs 10 at 100ms) while still
-/// delivering <1s event visibility for streamed run lifecycle.
-const RUN_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// Fast poll cadence for background lifecycle runs streamed over WebSocket.
+/// Active streams keep sub-second event visibility; idle streams back off below.
+const RUN_STREAM_FAST_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const RUN_STREAM_IDLE_STEP_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const RUN_STREAM_IDLE_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const RUN_STREAM_IDLE_STEP_AFTER_EMPTY_POLLS: u32 = 2;
+const RUN_STREAM_IDLE_MAX_AFTER_EMPTY_POLLS: u32 = 5;
 /// Safety valve for retryable lifecycle poll failures to avoid indefinite hung streams.
-/// At 500ms poll cadence, 60 consecutive errors ≈ 30s wall time.
+/// Wall time depends on the current adaptive poll cadence.
 const MAX_CONSECUTIVE_RETRYABLE_POLL_ERRORS: u32 = 60;
+const METRIC_WS_RUN_STREAM_POLL_ATTEMPTS_TOTAL: &str = "astra_ws_run_stream_poll_attempts_total";
+const METRIC_WS_RUN_STREAM_POLL_ERRORS_TOTAL: &str = "astra_ws_run_stream_poll_errors_total";
+
+pub(crate) fn register_ws_run_stream_poll_metrics(registry: &MetricsRegistry) {
+    registry.register_counter(
+        METRIC_WS_RUN_STREAM_POLL_ATTEMPTS_TOTAL,
+        "WebSocket run stream lifecycle poll attempts by operation and low-cardinality outcome.",
+    );
+    registry.register_counter(
+        METRIC_WS_RUN_STREAM_POLL_ERRORS_TOTAL,
+        "WebSocket run stream lifecycle poll errors by operation and low-cardinality class.",
+    );
+}
+
+fn record_ws_run_stream_poll_attempt(
+    registry: &MetricsRegistry,
+    operation: &'static str,
+    outcome: &'static str,
+) {
+    registry.increment_counter(
+        METRIC_WS_RUN_STREAM_POLL_ATTEMPTS_TOTAL,
+        &[("operation", operation), ("outcome", outcome)],
+        1,
+    );
+}
+
+fn record_ws_run_stream_poll_error(
+    registry: &MetricsRegistry,
+    operation: &'static str,
+    class: &'static str,
+) {
+    registry.increment_counter(
+        METRIC_WS_RUN_STREAM_POLL_ERRORS_TOTAL,
+        &[("operation", operation), ("class", class)],
+        1,
+    );
+}
 
 fn ws_connection_limit_reached_with(current: usize) -> bool {
     current >= MAX_WS_CONNECTIONS
@@ -235,6 +276,8 @@ pub(super) enum WsServerMessage {
     #[serde(rename = "user_prompt_request")]
     UserPromptRequest {
         request_id: String,
+        session_id: String,
+        run_id: String,
         prompt: AskUserPrompt,
     },
 
@@ -873,7 +916,7 @@ async fn handle_resume_run(
 }
 
 /// Outcome of a dedup-insert into the edge-callback ledger.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum WsLedgerOutcome {
     /// Key was absent; value has been inserted.
     Inserted,
@@ -881,6 +924,17 @@ pub(crate) enum WsLedgerOutcome {
     IdempotentReplay,
     /// Key was present with a DIFFERENT value; the original decision is preserved.
     ConflictIgnored,
+    /// Key was absent but the shared ledger was already at capacity.
+    CapacityExceeded,
+}
+
+fn ws_ledger_outcome_label(outcome: WsLedgerOutcome) -> &'static str {
+    match outcome {
+        WsLedgerOutcome::Inserted => "inserted",
+        WsLedgerOutcome::IdempotentReplay => "idempotent_replay",
+        WsLedgerOutcome::ConflictIgnored => "conflict_ignored",
+        WsLedgerOutcome::CapacityExceeded => "capacity_exceeded",
+    }
 }
 
 /// Insert `value` under `key` in the ledger with at-most-once idempotency semantics.
@@ -889,12 +943,27 @@ pub(crate) enum WsLedgerOutcome {
 /// - Key present + same JSON value → no-op, return `IdempotentReplay`.
 /// - Key present + different JSON value → do NOT overwrite; emit a warning;
 ///   return `ConflictIgnored`.
+/// - Key absent + ledger full → do NOT insert; emit a warning; return
+///   `CapacityExceeded`.
 pub(crate) fn ws_ledger_dedup_insert(
     ledger: &mut std::collections::HashMap<String, serde_json::Value>,
     key: String,
     value: serde_json::Value,
 ) -> WsLedgerOutcome {
     use std::collections::hash_map::Entry;
+    if !ledger.contains_key(&key)
+        && ledger.len() >= astra_turn_core::edge_ledger::LEDGER_MAX_ENTRIES
+    {
+        tracing::warn!(
+            target: "astra_runtime::ws_callback",
+            key = %key,
+            entries = ledger.len(),
+            limit = astra_turn_core::edge_ledger::LEDGER_MAX_ENTRIES,
+            "WS ledger dedup: refusing new callback because edge callback ledger is full"
+        );
+        return WsLedgerOutcome::CapacityExceeded;
+    }
+
     match ledger.entry(key.clone()) {
         Entry::Vacant(e) => {
             e.insert(value);
@@ -928,16 +997,191 @@ async fn handle_tool_approval(
     approved: bool,
     reason: Option<String>,
 ) {
+    use astra_services::session_journal::{
+        ApprovalDecisionAppendOutcome, ApprovalJournalDecision,
+        append_approval_decision_for_run_if_absent, find_latest_approval_required_for_run,
+        validate_session_id,
+    };
     use astra_turn_core::edge_ledger::approval_callback_key;
 
-    let key = approval_callback_key(&conn.principal.user.user_id, request_id);
-    let value = serde_json::json!({
-        "approved": approved,
-        "reason": reason,
-    });
-    let ledger = state.edge_callback_ledger.clone();
-    let mut guard = ledger.lock().await;
-    ws_ledger_dedup_insert(&mut guard, key, value);
+    fn approval_ledger_value(approved: bool, reason: Option<String>) -> serde_json::Value {
+        serde_json::json!({
+            "approved": approved,
+            "reason": reason,
+        })
+    }
+
+    fn approval_ledger_value_from_journal(decision: &ApprovalJournalDecision) -> serde_json::Value {
+        let approved = matches!(decision.decision.as_str(), "allow" | "allow_session");
+        approval_ledger_value(approved, decision.reason.clone())
+    }
+
+    let registry = state.metrics_registry();
+    let Some(session_id) = conn.session_id.as_deref() else {
+        crate::server::interaction_metrics::record_approval_journal_write(
+            registry.as_ref(),
+            "skipped_no_context",
+        );
+        return;
+    };
+    let Some(run_id) = conn
+        .active_run_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|run_id| !run_id.is_empty())
+    else {
+        crate::server::interaction_metrics::record_approval_journal_write(
+            registry.as_ref(),
+            "invalid_run",
+        );
+        return;
+    };
+    if let Err(error) = validate_session_id(session_id) {
+        tracing::warn!(
+            target: "astra_runtime::ws_callback",
+            user_id = %conn.principal.user.user_id,
+            request_id = %request_id,
+            session_id = %session_id,
+            error = %error,
+            "refusing approval response with invalid session_id"
+        );
+        crate::server::interaction_metrics::record_approval_journal_write(
+            registry.as_ref(),
+            "invalid_session",
+        );
+        return;
+    }
+
+    let key = approval_callback_key(&conn.principal.user.user_id, session_id, run_id, request_id);
+    let mut value = approval_ledger_value(approved, reason.clone());
+    let decision = if approved { "allow" } else { "deny" };
+    let required = match find_latest_approval_required_for_run(session_id, request_id, run_id) {
+        Ok(Some(request)) => {
+            crate::server::interaction_metrics::record_approval_journal_lookup(
+                registry.as_ref(),
+                "required",
+                "hit",
+            );
+            Some(request)
+        }
+        Ok(None) => {
+            crate::server::interaction_metrics::record_approval_journal_lookup(
+                registry.as_ref(),
+                "required",
+                "miss",
+            );
+            None
+        }
+        Err(error) => {
+            crate::server::interaction_metrics::record_approval_journal_lookup(
+                registry.as_ref(),
+                "required",
+                "error",
+            );
+            tracing::warn!(
+                target: "astra_runtime::ws_callback",
+                user_id = %conn.principal.user.user_id,
+                session_id = %session_id,
+                run_id = %run_id,
+                request_id = %request_id,
+                error = %error,
+                "approval journal required lookup failed"
+            );
+            None
+        }
+    };
+    let approval_turn = required.as_ref().and_then(|request| request.turn);
+    let tool_name = required
+        .as_ref()
+        .and_then(|request| request.tool_name.as_deref());
+    let approval_kind = required
+        .as_ref()
+        .and_then(|request| request.approval_kind.as_deref());
+    match append_approval_decision_for_run_if_absent(
+        session_id,
+        approval_turn,
+        request_id,
+        run_id,
+        tool_name,
+        approval_kind,
+        decision,
+        reason.as_deref(),
+    ) {
+        Ok(ApprovalDecisionAppendOutcome::Appended) => {
+            crate::server::interaction_metrics::record_approval_journal_lookup(
+                registry.as_ref(),
+                "decision",
+                "miss",
+            );
+            crate::server::interaction_metrics::record_approval_journal_write(
+                registry.as_ref(),
+                "ok",
+            );
+        }
+        Ok(ApprovalDecisionAppendOutcome::Idempotent) => {
+            crate::server::interaction_metrics::record_approval_journal_lookup(
+                registry.as_ref(),
+                "decision",
+                "hit",
+            );
+            crate::server::interaction_metrics::record_approval_journal_write(
+                registry.as_ref(),
+                "idempotent",
+            );
+        }
+        Ok(ApprovalDecisionAppendOutcome::Conflict(existing)) => {
+            crate::server::interaction_metrics::record_approval_journal_lookup(
+                registry.as_ref(),
+                "decision",
+                "hit",
+            );
+            crate::server::interaction_metrics::record_approval_journal_write(
+                registry.as_ref(),
+                "conflict",
+            );
+            tracing::warn!(
+                target: "astra_runtime::ws_callback",
+                user_id = %conn.principal.user.user_id,
+                session_id = %session_id,
+                run_id = %run_id,
+                request_id = %request_id,
+                existing_decision = %existing.decision,
+                incoming_decision = %decision,
+                "approval decision already durable; preserving existing decision for local ledger"
+            );
+            value = approval_ledger_value_from_journal(&existing);
+        }
+        Err(error) => {
+            crate::server::interaction_metrics::record_approval_journal_lookup(
+                registry.as_ref(),
+                "decision",
+                "error",
+            );
+            crate::server::interaction_metrics::record_approval_journal_write(
+                registry.as_ref(),
+                "error",
+            );
+            tracing::warn!(
+                target: "astra_runtime::ws_callback",
+                user_id = %conn.principal.user.user_id,
+                session_id = %session_id,
+                run_id = %run_id,
+                request_id = %request_id,
+                error = %error,
+                "failed to persist approval decision journal event"
+            );
+        }
+    }
+
+    let outcome = {
+        let ledger = state.edge_callback_ledger.clone();
+        let mut guard = ledger.lock().await;
+        ws_ledger_dedup_insert(&mut guard, key, value)
+    };
+    crate::server::interaction_metrics::record_approval_ledger_insert(
+        registry.as_ref(),
+        ws_ledger_outcome_label(outcome),
+    );
 }
 
 /// Store an ask_user response in the edge callback ledger.
@@ -948,17 +1192,138 @@ async fn handle_user_prompt_response(
     answers: Option<AskUserAnswers>,
     cancelled: bool,
 ) {
+    use astra_services::session_journal::{JournalEvent, JournalWriter, validate_session_id};
     use astra_turn_core::edge_ledger::user_prompt_callback_key;
 
-    let key = user_prompt_callback_key(&conn.principal.user.user_id, request_id);
+    let registry = state.metrics_registry();
+    let (session_id, run_id) = match (conn.session_id.as_deref(), conn.active_run_id.as_deref()) {
+        (Some(session_id), Some(run_id)) if !run_id.trim().is_empty() => (session_id, run_id),
+        (Some(_), Some(_)) => {
+            crate::server::interaction_metrics::record_ask_user_journal_write(
+                registry.as_ref(),
+                "response",
+                "invalid_run",
+            );
+            crate::server::interaction_metrics::record_ask_user_ledger_insert(
+                registry.as_ref(),
+                "invalid_context",
+            );
+            return;
+        }
+        _ => {
+            crate::server::interaction_metrics::record_ask_user_journal_write(
+                registry.as_ref(),
+                "response",
+                "skipped_no_context",
+            );
+            crate::server::interaction_metrics::record_ask_user_ledger_insert(
+                registry.as_ref(),
+                "skipped_no_context",
+            );
+            return;
+        }
+    };
+    if let Err(error) = validate_session_id(session_id) {
+        tracing::warn!(
+            target: "astra_runtime::ws_callback",
+            user_id = %conn.principal.user.user_id,
+            request_id = %request_id,
+            session_id = %session_id,
+            error = %error,
+            "refusing durable ask_user response journal write for invalid session_id"
+        );
+        crate::server::interaction_metrics::record_ask_user_journal_write(
+            registry.as_ref(),
+            "response",
+            "invalid_session",
+        );
+        crate::server::interaction_metrics::record_ask_user_ledger_insert(
+            registry.as_ref(),
+            "invalid_session",
+        );
+        return;
+    } else {
+        if !cancelled && answers.is_none() {
+            crate::server::interaction_metrics::record_ask_user_journal_write(
+                registry.as_ref(),
+                "response",
+                "missing_answers",
+            );
+            crate::server::interaction_metrics::record_ask_user_ledger_insert(
+                registry.as_ref(),
+                "invalid_payload",
+            );
+            return;
+        }
+        let status = if cancelled { "cancelled" } else { "submitted" };
+        let mut write_outcome = "ok";
+        let answers_json = match answers.as_ref() {
+            Some(answers) => match serde_json::to_value(answers) {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    tracing::warn!(
+                        target: "astra_runtime::ws_callback",
+                        user_id = %conn.principal.user.user_id,
+                        request_id = %request_id,
+                        session_id = %session_id,
+                        error = %error,
+                        "failed to serialize ask_user answers for journal"
+                    );
+                    write_outcome = "serialize_error";
+                    None
+                }
+            },
+            None => None,
+        };
+        match JournalWriter::new(session_id).and_then(|writer| {
+            writer.append(&JournalEvent::ask_user_response(
+                Some(session_id),
+                None,
+                request_id,
+                Some(run_id),
+                status,
+                answers_json,
+            ))
+        }) {
+            Ok(()) => crate::server::interaction_metrics::record_ask_user_journal_write(
+                registry.as_ref(),
+                "response",
+                write_outcome,
+            ),
+            Err(error) => {
+                crate::server::interaction_metrics::record_ask_user_journal_write(
+                    registry.as_ref(),
+                    "response",
+                    "error",
+                );
+                tracing::warn!(
+                    target: "astra_runtime::ws_callback",
+                    user_id = %conn.principal.user.user_id,
+                    request_id = %request_id,
+                    session_id = %session_id,
+                    run_id = %run_id,
+                    error = %error,
+                    "failed to persist ask_user response journal event"
+                );
+            }
+        }
+    }
+    let key =
+        user_prompt_callback_key(&conn.principal.user.user_id, session_id, run_id, request_id);
     let value = if cancelled {
         serde_json::json!({ "cancelled": true })
     } else {
         serde_json::json!({ "answers": answers })
     };
-    let ledger = state.edge_callback_ledger.clone();
-    let mut guard = ledger.lock().await;
-    ws_ledger_dedup_insert(&mut guard, key, value);
+    let outcome = {
+        let ledger = state.edge_callback_ledger.clone();
+        let mut guard = ledger.lock().await;
+        ws_ledger_dedup_insert(&mut guard, key, value)
+    };
+    crate::server::interaction_metrics::record_ask_user_ledger_insert(
+        registry.as_ref(),
+        ws_ledger_outcome_label(outcome),
+    );
 }
 
 #[cfg(test)]
@@ -1205,6 +1570,16 @@ fn lifecycle_poll_error_policy(status: StatusCode) -> LifecyclePollErrorPolicy {
     }
 }
 
+fn lifecycle_poll_error_class(status: StatusCode) -> &'static str {
+    if super::http_helpers::status_to_sse_retryable(status) {
+        "retryable"
+    } else if matches!(status, StatusCode::FORBIDDEN | StatusCode::NOT_FOUND) {
+        "access_or_missing"
+    } else {
+        "fatal"
+    }
+}
+
 fn should_emit_transient_poll_error(
     last_error: &mut Option<(StatusCode, String)>,
     status: StatusCode,
@@ -1225,6 +1600,63 @@ fn should_emit_transient_poll_error(
 fn retryable_poll_failure_limit_reached(consecutive_failures: &mut u32) -> bool {
     *consecutive_failures = consecutive_failures.saturating_add(1);
     *consecutive_failures >= MAX_CONSECUTIVE_RETRYABLE_POLL_ERRORS
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RunStreamPollCadence {
+    empty_successful_polls: u32,
+    current_interval: Duration,
+}
+
+impl RunStreamPollCadence {
+    fn new() -> Self {
+        Self {
+            empty_successful_polls: 0,
+            current_interval: RUN_STREAM_FAST_POLL_INTERVAL,
+        }
+    }
+
+    #[cfg(test)]
+    fn interval(self) -> Duration {
+        self.current_interval
+    }
+
+    fn record_successful_poll(&mut self, saw_activity: bool) -> Option<Duration> {
+        if saw_activity {
+            self.empty_successful_polls = 0;
+        } else {
+            self.empty_successful_polls = self.empty_successful_polls.saturating_add(1);
+        }
+
+        let target = run_stream_poll_interval_for_empty_successes(self.empty_successful_polls);
+        if target == self.current_interval {
+            return None;
+        }
+        self.current_interval = target;
+        Some(target)
+    }
+}
+
+fn run_stream_poll_interval_for_empty_successes(empty_successful_polls: u32) -> Duration {
+    if empty_successful_polls >= RUN_STREAM_IDLE_MAX_AFTER_EMPTY_POLLS {
+        RUN_STREAM_IDLE_POLL_INTERVAL
+    } else if empty_successful_polls >= RUN_STREAM_IDLE_STEP_AFTER_EMPTY_POLLS {
+        RUN_STREAM_IDLE_STEP_POLL_INTERVAL
+    } else {
+        RUN_STREAM_FAST_POLL_INTERVAL
+    }
+}
+
+fn run_stream_poll_timer(interval: Duration) -> tokio::time::Interval {
+    let mut poll = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+    poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    poll
+}
+
+fn run_stream_initial_poll_timer() -> tokio::time::Interval {
+    let mut poll = tokio::time::interval(RUN_STREAM_FAST_POLL_INTERVAL);
+    poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    poll
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1306,8 +1738,8 @@ async fn stream_run_over_websocket(
     conn: &mut WsConnection,
     run_id: &str,
 ) {
-    let mut poll = tokio::time::interval(RUN_STREAM_POLL_INTERVAL);
-    poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut poll_cadence = RunStreamPollCadence::new();
+    let mut poll = run_stream_initial_poll_timer();
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut last_index = 0u32;
@@ -1316,6 +1748,8 @@ async fn stream_run_over_websocket(
     let mut status_poll_error: Option<(StatusCode, String)> = None;
     let mut consecutive_stream_retryable_errors = 0u32;
     let mut consecutive_status_retryable_errors = 0u32;
+    let metrics_registry = state.metrics_registry();
+    register_ws_run_stream_poll_metrics(&metrics_registry);
 
     loop {
         tokio::select! {
@@ -1407,13 +1841,16 @@ async fn stream_run_over_websocket(
                 }
             }
             _ = poll.tick() => {
+                let mut saw_poll_activity = false;
+
                 // ── Phase E: Forward pending approval requests to client ──
-                for req in state
+                let approval_requests = state
                     .execution
                     .run_lifecycle_service
                     .drain_approval_requests(run_id)
-                    .await
-                {
+                    .await;
+                saw_poll_activity |= !approval_requests.is_empty();
+                for req in approval_requests {
                     send_msg(
                         socket,
                         &WsServerMessage::ToolApprovalRequest {
@@ -1431,12 +1868,13 @@ async fn stream_run_over_websocket(
                     .await;
                 }
 
-                for req in state
+                let user_prompt_requests = state
                     .execution
                     .run_lifecycle_service
                     .drain_user_prompt_requests(run_id)
-                    .await
-                {
+                    .await;
+                saw_poll_activity |= !user_prompt_requests.is_empty();
+                for req in user_prompt_requests {
                     let Ok(prompt) = serde_json::from_value::<AskUserPrompt>(
                         req.get("prompt").cloned().unwrap_or(Value::Null),
                     ) else {
@@ -1455,6 +1893,16 @@ async fn stream_run_over_websocket(
                                 .and_then(|v| v.as_str())
                                 .unwrap_or_default()
                                 .to_string(),
+                            session_id: req
+                                .get("session_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string(),
+                            run_id: req
+                                .get("run_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string(),
                             prompt,
                         },
                     )
@@ -1462,12 +1910,13 @@ async fn stream_run_over_websocket(
                 }
 
                 // ── Phase F.3: Forward pending progress events to client ──
-                for evt in state
+                let progress_events = state
                     .execution
                     .run_lifecycle_service
                     .drain_progress_events(run_id)
-                    .await
-                {
+                    .await;
+                saw_poll_activity |= !progress_events.is_empty();
+                for evt in progress_events {
                     match evt.get("kind").and_then(|v| v.as_str()) {
                         Some("started") => {
                             send_msg(
@@ -1559,11 +2008,27 @@ async fn stream_run_over_websocket(
                     .await
                 {
                     Ok(events) => {
+                        record_ws_run_stream_poll_attempt(
+                            &metrics_registry,
+                            "stream_run",
+                            "ok",
+                        );
                         stream_poll_error = None;
                         consecutive_stream_retryable_errors = 0;
+                        saw_poll_activity |= !events.is_empty();
                         events
                     }
                     Err((status, err)) => {
+                        record_ws_run_stream_poll_attempt(
+                            &metrics_registry,
+                            "stream_run",
+                            "error",
+                        );
+                        record_ws_run_stream_poll_error(
+                            &metrics_registry,
+                            "stream_run",
+                            lifecycle_poll_error_class(status),
+                        );
                         let message = err.0.detail;
                         let policy = lifecycle_poll_error_policy(status);
                         if policy.continue_polling
@@ -1668,11 +2133,26 @@ async fn stream_run_over_websocket(
                     .await
                 {
                     Ok(status) => {
+                        record_ws_run_stream_poll_attempt(
+                            &metrics_registry,
+                            "get_run_status",
+                            "ok",
+                        );
                         status_poll_error = None;
                         consecutive_status_retryable_errors = 0;
                         status
                     }
                     Err((status, err)) => {
+                        record_ws_run_stream_poll_attempt(
+                            &metrics_registry,
+                            "get_run_status",
+                            "error",
+                        );
+                        record_ws_run_stream_poll_error(
+                            &metrics_registry,
+                            "get_run_status",
+                            lifecycle_poll_error_class(status),
+                        );
                         let message = err.0.detail;
                         let policy = lifecycle_poll_error_policy(status);
                         if policy.continue_polling
@@ -1749,6 +2229,12 @@ async fn stream_run_over_websocket(
                     )
                     .await;
                     return;
+                }
+
+                if let Some(next_interval) =
+                    poll_cadence.record_successful_poll(saw_poll_activity)
+                {
+                    poll = run_stream_poll_timer(next_interval);
                 }
             }
         }
@@ -2066,6 +2552,7 @@ mod tests {
         AuthRegisterRequestData, AuthService, AuthTokenRecord, ExternalRuntimeContextRequestData,
         ExternalRuntimeContextResponse,
     };
+    use astra_tools::{AskUserGate, ToolApprovalGate};
 
     #[derive(Clone)]
     struct StubHealthChecker;
@@ -2115,7 +2602,7 @@ mod tests {
         ) -> Result<SessionListRecord, (StatusCode, Json<ErrorResponse>)> {
             Ok(SessionListRecord {
                 sessions: Vec::new(),
-                total: 0,
+                total: Some(0),
                 limit: 20,
                 next_cursor: None,
             })
@@ -4127,6 +4614,93 @@ mod tests {
         assert_eq!(HEARTBEAT_INTERVAL, Duration::from_secs(30));
     }
 
+    #[test]
+    fn run_stream_poll_cadence_backs_off_after_successful_empty_polls() {
+        let mut cadence = RunStreamPollCadence::new();
+        assert_eq!(cadence.interval(), RUN_STREAM_FAST_POLL_INTERVAL);
+
+        assert_eq!(cadence.record_successful_poll(false), None);
+        assert_eq!(cadence.interval(), RUN_STREAM_FAST_POLL_INTERVAL);
+
+        assert_eq!(
+            cadence.record_successful_poll(false),
+            Some(RUN_STREAM_IDLE_STEP_POLL_INTERVAL)
+        );
+        assert_eq!(cadence.interval(), RUN_STREAM_IDLE_STEP_POLL_INTERVAL);
+
+        assert_eq!(cadence.record_successful_poll(false), None);
+        assert_eq!(cadence.record_successful_poll(false), None);
+        assert_eq!(
+            cadence.record_successful_poll(false),
+            Some(RUN_STREAM_IDLE_POLL_INTERVAL)
+        );
+        assert_eq!(cadence.interval(), RUN_STREAM_IDLE_POLL_INTERVAL);
+    }
+
+    #[test]
+    fn run_stream_poll_cadence_resets_to_fast_after_activity() {
+        let mut cadence = RunStreamPollCadence::new();
+        for _ in 0..RUN_STREAM_IDLE_MAX_AFTER_EMPTY_POLLS {
+            let _ = cadence.record_successful_poll(false);
+        }
+        assert_eq!(cadence.interval(), RUN_STREAM_IDLE_POLL_INTERVAL);
+
+        assert_eq!(
+            cadence.record_successful_poll(true),
+            Some(RUN_STREAM_FAST_POLL_INTERVAL)
+        );
+        assert_eq!(cadence.interval(), RUN_STREAM_FAST_POLL_INTERVAL);
+        assert_eq!(cadence.record_successful_poll(false), None);
+        assert_eq!(cadence.interval(), RUN_STREAM_FAST_POLL_INTERVAL);
+    }
+
+    #[test]
+    fn ws_run_stream_poll_metrics_use_low_cardinality_labels() {
+        let registry = MetricsRegistry::new();
+        register_ws_run_stream_poll_metrics(&registry);
+
+        record_ws_run_stream_poll_attempt(&registry, "stream_run", "ok");
+        record_ws_run_stream_poll_attempt(&registry, "stream_run", "error");
+        record_ws_run_stream_poll_error(
+            &registry,
+            "stream_run",
+            lifecycle_poll_error_class(StatusCode::SERVICE_UNAVAILABLE),
+        );
+        record_ws_run_stream_poll_attempt(&registry, "get_run_status", "error");
+        record_ws_run_stream_poll_error(
+            &registry,
+            "get_run_status",
+            lifecycle_poll_error_class(StatusCode::NOT_FOUND),
+        );
+
+        let rendered = registry.render_prometheus();
+        assert!(
+            rendered.contains("# TYPE astra_ws_run_stream_poll_attempts_total counter"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "astra_ws_run_stream_poll_attempts_total{operation=\"stream_run\",outcome=\"ok\"} 1"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "astra_ws_run_stream_poll_errors_total{class=\"retryable\",operation=\"stream_run\"} 1"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "astra_ws_run_stream_poll_errors_total{class=\"access_or_missing\",operation=\"get_run_status\"} 1"
+            ),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("run_id="), "{rendered}");
+        assert!(!rendered.contains("session_id="), "{rendered}");
+        assert!(!rendered.contains("user_id="), "{rendered}");
+    }
+
     // ─── SSE parsing edge cases ─────────────────────────────────────────
 
     /// Helper that mirrors the SSE → WS parsing logic in `stream_sse_response_as_ws`.
@@ -4418,6 +4992,8 @@ mod tests {
     fn serialize_user_prompt_request() {
         let msg = WsServerMessage::UserPromptRequest {
             request_id: "req-2".into(),
+            session_id: "sess-1".into(),
+            run_id: "run-1".into(),
             prompt: AskUserPrompt {
                 context: Some("Need confirmation".into()),
                 questions: vec![astra_tools::AskUserQuestion {
@@ -4443,6 +5019,8 @@ mod tests {
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains(r#""type":"user_prompt_request""#));
+        assert!(json.contains(r#""session_id":"sess-1""#));
+        assert!(json.contains(r#""run_id":"run-1""#));
         assert!(json.contains(r#""question":"Continue?""#));
         assert!(json.contains(r#""header":"Confirm""#));
         assert!(json.contains(r#""context":"Need confirmation""#));
@@ -4482,6 +5060,8 @@ mod tests {
             },
             WsServerMessage::UserPromptRequest {
                 request_id: "req-2".into(),
+                session_id: "sess-1".into(),
+                run_id: "run-1".into(),
                 prompt: AskUserPrompt {
                     context: None,
                     questions: vec![astra_tools::AskUserQuestion {
@@ -4567,6 +5147,444 @@ mod tests {
         assert!(serde_json::from_str::<WsClientMessage>(json).is_err());
     }
 
+    #[test]
+    fn user_prompt_rejects_client_supplied_session_and_run_identity() {
+        let json = r#"{"type":"user_prompt","request_id":"req-2","session_id":"sess-1","run_id":"run-1","answers":{"answers":[]}}"#;
+        assert!(serde_json::from_str::<WsClientMessage>(json).is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tool_approval_response_handler_persists_journal_and_local_ledger() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let writer = astra_services::session_journal::JournalWriter::new("sess-approval-ws")
+            .expect("journal writer");
+        writer
+            .append(
+                &astra_services::session_journal::JournalEvent::approval_required_for_run(
+                    Some("sess-approval-ws"),
+                    Some(11),
+                    "req-approval-ws",
+                    Some("run-approval-ws"),
+                    "write_file",
+                    "standard",
+                    None,
+                ),
+            )
+            .expect("approval required journal event");
+        let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker));
+        let conn = WsConnection {
+            principal: AuthPrincipal::internal(test_user()),
+            authorization: "Bearer test-token".into(),
+            forward_headers: std::collections::HashMap::new(),
+            session_id: Some("sess-approval-ws".into()),
+            pending_session_id: None,
+            active_run_id: Some("run-approval-ws".into()),
+            bridge_prepared_run_id: None,
+        };
+
+        handle_tool_approval(
+            &state,
+            &conn,
+            "req-approval-ws",
+            true,
+            Some("approved from ws".into()),
+        )
+        .await;
+
+        let decision = astra_services::session_journal::find_latest_approval_decision_for_run(
+            "sess-approval-ws",
+            "req-approval-ws",
+            "run-approval-ws",
+        )
+        .unwrap()
+        .expect("approval decision should be durable for no-sticky replay");
+        assert_eq!(decision.run_id.as_deref(), Some("run-approval-ws"));
+        assert_eq!(decision.decision, "allow");
+        assert_eq!(decision.reason.as_deref(), Some("approved from ws"));
+        assert_eq!(decision.tool_name.as_deref(), Some("write_file"));
+        assert_eq!(decision.approval_kind.as_deref(), Some("standard"));
+
+        let ledger = state.edge_callback_ledger.lock().await;
+        let key = astra_turn_core::edge_ledger::approval_callback_key(
+            "u1",
+            "sess-approval-ws",
+            "run-approval-ws",
+            "req-approval-ws",
+        );
+        assert_eq!(
+            ledger.get(&key),
+            Some(&serde_json::json!({
+                "approved": true,
+                "reason": "approved from ws",
+            }))
+        );
+        drop(ledger);
+
+        let metrics = state.metrics_registry().render_prometheus();
+        assert!(
+            metrics.contains(
+                "astra_interaction_approval_journal_lookup_total{event=\"required\",outcome=\"hit\"} 1"
+            ),
+            "{metrics}"
+        );
+        assert!(
+            metrics.contains("astra_interaction_approval_journal_write_total{outcome=\"ok\"} 1"),
+            "{metrics}"
+        );
+        assert!(
+            metrics
+                .contains("astra_interaction_approval_ledger_insert_total{outcome=\"inserted\"} 1"),
+            "{metrics}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tool_approval_response_on_other_appstate_replays_from_journal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let callback_state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker));
+        let waiter_state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker));
+        let conn = WsConnection {
+            principal: AuthPrincipal::internal(test_user()),
+            authorization: "Bearer test-token".into(),
+            forward_headers: std::collections::HashMap::new(),
+            session_id: Some("sess-approval-no-sticky".into()),
+            pending_session_id: None,
+            active_run_id: Some("run-approval-no-sticky".into()),
+            bridge_prepared_run_id: None,
+        };
+
+        handle_tool_approval(
+            &callback_state,
+            &conn,
+            "req-approval-no-sticky",
+            false,
+            Some("not allowed here".into()),
+        )
+        .await;
+
+        let callback_key = astra_turn_core::edge_ledger::approval_callback_key(
+            "u1",
+            "sess-approval-no-sticky",
+            "run-approval-no-sticky",
+            "req-approval-no-sticky",
+        );
+        assert!(
+            callback_state
+                .edge_callback_ledger
+                .lock()
+                .await
+                .contains_key(&callback_key),
+            "callback pod may keep its same-pod wakeup entry"
+        );
+        assert!(
+            waiter_state.edge_callback_ledger.lock().await.is_empty(),
+            "waiter pod intentionally has no same-pod ledger entry"
+        );
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let gate =
+            astra_turn_core::ws_approval_gate::WebSocketApprovalGate::new_with_journal_context(
+                "u1".into(),
+                "sess-approval-no-sticky".into(),
+                "run-approval-no-sticky".into(),
+                Some(4),
+                waiter_state.edge_callback_ledger.clone(),
+                tx,
+            );
+        let decision = gate
+            .request_approval(
+                "req-approval-no-sticky",
+                "write_file",
+                &serde_json::json!({"path": "x"}),
+            )
+            .await;
+
+        match decision {
+            astra_tools::ApprovalDecision::Denied { reason } => {
+                assert_eq!(reason.as_deref(), Some("not allowed here"));
+            }
+            other => panic!("expected denied approval from journal, got {other:?}"),
+        }
+        assert!(
+            waiter_state.edge_callback_ledger.lock().await.is_empty(),
+            "journal replay should not require or populate waiter ledger"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn user_prompt_response_handler_persists_journal_and_local_ledger() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker));
+        let conn = WsConnection {
+            principal: AuthPrincipal::internal(test_user()),
+            authorization: "Bearer test-token".into(),
+            forward_headers: std::collections::HashMap::new(),
+            session_id: Some("sess-ws-journal".into()),
+            pending_session_id: None,
+            active_run_id: Some("run-ws-journal".into()),
+            bridge_prepared_run_id: None,
+        };
+        let answers = AskUserAnswers {
+            answers: vec![astra_tools::AskUserQuestionAnswer {
+                question: "Continue?".into(),
+                answers: vec!["yes".into()],
+                multi_select: false,
+                annotation: None,
+            }],
+        };
+
+        handle_user_prompt_response(
+            &state,
+            &conn,
+            "req-ws-journal",
+            Some(answers.clone()),
+            false,
+        )
+        .await;
+
+        let journal_response =
+            astra_services::session_journal::find_latest_ask_user_response_for_run(
+                "sess-ws-journal",
+                "req-ws-journal",
+                "run-ws-journal",
+            )
+            .unwrap()
+            .expect("ask_user response should be durable for no-sticky replay");
+        assert_eq!(journal_response.status, "submitted");
+        assert_eq!(journal_response.run_id.as_deref(), Some("run-ws-journal"));
+        let durable_answers: AskUserAnswers =
+            serde_json::from_value(journal_response.answers.expect("durable answers")).unwrap();
+        assert_eq!(durable_answers, answers);
+
+        let ledger = state.edge_callback_ledger.lock().await;
+        let key = astra_turn_core::edge_ledger::user_prompt_callback_key(
+            "u1",
+            "sess-ws-journal",
+            "run-ws-journal",
+            "req-ws-journal",
+        );
+        assert_eq!(
+            serde_json::from_value::<AskUserAnswers>(
+                ledger
+                    .get(&key)
+                    .expect("local ledger should still wake same-pod waiters")["answers"]
+                    .clone()
+            )
+            .unwrap(),
+            answers
+        );
+        drop(ledger);
+
+        let metrics = state.metrics_registry().render_prometheus();
+        assert!(
+            metrics.contains(
+                "astra_interaction_ask_user_journal_write_total{event=\"response\",outcome=\"ok\"} 1"
+            ),
+            "{metrics}"
+        );
+        assert!(
+            metrics
+                .contains("astra_interaction_ask_user_ledger_insert_total{outcome=\"inserted\"} 1"),
+            "{metrics}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn user_prompt_response_missing_answers_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker));
+        let conn = WsConnection {
+            principal: AuthPrincipal::internal(test_user()),
+            authorization: "Bearer test-token".into(),
+            forward_headers: std::collections::HashMap::new(),
+            session_id: Some("sess-ws-missing-answers".into()),
+            pending_session_id: None,
+            active_run_id: Some("run-ws-missing-answers".into()),
+            bridge_prepared_run_id: None,
+        };
+
+        handle_user_prompt_response(&state, &conn, "req-ws-missing-answers", None, false).await;
+
+        assert!(
+            state.edge_callback_ledger.lock().await.is_empty(),
+            "invalid ask_user responses must not wake waiters"
+        );
+        assert!(
+            astra_services::session_journal::find_latest_ask_user_response_for_run(
+                "sess-ws-missing-answers",
+                "req-ws-missing-answers",
+                "run-ws-missing-answers",
+            )
+            .unwrap()
+            .is_none(),
+            "invalid ask_user responses must not become durable"
+        );
+        let metrics = state.metrics_registry().render_prometheus();
+        assert!(
+            metrics.contains(
+                "astra_interaction_ask_user_journal_write_total{event=\"response\",outcome=\"missing_answers\"} 1"
+            ),
+            "{metrics}"
+        );
+        assert!(
+            metrics.contains(
+                "astra_interaction_ask_user_ledger_insert_total{outcome=\"invalid_payload\"} 1"
+            ),
+            "{metrics}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn user_prompt_response_without_connection_context_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker));
+        let conn = WsConnection {
+            principal: AuthPrincipal::internal(test_user()),
+            authorization: "Bearer test-token".into(),
+            forward_headers: std::collections::HashMap::new(),
+            session_id: Some("sess-ws-no-context".into()),
+            pending_session_id: None,
+            active_run_id: None,
+            bridge_prepared_run_id: None,
+        };
+
+        handle_user_prompt_response(
+            &state,
+            &conn,
+            "req-ws-no-context",
+            Some(AskUserAnswers { answers: vec![] }),
+            false,
+        )
+        .await;
+
+        assert!(
+            state.edge_callback_ledger.lock().await.is_empty(),
+            "ask_user responses without an active run must not wake any waiter"
+        );
+        assert!(
+            astra_services::session_journal::find_latest_ask_user_response_for_run(
+                "sess-ws-no-context",
+                "req-ws-no-context",
+                "run-ws-no-context",
+            )
+            .unwrap()
+            .is_none(),
+            "ask_user responses without active run context must not become durable"
+        );
+        let metrics = state.metrics_registry().render_prometheus();
+        assert!(
+            metrics.contains(
+                "astra_interaction_ask_user_journal_write_total{event=\"response\",outcome=\"skipped_no_context\"} 1"
+            ),
+            "{metrics}"
+        );
+        assert!(
+            metrics.contains(
+                "astra_interaction_ask_user_ledger_insert_total{outcome=\"skipped_no_context\"} 1"
+            ),
+            "{metrics}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn user_prompt_response_on_other_appstate_replays_from_journal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let callback_state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker));
+        let waiter_state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker));
+        let conn = WsConnection {
+            principal: AuthPrincipal::internal(test_user()),
+            authorization: "Bearer test-token".into(),
+            forward_headers: std::collections::HashMap::new(),
+            session_id: Some("sess-ws-no-sticky".into()),
+            pending_session_id: None,
+            active_run_id: Some("run-ws-no-sticky".into()),
+            bridge_prepared_run_id: None,
+        };
+        let answers = AskUserAnswers {
+            answers: vec![astra_tools::AskUserQuestionAnswer {
+                question: "Continue?".into(),
+                answers: vec!["yes".into()],
+                multi_select: false,
+                annotation: None,
+            }],
+        };
+
+        handle_user_prompt_response(
+            &callback_state,
+            &conn,
+            "req-ws-no-sticky",
+            Some(answers.clone()),
+            false,
+        )
+        .await;
+
+        let callback_key = astra_turn_core::edge_ledger::user_prompt_callback_key(
+            "u1",
+            "sess-ws-no-sticky",
+            "run-ws-no-sticky",
+            "req-ws-no-sticky",
+        );
+        assert!(
+            callback_state
+                .edge_callback_ledger
+                .lock()
+                .await
+                .contains_key(&callback_key),
+            "callback pod may keep its same-pod wakeup entry"
+        );
+        assert!(
+            waiter_state.edge_callback_ledger.lock().await.is_empty(),
+            "waiter pod intentionally has no same-pod ledger entry"
+        );
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let gate = astra_turn_core::ws_user_prompt_gate::WebSocketUserPromptGate::new(
+            "u1".into(),
+            "sess-ws-no-sticky".into(),
+            "run-ws-no-sticky".into(),
+            Some(4),
+            waiter_state.edge_callback_ledger.clone(),
+            tx,
+        );
+        let prompt = AskUserPrompt {
+            context: Some("Need confirmation".into()),
+            questions: vec![astra_tools::AskUserQuestion {
+                header: "Confirm".into(),
+                question: "Continue?".into(),
+                options: vec![
+                    astra_tools::AskUserChoice {
+                        label: "yes".into(),
+                        description: None,
+                        preview: None,
+                    },
+                    astra_tools::AskUserChoice {
+                        label: "no".into(),
+                        description: None,
+                        preview: None,
+                    },
+                ],
+                multi_select: false,
+                allow_freeform: false,
+            }],
+            timeout_ms: Some(200),
+        };
+
+        let decision = gate
+            .request_questionnaire("req-ws-no-sticky", &prompt)
+            .await;
+        assert_eq!(decision, astra_tools::AskUserDecision::Submitted(answers));
+        assert!(
+            waiter_state.edge_callback_ledger.lock().await.is_empty(),
+            "journal replay should not require or populate waiter ledger"
+        );
+    }
+
     // ── ws_ledger_dedup_insert unit tests ──────────────────────────────────
 
     #[test]
@@ -4609,6 +5627,48 @@ mod tests {
         assert_eq!(
             ledger["user:req-1"], original,
             "conflicting update must not overwrite the first decision"
+        );
+    }
+
+    #[test]
+    fn ws_ledger_dedup_insert_rejects_new_key_when_full() {
+        let mut ledger = std::collections::HashMap::new();
+        for i in 0..astra_turn_core::edge_ledger::LEDGER_MAX_ENTRIES {
+            ledger.insert(format!("user:req-{i}"), serde_json::json!({"i": i}));
+        }
+
+        let outcome = ws_ledger_dedup_insert(
+            &mut ledger,
+            "user:req-new".to_string(),
+            serde_json::json!({"approved": true}),
+        );
+
+        assert_eq!(outcome, WsLedgerOutcome::CapacityExceeded);
+        assert!(
+            !ledger.contains_key("user:req-new"),
+            "full ledger must not accept new WS callback keys"
+        );
+        assert_eq!(
+            ledger.len(),
+            astra_turn_core::edge_ledger::LEDGER_MAX_ENTRIES
+        );
+    }
+
+    #[test]
+    fn ws_ledger_dedup_insert_allows_existing_key_when_full() {
+        let mut ledger = std::collections::HashMap::new();
+        for i in 0..astra_turn_core::edge_ledger::LEDGER_MAX_ENTRIES {
+            ledger.insert(format!("user:req-{i}"), serde_json::json!({"i": i}));
+        }
+        let value = serde_json::json!({"i": 0});
+
+        let outcome = ws_ledger_dedup_insert(&mut ledger, "user:req-0".to_string(), value.clone());
+
+        assert_eq!(outcome, WsLedgerOutcome::IdempotentReplay);
+        assert_eq!(ledger["user:req-0"], value);
+        assert_eq!(
+            ledger.len(),
+            astra_turn_core::edge_ledger::LEDGER_MAX_ENTRIES
         );
     }
 

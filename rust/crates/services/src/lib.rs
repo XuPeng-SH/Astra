@@ -22,6 +22,7 @@ pub mod event_coordinator;
 pub mod event_ingestion;
 pub mod events;
 pub mod harness;
+pub mod interaction_contract;
 pub mod introspection;
 pub mod jobs;
 pub mod llm_trusted_domains;
@@ -196,6 +197,10 @@ pub use harness::{
     SkillifyDraftRecord, SkillifyDraftRequest, SkillifyPublishRecord, SkillifyPublishRequest,
     SkillifyRunRequest, SkillifySourceFile, SkillifySourcePacket, UnconfiguredHarnessService,
 };
+pub use interaction_contract::{
+    InteractionContract, InteractionDurableStore, InteractionIdentity, InteractionKind,
+    InteractionStatus, approval_decision_status, ask_user_response_status, edge_dispatch_status,
+};
 pub use introspection::{
     DatabaseIntrospectionService, IntrospectionService, UnconfiguredIntrospectionService,
 };
@@ -241,9 +246,8 @@ pub use multi_agent::{
     UnconfiguredEdgeRegistryService, UnconfiguredTaskLeaseService,
 };
 pub use pagination::{
-    MAX_ADMIN_AUDIT_LOG_LIMIT, MAX_API_LIST_LIMIT, MAX_API_LIST_OFFSET,
-    MAX_MARKETPLACE_SEARCH_OFFSET, clamp_admin_audit_limit, clamp_api_list_pagination,
-    clamp_marketplace_search_offset,
+    MAX_ADMIN_AUDIT_LOG_LIMIT, MAX_API_LIST_LIMIT, MAX_API_LIST_OFFSET, clamp_admin_audit_limit,
+    clamp_api_list_pagination,
 };
 pub use personal_skills::{
     ActivateUserSkillVersion, CreateUserSkillSource, DatabasePersonalSkillStore, InstallUserSkill,
@@ -264,9 +268,11 @@ pub use reflect::{
 pub use replay::{DatabaseReplayService, ReplayService, UnconfiguredReplayService};
 pub use runs::{
     CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, DatabaseRunStateStore,
-    DurableRunRecord, InMemoryRunStateStore, LlmTokenServiceConfig, LlmTokenServiceRequest,
-    RunLifecycleService, RunListRecord, RunMutationRecord, RunStateStore, RunStatusRecord,
-    UnconfiguredRunLifecycleService, extract_event_type, transform_run_event_for_client,
+    DurableRunListPage, DurableRunRecord, InMemoryRunStateStore, LlmTokenServiceConfig,
+    LlmTokenServiceRequest, RunLifecycleService, RunListCursor, RunListRecord, RunMutationRecord,
+    RunStateStore, RunStatusRecord, UnconfiguredRunLifecycleService, extract_event_type,
+    run_list_cursor_db_updated_at, run_list_cursor_run_id, transform_run_event_for_client,
+    validate_run_list_limit,
 };
 pub use sandbox::{
     DatabaseSandboxService, SandboxCreateRequestData, SandboxRecord, SandboxService,
@@ -285,7 +291,8 @@ pub use service_error::{ServiceError, ServiceErrorKind, ServiceResult};
 pub use session_artifact_store::{
     DatabaseSessionArtifactStore, LOCAL_SESSION_LAYOUT_VERSION, LocalSessionArtifactStore,
     OwnerScope, OwnerScopeKind, SessionArtifactJsonRecord, SessionArtifactJsonStore,
-    SessionArtifactStore, SessionArtifactStoreError, StoredSessionArtifact, local_owner_user_id,
+    SessionArtifactListCursor, SessionArtifactListPage, SessionArtifactStore,
+    SessionArtifactStoreError, StoredSessionArtifact, local_owner_user_id,
     local_session_artifact_store,
 };
 pub use session_fork::{ForkSessionOptions, ForkSessionResult, fork_local_session};
@@ -318,8 +325,9 @@ pub use sync_engine::{
 };
 pub use task_orchestrator::{
     LocalTaskService, MatrixOneTaskService, SubtaskPlan, TaskCheckpoint, TaskClaimability,
-    TaskCreateRequest, TaskListItem, TaskOutcome, TaskPlan, TaskRecord, TaskService, TaskStatus,
-    UnconfiguredTaskService,
+    TaskCreateRequest, TaskListCursor, TaskListItem, TaskListPage, TaskOutcome, TaskPlan,
+    TaskRecord, TaskService, TaskStatus, UnconfiguredTaskService, task_list_cursor_db_updated_at,
+    task_list_cursor_task_id, validate_task_list_limit,
 };
 pub use triggers::{
     DatabaseTriggerService, TriggerCreateRequestData, TriggerRecord, TriggerService,

@@ -1,5 +1,6 @@
 use super::*;
 use astra_services::runs::ExecutionBudget;
+use axum::http::StatusCode;
 use serde_json::{Map, Value, json};
 
 // ── default functions ───────────────────────────────────────────
@@ -70,6 +71,12 @@ fn deserialization_applies_defaults() {
     // RunStreamQuery
     let q: RunStreamQuery = serde_json::from_str("{}").unwrap();
     assert_eq!(q.last_index, 0);
+
+    // RunListQuery
+    let q: RunListQuery = serde_json::from_str("{}").unwrap();
+    assert_eq!(q.limit, 50);
+    assert!(q.after_updated_at.is_none());
+    assert!(q.after_run_id.is_none());
 
     // ChatRouteRequest
     let q: ChatRouteRequest = serde_json::from_str("{}").unwrap();
@@ -360,6 +367,68 @@ fn session_list_query_all_fields() {
 }
 
 #[test]
+fn session_artifact_list_query_cursor_requires_complete_seek_key() {
+    let q: SessionArtifactListQuery = serde_json::from_value(json!({
+        "artifact_kind": "llm_capture",
+        "limit": 10,
+        "after_created_at": "2026-10-01T12:34:56.123456",
+        "after_artifact_id": "artifact-5"
+    }))
+    .unwrap();
+    let cursor = q.cursor().unwrap().unwrap();
+    assert_eq!(cursor.created_at, "2026-10-01T12:34:56.123456");
+    assert_eq!(cursor.artifact_id, "artifact-5");
+
+    let missing_artifact_id: SessionArtifactListQuery = serde_json::from_value(json!({
+        "after_created_at": "2026-10-01T12:34:56.123456"
+    }))
+    .unwrap();
+    assert_eq!(
+        missing_artifact_id.cursor().unwrap_err().0,
+        StatusCode::BAD_REQUEST
+    );
+
+    let invalid_timestamp: SessionArtifactListQuery = serde_json::from_value(json!({
+        "after_created_at": "2026-10-01T12:34:56",
+        "after_artifact_id": "artifact-5"
+    }))
+    .unwrap();
+    assert_eq!(
+        invalid_timestamp.cursor().unwrap_err().0,
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[test]
+fn run_list_query_cursor_requires_complete_seek_key() {
+    let q: RunListQuery = serde_json::from_value(json!({
+        "limit": 20,
+        "after_updated_at": "2024-01-02T00:00:00.000000",
+        "after_run_id": "run-5"
+    }))
+    .unwrap();
+    let cursor = q.cursor().unwrap().unwrap();
+    assert_eq!(cursor.updated_at, "2024-01-02T00:00:00.000000");
+    assert_eq!(cursor.run_id, "run-5");
+
+    let missing_run_id: RunListQuery = serde_json::from_value(json!({
+        "after_updated_at": "2024-01-02T00:00:00.000000"
+    }))
+    .unwrap();
+    assert_eq!(
+        missing_run_id.cursor().unwrap_err().0,
+        StatusCode::BAD_REQUEST
+    );
+
+    let offset_query = serde_json::from_value::<RunListQuery>(json!({
+        "offset": 10,
+        "after_updated_at": "2024-01-02T00:00:00.000000",
+        "after_run_id": "run-5"
+    }));
+    assert!(offset_query.is_err(), "legacy offset must not deserialize");
+}
+
+#[test]
 fn admin_token_create_request_all_fields() {
     let input = json!({
         "token_type": "api_key",
@@ -594,7 +663,7 @@ fn auth_logout_response_serializes() {
 fn session_list_response_serializes() {
     let resp = SessionListResponse {
         sessions: vec![],
-        total: 0,
+        total: Some(0),
         limit: 50,
         next_cursor: None,
     };
@@ -602,6 +671,15 @@ fn session_list_response_serializes() {
     assert_eq!(v["sessions"], json!([]));
     assert_eq!(v["total"], 0);
     assert!(v["next_cursor"].is_null());
+
+    let resp = SessionListResponse {
+        sessions: vec![],
+        total: None,
+        limit: 50,
+        next_cursor: None,
+    };
+    let v = serde_json::to_value(&resp).unwrap();
+    assert!(v["total"].is_null());
 }
 
 #[test]
@@ -862,7 +940,7 @@ fn session_list_record_to_response() {
             updated_at: None,
             ended_at: None,
         }],
-        total: 1,
+        total: Some(1),
         limit: 50,
         next_cursor: Some(SessionListCursor {
             updated_at: "2024-01-01T00:00:00Z".into(),
@@ -871,7 +949,7 @@ fn session_list_record_to_response() {
     };
     let resp: SessionListResponse = record.into();
     assert_eq!(resp.sessions.len(), 1);
-    assert_eq!(resp.total, 1);
+    assert_eq!(resp.total, Some(1));
     assert_eq!(resp.limit, 50);
     assert_eq!(
         resp.next_cursor
@@ -883,15 +961,54 @@ fn session_list_record_to_response() {
     // empty
     let record = SessionListRecord {
         sessions: vec![],
-        total: 0,
+        total: None,
         limit: 20,
         next_cursor: None,
     };
     let resp: SessionListResponse = record.into();
     assert!(resp.sessions.is_empty());
-    assert_eq!(resp.total, 0);
+    assert_eq!(resp.total, None);
     assert_eq!(resp.limit, 20);
     assert!(resp.next_cursor.is_none());
+}
+
+#[test]
+fn run_list_record_to_response_preserves_optional_total_and_cursor() {
+    let record = RunListRecord {
+        runs: vec![RunStatusRecord {
+            run_id: "run-1".into(),
+            session_id: "session-1".into(),
+            status: "running".into(),
+            waiting_for: None,
+            events_count: 3,
+            workspace: None,
+            executor: None,
+            transport: None,
+            fallback_policy: None,
+        }],
+        total: None,
+        limit: 20,
+        next_cursor: Some(RunListCursor {
+            updated_at: "2024-01-02T00:00:00.000000".into(),
+            run_id: "run-1".into(),
+        }),
+    };
+
+    let resp: RunListResponse = record.into();
+    assert_eq!(resp.runs.len(), 1);
+    assert_eq!(resp.total, None);
+    assert_eq!(resp.limit, 20);
+    assert_eq!(
+        resp.next_cursor
+            .as_ref()
+            .map(|cursor| cursor.run_id.as_str()),
+        Some("run-1")
+    );
+
+    let v = serde_json::to_value(&resp).unwrap();
+    assert!(v["total"].is_null());
+    assert!(v.get("offset").is_none());
+    assert_eq!(v["next_cursor"]["run_id"], "run-1");
 }
 
 #[test]

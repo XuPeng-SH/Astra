@@ -138,7 +138,7 @@ pub struct LoadedSkill {
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐          │
 │  │ Bundled      │  │ Project      │  │ User global  │          │
 │  │ (in binary)  │  │ (.astra/     │  │ (~/.astra/   │          │
-│  │ 16 skills    │  │  skills/)    │  │  skills/)    │          │
+│  │ 16 skills    │  │  .claude/)   │  │  .claude/)   │          │
 │  └──────────────┘  └──────────────┘  └──────────────┘          │
 │  Always available, no network needed, hot-reload                │
 └─────────────────────────────────────────────────────────────────┘
@@ -159,7 +159,7 @@ This means a project's local override always wins over a bundled or remote skill
 ```rust
 // rust/crates/runtime/src/skills/manifest.rs
 pub enum SkillSourceKind {
-    Local,       // Filesystem: .astra/skills/, skills/, ~/.astra/skills/
+    Local,       // Filesystem: .astra/skills/, .claude/skills/, .agent/skills/, HOME skills
     Bundled,     // Compiled into binary (16 built-in skills)
     Database,    // MatrixOne skills_registry table
     Mcp,         // MCP server resources (skill:// URIs)
@@ -185,7 +185,7 @@ pub trait SkillProvider: Send + Sync {
 | Provider              | Location                       | Status         | Notes                            |
 | --------------------- | ------------------------------ | -------------- | -------------------------------- |
 | BundledSkillProvider  | `skills/providers/bundled.rs`  | ✅ Implemented | 16 skills compiled in binary     |
-| LocalSkillProvider    | `skills/providers/local.rs`    | ✅ Implemented | Scans 3 paths, symlink dedup     |
+| LocalSkillProvider    | `skills/providers/local.rs`    | ✅ Implemented | Scans local/HOME roots, symlink dedup |
 | DatabaseSkillProvider | `skills/providers/database.rs` | ⚠️ Adapter     | Wraps SkillService, needs tests  |
 | McpSkillProvider      | `skills/providers/mcp.rs`      | ✅ Implemented | Keyed cache (server, skill) pair |
 
@@ -210,8 +210,11 @@ UnifiedSkillRegistry::discover_all()
 pub fn skill_search_paths() -> Vec<PathBuf> {
     vec![
         cwd/.astra/skills/,     // Project-specific
-        cwd/skills/,            // Project root
+        cwd/.claude/skills/,    // Agent Skills-compatible project skills
+        cwd/.agent/skills/,     // Agent-compatible project skills
         ~/.astra/skills/,       // User global
+        ~/.claude/skills/,      // Agent Skills-compatible user global
+        ~/.agent/skills/,       // Agent-compatible user global
     ]
 }
 ```
@@ -257,7 +260,7 @@ pub fn skill_search_paths() -> Vec<PathBuf> {
 
 - Uses `notify` crate with `RecommendedWatcher`
 - 500ms debounce interval
-- Monitors `.astra/skills/`, `skills/`, `~/.astra/skills/`
+- Monitors `.astra/skills/`, `.claude/skills/`, `.agent/skills/`, and HOME skill directories
 - Triggers `discover_all()` on SKILL.md / manifest.yaml changes
 - Handle stored in session state, dropped on exit
 

@@ -47,6 +47,10 @@ mod tests {
 
     /// Clean up test messages between tests.
     async fn cleanup(pool: &sqlx::Pool<sqlx::MySql>) {
+        sqlx::query("DELETE FROM agent_message_broadcast_delivery WHERE consumer_id LIKE '%run-%' OR delegation_id LIKE 'del-%' OR message_id LIKE 'test-%'")
+            .execute(pool)
+            .await
+            .expect("cleanup messaging DB transport broadcast delivery fixture rows");
         sqlx::query("DELETE FROM agent_message_queue WHERE message_id LIKE 'test-%' OR from_run_id LIKE 'run-%'")
             .execute(pool)
             .await
@@ -118,18 +122,23 @@ mod tests {
 
         let status = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                let row =
-                    sqlx::query("SELECT status, claimed_by, claimed_at_ms FROM agent_message_queue WHERE message_id = ?")
-                        .bind(&message_id)
-                        .fetch_one(&pool)
-                        .await
-                        .unwrap();
+                let row = sqlx::query(
+                    "SELECT status, claimed_by, claimed_at_ms, claim_token
+                     FROM agent_message_queue
+                     WHERE message_id = ?",
+                )
+                .bind(&message_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
                 let status: String = row.try_get("status").unwrap();
                 let claimed_by: Option<String> = row.try_get("claimed_by").unwrap();
                 let claimed_at_ms: Option<i64> = row.try_get("claimed_at_ms").unwrap();
+                let claim_token: Option<String> = row.try_get("claim_token").unwrap();
                 if status == "acked" {
                     assert!(claimed_by.is_none());
                     assert!(claimed_at_ms.is_none());
+                    assert!(claim_token.is_none());
                     break status;
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -391,14 +400,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_failure_identity_falls_back_to_message_id() {
+    async fn direct_failure_identity_uses_message_id() {
         skip_without_db!(pool);
 
         let transport =
             DatabaseTransport::new(pool.clone()).with_poll_interval(Duration::from_millis(50));
 
-        let sender = addr("run-db-rowid-fallback-a", "alice");
-        let receiver = addr("run-db-rowid-fallback-b", "bob");
+        let sender = addr("run-db-message-id-failure-a", "alice");
+        let receiver = addr("run-db-message-id-failure-b", "bob");
 
         transport.register(sender.clone(), None).await.unwrap();
         transport.register(receiver.clone(), None).await.unwrap();
@@ -409,7 +418,7 @@ mod tests {
                 address: receiver.clone(),
             },
             MessagePayload::Text {
-                content: "fallback".into(),
+                content: "message-id-failure".into(),
                 summary: None,
             },
         ));
@@ -429,7 +438,7 @@ mod tests {
         .await
         .unwrap();
 
-        mark_direct_failed_by_identity(&pool, None, Some(&message_id), &claimed_by)
+        mark_direct_failed_by_identity(&pool, Some(&message_id), &claimed_by)
             .await
             .unwrap();
 
@@ -483,11 +492,12 @@ mod tests {
 
         sqlx::query(
             "UPDATE agent_message_queue
-             SET status = 'claimed', claimed_by = ?, claimed_at_ms = ?
+             SET status = 'claimed', claimed_by = ?, claimed_at_ms = ?, claim_token = ?
              WHERE message_id = ?",
         )
         .bind(&right_consumer)
         .bind(chrono::Utc::now().timestamp_millis())
+        .bind("ack-token")
         .bind(&message_id)
         .execute(&pool)
         .await
@@ -502,7 +512,7 @@ mod tests {
         );
 
         let row = sqlx::query(
-            "SELECT status, claimed_by, claimed_at_ms
+            "SELECT status, claimed_by, claimed_at_ms, claim_token
              FROM agent_message_queue
              WHERE message_id = ?",
         )
@@ -513,9 +523,11 @@ mod tests {
         let status: String = row.try_get("status").unwrap();
         let claimed_by: Option<String> = row.try_get("claimed_by").unwrap();
         let claimed_at_ms: Option<i64> = row.try_get("claimed_at_ms").unwrap();
+        let claim_token: Option<String> = row.try_get("claim_token").unwrap();
         assert_eq!(status, "claimed");
         assert_eq!(claimed_by.as_deref(), Some(right_consumer.as_str()));
         assert!(claimed_at_ms.is_some());
+        assert_eq!(claim_token.as_deref(), Some("ack-token"));
 
         assert!(
             transport
@@ -525,7 +537,7 @@ mod tests {
         );
 
         let row = sqlx::query(
-            "SELECT status, claimed_by, claimed_at_ms
+            "SELECT status, claimed_by, claimed_at_ms, claim_token
              FROM agent_message_queue
              WHERE message_id = ?",
         )
@@ -536,9 +548,11 @@ mod tests {
         let status: String = row.try_get("status").unwrap();
         let claimed_by: Option<String> = row.try_get("claimed_by").unwrap();
         let claimed_at_ms: Option<i64> = row.try_get("claimed_at_ms").unwrap();
+        let claim_token: Option<String> = row.try_get("claim_token").unwrap();
         assert_eq!(status, "acked");
         assert!(claimed_by.is_none());
         assert!(claimed_at_ms.is_none());
+        assert!(claim_token.is_none());
 
         cleanup(&pool).await;
     }
@@ -573,11 +587,12 @@ mod tests {
 
         sqlx::query(
             "UPDATE agent_message_queue
-             SET status = 'claimed', claimed_by = ?, claimed_at_ms = ?
+             SET status = 'claimed', claimed_by = ?, claimed_at_ms = ?, claim_token = ?
              WHERE message_id = ?",
         )
         .bind(&right_consumer)
         .bind(chrono::Utc::now().timestamp_millis())
+        .bind("nack-token")
         .bind(&message_id)
         .execute(&pool)
         .await
@@ -599,7 +614,7 @@ mod tests {
         );
 
         let row = sqlx::query(
-            "SELECT status, claimed_by, claimed_at_ms
+            "SELECT status, claimed_by, claimed_at_ms, claim_token
              FROM agent_message_queue
              WHERE message_id = ?",
         )
@@ -610,15 +625,17 @@ mod tests {
         let status: String = row.try_get("status").unwrap();
         let claimed_by: Option<String> = row.try_get("claimed_by").unwrap();
         let claimed_at_ms: Option<i64> = row.try_get("claimed_at_ms").unwrap();
+        let claim_token: Option<String> = row.try_get("claim_token").unwrap();
         assert_eq!(status, "failed");
         assert!(claimed_by.is_none());
         assert!(claimed_at_ms.is_none());
+        assert!(claim_token.is_none());
 
         cleanup(&pool).await;
     }
 
     #[tokio::test]
-    async fn current_claim_fetch_excludes_preexisting_claimed_rows() {
+    async fn current_claim_fetch_excludes_preexisting_claimed_rows_with_other_token() {
         skip_without_db!(pool);
 
         let transport =
@@ -648,8 +665,8 @@ mod tests {
             "INSERT INTO agent_message_queue
              (message_id, from_run_id, from_agent_id, to_run_id, to_agent_id,
               delegation_id, is_broadcast, payload_json, timestamp_ms, ttl_ms,
-              status, claimed_by, claimed_at_ms, attempt_count)
-             VALUES (?, ?, ?, ?, ?, NULL, FALSE, ?, ?, NULL, 'claimed', ?, ?, 1)",
+              status, claimed_by, claimed_at_ms, claim_token, attempt_count)
+             VALUES (?, ?, ?, ?, ?, NULL, FALSE, ?, ?, NULL, 'claimed', ?, ?, ?, 1)",
         )
         .bind(&stale.id)
         .bind(&sender.run_id)
@@ -660,6 +677,7 @@ mod tests {
         .bind(chrono::Utc::now().timestamp_millis() - 5_000)
         .bind(&consumer_id)
         .bind(chrono::Utc::now().timestamp_millis() - 5_000)
+        .bind("preexisting-token")
         .execute(&pool)
         .await
         .unwrap();
@@ -696,6 +714,22 @@ mod tests {
             extra.is_err(),
             "stale preexisting claimed row should not be re-fetched in the same poll cycle"
         );
+
+        let stale_row = sqlx::query(
+            "SELECT status, claimed_by, claim_token
+             FROM agent_message_queue
+             WHERE message_id = ?",
+        )
+        .bind(&stale.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let stale_status: String = stale_row.try_get("status").unwrap();
+        let stale_claimed_by: Option<String> = stale_row.try_get("claimed_by").unwrap();
+        let stale_claim_token: Option<String> = stale_row.try_get("claim_token").unwrap();
+        assert_eq!(stale_status, "claimed");
+        assert_eq!(stale_claimed_by.as_deref(), Some(consumer_id.as_str()));
+        assert_eq!(stale_claim_token.as_deref(), Some("preexisting-token"));
 
         cleanup(&pool).await;
     }

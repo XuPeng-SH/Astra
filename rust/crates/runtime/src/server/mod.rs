@@ -35,6 +35,7 @@ mod external_runtime_context;
 pub mod harness;
 pub(crate) mod header_utils;
 mod http_helpers;
+mod interaction_metrics;
 mod llm_trusted_domains_handlers;
 mod mcp_handlers;
 mod meta_handlers;
@@ -244,6 +245,15 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
     let mut bg_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     if let Some(ref pool) = state.shared_pool {
         bg_handles.push(spawn_data_cleanup(pool.clone(), bg_cancel.clone()));
+        bg_handles.push(spawn_edge_dispatch_cleanup(
+            state.execution.edge_dispatch_service.clone(),
+            bg_cancel.clone(),
+        ));
+        bg_handles.push(spawn_edge_dispatch_backlog_metrics_refresh(
+            pool.clone(),
+            state.multi_agent_metrics.clone(),
+            bg_cancel.clone(),
+        ));
         bg_handles.push(astra_services::session_reaper::spawn_session_reaper(
             pool.clone(),
             bg_cancel.clone(),
@@ -398,22 +408,237 @@ fn spawn_data_cleanup(
     })
 }
 
+const EDGE_DISPATCH_CLEANUP_INTERVAL_SECS: u64 = 15 * 60;
+const EDGE_DISPATCH_STALE_AFTER_SECS: u64 = 60 * 60;
+const EDGE_DISPATCH_BACKLOG_METRICS_REFRESH_INTERVAL_SECS: u64 = 15;
+const EDGE_DISPATCH_BACKLOG_METRICS_REFRESH_TIMEOUT_SECS: u64 = 5;
+
+/// Spawn a background task that expires orphaned edge dispatch rows.
+///
+/// Normal tool waits call `fail_dispatch` on timeout/cancel. This sweeper covers
+/// the unhappy path where the waiting pod crashes after inserting a dispatch
+/// but before it can mark the request terminal.
+fn spawn_edge_dispatch_cleanup(
+    dispatch: Arc<dyn astra_services::multi_agent::EdgeDispatchService>,
+    cancel: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    spawn_edge_dispatch_cleanup_with_config(
+        dispatch,
+        cancel,
+        std::time::Duration::from_secs(EDGE_DISPATCH_CLEANUP_INTERVAL_SECS),
+        std::time::Duration::from_secs(EDGE_DISPATCH_STALE_AFTER_SECS),
+    )
+}
+
+fn spawn_edge_dispatch_cleanup_with_config(
+    dispatch: Arc<dyn astra_services::multi_agent::EdgeDispatchService>,
+    cancel: tokio_util::sync::CancellationToken,
+    cleanup_interval: std::time::Duration,
+    stale_after: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(cleanup_interval);
+        interval.tick().await; // skip immediate first tick
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    tracing::info!(
+                        target: "astra_runtime::cleanup",
+                        "edge dispatch cleanup received cancellation; exiting"
+                    );
+                    break;
+                }
+                _ = interval.tick() => {}
+            }
+
+            match dispatch.cleanup_stale(stale_after).await {
+                Ok(rows) if rows > 0 => {
+                    tracing::info!(
+                        target: "astra_runtime::cleanup",
+                        rows,
+                        stale_after_secs = stale_after.as_secs(),
+                        "edge dispatch cleanup expired or deleted stale rows"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        target: "astra_runtime::cleanup",
+                        error = %error,
+                        "edge dispatch cleanup failed"
+                    );
+                }
+            }
+        }
+    })
+}
+
+fn spawn_edge_dispatch_backlog_metrics_refresh(
+    shared_pool: astra_core::SharedPool,
+    metrics: astra_services::multi_agent::SharedMultiAgentMetrics,
+    cancel: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let refresh_interval =
+            std::time::Duration::from_secs(EDGE_DISPATCH_BACKLOG_METRICS_REFRESH_INTERVAL_SECS);
+        let refresh_timeout =
+            std::time::Duration::from_secs(EDGE_DISPATCH_BACKLOG_METRICS_REFRESH_TIMEOUT_SECS);
+
+        loop {
+            let refresh = astra_services::multi_agent::refresh_edge_dispatch_backlog_metrics(
+                &shared_pool,
+                &metrics,
+            );
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    break;
+                }
+                outcome = tokio::time::timeout(refresh_timeout, refresh) => {
+                    match outcome {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            metrics
+                                .dispatch_backlog_scrape_errors_total
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            tracing::warn!(
+                                target: "astra_runtime::metrics",
+                                error = %error,
+                                "failed to refresh edge dispatch backlog metrics"
+                            );
+                        }
+                        Err(_) => {
+                            metrics
+                                .dispatch_backlog_scrape_errors_total
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            tracing::warn!(
+                                target: "astra_runtime::metrics",
+                                timeout_ms = refresh_timeout.as_millis(),
+                                "timed out refreshing edge dispatch backlog metrics"
+                            );
+                        }
+                    }
+                }
+            }
+
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    break;
+                }
+                _ = tokio::time::sleep(refresh_interval) => {}
+            }
+        }
+
+        tracing::info!(
+            target: "astra_runtime::metrics",
+            "edge dispatch backlog metrics refresh received cancellation; exiting"
+        );
+    })
+}
+
 pub use astra_server_types::edge_connection_pool;
 
 #[cfg(test)]
 mod tests {
     use std::sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     };
 
     use astra_core::{ErrorResponse, error_response};
     use astra_services::{
         CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, RunLifecycleService,
         RunListRecord, RunStatusRecord,
+        multi_agent::{EdgeDispatchRow, EdgeDispatchService},
     };
     use async_trait::async_trait;
     use axum::{Json, http::StatusCode};
+
+    #[derive(Default)]
+    struct RecordingEdgeDispatchService {
+        cleanup_calls: AtomicUsize,
+        stale_after_secs: AtomicU64,
+    }
+
+    #[async_trait]
+    impl EdgeDispatchService for RecordingEdgeDispatchService {
+        async fn insert_dispatch(
+            &self,
+            _user_id: &str,
+            _edge_agent_id: &str,
+            _request_id: &str,
+            _payload_json: &str,
+        ) -> Result<(), String> {
+            unreachable!("insert_dispatch is not used in cleanup tests")
+        }
+
+        async fn poll_pending(
+            &self,
+            _user_id: &str,
+            _edge_agent_id: &str,
+        ) -> Result<Vec<EdgeDispatchRow>, String> {
+            unreachable!("poll_pending is not used in cleanup tests")
+        }
+
+        async fn deliver_result(
+            &self,
+            _user_id: &str,
+            _request_id: &str,
+            _edge_agent_id: &str,
+            _result_json: &str,
+        ) -> Result<bool, String> {
+            unreachable!("deliver_result is not used in cleanup tests")
+        }
+
+        async fn fail_dispatch(
+            &self,
+            _user_id: &str,
+            _request_id: &str,
+            _reason: &str,
+        ) -> Result<bool, String> {
+            unreachable!("fail_dispatch is not used in cleanup tests")
+        }
+
+        async fn wait_result(
+            &self,
+            _user_id: &str,
+            _request_id: &str,
+            _timeout: std::time::Duration,
+        ) -> Result<Option<String>, String> {
+            unreachable!("wait_result is not used in cleanup tests")
+        }
+
+        async fn cleanup_stale(&self, older_than: std::time::Duration) -> Result<u64, String> {
+            self.cleanup_calls.fetch_add(1, Ordering::SeqCst);
+            self.stale_after_secs
+                .store(older_than.as_secs(), Ordering::SeqCst);
+            Ok(1)
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn edge_dispatch_cleanup_sweeper_uses_configured_stale_after() {
+        let service = Arc::new(RecordingEdgeDispatchService::default());
+        let dispatch: Arc<dyn EdgeDispatchService> = service.clone();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle = super::spawn_edge_dispatch_cleanup_with_config(
+            dispatch,
+            cancel.clone(),
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(30),
+        );
+
+        tokio::task::yield_now().await;
+        assert_eq!(service.cleanup_calls.load(Ordering::SeqCst), 0);
+
+        tokio::time::advance(std::time::Duration::from_secs(10)).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(service.cleanup_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(service.stale_after_secs.load(Ordering::SeqCst), 30);
+
+        cancel.cancel();
+        handle.await.expect("cleanup task should stop cleanly");
+    }
 
     #[derive(Default)]
     struct RecordingRunLifecycleService {
@@ -463,11 +688,11 @@ mod tests {
             unreachable!("cancel_run is not used in shutdown tests")
         }
 
-        async fn list_runs(
+        async fn list_runs_cursor(
             &self,
             _user_id: String,
             _limit: u32,
-            _offset: u32,
+            _cursor: Option<astra_services::runs::RunListCursor>,
         ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
             unreachable!("list_runs is not used in shutdown tests")
         }

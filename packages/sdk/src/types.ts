@@ -910,6 +910,11 @@ export type RunProjectionResponse = {
   recent_events: Array<StreamEvent | Record<string, unknown>>;
 };
 
+export type RunProjectionRepairResponse = {
+  repaired: boolean;
+  projection: RunProjectionResponse;
+};
+
 export type RunInputRequestBody = {
   idempotencyKey: string;
   input?: unknown;
@@ -954,7 +959,7 @@ export type RuntimeSessionResponse = {
 
 export type RuntimeSessionListResponse = {
   sessions: RuntimeSessionResponse[];
-  total?: number;
+  total?: number | null;
   limit?: number;
   next_cursor?: RuntimeSessionListCursor | null;
 };
@@ -978,7 +983,7 @@ export type RuntimeSessionUpdateBody = {
 
 export type RuntimeSessionListParams = {
   limit?: number;
-  cursor?: RuntimeSessionListCursor | null;
+  cursor?: RuntimeSessionListCursor;
 };
 
 export type RuntimeTranscriptItemResponse = {
@@ -1216,11 +1221,21 @@ export type SessionActivityResponse = {
 
 // ─── Run list ─────────────────────────────────────────────────────
 
+export type RunListCursor = {
+  updatedAt: string;
+  runId: string;
+};
+
+export type RunListParams = {
+  limit?: number;
+  cursor?: RunListCursor;
+};
+
 export type RunListResponse = {
   runs: RunStatus[];
-  total: number;
+  total: number | null;
   limit: number;
-  offset: number;
+  nextCursor?: RunListCursor | null;
 };
 
 // ─── Delegation (multi-agent) ─────────────────────────────────────
@@ -1304,7 +1319,7 @@ export type EventResponse = {
 
 export type EventListResponse = {
   events: EventResponse[];
-  total: number;
+  total: number | null;
   limit: number;
   next_cursor?: EventListCursor | null;
 };
@@ -1353,7 +1368,8 @@ export type ApprovalRespondRequestBody = {
   request_id: string;
   decision: ApprovalDecision;
   reason?: string;
-  session_id?: string;
+  session_id: string;
+  run_id: string;
   tool_name?: string;
   approval_kind?: ApprovalKind;
 };

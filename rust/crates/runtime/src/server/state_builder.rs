@@ -64,7 +64,8 @@ pub async fn build_server_state(
         &matrix_rt,
     );
 
-    Ok(state.with_matrix_cloud_runtime(Some(matrix_rt)))
+    let state = state.with_matrix_cloud_runtime(Some(matrix_rt));
+    Ok(state)
 }
 
 fn install_skillify_harness_service(

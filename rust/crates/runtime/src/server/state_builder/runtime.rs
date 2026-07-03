@@ -15,7 +15,8 @@ pub(super) async fn build_runtime_wiring(
         shared_pool.clone(),
     ));
     let run_engine = crate::server::run::engine::RunEngine::new(run_store)
-        .with_projection_store(Arc::clone(&state_projection_store));
+        .with_projection_store(Arc::clone(&state_projection_store))
+        .with_metrics_registry(state.metrics_registry());
     recover_active_runs(&run_engine).await;
 
     let profile_registry = Arc::new(default_agent_profile_registry());
@@ -67,6 +68,37 @@ pub(super) async fn build_runtime_wiring(
         .with_projection_store(Arc::clone(&state_projection_store)),
     );
 
+    astra_turn_core::parallel_tool_exec::set_tool_execution_metrics_registry(
+        state.metrics_registry(),
+    );
+    astra_turn_core::ws_user_prompt_gate::set_ws_user_prompt_metrics_registry(
+        state.metrics_registry(),
+    );
+    crate::turn::llm::client::set_llm_nonstream_fallback_metrics_registry(state.metrics_registry());
+    crate::llm_provider_admission::set_llm_provider_admission_metrics_registry(
+        state.metrics_registry(),
+    );
+    crate::server::server_loop_host::set_llm_main_attempt_metrics_registry(
+        state.metrics_registry(),
+    );
+    let provider_admission_config =
+        crate::llm_provider_admission::ProviderAdmissionConfig::from_env();
+    if let Err(error) =
+        crate::llm_provider_admission::ensure_llm_provider_admission_schema_if_configured(
+            shared_pool,
+        )
+        .await
+    {
+        let message = error.message;
+        if provider_admission_config.is_enabled() && !provider_admission_config.fail_open() {
+            return Err(Box::new(std::io::Error::other(message)));
+        }
+        tracing::warn!(
+            target: "astra_runtime::state_builder",
+            error = %message,
+            "llm provider admission schema init failed"
+        );
+    }
     let resource_governor = initialize_resource_governor(shared_pool).await;
     let run_concurrency_limit = std::env::var("ASTRA_RUN_CONCURRENCY_LIMIT")
         .ok()
@@ -99,6 +131,7 @@ pub(super) async fn build_runtime_wiring(
     .with_tool_event_writer(state.turn_persistence.tool_event_writer.clone())
     .with_auxiliary_event_writer(state.turn_persistence.auxiliary_event_writer.clone())
     .with_run_concurrency_limit(run_concurrency_limit)
+    .with_metrics_registry(state.metrics_registry())
     .with_tool_execution_service(state.tool_execution_service.clone());
     if let Some(svc) = memory_extraction_service.as_ref() {
         run_lifecycle = run_lifecycle.with_memory_extraction_service(Arc::clone(svc));

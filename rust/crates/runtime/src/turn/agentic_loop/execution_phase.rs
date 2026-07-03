@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::super::agentic::headless_round::HeadlessStderrStyle;
 use super::host::{
@@ -26,6 +26,8 @@ use uuid::Uuid;
 use crate::turn::observation_dispatcher::{
     FileSink, MemorySink, ObservationDispatcher, ObservationEvent,
 };
+
+const DEFERRED_USER_INPUT_EMPTY_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Lazily-initialized process-wide alert dispatcher.
 ///
@@ -76,6 +78,46 @@ fn alert_dispatch_session_id(session_id: Option<&str>) -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn is_llm_provider_admission_error(error: &astra_core::ClassifiedError) -> bool {
+    let Some(details_json) = error.details_json.as_deref() else {
+        return false;
+    };
+    let Ok(serde_json::Value::Object(details)) =
+        serde_json::from_str::<serde_json::Value>(details_json)
+    else {
+        return false;
+    };
+    details.get("source").and_then(serde_json::Value::as_str) == Some("llm_provider_admission")
+}
+
+fn record_direct_llm_error_state(
+    state: &mut AgenticLoopState,
+    error: &astra_core::ClassifiedError,
+) {
+    match error.kind {
+        astra_core::ErrorKind::RateLimit if !is_llm_provider_admission_error(error) => {
+            state.rate_limit_cooldown.record_429(None, false);
+        }
+        astra_core::ErrorKind::ServerError => {
+            state.rate_limit_cooldown.record_529(None, false);
+        }
+        _ => {}
+    }
+
+    if state.interruption.is_some() {
+        return;
+    }
+    if let Some((kind, action)) =
+        astra_turn_core::interruption::interruption_from_error_kind(error.kind)
+    {
+        state.interruption = Some(InterruptionRecord::new(
+            kind,
+            action,
+            interruption_state_summary(state, Some(error.message.clone())),
+        ));
+    }
+}
+
 pub(crate) fn deferred_user_input_text(input: &serde_json::Value) -> Option<String> {
     fn trimmed_text(value: Option<&serde_json::Value>) -> Option<String> {
         value
@@ -124,6 +166,11 @@ pub(crate) async fn inject_polled_deferred_user_inputs<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
 ) -> Result<(), astra_core::ClassifiedError> {
+    let poll_started = tokio::time::Instant::now();
+    if !state.deferred_input.should_poll_user_inputs(poll_started) {
+        return Ok(());
+    }
+
     let (run_control, user_id, run_id) = match (
         state.run_control.as_ref(),
         state.context_manifest_user_id.as_ref(),
@@ -142,11 +189,11 @@ pub(crate) async fn inject_polled_deferred_user_inputs<H: AgenticLoopHost>(
         )
         .await;
     if let Some(error) = &poll.error {
+        state
+            .deferred_input
+            .note_user_input_poll_finished(poll_started, DEFERRED_USER_INPUT_EMPTY_POLL_INTERVAL);
         tracing::warn!(run_id, error = %error, "deferred user input poll failed");
-        return Err(astra_core::ClassifiedError::new(
-            astra_core::ErrorKind::DatabaseError,
-            format!("failed to poll deferred user input for run {run_id}: {error}"),
-        ));
+        return Ok(());
     }
     let observed = state
         .deferred_input
@@ -154,6 +201,9 @@ pub(crate) async fn inject_polled_deferred_user_inputs<H: AgenticLoopHost>(
     let release_event_indices = state
         .deferred_input
         .release_event_indices_to_ack(&observed.released_event_indices);
+    state
+        .deferred_input
+        .note_user_input_poll_finished(poll_started, DEFERRED_USER_INPUT_EMPTY_POLL_INTERVAL);
     if observed.raw_inputs.is_empty() && release_event_indices.is_empty() {
         return Ok(());
     }
@@ -369,6 +419,9 @@ async fn persist_context_manifest_for_llm_call(
     pre_llm_messages: &[serde_json::Value],
     turn_result: Option<&HostTurnResult>,
 ) {
+    if !context_manifest_db_persistence_enabled() {
+        return;
+    }
     if turn_result.is_none() && state.last_llm_context_manifest_trace.is_none() {
         return;
     }
@@ -446,6 +499,18 @@ async fn persist_context_manifest_for_llm_call(
             "failed to persist per-llm-call context manifest"
         );
     }
+}
+
+fn context_manifest_db_persistence_enabled_for_trace(
+    trace: &astra_config::runtime_config::SessionTraceConfig,
+) -> bool {
+    trace.category_enabled(astra_config::runtime_config::TraceCategory::ContextAssembly)
+}
+
+fn context_manifest_db_persistence_enabled() -> bool {
+    context_manifest_db_persistence_enabled_for_trace(
+        &astra_config::runtime_config::RuntimeConfig::cached().trace,
+    )
 }
 
 fn context_window_tokens_for_context_manifest(state: &AgenticLoopState) -> u32 {
@@ -1247,7 +1312,13 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             .await;
         }
     }
-    let turn_result = turn_result?;
+    let turn_result = match turn_result {
+        Ok(turn_result) => turn_result,
+        Err(error) => {
+            record_direct_llm_error_state(state, &error);
+            return Err(error);
+        }
+    };
     state.rate_limit_cooldown.record_success();
     // Clear pipeline recovery escalation after a successful LLM call —
     // the PTL pressure is relieved.
@@ -3437,6 +3508,7 @@ mod tests {
 
     struct StubRunControlProvider {
         polls: Mutex<VecDeque<RunQueuedInputPoll>>,
+        poll_calls: Mutex<Vec<usize>>,
         released: Mutex<Vec<usize>>,
         release_failures: Mutex<usize>,
     }
@@ -3445,6 +3517,7 @@ mod tests {
         fn new(polls: Vec<RunQueuedInputPoll>) -> Self {
             Self {
                 polls: Mutex::new(VecDeque::from(polls)),
+                poll_calls: Mutex::new(Vec::new()),
                 released: Mutex::new(Vec::new()),
                 release_failures: Mutex::new(0),
             }
@@ -3453,9 +3526,14 @@ mod tests {
         fn with_release_failures(polls: Vec<RunQueuedInputPoll>, release_failures: usize) -> Self {
             Self {
                 polls: Mutex::new(VecDeque::from(polls)),
+                poll_calls: Mutex::new(Vec::new()),
                 released: Mutex::new(Vec::new()),
                 release_failures: Mutex::new(release_failures),
             }
+        }
+
+        async fn poll_call_count(&self) -> usize {
+            self.poll_calls.lock().await.len()
         }
     }
 
@@ -3463,6 +3541,40 @@ mod tests {
         decision: Option<FactualRetryFallbackDecision>,
         calls: Vec<(String, String, String)>,
         valid_tools: HashSet<String>,
+    }
+
+    struct DirectErrorHost {
+        error: Option<astra_core::ClassifiedError>,
+        valid_tools: HashSet<String>,
+    }
+
+    impl DirectErrorHost {
+        fn new(error: astra_core::ClassifiedError) -> Self {
+            Self {
+                error: Some(error),
+                valid_tools: HashSet::new(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl AgenticLoopHost for DirectErrorHost {
+        async fn execute_turn(
+            &mut self,
+            _state: &mut AgenticLoopState,
+        ) -> Result<HostTurnResult, astra_core::ClassifiedError> {
+            Err(self.error.take().expect("test host called once"))
+        }
+
+        fn emit_headless_line(&mut self, _style: HeadlessStderrStyle, _line: String) {}
+
+        fn is_quiet(&self) -> bool {
+            true
+        }
+
+        fn valid_tool_names(&self) -> &HashSet<String> {
+            &self.valid_tools
+        }
     }
 
     #[async_trait]
@@ -3567,6 +3679,7 @@ mod tests {
             _run_id: &str,
             after_event_index: usize,
         ) -> RunQueuedInputPoll {
+            self.poll_calls.lock().await.push(after_event_index);
             self.polls
                 .lock()
                 .await
@@ -3693,6 +3806,31 @@ mod tests {
         // The function signature enforces ordering: it takes a
         // turn_result: Option<&HostTurnResult>, which only exists after
         // execute_turn returns.
+    }
+
+    #[test]
+    fn context_manifest_db_persistence_follows_context_assembly_trace_category() {
+        use astra_config::runtime_config::{SessionTraceConfig, TraceCategory, TraceProfile};
+
+        let production = SessionTraceConfig::default();
+        assert!(
+            !context_manifest_db_persistence_enabled_for_trace(&production),
+            "production/default trace profile must not write context manifest diagnostics"
+        );
+
+        let dev = SessionTraceConfig::default().apply_profile(TraceProfile::Dev);
+        assert!(
+            context_manifest_db_persistence_enabled_for_trace(&dev),
+            "dev trace profile enables all diagnostic persistence categories"
+        );
+
+        let custom = SessionTraceConfig {
+            profile: TraceProfile::Custom,
+            enabled_categories: vec![TraceCategory::ContextAssembly],
+            ..SessionTraceConfig::default()
+        }
+        .normalize();
+        assert!(context_manifest_db_persistence_enabled_for_trace(&custom));
     }
 
     #[test]
@@ -3844,6 +3982,81 @@ mod tests {
             host.turn_completed_run_ids.is_empty(),
             "hook must not fire on execute_turn error"
         );
+    }
+
+    #[tokio::test]
+    async fn direct_provider_rate_limit_error_records_interruption_and_cooldown() {
+        let mut state = make_state();
+        let mut host = DirectErrorHost::new(astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::RateLimit,
+            "provider returned 429",
+        ));
+
+        let result = execute_turn_and_ingest_phase(
+            &mut host,
+            &mut state,
+            0,
+            TurnIterationPrep {
+                quiet: true,
+                turn_start_time: Instant::now(),
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
+        let interruption = state
+            .interruption
+            .as_ref()
+            .expect("direct provider 429 must be represented as an interruption");
+        assert_eq!(interruption.kind, InterruptionKind::RateLimited);
+        assert_eq!(state.llm_rounds_completed, 1);
+        let metrics = state.rate_limit_cooldown.metrics();
+        assert_eq!(metrics.total_429_errors, 1);
+        assert_eq!(metrics.consecutive_errors, 1);
+    }
+
+    #[tokio::test]
+    async fn direct_provider_admission_rejection_records_interruption_without_provider_cooldown() {
+        let mut state = make_state();
+        let mut host = DirectErrorHost::new(
+            astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::RateLimit,
+                "LLM provider admission rejected request before provider call",
+            )
+            .with_details_json(
+                serde_json::json!({
+                    "source": "llm_provider_admission",
+                    "scope": "provider",
+                    "limit": 20
+                })
+                .to_string(),
+            ),
+        );
+
+        let result = execute_turn_and_ingest_phase(
+            &mut host,
+            &mut state,
+            0,
+            TurnIterationPrep {
+                quiet: true,
+                turn_start_time: Instant::now(),
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
+        let interruption = state
+            .interruption
+            .as_ref()
+            .expect("admission rejection must be represented as an interruption");
+        assert_eq!(interruption.kind, InterruptionKind::RateLimited);
+        assert_eq!(state.llm_rounds_completed, 1);
+        let metrics = state.rate_limit_cooldown.metrics();
+        assert_eq!(
+            metrics.total_429_errors, 0,
+            "local admission rejection must not be counted as a provider 429"
+        );
+        assert_eq!(metrics.consecutive_errors, 0);
     }
 
     #[test]
@@ -5539,6 +5752,64 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn deferred_user_input_empty_poll_is_throttled() {
+        let mut state = make_state();
+        state.current_run_id = Some("run-empty-throttle".into());
+        state.context_manifest_user_id = Some("user-deferred".into());
+        let provider = Arc::new(StubRunControlProvider::new(vec![
+            RunQueuedInputPoll {
+                next_cursor: 0,
+                inputs: Vec::new(),
+                error: None,
+            },
+            RunQueuedInputPoll {
+                next_cursor: 2,
+                inputs: vec![crate::turn::run_control::QueuedRunInputEvent {
+                    event_index: 1,
+                    input: serde_json::json!({"content": "arrived after quiet poll"}),
+                }],
+                error: None,
+            },
+        ]));
+        state.run_control = Some(provider.clone());
+        let mut host = MockHost::new(vec![]);
+
+        inject_polled_deferred_user_inputs(&mut host, &mut state)
+            .await
+            .unwrap();
+        assert_eq!(provider.poll_call_count().await, 1);
+
+        inject_polled_deferred_user_inputs(&mut host, &mut state)
+            .await
+            .unwrap();
+        assert_eq!(
+            provider.poll_call_count().await,
+            1,
+            "empty poll should suppress immediate follow-up DB poll"
+        );
+        assert!(state.messages.is_empty());
+
+        tokio::time::advance(DEFERRED_USER_INPUT_EMPTY_POLL_INTERVAL - Duration::from_millis(1))
+            .await;
+        inject_polled_deferred_user_inputs(&mut host, &mut state)
+            .await
+            .unwrap();
+        assert_eq!(
+            provider.poll_call_count().await,
+            1,
+            "poll should remain suppressed until the interval fully elapses"
+        );
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        inject_polled_deferred_user_inputs(&mut host, &mut state)
+            .await
+            .unwrap();
+        assert_eq!(provider.poll_call_count().await, 2);
+        assert_eq!(state.message, "arrived after quiet poll");
+        assert_eq!(*provider.released.lock().await, vec![1]);
+    }
+
     #[tokio::test]
     async fn deferred_user_input_retries_release_without_reinjecting_after_ack_failure() {
         let mut state = make_state();
@@ -5573,6 +5844,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(state.deferred_input.deferred_user_input_cursor(), 2);
+        assert_eq!(
+            provider.poll_call_count().await,
+            2,
+            "pending release acknowledgement must bypass empty-poll throttling"
+        );
         assert_eq!(*provider.released.lock().await, vec![1]);
         assert_eq!(
             state
@@ -5611,7 +5887,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deferred_user_input_poll_error_fails_closed() {
+    async fn deferred_user_input_poll_error_degrades_without_advancing_cursor() {
         let mut state = make_state();
         state.current_run_id = Some("run-missing".into());
         state.context_manifest_user_id = Some("user-deferred".into());
@@ -5623,14 +5899,13 @@ mod tests {
         state.run_control = Some(provider.clone());
         let mut host = MockHost::new(vec![]);
 
-        let error = inject_polled_deferred_user_inputs(&mut host, &mut state)
+        inject_polled_deferred_user_inputs(&mut host, &mut state)
             .await
-            .expect_err("poll errors must stop the loop instead of being treated as empty input");
+            .expect("poll errors are control-plane misses and should not fail the main turn");
 
-        assert_eq!(error.kind, astra_core::ErrorKind::DatabaseError);
-        assert!(error.message.contains("run-missing"));
         assert_eq!(state.deferred_input.deferred_user_input_cursor(), 0);
         assert!(state.messages.is_empty());
+        assert!(state.volatile_pending.is_empty());
         assert!(provider.released.lock().await.is_empty());
     }
 

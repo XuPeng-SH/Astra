@@ -240,8 +240,8 @@ where
         query(
             "UPDATE agent_sessions \
              SET event_count = event_count + ?, \
-                 updated_at = NOW(6), \
-                 last_active_at = NOW(6), \
+                 updated_at = IF(last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND), NOW(6), updated_at), \
+                 last_active_at = IF(last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND), NOW(6), last_active_at), \
                  last_event_id = COALESCE(?, last_event_id) \
              WHERE session_id = ? AND user_id = ?",
         )
@@ -259,8 +259,8 @@ where
                      WHEN event_count >= ? THEN event_count - ? \
                      ELSE 0 \
                  END, \
-                 updated_at = NOW(6), \
-                 last_active_at = NOW(6), \
+                 updated_at = IF(last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND), NOW(6), updated_at), \
+                 last_active_at = IF(last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND), NOW(6), last_active_at), \
                  last_event_id = COALESCE(?, last_event_id) \
              WHERE session_id = ? AND user_id = ?",
         )
@@ -290,8 +290,8 @@ const ADD_AGENT_SESSION_EVENT_COUNT_OR_CREATE_SQL: &str = "INSERT INTO agent_ses
          ON DUPLICATE KEY UPDATE \
          event_count = IF(user_id = VALUES(user_id), event_count + VALUES(event_count), event_count), \
          last_event_id = IF(user_id = VALUES(user_id), COALESCE(VALUES(last_event_id), last_event_id), last_event_id), \
-         updated_at = IF(user_id = VALUES(user_id), NOW(6), updated_at), \
-         last_active_at = IF(user_id = VALUES(user_id), NOW(6), last_active_at)";
+         updated_at = IF(user_id = VALUES(user_id) AND last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND), NOW(6), updated_at), \
+         last_active_at = IF(user_id = VALUES(user_id) AND last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND), NOW(6), last_active_at)";
 
 pub async fn add_agent_session_event_count_or_create<'e, E>(
     executor: E,
@@ -335,8 +335,8 @@ where
 {
     let result = query(
         "UPDATE agent_sessions \
-         SET updated_at = NOW(6), \
-             last_active_at = NOW(6), \
+         SET updated_at = IF(last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND), NOW(6), updated_at), \
+             last_active_at = IF(last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND), NOW(6), last_active_at), \
              last_event_id = COALESCE(?, last_event_id) \
          WHERE session_id = ? AND user_id = ?",
     )
@@ -935,16 +935,47 @@ pub async fn ensure_core_schema(
 
     query(
         "CREATE TABLE IF NOT EXISTS auth_user_roles (
-            id BIGINT AUTO_INCREMENT PRIMARY KEY,
             user_id VARCHAR(64) NOT NULL,
             role_id VARCHAR(64) NOT NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            UNIQUE KEY uq_auth_user_roles_user_role (user_id, role_id),
-            INDEX idx_auth_user_roles_user_id (user_id),
+            PRIMARY KEY (user_id, role_id),
             INDEX idx_auth_user_roles_role_id (role_id)
         )",
     )
     .execute(&pool)
+    .await?;
+    fail_if_obsolete_shape(
+        &pool,
+        &settings.database,
+        "auth_user_roles",
+        &["user_id", "role_id"],
+        &["id"],
+        &["uq_auth_user_roles_user_role"],
+    )
+    .await?;
+    drop_index_if_present(
+        &pool,
+        &settings.database,
+        "auth_user_roles",
+        "idx_auth_user_roles_user_id",
+    )
+    .await?;
+    ensure_primary_key_shape(
+        &pool,
+        &settings.database,
+        "auth_user_roles",
+        &["user_id", "role_id"],
+        "ALTER TABLE auth_user_roles ADD PRIMARY KEY (user_id, role_id)",
+    )
+    .await?;
+    ensure_index_shape(
+        &pool,
+        &settings.database,
+        "auth_user_roles",
+        "idx_auth_user_roles_role_id",
+        &["role_id"],
+        "ALTER TABLE auth_user_roles ADD INDEX idx_auth_user_roles_role_id (role_id)",
+    )
     .await?;
 
     query(
@@ -986,7 +1017,6 @@ pub async fn ensure_core_schema(
 
     query(
         "CREATE TABLE IF NOT EXISTS auth_external_identities (
-            id BIGINT AUTO_INCREMENT PRIMARY KEY,
             provider_id VARCHAR(64) NOT NULL,
             external_subject VARCHAR(255) NOT NULL,
             astra_user_id VARCHAR(64) NOT NULL,
@@ -995,11 +1025,37 @@ pub async fn ensure_core_schema(
             display_name VARCHAR(255) NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            UNIQUE KEY uq_auth_external_identity_provider_subject (provider_id, external_subject),
+            PRIMARY KEY (provider_id, external_subject),
             INDEX idx_auth_external_identities_user (astra_user_id)
         )",
     )
     .execute(&pool)
+    .await?;
+    fail_if_obsolete_shape(
+        &pool,
+        &settings.database,
+        "auth_external_identities",
+        &["provider_id", "external_subject"],
+        &["id"],
+        &["uq_auth_external_identity_provider_subject"],
+    )
+    .await?;
+    ensure_primary_key_shape(
+        &pool,
+        &settings.database,
+        "auth_external_identities",
+        &["provider_id", "external_subject"],
+        "ALTER TABLE auth_external_identities ADD PRIMARY KEY (provider_id, external_subject)",
+    )
+    .await?;
+    ensure_index_shape(
+        &pool,
+        &settings.database,
+        "auth_external_identities",
+        "idx_auth_external_identities_user",
+        &["astra_user_id"],
+        "ALTER TABLE auth_external_identities ADD INDEX idx_auth_external_identities_user (astra_user_id)",
+    )
     .await?;
 
     query(
@@ -1233,7 +1289,7 @@ pub async fn ensure_core_schema(
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             CONSTRAINT chk_agent_runs_retry_scope CHECK (retry_scope IN ('node', 'subtree', 'siblings')),
             PRIMARY KEY (user_id, run_id),
-            INDEX idx_agent_runs_user_updated (user_id, updated_at),
+            INDEX idx_agent_runs_user_updated_run (user_id, updated_at, run_id),
             INDEX idx_agent_runs_user_session_status_updated (user_id, session_id, status, updated_at),
             INDEX idx_agent_runs_owner_root_depth (user_id, root_run_id, depth, created_at),
             INDEX idx_agent_runs_owner_parent_status_updated (user_id, parent_run_id, status, updated_at),
@@ -1259,10 +1315,16 @@ pub async fn ensure_core_schema(
         "idx_agent_runs_root_depth",
         "idx_agent_runs_parent",
         "idx_agent_runs_retry_of",
+        "idx_agent_runs_user_updated",
     ] {
         drop_index_if_present(&pool, &settings.database, "agent_runs", removed_index).await?;
     }
     for (index, expected_columns, ddl) in [
+        (
+            "idx_agent_runs_user_updated_run",
+            &["user_id", "updated_at", "run_id"][..],
+            "ALTER TABLE agent_runs ADD INDEX idx_agent_runs_user_updated_run (user_id, updated_at, run_id)",
+        ),
         (
             "idx_agent_runs_user_session_status_updated",
             &["user_id", "session_id", "status", "updated_at"][..],
@@ -1804,11 +1866,28 @@ pub async fn ensure_core_schema(
             request_hash VARCHAR(64) NOT NULL,
             summary_json LONGTEXT NOT NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            created_at_unix_ms BIGINT NULL,
             PRIMARY KEY (user_id, request_id),
             UNIQUE KEY uq_prompt_request_attempt (user_id, session_id, turn, round, source, attempt),
             INDEX idx_prompt_requests_owner_session_created (user_id, session_id, created_at, turn, round, attempt),
-            INDEX idx_prompt_requests_owner_run_created (user_id, run_id, created_at, turn, round, attempt)
+            INDEX idx_prompt_requests_owner_run_created (user_id, run_id, created_at, turn, round, attempt),
+            INDEX idx_prompt_requests_retention_ms (created_at_unix_ms, user_id, request_id, session_id)
         )",
+    )
+    .execute(&pool)
+    .await?;
+    add_column_if_missing(
+        &pool,
+        &settings.database,
+        "prompt_request_records",
+        "created_at_unix_ms",
+        "ALTER TABLE prompt_request_records ADD COLUMN created_at_unix_ms BIGINT NULL",
+    )
+    .await?;
+    query(
+        "UPDATE prompt_request_records
+         SET created_at_unix_ms = UNIX_TIMESTAMP(created_at) * 1000
+         WHERE created_at_unix_ms IS NULL",
     )
     .execute(&pool)
     .await?;
@@ -1856,6 +1935,11 @@ pub async fn ensure_core_schema(
                 "attempt",
             ][..],
             "ALTER TABLE prompt_request_records ADD INDEX idx_prompt_requests_owner_run_created (user_id, run_id, created_at, turn, round, attempt)",
+        ),
+        (
+            "idx_prompt_requests_retention_ms",
+            &["created_at_unix_ms", "user_id", "request_id", "session_id"][..],
+            "ALTER TABLE prompt_request_records ADD INDEX idx_prompt_requests_retention_ms (created_at_unix_ms, user_id, request_id, session_id)",
         ),
     ] {
         ensure_index_shape(
@@ -2100,7 +2184,6 @@ pub async fn ensure_core_schema(
     }
     query(
         "CREATE TABLE IF NOT EXISTS context_manifest_items (
-            id BIGINT AUTO_INCREMENT PRIMARY KEY,
             manifest_id VARCHAR(128) NOT NULL,
             session_id VARCHAR(128) NOT NULL,
             item_order INT NOT NULL,
@@ -2115,7 +2198,7 @@ pub async fn ensure_core_schema(
             render_mode VARCHAR(64) NOT NULL,
             raw_ref VARCHAR(255) NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            UNIQUE KEY uq_manifest_item_order (manifest_id, item_order),
+            PRIMARY KEY (manifest_id, item_order),
             INDEX idx_manifest_items_source (source_table, source_id),
             INDEX idx_manifest_items_manifest_zone (manifest_id, zone, included),
             INDEX idx_manifest_items_raw_ref (raw_ref)
@@ -2123,11 +2206,28 @@ pub async fn ensure_core_schema(
     )
     .execute(&pool)
     .await?;
+    fail_if_obsolete_shape(
+        &pool,
+        &settings.database,
+        "context_manifest_items",
+        &["manifest_id", "item_order"],
+        &["id"],
+        &["uq_manifest_item_order"],
+    )
+    .await?;
     drop_index_if_present(
         &pool,
         &settings.database,
         "context_manifest_items",
         "idx_manifest_items_session_zone",
+    )
+    .await?;
+    ensure_primary_key_shape(
+        &pool,
+        &settings.database,
+        "context_manifest_items",
+        &["manifest_id", "item_order"],
+        "ALTER TABLE context_manifest_items ADD PRIMARY KEY (manifest_id, item_order)",
     )
     .await?;
     ensure_index_shape(
@@ -2361,7 +2461,7 @@ pub async fn ensure_core_schema(
     }
     query(
         "CREATE TABLE IF NOT EXISTS session_state_item_events (
-            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            event_id VARCHAR(64) NOT NULL,
             item_id VARCHAR(128) NOT NULL,
             user_id VARCHAR(128) NOT NULL,
             session_id VARCHAR(128) NOT NULL,
@@ -2378,12 +2478,22 @@ pub async fn ensure_core_schema(
             trace_id VARCHAR(128) NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             CONSTRAINT chk_state_item_event_mutation CHECK (mutation IN ('insert', 'update', 'replace', 'archive', 'delete', 'bubble_up', 'apply_suggestion', 'activate')),
-            INDEX idx_state_events_item_created (item_id, created_at, id),
-            INDEX idx_state_events_owner_session_created (user_id, session_id, created_at, id),
-            INDEX idx_state_events_category_created (category, created_at)
+            PRIMARY KEY (user_id, event_id),
+            INDEX idx_state_events_item_created (item_id, created_at, event_id),
+            INDEX idx_state_events_owner_session_created (user_id, session_id, created_at, event_id),
+            INDEX idx_state_events_category_created (category, created_at, event_id)
         )",
     )
     .execute(&pool)
+    .await?;
+    fail_if_obsolete_shape(
+        &pool,
+        &settings.database,
+        "session_state_item_events",
+        &["user_id", "event_id"],
+        &["id"],
+        &[],
+    )
     .await?;
     drop_index_if_present(
         &pool,
@@ -2392,13 +2502,39 @@ pub async fn ensure_core_schema(
         "idx_state_events_session_created",
     )
     .await?;
+    ensure_primary_key_shape(
+        &pool,
+        &settings.database,
+        "session_state_item_events",
+        &["user_id", "event_id"],
+        "ALTER TABLE session_state_item_events ADD PRIMARY KEY (user_id, event_id)",
+    )
+    .await?;
+    ensure_index_shape(
+        &pool,
+        &settings.database,
+        "session_state_item_events",
+        "idx_state_events_item_created",
+        &["item_id", "created_at", "event_id"],
+        "ALTER TABLE session_state_item_events ADD INDEX idx_state_events_item_created (item_id, created_at, event_id)",
+    )
+    .await?;
     ensure_index_shape(
         &pool,
         &settings.database,
         "session_state_item_events",
         "idx_state_events_owner_session_created",
-        &["user_id", "session_id", "created_at", "id"],
-        "ALTER TABLE session_state_item_events ADD INDEX idx_state_events_owner_session_created (user_id, session_id, created_at, id)",
+        &["user_id", "session_id", "created_at", "event_id"],
+        "ALTER TABLE session_state_item_events ADD INDEX idx_state_events_owner_session_created (user_id, session_id, created_at, event_id)",
+    )
+    .await?;
+    ensure_index_shape(
+        &pool,
+        &settings.database,
+        "session_state_item_events",
+        "idx_state_events_category_created",
+        &["category", "created_at", "event_id"],
+        "ALTER TABLE session_state_item_events ADD INDEX idx_state_events_category_created (category, created_at, event_id)",
     )
     .await?;
 
@@ -3124,22 +3260,6 @@ pub async fn ensure_core_schema(
     .execute(&pool)
     .await?;
 
-    query(
-        "CREATE TABLE IF NOT EXISTS model_gateways (
-            id VARCHAR(128) PRIMARY KEY,
-            resolve_url LONGTEXT NOT NULL,
-            model_protocol VARCHAR(64) NOT NULL,
-            status VARCHAR(32) NOT NULL DEFAULT 'active',
-            metadata_json LONGTEXT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            disabled_at DATETIME(6) NULL,
-            INDEX idx_model_gateways_status_created (status, created_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
     // Server-wide admin config KV store. Holds settings that the admin explicitly manages
     // via `astra admin config set/get/unset` (first key: `reasoning_model_name`).
     query(
@@ -3167,24 +3287,9 @@ pub async fn ensure_core_schema(
     .execute(&pool)
     .await?;
 
-    query(
-        "CREATE TABLE IF NOT EXISTS session_sync_log (
-            sync_id VARCHAR(64) PRIMARY KEY,
-            user_id VARCHAR(64) NOT NULL,
-            session_id VARCHAR(64) NOT NULL,
-            sync_type VARCHAR(50) NOT NULL,
-            sync_direction VARCHAR(10) NOT NULL DEFAULT 'push',
-            payload_size INT NOT NULL DEFAULT 0,
-            duration_ms BIGINT NULL,
-            status VARCHAR(20) NOT NULL DEFAULT 'pending',
-            error_message TEXT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_sync_user_session_created (user_id, session_id, created_at),
-            INDEX idx_sync_user_status_created (user_id, status, created_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
+    query("DROP TABLE IF EXISTS session_sync_log")
+        .execute(&pool)
+        .await?;
 
     // Skills registry — master catalog for database-backed skills.
     //
@@ -3356,7 +3461,6 @@ pub async fn ensure_core_schema(
 
     query(
         "CREATE TABLE IF NOT EXISTS edge_pending_dispatch (
-            dispatch_id BIGINT AUTO_INCREMENT PRIMARY KEY,
             user_id VARCHAR(64) NOT NULL,
             edge_agent_id VARCHAR(255) NOT NULL,
             request_id VARCHAR(128) NOT NULL,
@@ -3367,12 +3471,21 @@ pub async fn ensure_core_schema(
             dispatched_at DATETIME(6) NULL,
             completed_at DATETIME(6) NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            UNIQUE KEY uq_edge_dispatch_owner_request (user_id, request_id),
-            INDEX idx_edge_dispatch_user_status (user_id, edge_agent_id, status),
+            PRIMARY KEY (user_id, request_id),
+            INDEX idx_edge_dispatch_user_status (user_id, edge_agent_id, status, created_at, request_id),
             INDEX idx_edge_dispatch_created (created_at)
         )",
     )
     .execute(&pool)
+    .await?;
+    fail_if_obsolete_shape(
+        &pool,
+        &settings.database,
+        "edge_pending_dispatch",
+        &["user_id", "request_id"],
+        &["dispatch_id"],
+        &["uq_edge_dispatch_owner_request"],
+    )
     .await?;
     drop_index_if_present(
         &pool,
@@ -3381,36 +3494,22 @@ pub async fn ensure_core_schema(
         "uq_edge_dispatch_request_id",
     )
     .await?;
+    ensure_primary_key_shape(
+        &pool,
+        &settings.database,
+        "edge_pending_dispatch",
+        &["user_id", "request_id"],
+        "ALTER TABLE edge_pending_dispatch ADD PRIMARY KEY (user_id, request_id)",
+    )
+    .await?;
     ensure_index_shape(
         &pool,
         &settings.database,
         "edge_pending_dispatch",
-        "uq_edge_dispatch_owner_request",
-        &["user_id", "request_id"],
-        "ALTER TABLE edge_pending_dispatch ADD UNIQUE KEY uq_edge_dispatch_owner_request (user_id, request_id)",
+        "idx_edge_dispatch_user_status",
+        &["user_id", "edge_agent_id", "status", "created_at", "request_id"],
+        "ALTER TABLE edge_pending_dispatch ADD INDEX idx_edge_dispatch_user_status (user_id, edge_agent_id, status, created_at, request_id)",
     )
-    .await?;
-
-    query(
-        "CREATE TABLE IF NOT EXISTS agent_bindings (
-            id VARCHAR(64) PRIMARY KEY,
-            binding_name VARCHAR(255) NOT NULL,
-            idempotency_key VARCHAR(255) NOT NULL,
-            status VARCHAR(32) NOT NULL DEFAULT 'active',
-            agent_md LONGTEXT NOT NULL,
-            capability_servers_json LONGTEXT NOT NULL,
-            runtime_policy_json LONGTEXT NOT NULL,
-            metadata_json LONGTEXT NULL,
-            binding_schema_version VARCHAR(32) NOT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            disabled_at DATETIME(6) NULL,
-            UNIQUE KEY uq_agent_bindings_name (binding_name),
-            UNIQUE KEY uq_agent_bindings_idempotency_key (idempotency_key),
-            INDEX idx_agent_bindings_status_created (status, created_at)
-        )",
-    )
-    .execute(&pool)
     .await?;
 
     query(
@@ -3437,7 +3536,7 @@ pub async fn ensure_core_schema(
 
     query(
         "CREATE TABLE IF NOT EXISTS mcp_servers (
-            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            id VARCHAR(64) NOT NULL,
             owner_user_id VARCHAR(128) NOT NULL,
             name VARCHAR(128) NOT NULL,
             description TEXT NULL,
@@ -3446,35 +3545,114 @@ pub async fn ensure_core_schema(
             is_active SMALLINT NOT NULL DEFAULT 1,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (owner_user_id, id),
             UNIQUE KEY uq_mcp_servers_owner_name (owner_user_id, name),
             INDEX idx_mcp_servers_owner_active (owner_user_id, is_active, updated_at)
         )",
     )
     .execute(&pool)
     .await?;
+    fail_if_varchar_columns_shorter_than(&pool, &settings.database, "mcp_servers", &[("id", 64)])
+        .await?;
+    ensure_primary_key_shape(
+        &pool,
+        &settings.database,
+        "mcp_servers",
+        &["owner_user_id", "id"],
+        "ALTER TABLE mcp_servers ADD PRIMARY KEY (owner_user_id, id)",
+    )
+    .await?;
+    ensure_index_shape(
+        &pool,
+        &settings.database,
+        "mcp_servers",
+        "uq_mcp_servers_owner_name",
+        &["owner_user_id", "name"],
+        "ALTER TABLE mcp_servers ADD UNIQUE INDEX uq_mcp_servers_owner_name (owner_user_id, name)",
+    )
+    .await?;
+    ensure_index_shape(
+        &pool,
+        &settings.database,
+        "mcp_servers",
+        "idx_mcp_servers_owner_active",
+        &["owner_user_id", "is_active", "updated_at"],
+        "ALTER TABLE mcp_servers ADD INDEX idx_mcp_servers_owner_active (owner_user_id, is_active, updated_at)",
+    )
+    .await?;
 
     query(
         "CREATE TABLE IF NOT EXISTS mcp_bindings (
-            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            id VARCHAR(64) NOT NULL,
             owner_user_id VARCHAR(128) NOT NULL,
-            mcp_id BIGINT NOT NULL,
+            mcp_id VARCHAR(64) NOT NULL,
             key_hash VARCHAR(128) NOT NULL,
             key_value_encrypted TEXT NOT NULL,
             comment TEXT NULL,
             is_active SMALLINT NOT NULL DEFAULT 1,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (owner_user_id, id),
             UNIQUE KEY uq_mcp_bindings_owner_mcp_key (owner_user_id, mcp_id, key_hash),
             INDEX idx_mcp_bindings_owner_active (owner_user_id, is_active, updated_at),
-            INDEX idx_mcp_bindings_mcp_id (mcp_id)
+            INDEX idx_mcp_bindings_owner_mcp (owner_user_id, mcp_id)
         )",
     )
     .execute(&pool)
     .await?;
+    fail_if_varchar_columns_shorter_than(
+        &pool,
+        &settings.database,
+        "mcp_bindings",
+        &[("id", 64), ("mcp_id", 64)],
+    )
+    .await?;
+    drop_index_if_present(
+        &pool,
+        &settings.database,
+        "mcp_bindings",
+        "idx_mcp_bindings_mcp_id",
+    )
+    .await?;
+    ensure_primary_key_shape(
+        &pool,
+        &settings.database,
+        "mcp_bindings",
+        &["owner_user_id", "id"],
+        "ALTER TABLE mcp_bindings ADD PRIMARY KEY (owner_user_id, id)",
+    )
+    .await?;
+    ensure_index_shape(
+        &pool,
+        &settings.database,
+        "mcp_bindings",
+        "uq_mcp_bindings_owner_mcp_key",
+        &["owner_user_id", "mcp_id", "key_hash"],
+        "ALTER TABLE mcp_bindings ADD UNIQUE INDEX uq_mcp_bindings_owner_mcp_key (owner_user_id, mcp_id, key_hash)",
+    )
+    .await?;
+    ensure_index_shape(
+        &pool,
+        &settings.database,
+        "mcp_bindings",
+        "idx_mcp_bindings_owner_active",
+        &["owner_user_id", "is_active", "updated_at"],
+        "ALTER TABLE mcp_bindings ADD INDEX idx_mcp_bindings_owner_active (owner_user_id, is_active, updated_at)",
+    )
+    .await?;
+    ensure_index_shape(
+        &pool,
+        &settings.database,
+        "mcp_bindings",
+        "idx_mcp_bindings_owner_mcp",
+        &["owner_user_id", "mcp_id"],
+        "ALTER TABLE mcp_bindings ADD INDEX idx_mcp_bindings_owner_mcp (owner_user_id, mcp_id)",
+    )
+    .await?;
     query(
         "CREATE TABLE IF NOT EXISTS mcp_tools (
-            id BIGINT AUTO_INCREMENT PRIMARY KEY,
-            binding_id BIGINT NOT NULL,
+            owner_user_id VARCHAR(128) NOT NULL,
+            binding_id VARCHAR(64) NOT NULL,
             tool_name VARCHAR(256) NOT NULL,
             public_name VARCHAR(384) NOT NULL,
             description TEXT NULL,
@@ -3482,12 +3660,61 @@ pub async fn ensure_core_schema(
             output_schema_json JSON NULL,
             schema_hash VARCHAR(128) NOT NULL,
             discovered_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            UNIQUE KEY uq_mcp_tools_binding_tool (binding_id, tool_name),
-            UNIQUE KEY uq_mcp_tools_binding_public (binding_id, public_name),
-            INDEX idx_mcp_tools_binding (binding_id)
+            PRIMARY KEY (owner_user_id, binding_id, tool_name),
+            UNIQUE KEY uq_mcp_tools_owner_binding_public (owner_user_id, binding_id, public_name),
+            INDEX idx_mcp_tools_owner_binding (owner_user_id, binding_id)
         )",
     )
     .execute(&pool)
+    .await?;
+    fail_if_obsolete_shape(
+        &pool,
+        &settings.database,
+        "mcp_tools",
+        &["owner_user_id", "binding_id", "tool_name"],
+        &["id"],
+        &["uq_mcp_tools_binding_tool", "uq_mcp_tools_binding_public"],
+    )
+    .await?;
+    fail_if_varchar_columns_shorter_than(
+        &pool,
+        &settings.database,
+        "mcp_tools",
+        &[("binding_id", 64)],
+    )
+    .await?;
+    drop_index_if_present(
+        &pool,
+        &settings.database,
+        "mcp_tools",
+        "idx_mcp_tools_binding",
+    )
+    .await?;
+    ensure_primary_key_shape(
+        &pool,
+        &settings.database,
+        "mcp_tools",
+        &["owner_user_id", "binding_id", "tool_name"],
+        "ALTER TABLE mcp_tools ADD PRIMARY KEY (owner_user_id, binding_id, tool_name)",
+    )
+    .await?;
+    ensure_index_shape(
+        &pool,
+        &settings.database,
+        "mcp_tools",
+        "uq_mcp_tools_owner_binding_public",
+        &["owner_user_id", "binding_id", "public_name"],
+        "ALTER TABLE mcp_tools ADD UNIQUE INDEX uq_mcp_tools_owner_binding_public (owner_user_id, binding_id, public_name)",
+    )
+    .await?;
+    ensure_index_shape(
+        &pool,
+        &settings.database,
+        "mcp_tools",
+        "idx_mcp_tools_owner_binding",
+        &["owner_user_id", "binding_id"],
+        "ALTER TABLE mcp_tools ADD INDEX idx_mcp_tools_owner_binding (owner_user_id, binding_id)",
+    )
     .await?;
 
     query(
@@ -3852,11 +4079,6 @@ pub async fn ensure_core_schema(
             "agent_sessions",
             "project_retention_policy",
             "ALTER TABLE agent_sessions ADD COLUMN project_retention_policy VARCHAR(32) NOT NULL DEFAULT 'session'",
-        ),
-        (
-            "session_sync_log",
-            "duration_ms",
-            "ALTER TABLE session_sync_log ADD COLUMN duration_ms BIGINT NULL",
         ),
     ] {
         if let Err(e) = add_column_if_missing(&pool, &settings.database, table, column, ddl).await {
@@ -4775,10 +4997,10 @@ pub struct RetentionPolicy {
     pub auth_token_days: u32,
     /// Max age in days for expired task leases (default: 7)
     pub task_lease_days: u32,
-    /// Max age in days for sync log entries (default: 30)
-    pub sync_log_days: u32,
     /// Max age in days for audit logs (default: 90)
     pub audit_log_days: u32,
+    /// Max age in days for prompt observability rows after their session/run is inactive (default: 90)
+    pub prompt_request_days: u32,
     /// Max age in days for agent events (default: 90)
     pub event_days: u32,
 }
@@ -4789,8 +5011,8 @@ impl Default for RetentionPolicy {
             refresh_token_days: 7,
             auth_token_days: 30,
             task_lease_days: 7,
-            sync_log_days: 30,
             audit_log_days: 90,
+            prompt_request_days: 90,
             event_days: 90,
         }
     }
@@ -4818,6 +5040,31 @@ fn decode_expired_agent_event_ref(
     Ok((user_id, event_id))
 }
 
+trait ExpiredPromptRequestRow {
+    fn string_column(&self, column: &str) -> Result<String, sqlx::Error>;
+}
+
+impl ExpiredPromptRequestRow for sqlx::mysql::MySqlRow {
+    fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
+        self.try_get(column)
+    }
+}
+
+fn decode_expired_prompt_request_ref(
+    row: &impl ExpiredPromptRequestRow,
+) -> Result<(String, String, String), String> {
+    let user_id = row
+        .string_column("user_id")
+        .map_err(|e| format!("cleanup prompt_request_records decode user_id: {e}"))?;
+    let session_id = row
+        .string_column("session_id")
+        .map_err(|e| format!("cleanup prompt_request_records decode session_id: {e}"))?;
+    let request_id = row
+        .string_column("request_id")
+        .map_err(|e| format!("cleanup prompt_request_records decode request_id: {e}"))?;
+    Ok((user_id, session_id, request_id))
+}
+
 /// Purge expired data across all tables with TTL/expiry semantics.
 ///
 /// Returns a list of per-table cleanup results showing how many rows were deleted.
@@ -4830,8 +5077,10 @@ pub async fn cleanup_expired_data(
     const AUTH_REFRESH_TOKEN_BATCH_LIMIT: u32 = 1000;
     const AUTH_TOKEN_BATCH_LIMIT: u32 = 1000;
     const TASK_LEASE_BATCH_LIMIT: u32 = 1000;
-    const SESSION_SYNC_LOG_BATCH_LIMIT: u32 = 1000;
     const AUTH_AUDIT_LOG_BATCH_LIMIT: u32 = 1000;
+    const PROMPT_REQUEST_BATCH_LIMIT: u32 = 1000;
+    const PROMPT_REQUEST_MAX_BATCHES_PER_RUN: u32 = 10;
+    const PROMPT_REQUEST_DELETE_CHUNK_SIZE: usize = 250;
     const AGENT_EVENT_BATCH_LIMIT: u32 = 1000;
     const AGENT_EVENT_DELETE_CHUNK_SIZE: usize = 250;
     let mut results = Vec::new();
@@ -4892,25 +5141,7 @@ pub async fn cleanup_expired_data(
         rows_deleted: deleted,
     });
 
-    // 4. Old sync log entries
-    let deleted = sqlx::query(
-        "DELETE FROM session_sync_log \
-         WHERE created_at < DATE_SUB(NOW(6), INTERVAL ? DAY) \
-         ORDER BY created_at ASC, sync_id ASC \
-         LIMIT ?",
-    )
-    .bind(policy.sync_log_days)
-    .bind(SESSION_SYNC_LOG_BATCH_LIMIT)
-    .execute(pool)
-    .await
-    .map(|r| r.rows_affected())
-    .map_err(|e| format!("cleanup session_sync_log: {e}"))?;
-    results.push(CleanupResult {
-        table: "session_sync_log",
-        rows_deleted: deleted,
-    });
-
-    // 5. Old audit logs
+    // 4. Old audit logs
     let deleted = sqlx::query(
         "DELETE FROM auth_audit_logs \
          WHERE created_at < DATE_SUB(NOW(6), INTERVAL ? DAY) \
@@ -4928,7 +5159,113 @@ pub async fn cleanup_expired_data(
         rows_deleted: deleted,
     });
 
-    // 6. Old agent events
+    // 5. Old prompt observability rows. Select parent request records first so
+    // child prompt_deltas and parent prompt_request_records are pruned together.
+    let prompt_request_retention_select_sql = format!(
+        "SELECT p.user_id, p.session_id, p.request_id
+             FROM prompt_request_records p
+             LEFT JOIN agent_sessions s
+               ON s.user_id = p.user_id AND s.session_id = p.session_id
+             LEFT JOIN agent_runs r
+               ON r.user_id = p.user_id AND r.run_id = p.run_id
+             WHERE p.created_at_unix_ms < UNIX_TIMESTAMP(DATE_SUB(NOW(6), INTERVAL {} DAY)) * 1000
+               AND (s.session_id IS NULL OR s.status IN ('ended', 'closed', 'cancelled', 'deleting'))
+               AND (p.run_id IS NULL OR r.run_id IS NULL OR r.status IN ('completed', 'failed', 'cancelled'))
+             ORDER BY p.created_at_unix_ms ASC, p.user_id ASC, p.request_id ASC
+             LIMIT ?",
+        policy.prompt_request_days
+    );
+    let mut prompt_delta_deleted = 0_u64;
+    let mut prompt_request_deleted = 0_u64;
+    for _ in 0..PROMPT_REQUEST_MAX_BATCHES_PER_RUN {
+        let mut tx = pool
+            .begin()
+            .await
+            .map_err(|e| format!("cleanup prompt_request_records begin transaction: {e}"))?;
+        let expired_prompt_rows = sqlx::query(&prompt_request_retention_select_sql)
+            .bind(PROMPT_REQUEST_BATCH_LIMIT)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| format!("cleanup prompt_request_records select expired ids: {e}"))?;
+        let expired_prompt_request_ids: Vec<(String, String, String)> = expired_prompt_rows
+            .iter()
+            .map(decode_expired_prompt_request_ref)
+            .collect::<Result<Vec<_>, _>>()?;
+        if expired_prompt_request_ids.is_empty() {
+            tx.commit()
+                .await
+                .map_err(|e| format!("cleanup prompt_request_records commit empty batch: {e}"))?;
+            break;
+        }
+        for chunk in expired_prompt_request_ids.chunks(PROMPT_REQUEST_DELETE_CHUNK_SIZE) {
+            let mut builder = QueryBuilder::<MySql>::new(
+                "DELETE FROM prompt_deltas WHERE (user_id, session_id, request_id) IN (",
+            );
+            for (index, (user_id, session_id, request_id)) in chunk.iter().enumerate() {
+                if index > 0 {
+                    builder.push(", ");
+                }
+                builder
+                    .push("(")
+                    .push_bind(user_id)
+                    .push(", ")
+                    .push_bind(session_id)
+                    .push(", ")
+                    .push_bind(request_id)
+                    .push(")");
+            }
+            builder.push(")");
+            let deleted = builder
+                .build()
+                .execute(&mut *tx)
+                .await
+                .map(|r| r.rows_affected())
+                .map_err(|e| format!("cleanup prompt_deltas: {e}"))?;
+            prompt_delta_deleted = prompt_delta_deleted.saturating_add(deleted);
+        }
+        for chunk in expired_prompt_request_ids.chunks(PROMPT_REQUEST_DELETE_CHUNK_SIZE) {
+            let mut builder = QueryBuilder::<MySql>::new(
+                "DELETE FROM prompt_request_records WHERE (user_id, session_id, request_id) IN (",
+            );
+            for (index, (user_id, session_id, request_id)) in chunk.iter().enumerate() {
+                if index > 0 {
+                    builder.push(", ");
+                }
+                builder
+                    .push("(")
+                    .push_bind(user_id)
+                    .push(", ")
+                    .push_bind(session_id)
+                    .push(", ")
+                    .push_bind(request_id)
+                    .push(")");
+            }
+            builder.push(")");
+            let deleted = builder
+                .build()
+                .execute(&mut *tx)
+                .await
+                .map(|r| r.rows_affected())
+                .map_err(|e| format!("cleanup prompt_request_records delete expired ids: {e}"))?;
+            prompt_request_deleted = prompt_request_deleted.saturating_add(deleted);
+        }
+        tx.commit()
+            .await
+            .map_err(|e| format!("cleanup prompt_request_records commit transaction: {e}"))?;
+        if expired_prompt_request_ids.len() < PROMPT_REQUEST_BATCH_LIMIT as usize {
+            break;
+        }
+    }
+    results.push(CleanupResult {
+        table: "prompt_deltas",
+        rows_deleted: prompt_delta_deleted,
+    });
+    results.push(CleanupResult {
+        table: "prompt_request_records",
+        rows_deleted: prompt_request_deleted,
+    });
+
+    // 7. Old agent events
     let mut tx = pool
         .begin()
         .await
@@ -5431,6 +5768,25 @@ mod tests {
     }
 
     #[test]
+    fn agent_runs_list_index_matches_seek_pagination_order() {
+        let source = include_str!("storage.rs");
+        assert!(
+            source.contains("INDEX idx_agent_runs_user_updated_run (user_id, updated_at, run_id)"),
+            "agent_runs run-list index must include the stable seek tie-breaker"
+        );
+        assert!(
+            source.contains(
+                "ALTER TABLE agent_runs ADD INDEX idx_agent_runs_user_updated_run (user_id, updated_at, run_id)"
+            ),
+            "agent_runs schema bootstrap must create the seek pagination index"
+        );
+        assert!(
+            source.contains("\"idx_agent_runs_user_updated\""),
+            "agent_runs schema bootstrap must remove the obsolete two-column run-list index"
+        );
+    }
+
+    #[test]
     fn primary_key_shape_mismatch_fails_without_dropping_existing_key() {
         let source = include_str!("storage.rs");
         assert!(
@@ -5456,6 +5812,218 @@ mod tests {
         assert!(
             create_pos < ensure_pos,
             "fresh databases must create edge_agent_registry before checking its primary-key shape"
+        );
+    }
+
+    #[test]
+    fn edge_pending_dispatch_identity_is_owner_request_bound() {
+        let source = include_str!("storage.rs");
+        let ddl = source
+            .split("CREATE TABLE IF NOT EXISTS edge_pending_dispatch")
+            .nth(1)
+            .and_then(|rest| rest.split(")\"").next())
+            .expect("edge_pending_dispatch DDL");
+
+        assert!(
+            ddl.contains("PRIMARY KEY (user_id, request_id)"),
+            "edge_pending_dispatch must use the owner/request product identity"
+        );
+        assert!(
+            !ddl.contains("dispatch_id BIGINT AUTO_INCREMENT"),
+            "edge_pending_dispatch must not reintroduce a global AUTO_INCREMENT surrogate"
+        );
+        assert!(
+            source.contains(
+                "ALTER TABLE edge_pending_dispatch ADD PRIMARY KEY (user_id, request_id)"
+            ),
+            "schema bootstrap must verify the owner/request primary key"
+        );
+        assert!(
+            source.contains("&[\"dispatch_id\"]"),
+            "legacy dispatch_id schemas must fail startup instead of silently preserving the old hot surrogate"
+        );
+    }
+
+    #[test]
+    fn context_manifest_items_identity_is_manifest_order_bound() {
+        let source = include_str!("storage.rs");
+        let ddl = source
+            .split("CREATE TABLE IF NOT EXISTS context_manifest_items")
+            .nth(1)
+            .and_then(|rest| rest.split(")\"").next())
+            .expect("context_manifest_items DDL");
+
+        assert!(
+            ddl.contains("PRIMARY KEY (manifest_id, item_order)"),
+            "context_manifest_items must use the manifest-local item ordering identity"
+        );
+        assert!(
+            !ddl.contains("id BIGINT AUTO_INCREMENT"),
+            "context_manifest_items must not reintroduce a global AUTO_INCREMENT surrogate"
+        );
+        assert!(
+            source.contains(
+                "ALTER TABLE context_manifest_items ADD PRIMARY KEY (manifest_id, item_order)"
+            ),
+            "schema bootstrap must verify the manifest/order primary key"
+        );
+        assert!(
+            source.contains("&[\"uq_manifest_item_order\"]"),
+            "legacy unique-key-plus-surrogate schemas must fail startup instead of preserving the old shape"
+        );
+    }
+
+    #[test]
+    fn session_state_item_events_identity_is_owner_event_bound() {
+        let source = include_str!("storage.rs");
+        let ddl = source
+            .split("CREATE TABLE IF NOT EXISTS session_state_item_events")
+            .nth(1)
+            .and_then(|rest| rest.split(")\"").next())
+            .expect("session_state_item_events DDL");
+
+        assert!(
+            ddl.contains("event_id VARCHAR(64) NOT NULL"),
+            "session_state_item_events must use an application-generated event identity"
+        );
+        assert!(
+            ddl.contains("PRIMARY KEY (user_id, event_id)"),
+            "session_state_item_events must keep event identity owner-bound"
+        );
+        assert!(
+            ddl.contains("idx_state_events_item_created (item_id, created_at, event_id)"),
+            "item audit queries must keep a deterministic event_id tie-breaker"
+        );
+        assert!(
+            ddl.contains(
+                "idx_state_events_owner_session_created (user_id, session_id, created_at, event_id)"
+            ),
+            "owner/session audit queries must keep a deterministic event_id tie-breaker"
+        );
+        assert!(
+            !ddl.contains("id BIGINT AUTO_INCREMENT"),
+            "session_state_item_events must not reintroduce a global AUTO_INCREMENT surrogate"
+        );
+        assert!(
+            source.contains(
+                "ALTER TABLE session_state_item_events ADD PRIMARY KEY (user_id, event_id)"
+            ),
+            "schema bootstrap must verify the owner/event primary key"
+        );
+        assert!(
+            source.contains(
+                "\"session_state_item_events\",\n        &[\"user_id\", \"event_id\"],\n        &[\"id\"]"
+            ),
+            "legacy id schemas must fail startup instead of preserving the old hot surrogate"
+        );
+    }
+
+    #[test]
+    fn auth_join_tables_use_product_identity_without_surrogate_ids() {
+        let source = include_str!("storage.rs");
+        let user_roles = source
+            .split("CREATE TABLE IF NOT EXISTS auth_user_roles")
+            .nth(1)
+            .and_then(|rest| rest.split(")\"").next())
+            .expect("auth_user_roles DDL");
+        let external_identities = source
+            .split("CREATE TABLE IF NOT EXISTS auth_external_identities")
+            .nth(1)
+            .and_then(|rest| rest.split(")\"").next())
+            .expect("auth_external_identities DDL");
+
+        assert!(
+            user_roles.contains("PRIMARY KEY (user_id, role_id)"),
+            "auth_user_roles identity is the user/role grant"
+        );
+        assert!(
+            external_identities.contains("PRIMARY KEY (provider_id, external_subject)"),
+            "auth_external_identities identity is the provider subject link"
+        );
+        for (table, ddl) in [
+            ("auth_user_roles", user_roles),
+            ("auth_external_identities", external_identities),
+        ] {
+            assert!(
+                !ddl.contains("id BIGINT AUTO_INCREMENT"),
+                "{table} must not reintroduce a global AUTO_INCREMENT surrogate"
+            );
+        }
+        assert!(
+            !user_roles.contains("idx_auth_user_roles_user_id"),
+            "auth_user_roles primary key already covers user_id lookups"
+        );
+        assert!(
+            source.contains("ALTER TABLE auth_user_roles ADD PRIMARY KEY (user_id, role_id)"),
+            "schema bootstrap must verify auth_user_roles primary-key shape"
+        );
+        assert!(
+            source.contains(
+                "ALTER TABLE auth_external_identities ADD PRIMARY KEY (provider_id, external_subject)"
+            ),
+            "schema bootstrap must verify auth_external_identities primary-key shape"
+        );
+        assert!(
+            source.contains("&[\"uq_auth_user_roles_user_role\"]"),
+            "legacy auth_user_roles unique-key-plus-surrogate schemas must fail startup"
+        );
+        assert!(
+            source.contains("&[\"uq_auth_external_identity_provider_subject\"]"),
+            "legacy auth_external_identities unique-key-plus-surrogate schemas must fail startup"
+        );
+    }
+
+    #[test]
+    fn mcp_registry_tables_use_owner_bound_string_identity() {
+        let source = include_str!("storage.rs");
+        let servers = source
+            .split("CREATE TABLE IF NOT EXISTS mcp_servers")
+            .nth(1)
+            .and_then(|rest| rest.split(")\"").next())
+            .expect("mcp_servers DDL");
+        let bindings = source
+            .split("CREATE TABLE IF NOT EXISTS mcp_bindings")
+            .nth(1)
+            .and_then(|rest| rest.split(")\"").next())
+            .expect("mcp_bindings DDL");
+        let tools = source
+            .split("CREATE TABLE IF NOT EXISTS mcp_tools")
+            .nth(1)
+            .and_then(|rest| rest.split(")\"").next())
+            .expect("mcp_tools DDL");
+
+        assert!(servers.contains("id VARCHAR(64) NOT NULL"));
+        assert!(servers.contains("PRIMARY KEY (owner_user_id, id)"));
+        assert!(bindings.contains("id VARCHAR(64) NOT NULL"));
+        assert!(bindings.contains("mcp_id VARCHAR(64) NOT NULL"));
+        assert!(bindings.contains("PRIMARY KEY (owner_user_id, id)"));
+        assert!(tools.contains("owner_user_id VARCHAR(128) NOT NULL"));
+        assert!(tools.contains("binding_id VARCHAR(64) NOT NULL"));
+        assert!(tools.contains("PRIMARY KEY (owner_user_id, binding_id, tool_name)"));
+
+        for (table, ddl) in [
+            ("mcp_servers", servers),
+            ("mcp_bindings", bindings),
+            ("mcp_tools", tools),
+        ] {
+            assert!(
+                !ddl.contains("AUTO_INCREMENT"),
+                "{table} must not reintroduce a global AUTO_INCREMENT surrogate"
+            );
+        }
+        assert!(source.contains("ALTER TABLE mcp_servers ADD PRIMARY KEY (owner_user_id, id)"));
+        assert!(source.contains("ALTER TABLE mcp_bindings ADD PRIMARY KEY (owner_user_id, id)"));
+        assert!(source.contains(
+            "ALTER TABLE mcp_tools ADD PRIMARY KEY (owner_user_id, binding_id, tool_name)"
+        ));
+        assert!(
+            source.contains("[('id', 64), ('mcp_id', 64)]")
+                || source.contains("[(\"id\", 64), (\"mcp_id\", 64)]"),
+            "legacy numeric mcp_bindings ids must fail varchar width checks"
+        );
+        assert!(
+            source.contains("&[\"uq_mcp_tools_binding_tool\", \"uq_mcp_tools_binding_public\"]"),
+            "legacy tool unique-key-plus-surrogate schemas must fail startup"
         );
     }
 
@@ -5569,6 +6137,39 @@ mod tests {
     }
 
     #[test]
+    fn core_schema_has_no_duplicate_create_table_declarations() {
+        let source = include_str!("storage.rs");
+        let ddl_source = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production storage DDL source");
+
+        let marker = "CREATE TABLE IF NOT EXISTS ";
+        let mut counts = std::collections::BTreeMap::<String, usize>::new();
+        for rest in ddl_source.split(marker).skip(1) {
+            let table = rest
+                .chars()
+                .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+                .collect::<String>();
+            assert!(
+                !table.is_empty(),
+                "CREATE TABLE declaration must include a parseable table name"
+            );
+            *counts.entry(table).or_default() += 1;
+        }
+
+        let duplicates: Vec<_> = counts
+            .iter()
+            .filter_map(|(table, count)| (*count > 1).then_some(format!("{table}:{count}")))
+            .collect();
+        assert!(
+            duplicates.is_empty(),
+            "duplicate CREATE TABLE declarations are not allowed: {}",
+            duplicates.join(", ")
+        );
+    }
+
+    #[test]
     fn session_artifacts_schema_bounds_retention_policy_values() {
         let source = include_str!("storage.rs");
         let ddl_source = source
@@ -5628,8 +6229,9 @@ mod tests {
             "AUTH_REFRESH_TOKEN_BATCH_LIMIT",
             "AUTH_TOKEN_BATCH_LIMIT",
             "TASK_LEASE_BATCH_LIMIT",
-            "SESSION_SYNC_LOG_BATCH_LIMIT",
             "AUTH_AUDIT_LOG_BATCH_LIMIT",
+            "PROMPT_REQUEST_BATCH_LIMIT",
+            "PROMPT_REQUEST_MAX_BATCHES_PER_RUN",
             "AGENT_EVENT_BATCH_LIMIT",
         ] {
             assert!(
@@ -5640,13 +6242,95 @@ mod tests {
         for ordering in [
             "ORDER BY created_at ASC, token_id ASC",
             "ORDER BY expires_at ASC, user_id ASC, task_id ASC",
-            "ORDER BY created_at ASC, sync_id ASC",
             "ORDER BY created_at ASC, log_id ASC",
+            "ORDER BY p.created_at_unix_ms ASC, p.user_id ASC, p.request_id ASC",
             "ORDER BY created_at ASC, user_id ASC, event_id ASC",
         ] {
             assert!(
                 body.contains(ordering),
                 "cleanup_expired_data DELETE/SELECT batches must be deterministic; missing {ordering}"
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_expired_prompt_requests_are_parent_bound_and_active_guarded() {
+        let source = include_str!("storage.rs");
+        let body = source
+            .split("pub async fn cleanup_expired_data")
+            .nth(1)
+            .and_then(|rest| rest.split("#[cfg(test)]").next())
+            .expect("cleanup_expired_data body");
+        assert!(
+            body.contains("policy.prompt_request_days"),
+            "prompt cleanup must be governed by explicit retention policy"
+        );
+        assert!(
+            body.contains(
+                "WHERE p.created_at_unix_ms < UNIX_TIMESTAMP(DATE_SUB(NOW(6), INTERVAL {} DAY)) * 1000"
+            ),
+            "prompt cleanup must use the numeric retention key instead of MatrixOne DATETIME comparisons"
+        );
+        assert!(
+            body.contains("policy.prompt_request_days") && body.contains("format!("),
+            "prompt cleanup may only inline the retention day literal from its typed u32 policy"
+        );
+        assert!(
+            body.contains("PROMPT_REQUEST_DELETE_CHUNK_SIZE")
+                && body.contains(".chunks(PROMPT_REQUEST_DELETE_CHUNK_SIZE)"),
+            "prompt cleanup must chunk tuple deletes"
+        );
+        assert!(
+            body.contains("for _ in 0..PROMPT_REQUEST_MAX_BATCHES_PER_RUN")
+                && body.contains(
+                    "expired_prompt_request_ids.len() < PROMPT_REQUEST_BATCH_LIMIT as usize"
+                ),
+            "prompt cleanup must drain multiple bounded batches and stop when the selected batch is partial"
+        );
+        assert!(
+            body.contains("FROM prompt_request_records p")
+                && body.contains("LEFT JOIN agent_sessions s")
+                && body.contains("LEFT JOIN agent_runs r"),
+            "prompt cleanup must select parent request rows with session/run guards"
+        );
+        assert!(
+            body.contains("s.status IN ('ended', 'closed', 'cancelled', 'deleting')")
+                && body.contains("r.status IN ('completed', 'failed', 'cancelled')"),
+            "prompt cleanup must avoid active sessions and non-terminal runs"
+        );
+        let child_delete = body
+            .find("DELETE FROM prompt_deltas WHERE (user_id, session_id, request_id) IN")
+            .expect("prompt cleanup must delete child delta rows");
+        let parent_delete = body
+            .find("DELETE FROM prompt_request_records WHERE (user_id, session_id, request_id) IN")
+            .expect("prompt cleanup must delete selected parent rows");
+        assert!(
+            child_delete < parent_delete,
+            "prompt cleanup must delete child deltas before parent request records"
+        );
+        assert!(
+            body.contains("table: \"prompt_deltas\"")
+                && body.contains("table: \"prompt_request_records\""),
+            "prompt cleanup should report child and parent row counts separately"
+        );
+    }
+
+    #[test]
+    fn cleanup_expired_data_does_not_age_delete_replay_or_tool_output_facts() {
+        let source = include_str!("storage.rs");
+        let body = source
+            .split("pub async fn cleanup_expired_data")
+            .nth(1)
+            .and_then(|rest| rest.split("#[cfg(test)]").next())
+            .expect("cleanup_expired_data body");
+        for table in [
+            "DELETE FROM agent_run_events",
+            "DELETE FROM session_tool_outputs",
+            "DELETE FROM session_tool_output_batches",
+        ] {
+            assert!(
+                !body.contains(table),
+                "global age-based cleanup must not directly delete replay/tool-output facts: {table}"
             );
         }
     }
@@ -5708,14 +6392,30 @@ mod tests {
         for assignment in [
             "event_count = IF(user_id = VALUES(user_id), event_count + VALUES(event_count), event_count)",
             "last_event_id = IF(user_id = VALUES(user_id), COALESCE(VALUES(last_event_id), last_event_id), last_event_id)",
-            "updated_at = IF(user_id = VALUES(user_id), NOW(6), updated_at)",
-            "last_active_at = IF(user_id = VALUES(user_id), NOW(6), last_active_at)",
+            "updated_at = IF(user_id = VALUES(user_id) AND last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND), NOW(6), updated_at)",
+            "last_active_at = IF(user_id = VALUES(user_id) AND last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND), NOW(6), last_active_at)",
         ] {
             assert!(
                 sql.contains(assignment),
                 "upsert assignment must be owner-guarded: {assignment}"
             );
         }
+    }
+
+    #[test]
+    fn session_activity_timestamp_updates_are_coalesced() {
+        let source = include_str!("storage.rs");
+        let coalesced = "last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND)";
+        assert!(
+            source.matches(coalesced).count() >= 6,
+            "session activity hot-path timestamp updates should be coalesced to reduce indexed timestamp churn"
+        );
+        assert!(
+            !source.contains(
+                "SET event_count = event_count + ?, \\\n                 updated_at = NOW(6),"
+            ),
+            "event_count bump must not force indexed timestamp columns on every event"
+        );
     }
 
     #[test]

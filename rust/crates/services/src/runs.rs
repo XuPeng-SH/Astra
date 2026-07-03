@@ -16,6 +16,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::db_row::RowExt as RunStateDbRow;
+use crate::pagination::MAX_API_LIST_LIMIT;
 
 pub const RUN_LIFECYCLE_UNCONFIGURED_ERROR_CODE: &str = "run_lifecycle_unconfigured";
 pub const SSE_HEARTBEAT_INTERVAL_SECS: u64 = 15;
@@ -54,6 +55,18 @@ pub trait RunLifecycleService: Send + Sync {
         Err(error_response(
             StatusCode::NOT_IMPLEMENTED,
             "Run projection not supported",
+        ))
+    }
+
+    async fn repair_run_projection(
+        &self,
+        _run_id: String,
+        _user_id: String,
+        _recent_limit: u32,
+    ) -> Result<RunProjectionRecord, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "Run projection repair not supported",
         ))
     }
 
@@ -96,11 +109,11 @@ pub trait RunLifecycleService: Send + Sync {
         ))
     }
 
-    async fn list_runs(
+    async fn list_runs_cursor(
         &self,
         user_id: String,
         limit: u32,
-        offset: u32,
+        cursor: Option<RunListCursor>,
     ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)>;
 
     /// Pause an active run. Default: NOT_IMPLEMENTED.
@@ -492,7 +505,7 @@ pub struct ChatRequestData {
     pub workspace_binding: Option<WorkspaceBindingRequest>,
     pub executor_binding: Option<ExecutorBindingRequest>,
     pub runtime_mcp_bindings: Vec<RuntimeMcpBindingRequest>,
-    pub mcp_binding_ids: Option<Vec<i64>>,
+    pub mcp_binding_ids: Option<Vec<String>>,
     pub context: Option<serde_json::Map<String, serde_json::Value>>,
     pub edge_executor_id: Option<String>,
     pub capabilities: Vec<String>,
@@ -630,6 +643,7 @@ pub struct RunProjectionRecord {
     pub total_completion_tokens: u64,
     pub total_tool_calls: u32,
     pub latest_checkpoint: Option<RunProjectionCheckpointRecord>,
+    pub has_durable_projection: bool,
     pub recent_events: Vec<serde_json::Value>,
 }
 
@@ -663,9 +677,71 @@ pub struct RunInputRecord {
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunListRecord {
     pub runs: Vec<RunStatusRecord>,
-    pub total: i64,
+    pub total: Option<i64>,
     pub limit: u32,
-    pub offset: u32,
+    pub next_cursor: Option<RunListCursor>,
+}
+
+/// Cursor for stable run list pagination.
+///
+/// `updated_at` is the ordering key, paired with `run_id` as the deterministic
+/// tie-breaker for rows updated in the same database timestamp.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunListCursor {
+    pub updated_at: String,
+    pub run_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DurableRunListPage {
+    pub runs: Vec<DurableRunRecord>,
+    pub total: Option<i64>,
+    pub next_cursor: Option<RunListCursor>,
+}
+
+#[must_use]
+pub fn validate_run_list_limit(limit: u32) -> u32 {
+    limit.clamp(1, MAX_API_LIST_LIMIT)
+}
+
+#[must_use]
+fn run_list_query_limit(limit: u32) -> i64 {
+    i64::from(validate_run_list_limit(limit)) + 1
+}
+
+pub fn run_list_cursor_db_updated_at(cursor: &RunListCursor) -> Result<String, String> {
+    let updated_at = cursor.updated_at.trim();
+    if updated_at.is_empty() {
+        return Err("invalid run list cursor: updated_at is required".to_string());
+    }
+    let mut db_updated_at = updated_at.replace('T', " ");
+    if let Some(stripped) = db_updated_at.strip_suffix('Z') {
+        db_updated_at = stripped.to_string();
+    }
+    if chrono::NaiveDateTime::parse_from_str(&db_updated_at, "%Y-%m-%d %H:%M:%S%.f").is_err() {
+        return Err(format!("invalid run list cursor timestamp: {updated_at}"));
+    }
+    Ok(db_updated_at)
+}
+
+pub fn run_list_cursor_run_id(cursor: &RunListCursor) -> Result<String, String> {
+    let run_id = cursor.run_id.trim();
+    if run_id.is_empty() {
+        return Err("invalid run list cursor: run_id is required".to_string());
+    }
+    Ok(run_id.to_string())
+}
+
+fn durable_run_list_next_cursor(run: &DurableRunRecord) -> RunListCursor {
+    RunListCursor {
+        updated_at: run.updated_at.clone(),
+        run_id: run.run_id.clone(),
+    }
+}
+
+fn durable_run_after_cursor(run: &DurableRunRecord, cursor: &RunListCursor) -> bool {
+    run.updated_at < cursor.updated_at
+        || (run.updated_at == cursor.updated_at && run.run_id < cursor.run_id)
 }
 
 // ─── Durable Run State Store ─────────────────────────────────────────────────
@@ -814,6 +890,11 @@ const AGENT_RUN_COLUMNS: &str = "run_id, user_id, session_id, parent_run_id, roo
      total_completion_tokens, total_tool_calls, agent_binding_id, agent_binding_name, \
      agent_binding_schema_version, selected_model_json, selected_model_name, \
      selected_model_gateway, capability_server_refs_json, runtime_profile, created_at, updated_at";
+const RUN_LIST_CURSOR_SELECT_SQL: &str =
+    "DATE_FORMAT(updated_at, '%Y-%m-%dT%H:%i:%s.%f') AS cursor_updated_at";
+const RUN_LIST_CURSOR_FILTER_SQL: &str = " AND (updated_at < ";
+const RUN_LIST_CURSOR_TIE_SQL: &str = " OR (updated_at = ";
+const RUN_LIST_ORDER_SQL: &str = " ORDER BY updated_at DESC, run_id DESC";
 
 const RUN_DISPLAY_PROJECTION_COLUMNS: &str = "run_id, user_id, session_id, status, waiting_for, \
      error_message, projection_event_idx, latest_event_type, latest_checkpoint_id, \
@@ -861,6 +942,39 @@ pub trait RunStateStore: Send + Sync {
         error_message: Option<&str>,
     ) -> Result<bool, String>;
 
+    /// Atomically update run status and append one durable event if the current
+    /// status is one of `expected_statuses`.
+    ///
+    /// This is the control-plane transition primitive for pause/resume/cancel:
+    /// status and its audit event must commit together or not at all.
+    #[allow(clippy::too_many_arguments)]
+    async fn update_run_status_with_event_if_current(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        expected_statuses: &[&str],
+        status: &str,
+        waiting_for: Option<&str>,
+        error_message: Option<&str>,
+        event: serde_json::Value,
+    ) -> Result<bool, String>;
+
+    /// Atomically update run status and append a durable event batch if the
+    /// current status is one of `expected_statuses`.
+    ///
+    /// Empty `events` is allowed and behaves as a status-only CAS transition.
+    #[allow(clippy::too_many_arguments)]
+    async fn update_run_status_with_events_if_current(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        expected_statuses: &[&str],
+        status: &str,
+        waiting_for: Option<&str>,
+        error_message: Option<&str>,
+        events: &[serde_json::Value],
+    ) -> Result<bool, String>;
+
     /// Update token/tool counts.
     async fn update_run_usage(
         &self,
@@ -894,6 +1008,16 @@ pub trait RunStateStore: Send + Sync {
         run_id: &str,
     ) -> Result<Option<DurableRunDisplayProjectionRecord>, String>;
 
+    /// Rebuild the typed display projection from durable run facts.
+    ///
+    /// This is an explicit repair path for projection writes that failed after
+    /// the authoritative run status/event/checkpoint facts already committed.
+    async fn rebuild_run_projection(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> Result<Option<DurableRunDisplayProjectionRecord>, String>;
+
     /// Append multiple events in a single batch. This is the canonical write
     /// path. Single-event callers should use `append_event` which delegates here.
     async fn append_events_batch(
@@ -914,13 +1038,17 @@ pub trait RunStateStore: Send + Sync {
         self.append_events_batch(user_id, run_id, &[event]).await
     }
 
-    /// List runs for a user with pagination.
-    async fn list_user_runs(
+    /// List runs with seek pagination. This path intentionally does not compute
+    /// an exact total; callers should use `next_cursor`/short page semantics.
+    async fn list_user_runs_cursor(
         &self,
         user_id: &str,
         limit: u32,
-        offset: u32,
-    ) -> Result<(Vec<DurableRunRecord>, i64), String>;
+        cursor: Option<RunListCursor>,
+    ) -> Result<DurableRunListPage, String> {
+        let _ = (user_id, limit, cursor);
+        Err("run list cursor pagination is not supported by this store".to_string())
+    }
 
     /// Find runs in WAITING status (for resume engine).
     async fn find_waiting_runs(&self) -> Result<Vec<DurableRunRecord>, String>;
@@ -935,6 +1063,39 @@ pub trait RunStateStore: Send + Sync {
     /// app instance can falsely mark another instance's live run as crashed.
     async fn find_recoverable_running_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
         self.find_running_runs().await
+    }
+
+    /// Find all active runs this store owner may recover after startup.
+    ///
+    /// This includes stable waiting runs plus running/input-queued runs that
+    /// need recovery classification. Shared durable stores must apply the same
+    /// owner-lease boundary to every returned status so a restarting pod cannot
+    /// resume or fail work still leased by another live pod.
+    async fn find_recoverable_active_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
+        let mut active = self.find_waiting_runs().await?;
+        active.extend(self.find_recoverable_running_runs().await?);
+        Ok(active)
+    }
+
+    /// Return the interval at which the runtime should renew this store
+    /// owner's active run leases. Stores without shared lease state can return
+    /// `None`.
+    fn owner_lease_renewal_interval(&self) -> Option<Duration> {
+        None
+    }
+
+    /// Renew the current store owner's lease for a live run.
+    ///
+    /// Shared durable stores should only renew rows still owned by this store
+    /// instance and still in one of the expected active statuses. Returning
+    /// `Ok(false)` tells the runtime to stop heartbeating that run.
+    async fn renew_owner_lease(
+        &self,
+        _user_id: &str,
+        _run_id: &str,
+        _expected_statuses: &[&str],
+    ) -> Result<bool, String> {
+        Ok(false)
     }
 
     /// Find the newest run that blocks starting another run in the same session.
@@ -1157,6 +1318,44 @@ fn build_run_display_projection(
     }
 }
 
+fn usage_projection_patch_hash(
+    run_id: &str,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    tool_calls: u32,
+) -> String {
+    let payload = serde_json::json!({
+        "run_id": run_id,
+        "usage_patch": {
+            "total_prompt_tokens": prompt_tokens,
+            "total_completion_tokens": completion_tokens,
+            "total_tool_calls": tool_calls,
+        },
+    });
+    sha256_hex(payload.to_string().as_bytes())
+}
+
+fn status_projection_patch_hash(
+    run_id: &str,
+    status: &str,
+    waiting_for: Option<&str>,
+    error_message: Option<&str>,
+    projection_event_idx: i64,
+    latest_event_type: Option<&str>,
+) -> String {
+    let payload = serde_json::json!({
+        "run_id": run_id,
+        "status_patch": {
+            "status": status,
+            "waiting_for": waiting_for,
+            "error_message": error_message,
+            "projection_event_idx": projection_event_idx,
+            "latest_event_type": latest_event_type,
+        },
+    });
+    sha256_hex(payload.to_string().as_bytes())
+}
+
 #[async_trait]
 impl RunStateStore for InMemoryRunStateStore {
     async fn insert_run(&self, record: DurableRunRecord) -> Result<(), String> {
@@ -1227,6 +1426,7 @@ impl RunStateStore for InMemoryRunStateStore {
         waiting_for: Option<&str>,
         error_message: Option<&str>,
     ) -> Result<bool, String> {
+        let terminal_error_code = terminal_error_code_from_message(status, error_message);
         let updated = {
             let mut runs = self.runs.write().await;
             if let Some(run) = runs.get_mut(run_id) {
@@ -1237,6 +1437,9 @@ impl RunStateStore for InMemoryRunStateStore {
                     run.waiting_for = waiting_for.map(ToString::to_string);
                     if let Some(msg) = error_message {
                         run.error_message = Some(msg.to_string());
+                    }
+                    if let Some(code) = terminal_error_code.as_ref() {
+                        run.error_code = Some(code.clone());
                     }
                     run.updated_at = chrono::Utc::now().to_rfc3339();
                     Some(run.clone())
@@ -1265,6 +1468,7 @@ impl RunStateStore for InMemoryRunStateStore {
         if expected_statuses.is_empty() {
             return Ok(false);
         }
+        let terminal_error_code = terminal_error_code_from_message(status, error_message);
         let updated = {
             let mut runs = self.runs.write().await;
             if let Some(run) = runs.get_mut(run_id) {
@@ -1276,6 +1480,9 @@ impl RunStateStore for InMemoryRunStateStore {
                     if let Some(msg) = error_message {
                         run.error_message = Some(msg.to_string());
                     }
+                    if let Some(code) = terminal_error_code.as_ref() {
+                        run.error_code = Some(code.clone());
+                    }
                     run.updated_at = chrono::Utc::now().to_rfc3339();
                     Some(run.clone())
                 }
@@ -1285,6 +1492,106 @@ impl RunStateStore for InMemoryRunStateStore {
         };
         if let Some(run) = updated {
             self.sync_projection(&run, None, None).await;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    async fn update_run_status_with_event_if_current(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        expected_statuses: &[&str],
+        status: &str,
+        waiting_for: Option<&str>,
+        error_message: Option<&str>,
+        event: serde_json::Value,
+    ) -> Result<bool, String> {
+        if expected_statuses.is_empty() {
+            return Ok(false);
+        }
+        let latest_event_type = extract_event_type(&event);
+        let terminal_error_code = terminal_error_code_from_transition(
+            status,
+            error_message,
+            std::slice::from_ref(&event),
+        );
+        let updated = {
+            let mut runs = self.runs.write().await;
+            if let Some(run) = runs.get_mut(run_id) {
+                if run.user_id != user_id || !expected_statuses.contains(&run.status.as_str()) {
+                    None
+                } else {
+                    run.status = status.to_string();
+                    run.waiting_for = waiting_for.map(ToString::to_string);
+                    if let Some(msg) = error_message {
+                        run.error_message = Some(msg.to_string());
+                    }
+                    if let Some(code) = terminal_error_code.as_ref() {
+                        run.error_code = Some(code.clone());
+                    }
+                    run.events.push(event);
+                    run.last_event_idx = run.events.len() as i64 - 1;
+                    run.updated_at = chrono::Utc::now().to_rfc3339();
+                    Some(run.clone())
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(run) = updated {
+            self.sync_projection(&run, Some(latest_event_type), None)
+                .await;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    async fn update_run_status_with_events_if_current(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        expected_statuses: &[&str],
+        status: &str,
+        waiting_for: Option<&str>,
+        error_message: Option<&str>,
+        events: &[serde_json::Value],
+    ) -> Result<bool, String> {
+        if expected_statuses.is_empty() {
+            return Ok(false);
+        }
+        let latest_event_type = events.last().map(extract_event_type);
+        let terminal_error_code =
+            terminal_error_code_from_transition(status, error_message, events);
+        let updated = {
+            let mut runs = self.runs.write().await;
+            if let Some(run) = runs.get_mut(run_id) {
+                if run.user_id != user_id || !expected_statuses.contains(&run.status.as_str()) {
+                    None
+                } else {
+                    run.status = status.to_string();
+                    run.waiting_for = waiting_for.map(ToString::to_string);
+                    if let Some(msg) = error_message {
+                        run.error_message = Some(msg.to_string());
+                    }
+                    if let Some(code) = terminal_error_code.as_ref() {
+                        run.error_code = Some(code.clone());
+                    }
+                    if !events.is_empty() {
+                        run.events.extend(events.iter().cloned());
+                        run.last_event_idx = run.events.len() as i64 - 1;
+                    }
+                    run.updated_at = chrono::Utc::now().to_rfc3339();
+                    Some(run.clone())
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(run) = updated {
+            self.sync_projection(&run, latest_event_type, None).await;
             Ok(true)
         } else {
             Ok(false)
@@ -1335,6 +1642,9 @@ impl RunStateStore for InMemoryRunStateStore {
                 return Ok(false);
             };
             if run.user_id != user_id {
+                return Ok(false);
+            }
+            if durable_run_status_is_terminal(&run.status) {
                 return Ok(false);
             }
             let (checkpoint_kind, checkpoint_version, idempotency_key) =
@@ -1415,6 +1725,28 @@ impl RunStateStore for InMemoryRunStateStore {
             .cloned())
     }
 
+    async fn rebuild_run_projection(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> Result<Option<DurableRunDisplayProjectionRecord>, String> {
+        let Some(run) = self.load_run(user_id, run_id).await? else {
+            return Ok(None);
+        };
+        let latest_event_type = run.events.last().map(extract_event_type);
+        let latest_checkpoint = self.load_latest_checkpoint(user_id, run_id, None).await?;
+        let projection = build_run_display_projection(
+            &run,
+            latest_event_type,
+            latest_checkpoint.as_ref().map(checkpoint_summary_tuple),
+        );
+        self.projections
+            .write()
+            .await
+            .insert(run_id.to_string(), projection.clone());
+        Ok(Some(projection))
+    }
+
     async fn append_events_batch(
         &self,
         user_id: &str,
@@ -1446,12 +1778,16 @@ impl RunStateStore for InMemoryRunStateStore {
         Ok(())
     }
 
-    async fn list_user_runs(
+    async fn list_user_runs_cursor(
         &self,
         user_id: &str,
         limit: u32,
-        offset: u32,
-    ) -> Result<(Vec<DurableRunRecord>, i64), String> {
+        cursor: Option<RunListCursor>,
+    ) -> Result<DurableRunListPage, String> {
+        if let Some(cursor) = &cursor {
+            run_list_cursor_run_id(cursor)?;
+        }
+        let limit = validate_run_list_limit(limit);
         let runs = self.runs.read().await;
         let mut user_runs: Vec<_> = runs
             .values()
@@ -1464,13 +1800,23 @@ impl RunStateStore for InMemoryRunStateStore {
                 .then_with(|| b.created_at.cmp(&a.created_at))
                 .then_with(|| b.run_id.cmp(&a.run_id))
         });
-        let total = user_runs.len() as i64;
-        let page = user_runs
-            .into_iter()
-            .skip(offset as usize)
-            .take(limit as usize)
-            .collect();
-        Ok((page, total))
+        if let Some(cursor) = &cursor {
+            user_runs.retain(|run| durable_run_after_cursor(run, cursor));
+        }
+        let has_more = user_runs.len() > limit as usize;
+        if has_more {
+            user_runs.truncate(limit as usize);
+        }
+        let next_cursor = if has_more {
+            user_runs.last().map(durable_run_list_next_cursor)
+        } else {
+            None
+        };
+        Ok(DurableRunListPage {
+            runs: user_runs,
+            total: None,
+            next_cursor,
+        })
     }
 
     async fn find_waiting_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
@@ -1643,6 +1989,13 @@ impl DatabaseRunStateStore {
 
     pub fn owner_pod_id(&self) -> &str {
         &self.owner_pod_id
+    }
+
+    fn lease_expires_at(&self) -> chrono::NaiveDateTime {
+        let lease_expires_at = chrono::Utc::now()
+            + chrono::Duration::from_std(self.lease_ttl)
+                .unwrap_or_else(|_| chrono::Duration::seconds(45));
+        lease_expires_at.naive_utc()
     }
 
     async fn load_tool_preview_contracts(
@@ -1954,6 +2307,30 @@ impl DatabaseRunStateStore {
         row.map(run_projection_record_from_row).transpose()
     }
 
+    async fn load_latest_event_type_for_user(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> DbStoreResult<Option<String>> {
+        let row = sqlx::query(
+            "SELECT event_type
+             FROM agent_run_events
+             WHERE user_id = ? AND run_id = ?
+             ORDER BY event_idx DESC
+             LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(run_id)
+        .fetch_optional(self.pool.get())
+        .await
+        .map_err(|source| db_error("load_latest_event_type_for_user", run_id, source))?;
+        row.map(|row| {
+            row.try_get::<String, _>("event_type")
+                .map_err(|source| db_error("decode_latest_event_type", run_id, source))
+        })
+        .transpose()
+    }
+
     async fn upsert_run_projection(
         &self,
         projection: &DurableRunDisplayProjectionRecord,
@@ -2001,6 +2378,155 @@ impl DatabaseRunStateStore {
         Ok(())
     }
 
+    async fn patch_run_projection_usage_for_user(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        tool_calls: u32,
+    ) -> DbStoreResult<u64> {
+        let projection_hash =
+            usage_projection_patch_hash(run_id, prompt_tokens, completion_tokens, tool_calls);
+        let result = sqlx::query(
+            "UPDATE run_display_projections
+             SET total_prompt_tokens = ?,
+                 total_completion_tokens = ?,
+                 total_tool_calls = ?,
+                 projection_hash = ?,
+                 updated_at = NOW(6)
+             WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(prompt_tokens as i64)
+        .bind(completion_tokens as i64)
+        .bind(tool_calls as i64)
+        .bind(&projection_hash)
+        .bind(user_id)
+        .bind(run_id)
+        .execute(self.pool.get())
+        .await
+        .map_err(|source| db_error("patch_run_projection_usage", run_id, source))?;
+        Ok(result.rows_affected())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn patch_run_projection_status_for_user(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        status: &str,
+        waiting_for: Option<&str>,
+        error_message: Option<&str>,
+        projection_event_idx: i64,
+        latest_event_type: Option<&str>,
+    ) -> DbStoreResult<u64> {
+        let projection_hash = status_projection_patch_hash(
+            run_id,
+            status,
+            waiting_for,
+            error_message,
+            projection_event_idx,
+            latest_event_type,
+        );
+        let result = sqlx::query(
+            "UPDATE run_display_projections
+             SET status = ?,
+                 waiting_for = ?,
+                 error_message = ?,
+                 projection_event_idx = ?,
+                 latest_event_type = COALESCE(?, latest_event_type),
+                 projection_hash = ?,
+                 updated_at = NOW(6)
+             WHERE user_id = ? AND run_id = ? AND projection_event_idx <= ?",
+        )
+        .bind(status)
+        .bind(waiting_for)
+        .bind(error_message)
+        .bind(projection_event_idx)
+        .bind(latest_event_type)
+        .bind(&projection_hash)
+        .bind(user_id)
+        .bind(run_id)
+        .bind(projection_event_idx)
+        .execute(self.pool.get())
+        .await
+        .map_err(|source| db_error("patch_run_projection_status", run_id, source))?;
+        Ok(result.rows_affected())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn patch_or_repair_run_projection_status_for_user(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        status: &str,
+        waiting_for: Option<&str>,
+        error_message: Option<&str>,
+        projection_event_idx: i64,
+        latest_event_type: Option<&str>,
+    ) {
+        match self
+            .patch_run_projection_status_for_user(
+                user_id,
+                run_id,
+                status,
+                waiting_for,
+                error_message,
+                projection_event_idx,
+                latest_event_type,
+            )
+            .await
+        {
+            Ok(0) => {
+                match self
+                    .load_run_projection_metadata_for_user(user_id, run_id)
+                    .await
+                {
+                    Ok(None) => {
+                        if let Err(error) = self
+                            .sync_projection_for_user(user_id, run_id, None, None)
+                            .await
+                        {
+                            tracing::warn!(
+                                user_id,
+                                run_id,
+                                error = %error,
+                                "run transition committed but missing display projection repair failed"
+                            );
+                        }
+                    }
+                    Ok(Some(existing)) if existing.projection_event_idx > projection_event_idx => {
+                        tracing::debug!(
+                            user_id,
+                            run_id,
+                            attempted_projection_event_idx = projection_event_idx,
+                            current_projection_event_idx = existing.projection_event_idx,
+                            "ignored stale run display projection status patch"
+                        );
+                    }
+                    Ok(Some(_)) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            user_id,
+                            run_id,
+                            error = %error,
+                            "run transition committed but display projection state check failed"
+                        );
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(
+                    user_id,
+                    run_id,
+                    error = %error,
+                    "run transition committed but display projection status patch failed"
+                );
+            }
+        }
+    }
+
     async fn sync_projection_for_user(
         &self,
         user_id: &str,
@@ -2014,13 +2540,26 @@ impl DatabaseRunStateStore {
         let existing = self
             .load_run_projection_metadata_for_user(user_id, run_id)
             .await?;
+        let latest_event_type = if let Some(latest_event_type) = latest_event_type {
+            Some(latest_event_type.to_owned())
+        } else {
+            let existing_event_type = existing
+                .as_ref()
+                .and_then(|entry| entry.latest_event_type.clone());
+            if existing
+                .as_ref()
+                .is_some_and(|entry| entry.projection_event_idx >= run.last_event_idx)
+            {
+                existing_event_type
+            } else {
+                self.load_latest_event_type_for_user(user_id, run_id)
+                    .await?
+                    .or(existing_event_type)
+            }
+        };
         let projection = build_run_display_projection(
             &run,
-            latest_event_type.map(ToOwned::to_owned).or_else(|| {
-                existing
-                    .as_ref()
-                    .and_then(|entry| entry.latest_event_type.clone())
-            }),
+            latest_event_type,
             latest_checkpoint.map(checkpoint_summary_tuple).or_else(|| {
                 existing.as_ref().and_then(|entry| {
                     Some((
@@ -2165,53 +2704,18 @@ impl DatabaseRunStateStore {
             .allocate_event_indices_batch_for_user(user_id, run_id, events.len() as i64)
             .await?;
 
-        #[derive(Debug)]
-        struct BatchEventRow {
-            id: String,
-            run_id: String,
-            event_idx: i64,
-            user_id: String,
-            session_id: String,
-            event_type: String,
-            event_id: String,
-            agent_id: String,
-            idempotency_key: Option<String>,
-            event_hash: String,
-            producer_pod_id: String,
-            payload_json: String,
-        }
-
-        let mut rows: Vec<BatchEventRow> = Vec::with_capacity(events.len());
+        let mut rows: Vec<RunEventInsertRow> = Vec::with_capacity(events.len());
 
         for (i, event) in events.iter().enumerate() {
-            let payload_json = serde_json::to_string(event).map_err(|source| {
-                DatabaseRunStateStoreError::Json {
-                    operation: "serialize_run_event_batch",
-                    entity: run_id.to_string(),
-                    source,
-                }
-            })?;
-            let event_type = extract_event_type(event);
-            let event_id = extract_optional_string(event, "event_id")
-                .or_else(|| extract_optional_string(event, "id"))
-                .unwrap_or_else(|| Uuid::new_v4().to_string());
-            let event_hash = sha256_hex(payload_json.as_bytes());
-            let idempotency_key = extract_optional_string(event, "idempotency_key");
-
-            rows.push(BatchEventRow {
-                id: Uuid::new_v4().to_string(),
-                run_id: run_id.to_string(),
-                event_idx: start_idx + i as i64,
-                user_id: run.user_id.clone(),
-                session_id: run.session_id.clone(),
-                event_type,
-                event_id,
-                agent_id: run.agent_id.clone().unwrap_or_default(),
-                idempotency_key,
-                event_hash,
-                producer_pod_id: self.owner_pod_id.clone(),
-                payload_json,
-            });
+            rows.push(build_run_event_insert_row(
+                &run.user_id,
+                run_id,
+                &run.session_id,
+                run.agent_id.as_deref(),
+                start_idx + i as i64,
+                &self.owner_pod_id,
+                event,
+            )?);
         }
 
         let mut builder = sqlx::QueryBuilder::<sqlx::MySql>::new(
@@ -2286,6 +2790,11 @@ impl DatabaseRunStateStore {
 
         Ok(())
     }
+}
+
+fn run_owner_lease_renewal_interval(lease_ttl: Duration) -> Duration {
+    let interval_ms = (lease_ttl.as_millis().max(1) / 3).clamp(1, 15_000);
+    Duration::from_millis(u64::try_from(interval_ms).unwrap_or(u64::MAX))
 }
 
 #[async_trait]
@@ -2368,7 +2877,7 @@ impl RunStateStore for DatabaseRunStateStore {
             .bind(&record.status)
             .bind(&record.waiting_for)
             .bind(&self.owner_pod_id)
-            .bind(lease_expires_at.naive_utc())
+            .bind(lease_expires_at)
             .bind(record.run_generation as i64)
             .bind(record.last_event_idx)
             .bind(&record.checkpoint_version)
@@ -2420,7 +2929,7 @@ impl RunStateStore for DatabaseRunStateStore {
             .bind(&record.status)
             .bind(&record.waiting_for)
             .bind(&self.owner_pod_id)
-            .bind(lease_expires_at.naive_utc())
+            .bind(lease_expires_at)
             .bind(record.run_generation as i64)
             .bind(record.last_event_idx)
             .bind(&record.checkpoint_version)
@@ -2503,38 +3012,39 @@ impl RunStateStore for DatabaseRunStateStore {
         waiting_for: Option<&str>,
         error_message: Option<&str>,
     ) -> Result<bool, String> {
-        let result = if let Some(error_message) = error_message {
-            sqlx::query(
-                "UPDATE agent_runs
-                 SET status = ?, waiting_for = ?, error_message = ?, updated_at = NOW(6)
-                 WHERE user_id = ? AND run_id = ?",
-            )
-            .bind(status)
-            .bind(waiting_for)
-            .bind(error_message)
-            .bind(user_id)
-            .bind(run_id)
+        let terminal_error_code = terminal_error_code_from_message(status, error_message);
+        let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new("UPDATE agent_runs SET status = ");
+        query.push_bind(status);
+        query.push(", waiting_for = ");
+        query.push_bind(waiting_for);
+        if let Some(error_message) = error_message {
+            query.push(", error_message = ");
+            query.push_bind(error_message);
+        }
+        if let Some(error_code) = terminal_error_code.as_deref() {
+            query.push(", error_code = ");
+            query.push_bind(error_code);
+        }
+        query.push(", updated_at = NOW(6) WHERE user_id = ");
+        query.push_bind(user_id);
+        query.push(" AND run_id = ");
+        query.push_bind(run_id);
+        let result = query
+            .build()
             .execute(self.pool.get())
             .await
-            .map_err(|source| db_error("update_run_status", run_id, source).to_string())?
-        } else {
-            sqlx::query(
-                "UPDATE agent_runs
-                 SET status = ?, waiting_for = ?, updated_at = NOW(6)
-                 WHERE user_id = ? AND run_id = ?",
-            )
-            .bind(status)
-            .bind(waiting_for)
-            .bind(user_id)
-            .bind(run_id)
-            .execute(self.pool.get())
-            .await
-            .map_err(|source| db_error("update_run_status", run_id, source).to_string())?
-        };
-        if result.rows_affected() > 0 {
-            self.sync_projection_for_user(user_id, run_id, None, None)
+            .map_err(|source| db_error("update_run_status", run_id, source).to_string())?;
+        if result.rows_affected() > 0
+            && let Err(error) = self
+                .sync_projection_for_user(user_id, run_id, None, None)
                 .await
-                .map_err(|e| e.to_string())?;
+        {
+            tracing::warn!(
+                user_id,
+                run_id,
+                error = %error,
+                "run status committed but display projection refresh failed"
+            );
         }
         Ok(result.rows_affected() > 0)
     }
@@ -2559,6 +3069,11 @@ impl RunStateStore for DatabaseRunStateStore {
             query.push(", error_message = ");
             query.push_bind(error_message);
         }
+        let terminal_error_code = terminal_error_code_from_message(status, error_message);
+        if let Some(error_code) = terminal_error_code.as_deref() {
+            query.push(", error_code = ");
+            query.push_bind(error_code);
+        }
         query.push(", updated_at = NOW(6) WHERE user_id = ");
         query.push_bind(user_id);
         query.push(" AND run_id = ");
@@ -2576,12 +3091,402 @@ impl RunStateStore for DatabaseRunStateStore {
             .map_err(|source| {
                 db_error("update_run_status_if_current", run_id, source).to_string()
             })?;
-        if result.rows_affected() > 0 {
-            self.sync_projection_for_user(user_id, run_id, None, None)
+        if result.rows_affected() > 0
+            && let Err(error) = self
+                .sync_projection_for_user(user_id, run_id, None, None)
                 .await
-                .map_err(|e| e.to_string())?;
+        {
+            tracing::warn!(
+                user_id,
+                run_id,
+                error = %error,
+                "run status CAS committed but display projection refresh failed"
+            );
         }
         Ok(result.rows_affected() > 0)
+    }
+
+    async fn update_run_status_with_event_if_current(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        expected_statuses: &[&str],
+        status: &str,
+        waiting_for: Option<&str>,
+        error_message: Option<&str>,
+        event: serde_json::Value,
+    ) -> Result<bool, String> {
+        if expected_statuses.is_empty() {
+            return Ok(false);
+        }
+        let terminal_error_code = terminal_error_code_from_transition(
+            status,
+            error_message,
+            std::slice::from_ref(&event),
+        );
+
+        let mut tx = self.pool.get().begin().await.map_err(|source| {
+            db_error("transition_run_status_with_event_begin", run_id, source).to_string()
+        })?;
+
+        let Some(row) = sqlx::query(
+            "SELECT session_id, agent_id, last_event_idx
+             FROM agent_runs WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(user_id)
+        .bind(run_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|source| {
+            db_error("transition_run_status_with_event_load_run", run_id, source).to_string()
+        })?
+        else {
+            tx.rollback().await.map_err(|source| {
+                db_error(
+                    "transition_run_status_with_event_rollback_missing",
+                    run_id,
+                    source,
+                )
+                .to_string()
+            })?;
+            return Ok(false);
+        };
+
+        let session_id: String = row.try_get("session_id").map_err(|source| {
+            db_error(
+                "transition_run_status_with_event_decode_session",
+                run_id,
+                source,
+            )
+            .to_string()
+        })?;
+        let agent_id: Option<String> = row.try_get("agent_id").map_err(|source| {
+            db_error(
+                "transition_run_status_with_event_decode_agent",
+                run_id,
+                source,
+            )
+            .to_string()
+        })?;
+        let last_event_idx: i64 = row.try_get("last_event_idx").map_err(|source| {
+            db_error(
+                "transition_run_status_with_event_decode_last_event_idx",
+                run_id,
+                source,
+            )
+            .to_string()
+        })?;
+        let event_idx = last_event_idx + 1;
+
+        let event_row = match build_run_event_insert_row(
+            user_id,
+            run_id,
+            &session_id,
+            agent_id.as_deref(),
+            event_idx,
+            &self.owner_pod_id,
+            &event,
+        ) {
+            Ok(row) => row,
+            Err(error) => {
+                tx.rollback().await.map_err(|source| {
+                    db_error(
+                        "transition_run_status_with_event_rollback_prepare_event",
+                        run_id,
+                        source,
+                    )
+                    .to_string()
+                })?;
+                return Err(error.to_string());
+            }
+        };
+
+        let mut update = sqlx::QueryBuilder::<sqlx::MySql>::new("UPDATE agent_runs SET status = ");
+        update.push_bind(status);
+        update.push(", waiting_for = ");
+        update.push_bind(waiting_for);
+        if let Some(error_message) = error_message {
+            update.push(", error_message = ");
+            update.push_bind(error_message);
+        }
+        if let Some(error_code) = terminal_error_code.as_deref() {
+            update.push(", error_code = ");
+            update.push_bind(error_code);
+        }
+        update.push(", last_event_idx = ");
+        update.push_bind(event_idx);
+        update.push(", updated_at = NOW(6) WHERE user_id = ");
+        update.push_bind(user_id);
+        update.push(" AND run_id = ");
+        update.push_bind(run_id);
+        update.push(" AND last_event_idx = ");
+        update.push_bind(last_event_idx);
+        update.push(" AND status IN (");
+        let mut separated = update.separated(", ");
+        for expected in expected_statuses {
+            separated.push_bind(*expected);
+        }
+        separated.push_unseparated(")");
+
+        let update_result = update.build().execute(&mut *tx).await.map_err(|source| {
+            db_error("transition_run_status_with_event_update", run_id, source).to_string()
+        })?;
+        if update_result.rows_affected() == 0 {
+            tx.rollback().await.map_err(|source| {
+                db_error(
+                    "transition_run_status_with_event_rollback_conflict",
+                    run_id,
+                    source,
+                )
+                .to_string()
+            })?;
+            return Ok(false);
+        }
+
+        let insert_result = sqlx::query(
+            "INSERT INTO agent_run_events
+             (id, run_id, event_idx, user_id, session_id, event_type, event_id, agent_id,
+              idempotency_key, event_hash, producer_pod_id, payload_json, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
+        )
+        .bind(&event_row.id)
+        .bind(&event_row.run_id)
+        .bind(event_row.event_idx)
+        .bind(&event_row.user_id)
+        .bind(&event_row.session_id)
+        .bind(&event_row.event_type)
+        .bind(&event_row.event_id)
+        .bind(&event_row.agent_id)
+        .bind(&event_row.idempotency_key)
+        .bind(&event_row.event_hash)
+        .bind(&event_row.producer_pod_id)
+        .bind(&event_row.payload_json)
+        .execute(&mut *tx)
+        .await;
+        if let Err(source) = insert_result {
+            let rollback_error = tx.rollback().await.err();
+            let mut detail = db_error(
+                "transition_run_status_with_event_insert_event",
+                run_id,
+                source,
+            )
+            .to_string();
+            if let Some(rollback_error) = rollback_error {
+                detail.push_str(&format!(
+                    "; rollback after insert failure also failed: {rollback_error}"
+                ));
+            }
+            return Err(detail);
+        }
+
+        tx.commit().await.map_err(|source| {
+            db_error("transition_run_status_with_event_commit", run_id, source).to_string()
+        })?;
+
+        self.patch_or_repair_run_projection_status_for_user(
+            user_id,
+            run_id,
+            status,
+            waiting_for,
+            error_message,
+            event_row.event_idx,
+            Some(&event_row.event_type),
+        )
+        .await;
+        Ok(true)
+    }
+
+    async fn update_run_status_with_events_if_current(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        expected_statuses: &[&str],
+        status: &str,
+        waiting_for: Option<&str>,
+        error_message: Option<&str>,
+        events: &[serde_json::Value],
+    ) -> Result<bool, String> {
+        if expected_statuses.is_empty() {
+            return Ok(false);
+        }
+        let terminal_error_code =
+            terminal_error_code_from_transition(status, error_message, events);
+
+        let mut tx = self.pool.get().begin().await.map_err(|source| {
+            db_error("transition_run_status_with_events_begin", run_id, source).to_string()
+        })?;
+
+        let Some(row) = sqlx::query(
+            "SELECT session_id, agent_id, last_event_idx
+             FROM agent_runs WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(user_id)
+        .bind(run_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|source| {
+            db_error("transition_run_status_with_events_load_run", run_id, source).to_string()
+        })?
+        else {
+            tx.rollback().await.map_err(|source| {
+                db_error(
+                    "transition_run_status_with_events_rollback_missing",
+                    run_id,
+                    source,
+                )
+                .to_string()
+            })?;
+            return Ok(false);
+        };
+
+        let session_id: String = row.try_get("session_id").map_err(|source| {
+            db_error(
+                "transition_run_status_with_events_decode_session",
+                run_id,
+                source,
+            )
+            .to_string()
+        })?;
+        let agent_id: Option<String> = row.try_get("agent_id").map_err(|source| {
+            db_error(
+                "transition_run_status_with_events_decode_agent",
+                run_id,
+                source,
+            )
+            .to_string()
+        })?;
+        let last_event_idx: i64 = row.try_get("last_event_idx").map_err(|source| {
+            db_error(
+                "transition_run_status_with_events_decode_last_event_idx",
+                run_id,
+                source,
+            )
+            .to_string()
+        })?;
+
+        let mut event_rows = Vec::with_capacity(events.len());
+        for (offset, event) in events.iter().enumerate() {
+            match build_run_event_insert_row(
+                user_id,
+                run_id,
+                &session_id,
+                agent_id.as_deref(),
+                last_event_idx + 1 + offset as i64,
+                &self.owner_pod_id,
+                event,
+            ) {
+                Ok(row) => event_rows.push(row),
+                Err(error) => {
+                    tx.rollback().await.map_err(|source| {
+                        db_error(
+                            "transition_run_status_with_events_rollback_prepare_event",
+                            run_id,
+                            source,
+                        )
+                        .to_string()
+                    })?;
+                    return Err(error.to_string());
+                }
+            }
+        }
+
+        let next_last_event_idx = last_event_idx + events.len() as i64;
+        let mut update = sqlx::QueryBuilder::<sqlx::MySql>::new("UPDATE agent_runs SET status = ");
+        update.push_bind(status);
+        update.push(", waiting_for = ");
+        update.push_bind(waiting_for);
+        if let Some(error_message) = error_message {
+            update.push(", error_message = ");
+            update.push_bind(error_message);
+        }
+        if let Some(error_code) = terminal_error_code.as_deref() {
+            update.push(", error_code = ");
+            update.push_bind(error_code);
+        }
+        update.push(", last_event_idx = ");
+        update.push_bind(next_last_event_idx);
+        update.push(", updated_at = NOW(6) WHERE user_id = ");
+        update.push_bind(user_id);
+        update.push(" AND run_id = ");
+        update.push_bind(run_id);
+        update.push(" AND last_event_idx = ");
+        update.push_bind(last_event_idx);
+        update.push(" AND status IN (");
+        let mut separated = update.separated(", ");
+        for expected in expected_statuses {
+            separated.push_bind(*expected);
+        }
+        separated.push_unseparated(")");
+
+        let update_result = update.build().execute(&mut *tx).await.map_err(|source| {
+            db_error("transition_run_status_with_events_update", run_id, source).to_string()
+        })?;
+        if update_result.rows_affected() == 0 {
+            tx.rollback().await.map_err(|source| {
+                db_error(
+                    "transition_run_status_with_events_rollback_conflict",
+                    run_id,
+                    source,
+                )
+                .to_string()
+            })?;
+            return Ok(false);
+        }
+
+        if !event_rows.is_empty() {
+            let mut insert = sqlx::QueryBuilder::<sqlx::MySql>::new(
+                "INSERT INTO agent_run_events
+                 (id, run_id, event_idx, user_id, session_id, event_type, event_id, agent_id,
+                  idempotency_key, event_hash, producer_pod_id, payload_json, created_at) ",
+            );
+            insert.push_values(&event_rows, |mut row, event| {
+                row.push_bind(&event.id)
+                    .push_bind(&event.run_id)
+                    .push_bind(event.event_idx)
+                    .push_bind(&event.user_id)
+                    .push_bind(&event.session_id)
+                    .push_bind(&event.event_type)
+                    .push_bind(&event.event_id)
+                    .push_bind(&event.agent_id)
+                    .push_bind(&event.idempotency_key)
+                    .push_bind(&event.event_hash)
+                    .push_bind(&event.producer_pod_id)
+                    .push_bind(&event.payload_json)
+                    .push("NOW(6)");
+            });
+            let insert_result = insert.build().execute(&mut *tx).await;
+            if let Err(source) = insert_result {
+                let rollback_error = tx.rollback().await.err();
+                let mut detail = db_error(
+                    "transition_run_status_with_events_insert_events",
+                    run_id,
+                    source,
+                )
+                .to_string();
+                if let Some(rollback_error) = rollback_error {
+                    detail.push_str(&format!(
+                        "; rollback after insert failure also failed: {rollback_error}"
+                    ));
+                }
+                return Err(detail);
+            }
+        }
+
+        tx.commit().await.map_err(|source| {
+            db_error("transition_run_status_with_events_commit", run_id, source).to_string()
+        })?;
+
+        self.patch_or_repair_run_projection_status_for_user(
+            user_id,
+            run_id,
+            status,
+            waiting_for,
+            error_message,
+            next_last_event_idx,
+            event_rows.last().map(|event| event.event_type.as_str()),
+        )
+        .await;
+        Ok(true)
     }
 
     async fn update_run_usage(
@@ -2606,9 +3511,39 @@ impl RunStateStore for DatabaseRunStateStore {
         .await
         .map_err(|source| db_error("update_run_usage", run_id, source).to_string())?;
         if result.rows_affected() > 0 {
-            self.sync_projection_for_user(user_id, run_id, None, None)
+            match self
+                .patch_run_projection_usage_for_user(
+                    user_id,
+                    run_id,
+                    prompt_tokens,
+                    completion_tokens,
+                    tool_calls,
+                )
                 .await
-                .map_err(|e| e.to_string())?;
+            {
+                Ok(0) => {
+                    if let Err(error) = self
+                        .sync_projection_for_user(user_id, run_id, None, None)
+                        .await
+                    {
+                        tracing::warn!(
+                            user_id,
+                            run_id,
+                            error = %error,
+                            "run usage committed but display projection repair failed"
+                        );
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        user_id,
+                        run_id,
+                        error = %error,
+                        "run usage committed but display projection usage patch failed"
+                    );
+                }
+            }
         }
         Ok(result.rows_affected() > 0)
     }
@@ -2764,6 +3699,27 @@ impl RunStateStore for DatabaseRunStateStore {
             .map_err(|e| e.to_string())
     }
 
+    async fn rebuild_run_projection(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> Result<Option<DurableRunDisplayProjectionRecord>, String> {
+        let Some(run) = self.load_run(user_id, run_id).await? else {
+            return Ok(None);
+        };
+        let latest_event_type = run.events.last().map(extract_event_type);
+        let latest_checkpoint = self.load_latest_checkpoint(user_id, run_id, None).await?;
+        let projection = build_run_display_projection(
+            &run,
+            latest_event_type,
+            latest_checkpoint.as_ref().map(checkpoint_summary_tuple),
+        );
+        self.upsert_run_projection(&projection)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Some(projection))
+    }
+
     // `append_event` not overridden — trait default delegates to
     // `append_events_batch` which uses bulk INSERT internally.
 
@@ -2778,36 +3734,64 @@ impl RunStateStore for DatabaseRunStateStore {
             .map_err(|e| e.to_string())
     }
 
-    async fn list_user_runs(
+    async fn list_user_runs_cursor(
         &self,
         user_id: &str,
         limit: u32,
-        offset: u32,
-    ) -> Result<(Vec<DurableRunRecord>, i64), String> {
-        let total_row = sqlx::query("SELECT COUNT(*) AS total FROM agent_runs WHERE user_id = ?")
-            .bind(user_id)
-            .fetch_one(self.pool.get())
-            .await
-            .map_err(|source| db_error("count_user_runs", user_id, source).to_string())?;
-        let total = run_row_non_negative_i64(&total_row, "count_user_runs", "agent_runs", "total")
-            .map_err(|e| e.to_string())?;
-        let sql = format!(
-            "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs \
-             WHERE user_id = ? ORDER BY updated_at DESC LIMIT ? OFFSET ?"
-        );
-        let rows = sqlx::query(&sql)
-            .bind(user_id)
-            .bind(limit as i64)
-            .bind(offset as i64)
-            .fetch_all(self.pool.get())
-            .await
-            .map_err(|source| db_error("list_user_runs", user_id, source).to_string())?;
-        let runs = rows
-            .into_iter()
-            .map(run_record_from_row)
-            .collect::<DbStoreResult<Vec<_>>>()
-            .map_err(|e| e.to_string())?;
-        Ok((runs, total))
+        cursor: Option<RunListCursor>,
+    ) -> Result<DurableRunListPage, String> {
+        let limit = validate_run_list_limit(limit);
+        let query_limit = run_list_query_limit(limit);
+        let rows = if let Some(cursor) = cursor {
+            let updated_at = run_list_cursor_db_updated_at(&cursor)?;
+            let run_id = run_list_cursor_run_id(&cursor)?;
+            let sql = format!(
+                "SELECT {AGENT_RUN_COLUMNS}, {RUN_LIST_CURSOR_SELECT_SQL} FROM agent_runs \
+                 WHERE user_id = ?{RUN_LIST_CURSOR_FILTER_SQL}?{RUN_LIST_CURSOR_TIE_SQL}? AND run_id < ?))\
+                 {RUN_LIST_ORDER_SQL} LIMIT ?"
+            );
+            sqlx::query(&sql)
+                .bind(user_id)
+                .bind(updated_at.clone())
+                .bind(updated_at)
+                .bind(run_id)
+                .bind(query_limit)
+                .fetch_all(self.pool.get())
+                .await
+        } else {
+            let sql = format!(
+                "SELECT {AGENT_RUN_COLUMNS}, {RUN_LIST_CURSOR_SELECT_SQL} FROM agent_runs \
+                 WHERE user_id = ?{RUN_LIST_ORDER_SQL} LIMIT ?"
+            );
+            sqlx::query(&sql)
+                .bind(user_id)
+                .bind(query_limit)
+                .fetch_all(self.pool.get())
+                .await
+        }
+        .map_err(|source| db_error("list_user_runs_cursor", user_id, source).to_string())?;
+
+        let mut entries = Vec::with_capacity(rows.len());
+        for row in rows {
+            let cursor = run_list_cursor_from_row(&row).map_err(|e| e.to_string())?;
+            let run = run_record_from_row(row).map_err(|e| e.to_string())?;
+            entries.push((run, cursor));
+        }
+        let has_more = entries.len() > limit as usize;
+        if has_more {
+            entries.truncate(limit as usize);
+        }
+        let next_cursor = if has_more {
+            entries.last().map(|(_, cursor)| cursor.clone())
+        } else {
+            None
+        };
+        let runs = entries.into_iter().map(|(run, _)| run).collect();
+        Ok(DurableRunListPage {
+            runs,
+            total: None,
+            next_cursor,
+        })
     }
 
     async fn find_waiting_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
@@ -2856,6 +3840,74 @@ impl RunStateStore for DatabaseRunStateStore {
             .map(run_record_from_row)
             .collect::<DbStoreResult<Vec<_>>>()
             .map_err(|e| e.to_string())
+    }
+
+    async fn find_recoverable_active_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
+        let sql = format!(
+            "SELECT {AGENT_RUN_COLUMNS} FROM agent_runs
+             WHERE status IN (?, ?, ?)
+               AND (
+                   owner_pod_id IS NULL
+                   OR owner_pod_id = ?
+                   OR owner_lease_expires_at IS NULL
+                   OR owner_lease_expires_at < NOW(6)
+               )
+             ORDER BY updated_at ASC",
+        );
+        let rows = sqlx::query(&sql)
+            .bind(STATUS_WAITING)
+            .bind(STATUS_RUNNING)
+            .bind(STATUS_INPUT_QUEUED)
+            .bind(&self.owner_pod_id)
+            .fetch_all(self.pool.get())
+            .await
+            .map_err(|source| {
+                db_error("find_recoverable_active_runs", "active", source).to_string()
+            })?;
+        rows.into_iter()
+            .map(run_record_from_row)
+            .collect::<DbStoreResult<Vec<_>>>()
+            .map_err(|e| e.to_string())
+    }
+
+    fn owner_lease_renewal_interval(&self) -> Option<Duration> {
+        Some(run_owner_lease_renewal_interval(self.lease_ttl))
+    }
+
+    async fn renew_owner_lease(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        expected_statuses: &[&str],
+    ) -> Result<bool, String> {
+        if expected_statuses.is_empty() {
+            return Ok(false);
+        }
+
+        let mut query =
+            sqlx::QueryBuilder::<sqlx::MySql>::new("UPDATE agent_runs SET owner_pod_id = ");
+        query.push_bind(&self.owner_pod_id);
+        query.push(", owner_lease_expires_at = ");
+        query.push_bind(self.lease_expires_at());
+        query.push(" WHERE user_id = ");
+        query.push_bind(user_id);
+        query.push(" AND run_id = ");
+        query.push_bind(run_id);
+        query.push(" AND owner_pod_id = ");
+        query.push_bind(&self.owner_pod_id);
+        query.push(" AND status IN (");
+        let mut separated = query.separated(", ");
+        for expected in expected_statuses {
+            separated.push_bind(*expected);
+        }
+        separated.push_unseparated(")");
+
+        let result = query
+            .build()
+            .execute(self.pool.get())
+            .await
+            .map_err(|source| db_error("renew_owner_lease", run_id, source).to_string())?;
+        Ok(result.rows_affected() > 0)
     }
 
     async fn find_blocking_session_run(
@@ -3183,6 +4235,30 @@ fn run_record_from_row(row: sqlx::mysql::MySqlRow) -> DbStoreResult<DurableRunRe
     decode_run_record_from_row(&row)
 }
 
+fn run_list_cursor_from_row(row: &impl RunStateDbRow) -> DbStoreResult<RunListCursor> {
+    let operation = "list_user_runs_cursor";
+    let table = "agent_runs";
+    let updated_at = run_row_string(row, operation, table, "cursor_updated_at")?;
+    if updated_at.trim().is_empty() {
+        return Err(invalid_database_value_error(
+            operation,
+            table,
+            "cursor_updated_at",
+            "expected non-empty run list cursor timestamp",
+        ));
+    }
+    let run_id = run_row_string(row, operation, table, "run_id")?;
+    if run_id.trim().is_empty() {
+        return Err(invalid_database_value_error(
+            operation,
+            table,
+            "run_id",
+            "expected non-empty run list cursor run_id",
+        ));
+    }
+    Ok(RunListCursor { updated_at, run_id })
+}
+
 fn decode_run_record_from_row(row: &impl RunStateDbRow) -> DbStoreResult<DurableRunRecord> {
     let operation = "decode_run_row";
     let table = "agent_runs";
@@ -3361,6 +4437,60 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{digest:x}")
 }
 
+#[derive(Debug)]
+struct RunEventInsertRow {
+    id: String,
+    run_id: String,
+    event_idx: i64,
+    user_id: String,
+    session_id: String,
+    event_type: String,
+    event_id: String,
+    agent_id: String,
+    idempotency_key: Option<String>,
+    event_hash: String,
+    producer_pod_id: String,
+    payload_json: String,
+}
+
+fn build_run_event_insert_row(
+    user_id: &str,
+    run_id: &str,
+    session_id: &str,
+    agent_id: Option<&str>,
+    event_idx: i64,
+    owner_pod_id: &str,
+    event: &serde_json::Value,
+) -> DbStoreResult<RunEventInsertRow> {
+    let payload_json =
+        serde_json::to_string(event).map_err(|source| DatabaseRunStateStoreError::Json {
+            operation: "serialize_run_event",
+            entity: run_id.to_string(),
+            source,
+        })?;
+    let event_type = extract_event_type(event);
+    let event_id = extract_optional_string(event, "event_id")
+        .or_else(|| extract_optional_string(event, "id"))
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let event_hash = sha256_hex(payload_json.as_bytes());
+    let idempotency_key = extract_optional_string(event, "idempotency_key");
+
+    Ok(RunEventInsertRow {
+        id: Uuid::new_v4().to_string(),
+        run_id: run_id.to_string(),
+        event_idx,
+        user_id: user_id.to_string(),
+        session_id: session_id.to_string(),
+        event_type,
+        event_id,
+        agent_id: agent_id.unwrap_or_default().to_string(),
+        idempotency_key,
+        event_hash,
+        producer_pod_id: owner_pod_id.to_string(),
+        payload_json,
+    })
+}
+
 /// Known client-facing event `type` values that are safe to surface
 /// on the external `/chat/turn` SSE stream. Anything outside this
 /// allowlist is dropped — it's either an internal diagnostic event
@@ -3488,6 +4618,63 @@ fn run_error_client_surface(error_kind: &str) -> Option<(&'static str, bool, Opt
         "cancelled" => Some(("CANCELLED", false, None)),
         _ => None,
     }
+}
+
+fn data_string(data: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
+    data.get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn run_error_code_from_data(data: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    data_string(data, "error_code").or_else(|| data_string(data, "error_kind"))
+}
+
+fn run_error_code_from_event(event: &serde_json::Value) -> Option<String> {
+    let event_type = event
+        .get("event_type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if event_type != "run_error" && event_type != "run_finished" {
+        return None;
+    }
+    event
+        .get("data")
+        .and_then(serde_json::Value::as_object)
+        .or_else(|| event.as_object())
+        .and_then(run_error_code_from_data)
+}
+
+fn terminal_error_code_from_events(status: &str, events: &[serde_json::Value]) -> Option<String> {
+    if status != STATUS_FAILED {
+        return None;
+    }
+    events.iter().rev().find_map(run_error_code_from_event)
+}
+
+fn terminal_error_code_from_message(status: &str, error_message: Option<&str>) -> Option<String> {
+    if status != STATUS_FAILED {
+        return None;
+    }
+    let message = error_message?.trim();
+    if message.is_empty() {
+        return None;
+    }
+    Some(
+        astra_core::ClassifiedError::from(message.to_string())
+            .kind
+            .as_str()
+            .to_string(),
+    )
+}
+
+fn terminal_error_code_from_transition(
+    status: &str,
+    error_message: Option<&str>,
+    events: &[serde_json::Value],
+) -> Option<String> {
+    terminal_error_code_from_events(status, events)
+        .or_else(|| terminal_error_code_from_message(status, error_message))
 }
 
 pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::Value {
@@ -3637,6 +4824,7 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
                     "run_id",
                     "status",
                     "error",
+                    "error_code",
                     "error_kind",
                     "interrupted",
                     "interruption_kind",
@@ -3658,6 +4846,7 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
                 .and_then(serde_json::Value::as_str)
                 .and_then(run_error_client_surface);
             let code = surface.map_or("RUN_ERROR", |(code, _, _)| code);
+            let error_code = run_error_code_from_data(&data);
             let mut out = serde_json::Map::from_iter([
                 (
                     "type".to_string(),
@@ -3670,6 +4859,12 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
                     serde_json::Value::String(code.to_string()),
                 ),
             ]);
+            if let Some(error_code) = error_code {
+                out.insert(
+                    "error_code".to_string(),
+                    serde_json::Value::String(error_code),
+                );
+            }
             if let Some((_, retryable, retry_after_ms)) = surface {
                 out.insert("retryable".to_string(), serde_json::Value::Bool(retryable));
                 if let Some(retry_after_ms) = retry_after_ms {
@@ -3898,11 +5093,11 @@ impl RunLifecycleService for UnconfiguredRunLifecycleService {
         ))
     }
 
-    async fn list_runs(
+    async fn list_runs_cursor(
         &self,
         _user_id: String,
         _limit: u32,
-        _offset: u32,
+        _cursor: Option<RunListCursor>,
     ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
         Err(error_response_coded(
             StatusCode::NOT_IMPLEMENTED,
@@ -3916,6 +5111,10 @@ impl RunLifecycleService for UnconfiguredRunLifecycleService {
 mod tests {
     use super::*;
     use serde_json::json;
+    use uuid::Uuid;
+
+    static MATRIXONE_RUN_STORE_BOOTSTRAP: tokio::sync::OnceCell<astra_core::MatrixOneSettings> =
+        tokio::sync::OnceCell::const_new();
 
     fn durable_run_record(run_id: &str) -> DurableRunRecord {
         DurableRunRecord {
@@ -4138,6 +5337,53 @@ mod tests {
 
     fn make_event(event_type: &str, data: serde_json::Value) -> serde_json::Value {
         json!({"event_type": event_type, "data": data})
+    }
+
+    async fn setup_database_run_state_store_it() -> (DatabaseRunStateStore, astra_core::SharedPool)
+    {
+        assert_eq!(
+            std::env::var("ASTRA_TEST_DB_IT").as_deref(),
+            Ok("1"),
+            "set ASTRA_TEST_DB_IT=1 for ignored integration tests"
+        );
+        let settings = MATRIXONE_RUN_STORE_BOOTSTRAP
+            .get_or_init(|| async {
+                let settings = astra_core::MatrixOneSettings::from_env();
+                let catalog = std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG")
+                    .unwrap_or_else(|_| "mysql".to_string());
+                crate::storage::ensure_core_schema(&settings, &catalog)
+                    .await
+                    .expect("ensure_core_schema");
+                settings
+            })
+            .await
+            .clone();
+        let pool = astra_core::SharedPool::new(&settings)
+            .await
+            .expect("SharedPool::new");
+        (
+            DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("runs-it-pod"),
+            pool,
+        )
+    }
+
+    async fn cleanup_database_run_fixture(
+        pool: &astra_core::SharedPool,
+        user_id: &str,
+        run_id: &str,
+    ) {
+        for sql in [
+            "DELETE FROM run_display_projections WHERE user_id = ? AND run_id = ?",
+            "DELETE FROM run_checkpoints WHERE user_id = ? AND run_id = ?",
+            "DELETE FROM agent_run_events WHERE user_id = ? AND run_id = ?",
+            "DELETE FROM agent_runs WHERE user_id = ? AND run_id = ?",
+        ] {
+            let _ = sqlx::query(sql)
+                .bind(user_id)
+                .bind(run_id)
+                .execute(pool.get())
+                .await;
+        }
     }
 
     #[test]
@@ -4431,6 +5677,123 @@ mod tests {
     }
 
     #[test]
+    fn usage_projection_patch_hash_changes_with_usage_totals() {
+        let base = usage_projection_patch_hash("run-1", 10, 4, 2);
+        assert_eq!(base, usage_projection_patch_hash("run-1", 10, 4, 2));
+        assert_ne!(base, usage_projection_patch_hash("run-1", 11, 4, 2));
+        assert_ne!(base, usage_projection_patch_hash("run-1", 10, 5, 2));
+        assert_ne!(base, usage_projection_patch_hash("run-1", 10, 4, 3));
+        assert_ne!(base, usage_projection_patch_hash("run-2", 10, 4, 2));
+    }
+
+    #[test]
+    fn status_projection_patch_hash_changes_with_transition_fields() {
+        let base = status_projection_patch_hash(
+            "run-1",
+            STATUS_FAILED,
+            None,
+            Some("boom"),
+            2,
+            Some("run_finished"),
+        );
+        assert_eq!(
+            base,
+            status_projection_patch_hash(
+                "run-1",
+                STATUS_FAILED,
+                None,
+                Some("boom"),
+                2,
+                Some("run_finished")
+            )
+        );
+        assert_ne!(
+            base,
+            status_projection_patch_hash(
+                "run-1",
+                STATUS_COMPLETED,
+                None,
+                Some("boom"),
+                2,
+                Some("run_finished")
+            )
+        );
+        assert_ne!(
+            base,
+            status_projection_patch_hash(
+                "run-1",
+                STATUS_FAILED,
+                Some("tool_approval"),
+                Some("boom"),
+                2,
+                Some("run_finished")
+            )
+        );
+        assert_ne!(
+            base,
+            status_projection_patch_hash(
+                "run-1",
+                STATUS_FAILED,
+                None,
+                Some("boom"),
+                3,
+                Some("run_finished")
+            )
+        );
+        assert_ne!(
+            base,
+            status_projection_patch_hash("run-1", STATUS_FAILED, None, Some("boom"), 2, None)
+        );
+    }
+
+    #[test]
+    fn database_projection_status_patch_is_event_idx_monotonic() {
+        let source = include_str!("runs.rs");
+        let patch_body = source
+            .split("async fn patch_run_projection_status_for_user")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split("async fn patch_or_repair_run_projection_status_for_user")
+                    .next()
+            })
+            .expect("projection status patch body");
+        assert!(
+            patch_body.contains("AND projection_event_idx <= ?"),
+            "status projection patch must reject stale event_idx writes"
+        );
+        assert!(
+            patch_body.contains(".bind(projection_event_idx)\n        .execute"),
+            "status projection patch must bind the event_idx guard"
+        );
+
+        let repair_body = source
+            .split("async fn patch_or_repair_run_projection_status_for_user")
+            .nth(1)
+            .and_then(|rest| rest.split("async fn sync_projection_for_user").next())
+            .expect("projection repair body");
+        assert!(
+            repair_body.contains("existing.projection_event_idx > projection_event_idx"),
+            "zero-row status patches must distinguish stale writes from missing projections"
+        );
+        assert!(
+            repair_body.contains("sync_projection_for_user(user_id, run_id, None, None)"),
+            "missing-row repair must not reuse a possibly stale transition event type"
+        );
+        let sync_body = source
+            .split("async fn sync_projection_for_user")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split("async fn allocate_event_indices_batch_for_user")
+                    .next()
+            })
+            .expect("projection sync body");
+        assert!(
+            sync_body.contains("load_latest_event_type_for_user"),
+            "projection sync must derive latest_event_type from durable events when projection lags"
+        );
+    }
+
+    #[test]
     fn tool_preview_contract_row_decode_preserves_values_and_fails_loudly() {
         let (tool_name, contract) = decode_tool_preview_contract_row(&FakeRunStateRow::complete())
             .expect("preview contract decodes");
@@ -4527,6 +5890,91 @@ mod tests {
         );
     }
 
+    #[test]
+    fn owner_lease_renewal_interval_is_derived_from_ttl() {
+        assert_eq!(
+            run_owner_lease_renewal_interval(Duration::from_secs(45)),
+            Duration::from_secs(15)
+        );
+        assert_eq!(
+            run_owner_lease_renewal_interval(Duration::from_millis(30)),
+            Duration::from_millis(10)
+        );
+        assert_eq!(
+            run_owner_lease_renewal_interval(Duration::from_secs(300)),
+            Duration::from_secs(15),
+            "very long leases should not make active-run heartbeat too sparse"
+        );
+    }
+
+    #[test]
+    fn renew_owner_lease_update_is_owner_and_status_bound() {
+        let source = include_str!("runs.rs");
+        let database_impl = source
+            .split("impl RunStateStore for DatabaseRunStateStore")
+            .nth(1)
+            .expect("database RunStateStore impl");
+        let body = database_impl
+            .split("async fn renew_owner_lease")
+            .nth(1)
+            .and_then(|rest| rest.split("async fn find_blocking_session_run").next())
+            .expect("database renew_owner_lease body");
+
+        assert!(
+            body.contains("WHERE user_id = ") && body.contains("AND run_id = "),
+            "lease renewal must not update agent_runs by bare run_id"
+        );
+        assert!(
+            body.contains("AND owner_pod_id = "),
+            "lease renewal must only refresh the current store owner's rows"
+        );
+        assert!(
+            body.contains("AND status IN ("),
+            "lease renewal must stop once the run leaves active statuses"
+        );
+        assert!(
+            !body.contains("updated_at = NOW(6)"),
+            "lease heartbeat must not mutate user-visible run updated_at ordering"
+        );
+    }
+
+    #[test]
+    fn recoverable_active_query_is_owner_lease_bound_for_waiting_runs() {
+        let source = include_str!("runs.rs");
+        let database_impl = source
+            .split("impl RunStateStore for DatabaseRunStateStore")
+            .nth(1)
+            .expect("database RunStateStore impl");
+        let body = database_impl
+            .split("async fn find_recoverable_active_runs")
+            .nth(1)
+            .and_then(|rest| rest.split("async fn find_blocking_session_run").next())
+            .expect("database find_recoverable_active_runs body");
+
+        assert!(
+            body.contains("status IN (?, ?, ?)"),
+            "recoverable active query must cover waiting, running, and input-queued in one lease-scoped scan"
+        );
+        assert!(
+            body.contains(".bind(STATUS_WAITING)")
+                && body.contains(".bind(STATUS_RUNNING)")
+                && body.contains(".bind(STATUS_INPUT_QUEUED)"),
+            "waiting runs must be returned by the same recoverable active query as in-flight runs"
+        );
+        assert!(
+            !body.contains("STATUS_PAUSED"),
+            "paused runs are resumable/user-held state and must not be crash-recovered"
+        );
+        assert!(
+            body.contains("owner_pod_id = ?") && body.contains("owner_lease_expires_at < NOW(6)"),
+            "recoverable active query must respect the owner lease boundary"
+        );
+        assert!(
+            !body.contains("find_runs_by_status"),
+            "recoverable waiting runs must not fall back to the unscoped status query"
+        );
+    }
+
     #[tokio::test]
     async fn in_memory_store_allows_new_root_run_when_existing_run_is_paused_without_waiting() {
         let store = InMemoryRunStateStore::new();
@@ -4558,6 +6006,162 @@ mod tests {
             .await
             .expect_err("approval-waiting paused run must still block the session");
         assert_eq!(error, "session already has an active run");
+    }
+
+    #[tokio::test]
+    async fn in_memory_list_user_runs_cursor_seek_paginates_without_count() {
+        let store = InMemoryRunStateStore::new();
+        for i in 0..5 {
+            let mut run = durable_run_record(&format!("run-{i}"));
+            run.status = STATUS_COMPLETED.into();
+            run.session_id = format!("session-{i}");
+            run.created_at = "2026-07-03T10:00:00.000000Z".into();
+            run.updated_at = "2026-07-03T10:00:00.000000Z".into();
+            store.insert_run(run).await.unwrap();
+        }
+
+        let first = store.list_user_runs_cursor("u1", 2, None).await.unwrap();
+        assert_eq!(first.total, None);
+        assert_eq!(
+            first
+                .runs
+                .iter()
+                .map(|run| run.run_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["run-4", "run-3"]
+        );
+        assert_eq!(
+            first
+                .next_cursor
+                .as_ref()
+                .map(|cursor| cursor.run_id.as_str()),
+            Some("run-3")
+        );
+
+        let second = store
+            .list_user_runs_cursor("u1", 2, first.next_cursor)
+            .await
+            .unwrap();
+        assert_eq!(
+            second
+                .runs
+                .iter()
+                .map(|run| run.run_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["run-2", "run-1"]
+        );
+
+        let third = store
+            .list_user_runs_cursor("u1", 2, second.next_cursor)
+            .await
+            .unwrap();
+        assert_eq!(
+            third
+                .runs
+                .iter()
+                .map(|run| run.run_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["run-0"]
+        );
+        assert!(third.next_cursor.is_none());
+
+        let without_total = store.list_user_runs_cursor("u1", 2, None).await.unwrap();
+        assert_eq!(without_total.total, None);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_list_user_runs_cursor_seek_paginates_tied_updated_at_on_matrixone() {
+        let (store, pool) = setup_database_run_state_store_it().await;
+        let user_id = format!("runs-it-cursor-user-{}", Uuid::new_v4());
+        let prefix = format!("runs-it-cursor-run-{}", Uuid::new_v4());
+        let run_ids = (0..5)
+            .map(|idx| format!("{prefix}-{idx}"))
+            .collect::<Vec<_>>();
+        let tied_ts = "2026-07-03 10:00:00.123456";
+
+        for (idx, run_id) in run_ids.iter().enumerate() {
+            cleanup_database_run_fixture(&pool, &user_id, run_id).await;
+            let mut run = durable_run_record(run_id);
+            run.user_id = user_id.clone();
+            run.session_id = format!("runs-it-cursor-session-{idx}");
+            run.status = STATUS_COMPLETED.into();
+            store.insert_run(run).await.expect("insert cursor run");
+            sqlx::query(
+                "UPDATE agent_runs SET created_at = ?, updated_at = ? \
+                 WHERE user_id = ? AND run_id = ?",
+            )
+            .bind(tied_ts)
+            .bind(tied_ts)
+            .bind(&user_id)
+            .bind(run_id)
+            .execute(pool.get())
+            .await
+            .expect("force tied run timestamp");
+        }
+
+        let first = store
+            .list_user_runs_cursor(&user_id, 2, None)
+            .await
+            .expect("first cursor page");
+        assert_eq!(
+            first
+                .runs
+                .iter()
+                .map(|run| run.run_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![run_ids[4].as_str(), run_ids[3].as_str()]
+        );
+        let first_cursor = first.next_cursor.expect("first page cursor");
+        assert_eq!(first_cursor.run_id, run_ids[3]);
+
+        let second = store
+            .list_user_runs_cursor(&user_id, 2, Some(first_cursor))
+            .await
+            .expect("second cursor page");
+        assert_eq!(
+            second
+                .runs
+                .iter()
+                .map(|run| run.run_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![run_ids[2].as_str(), run_ids[1].as_str()]
+        );
+        let second_cursor = second.next_cursor.expect("second page cursor");
+        assert_eq!(second_cursor.run_id, run_ids[1]);
+
+        let third = store
+            .list_user_runs_cursor(&user_id, 2, Some(second_cursor))
+            .await
+            .expect("third cursor page");
+        assert_eq!(
+            third
+                .runs
+                .iter()
+                .map(|run| run.run_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![run_ids[0].as_str()]
+        );
+        assert!(third.next_cursor.is_none());
+
+        for run_id in &run_ids {
+            cleanup_database_run_fixture(&pool, &user_id, run_id).await;
+        }
+    }
+
+    #[test]
+    fn run_list_sql_contract_uses_seek_cursor_not_offset() {
+        let order_sql = RUN_LIST_ORDER_SQL.to_ascii_uppercase();
+        let cursor_sql = format!(
+            "{}?{}? AND run_id < ?))",
+            RUN_LIST_CURSOR_FILTER_SQL, RUN_LIST_CURSOR_TIE_SQL
+        )
+        .to_ascii_uppercase();
+        assert!(!order_sql.contains(" OFFSET "));
+        assert!(!cursor_sql.contains(" OFFSET "));
+        assert!(order_sql.contains("UPDATED_AT DESC"));
+        assert!(order_sql.contains("RUN_ID DESC"));
+        assert!(cursor_sql.contains("RUN_ID < ?"));
     }
 
     #[test]
@@ -4711,12 +6315,13 @@ mod tests {
 
         let finished = transform_run_event_for_client(make_event(
             "run_finished",
-            json!({"run_id": "run-1", "status": "failed", "error": "boom"}),
+            json!({"run_id": "run-1", "status": "failed", "error": "boom", "error_code": "network"}),
         ));
         assert_eq!(finished["type"], "run_finished");
         assert_eq!(finished["run_id"], "run-1");
         assert_eq!(finished["status"], "failed");
         assert_eq!(finished["error"], "boom");
+        assert_eq!(finished["error_code"], "network");
 
         let waiting = transform_run_event_for_client(make_event(
             "run_waiting",
@@ -4744,6 +6349,7 @@ mod tests {
         assert_eq!(out["type"], "run_error");
         assert_eq!(out["message"], "slow down");
         assert_eq!(out["error_kind"], "rate_limit");
+        assert_eq!(out["error_code"], "rate_limit");
         assert_eq!(out["code"], "LLM_RATE_LIMIT");
         assert_eq!(out["retryable"], true);
         assert_eq!(out["retry_after_ms"], 5_000);
@@ -4753,6 +6359,7 @@ mod tests {
             json!({"error": "provider 500", "error_kind": "server_error"}),
         ));
         assert_eq!(out["code"], "SERVER_ERROR");
+        assert_eq!(out["error_code"], "server_error");
         assert_eq!(out["retryable"], true);
         assert_eq!(out["retry_after_ms"], 2_000);
     }
@@ -5357,6 +6964,601 @@ mod tests {
             .await
             .expect_err("single append delegates to batch and must also fail");
         assert!(single_error.contains("run not found"));
+    }
+
+    #[tokio::test]
+    async fn status_with_event_transition_commits_status_and_event() {
+        let store = InMemoryRunStateStore::new();
+        store
+            .insert_run(durable_run_record("transition-commit"))
+            .await
+            .unwrap();
+
+        let updated = store
+            .update_run_status_with_event_if_current(
+                "u1",
+                "transition-commit",
+                &[STATUS_RUNNING],
+                STATUS_PAUSED,
+                Some("user_resume"),
+                None,
+                make_event("run_paused", json!({})),
+            )
+            .await
+            .unwrap();
+
+        assert!(updated);
+        let loaded = store
+            .load_run("u1", "transition-commit")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.status, STATUS_PAUSED);
+        assert_eq!(loaded.waiting_for.as_deref(), Some("user_resume"));
+        assert_eq!(loaded.last_event_idx, 0);
+        assert_eq!(loaded.events.len(), 1);
+        assert_eq!(loaded.events[0]["event_type"], "run_paused");
+
+        let projection = store
+            .load_run_projection("u1", "transition-commit")
+            .await
+            .unwrap()
+            .expect("transition should refresh projection");
+        assert_eq!(projection.status, STATUS_PAUSED);
+        assert_eq!(projection.latest_event_type.as_deref(), Some("run_paused"));
+    }
+
+    #[tokio::test]
+    async fn status_with_event_transition_rejects_unexpected_status_without_event() {
+        let store = InMemoryRunStateStore::new();
+        store
+            .insert_run(durable_run_record("transition-conflict"))
+            .await
+            .unwrap();
+
+        let updated = store
+            .update_run_status_with_event_if_current(
+                "u1",
+                "transition-conflict",
+                &[STATUS_PAUSED],
+                STATUS_CANCELLED,
+                None,
+                None,
+                make_event("run_finished", json!({"cancelled": true})),
+            )
+            .await
+            .unwrap();
+
+        assert!(!updated);
+        let loaded = store
+            .load_run("u1", "transition-conflict")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.status, STATUS_RUNNING);
+        assert!(loaded.waiting_for.is_none());
+        assert_eq!(loaded.last_event_idx, -1);
+        assert!(loaded.events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn status_with_event_transition_rejects_wrong_owner_without_event() {
+        let store = InMemoryRunStateStore::new();
+        store
+            .insert_run(durable_run_record("transition-owner"))
+            .await
+            .unwrap();
+
+        let updated = store
+            .update_run_status_with_event_if_current(
+                "u2",
+                "transition-owner",
+                &[STATUS_RUNNING],
+                STATUS_CANCELLED,
+                None,
+                None,
+                make_event("run_finished", json!({"cancelled": true})),
+            )
+            .await
+            .unwrap();
+
+        assert!(!updated);
+        let loaded = store
+            .load_run("u1", "transition-owner")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.status, STATUS_RUNNING);
+        assert_eq!(loaded.last_event_idx, -1);
+        assert!(loaded.events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn save_checkpoint_rejects_terminal_run_without_mutation() {
+        let store = InMemoryRunStateStore::new();
+        store
+            .insert_run(durable_run_record("terminal-checkpoint"))
+            .await
+            .unwrap();
+        store
+            .update_run_status_with_event_if_current(
+                "u1",
+                "terminal-checkpoint",
+                &[STATUS_RUNNING],
+                STATUS_FAILED,
+                None,
+                Some("boom"),
+                make_event("run_error", json!({"error": "boom"})),
+            )
+            .await
+            .unwrap();
+
+        let saved = store
+            .save_checkpoint(
+                "u1",
+                "terminal-checkpoint",
+                r#"{"version":"checkpoint_v2","graceful":true,"last_batch_id":"terminal"}"#,
+            )
+            .await
+            .unwrap();
+
+        assert!(!saved);
+        let loaded = store
+            .load_run("u1", "terminal-checkpoint")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.status, STATUS_FAILED);
+        assert!(loaded.checkpoint_json.is_none());
+        assert!(loaded.checkpoint_version.is_none());
+        assert!(
+            store
+                .load_latest_checkpoint("u1", "terminal-checkpoint", None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn status_with_events_transition_commits_event_batch() {
+        let store = InMemoryRunStateStore::new();
+        store
+            .insert_run(durable_run_record("transition-batch"))
+            .await
+            .unwrap();
+
+        let events = vec![
+            make_event(
+                "run_error",
+                json!({"error": "boom", "error_code": "network", "error_kind": "network"}),
+            ),
+            make_event(
+                "run_finished",
+                json!({"status": "failed", "error_code": "network"}),
+            ),
+        ];
+        let updated = store
+            .update_run_status_with_events_if_current(
+                "u1",
+                "transition-batch",
+                &[STATUS_RUNNING],
+                STATUS_FAILED,
+                None,
+                Some("boom"),
+                &events,
+            )
+            .await
+            .unwrap();
+
+        assert!(updated);
+        let loaded = store
+            .load_run("u1", "transition-batch")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.status, STATUS_FAILED);
+        assert_eq!(loaded.error_code.as_deref(), Some("network"));
+        assert_eq!(loaded.error_message.as_deref(), Some("boom"));
+        assert_eq!(loaded.last_event_idx, 1);
+        assert_eq!(loaded.events.len(), 2);
+        assert_eq!(loaded.events[0]["event_type"], "run_error");
+        assert_eq!(loaded.events[1]["event_type"], "run_finished");
+
+        let projection = store
+            .load_run_projection("u1", "transition-batch")
+            .await
+            .unwrap()
+            .expect("transition should refresh projection");
+        assert_eq!(projection.status, STATUS_FAILED);
+        assert_eq!(
+            projection.latest_event_type.as_deref(),
+            Some("run_finished")
+        );
+    }
+
+    #[tokio::test]
+    async fn status_with_events_transition_allows_empty_batch() {
+        let store = InMemoryRunStateStore::new();
+        store
+            .insert_run(durable_run_record("transition-empty-batch"))
+            .await
+            .unwrap();
+
+        let updated = store
+            .update_run_status_with_events_if_current(
+                "u1",
+                "transition-empty-batch",
+                &[STATUS_RUNNING],
+                STATUS_WAITING,
+                Some("tool_approval"),
+                None,
+                &[],
+            )
+            .await
+            .unwrap();
+
+        assert!(updated);
+        let loaded = store
+            .load_run("u1", "transition-empty-batch")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.status, STATUS_WAITING);
+        assert_eq!(loaded.waiting_for.as_deref(), Some("tool_approval"));
+        assert_eq!(loaded.last_event_idx, -1);
+        assert!(loaded.events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_status_transition_classifies_error_message_without_events() {
+        let store = InMemoryRunStateStore::new();
+        store
+            .insert_run(durable_run_record("transition-message-code"))
+            .await
+            .unwrap();
+
+        let updated = store
+            .update_run_status_if_current(
+                "u1",
+                "transition-message-code",
+                &[STATUS_RUNNING],
+                STATUS_FAILED,
+                None,
+                Some(
+                    "database operation failed: error communicating with database: unexpected EOF",
+                ),
+            )
+            .await
+            .unwrap();
+
+        assert!(updated);
+        let loaded = store
+            .load_run("u1", "transition-message-code")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.status, STATUS_FAILED);
+        assert_eq!(loaded.error_code.as_deref(), Some("database_error"));
+        assert_eq!(
+            loaded.error_message.as_deref(),
+            Some("database operation failed: error communicating with database: unexpected EOF")
+        );
+        assert_eq!(loaded.last_event_idx, -1);
+        assert!(loaded.events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_direct_status_update_classifies_error_message_without_events() {
+        let store = InMemoryRunStateStore::new();
+        store
+            .insert_run(durable_run_record("direct-message-code"))
+            .await
+            .unwrap();
+
+        let updated = store
+            .update_run_status(
+                "u1",
+                "direct-message-code",
+                STATUS_FAILED,
+                None,
+                Some("[stream_transport] stream body closed"),
+            )
+            .await
+            .unwrap();
+
+        assert!(updated);
+        let loaded = store
+            .load_run("u1", "direct-message-code")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.status, STATUS_FAILED);
+        assert_eq!(loaded.error_code.as_deref(), Some("stream_transport"));
+        assert_eq!(
+            loaded.error_message.as_deref(),
+            Some("[stream_transport] stream body closed")
+        );
+        assert_eq!(loaded.last_event_idx, -1);
+        assert!(loaded.events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_empty_event_batch_classifies_error_message() {
+        let store = InMemoryRunStateStore::new();
+        store
+            .insert_run(durable_run_record("transition-empty-failed-batch"))
+            .await
+            .unwrap();
+
+        let updated = store
+            .update_run_status_with_events_if_current(
+                "u1",
+                "transition-empty-failed-batch",
+                &[STATUS_RUNNING],
+                STATUS_FAILED,
+                None,
+                Some("[network] LLM request failed: connection reset"),
+                &[],
+            )
+            .await
+            .unwrap();
+
+        assert!(updated);
+        let loaded = store
+            .load_run("u1", "transition-empty-failed-batch")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.status, STATUS_FAILED);
+        assert_eq!(loaded.error_code.as_deref(), Some("network"));
+        assert_eq!(loaded.last_event_idx, -1);
+        assert!(loaded.events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn status_with_events_transition_rejects_unexpected_status_without_batch() {
+        let store = InMemoryRunStateStore::new();
+        store
+            .insert_run(durable_run_record("transition-batch-conflict"))
+            .await
+            .unwrap();
+
+        let events = vec![make_event("run_finished", json!({"status": "cancelled"}))];
+        let updated = store
+            .update_run_status_with_events_if_current(
+                "u1",
+                "transition-batch-conflict",
+                &[STATUS_PAUSED],
+                STATUS_CANCELLED,
+                None,
+                None,
+                &events,
+            )
+            .await
+            .unwrap();
+
+        assert!(!updated);
+        let loaded = store
+            .load_run("u1", "transition-batch-conflict")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.status, STATUS_RUNNING);
+        assert_eq!(loaded.last_event_idx, -1);
+        assert!(loaded.events.is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_status_event_batch_transition_and_projection_repair_hold_on_matrixone() {
+        let (store, pool) = setup_database_run_state_store_it().await;
+        let user_id = format!("runs-it-user-{}", Uuid::new_v4());
+        let run_id = format!("runs-it-run-{}", Uuid::new_v4());
+        let session_id = format!("runs-it-session-{}", Uuid::new_v4());
+        cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
+
+        let mut record = durable_run_record(&run_id);
+        record.user_id = user_id.clone();
+        record.session_id = session_id;
+        record.root_run_id = Some(run_id.clone());
+        record.ancestor_path = Some(run_id.clone());
+        store.insert_run(record).await.expect("insert run");
+
+        let saved_checkpoint = store
+            .save_checkpoint(
+                &user_id,
+                &run_id,
+                r#"{"version":"checkpoint_v2","graceful":true,"last_batch_id":"db-it"}"#,
+            )
+            .await
+            .expect("save checkpoint before terminal transition");
+        assert!(saved_checkpoint);
+
+        let events = vec![
+            make_event("run_error", json!({"error": "boom"})),
+            make_event("run_finished", json!({"status": "failed"})),
+        ];
+        let updated = store
+            .update_run_status_with_events_if_current(
+                &user_id,
+                &run_id,
+                &[STATUS_RUNNING],
+                STATUS_FAILED,
+                None,
+                Some("boom"),
+                &events,
+            )
+            .await
+            .expect("status+events transition");
+        assert!(updated);
+
+        let stale_update = store
+            .update_run_status_with_events_if_current(
+                &user_id,
+                &run_id,
+                &[STATUS_RUNNING],
+                STATUS_CANCELLED,
+                None,
+                None,
+                &[make_event("run_finished", json!({"cancelled": true}))],
+            )
+            .await
+            .expect("stale status+events transition");
+        assert!(!stale_update);
+
+        store
+            .update_run_usage(&user_id, &run_id, 10, 4, 2)
+            .await
+            .expect("update usage");
+        let usage_projection = store
+            .load_run_projection(&user_id, &run_id)
+            .await
+            .expect("load projection after usage patch")
+            .expect("projection should exist after usage patch");
+        assert_eq!(usage_projection.status, STATUS_FAILED);
+        assert_eq!(usage_projection.error_message.as_deref(), Some("boom"));
+        assert_eq!(usage_projection.projection_event_idx, 1);
+        assert_eq!(
+            usage_projection.latest_event_type.as_deref(),
+            Some("run_finished")
+        );
+        assert_eq!(
+            usage_projection.latest_checkpoint_version.as_deref(),
+            Some("checkpoint_v2")
+        );
+        assert_eq!(usage_projection.total_prompt_tokens, 10);
+        assert_eq!(usage_projection.total_completion_tokens, 4);
+        assert_eq!(usage_projection.total_tool_calls, 2);
+
+        let loaded = store
+            .load_run(&user_id, &run_id)
+            .await
+            .expect("load run")
+            .expect("run exists");
+        assert_eq!(loaded.status, STATUS_FAILED);
+        assert_eq!(loaded.error_message.as_deref(), Some("boom"));
+        assert_eq!(loaded.error_code.as_deref(), Some("unknown"));
+        assert_eq!(loaded.last_event_idx, 1);
+        assert_eq!(loaded.events.len(), 2);
+        assert_eq!(loaded.events[0]["event_type"], "run_error");
+        assert_eq!(loaded.events[1]["event_type"], "run_finished");
+
+        sqlx::query(
+            "UPDATE run_display_projections
+             SET status = 'running',
+                 error_message = NULL,
+                 projection_event_idx = -1,
+                 latest_event_type = 'stale_event',
+                 latest_checkpoint_kind = NULL,
+                 latest_checkpoint_version = NULL
+             WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&run_id)
+        .execute(pool.get())
+        .await
+        .expect("corrupt projection");
+
+        let repaired = store
+            .rebuild_run_projection(&user_id, &run_id)
+            .await
+            .expect("repair projection")
+            .expect("projection repaired");
+        assert_eq!(repaired.status, STATUS_FAILED);
+        assert_eq!(repaired.error_message.as_deref(), Some("boom"));
+        assert_eq!(repaired.projection_event_idx, 1);
+        assert_eq!(repaired.latest_event_type.as_deref(), Some("run_finished"));
+        assert_eq!(
+            repaired.latest_checkpoint_version.as_deref(),
+            Some("checkpoint_v2")
+        );
+
+        cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
+    }
+
+    #[tokio::test]
+    async fn rebuild_run_projection_repairs_stale_projection_from_facts() {
+        let store = InMemoryRunStateStore::new();
+        store
+            .insert_run(durable_run_record("projection-repair"))
+            .await
+            .unwrap();
+        let saved_checkpoint = store
+            .save_checkpoint(
+                "u1",
+                "projection-repair",
+                r#"{"version":"checkpoint_v2","graceful":true,"last_batch_id":"repair"}"#,
+            )
+            .await
+            .unwrap();
+        assert!(saved_checkpoint);
+
+        let events = vec![
+            make_event("run_error", json!({"error": "boom"})),
+            make_event("run_finished", json!({"status": "failed"})),
+        ];
+        store
+            .update_run_status_with_events_if_current(
+                "u1",
+                "projection-repair",
+                &[STATUS_RUNNING],
+                STATUS_FAILED,
+                None,
+                Some("boom"),
+                &events,
+            )
+            .await
+            .unwrap();
+        store
+            .update_run_usage("u1", "projection-repair", 10, 4, 2)
+            .await
+            .unwrap();
+
+        let mut stale = store
+            .load_run_projection("u1", "projection-repair")
+            .await
+            .unwrap()
+            .expect("projection should exist before corruption");
+        stale.status = STATUS_RUNNING.to_string();
+        stale.error_message = None;
+        stale.projection_event_idx = -1;
+        stale.latest_event_type = Some("stale_event".to_string());
+        stale.latest_checkpoint_kind = None;
+        stale.latest_checkpoint_version = None;
+        stale.total_prompt_tokens = 0;
+        stale.total_completion_tokens = 0;
+        stale.total_tool_calls = 0;
+        store
+            .projections
+            .write()
+            .await
+            .insert("projection-repair".to_string(), stale);
+
+        let repaired = store
+            .rebuild_run_projection("u1", "projection-repair")
+            .await
+            .unwrap()
+            .expect("repair should rebuild projection");
+        assert_eq!(repaired.status, STATUS_FAILED);
+        assert_eq!(repaired.error_message.as_deref(), Some("boom"));
+        assert_eq!(repaired.projection_event_idx, 1);
+        assert_eq!(repaired.latest_event_type.as_deref(), Some("run_finished"));
+        assert_eq!(repaired.latest_checkpoint_kind.as_deref(), Some("resume"));
+        assert_eq!(
+            repaired.latest_checkpoint_version.as_deref(),
+            Some("checkpoint_v2")
+        );
+        assert_eq!(repaired.total_prompt_tokens, 10);
+        assert_eq!(repaired.total_completion_tokens, 4);
+        assert_eq!(repaired.total_tool_calls, 2);
+
+        let loaded = store
+            .load_run_projection("u1", "projection-repair")
+            .await
+            .unwrap()
+            .expect("repaired projection should be stored");
+        assert_eq!(loaded.projection_hash, repaired.projection_hash);
     }
 
     #[tokio::test]

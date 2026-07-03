@@ -11,8 +11,8 @@ use astra_runtime::{
 };
 use astra_services::runs::{
     CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, DurableRunRecord,
-    RunInputData, RunInputRecord, RunLifecycleService, RunListRecord, RunMutationRecord,
-    RunStateStore, RunStatusRecord,
+    RunInputData, RunInputRecord, RunLifecycleService, RunListCursor, RunListRecord,
+    RunMutationRecord, RunStateStore, RunStatusRecord,
 };
 use astra_services::session_workspace::{WorkspaceMetadata, persist_remote_workspace};
 use astra_services::{
@@ -416,17 +416,17 @@ impl RunLifecycleService for JointRunLifecycle {
         })
     }
 
-    async fn list_runs(
+    async fn list_runs_cursor(
         &self,
         _user_id: String,
         limit: u32,
-        offset: u32,
+        _cursor: Option<RunListCursor>,
     ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
         Ok(RunListRecord {
             runs: Vec::new(),
-            total: 0,
+            total: None,
             limit,
-            offset,
+            next_cursor: None,
         })
     }
 
@@ -1232,9 +1232,10 @@ async fn e2e_joint_3_s07_approval_survives_48h_restarts_and_migration() {
     ] {
         sqlx::query(
             "INSERT INTO session_state_item_events
-             (item_id, user_id, session_id, category, item_key, mutation, payload_json, created_at)
-             VALUES (?, ?, ?, 'approval_state', 'release-approval', 'apply_suggestion', ?, NOW(6))",
+             (event_id, item_id, user_id, session_id, category, item_key, mutation, payload_json, created_at)
+             VALUES (?, ?, ?, ?, 'approval_state', 'release-approval', 'apply_suggestion', ?, NOW(6))",
         )
+        .bind(id("state-event"))
         .bind(&approval_item)
         .bind(&user_id)
         .bind(&session_id)

@@ -1013,6 +1013,13 @@ fn maybe_run_memory_extraction(state: &mut AgenticLoopState) {
     let Some(session_id) = state.current_session_id.clone() else {
         return;
     };
+    let Some(user_id) = state.context_manifest_user_id.clone() else {
+        tracing::warn!(
+            session_id = %session_id,
+            "Skipping session-memory extraction: missing durable user_id"
+        );
+        return;
+    };
     let turn_number = state.max_turns.saturating_sub(state.remaining_turns);
 
     let had_error = state.error_recovery.consecutive_same_error > 0;
@@ -1032,15 +1039,14 @@ fn maybe_run_memory_extraction(state: &mut AgenticLoopState) {
         .saturating_add(state.total_cache_creation) as usize;
 
     let req = crate::session_memory::ExtractionRequest {
+        user_id,
         session_id,
         messages: state.messages.clone(),
         session_facts: state.session_facts.clone(),
         current_tokens,
         current_tool_calls: state.total_tool_calls as usize,
         had_error,
-        had_user_correction: astra_turn_core::input_classifier::is_correction_signal(
-            &state.message,
-        ),
+        had_user_correction: astra_turn_core::input_classifier::is_reanchor_signal(&state.message),
         turn_number: turn_number as u32,
         config: astra_turn_core::cloud_session_memory_extract::SessionMemoryExtractConfig::default(
         ),
@@ -2281,6 +2287,7 @@ mod tests {
         let mut host = MockHost::new(Vec::new());
         let mut state = make_state();
         state.current_session_id = Some(sid.clone());
+        state.context_manifest_user_id = Some("test-user".into());
         state.error_recovery.consecutive_same_error = 0;
         state
             .messages

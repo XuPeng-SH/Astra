@@ -222,7 +222,7 @@ describe("AstraClient — Sessions", () => {
   test("listRuntimeSessions preserves pagination envelope", async () => {
     globalThis.fetch = mockFetch(200, {
       sessions: [],
-      total: 3,
+      total: null,
       limit: 2,
       next_cursor: {
         updated_at: "2026-06-29T08:00:00Z",
@@ -236,7 +236,7 @@ describe("AstraClient — Sessions", () => {
         session_id: "session-1",
       },
     });
-    expect(result.total).toBe(3);
+    expect(result.total).toBeNull();
     const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock
       .calls[0][0] as string;
     expect(url).toContain("limit=2");
@@ -470,6 +470,42 @@ describe("AstraClient — Runs", () => {
     expect(url).toContain("recent_limit=25");
   });
 
+  test("repairRunProjection posts to repair endpoint", async () => {
+    globalThis.fetch = mockFetch(200, {
+      repaired: true,
+      projection: {
+        run_id: "r1",
+        session_id: "s1",
+        status: "running",
+        run_event_high_watermark: 7,
+        projection_event_idx: 7,
+        projection_updated_at: "2026-06-10T00:00:00.000Z",
+        projection_hash: "hash",
+        total_prompt_tokens: 1,
+        total_completion_tokens: 2,
+        total_tool_calls: 3,
+        observability: {
+          has_durable_projection: true,
+          observability_available: true,
+          projection_lag_events: 0,
+          prompt_request_count: 0,
+        },
+        recent_events: [],
+      },
+    });
+
+    const repaired = await createClient().repairRunProjection("r1", {
+      recentLimit: 10,
+    });
+
+    expect(repaired.repaired).toBe(true);
+    expect(repaired.projection.projection_event_idx).toBe(7);
+    const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(call[0]).toContain("/chat/runs/r1/projection/repair");
+    expect(call[0]).toContain("recent_limit=10");
+    expect(call[1].method).toBe("POST");
+  });
+
   test("listRuns normalizes snake_case runs", async () => {
     globalThis.fetch = mockFetch(200, {
       runs: [
@@ -497,9 +533,9 @@ describe("AstraClient — Runs", () => {
           fallback_policy: "disabled",
         },
       ],
-      total: 1,
+      total: null,
       limit: 50,
-      offset: 0,
+      next_cursor: null,
     });
     const r = await createClient().listRuns();
     expect(r.runs[0].runId).toBe("r1");
@@ -508,8 +544,43 @@ describe("AstraClient — Runs", () => {
     expect(r.runs[0].executor?.kind).toBe("server_local");
     expect(r.runs[0].transport).toBe("server_local");
     expect(r.runs[0].fallbackPolicy).toBe("disabled");
+    expect(r.total).toBeNull();
+    expect(r.nextCursor).toBeNull();
     const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0];
     expect(url).toContain("/runs");
+  });
+
+  test("listRuns sends seek cursor and preserves nullable total", async () => {
+    globalThis.fetch = mockFetch(200, {
+      runs: [],
+      total: null,
+      limit: 2,
+      next_cursor: {
+        updated_at: "2026-06-29T08:00:00.000000",
+        run_id: "run-2",
+      },
+    });
+
+    const r = await createClient().listRuns({
+      limit: 2,
+      cursor: {
+        updatedAt: "2026-06-29T08:30:00.000000",
+        runId: "run-1",
+      },
+    });
+
+    expect(r.total).toBeNull();
+    expect(r.nextCursor).toEqual({
+      updatedAt: "2026-06-29T08:00:00.000000",
+      runId: "run-2",
+    });
+    const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock
+      .calls[0][0] as string;
+    expect(url).toContain("/runs");
+    expect(url).toContain("limit=2");
+    expect(url).toContain("after_updated_at=2026-06-29T08%3A30%3A00.000000");
+    expect(url).toContain("after_run_id=run-1");
+    expect(url).not.toContain("offset=");
   });
 
   test("delegateRun posts delegation body", async () => {
@@ -743,15 +814,16 @@ describe("AstraClient — Events and edges", () => {
   test("listEvents", async () => {
     globalThis.fetch = mockFetch(200, {
       events: [],
-      total: 0,
+      total: null,
       limit: 50,
       next_cursor: null,
     });
-    await createClient().listEvents({ sessionId: "s1", limit: 20 });
+    const result = await createClient().listEvents({ eventType: "tool_call", limit: 20 });
     const url = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0];
     expect(url).toContain("/events?");
-    expect(url).toContain("session_id=s1");
+    expect(url).toContain("event_type=tool_call");
     expect(url).toContain("limit=20");
+    expect(result.total).toBeNull();
   });
 
   test("getCausalChain", async () => {

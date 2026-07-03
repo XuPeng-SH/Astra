@@ -38,11 +38,11 @@ use astra_services::{
     DatabaseSessionArtifactStore, DatabaseSessionService, DatabaseSkillService,
     DatabaseStateProjectionStore, DecisionCreateRequestData, DecisionListFilter, DecisionService,
     DurableTaskLifecycle, EventCreateRequestData, EventListFilter, EventService,
-    IntrospectionService, MAX_API_LIST_LIMIT, MAX_MARKETPLACE_SEARCH_OFFSET, MarketplaceService,
-    MarketplaceStatsService, MatrixOneDurableTaskLifecycle, MatrixOneSyncService, ReflectService,
-    ReplayService, RetrievalStage, SessionArtifactJsonStore, SessionArtifactStore,
-    SessionArtifactStoreError, SessionListFilter, SessionService, SkillSearchQuery, SkillService,
-    SnapshotCreateRequestData, SnapshotListFilter,
+    IntrospectionService, MAX_API_LIST_LIMIT, MarketplaceService, MarketplaceStatsService,
+    MatrixOneDurableTaskLifecycle, MatrixOneSyncService, ReflectService, ReplayService,
+    RetrievalStage, SessionArtifactJsonStore, SessionArtifactStore, SessionArtifactStoreError,
+    SessionListFilter, SessionService, SkillSearchQuery, SkillService, SnapshotCreateRequestData,
+    SnapshotListFilter,
 };
 use sqlx::Row;
 use std::collections::HashSet;
@@ -532,7 +532,7 @@ async fn events_sessions_decisions_admin_and_marketplace_search_clamps() {
         .get_session_events(session_id.clone(), user_id.clone(), 2, None)
         .await
         .expect("session events first page");
-    assert_eq!(first_session_page.total, 3);
+    assert_eq!(first_session_page.total, Some(3));
     assert_eq!(
         first_session_page
             .events
@@ -936,11 +936,14 @@ async fn events_sessions_decisions_admin_and_marketplace_search_clamps() {
             category: None,
             trust_tier: None,
             limit: Some(5),
-            offset: Some(u32::MAX),
+            after_ranking_score: None,
+            after_skill_name: None,
+            after_version: None,
         })
         .await
         .expect("search_ranked");
-    assert_eq!(sr.offset, MAX_MARKETPLACE_SEARCH_OFFSET);
+    assert_eq!(sr.limit, 5);
+    assert!(sr.total.is_none());
 
     cleanup_session_bundle(
         &pool,
@@ -1000,7 +1003,8 @@ async fn get_session_events_uses_session_event_count_summary_without_event_scan(
         .expect("get session events");
 
     assert_eq!(
-        events.total, 7,
+        events.total,
+        Some(7),
         "session event total should use agent_sessions.event_count summary, not COUNT(agent_events)"
     );
     assert_eq!(events.events.len(), 1);
@@ -1019,7 +1023,8 @@ async fn get_session_events_uses_session_event_count_summary_without_event_scan(
         .await
         .expect("list unfiltered session events");
     assert_eq!(
-        listed.total, 7,
+        listed.total,
+        Some(7),
         "unfiltered list_events session total should use agent_sessions.event_count summary"
     );
 
@@ -1389,7 +1394,6 @@ async fn cleanup_restore_fixture_for_owner(
             "ctx_snapshots",
             "agent_event_edges",
             "session_artifacts",
-            "session_sync_log",
             "session_checkpoints",
             "agent_events",
             "prompt_deltas",
@@ -1912,15 +1916,36 @@ async fn session_artifact_latest_and_list_use_stable_tiebreaker_for_tied_timesta
     );
 
     let listed = store
-        .list_json_artifacts(&user_id, &session_id, Some("llm_capture"), 10)
+        .list_json_artifacts(&user_id, &session_id, Some("llm_capture"), 10, None)
         .await
         .expect("list session artifacts");
-    assert_eq!(listed.len(), 2);
+    assert_eq!(listed.artifacts.len(), 2);
     assert_eq!(
-        listed[0].artifact_id, newer_id,
+        listed.artifacts[0].artifact_id, newer_id,
         "artifact lists should use the same stable latest-first ordering"
     );
-    assert_eq!(listed[1].artifact_id, older_id);
+    assert_eq!(listed.artifacts[1].artifact_id, older_id);
+    assert!(listed.next_cursor.is_none());
+
+    let first_page = store
+        .list_json_artifacts(&user_id, &session_id, Some("llm_capture"), 1, None)
+        .await
+        .expect("list first artifact page");
+    assert_eq!(first_page.artifacts.len(), 1);
+    assert_eq!(first_page.artifacts[0].artifact_id, newer_id);
+    let second_page = store
+        .list_json_artifacts(
+            &user_id,
+            &session_id,
+            Some("llm_capture"),
+            1,
+            first_page.next_cursor.clone(),
+        )
+        .await
+        .expect("list second artifact page");
+    assert_eq!(second_page.artifacts.len(), 1);
+    assert_eq!(second_page.artifacts[0].artifact_id, older_id);
+    assert!(second_page.next_cursor.is_none());
 
     cleanup_restore_fixture_for_owner(&pool, &user_id, &[session_id]).await;
 }
@@ -2036,9 +2061,10 @@ async fn session_artifact_store_is_owner_bound_on_reads_and_writes() {
     );
     assert_eq!(
         store
-            .list_json_artifacts(&owner_user_id, &session_id, Some("llm_capture"), 10)
+            .list_json_artifacts(&owner_user_id, &session_id, Some("llm_capture"), 10, None)
             .await
             .expect("owner list")
+            .artifacts
             .len(),
         1,
         "owner list sees exactly the session artifact"
@@ -2070,9 +2096,10 @@ async fn session_artifact_store_is_owner_bound_on_reads_and_writes() {
     );
     assert!(
         store
-            .list_json_artifacts(&other_user_id, &session_id, None, 10)
+            .list_json_artifacts(&other_user_id, &session_id, None, 10, None)
             .await
             .expect("non-owner list")
+            .artifacts
             .is_empty(),
         "non-owner list does not leak another user's artifacts"
     );
@@ -2590,6 +2617,8 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
                 min_turns: None,
                 sort: "created".into(),
                 order: "desc".into(),
+                after_sort_value: None,
+                after_session_id: None,
             },
         )
         .await
@@ -2672,6 +2701,8 @@ async fn session_audit_session_turn_count_uses_turn_seq_high_watermark() {
             &TurnListParams {
                 page: 1,
                 per_page: 10,
+                after_created_at: None,
+                after_event_id: None,
             },
         )
         .await
@@ -2695,6 +2726,8 @@ async fn session_audit_session_turn_count_uses_turn_seq_high_watermark() {
                 min_turns: Some(3),
                 sort: "turns".into(),
                 order: "desc".into(),
+                after_sort_value: None,
+                after_session_id: None,
             },
         )
         .await
@@ -2716,6 +2749,8 @@ async fn session_audit_session_turn_count_uses_turn_seq_high_watermark() {
                 min_turns: Some(5),
                 sort: "turns".into(),
                 order: "desc".into(),
+                after_sort_value: None,
+                after_session_id: None,
             },
         )
         .await
@@ -3131,6 +3166,8 @@ async fn session_audit_turn_views_decode_json_columns_on_live_matrixone() {
             &TurnListParams {
                 page: 1,
                 per_page: 20,
+                after_created_at: None,
+                after_event_id: None,
             },
         )
         .await
@@ -3444,7 +3481,6 @@ async fn session_restore_cloud_roundtrip_restores_resume_and_picker_fields() {
     let (shared, _settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
     let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
-    let audit = flusher.writer.clone();
     let svc = MatrixOneSyncService::new(pool.clone(), flusher.writer.clone());
 
     let user_id = Uuid::new_v4().to_string();
@@ -3804,46 +3840,8 @@ async fn session_restore_cloud_roundtrip_restores_resume_and_picker_fields() {
     assert_eq!(listed_b.model.as_deref(), Some("claude-sonnet-4.5"));
     assert_eq!(listed_b.git_branch.as_deref(), Some("legacy-fallback"));
 
-    // Flush audit entries before checking sync_log counts.
-    drop(audit);
     flusher.shutdown.cancel();
     let _ = flusher.join_handle.await;
-
-    let session_a_state_syncs: i64 = sqlx::query(
-        "SELECT COUNT(*) AS c FROM session_sync_log \
-         WHERE session_id = ? AND user_id = ? AND sync_type = 'session_state' AND status = 'success'",
-    )
-    .bind(&session_a)
-    .bind(&user_id)
-    .fetch_one(&pool)
-    .await
-    .expect("load session A session_state sync log count")
-    .try_get("c")
-    .expect("session A session_state sync log count");
-    let session_b_state_syncs: i64 = sqlx::query(
-        "SELECT COUNT(*) AS c FROM session_sync_log \
-         WHERE session_id = ? AND user_id = ? AND sync_type = 'session_state' AND status = 'success'",
-    )
-    .bind(&session_b)
-    .bind(&user_id)
-    .fetch_one(&pool)
-    .await
-    .expect("load session B session_state sync log count")
-    .try_get("c")
-    .expect("session B session_state sync log count");
-    let context_trace_syncs: i64 = sqlx::query(
-        "SELECT COUNT(*) AS c FROM session_sync_log \
-         WHERE user_id = ? AND sync_type = 'context_trace' AND status = 'success'",
-    )
-    .bind(&user_id)
-    .fetch_one(&pool)
-    .await
-    .expect("load context_trace sync log count")
-    .try_get("c")
-    .expect("context_trace sync log count");
-    assert_eq!(session_a_state_syncs, 2);
-    assert_eq!(session_b_state_syncs, 1);
-    assert_eq!(context_trace_syncs, 2);
 
     cleanup_restore_fixture_for_owner(&pool, &user_id, &[session_a, session_b]).await;
 }
@@ -3958,11 +3956,10 @@ async fn session_restore_turn_count_uses_turn_seq_high_watermark() {
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn session_sync_log_async_audit_flusher_writes_per_type_on_live_matrixone() {
+async fn sync_audit_no_longer_persists_session_sync_log_on_live_matrixone() {
     let (shared, _settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
     let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
-    let audit = flusher.writer.clone();
     let svc = MatrixOneSyncService::new(pool.clone(), flusher.writer.clone());
 
     let user_id = Uuid::new_v4().to_string();
@@ -4000,34 +3997,7 @@ async fn session_sync_log_async_audit_flusher_writes_per_type_on_live_matrixone(
     .await
     .expect("push checkpoint");
 
-    // Bulk-seed 199 rows directly into `session_sync_log` (matching the
-    // schema that `push_context_trace_signal` would write).
-    // The final 6 pushes go through the production API so the async audit
-    // flusher batches and writes audit entries alongside the seeded rows.
-    let seed_count = 199_i64;
-    let mut bulk_sql = String::from(
-        "INSERT INTO session_sync_log \
-         (sync_id, user_id, session_id, sync_type, sync_direction, payload_size, \
-          status, error_message, created_at) VALUES ",
-    );
-    for i in 0..seed_count {
-        if i > 0 {
-            bulk_sql.push_str(", ");
-        }
-        bulk_sql.push_str("(?, ?, ?, 'context_trace', 'push', 128, 'success', NULL, NOW(6))");
-    }
-    let mut q = sqlx::query(&bulk_sql);
-    for _ in 0..seed_count {
-        q = q
-            .bind(uuid::Uuid::new_v4().to_string())
-            .bind(&user_id)
-            .bind(&session_id);
-    }
-    q.execute(&pool)
-        .await
-        .expect("bulk-seed context_trace sync_log rows");
-
-    for idx in seed_count..205 {
+    for idx in 0..6 {
         let trace = ContextTraceSignal {
             turn_id: format!("turn-{idx}"),
             captured_at: Some(format!("2026-09-03T10:{:02}:00Z", idx % 60)),
@@ -4048,63 +4018,47 @@ async fn session_sync_log_async_audit_flusher_writes_per_type_on_live_matrixone(
             .expect("push context trace");
     }
 
-    // Flush audit entries before checking sync_log counts.
-    drop(audit);
     flusher.shutdown.cancel();
     let _ = flusher.join_handle.await;
 
-    let session_state_count: i64 = sqlx::query(
-        "SELECT COUNT(*) AS c FROM session_sync_log \
-         WHERE user_id = ? AND status = 'success' AND sync_type = 'session_state'",
-    )
-    .bind(&user_id)
-    .fetch_one(&pool)
-    .await
-    .expect("load session_state sync count")
-    .try_get("c")
-    .expect("session_state sync count");
-    let checkpoint_count: i64 = sqlx::query(
-        "SELECT COUNT(*) AS c FROM session_sync_log \
-         WHERE user_id = ? AND status = 'success' AND sync_type = 'checkpoint'",
-    )
-    .bind(&user_id)
-    .fetch_one(&pool)
-    .await
-    .expect("load checkpoint sync count")
-    .try_get("c")
-    .expect("checkpoint sync count");
-    let context_trace_count: i64 = sqlx::query(
-        "SELECT COUNT(*) AS c FROM session_sync_log \
-         WHERE user_id = ? AND status = 'success' AND sync_type = 'context_trace'",
-    )
-    .bind(&user_id)
-    .fetch_one(&pool)
-    .await
-    .expect("load context_trace sync count")
-    .try_get("c")
-    .expect("context_trace sync count");
-    let total_success_count: i64 = sqlx::query(
-        "SELECT COUNT(*) AS c FROM session_sync_log \
-         WHERE user_id = ? AND status = 'success'",
-    )
-    .bind(&user_id)
-    .fetch_one(&pool)
-    .await
-    .expect("load total success sync count")
-    .try_get("c")
-    .expect("total success sync count");
-
-    assert_eq!(session_state_count, 1, "1 push_session_state = 1 audit row");
-    assert_eq!(checkpoint_count, 1, "1 push_checkpoint = 1 audit row");
-    // 199 bulk-seeded + 6 from push_context_trace_signal
-    assert_eq!(
-        context_trace_count, 205,
-        "199 seeded + 6 pushed = 205 context_trace audit rows"
+    let sync_log_query = sqlx::query("SELECT COUNT(*) AS c FROM session_sync_log")
+        .fetch_one(&pool)
+        .await;
+    assert!(
+        sync_log_query.is_err(),
+        "session_sync_log must not be part of the current schema"
     );
-    // 1 session_state + 1 checkpoint + 205 context_trace
+
+    let checkpoint_count: i64 = sqlx::query(
+        "SELECT COUNT(*) AS c FROM session_checkpoints \
+         WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load checkpoint fact count")
+    .try_get("c")
+    .expect("checkpoint fact count");
+    let context_trace_count: i64 = sqlx::query(
+        "SELECT COUNT(*) AS c FROM agent_events \
+         WHERE user_id = ? AND session_id = ? AND event_type = 'context_trace_signal'",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load context trace fact count")
+    .try_get("c")
+    .expect("context trace fact count");
+
     assert_eq!(
-        total_success_count, 207,
-        "total success audit rows = 1 + 1 + 205"
+        checkpoint_count, 1,
+        "push_checkpoint writes the domain fact"
+    );
+    assert_eq!(
+        context_trace_count, 6,
+        "context trace pushes write durable agent_events facts"
     );
 
     cleanup_restore_fixture_for_owner(&pool, &user_id, &[session_id]).await;
@@ -4577,7 +4531,6 @@ async fn context_trace_push_lazily_creates_session_row_on_live_matrixone() {
     let (shared, _settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
     let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
-    let audit = flusher.writer.clone();
     let svc = MatrixOneSyncService::new(pool.clone(), flusher.writer.clone());
 
     let user_id = Uuid::new_v4().to_string();
@@ -4648,23 +4601,8 @@ async fn context_trace_push_lazily_creates_session_row_on_live_matrixone() {
         Some("turn-missing-row")
     );
 
-    // Flush audit entries before checking sync_log counts.
-    drop(audit);
     flusher.shutdown.cancel();
     let _ = flusher.join_handle.await;
-
-    let context_trace_syncs: i64 = sqlx::query(
-        "SELECT COUNT(*) AS c FROM session_sync_log \
-         WHERE session_id = ? AND user_id = ? AND sync_type = 'context_trace' AND status = 'success'",
-    )
-    .bind(&session_id)
-    .bind(&user_id)
-    .fetch_one(&pool)
-    .await
-    .expect("load context_trace sync count")
-    .try_get("c")
-    .expect("context_trace sync count");
-    assert_eq!(context_trace_syncs, 1);
 
     cleanup_restore_fixture_for_owner(&pool, &user_id, &[session_id]).await;
 }
@@ -4675,7 +4613,6 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
     let (shared, _settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
     let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
-    let audit = flusher.writer.clone();
     let svc = MatrixOneSyncService::new(pool.clone(), flusher.writer.clone());
 
     let user_id = Uuid::new_v4().to_string();
@@ -5017,35 +4954,8 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
         Some("context_window")
     );
 
-    // Flush audit entries before checking sync_log counts.
-    drop(audit);
     flusher.shutdown.cancel();
     let _ = flusher.join_handle.await;
-
-    let sync_successes = sqlx::query(
-        "SELECT COUNT(*) AS c FROM session_sync_log \
-         WHERE session_id = ? AND user_id = ? AND sync_type = 'step_checkpoint' AND status = 'success'",
-    )
-    .bind(&session_id)
-    .bind(&user_id)
-    .fetch_one(&pool)
-    .await
-    .expect("load step checkpoint sync log count")
-    .try_get::<i64, _>("c")
-    .expect("decode step checkpoint sync log count");
-    assert_eq!(sync_successes, 2);
-    let checkpoint_sync_successes = sqlx::query(
-        "SELECT COUNT(*) AS c FROM session_sync_log \
-         WHERE session_id = ? AND user_id = ? AND sync_type = 'checkpoint' AND status = 'success'",
-    )
-    .bind(&session_id)
-    .bind(&user_id)
-    .fetch_one(&pool)
-    .await
-    .expect("load ordinary checkpoint sync log count")
-    .try_get::<i64, _>("c")
-    .expect("decode ordinary checkpoint sync log count");
-    assert_eq!(checkpoint_sync_successes, 1);
 
     cleanup_restore_fixture_for_owner(&pool, &user_id, &[session_id, heavy_only_session]).await;
 }

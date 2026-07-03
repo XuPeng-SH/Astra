@@ -20,7 +20,7 @@ impl LocalSkillProvider {
     /// Create with standard CLI search paths.
     ///
     /// This includes project walk-up paths (`.astra/skills/`, `.claude/skills/`,
-    /// and `skills/`) plus user-level HOME paths. Use this for standalone CLI
+    /// `.agent/skills/`) plus user-level HOME paths. Use this for standalone CLI
     /// execution, where project-local skills are part of the local workspace.
     pub fn standard() -> Self {
         Self {
@@ -196,7 +196,7 @@ mod tests {
         assert!(matches!(result, Err(SkillError::NotFound(_))));
     }
 
-    /// Kebab-case manifest `name` with snake_case directory (common in `skills/<dir>/`).
+    /// Kebab-case manifest `name` with snake_case directory.
     #[tokio::test]
     async fn load_resolves_kebab_name_from_snake_case_dir() {
         let dir = TempDir::new().unwrap();
@@ -290,7 +290,7 @@ mod tests {
     #[tokio::test]
     async fn review_changes_skill_keeps_agent_available_for_parallel_reviews() {
         let repo_skills = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../skills")
+            .join("../../../.agent/skills")
             .canonicalize()
             .expect("repo skills dir should resolve in workspace tests");
         let provider = LocalSkillProvider::with_paths(vec![repo_skills]);

@@ -41,6 +41,9 @@ help:
 	@echo "  make test               - test-offline + test-online (Rust DB online; optional SDK remote E2E if ASTRA_SDK_ONLINE_E2E=1)"
 	@echo "  make test-offline       - Rust workspace + bridge-e2e-hooks + @astra/sdk (30s per case via profile=strict; override: NEXTEST_OFFLINE_PROFILE=<profile>)"
 	@echo "  make test-online        - Rust #[ignore] + Matrix E2E (30s per case via profile=strict-online; see rust/.config/nextest.toml)"
+	@echo "  make test-no-sticky-control - Fast no-sticky control-plane tests (approval/ask_user/edge callbacks; no live DB)"
+	@echo "  make test-cleanup-pressure - Live MatrixOne cleanup pressure probes (explicit, not part of test-online)"
+	@echo "  make test-durable-event-pressure - Live MatrixOne durable event pressure probe (explicit, not part of test-online)"
 	@echo "  make test-saas          - SaaS platform E2E (docs/testing/saas-test-plan.md §5; MatrixOne + optional SDK)"
 	@echo "  make test-saas-coverage - SaaS E2E + llvm line coverage report (needs: cargo install cargo-llvm-cov)"
 	@echo "  make test-live-llm      - Live LLM suite (real provider APIs from .models.yaml; one model per provider)"
@@ -130,6 +133,12 @@ STACK_REQUIRED_ENV := $(STACK_SECRET_ENV) MEMORIA_EMBEDDING_API_KEY MEMORIA_EMBE
 #   make test-online NEXTEST_ONLINE_PROFILE=strict-online-ci
 NEXTEST_OFFLINE_PROFILE ?= strict
 NEXTEST_ONLINE_PROFILE  ?= strict-online
+CLEANUP_PRESSURE_PROFILE ?= smoke
+CLEANUP_PRESSURE_DATABASE_BASE ?= astra_runtime_test_cleanup_pressure
+CLEANUP_PRESSURE_ARGS ?=
+DURABLE_EVENT_PRESSURE_PROFILE ?= smoke
+DURABLE_EVENT_PRESSURE_DATABASE ?= astra_runtime_test_durable_event_pressure
+DURABLE_EVENT_PRESSURE_ARGS ?=
 
 NEXTEST_OFFLINE_FLAGS := --profile $(NEXTEST_OFFLINE_PROFILE)
 NEXTEST_ONLINE_FLAGS  := --profile $(NEXTEST_ONLINE_PROFILE)
@@ -797,7 +806,7 @@ sweep:
 # Testing
 # ============================================================================
 
-.PHONY: test test-offline test-online test-saas test-saas-coverage test-sdk-offline test-web-offline test-sdk-online
+.PHONY: test test-offline test-online test-no-sticky-control test-saas test-saas-coverage test-sdk-offline test-web-offline test-sdk-online
 test: test-offline test-online
 
 .PHONY: test-dashboard
@@ -807,6 +816,16 @@ test-dashboard: ## Build astra-test and launch live dashboard
 
 .PHONY: test-offline
 test-offline: sweep test-workspace test-runtime-bridge-hooks test-sdk-offline test-web-offline
+
+# Fast correctness gate for the no-sticky control plane. This intentionally
+# stays out of the default test targets: it is focused evidence for LB/session
+# affinity removal, not a replacement for live multi-pod deployment validation.
+.PHONY: test-no-sticky-control
+test-no-sticky-control:
+	@echo "Running no-sticky control-plane tests (approval, ask_user, edge callbacks; no live DB required)..."
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --lib replays_from_journal -- --nocapture
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --lib do_not_require_sticky_pod -- --nocapture
+	@CARGO_INCREMENTAL=0 $(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --test edge_5_5_http_e2e without_sticky_ledger -- --nocapture
 
 .PHONY: test-workspace
 test-workspace: sweep
@@ -915,6 +934,7 @@ test-online:
 	ASTRA_DATABASE=$$RUNTIME_IGNORED_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
 		CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) \
 			--lib --bins --run-ignored only $(NEXTEST_ONLINE_FLAGS) \
+			-E 'not test(/durable_run_event_pressure_probe/)' \
 			|| FAILED="$$FAILED astra-runtime-ignored"; \
 	echo "Running astra-turn-core db-store ignored tests (live DB=$$RUNTIME_IGNORED_DB; nextest profile=$(NEXTEST_ONLINE_PROFILE))..."; \
 	ASTRA_DATABASE=$$RUNTIME_IGNORED_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
@@ -922,6 +942,12 @@ test-online:
 		CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) -p astra-turn-core \
 			--features db-store --lib --run-ignored only $(NEXTEST_ONLINE_FLAGS) \
 			|| FAILED="$$FAILED astra-turn-core-db-store"; \
+	echo "Running astra-services ignored lib tests (live DB=$$RUNTIME_IGNORED_DB; nextest profile=$(NEXTEST_ONLINE_PROFILE))..."; \
+	ASTRA_DATABASE=$$RUNTIME_IGNORED_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
+		ASTRA_TEST_DB_IT=1 \
+		CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) -p astra-services \
+			--lib --run-ignored only $(NEXTEST_ONLINE_FLAGS) \
+			|| FAILED="$$FAILED astra-services-db-store"; \
 	echo "Running ignored integration suites (live DB=$$INTEGRATION_DB; nextest profile=$(NEXTEST_ONLINE_PROFILE))..."; \
 	ASTRA_DATABASE=$$INTEGRATION_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
 		ASTRA_TEST_DATABASE=$$INTEGRATION_DB \
@@ -940,6 +966,23 @@ test-online:
 	@echo ""
 	@echo "NOTE: live-LLM suite (real provider APIs, reads .models.yaml) auto-skips unless"
 	@echo "      ASTRA_LIVE_LLM=1 is set. Run it explicitly with: make test-live-llm"
+
+# Explicit cleanup pressure probes. This is intentionally not part of
+# test-online because pressure timings are operational evidence, not a normal
+# per-case correctness budget.
+.PHONY: test-cleanup-pressure
+test-cleanup-pressure:
+	@python3 scripts/load/cleanup_pressure_probe.py \
+		--profile "$(CLEANUP_PRESSURE_PROFILE)" \
+		--database-base "$(CLEANUP_PRESSURE_DATABASE_BASE)" \
+		$(CLEANUP_PRESSURE_ARGS)
+
+.PHONY: test-durable-event-pressure
+test-durable-event-pressure:
+	@python3 scripts/load/durable_event_pressure_probe.py \
+		--profile "$(DURABLE_EVENT_PRESSURE_PROFILE)" \
+		--database "$(DURABLE_EVENT_PRESSURE_DATABASE)" \
+		$(DURABLE_EVENT_PRESSURE_ARGS)
 
 # SaaS platform E2E (docs/testing/saas-test-plan.md §5): resource governance, admin RBAC,
 # auth refresh, session reaper. Requires MatrixOne + .env secrets (same as test-online).

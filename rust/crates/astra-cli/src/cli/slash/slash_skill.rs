@@ -618,7 +618,7 @@ Follow these steps:
                         eprintln!(
                             "{}",
                             format!(
-                                "  \u{2717} Skill directory not found for '{name}' (searched .astra/skills, .claude/skills, skills/, ~/.astra/skills, ~/.claude/skills)"
+                                "  \u{2717} Skill directory not found for '{name}' (searched .astra/skills, .claude/skills, .agent/skills, ~/.astra/skills, ~/.claude/skills, ~/.agent/skills)"
                             )
                             .yellow()
                         );
@@ -723,8 +723,8 @@ Follow these steps:
                 }
                 return Ok(());
             }
-            // Search all shared loader paths: project .astra/.claude skills,
-            // cwd skills/, and user-level .astra/.claude skills.
+            // Search all shared loader paths: project .astra/.claude/.agent
+            // skills and matching user-level skill roots.
             let search_paths = crate::skill_instructions::skill_search_paths();
             let found = search_paths.iter().find_map(|base| {
                 let dir = base.join(name);
@@ -830,14 +830,14 @@ Follow these steps:
             if !api_ok {
                 eprintln!(
                     "  {}",
-                    "Local view: unified catalog + on-disk paths (.astra/skills, .claude/skills, skills/, ~/.astra/skills, ~/.claude/skills)."
+                    "Local view: unified catalog + on-disk paths (.astra/skills, .claude/skills, .agent/skills, ~/.astra/skills, ~/.claude/skills, ~/.agent/skills)."
                         .dim()
                 );
                 let registry = &state.unified_skill_registry;
                 let mut manifests = registry.all_manifests();
                 if manifests.is_empty() {
                     eprintln!("  {}", "No skills discovered in catalog.".dim());
-                    eprintln!("  {}", "Use /skill new <name> to create one, or add SKILL.md files to .astra/skills/ or .claude/skills/.".dim());
+                    eprintln!("  {}", "Use /skill new <name> to create one, or add SKILL.md files to .astra/skills/, .claude/skills/, or .agent/skills/.".dim());
                     eprintln!();
                     return Ok(());
                 }
@@ -1081,11 +1081,17 @@ Follow these steps:
                     >(&text)
                     {
                         Ok(resp) => {
+                            let more = if resp.next_cursor.is_some() {
+                                ", more available"
+                            } else {
+                                ""
+                            };
                             eprintln!(
-                                "\n  {} '{}' ({} results)",
+                                "\n  {} '{}' (showing {}{})",
                                 "Marketplace search:".dim(),
                                 query_str.magenta(),
-                                resp.total
+                                resp.results.len(),
+                                more
                             );
                             eprintln!("{}", "\u{2500}".repeat(78).dim());
 
@@ -1316,8 +1322,8 @@ fn parse_skill_info_args(sub_arg: &str) -> (String, bool) {
     (s.to_string(), false)
 }
 
-/// Same resolution order as `/skill dev`: shared loader paths for project,
-/// legacy cwd, and user-level skills.
+/// Same resolution order as `/skill dev`: shared loader paths for project and
+/// user-level skills.
 fn resolve_skill_dir_on_disk(name: &str) -> Option<std::path::PathBuf> {
     crate::skill_instructions::skill_search_paths()
         .into_iter()
@@ -2017,7 +2023,6 @@ mod tests {
                 }],
                 "total": 1,
                 "limit": 20,
-                "offset": 0,
             });
 
             Mock::given(method("GET"))
@@ -2040,7 +2045,6 @@ mod tests {
                 "results": [],
                 "total": 0,
                 "limit": 10,
-                "offset": 0,
             });
 
             Mock::given(method("GET"))
@@ -2063,7 +2067,6 @@ mod tests {
                 "results": [],
                 "total": 0,
                 "limit": 20,
-                "offset": 0,
             });
 
             Mock::given(method("GET"))
@@ -2111,7 +2114,6 @@ mod tests {
                 }],
                 "total": 1,
                 "limit": 15,
-                "offset": 0,
             });
 
             Mock::given(method("GET"))
@@ -2139,7 +2141,6 @@ mod tests {
                 }],
                 "total": 1,
                 "limit": 50,
-                "offset": 0,
             });
 
             Mock::given(method("GET"))
@@ -2161,7 +2162,6 @@ mod tests {
                 "installations": [],
                 "total": 0,
                 "limit": 50,
-                "offset": 0,
             });
 
             Mock::given(method("GET"))
@@ -2251,12 +2251,11 @@ mod tests {
                 }],
                 "total": 3,
                 "limit": 50,
-                "offset": 0,
             });
 
             Mock::given(method("GET"))
                 .and(path("/marketplace/search"))
-                .and(query_param("name", "my-skill"))
+                .and(query_param("query", "my-skill"))
                 .and(query_param("limit", "50"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(&resp))
                 .expect(1)
@@ -2275,7 +2274,6 @@ mod tests {
                 "results": [],
                 "total": 0,
                 "limit": 1,
-                "offset": 0,
             });
 
             Mock::given(method("GET"))
@@ -3057,7 +3055,7 @@ async fn fetch_marketplace_version(
     tok: &str,
 ) -> Option<String> {
     let query_pairs = vec![
-        ("name", skill_name.to_string()),
+        ("query", skill_name.to_string()),
         ("limit", "50".to_string()),
     ];
     match api
@@ -3563,10 +3561,16 @@ async fn browse_marketplace(
                                 desc
                             );
                         }
+                        let more = if resp.next_cursor.is_some() {
+                            " (more available)"
+                        } else {
+                            ""
+                        };
                         eprintln!(
-                            "\n  {} {} total",
+                            "\n  {} {}{}",
                             "Showing".dim(),
-                            resp.total.to_string().dim()
+                            resp.results.len().to_string().dim(),
+                            more.dim()
                         );
                     }
                 }
@@ -3703,9 +3707,9 @@ async fn list_installed_marketplace(api: &astra_thin_client::ThinClient, token: 
                             );
                         }
                         eprintln!(
-                            "\n  {} {} total",
+                            "\n  {} {}",
                             "Installed:".dim(),
-                            resp.total.to_string().dim()
+                            resp.installations.len().to_string().dim()
                         );
                     }
                 }

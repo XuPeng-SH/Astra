@@ -19,6 +19,10 @@ use std::sync::{LazyLock, Mutex};
 
 use astra_core::canonical_names::{normalize_name_list, normalize_optional_name};
 
+use crate::interaction_contract::{
+    InteractionContract, InteractionIdentity, InteractionKind, approval_decision_status,
+    ask_user_response_status,
+};
 use crate::{OwnerScope, SessionArtifactStore};
 
 thread_local! {
@@ -1059,6 +1063,8 @@ fn is_noop_or_cached_result_text(text: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalJournalDecision {
     pub request_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     pub decision: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
@@ -1068,9 +1074,32 @@ pub struct ApprovalJournalDecision {
     pub approval_kind: Option<String>,
 }
 
+impl ApprovalJournalDecision {
+    pub fn interaction_contract(
+        &self,
+        session_id: &str,
+        user_id: Option<&str>,
+    ) -> Option<InteractionContract> {
+        let run_id = self.run_id.as_deref()?;
+        let identity =
+            InteractionIdentity::new(user_id, session_id, run_id, self.request_id.as_str());
+        if !identity.is_run_scoped() {
+            return None;
+        }
+        Some(InteractionContract::new(
+            InteractionKind::Approval,
+            identity,
+            approval_decision_status(&self.decision),
+            Some("session_journal.approval_decision".to_string()),
+        ))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalJournalRequest {
     pub request_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1324,6 +1353,10 @@ pub enum JournalEventType {
     ApprovalDecision,
     /// An approval prompt timed out before a decision arrived.
     ApprovalTimeout,
+    /// An ask_user prompt was emitted and is waiting for a response.
+    AskUserPrompted,
+    /// An ask_user response was received.
+    AskUserResponse,
     /// Permission evaluation / approval / persistence audit event.
     PermissionAudit,
     /// A rollback-capable execution boundary started tracking side effects.
@@ -1941,32 +1974,136 @@ pub fn find_latest_approval_decision(
     session_id: &str,
     request_id: &str,
 ) -> std::io::Result<Option<ApprovalJournalDecision>> {
+    find_latest_approval_decision_impl(session_id, request_id, None)
+}
+
+pub fn find_latest_approval_decision_for_run(
+    session_id: &str,
+    request_id: &str,
+    run_id: &str,
+) -> std::io::Result<Option<ApprovalJournalDecision>> {
+    find_latest_approval_decision_impl(session_id, request_id, Some(run_id))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalDecisionAppendOutcome {
+    Appended,
+    Idempotent,
+    Conflict(ApprovalJournalDecision),
+}
+
+fn approval_decision_from_event(
+    event: &JournalEvent,
+    request_id: &str,
+    run_id: Option<&str>,
+) -> Option<ApprovalJournalDecision> {
+    if event.event_type != JournalEventType::ApprovalDecision {
+        return None;
+    }
+    let metadata = event.metadata.as_ref()?;
+    let found_request_id = approval_metadata_str(metadata, "request_id")?;
+    if found_request_id != request_id {
+        return None;
+    }
+    let found_run_id = approval_metadata_str(metadata, "run_id");
+    if let Some(expected_run_id) = run_id
+        && found_run_id.as_deref() != Some(expected_run_id)
+    {
+        return None;
+    }
+    let decision = approval_metadata_str(metadata, "decision")?;
+    Some(ApprovalJournalDecision {
+        request_id: found_request_id,
+        run_id: found_run_id,
+        decision,
+        reason: approval_metadata_str(metadata, "reason"),
+        tool_name: approval_metadata_str(metadata, "tool_name"),
+        approval_kind: approval_metadata_str(metadata, "approval_kind"),
+    })
+}
+
+fn approval_decision_matches(
+    existing: &ApprovalJournalDecision,
+    decision: &str,
+    reason: Option<&str>,
+    tool_name: Option<&str>,
+    approval_kind: Option<&str>,
+) -> bool {
+    existing.decision == decision
+        && existing.reason.as_deref() == reason
+        && existing.tool_name.as_deref() == tool_name
+        && existing.approval_kind.as_deref() == approval_kind
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn append_approval_decision_for_run_if_absent(
+    session_id: &str,
+    turn: Option<u32>,
+    request_id: &str,
+    run_id: &str,
+    tool_name: Option<&str>,
+    approval_kind: Option<&str>,
+    decision: &str,
+    reason: Option<&str>,
+) -> std::io::Result<ApprovalDecisionAppendOutcome> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    validate_session_id(session_id)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    if run_id.trim().is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "run_id required",
+        ));
+    }
+
+    let path = journal_file_path(session_id);
+    let mut file = open_locked_journal_file(&path)?;
+    let mut content = String::new();
+    file.seek(SeekFrom::Start(0))?;
+    file.read_to_string(&mut content)?;
+    let events = parse_journal_text(&content).0;
+    for event in events.iter().rev() {
+        let Some(existing) = approval_decision_from_event(event, request_id, Some(run_id)) else {
+            continue;
+        };
+        return if approval_decision_matches(&existing, decision, reason, tool_name, approval_kind) {
+            Ok(ApprovalDecisionAppendOutcome::Idempotent)
+        } else {
+            Ok(ApprovalDecisionAppendOutcome::Conflict(existing))
+        };
+    }
+
+    let event = JournalEvent::approval_decision_for_run(
+        Some(session_id),
+        turn,
+        request_id,
+        Some(run_id),
+        tool_name,
+        approval_kind,
+        decision,
+        reason,
+    );
+    let events = prepend_session_start_if_needed(&path, std::slice::from_ref(&event))?;
+    let buf = serialize_journal_events(events.as_ref())?;
+    file.write_all(&buf)?;
+    file.sync_data()?;
+    update_cached_session_start_state_from_events(&path, events.as_ref());
+    Ok(ApprovalDecisionAppendOutcome::Appended)
+}
+
+fn find_latest_approval_decision_impl(
+    session_id: &str,
+    request_id: &str,
+    run_id: Option<&str>,
+) -> std::io::Result<Option<ApprovalJournalDecision>> {
     validate_session_id(session_id)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let events = read_journal(session_id)?;
-    for event in events.into_iter().rev() {
-        if event.event_type != JournalEventType::ApprovalDecision {
-            continue;
-        }
-        let Some(metadata) = event.metadata.as_ref() else {
-            continue;
+    for event in events.iter().rev() {
+        if let Some(decision) = approval_decision_from_event(event, request_id, run_id) {
+            return Ok(Some(decision));
         };
-        let Some(found_request_id) = approval_metadata_str(metadata, "request_id") else {
-            continue;
-        };
-        if found_request_id != request_id {
-            continue;
-        }
-        let Some(decision) = approval_metadata_str(metadata, "decision") else {
-            continue;
-        };
-        return Ok(Some(ApprovalJournalDecision {
-            request_id: found_request_id,
-            decision,
-            reason: approval_metadata_str(metadata, "reason"),
-            tool_name: approval_metadata_str(metadata, "tool_name"),
-            approval_kind: approval_metadata_str(metadata, "approval_kind"),
-        }));
     }
     Ok(None)
 }
@@ -1974,6 +2111,22 @@ pub fn find_latest_approval_decision(
 pub fn find_latest_approval_required(
     session_id: &str,
     request_id: &str,
+) -> std::io::Result<Option<ApprovalJournalRequest>> {
+    find_latest_approval_required_impl(session_id, request_id, None)
+}
+
+pub fn find_latest_approval_required_for_run(
+    session_id: &str,
+    request_id: &str,
+    run_id: &str,
+) -> std::io::Result<Option<ApprovalJournalRequest>> {
+    find_latest_approval_required_impl(session_id, request_id, Some(run_id))
+}
+
+fn find_latest_approval_required_impl(
+    session_id: &str,
+    request_id: &str,
+    run_id: Option<&str>,
 ) -> std::io::Result<Option<ApprovalJournalRequest>> {
     validate_session_id(session_id)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
@@ -1991,11 +2144,115 @@ pub fn find_latest_approval_required(
         if found_request_id != request_id {
             continue;
         }
+        let found_run_id = approval_metadata_str(metadata, "run_id");
+        if let Some(expected_run_id) = run_id
+            && found_run_id.as_deref() != Some(expected_run_id)
+        {
+            continue;
+        }
         return Ok(Some(ApprovalJournalRequest {
             request_id: found_request_id,
+            run_id: found_run_id,
             turn: event.turn,
             tool_name: approval_metadata_str(metadata, "tool_name"),
             approval_kind: approval_metadata_str(metadata, "approval_kind"),
+        }));
+    }
+    Ok(None)
+}
+
+fn ask_user_metadata_str(metadata: &serde_json::Value, field: &str) -> Option<String> {
+    metadata
+        .get("ask_user")
+        .and_then(|ask_user| ask_user.get(field))
+        .and_then(|value| value.as_str())
+        .map(ToString::to_string)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AskUserJournalResponse {
+    pub request_id: String,
+    pub run_id: Option<String>,
+    pub status: String,
+    pub answers: Option<serde_json::Value>,
+}
+
+impl AskUserJournalResponse {
+    pub fn interaction_contract(
+        &self,
+        session_id: &str,
+        user_id: Option<&str>,
+    ) -> Option<InteractionContract> {
+        let run_id = self.run_id.as_deref()?;
+        let identity =
+            InteractionIdentity::new(user_id, session_id, run_id, self.request_id.as_str());
+        if !identity.is_run_scoped() {
+            return None;
+        }
+        Some(InteractionContract::new(
+            InteractionKind::UserPrompt,
+            identity,
+            ask_user_response_status(&self.status),
+            Some("session_journal.ask_user_response".to_string()),
+        ))
+    }
+}
+
+pub fn find_latest_ask_user_response(
+    session_id: &str,
+    request_id: &str,
+) -> std::io::Result<Option<AskUserJournalResponse>> {
+    find_latest_ask_user_response_impl(session_id, request_id, None)
+}
+
+pub fn find_latest_ask_user_response_for_run(
+    session_id: &str,
+    request_id: &str,
+    run_id: &str,
+) -> std::io::Result<Option<AskUserJournalResponse>> {
+    find_latest_ask_user_response_impl(session_id, request_id, Some(run_id))
+}
+
+fn find_latest_ask_user_response_impl(
+    session_id: &str,
+    request_id: &str,
+    run_id: Option<&str>,
+) -> std::io::Result<Option<AskUserJournalResponse>> {
+    validate_session_id(session_id)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let events = read_journal(session_id)?;
+    for event in events.into_iter().rev() {
+        if event.event_type != JournalEventType::AskUserResponse {
+            continue;
+        }
+        let Some(metadata) = event.metadata.as_ref() else {
+            continue;
+        };
+        let Some(found_request_id) = ask_user_metadata_str(metadata, "request_id") else {
+            continue;
+        };
+        if found_request_id != request_id {
+            continue;
+        }
+        let found_run_id = ask_user_metadata_str(metadata, "run_id");
+        if let Some(expected_run_id) = run_id
+            && found_run_id.as_deref() != Some(expected_run_id)
+        {
+            continue;
+        }
+        let Some(status) = ask_user_metadata_str(metadata, "status") else {
+            continue;
+        };
+        let answers = metadata
+            .get("ask_user")
+            .and_then(|ask_user| ask_user.get("answers"))
+            .filter(|answers| !answers.is_null())
+            .cloned();
+        return Ok(Some(AskUserJournalResponse {
+            request_id: found_request_id,
+            run_id: found_run_id,
+            status,
+            answers,
         }));
     }
     Ok(None)
@@ -3058,6 +3315,26 @@ impl JournalEvent {
         approval_kind: &str,
         detail: Option<&str>,
     ) -> Self {
+        Self::approval_required_for_run(
+            session_id,
+            turn,
+            request_id,
+            None,
+            tool_name,
+            approval_kind,
+            detail,
+        )
+    }
+
+    pub fn approval_required_for_run(
+        session_id: Option<&str>,
+        turn: Option<u32>,
+        request_id: &str,
+        run_id: Option<&str>,
+        tool_name: &str,
+        approval_kind: &str,
+        detail: Option<&str>,
+    ) -> Self {
         let mut evt = Self::base(JournalEventType::ApprovalRequired, session_id);
         evt.turn = turn;
         evt.user_input = Some(truncate(
@@ -3067,6 +3344,7 @@ impl JournalEvent {
         evt.metadata = Some(serde_json::json!({
             "approval": {
                 "request_id": request_id,
+                "run_id": run_id.filter(|s| !s.is_empty()),
                 "tool_name": tool_name,
                 "approval_kind": approval_kind,
                 "detail": detail.filter(|s| !s.is_empty()),
@@ -3084,6 +3362,29 @@ impl JournalEvent {
         decision: &str,
         reason: Option<&str>,
     ) -> Self {
+        Self::approval_decision_for_run(
+            session_id,
+            turn,
+            request_id,
+            None,
+            tool_name,
+            approval_kind,
+            decision,
+            reason,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn approval_decision_for_run(
+        session_id: Option<&str>,
+        turn: Option<u32>,
+        request_id: &str,
+        run_id: Option<&str>,
+        tool_name: Option<&str>,
+        approval_kind: Option<&str>,
+        decision: &str,
+        reason: Option<&str>,
+    ) -> Self {
         let mut evt = Self::base(JournalEventType::ApprovalDecision, session_id);
         evt.turn = turn;
         let summary_tool = tool_name.filter(|s| !s.is_empty()).unwrap_or("unknown");
@@ -3094,6 +3395,7 @@ impl JournalEvent {
         evt.metadata = Some(serde_json::json!({
             "approval": {
                 "request_id": request_id,
+                "run_id": run_id.filter(|s| !s.is_empty()),
                 "tool_name": tool_name.filter(|s| !s.is_empty()),
                 "approval_kind": approval_kind.filter(|s| !s.is_empty()),
                 "decision": decision,
@@ -3110,6 +3412,17 @@ impl JournalEvent {
         tool_name: &str,
         approval_kind: &str,
     ) -> Self {
+        Self::approval_timeout_for_run(session_id, turn, request_id, None, tool_name, approval_kind)
+    }
+
+    pub fn approval_timeout_for_run(
+        session_id: Option<&str>,
+        turn: Option<u32>,
+        request_id: &str,
+        run_id: Option<&str>,
+        tool_name: &str,
+        approval_kind: &str,
+    ) -> Self {
         let mut evt = Self::base(JournalEventType::ApprovalTimeout, session_id);
         evt.turn = turn;
         evt.error = Some(truncate(
@@ -3119,8 +3432,54 @@ impl JournalEvent {
         evt.metadata = Some(serde_json::json!({
             "approval": {
                 "request_id": request_id,
+                "run_id": run_id.filter(|s| !s.is_empty()),
                 "tool_name": tool_name,
                 "approval_kind": approval_kind,
+            }
+        }));
+        evt
+    }
+
+    pub fn ask_user_prompted(
+        session_id: Option<&str>,
+        turn: Option<u32>,
+        request_id: &str,
+        run_id: Option<&str>,
+        prompt: serde_json::Value,
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::AskUserPrompted, session_id);
+        evt.turn = turn;
+        evt.user_input = Some(truncate(&format!("ask_user_prompted {request_id}"), 200));
+        evt.metadata = Some(serde_json::json!({
+            "ask_user": {
+                "request_id": request_id,
+                "run_id": run_id.filter(|s| !s.is_empty()),
+                "prompt": prompt,
+            }
+        }));
+        evt
+    }
+
+    pub fn ask_user_response(
+        session_id: Option<&str>,
+        turn: Option<u32>,
+        request_id: &str,
+        run_id: Option<&str>,
+        status: &str,
+        answers: Option<serde_json::Value>,
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::AskUserResponse, session_id);
+        evt.turn = turn;
+        evt.user_input = Some(truncate(
+            &format!("ask_user_response {request_id} {status}"),
+            200,
+        ));
+        evt.metadata = Some(serde_json::json!({
+            "ask_user": {
+                "request_id": request_id,
+                "run_id": run_id.filter(|s| !s.is_empty()),
+                "status": status,
+                "answers": answers,
             }
         }));
         evt
@@ -4351,6 +4710,9 @@ pub fn run_session_maintenance(
 #[cfg(test)]
 mod approval_tests {
     use super::*;
+    use crate::interaction_contract::{
+        InteractionDurableStore, InteractionKind, InteractionStatus,
+    };
 
     #[test]
     fn find_latest_approval_decision_reads_latest_matching_entry() {
@@ -4436,6 +4798,302 @@ mod approval_tests {
         assert_eq!(found.turn, Some(11));
         assert_eq!(found.tool_name.as_deref(), Some("bash"));
         assert_eq!(found.approval_kind.as_deref(), Some("explicit"));
+    }
+
+    #[test]
+    fn approval_lookup_for_run_ignores_same_request_id_from_other_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let writer = JournalWriter::new("sess-approval-run").unwrap();
+
+        writer
+            .append(&JournalEvent::approval_required_for_run(
+                Some("sess-approval-run"),
+                Some(1),
+                "shared-req",
+                Some("run-a"),
+                "bash",
+                "explicit",
+                Some("rm -rf tmp"),
+            ))
+            .unwrap();
+        writer
+            .append(&JournalEvent::approval_decision_for_run(
+                Some("sess-approval-run"),
+                Some(1),
+                "shared-req",
+                Some("run-a"),
+                Some("bash"),
+                Some("explicit"),
+                "deny",
+                Some("wrong run"),
+            ))
+            .unwrap();
+        writer
+            .append(&JournalEvent::approval_required_for_run(
+                Some("sess-approval-run"),
+                Some(2),
+                "shared-req",
+                Some("run-b"),
+                "write_file",
+                "standard",
+                Some("src/lib.rs"),
+            ))
+            .unwrap();
+        writer
+            .append(&JournalEvent::approval_decision_for_run(
+                Some("sess-approval-run"),
+                Some(2),
+                "shared-req",
+                Some("run-b"),
+                Some("write_file"),
+                Some("standard"),
+                "allow",
+                None,
+            ))
+            .unwrap();
+
+        let request =
+            find_latest_approval_required_for_run("sess-approval-run", "shared-req", "run-b")
+                .unwrap()
+                .expect("run-b approval request");
+        assert_eq!(request.run_id.as_deref(), Some("run-b"));
+        assert_eq!(request.turn, Some(2));
+        assert_eq!(request.tool_name.as_deref(), Some("write_file"));
+
+        let decision =
+            find_latest_approval_decision_for_run("sess-approval-run", "shared-req", "run-b")
+                .unwrap()
+                .expect("run-b approval decision");
+        assert_eq!(decision.run_id.as_deref(), Some("run-b"));
+        assert_eq!(decision.decision, "allow");
+        assert_eq!(decision.reason, None);
+
+        assert!(
+            find_latest_approval_decision_for_run("sess-approval-run", "shared-req", "run-missing")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn approval_decision_projects_to_run_scoped_interaction_contract() {
+        let decision = ApprovalJournalDecision {
+            request_id: "req-contract".into(),
+            run_id: Some("run-contract".into()),
+            decision: "deny".into(),
+            reason: Some("not safe".into()),
+            tool_name: Some("bash".into()),
+            approval_kind: Some("explicit".into()),
+        };
+
+        let contract = decision
+            .interaction_contract("sess-contract", Some("user-contract"))
+            .expect("run-scoped approval decision should become an interaction contract");
+
+        assert_eq!(contract.kind, InteractionKind::Approval);
+        assert_eq!(
+            contract.durable_store,
+            InteractionDurableStore::SessionJournal
+        );
+        assert_eq!(contract.status, InteractionStatus::Resolved);
+        assert_eq!(contract.identity.user_id.as_deref(), Some("user-contract"));
+        assert_eq!(contract.identity.session_id, "sess-contract");
+        assert_eq!(contract.identity.run_id, "run-contract");
+        assert_eq!(contract.identity.request_id, "req-contract");
+        assert!(contract.is_wait_satisfied());
+    }
+
+    #[test]
+    fn approval_decision_without_run_id_is_not_a_cross_pod_contract() {
+        let decision = ApprovalJournalDecision {
+            request_id: "legacy-req".into(),
+            run_id: None,
+            decision: "allow".into(),
+            reason: None,
+            tool_name: None,
+            approval_kind: None,
+        };
+
+        assert!(
+            decision
+                .interaction_contract("sess-contract", Some("user-contract"))
+                .is_none(),
+            "legacy session/request-only decisions are not safe no-sticky interaction facts"
+        );
+    }
+
+    #[test]
+    fn append_approval_decision_for_run_is_idempotent_and_conflict_safe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+
+        let first = append_approval_decision_for_run_if_absent(
+            "sess-approval-idempotent",
+            Some(3),
+            "req-idem",
+            "run-idem",
+            Some("write_file"),
+            Some("standard"),
+            "allow",
+            Some("approved"),
+        )
+        .unwrap();
+        assert_eq!(first, ApprovalDecisionAppendOutcome::Appended);
+
+        let duplicate = append_approval_decision_for_run_if_absent(
+            "sess-approval-idempotent",
+            Some(3),
+            "req-idem",
+            "run-idem",
+            Some("write_file"),
+            Some("standard"),
+            "allow",
+            Some("approved"),
+        )
+        .unwrap();
+        assert_eq!(duplicate, ApprovalDecisionAppendOutcome::Idempotent);
+
+        let conflict = append_approval_decision_for_run_if_absent(
+            "sess-approval-idempotent",
+            Some(3),
+            "req-idem",
+            "run-idem",
+            Some("write_file"),
+            Some("standard"),
+            "deny",
+            Some("late conflicting replay"),
+        )
+        .unwrap();
+        let ApprovalDecisionAppendOutcome::Conflict(existing) = conflict else {
+            panic!("expected conflict for distinct decision replay");
+        };
+        assert_eq!(existing.decision, "allow");
+        assert_eq!(existing.reason.as_deref(), Some("approved"));
+
+        let decisions = read_journal("sess-approval-idempotent")
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.event_type == JournalEventType::ApprovalDecision)
+            .count();
+        assert_eq!(decisions, 1, "idempotent/conflict paths must not append");
+    }
+
+    #[test]
+    fn find_latest_ask_user_response_reads_latest_matching_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let writer = JournalWriter::new("sess-ask-user").unwrap();
+
+        writer
+            .append(&JournalEvent::ask_user_prompted(
+                Some("sess-ask-user"),
+                Some(5),
+                "ask-1",
+                Some("run-1"),
+                serde_json::json!({"questions": []}),
+            ))
+            .unwrap();
+        writer
+            .append(&JournalEvent::ask_user_response(
+                Some("sess-ask-user"),
+                Some(5),
+                "ask-1",
+                Some("run-1"),
+                "submitted",
+                Some(serde_json::json!({
+                    "answers": [{
+                        "question": "Continue?",
+                        "answers": ["yes"],
+                        "multi_select": false
+                    }]
+                })),
+            ))
+            .unwrap();
+
+        let found = find_latest_ask_user_response("sess-ask-user", "ask-1")
+            .unwrap()
+            .expect("ask_user response");
+        assert_eq!(found.request_id, "ask-1");
+        assert_eq!(found.run_id.as_deref(), Some("run-1"));
+        assert_eq!(found.status, "submitted");
+        assert_eq!(
+            found.answers.unwrap()["answers"][0]["answers"][0].as_str(),
+            Some("yes")
+        );
+    }
+
+    #[test]
+    fn ask_user_response_projects_to_run_scoped_interaction_contract() {
+        let response = AskUserJournalResponse {
+            request_id: "ask-contract".into(),
+            run_id: Some("run-contract".into()),
+            status: "cancelled".into(),
+            answers: None,
+        };
+
+        let contract = response
+            .interaction_contract("sess-contract", Some("user-contract"))
+            .expect("run-scoped ask_user response should become an interaction contract");
+
+        assert_eq!(contract.kind, InteractionKind::UserPrompt);
+        assert_eq!(
+            contract.durable_store,
+            InteractionDurableStore::SessionJournal
+        );
+        assert_eq!(contract.status, InteractionStatus::Cancelled);
+        assert_eq!(contract.identity.user_id.as_deref(), Some("user-contract"));
+        assert_eq!(contract.identity.session_id, "sess-contract");
+        assert_eq!(contract.identity.run_id, "run-contract");
+        assert_eq!(contract.identity.request_id, "ask-contract");
+        assert!(contract.is_wait_satisfied());
+    }
+
+    #[test]
+    fn ask_user_response_lookup_for_run_ignores_other_run_same_request_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let writer = JournalWriter::new("sess-ask-user-run").unwrap();
+
+        writer
+            .append(&JournalEvent::ask_user_response(
+                Some("sess-ask-user-run"),
+                Some(1),
+                "ask-shared",
+                Some("run-a"),
+                "submitted",
+                Some(serde_json::json!({"answers": [{"question": "A?", "answers": ["a"]}]})),
+            ))
+            .unwrap();
+        writer
+            .append(&JournalEvent::ask_user_response(
+                Some("sess-ask-user-run"),
+                Some(2),
+                "ask-shared",
+                Some("run-b"),
+                "cancelled",
+                None,
+            ))
+            .unwrap();
+
+        let found =
+            find_latest_ask_user_response_for_run("sess-ask-user-run", "ask-shared", "run-a")
+                .unwrap()
+                .expect("run-a ask_user response");
+        assert_eq!(found.run_id.as_deref(), Some("run-a"));
+        assert_eq!(found.status, "submitted");
+        assert_eq!(
+            found.answers.unwrap()["answers"][0]["answers"][0].as_str(),
+            Some("a")
+        );
+
+        let cancelled =
+            find_latest_ask_user_response_for_run("sess-ask-user-run", "ask-shared", "run-b")
+                .unwrap()
+                .expect("run-b ask_user response");
+        assert_eq!(cancelled.run_id.as_deref(), Some("run-b"));
+        assert_eq!(cancelled.status, "cancelled");
+        assert!(cancelled.answers.is_none());
     }
 
     #[test]

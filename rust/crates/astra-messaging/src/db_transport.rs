@@ -29,8 +29,7 @@
 //! Created by [`ensure_schema()`]:
 //! ```sql
 //! CREATE TABLE IF NOT EXISTS agent_message_queue (
-//!     id            BIGINT AUTO_INCREMENT PRIMARY KEY,
-//!     message_id    VARCHAR(36) NOT NULL,
+//!     message_id    VARCHAR(36) PRIMARY KEY,
 //!     from_run_id   VARCHAR(128) NOT NULL,
 //!     from_agent_id VARCHAR(128) NOT NULL,
 //!     to_run_id     VARCHAR(128),          -- NULL for broadcast
@@ -43,10 +42,20 @@
 //!     status        VARCHAR(16) DEFAULT 'pending', -- pending/claimed/acked/failed
 //!     claimed_by    VARCHAR(256),         -- consumer ID that claimed the message
 //!     claimed_at_ms BIGINT,               -- when the message was claimed
+//!     claim_token   VARCHAR(64),          -- unique token for one direct claim batch
 //!     attempt_count INT DEFAULT 0,        -- number of delivery attempts
 //!     created_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-//!     INDEX idx_amq_direct    (to_run_id, to_agent_id, status, id),
-//!     INDEX idx_amq_broadcast (delegation_id, is_broadcast, status, id)
+//!     INDEX idx_amq_direct    (to_run_id, to_agent_id, status, created_at, message_id),
+//!     INDEX idx_amq_broadcast (delegation_id, is_broadcast, status, created_at, message_id)
+//! );
+//!
+//! CREATE TABLE IF NOT EXISTS agent_message_broadcast_delivery (
+//!     message_id    VARCHAR(36) NOT NULL,
+//!     consumer_id   VARCHAR(256) NOT NULL,
+//!     delegation_id VARCHAR(128) NOT NULL,
+//!     delivered_at  DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+//!     PRIMARY KEY (message_id, consumer_id),
+//!     INDEX idx_ambd_consumer (consumer_id, delegation_id, delivered_at)
 //! );
 //! ```
 
@@ -55,7 +64,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use sqlx::mysql::MySqlRow;
 use sqlx::{MySql, Pool, Row, query};
 use tokio::sync::{RwLock, mpsc, watch};
 
@@ -68,6 +76,12 @@ const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Maximum number of messages to fetch per poll cycle.
 const POLL_BATCH_SIZE: i64 = 100;
 
+/// Maximum queue rows pruned by a single maintenance statement.
+const QUEUE_CLEANUP_BATCH_LIMIT: i64 = 1000;
+
+/// Maximum broadcast delivery rows pruned by a single maintenance statement.
+const BROADCAST_DELIVERY_CLEANUP_BATCH_LIMIT: i64 = 1000;
+
 /// Initial backoff on DB poll error (doubles each consecutive failure).
 const INITIAL_BACKOFF: Duration = Duration::from_millis(200);
 
@@ -76,6 +90,25 @@ const MAX_BACKOFF: Duration = Duration::from_secs(10);
 
 /// After this many consecutive failures, log a critical warning.
 const CRITICAL_FAILURE_THRESHOLD: u32 = 30;
+
+const CLEANUP_EXPIRED_MESSAGES_SQL: &str = "DELETE FROM agent_message_queue
+             WHERE ttl_ms IS NOT NULL
+               AND timestamp_ms < (? - ttl_ms)
+             ORDER BY created_at ASC, message_id ASC
+             LIMIT ?";
+
+const CLEANUP_TERMINAL_MESSAGES_SQL: &str = "DELETE FROM agent_message_queue
+             WHERE timestamp_ms < ?
+               AND status IN ('acked', 'failed')
+             ORDER BY created_at ASC, message_id ASC
+             LIMIT ?";
+
+const CLEANUP_ORPHAN_BROADCAST_DELIVERY_SQL: &str = "DELETE FROM agent_message_broadcast_delivery
+         WHERE message_id NOT IN (
+             SELECT message_id FROM agent_message_queue
+         )
+         ORDER BY message_id ASC, consumer_id ASC
+         LIMIT ?";
 
 // ─── Metrics ────────────────────────────────────────────────────────────────
 
@@ -91,12 +124,13 @@ pub struct TransportMetrics {
 
 // ─── Schema ─────────────────────────────────────────────────────────────────
 
-/// Create the `agent_message_queue` table if it doesn't exist.
+/// Create the message transport tables if they don't exist.
 pub async fn ensure_schema(pool: &Pool<MySql>) -> Result<(), sqlx::Error> {
+    recreate_legacy_agent_message_queue_if_needed(pool).await?;
+
     query(
         "CREATE TABLE IF NOT EXISTS agent_message_queue (
-            id            BIGINT AUTO_INCREMENT PRIMARY KEY,
-            message_id    VARCHAR(36) NOT NULL,
+            message_id    VARCHAR(36) PRIMARY KEY,
             from_run_id   VARCHAR(128) NOT NULL,
             from_agent_id VARCHAR(128) NOT NULL,
             to_run_id     VARCHAR(128),
@@ -109,14 +143,93 @@ pub async fn ensure_schema(pool: &Pool<MySql>) -> Result<(), sqlx::Error> {
             status        VARCHAR(16) NOT NULL DEFAULT 'pending',
             claimed_by    VARCHAR(256),
             claimed_at_ms BIGINT,
+            claim_token   VARCHAR(64),
             attempt_count INT NOT NULL DEFAULT 0,
             created_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_amq_direct    (to_run_id, to_agent_id, status, id),
-            INDEX idx_amq_broadcast (delegation_id, is_broadcast, status, id)
+            INDEX idx_amq_direct    (to_run_id, to_agent_id, status, created_at, message_id),
+            INDEX idx_amq_broadcast (delegation_id, is_broadcast, status, created_at, message_id)
         )",
     )
     .execute(pool)
     .await?;
+    ensure_agent_message_queue_claim_token_column(pool).await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS agent_message_broadcast_delivery (
+            message_id    VARCHAR(36) NOT NULL,
+            consumer_id   VARCHAR(256) NOT NULL,
+            delegation_id VARCHAR(128) NOT NULL,
+            delivered_at  DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (message_id, consumer_id),
+            INDEX idx_ambd_consumer (consumer_id, delegation_id, delivered_at)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn ensure_agent_message_queue_claim_token_column(
+    pool: &Pool<MySql>,
+) -> Result<(), sqlx::Error> {
+    let row = query(
+        "SELECT COUNT(*) AS cnt
+         FROM INFORMATION_SCHEMA.COLUMNS
+         WHERE TABLE_SCHEMA = DATABASE()
+           AND TABLE_NAME = 'agent_message_queue'
+           AND COLUMN_NAME = 'claim_token'",
+    )
+    .fetch_one(pool)
+    .await?;
+    let existing: i64 = row.try_get("cnt")?;
+    if existing > 0 {
+        return Ok(());
+    }
+    query("ALTER TABLE agent_message_queue ADD COLUMN claim_token VARCHAR(64)")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+async fn recreate_legacy_agent_message_queue_if_needed(
+    pool: &Pool<MySql>,
+) -> Result<(), sqlx::Error> {
+    let row = query(
+        "SELECT COUNT(*) AS cnt
+         FROM INFORMATION_SCHEMA.COLUMNS
+         WHERE TABLE_SCHEMA = DATABASE()
+           AND TABLE_NAME = 'agent_message_queue'
+           AND COLUMN_NAME = 'id'",
+    )
+    .fetch_one(pool)
+    .await?;
+    let legacy_id_columns: i64 = row.try_get("cnt")?;
+    if legacy_id_columns == 0 {
+        return Ok(());
+    }
+
+    // Safety gate: refuse auto-migration; require explicit operator opt-in.
+    let force_migrate = std::env::var("ASTRA_MSG_QUEUE_MIGRATE_DROP_LEGACY")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !force_migrate {
+        return Err(sqlx::Error::Protocol(
+            "legacy agent_message_queue schema detected (AUTO_INCREMENT `id` column). \
+             Drain all pending messages, then set ASTRA_MSG_QUEUE_MIGRATE_DROP_LEGACY=true to recreate."
+                .into(),
+        ));
+    }
+
+    tracing::warn!(
+        target: "astra_runtime::messaging::db_transport",
+        "ASTRA_MSG_QUEUE_MIGRATE_DROP_LEGACY=true: dropping legacy agent_message_queue and agent_message_broadcast_delivery"
+    );
+    query("DROP TABLE IF EXISTS agent_message_broadcast_delivery")
+        .execute(pool)
+        .await?;
+    query("DROP TABLE IF EXISTS agent_message_queue")
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -207,34 +320,22 @@ impl DatabaseTransport {
         }
     }
 
-    /// Delete expired messages from the queue.
+    /// Delete one bounded batch of expired messages from the queue.
     ///
-    /// Call periodically to prevent unbounded table growth.
+    /// Call periodically until it returns 0 to prevent unbounded table growth.
     pub async fn cleanup_expired(&self) -> Result<u64, sqlx::Error> {
         let now_ms = chrono::Utc::now().timestamp_millis();
-        let result = query(
-            "DELETE FROM agent_message_queue
-             WHERE ttl_ms IS NOT NULL
-               AND timestamp_ms < (? - ttl_ms)",
-        )
-        .bind(now_ms)
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected())
+        let deleted = cleanup_expired_in_pool(&self.pool, now_ms).await?;
+        cleanup_broadcast_delivery_orphans(&self.pool).await?;
+        Ok(deleted)
     }
 
-    /// Delete terminal messages older than the given duration.
+    /// Delete one bounded batch of terminal messages older than the given duration.
     pub async fn cleanup_older_than(&self, max_age: Duration) -> Result<u64, sqlx::Error> {
         let cutoff_ms = chrono::Utc::now().timestamp_millis() - max_age.as_millis() as i64;
-        let result = query(
-            "DELETE FROM agent_message_queue
-             WHERE timestamp_ms < ?
-               AND status IN ('acked', 'failed')",
-        )
-        .bind(cutoff_ms)
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected())
+        let deleted = cleanup_terminal_older_than_in_pool(&self.pool, cutoff_ms).await?;
+        cleanup_broadcast_delivery_orphans(&self.pool).await?;
+        Ok(deleted)
     }
 
     /// Number of currently registered agents (local process only).
@@ -261,7 +362,7 @@ impl DatabaseTransport {
     ) -> Result<bool, MailboxError> {
         let result = query(
             "UPDATE agent_message_queue
-             SET status = 'acked', claimed_by = NULL, claimed_at_ms = NULL
+             SET status = 'acked', claimed_by = NULL, claimed_at_ms = NULL, claim_token = NULL
              WHERE message_id = ? AND status = 'claimed' AND claimed_by = ?",
         )
         .bind(message_id)
@@ -280,7 +381,7 @@ impl DatabaseTransport {
     ) -> Result<bool, MailboxError> {
         let result = query(
             "UPDATE agent_message_queue
-             SET status = 'failed', claimed_by = NULL, claimed_at_ms = NULL
+             SET status = 'failed', claimed_by = NULL, claimed_at_ms = NULL, claim_token = NULL
              WHERE message_id = ? AND status = 'claimed' AND claimed_by = ?",
         )
         .bind(message_id)
@@ -558,7 +659,6 @@ async fn poll_loop(
     metrics: Arc<TransportMetrics>,
     consumer_id: String,
 ) {
-    let mut last_broadcast_id: i64 = 0;
     let mut consecutive_errors: u32 = 0;
     let mut current_backoff = INITIAL_BACKOFF;
 
@@ -576,14 +676,17 @@ async fn poll_loop(
         // 1. Claim direct messages atomically (UPDATE then SELECT).
         //    This ensures no two consumers process the same direct message.
         let now_ms = chrono::Utc::now().timestamp_millis();
+        let claim_token = uuid::Uuid::new_v4().to_string();
         let claim_result = query(
             "UPDATE agent_message_queue
-             SET status = 'claimed', claimed_by = ?, claimed_at_ms = ?, attempt_count = attempt_count + 1
+             SET status = 'claimed', claimed_by = ?, claimed_at_ms = ?, claim_token = ?,
+                 attempt_count = attempt_count + 1
              WHERE to_run_id = ? AND to_agent_id = ? AND status = 'pending'
-             ORDER BY id ASC LIMIT ?",
+             ORDER BY created_at ASC, message_id ASC LIMIT ?",
         )
         .bind(&consumer_id)
         .bind(now_ms)
+        .bind(&claim_token)
         .bind(&addr.run_id)
         .bind(&addr.agent_id)
         .bind(POLL_BATCH_SIZE)
@@ -594,15 +697,15 @@ async fn poll_loop(
             Ok(result) if result.rows_affected() > 0 => {
                 // Fetch the messages we just claimed.
                 let fetch_result = query(
-                    "SELECT id, CAST(id AS CHAR) AS row_id_text, message_id, payload_json FROM agent_message_queue
+                    "SELECT message_id, payload_json FROM agent_message_queue
                      WHERE to_run_id = ? AND to_agent_id = ? AND status = 'claimed' AND claimed_by = ?
-                       AND claimed_at_ms = ?
-                     ORDER BY id ASC LIMIT ?",
+                       AND claim_token = ?
+                     ORDER BY created_at ASC, message_id ASC LIMIT ?",
                 )
                 .bind(&addr.run_id)
                 .bind(&addr.agent_id)
                 .bind(&consumer_id)
-                .bind(now_ms)
+                .bind(&claim_token)
                 .bind(POLL_BATCH_SIZE)
                 .fetch_all(&pool)
                 .await;
@@ -610,51 +713,32 @@ async fn poll_loop(
                 if let Ok(rows) = fetch_result {
                     for row in rows {
                         let message_id: Option<String> = row.try_get("message_id").ok();
-                        let row_id = match extract_queue_row_id(&row) {
-                            Ok(id) => Some(id),
-                            Err(e) => {
-                                had_error = true;
-                                metrics
-                                    .poll_errors
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                tracing::warn!(target: "astra_runtime::messaging::db_transport",
-                                    "  ⚠ messaging: failed to extract direct row id for {}@{} (message_id: {}): {:?}",
-                                    addr.agent_id,
-                                    addr.run_id,
-                                    message_id.as_deref().unwrap_or("<unavailable>"),
-                                    e
-                                );
-                                None
-                            }
-                        };
-                        if row_id.is_none() {
+                        if message_id.is_none() {
+                            had_error = true;
                             metrics
-                                .messages_dropped
+                                .poll_errors
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            match mark_direct_failed_by_identity(
+                            if let Err(e) = release_direct_claimed_batch_for_consumer_in_pool(
                                 &pool,
-                                None,
-                                message_id.as_deref(),
                                 &consumer_id,
+                                &claim_token,
+                                max_delivery_attempts,
                             )
                             .await
                             {
-                                Ok(()) => continue,
-                                Err(e) => {
-                                    had_error = true;
-                                    metrics
-                                        .poll_errors
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    tracing::warn!(target: "astra_runtime::messaging::db_transport",
-                                        "  ⚠ messaging: failed to dead-letter direct row without id (message_id: {}) for {}@{}: {:?}",
-                                        message_id.as_deref().unwrap_or("<unavailable>"),
-                                        addr.agent_id,
-                                        addr.run_id,
-                                        e
-                                    );
-                                    break;
-                                }
+                                tracing::warn!(target: "astra_runtime::messaging::db_transport",
+                                    "  ⚠ messaging: failed to release direct claimed batch after missing message_id for {}@{}: {:?}",
+                                    addr.agent_id,
+                                    addr.run_id,
+                                    e
+                                );
                             }
+                            tracing::warn!(target: "astra_runtime::messaging::db_transport",
+                                "  ⚠ messaging: claimed direct row without message_id for {}@{}; released current claim batch",
+                                addr.agent_id,
+                                addr.run_id,
+                            );
+                            break;
                         }
                         let json: String = match row.try_get("payload_json") {
                             Ok(j) => j,
@@ -664,7 +748,6 @@ async fn poll_loop(
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 match mark_direct_failed_by_identity(
                                     &pool,
-                                    row_id,
                                     message_id.as_deref(),
                                     &consumer_id,
                                 )
@@ -677,8 +760,7 @@ async fn poll_loop(
                                             .poll_errors
                                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         tracing::warn!(target: "astra_runtime::messaging::db_transport",
-                                            "  ⚠ messaging: failed to dead-letter undecodable direct row (row_id: {:?}, message_id: {}) for {}@{}: {:?}",
-                                            row_id,
+                                            "  ⚠ messaging: failed to dead-letter undecodable direct row (message_id: {}) for {}@{}: {:?}",
                                             message_id.as_deref().unwrap_or("<unavailable>"),
                                             addr.agent_id,
                                             addr.run_id,
@@ -713,16 +795,17 @@ async fn poll_loop(
                                     }
                                     return;
                                 }
-                                let row_id = row_id.expect("checked above");
-                                if let Err(e) = mark_direct_acked(&pool, row_id, &consumer_id).await
+                                let message_id = message_id.as_deref().expect("checked above");
+                                if let Err(e) =
+                                    mark_direct_acked(&pool, message_id, &consumer_id).await
                                 {
                                     had_error = true;
                                     metrics
                                         .poll_errors
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     tracing::warn!(target: "astra_runtime::messaging::db_transport",
-                                        "  ⚠ messaging: failed to ack delivered direct row {} for {}@{}: {:?}",
-                                        row_id, addr.agent_id, addr.run_id, e
+                                        "  ⚠ messaging: failed to ack delivered direct message {} for {}@{}: {:?}",
+                                        message_id, addr.agent_id, addr.run_id, e
                                     );
                                 }
                             }
@@ -732,7 +815,6 @@ async fn poll_loop(
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 match mark_direct_failed_by_identity(
                                     &pool,
-                                    row_id,
                                     message_id.as_deref(),
                                     &consumer_id,
                                 )
@@ -745,8 +827,7 @@ async fn poll_loop(
                                             .poll_errors
                                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         tracing::warn!(target: "astra_runtime::messaging::db_transport",
-                                            "  ⚠ messaging: failed to dead-letter direct row (row_id: {:?}, message_id: {}) for {}@{}: {:?}",
-                                            row_id,
+                                            "  ⚠ messaging: failed to dead-letter direct row (message_id: {}) for {}@{}: {:?}",
                                             message_id.as_deref().unwrap_or("<unavailable>"),
                                             addr.agent_id,
                                             addr.run_id,
@@ -762,6 +843,21 @@ async fn poll_loop(
                     metrics
                         .poll_errors
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if let Err(e) = release_direct_claimed_batch_for_consumer_in_pool(
+                        &pool,
+                        &consumer_id,
+                        &claim_token,
+                        max_delivery_attempts,
+                    )
+                    .await
+                    {
+                        tracing::warn!(target: "astra_runtime::messaging::db_transport",
+                            "  ⚠ messaging: failed to release direct claimed batch after fetch error for {}@{}: {:?}",
+                            addr.agent_id,
+                            addr.run_id,
+                            e
+                        );
+                    }
                     tracing::warn!(target: "astra_runtime::messaging::db_transport",
                         "  ⚠ messaging: direct fetch error for {}@{}: {:?}",
                         addr.agent_id,
@@ -786,15 +882,21 @@ async fn poll_loop(
         }
 
         // 2. Poll broadcast messages (if in a delegation group).
-        //    Broadcasts use cursor-based reading (all agents see every broadcast).
+        //    Broadcast delivery is tracked per consumer so correctness does not
+        //    depend on a global append id or wall-clock-monotonic cursor.
         if let Some(ref did) = delegation_id {
             let broadcast_result = query(
-                "SELECT id, CAST(id AS CHAR) AS row_id_text, message_id, payload_json FROM agent_message_queue
-                 WHERE delegation_id = ? AND is_broadcast = TRUE AND id > ? AND status IN ('pending', 'claimed')
-                 ORDER BY id ASC LIMIT ?",
+                "SELECT q.message_id, q.payload_json
+                 FROM agent_message_queue q
+                 LEFT JOIN agent_message_broadcast_delivery d
+                   ON d.message_id = q.message_id AND d.consumer_id = ?
+                 WHERE q.delegation_id = ? AND q.is_broadcast = TRUE
+                   AND q.status IN ('pending', 'claimed')
+                   AND d.message_id IS NULL
+                 ORDER BY q.created_at ASC, q.message_id ASC LIMIT ?",
             )
+            .bind(&consumer_id)
             .bind(did)
-            .bind(last_broadcast_id)
             .bind(POLL_BATCH_SIZE)
             .fetch_all(&pool)
             .await;
@@ -802,71 +904,35 @@ async fn poll_loop(
             if let Ok(rows) = broadcast_result {
                 for row in rows {
                     let message_id: Option<String> = row.try_get("message_id").ok();
-                    let row_id = match extract_queue_row_id(&row) {
-                        Ok(id) => Some(id),
-                        Err(e) => {
-                            had_error = true;
-                            metrics
-                                .poll_errors
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            tracing::warn!(target: "astra_runtime::messaging::db_transport",
-                                "  ⚠ messaging: failed to extract broadcast row id for delegation {} (message_id: {}): {:?}",
-                                did,
-                                message_id.as_deref().unwrap_or("<unavailable>"),
-                                e
-                            );
-                            None
-                        }
-                    };
-                    if row_id.is_none() {
+                    if message_id.is_none() {
+                        had_error = true;
                         metrics
-                            .messages_dropped
+                            .poll_errors
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        match mark_broadcast_failed_by_identity(
-                            &pool,
-                            None,
-                            message_id.as_deref(),
-                            did,
-                        )
-                        .await
-                        {
-                            Ok(()) => continue,
-                            Err(e) => {
-                                had_error = true;
-                                metrics
-                                    .poll_errors
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                tracing::warn!(target: "astra_runtime::messaging::db_transport",
-                                    "  ⚠ messaging: failed to dead-letter broadcast row without id (message_id: {}) for delegation {}: {:?}",
-                                    message_id.as_deref().unwrap_or("<unavailable>"),
-                                    did,
-                                    e
-                                );
-                                break;
-                            }
-                        }
+                        tracing::warn!(target: "astra_runtime::messaging::db_transport",
+                            "  ⚠ messaging: broadcast row missing message_id for delegation {}",
+                            did
+                        );
+                        continue;
                     }
-                    let row_id = row_id.expect("checked above");
+                    let message_id = message_id.expect("checked above");
                     let json: String = match row.try_get("payload_json") {
                         Ok(j) => j,
                         Err(_) => {
                             metrics
                                 .messages_dropped
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            match mark_broadcast_failed(&pool, row_id).await {
-                                Ok(()) => {
-                                    advance_broadcast_cursor(&mut last_broadcast_id, row_id);
-                                }
+                            match mark_broadcast_failed_by_identity(&pool, &message_id, did).await {
+                                Ok(()) => {}
                                 Err(e) => {
                                     had_error = true;
                                     metrics
                                         .poll_errors
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     tracing::warn!(target: "astra_runtime::messaging::db_transport",
-                                        "  ⚠ messaging: failed to dead-letter undecodable broadcast row {} for delegation {}: {:?}",
-                                        row_id, did, e
+                                        "  ⚠ messaging: failed to dead-letter undecodable broadcast message {} for delegation {}: {:?}",
+                                        message_id, did, e
                                     );
-                                    advance_broadcast_cursor(&mut last_broadcast_id, row_id);
                                 }
                             }
                             continue;
@@ -875,32 +941,54 @@ async fn poll_loop(
 
                     match serde_json::from_str::<AgentMessage>(&json) {
                         Ok(msg) if !msg.is_expired() => {
-                            metrics
-                                .messages_received
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if tx.send(Arc::new(msg)).is_err() {
-                                return;
-                            }
-                            advance_broadcast_cursor(&mut last_broadcast_id, row_id);
-                        }
-                        Ok(_) | Err(_) => {
-                            metrics
-                                .messages_dropped
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            match mark_broadcast_failed(&pool, row_id).await {
-                                Ok(()) => {
-                                    advance_broadcast_cursor(&mut last_broadcast_id, row_id);
-                                }
+                            match reserve_broadcast_delivery(&pool, &message_id, &consumer_id, did)
+                                .await
+                            {
+                                Ok(true) => {}
+                                Ok(false) => continue,
                                 Err(e) => {
                                     had_error = true;
                                     metrics
                                         .poll_errors
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     tracing::warn!(target: "astra_runtime::messaging::db_transport",
-                                        "  ⚠ messaging: failed to dead-letter broadcast row {} for delegation {}: {:?}",
-                                        row_id, did, e
+                                        "  ⚠ messaging: failed to reserve broadcast delivery {} for {} in delegation {}: {:?}",
+                                        message_id, consumer_id, did, e
                                     );
-                                    advance_broadcast_cursor(&mut last_broadcast_id, row_id);
+                                    continue;
+                                }
+                            }
+                            metrics
+                                .messages_received
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if tx.send(Arc::new(msg)).is_err() {
+                                if let Err(e) =
+                                    release_broadcast_delivery(&pool, &message_id, &consumer_id)
+                                        .await
+                                {
+                                    tracing::warn!(target: "astra_runtime::messaging::db_transport",
+                                        "  ⚠ messaging: failed to release reserved broadcast delivery {} for {} after closed channel: {:?}",
+                                        message_id, consumer_id, e
+                                    );
+                                }
+                                return;
+                            }
+                        }
+                        Ok(_) | Err(_) => {
+                            metrics
+                                .messages_dropped
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            match mark_broadcast_failed_by_identity(&pool, &message_id, did).await {
+                                Ok(()) => {}
+                                Err(e) => {
+                                    had_error = true;
+                                    metrics
+                                        .poll_errors
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    tracing::warn!(target: "astra_runtime::messaging::db_transport",
+                                        "  ⚠ messaging: failed to dead-letter broadcast message {} for delegation {}: {:?}",
+                                        message_id, did, e
+                                    );
                                 }
                             }
                         }
@@ -947,26 +1035,49 @@ async fn poll_loop(
     }
 }
 
-async fn mark_broadcast_failed(pool: &Pool<MySql>, row_id: i64) -> Result<(), sqlx::Error> {
-    query(
-        "UPDATE agent_message_queue
-         SET status = 'failed', claimed_by = NULL, claimed_at_ms = NULL
-         WHERE id = ? AND is_broadcast = TRUE AND status IN ('pending', 'claimed')",
+async fn reserve_broadcast_delivery(
+    pool: &Pool<MySql>,
+    message_id: &str,
+    consumer_id: &str,
+    delegation_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let result = query(
+        "INSERT IGNORE INTO agent_message_broadcast_delivery
+         (message_id, consumer_id, delegation_id)
+         VALUES (?, ?, ?)",
     )
-    .bind(row_id)
+    .bind(message_id)
+    .bind(consumer_id)
+    .bind(delegation_id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+async fn release_broadcast_delivery(
+    pool: &Pool<MySql>,
+    message_id: &str,
+    consumer_id: &str,
+) -> Result<(), sqlx::Error> {
+    query(
+        "DELETE FROM agent_message_broadcast_delivery
+         WHERE message_id = ? AND consumer_id = ?",
+    )
+    .bind(message_id)
+    .bind(consumer_id)
     .execute(pool)
     .await?;
     Ok(())
 }
 
-async fn mark_broadcast_failed_by_message_id(
+async fn mark_broadcast_failed_by_identity(
     pool: &Pool<MySql>,
     message_id: &str,
     delegation_id: &str,
 ) -> Result<(), sqlx::Error> {
     query(
         "UPDATE agent_message_queue
-         SET status = 'failed', claimed_by = NULL, claimed_at_ms = NULL
+         SET status = 'failed', claimed_by = NULL, claimed_at_ms = NULL, claim_token = NULL
          WHERE message_id = ? AND delegation_id = ? AND is_broadcast = TRUE AND status IN ('pending', 'claimed')",
     )
     .bind(message_id)
@@ -976,46 +1087,17 @@ async fn mark_broadcast_failed_by_message_id(
     Ok(())
 }
 
-async fn mark_broadcast_failed_by_identity(
-    pool: &Pool<MySql>,
-    row_id: Option<i64>,
-    message_id: Option<&str>,
-    delegation_id: &str,
-) -> Result<(), sqlx::Error> {
-    match (row_id, message_id) {
-        (Some(row_id), _) => mark_broadcast_failed(pool, row_id).await,
-        (None, Some(message_id)) => {
-            mark_broadcast_failed_by_message_id(pool, message_id, delegation_id).await
-        }
-        (None, None) => Err(sqlx::Error::Protocol(
-            "missing row_id and message_id for broadcast failure path".into(),
-        )),
-    }
-}
-
-async fn mark_direct_failed(pool: &Pool<MySql>, row_id: i64) -> Result<(), sqlx::Error> {
-    query(
-        "UPDATE agent_message_queue
-         SET status = 'failed', claimed_by = NULL, claimed_at_ms = NULL
-         WHERE id = ? AND is_broadcast = FALSE AND status IN ('pending', 'claimed')",
-    )
-    .bind(row_id)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
 async fn mark_direct_acked(
     pool: &Pool<MySql>,
-    row_id: i64,
+    message_id: &str,
     consumer_id: &str,
 ) -> Result<(), sqlx::Error> {
     query(
         "UPDATE agent_message_queue
-         SET status = 'acked', claimed_by = NULL, claimed_at_ms = NULL
-         WHERE id = ? AND is_broadcast = FALSE AND status = 'claimed' AND claimed_by = ?",
+         SET status = 'acked', claimed_by = NULL, claimed_at_ms = NULL, claim_token = NULL
+         WHERE message_id = ? AND is_broadcast = FALSE AND status = 'claimed' AND claimed_by = ?",
     )
-    .bind(row_id)
+    .bind(message_id)
     .bind(consumer_id)
     .execute(pool)
     .await?;
@@ -1029,7 +1111,7 @@ async fn mark_direct_failed_by_message_id(
 ) -> Result<(), sqlx::Error> {
     query(
         "UPDATE agent_message_queue
-         SET status = 'failed', claimed_by = NULL, claimed_at_ms = NULL
+         SET status = 'failed', claimed_by = NULL, claimed_at_ms = NULL, claim_token = NULL
          WHERE message_id = ? AND is_broadcast = FALSE AND status = 'claimed' AND claimed_by = ?",
     )
     .bind(message_id)
@@ -1041,19 +1123,44 @@ async fn mark_direct_failed_by_message_id(
 
 pub async fn mark_direct_failed_by_identity(
     pool: &Pool<MySql>,
-    row_id: Option<i64>,
     message_id: Option<&str>,
     consumer_id: &str,
 ) -> Result<(), sqlx::Error> {
-    match (row_id, message_id) {
-        (Some(row_id), _) => mark_direct_failed(pool, row_id).await,
-        (None, Some(message_id)) => {
-            mark_direct_failed_by_message_id(pool, message_id, consumer_id).await
-        }
-        (None, None) => Err(sqlx::Error::Protocol(
-            "missing row_id and message_id for direct failure path".into(),
+    match message_id {
+        Some(message_id) => mark_direct_failed_by_message_id(pool, message_id, consumer_id).await,
+        None => Err(sqlx::Error::Protocol(
+            "missing message_id for direct failure path".into(),
         )),
     }
+}
+
+async fn cleanup_expired_in_pool(pool: &Pool<MySql>, now_ms: i64) -> Result<u64, sqlx::Error> {
+    let result = query(CLEANUP_EXPIRED_MESSAGES_SQL)
+        .bind(now_ms)
+        .bind(QUEUE_CLEANUP_BATCH_LIMIT)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+async fn cleanup_terminal_older_than_in_pool(
+    pool: &Pool<MySql>,
+    cutoff_ms: i64,
+) -> Result<u64, sqlx::Error> {
+    let result = query(CLEANUP_TERMINAL_MESSAGES_SQL)
+        .bind(cutoff_ms)
+        .bind(QUEUE_CLEANUP_BATCH_LIMIT)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+async fn cleanup_broadcast_delivery_orphans(pool: &Pool<MySql>) -> Result<u64, sqlx::Error> {
+    let result = query(CLEANUP_ORPHAN_BROADCAST_DELIVERY_SQL)
+        .bind(BROADCAST_DELIVERY_CLEANUP_BATCH_LIMIT)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
 }
 
 // ─── DatabaseMessageStream ──────────────────────────────────────────────────
@@ -1150,17 +1257,9 @@ impl CleanupScheduler {
 
                 // 1. Cleanup TTL-expired messages.
                 let now_ms = chrono::Utc::now().timestamp_millis();
-                match query(
-                    "DELETE FROM agent_message_queue
-                     WHERE ttl_ms IS NOT NULL
-                       AND timestamp_ms < (? - ttl_ms)",
-                )
-                .bind(now_ms)
-                .execute(&pool)
-                .await
-                {
+                match cleanup_expired_in_pool(&pool, now_ms).await {
                     Ok(result) => {
-                        let n = result.rows_affected();
+                        let n = result;
                         if n > 0 {
                             tracing::info!(target: "astra_runtime::messaging::db_transport", "cleaned up {n} TTL-expired messages");
                         }
@@ -1172,17 +1271,9 @@ impl CleanupScheduler {
 
                 // 2. Cleanup old terminal messages (regardless of TTL).
                 let cutoff_ms = now_ms - age.as_millis() as i64;
-                match query(
-                    "DELETE FROM agent_message_queue
-                     WHERE timestamp_ms < ?
-                       AND status IN ('acked', 'failed')",
-                )
-                .bind(cutoff_ms)
-                .execute(&pool)
-                .await
-                {
+                match cleanup_terminal_older_than_in_pool(&pool, cutoff_ms).await {
                     Ok(result) => {
-                        let n = result.rows_affected();
+                        let n = result;
                         if n > 0 {
                             tracing::info!(
                                 target: "astra_runtime::messaging::db_transport",
@@ -1193,6 +1284,21 @@ impl CleanupScheduler {
                     }
                     Err(e) => {
                         tracing::warn!(target: "astra_runtime::messaging::db_transport", "  ⚠ messaging: age cleanup error: {e}");
+                    }
+                }
+
+                // 3. Cleanup broadcast delivery rows whose queue message was pruned.
+                match cleanup_broadcast_delivery_orphans(&pool).await {
+                    Ok(n) => {
+                        if n > 0 {
+                            tracing::info!(
+                                target: "astra_runtime::messaging::db_transport",
+                                "cleaned up {n} orphaned broadcast delivery rows"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "astra_runtime::messaging::db_transport", "  ⚠ messaging: broadcast delivery cleanup error: {e}");
                     }
                 }
             }
@@ -1217,7 +1323,7 @@ async fn reclaim_stale_in_pool(
 
     let reclaimed = query(
         "UPDATE agent_message_queue
-         SET status = 'pending', claimed_by = NULL, claimed_at_ms = NULL
+         SET status = 'pending', claimed_by = NULL, claimed_at_ms = NULL, claim_token = NULL
          WHERE status = 'claimed'
            AND claimed_at_ms < ?
            AND attempt_count < ?",
@@ -1230,7 +1336,7 @@ async fn reclaim_stale_in_pool(
 
     query(
         "UPDATE agent_message_queue
-           SET status = 'failed', claimed_by = NULL, claimed_at_ms = NULL
+           SET status = 'failed', claimed_by = NULL, claimed_at_ms = NULL, claim_token = NULL
            WHERE status = 'claimed'
              AND claimed_at_ms < ?
              AND attempt_count >= ?",
@@ -1248,29 +1354,6 @@ async fn reclaim_stale_in_pool(
     Ok(reclaimed.rows_affected())
 }
 
-fn extract_queue_row_id(row: &MySqlRow) -> Result<i64, sqlx::Error> {
-    match row.try_get("id") {
-        Ok(id) => Ok(id),
-        Err(primary_err) => match row
-            .try_get::<Option<String>, _>("row_id_text")
-            .ok()
-            .flatten()
-            .and_then(|value| parse_row_id_text_fallback(&value))
-        {
-            Some(id) => Ok(id),
-            None => Err(primary_err),
-        },
-    }
-}
-
-fn parse_row_id_text_fallback(value: &str) -> Option<i64> {
-    value.parse::<i64>().ok()
-}
-
-fn advance_broadcast_cursor(last_broadcast_id: &mut i64, row_id: i64) {
-    *last_broadcast_id = (*last_broadcast_id).max(row_id);
-}
-
 async fn release_claimed_for_consumer_in_pool(
     pool: &Pool<MySql>,
     consumer_id: &str,
@@ -1283,7 +1366,7 @@ async fn release_claimed_for_consumer_in_pool(
 
     query(
         "UPDATE agent_message_queue
-         SET status = 'pending', claimed_by = NULL, claimed_at_ms = NULL
+         SET status = 'pending', claimed_by = NULL, claimed_at_ms = NULL, claim_token = NULL
          WHERE status = 'claimed'
            AND is_broadcast = FALSE
            AND claimed_by = ?
@@ -1297,7 +1380,7 @@ async fn release_claimed_for_consumer_in_pool(
 
     query(
         "UPDATE agent_message_queue
-         SET status = 'failed', claimed_by = NULL, claimed_at_ms = NULL
+         SET status = 'failed', claimed_by = NULL, claimed_at_ms = NULL, claim_token = NULL
          WHERE status = 'claimed'
            AND is_broadcast = FALSE
            AND claimed_by = ?
@@ -1316,11 +1399,67 @@ async fn release_claimed_for_consumer_in_pool(
     Ok(())
 }
 
+async fn release_direct_claimed_batch_for_consumer_in_pool(
+    pool: &Pool<MySql>,
+    consumer_id: &str,
+    claim_token: &str,
+    max_delivery_attempts: u32,
+) -> Result<(), MailboxError> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| MailboxError::Transport(format!("release direct batch begin: {e}")))?;
+
+    query(
+        "UPDATE agent_message_queue
+         SET status = 'pending', claimed_by = NULL, claimed_at_ms = NULL, claim_token = NULL
+         WHERE status = 'claimed'
+           AND is_broadcast = FALSE
+           AND claimed_by = ?
+           AND claim_token = ?
+           AND attempt_count < ?",
+    )
+    .bind(consumer_id)
+    .bind(claim_token)
+    .bind(max_delivery_attempts as i64)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| MailboxError::Transport(format!("release direct batch requeue: {e}")))?;
+
+    query(
+        "UPDATE agent_message_queue
+         SET status = 'failed', claimed_by = NULL, claimed_at_ms = NULL, claim_token = NULL
+         WHERE status = 'claimed'
+           AND is_broadcast = FALSE
+           AND claimed_by = ?
+           AND claim_token = ?
+           AND attempt_count >= ?",
+    )
+    .bind(consumer_id)
+    .bind(claim_token)
+    .bind(max_delivery_attempts as i64)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| MailboxError::Transport(format!("release direct batch dead-letter: {e}")))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| MailboxError::Transport(format!("release direct batch commit: {e}")))?;
+
+    Ok(())
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::{
+        QueryBuilder,
+        mysql::{MySqlConnectOptions, MySqlPoolOptions},
+    };
+
+    static LIVE_DB_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[test]
     fn abort_on_drop_aborts_task() {
@@ -1337,34 +1476,382 @@ mod tests {
     }
 
     #[test]
-    fn parse_row_id_text_fallback_numeric_and_reject() {
-        assert_eq!(super::parse_row_id_text_fallback("42"), Some(42));
-        assert_eq!(super::parse_row_id_text_fallback("not-a-row-id"), None);
-        assert_eq!(super::parse_row_id_text_fallback(""), None);
-    }
-
-    #[test]
-    fn broadcast_cursor_advances_monotonically() {
-        let mut cursor = 5;
-        super::advance_broadcast_cursor(&mut cursor, 3);
-        assert_eq!(cursor, 5);
-        super::advance_broadcast_cursor(&mut cursor, 9);
-        assert_eq!(cursor, 9);
-    }
-
-    #[test]
     fn constants_are_reasonable() {
         // Poll interval
         assert_eq!(DEFAULT_POLL_INTERVAL, Duration::from_millis(100));
+        assert_eq!(POLL_BATCH_SIZE, 100);
+        const {
+            assert!(QUEUE_CLEANUP_BATCH_LIMIT >= POLL_BATCH_SIZE);
+            assert!(QUEUE_CLEANUP_BATCH_LIMIT <= 10_000);
+            assert!(BROADCAST_DELIVERY_CLEANUP_BATCH_LIMIT <= 10_000);
+        };
         // Cleanup
         assert_eq!(DEFAULT_CLEANUP_INTERVAL, Duration::from_secs(300));
         assert_eq!(DEFAULT_MAX_AGE, Duration::from_secs(3600));
         // Backoff
         let threshold: u32 = CRITICAL_FAILURE_THRESHOLD;
         assert!(threshold >= 10);
-        assert!(INITIAL_BACKOFF >= Duration::from_millis(100));
-        assert!(MAX_BACKOFF <= Duration::from_secs(30));
-        assert!(MAX_BACKOFF > INITIAL_BACKOFF);
+        let initial_backoff = INITIAL_BACKOFF;
+        let max_backoff = MAX_BACKOFF;
+        assert!(initial_backoff >= Duration::from_millis(100));
+        assert!(max_backoff <= Duration::from_secs(30));
+        assert!(max_backoff > initial_backoff);
+    }
+
+    #[test]
+    fn queue_schema_declares_direct_claim_token() {
+        let source = include_str!("db_transport.rs");
+        let ensure_body = source
+            .split("pub async fn ensure_schema")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split("async fn recreate_legacy_agent_message_queue_if_needed")
+                    .next()
+            })
+            .expect("ensure_schema body");
+        assert!(
+            ensure_body.contains("claim_token   VARCHAR(64)"),
+            "agent_message_queue must persist a unique direct claim batch token"
+        );
+        assert!(
+            ensure_body.contains("ensure_agent_message_queue_claim_token_column(pool).await"),
+            "schema setup must add claim_token when an existing queue table predates the column"
+        );
+    }
+
+    #[test]
+    fn queue_cleanup_sql_uses_ordered_bounded_batches() {
+        for (name, sql) in [
+            ("expired", CLEANUP_EXPIRED_MESSAGES_SQL),
+            ("terminal", CLEANUP_TERMINAL_MESSAGES_SQL),
+        ] {
+            assert!(
+                sql.contains("DELETE FROM agent_message_queue"),
+                "{name} cleanup must target the queue table"
+            );
+            assert!(
+                sql.contains("ORDER BY created_at ASC, message_id ASC"),
+                "{name} cleanup must prune deterministically"
+            );
+            assert!(
+                sql.trim_end().ends_with("LIMIT ?"),
+                "{name} cleanup must stay batch bounded"
+            );
+        }
+        assert!(
+            CLEANUP_ORPHAN_BROADCAST_DELIVERY_SQL
+                .contains("DELETE FROM agent_message_broadcast_delivery"),
+            "orphan cleanup must target broadcast delivery rows"
+        );
+        assert!(
+            CLEANUP_ORPHAN_BROADCAST_DELIVERY_SQL
+                .contains("ORDER BY message_id ASC, consumer_id ASC"),
+            "orphan delivery cleanup must prune deterministically"
+        );
+        assert!(
+            CLEANUP_ORPHAN_BROADCAST_DELIVERY_SQL
+                .trim_end()
+                .ends_with("LIMIT ?"),
+            "orphan delivery cleanup must stay batch bounded"
+        );
+    }
+
+    #[test]
+    fn cleanup_scheduler_reuses_bounded_cleanup_helpers() {
+        let source = include_str!("db_transport.rs");
+        let scheduler_body = source
+            .split("impl CleanupScheduler")
+            .nth(1)
+            .and_then(|rest| rest.split("async fn reclaim_stale_in_pool").next())
+            .expect("cleanup scheduler body");
+        assert!(
+            scheduler_body.contains(
+                "reclaim_stale_in_pool(&pool, visibility_timeout, max_delivery_attempts)"
+            ),
+            "cleanup scheduler must reclaim stale claimed messages, not only prune old rows"
+        );
+        for helper in [
+            "cleanup_expired_in_pool(&pool, now_ms)",
+            "cleanup_terminal_older_than_in_pool(&pool, cutoff_ms)",
+            "cleanup_broadcast_delivery_orphans(&pool)",
+        ] {
+            assert!(
+                scheduler_body.contains(helper),
+                "cleanup scheduler must call bounded helper {helper}"
+            );
+        }
+        assert!(
+            !scheduler_body.contains("DELETE FROM agent_message_queue"),
+            "cleanup scheduler must not inline unbounded queue DELETE statements"
+        );
+        assert!(
+            !scheduler_body.contains("DELETE FROM agent_message_broadcast_delivery"),
+            "cleanup scheduler must not inline unbounded broadcast delivery DELETE statements"
+        );
+    }
+
+    #[test]
+    fn reclaim_stale_has_retry_and_dead_letter_branches() {
+        let source = include_str!("db_transport.rs");
+        let helper_body = source
+            .split("async fn reclaim_stale_in_pool")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split("async fn release_claimed_for_consumer_in_pool")
+                    .next()
+            })
+            .expect("reclaim_stale helper body");
+
+        assert!(
+            helper_body.contains("SET status = 'pending'")
+                && helper_body.contains("AND attempt_count < ?"),
+            "stale claimed retryable messages must be requeued below max attempts"
+        );
+        assert!(
+            helper_body.contains("SET status = 'failed'")
+                && helper_body.contains("AND attempt_count >= ?"),
+            "stale claimed exhausted messages must be dead-lettered at max attempts"
+        );
+        assert!(
+            helper_body.contains("claimed_at_ms < ?"),
+            "stale reclaim must be visibility-timeout bound"
+        );
+    }
+
+    #[test]
+    fn direct_fetch_error_releases_only_current_tokenized_claim_batch() {
+        let source = include_str!("db_transport.rs");
+        let poll_body = source
+            .split("async fn poll_loop(")
+            .nth(1)
+            .and_then(|rest| rest.split("// 2. Poll broadcast messages").next())
+            .expect("poll_loop direct-claim body");
+        assert!(
+            poll_body.contains("release_direct_claimed_batch_for_consumer_in_pool")
+                && poll_body.contains("claim_token"),
+            "direct fetch error must release the just-claimed tokenized batch instead of waiting for visibility timeout"
+        );
+        assert!(
+            poll_body.contains("claim_token = ?"),
+            "direct claim fetch must use claim_token rather than claimed_at_ms as the batch discriminator"
+        );
+        let missing_message_id_branch = poll_body
+            .split("if message_id.is_none()")
+            .nth(1)
+            .and_then(|rest| rest.split("let json: String").next())
+            .expect("missing message_id branch");
+        assert!(
+            missing_message_id_branch.contains("had_error = true")
+                && missing_message_id_branch
+                    .contains("release_direct_claimed_batch_for_consumer_in_pool"),
+            "claimed direct rows without message_id must be treated as poll errors and release the current claim batch"
+        );
+
+        let helper_body = source
+            .split("async fn release_direct_claimed_batch_for_consumer_in_pool")
+            .nth(1)
+            .and_then(|rest| rest.split("// ─── Tests").next())
+            .expect("release direct claimed batch helper");
+        assert!(
+            helper_body.contains("AND claim_token = ?"),
+            "direct fetch error release must be scoped to the current unique claim_token batch"
+        );
+        assert!(
+            helper_body.contains("AND attempt_count < ?")
+                && helper_body.contains("AND attempt_count >= ?"),
+            "direct fetch error release must preserve max-attempt dead-letter semantics"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live MatrixOne; set ASTRA_TEST_DB_IT=1"]
+    async fn db_cleanup_prunes_expired_terminal_and_orphan_delivery_batches() {
+        let _guard = LIVE_DB_TEST_LOCK.lock().await;
+        let pool = live_test_pool().await;
+        ensure_schema(&pool).await.expect("ensure messaging schema");
+        clear_message_tables(&pool).await;
+
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let delegation_id = format!("delegation-{}", uuid::Uuid::new_v4());
+        let consumer_id = format!("consumer-{}", uuid::Uuid::new_v4());
+        let expired_message_id = uuid::Uuid::new_v4().to_string();
+        let terminal_message_id = uuid::Uuid::new_v4().to_string();
+        let live_message_id = uuid::Uuid::new_v4().to_string();
+        let orphan_message_id = uuid::Uuid::new_v4().to_string();
+
+        insert_queue_row(
+            &pool,
+            &expired_message_id,
+            &delegation_id,
+            now_ms - 10_000,
+            Some(1),
+            "pending",
+            true,
+        )
+        .await;
+        insert_queue_row(
+            &pool,
+            &terminal_message_id,
+            &delegation_id,
+            now_ms - 7_200_000,
+            None,
+            "acked",
+            true,
+        )
+        .await;
+        insert_queue_row(
+            &pool,
+            &live_message_id,
+            &delegation_id,
+            now_ms,
+            Some(86_400_000),
+            "pending",
+            true,
+        )
+        .await;
+        insert_delivery_row(&pool, &expired_message_id, &consumer_id, &delegation_id).await;
+        insert_delivery_row(&pool, &terminal_message_id, &consumer_id, &delegation_id).await;
+        insert_delivery_row(&pool, &live_message_id, &consumer_id, &delegation_id).await;
+        insert_delivery_row(&pool, &orphan_message_id, &consumer_id, &delegation_id).await;
+
+        let transport = DatabaseTransport::new(pool.clone());
+        assert_eq!(
+            transport.cleanup_expired().await.expect("ttl cleanup"),
+            1,
+            "expired cleanup should prune exactly the expired queue row"
+        );
+        assert_eq!(
+            transport
+                .cleanup_older_than(Duration::from_secs(3600))
+                .await
+                .expect("terminal cleanup"),
+            1,
+            "terminal cleanup should prune exactly the old acked queue row"
+        );
+
+        assert_eq!(count_queue_message(&pool, &expired_message_id).await, 0);
+        assert_eq!(count_queue_message(&pool, &terminal_message_id).await, 0);
+        assert_eq!(count_queue_message(&pool, &live_message_id).await, 1);
+        assert_eq!(count_delivery_message(&pool, &expired_message_id).await, 0);
+        assert_eq!(count_delivery_message(&pool, &terminal_message_id).await, 0);
+        assert_eq!(count_delivery_message(&pool, &orphan_message_id).await, 0);
+        assert_eq!(count_delivery_message(&pool, &live_message_id).await, 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live MatrixOne; set ASTRA_TEST_DB_IT=1"]
+    async fn db_cleanup_expired_prunes_more_than_one_queue_batch() {
+        let _guard = LIVE_DB_TEST_LOCK.lock().await;
+        let pool = live_test_pool().await;
+        ensure_schema(&pool).await.expect("ensure messaging schema");
+        clear_message_tables(&pool).await;
+
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let delegation_id = format!("delegation-batch-{}", uuid::Uuid::new_v4());
+        let consumer_id = format!("consumer-batch-{}", uuid::Uuid::new_v4());
+        let row_count = QUEUE_CLEANUP_BATCH_LIMIT + 5;
+        let message_ids = (0..row_count)
+            .map(|_| uuid::Uuid::new_v4().to_string())
+            .collect::<Vec<_>>();
+
+        insert_expired_queue_rows(&pool, &message_ids, &delegation_id, now_ms).await;
+        insert_delivery_rows(&pool, &message_ids, &consumer_id, &delegation_id).await;
+        wait_for_queue_count(&pool, row_count).await;
+        wait_for_delivery_count(&pool, row_count).await;
+
+        let transport = DatabaseTransport::new(pool.clone());
+        let first = transport.cleanup_expired().await.expect("first cleanup");
+        assert_eq!(
+            first, QUEUE_CLEANUP_BATCH_LIMIT as u64,
+            "first cleanup must stop at one bounded queue batch"
+        );
+        wait_for_queue_count(&pool, row_count - QUEUE_CLEANUP_BATCH_LIMIT).await;
+
+        let second = transport.cleanup_expired().await.expect("second cleanup");
+        assert_eq!(
+            second,
+            (row_count - QUEUE_CLEANUP_BATCH_LIMIT) as u64,
+            "second cleanup must prune the remaining expired rows"
+        );
+        wait_for_queue_count(&pool, 0).await;
+        wait_for_delivery_count(&pool, 0).await;
+
+        let third = transport.cleanup_expired().await.expect("third cleanup");
+        assert_eq!(
+            third, 0,
+            "cleanup should converge after expired rows are gone"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live MatrixOne pressure DB; set ASTRA_TEST_DB_IT=1"]
+    async fn db_cleanup_expired_pressure_probe() {
+        let _guard = LIVE_DB_TEST_LOCK.lock().await;
+        let pool = live_test_pool().await;
+        ensure_schema(&pool).await.expect("ensure messaging schema");
+        clear_message_tables(&pool).await;
+
+        let row_count = cleanup_pressure_rows(
+            "ASTRA_CLEANUP_PRESSURE_QUEUE_ROWS",
+            QUEUE_CLEANUP_BATCH_LIMIT * 5,
+            QUEUE_CLEANUP_BATCH_LIMIT + 1,
+        );
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let delegation_id = format!("delegation-pressure-{}", uuid::Uuid::new_v4());
+        let consumer_id = format!("consumer-pressure-{}", uuid::Uuid::new_v4());
+        let message_ids = (0..row_count)
+            .map(|_| uuid::Uuid::new_v4().to_string())
+            .collect::<Vec<_>>();
+
+        let insert_started = std::time::Instant::now();
+        for chunk in message_ids.chunks(QUEUE_CLEANUP_BATCH_LIMIT as usize) {
+            insert_expired_queue_rows(&pool, chunk, &delegation_id, now_ms).await;
+            insert_delivery_rows(&pool, chunk, &consumer_id, &delegation_id).await;
+        }
+        let insert_ms = insert_started.elapsed().as_millis();
+        wait_for_queue_count(&pool, row_count).await;
+        wait_for_delivery_count(&pool, row_count).await;
+
+        let transport = DatabaseTransport::new(pool.clone());
+        let cleanup_started = std::time::Instant::now();
+        let mut deleted = 0_u64;
+        let mut batches = 0_u64;
+        loop {
+            let removed = transport.cleanup_expired().await.expect("pressure cleanup");
+            assert!(
+                removed <= QUEUE_CLEANUP_BATCH_LIMIT as u64,
+                "cleanup must not exceed one bounded queue batch"
+            );
+            if removed == 0 {
+                break;
+            }
+            batches += 1;
+            deleted += removed;
+            assert!(
+                batches <= ((row_count / QUEUE_CLEANUP_BATCH_LIMIT) + 2) as u64,
+                "cleanup should converge near the expected batch count"
+            );
+        }
+        let cleanup_ms = cleanup_started.elapsed().as_millis();
+
+        assert_eq!(deleted, row_count as u64);
+        wait_for_queue_count(&pool, 0).await;
+        wait_for_delivery_count(&pool, 0).await;
+
+        eprintln!(
+            "CLEANUP_PRESSURE_RESULT {}",
+            serde_json::json!({
+                "path": "agent_message_queue.expired",
+                "rows_inserted": row_count,
+                "rows_deleted": deleted,
+                "batch_limit": QUEUE_CLEANUP_BATCH_LIMIT,
+                "batches": batches,
+                "insert_ms": insert_ms,
+                "cleanup_ms": cleanup_ms,
+                "remaining_queue_rows": count_queue_rows(&pool).await,
+                "remaining_delivery_rows": count_delivery_rows(&pool).await,
+            })
+        );
     }
 
     #[test]
@@ -1375,5 +1862,275 @@ mod tests {
             0
         );
         assert_eq!(m.poll_errors.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    async fn live_test_pool() -> Pool<MySql> {
+        let _ = dotenvy::dotenv();
+        assert_eq!(
+            std::env::var("ASTRA_TEST_DB_IT").as_deref(),
+            Ok("1"),
+            "set ASTRA_TEST_DB_IT=1 for ignored MatrixOne integration tests"
+        );
+
+        let host = std::env::var("MATRIXONE_HOST").unwrap_or_else(|_| "localhost".to_string());
+        let port = std::env::var("MATRIXONE_PORT")
+            .ok()
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(6001);
+        let user = std::env::var("MATRIXONE_USER").unwrap_or_else(|_| "root".to_string());
+        let password = std::env::var("MATRIXONE_PASSWORD").unwrap_or_else(|_| "111".to_string());
+        let database = resolved_test_database_name();
+        let bootstrap_catalog =
+            std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
+
+        assert_test_database_name(&database);
+        assert_test_database_name(&bootstrap_catalog);
+
+        let admin_options = mysql_options(&host, port, &user, &password, &bootstrap_catalog);
+        let admin_pool = MySqlPoolOptions::new()
+            .max_connections(2)
+            .connect_with(admin_options)
+            .await
+            .expect("connect MatrixOne bootstrap catalog");
+        sqlx::query(&format!(
+            "CREATE DATABASE IF NOT EXISTS {}",
+            quote_mysql_identifier(&database)
+        ))
+        .execute(&admin_pool)
+        .await
+        .expect("create MatrixOne test database");
+        admin_pool.close().await;
+
+        MySqlPoolOptions::new()
+            .max_connections(5)
+            .connect_with(mysql_options(&host, port, &user, &password, &database))
+            .await
+            .expect("connect MatrixOne test database")
+    }
+
+    fn mysql_options(
+        host: &str,
+        port: u16,
+        user: &str,
+        password: &str,
+        database: &str,
+    ) -> MySqlConnectOptions {
+        MySqlConnectOptions::new()
+            .host(host)
+            .port(port)
+            .username(user)
+            .password(password)
+            .database(database)
+    }
+
+    fn resolved_test_database_name() -> String {
+        let base = std::env::var("ASTRA_DATABASE").unwrap_or_else(|_| "astra_runtime".to_string());
+        match std::env::var("ASTRA_DATABASE_PREFIX") {
+            Ok(prefix) if !prefix.is_empty() => format!("{prefix}{base}"),
+            _ => base,
+        }
+    }
+
+    fn assert_test_database_name(name: &str) {
+        assert!(
+            name.chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_'),
+            "MatrixOne test database name must be a simple identifier: {name}"
+        );
+        if name == "mysql" {
+            return;
+        }
+        assert!(
+            name.contains("test") || name.contains("smoke"),
+            "refusing to run destructive MatrixOne integration test against non-test database: {name}"
+        );
+    }
+
+    fn quote_mysql_identifier(name: &str) -> String {
+        assert_test_database_name(name);
+        format!("`{name}`")
+    }
+
+    async fn insert_queue_row(
+        pool: &Pool<MySql>,
+        message_id: &str,
+        delegation_id: &str,
+        timestamp_ms: i64,
+        ttl_ms: Option<i64>,
+        status: &str,
+        is_broadcast: bool,
+    ) {
+        query(
+            "INSERT INTO agent_message_queue
+             (message_id, from_run_id, from_agent_id, delegation_id, is_broadcast,
+              payload_json, timestamp_ms, ttl_ms, status)
+             VALUES (?, ?, ?, ?, ?, '{}', ?, ?, ?)",
+        )
+        .bind(message_id)
+        .bind(format!("from-run-{message_id}"))
+        .bind("from-agent")
+        .bind(delegation_id)
+        .bind(is_broadcast)
+        .bind(timestamp_ms)
+        .bind(ttl_ms)
+        .bind(status)
+        .execute(pool)
+        .await
+        .expect("insert queue row");
+    }
+
+    async fn insert_delivery_row(
+        pool: &Pool<MySql>,
+        message_id: &str,
+        consumer_id: &str,
+        delegation_id: &str,
+    ) {
+        query(
+            "INSERT INTO agent_message_broadcast_delivery
+             (message_id, consumer_id, delegation_id)
+             VALUES (?, ?, ?)",
+        )
+        .bind(message_id)
+        .bind(consumer_id)
+        .bind(delegation_id)
+        .execute(pool)
+        .await
+        .expect("insert broadcast delivery row");
+    }
+
+    async fn count_queue_message(pool: &Pool<MySql>, message_id: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_message_queue WHERE message_id = ?")
+            .bind(message_id)
+            .fetch_one(pool)
+            .await
+            .expect("count queue message")
+    }
+
+    async fn count_delivery_message(pool: &Pool<MySql>, message_id: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_message_broadcast_delivery WHERE message_id = ?",
+        )
+        .bind(message_id)
+        .fetch_one(pool)
+        .await
+        .expect("count delivery message")
+    }
+
+    async fn insert_expired_queue_rows(
+        pool: &Pool<MySql>,
+        message_ids: &[String],
+        delegation_id: &str,
+        now_ms: i64,
+    ) {
+        let mut builder = QueryBuilder::<MySql>::new(
+            "INSERT INTO agent_message_queue
+             (message_id, from_run_id, from_agent_id, delegation_id, is_broadcast,
+              payload_json, timestamp_ms, ttl_ms, status) ",
+        );
+        builder.push_values(message_ids, |mut row, message_id| {
+            row.push_bind(message_id)
+                .push_bind(format!("from-run-{message_id}"))
+                .push_bind("from-agent")
+                .push_bind(delegation_id)
+                .push_bind(true)
+                .push_bind("{}")
+                .push_bind(now_ms - 10_000)
+                .push_bind(1_i64)
+                .push_bind("pending");
+        });
+        builder
+            .build()
+            .execute(pool)
+            .await
+            .expect("insert expired queue rows");
+    }
+
+    async fn clear_message_tables(pool: &Pool<MySql>) {
+        query("DELETE FROM agent_message_broadcast_delivery")
+            .execute(pool)
+            .await
+            .expect("clear broadcast delivery table");
+        query("DELETE FROM agent_message_queue")
+            .execute(pool)
+            .await
+            .expect("clear message queue table");
+    }
+
+    async fn insert_delivery_rows(
+        pool: &Pool<MySql>,
+        message_ids: &[String],
+        consumer_id: &str,
+        delegation_id: &str,
+    ) {
+        let mut builder = QueryBuilder::<MySql>::new(
+            "INSERT INTO agent_message_broadcast_delivery
+             (message_id, consumer_id, delegation_id) ",
+        );
+        builder.push_values(message_ids, |mut row, message_id| {
+            row.push_bind(message_id)
+                .push_bind(consumer_id)
+                .push_bind(delegation_id);
+        });
+        builder
+            .build()
+            .execute(pool)
+            .await
+            .expect("insert broadcast delivery rows");
+    }
+
+    async fn count_queue_rows(pool: &Pool<MySql>) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_message_queue")
+            .fetch_one(pool)
+            .await
+            .expect("count queue rows")
+    }
+
+    async fn count_delivery_rows(pool: &Pool<MySql>) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_message_broadcast_delivery")
+            .fetch_one(pool)
+            .await
+            .expect("count delivery rows")
+    }
+
+    async fn wait_for_queue_count(pool: &Pool<MySql>, expected: i64) {
+        wait_for_count("queue", expected, || async { count_queue_rows(pool).await }).await;
+    }
+
+    async fn wait_for_delivery_count(pool: &Pool<MySql>, expected: i64) {
+        wait_for_count("broadcast delivery", expected, || async {
+            count_delivery_rows(pool).await
+        })
+        .await;
+    }
+
+    async fn wait_for_count<F, Fut>(label: &str, expected: i64, mut current: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = i64>,
+    {
+        let mut last = current().await;
+        for _ in 0..20 {
+            if last == expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            last = current().await;
+        }
+        assert_eq!(
+            last, expected,
+            "{label} row count did not reach expected value"
+        );
+    }
+
+    fn cleanup_pressure_rows(env_key: &str, default: i64, minimum: i64) -> i64 {
+        let rows = std::env::var(env_key)
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(default);
+        assert!(
+            rows >= minimum,
+            "{env_key} must be at least {minimum} rows to exercise pressure cleanup"
+        );
+        rows
     }
 }

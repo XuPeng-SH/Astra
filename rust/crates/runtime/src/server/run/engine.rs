@@ -31,20 +31,58 @@
 //! 5. `recover_active_runs()` — On startup, loads runs that were active when process died
 //! 6. `load_run()` — Loads a run from store (cache miss path)
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use astra_services::{
     DatabaseStateProjectionStore,
     runs::{
         CapabilityServerRefs, DurableRunCheckpointRecord, DurableRunDisplayProjectionRecord,
-        DurableRunRecord, DurableRunStatusKind, RequestedTurnInteractionMode, RunStateStore,
-        RuntimeProfileRequest, SelectedModelRequest, durable_run_status_kind,
+        DurableRunListPage, DurableRunRecord, DurableRunStatusKind, RequestedTurnInteractionMode,
+        RunListCursor, RunStateStore, RuntimeProfileRequest, SelectedModelRequest,
+        durable_run_status_kind,
     },
 };
+use astra_turn_core::pipeline_metrics::MetricsRegistry;
 
 use astra_core::{
-    STATUS_CANCELLED, STATUS_INPUT_QUEUED, STATUS_PAUSED, STATUS_RUNNING, STATUS_WAITING,
+    STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED, STATUS_INPUT_QUEUED, STATUS_PAUSED,
+    STATUS_RUNNING, STATUS_WAITING,
 };
+
+const METRIC_RUN_CONTROL_POLL_ATTEMPTS_TOTAL: &str = "astra_run_control_poll_attempts_total";
+const METRIC_RUN_CONTROL_POLL_ERRORS_TOTAL: &str = "astra_run_control_poll_errors_total";
+const METRIC_RUN_RECOVERY_SCANS_TOTAL: &str = "astra_run_recovery_scans_total";
+const METRIC_RUN_RECOVERY_RUNS_TOTAL: &str = "astra_run_recovery_runs_total";
+const TERMINAL_TRANSITION_MAX_ATTEMPTS: usize = 3;
+const TERMINAL_TRANSITION_RETRY_BASE_DELAY_MS: u64 = 25;
+const OWNER_LEASE_RENEWAL_STATUSES: &[&str] = &[
+    STATUS_RUNNING,
+    STATUS_WAITING,
+    STATUS_INPUT_QUEUED,
+    STATUS_PAUSED,
+];
+
+fn crash_recovery_terminal_events() -> [serde_json::Value; 2] {
+    [
+        serde_json::json!({
+            "event_type": "run_error",
+            "data": {
+                "error": "recovered from crash",
+                "error_code": "crash_recovery",
+                "error_kind": "crash_recovery",
+            },
+        }),
+        serde_json::json!({
+            "event_type": "run_finished",
+            "data": {
+                "status": STATUS_FAILED,
+                "error": "recovered from crash",
+                "error_code": "crash_recovery",
+                "error_kind": "crash_recovery",
+            },
+        }),
+    ]
+}
 
 /// Durable run execution engine.
 ///
@@ -57,6 +95,21 @@ use astra_core::{
 pub struct RunEngine {
     store: Arc<dyn RunStateStore>,
     projection_store: Option<Arc<DatabaseStateProjectionStore>>,
+    metrics_registry: Option<Arc<MetricsRegistry>>,
+}
+
+pub(crate) struct RunOwnerLeaseHeartbeat {
+    stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    join: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for RunOwnerLeaseHeartbeat {
+    fn drop(&mut self) {
+        if let Some(stop_tx) = self.stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
+        self.join.abort();
+    }
 }
 
 /// Optional run-start interaction context persisted into the durable
@@ -98,6 +151,127 @@ fn runtime_profile_label(profile: RuntimeProfileRequest) -> &'static str {
         RuntimeProfileRequest::RequestScopedRuntimeMcp => "request_scoped_runtime_mcp",
         RuntimeProfileRequest::AgentBindingRegistry => "agent_binding_registry",
     }
+}
+
+fn register_run_control_poll_metrics(registry: &MetricsRegistry) {
+    registry.register_counter(
+        METRIC_RUN_CONTROL_POLL_ATTEMPTS_TOTAL,
+        "Run control-plane poll attempts by operation and low-cardinality outcome.",
+    );
+    registry.register_counter(
+        METRIC_RUN_CONTROL_POLL_ERRORS_TOTAL,
+        "Run control-plane poll errors by operation and low-cardinality class.",
+    );
+}
+
+fn register_run_recovery_metrics(registry: &MetricsRegistry) {
+    registry.register_counter(
+        METRIC_RUN_RECOVERY_SCANS_TOTAL,
+        "Startup run recovery scans by low-cardinality outcome.",
+    );
+    registry.register_counter(
+        METRIC_RUN_RECOVERY_RUNS_TOTAL,
+        "Startup run recovery actions by low-cardinality action and outcome.",
+    );
+}
+
+fn record_control_poll_attempt(
+    registry: Option<&Arc<MetricsRegistry>>,
+    operation: &'static str,
+    outcome: &'static str,
+) {
+    let Some(registry) = registry else {
+        return;
+    };
+    register_run_control_poll_metrics(registry);
+    registry.increment_counter(
+        METRIC_RUN_CONTROL_POLL_ATTEMPTS_TOTAL,
+        &[("operation", operation), ("outcome", outcome)],
+        1,
+    );
+}
+
+fn record_control_poll_error(
+    registry: Option<&Arc<MetricsRegistry>>,
+    operation: &'static str,
+    class: &'static str,
+) {
+    let Some(registry) = registry else {
+        return;
+    };
+    register_run_control_poll_metrics(registry);
+    registry.increment_counter(
+        METRIC_RUN_CONTROL_POLL_ERRORS_TOTAL,
+        &[("operation", operation), ("class", class)],
+        1,
+    );
+}
+
+fn record_recovery_scan(registry: Option<&Arc<MetricsRegistry>>, outcome: &'static str) {
+    let Some(registry) = registry else {
+        return;
+    };
+    register_run_recovery_metrics(registry);
+    registry.increment_counter(METRIC_RUN_RECOVERY_SCANS_TOTAL, &[("outcome", outcome)], 1);
+}
+
+fn record_recovery_run(
+    registry: Option<&Arc<MetricsRegistry>>,
+    action: &'static str,
+    outcome: &'static str,
+) {
+    let Some(registry) = registry else {
+        return;
+    };
+    register_run_recovery_metrics(registry);
+    registry.increment_counter(
+        METRIC_RUN_RECOVERY_RUNS_TOTAL,
+        &[("action", action), ("outcome", outcome)],
+        1,
+    );
+}
+
+fn terminal_transition_retry_delay(attempt: usize) -> Duration {
+    Duration::from_millis(TERMINAL_TRANSITION_RETRY_BASE_DELAY_MS.saturating_mul(attempt as u64))
+}
+
+fn json_contains_expected_fields(actual: &serde_json::Value, expected: &serde_json::Value) -> bool {
+    match (actual, expected) {
+        (serde_json::Value::Object(actual), serde_json::Value::Object(expected)) => {
+            expected.iter().all(|(key, expected_value)| {
+                key == "index"
+                    || actual.get(key).is_some_and(|actual_value| {
+                        json_contains_expected_fields(actual_value, expected_value)
+                    })
+            })
+        }
+        (serde_json::Value::Array(actual), serde_json::Value::Array(expected)) => {
+            actual.len() == expected.len()
+                && actual
+                    .iter()
+                    .zip(expected)
+                    .all(|(actual_value, expected_value)| {
+                        json_contains_expected_fields(actual_value, expected_value)
+                    })
+        }
+        _ => actual == expected,
+    }
+}
+
+fn durable_run_contains_event_batch(
+    run: &DurableRunRecord,
+    expected_events: &[serde_json::Value],
+) -> bool {
+    expected_events.is_empty()
+        || run
+            .events
+            .windows(expected_events.len())
+            .any(|actual_events| {
+                actual_events
+                    .iter()
+                    .zip(expected_events)
+                    .all(|(actual, expected)| json_contains_expected_fields(actual, expected))
+            })
 }
 
 fn run_started_event_data(context: &RunStartContext) -> serde_json::Value {
@@ -166,6 +340,7 @@ impl RunEngine {
         Self {
             store,
             projection_store: None,
+            metrics_registry: None,
         }
     }
 
@@ -180,6 +355,66 @@ impl RunEngine {
     ) -> Self {
         self.projection_store = Some(projection_store);
         self
+    }
+
+    /// Attach the shared metrics registry used by `/metrics`.
+    pub fn with_metrics_registry(mut self, registry: Arc<MetricsRegistry>) -> Self {
+        register_run_control_poll_metrics(&registry);
+        register_run_recovery_metrics(&registry);
+        self.metrics_registry = Some(registry);
+        self
+    }
+
+    /// Start renewing the store owner's active-run lease until the returned
+    /// guard is dropped. Stores without shared owner leases return `None`.
+    pub(crate) fn start_owner_lease_heartbeat(
+        &self,
+        user_id: String,
+        run_id: String,
+    ) -> Option<RunOwnerLeaseHeartbeat> {
+        let interval = self
+            .store
+            .owner_lease_renewal_interval()?
+            .max(Duration::from_millis(1));
+        let engine = self.clone();
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
+        let join = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(interval) => {}
+                    _ = &mut stop_rx => break,
+                }
+
+                match engine
+                    .store
+                    .renew_owner_lease(&user_id, &run_id, OWNER_LEASE_RENEWAL_STATUSES)
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        tracing::debug!(
+                            target: "astra_runtime::run_engine",
+                            run_id = %run_id,
+                            "stopping run owner lease heartbeat after renewal returned false"
+                        );
+                        break;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "astra_runtime::run_engine",
+                            run_id = %run_id,
+                            error = %error,
+                            "failed to renew active run owner lease"
+                        );
+                    }
+                }
+            }
+        });
+
+        Some(RunOwnerLeaseHeartbeat {
+            stop_tx: Some(stop_tx),
+            join,
+        })
     }
 
     /// Create a durable run record in the store.
@@ -267,10 +502,18 @@ impl RunEngine {
         } else {
             (Some(run_id.to_string()), Some(run_id.to_string()), 0)
         };
-        let selected_model_json = context
-            .selected_model
-            .as_ref()
-            .and_then(|selected_model| serde_json::to_string(selected_model).ok());
+        let selected_model_json = context.selected_model.as_ref().and_then(|m| {
+            serde_json::to_string(m)
+                .inspect_err(|e| {
+                    tracing::warn!(
+                        target: "astra_runtime::engine",
+                        run_id = %run_id,
+                        error = %e,
+                        "failed to serialize selected_model for durable run record"
+                    );
+                })
+                .ok()
+        });
         let selected_model_name = context
             .selected_model
             .as_ref()
@@ -279,10 +522,19 @@ impl RunEngine {
             .selected_model
             .as_ref()
             .and_then(|selected_model| selected_model.gateway.clone());
-        let capability_server_refs_json = context
-            .capability_server_refs
-            .as_ref()
-            .and_then(|refs| serde_json::to_string(refs).ok());
+        let capability_server_refs_json =
+            context.capability_server_refs.as_ref().and_then(|refs| {
+                serde_json::to_string(refs)
+                    .inspect_err(|e| {
+                        tracing::warn!(
+                            target: "astra_runtime::engine",
+                            run_id = %run_id,
+                            error = %e,
+                            "failed to serialize capability_server_refs for durable run record"
+                        );
+                    })
+                    .ok()
+            });
         let runtime_profile = context
             .runtime_profile
             .map(runtime_profile_label)
@@ -330,7 +582,7 @@ impl RunEngine {
             updated_at: now,
         };
         self.store.insert_run(record).await?;
-        self.project_delegation_run_if_needed(user_id, run_id, STATUS_RUNNING, None)
+        self.project_delegation_run_if_needed(user_id, run_id, None)
             .await?;
         Ok(())
     }
@@ -350,8 +602,18 @@ impl RunEngine {
             .await?;
         if updated {
             let summary = error_message.or(waiting_for);
-            self.project_delegation_run_if_needed(user_id, run_id, status, summary)
-                .await?;
+            if let Err(error) = self
+                .project_delegation_run_if_needed(user_id, run_id, summary)
+                .await
+            {
+                tracing::warn!(
+                    user_id,
+                    run_id,
+                    status,
+                    error = %error,
+                    "run transition committed but delegation projection refresh failed"
+                );
+            }
         }
         Ok(updated)
     }
@@ -381,17 +643,252 @@ impl RunEngine {
             .await?;
         if updated {
             let summary = error_message.or(waiting_for);
-            self.project_delegation_run_if_needed(user_id, run_id, status, summary)
-                .await?;
+            if let Err(error) = self
+                .project_delegation_run_if_needed(user_id, run_id, summary)
+                .await
+            {
+                tracing::warn!(
+                    user_id,
+                    run_id,
+                    status,
+                    error = %error,
+                    "run transition committed but delegation projection refresh failed"
+                );
+            }
         }
         Ok(updated)
+    }
+
+    /// Atomically persist a status transition and its durable audit event.
+    ///
+    /// Use this for user/control-plane transitions where status without the
+    /// corresponding event would be an inconsistent durable fact.
+    pub async fn transition_status_with_event_if_current(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        expected_statuses: &[&str],
+        status: &str,
+        waiting_for: Option<&str>,
+        error_message: Option<&str>,
+        event: serde_json::Value,
+    ) -> Result<bool, String> {
+        let updated = self
+            .store
+            .update_run_status_with_event_if_current(
+                user_id,
+                run_id,
+                expected_statuses,
+                status,
+                waiting_for,
+                error_message,
+                event,
+            )
+            .await?;
+        if updated {
+            let summary = error_message.or(waiting_for);
+            if let Err(error) = self
+                .project_delegation_run_if_needed(user_id, run_id, summary)
+                .await
+            {
+                tracing::warn!(
+                    user_id,
+                    run_id,
+                    status,
+                    error = %error,
+                    "run transition committed but delegation projection refresh failed"
+                );
+            }
+        }
+        Ok(updated)
+    }
+
+    /// Atomically persist a status transition and a durable audit event batch.
+    ///
+    /// Empty `events` is valid and behaves as a CAS status transition.
+    pub async fn transition_status_with_events_if_current(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        expected_statuses: &[&str],
+        status: &str,
+        waiting_for: Option<&str>,
+        error_message: Option<&str>,
+        events: &[serde_json::Value],
+    ) -> Result<bool, String> {
+        let updated = self
+            .store
+            .update_run_status_with_events_if_current(
+                user_id,
+                run_id,
+                expected_statuses,
+                status,
+                waiting_for,
+                error_message,
+                events,
+            )
+            .await?;
+        if updated {
+            let summary = error_message.or(waiting_for);
+            if let Err(error) = self
+                .project_delegation_run_if_needed(user_id, run_id, summary)
+                .await
+            {
+                tracing::warn!(
+                    user_id,
+                    run_id,
+                    status,
+                    error = %error,
+                    "run transition committed but delegation projection refresh failed"
+                );
+            }
+        }
+        Ok(updated)
+    }
+
+    /// Atomically persist a terminal status transition and durable terminal events,
+    /// retrying short-lived store errors without weakening the underlying CAS.
+    ///
+    /// If the store commits but the connection drops before the caller observes
+    /// success, a retry can return `Ok(false)` because the status is already
+    /// terminal. In that case we reconcile by loading the durable row and only
+    /// treat it as committed when the stored status and terminal event batch are
+    /// both present. If the status committed but the expected events are missing,
+    /// repair the event batch before reporting success.
+    pub async fn transition_terminal_status_with_events_if_current(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        expected_statuses: &[&str],
+        status: &str,
+        waiting_for: Option<&str>,
+        error_message: Option<&str>,
+        events: &[serde_json::Value],
+    ) -> Result<bool, String> {
+        let mut saw_store_error = false;
+        let mut last_error: Option<String> = None;
+        for attempt in 1..=TERMINAL_TRANSITION_MAX_ATTEMPTS {
+            match self
+                .transition_status_with_events_if_current(
+                    user_id,
+                    run_id,
+                    expected_statuses,
+                    status,
+                    waiting_for,
+                    error_message,
+                    events,
+                )
+                .await
+            {
+                Ok(true) => return Ok(true),
+                Ok(false) if saw_store_error => {
+                    return self
+                        .reconcile_terminal_transition_after_store_error(
+                            user_id,
+                            run_id,
+                            status,
+                            waiting_for,
+                            error_message,
+                            events,
+                            last_error.as_deref(),
+                        )
+                        .await;
+                }
+                Ok(false) => return Ok(false),
+                Err(error) => {
+                    saw_store_error = true;
+                    last_error = Some(error.clone());
+                    if attempt >= TERMINAL_TRANSITION_MAX_ATTEMPTS {
+                        break;
+                    }
+                    tracing::warn!(
+                        user_id,
+                        run_id,
+                        status,
+                        attempt,
+                        max_attempts = TERMINAL_TRANSITION_MAX_ATTEMPTS,
+                        error = %error,
+                        "terminal run transition failed; retrying"
+                    );
+                    tokio::time::sleep(terminal_transition_retry_delay(attempt)).await;
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| "terminal transition retry exhausted".to_string()))
+    }
+
+    async fn reconcile_terminal_transition_after_store_error(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        status: &str,
+        waiting_for: Option<&str>,
+        error_message: Option<&str>,
+        events: &[serde_json::Value],
+        last_error: Option<&str>,
+    ) -> Result<bool, String> {
+        let Some(run) = self
+            .store
+            .load_run(user_id, run_id)
+            .await
+            .map_err(|error| {
+                if let Some(last_error) = last_error {
+                    format!(
+                        "{last_error}; failed to reconcile terminal transition after retry: {error}"
+                    )
+                } else {
+                    error
+                }
+            })?
+        else {
+            return Ok(false);
+        };
+        if run.status != status {
+            return Ok(false);
+        }
+        if !durable_run_contains_event_batch(&run, events) {
+            self.store
+                .append_events_batch(user_id, run_id, events)
+                .await
+                .map_err(|error| {
+                    if let Some(last_error) = last_error {
+                        format!(
+                            "{last_error}; terminal transition reached status {status} but event repair failed: {error}"
+                        )
+                    } else {
+                        format!(
+                            "terminal transition reached status {status} but event repair failed: {error}"
+                        )
+                    }
+                })?;
+            tracing::warn!(
+                user_id,
+                run_id,
+                status,
+                repaired_event_count = events.len(),
+                "terminal run transition reconciled status but had to repair missing events"
+            );
+        }
+        let summary = error_message.or(waiting_for);
+        if let Err(error) = self
+            .project_delegation_run_if_needed(user_id, run_id, summary)
+            .await
+        {
+            tracing::warn!(
+                user_id,
+                run_id,
+                status,
+                error = %error,
+                "terminal run transition reconciled but delegation projection refresh failed"
+            );
+        }
+        Ok(true)
     }
 
     async fn project_delegation_run_if_needed(
         &self,
         user_id: &str,
         run_id: &str,
-        status: &str,
         last_summary_text: Option<&str>,
     ) -> Result<(), String> {
         let Some(projection_store) = self.projection_store.as_ref() else {
@@ -407,7 +904,6 @@ impl RunEngine {
             .upsert_delegation_projection_for_run(
                 &run.user_id,
                 run_id,
-                status,
                 run.agent_id.as_deref(),
                 last_summary_text,
             )
@@ -470,6 +966,15 @@ impl RunEngine {
         self.store.load_run_projection(user_id, run_id).await
     }
 
+    /// Rebuild the durable display projection from authoritative run facts.
+    pub async fn rebuild_run_projection(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> Result<Option<DurableRunDisplayProjectionRecord>, String> {
+        self.store.rebuild_run_projection(user_id, run_id).await
+    }
+
     /// Append an event to the durable event log.
     pub async fn append_event(
         &self,
@@ -511,7 +1016,17 @@ impl RunEngine {
         user_id: &str,
         run_id: &str,
     ) -> Result<Option<RunControlStatus>, String> {
-        let record = self.store.load_run(user_id, run_id).await?;
+        let record = match self.store.load_run(user_id, run_id).await {
+            Ok(record) => {
+                record_control_poll_attempt(self.metrics_registry.as_ref(), "status", "ok");
+                record
+            }
+            Err(error) => {
+                record_control_poll_attempt(self.metrics_registry.as_ref(), "status", "error");
+                record_control_poll_error(self.metrics_registry.as_ref(), "status", "store");
+                return Err(error);
+            }
+        };
         Ok(match record {
             None => None,
             Some(r) => match durable_run_status_kind(&r.status) {
@@ -565,92 +1080,187 @@ impl RunEngine {
     /// - `running` runs with graceful checkpoint_v1: moved to `waiting` and
     ///   annotated with `run_resumed_after_restart` for exactly-once replay.
     /// - other `running` runs: were in-flight when the process died; marked
-    ///   `failed` with reason "recovered from crash".
+    ///   `failed` with crash-recovery terminal events.
     pub async fn recover_active_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
-        let waiting = self.store.find_waiting_runs().await?;
-        let running = self.store.find_recoverable_running_runs().await?;
-
-        let mut recovered_running = Vec::with_capacity(running.len());
-        for mut run in running {
-            if has_graceful_resume_checkpoint(self, &run).await {
-                if let Err(e) = self
-                    .store
-                    .update_run_status(
-                        &run.user_id,
-                        &run.run_id,
-                        STATUS_WAITING,
-                        Some("restart_resume"),
-                        None,
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        target: "astra_runtime::run_engine",
-                        run_id = %run.run_id,
-                        error = %e,
-                        "failed to mark graceful run waiting during recovery"
-                    );
-                }
-                if let Err(e) = self
-                    .store
-                    .append_event(
-                        &run.user_id,
-                        &run.run_id,
-                        serde_json::json!({
-                            "event_type": "run_resumed_after_restart",
-                            "data": {"checkpoint_version": "checkpoint_v1"}
-                        }),
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        target: "astra_runtime::run_engine",
-                        run_id = %run.run_id,
-                        error = %e,
-                        "failed to append graceful restart event"
-                    );
-                }
-                run.status = STATUS_WAITING.to_string();
-                run.waiting_for = Some("restart_resume".to_string());
-            } else {
-                if let Err(e) = self
-                    .store
-                    .update_run_status(
-                        &run.user_id,
-                        &run.run_id,
-                        astra_core::STATUS_FAILED,
-                        None,
-                        Some("recovered from crash"),
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        target: "astra_runtime::run_engine",
-                        run_id = %run.run_id,
-                        error = %e,
-                        "failed to mark crashed run as failed during recovery"
-                    );
-                }
-                run.status = astra_core::STATUS_FAILED.to_string();
-                run.error_message = Some("recovered from crash".to_string());
+        let active = match self.store.find_recoverable_active_runs().await {
+            Ok(active) => {
+                record_recovery_scan(self.metrics_registry.as_ref(), "ok");
+                active
             }
-            recovered_running.push(run);
+            Err(error) => {
+                record_recovery_scan(self.metrics_registry.as_ref(), "error");
+                return Err(error);
+            }
+        };
+        let mut recovered = Vec::with_capacity(active.len());
+        for run in active {
+            if run.status == STATUS_WAITING {
+                record_recovery_run(self.metrics_registry.as_ref(), "preserve_waiting", "ok");
+                recovered.push(run);
+                continue;
+            }
+            if let Some(recovered_run) = self.recover_active_run(run).await {
+                recovered.push(recovered_run);
+            }
         }
-
-        // Return all: waiting (to resume) + recovered running runs.
-        let mut all = waiting;
-        all.extend(recovered_running);
-        Ok(all)
+        Ok(recovered)
     }
 
-    /// List runs for a user (delegates to store).
-    pub async fn list_user_runs(
+    async fn recover_active_run(&self, mut run: DurableRunRecord) -> Option<DurableRunRecord> {
+        let expected_status = run.status.clone();
+        if has_graceful_resume_checkpoint(self, &run).await {
+            let event = serde_json::json!({
+                "event_type": "run_resumed_after_restart",
+                "data": {"checkpoint_version": "checkpoint_v1"}
+            });
+            match self
+                .store
+                .update_run_status_with_event_if_current(
+                    &run.user_id,
+                    &run.run_id,
+                    &[expected_status.as_str()],
+                    STATUS_WAITING,
+                    Some("restart_resume"),
+                    None,
+                    event,
+                )
+                .await
+            {
+                Ok(true) => {
+                    record_recovery_run(
+                        self.metrics_registry.as_ref(),
+                        "resume_checkpoint",
+                        "committed",
+                    );
+                    run.status = STATUS_WAITING.to_string();
+                    run.waiting_for = Some("restart_resume".to_string());
+                    run.last_event_idx += 1;
+                    run.events.push(serde_json::json!({
+                        "event_type": "run_resumed_after_restart",
+                        "data": {"checkpoint_version": "checkpoint_v1"}
+                    }));
+                    Some(run)
+                }
+                Ok(false) => self.recovery_conflict_current_run(&run).await,
+                Err(e) => {
+                    record_recovery_run(
+                        self.metrics_registry.as_ref(),
+                        "resume_checkpoint",
+                        "error",
+                    );
+                    tracing::warn!(
+                        target: "astra_runtime::run_engine",
+                        run_id = %run.run_id,
+                        error = %e,
+                        "failed to atomically mark graceful run waiting during recovery"
+                    );
+                    None
+                }
+            }
+        } else {
+            let events = crash_recovery_terminal_events();
+            match self
+                .store
+                .update_run_status_with_events_if_current(
+                    &run.user_id,
+                    &run.run_id,
+                    &[expected_status.as_str()],
+                    STATUS_FAILED,
+                    None,
+                    Some("recovered from crash"),
+                    &events,
+                )
+                .await
+            {
+                Ok(true) => {
+                    record_recovery_run(
+                        self.metrics_registry.as_ref(),
+                        "fail_crashed",
+                        "committed",
+                    );
+                    run.status = STATUS_FAILED.to_string();
+                    run.waiting_for = None;
+                    run.error_message = Some("recovered from crash".to_string());
+                    run.error_code = Some("crash_recovery".to_string());
+                    run.last_event_idx += events.len() as i64;
+                    run.events.extend(events);
+                    Some(run)
+                }
+                Ok(false) => self.recovery_conflict_current_run(&run).await,
+                Err(e) => {
+                    record_recovery_run(self.metrics_registry.as_ref(), "fail_crashed", "error");
+                    tracing::warn!(
+                        target: "astra_runtime::run_engine",
+                        run_id = %run.run_id,
+                        error = %e,
+                        "failed to atomically mark crashed run as failed during recovery"
+                    );
+                    None
+                }
+            }
+        }
+    }
+
+    async fn recovery_conflict_current_run(
+        &self,
+        stale_run: &DurableRunRecord,
+    ) -> Option<DurableRunRecord> {
+        let current = match self.load_run(&stale_run.user_id, &stale_run.run_id).await {
+            Ok(current) => current,
+            Err(error) => {
+                record_recovery_run(self.metrics_registry.as_ref(), "conflict_reload", "error");
+                tracing::warn!(
+                    target: "astra_runtime::run_engine",
+                    run_id = %stale_run.run_id,
+                    error = %error,
+                    "recovery transition CAS missed and current run reload failed"
+                );
+                return None;
+            }
+        };
+        let Some(current) = current else {
+            record_recovery_run(self.metrics_registry.as_ref(), "conflict_reload", "missing");
+            tracing::warn!(
+                target: "astra_runtime::run_engine",
+                run_id = %stale_run.run_id,
+                "recovery transition CAS missed and current run is gone"
+            );
+            return None;
+        };
+        if current.status == STATUS_WAITING || current.status == STATUS_FAILED {
+            record_recovery_run(
+                self.metrics_registry.as_ref(),
+                "conflict_current",
+                "accepted",
+            );
+            Some(current)
+        } else {
+            record_recovery_run(
+                self.metrics_registry.as_ref(),
+                "conflict_current",
+                "skipped",
+            );
+            tracing::warn!(
+                target: "astra_runtime::run_engine",
+                run_id = %stale_run.run_id,
+                stale_status = %stale_run.status,
+                current_status = %current.status,
+                "recovery transition skipped because durable status changed"
+            );
+            None
+        }
+    }
+
+    /// List runs for a user using seek pagination.
+    pub async fn list_user_runs_cursor(
         &self,
         user_id: &str,
         limit: u32,
-        offset: u32,
-    ) -> Result<(Vec<DurableRunRecord>, i64), String> {
-        self.store.list_user_runs(user_id, limit, offset).await
+        cursor: Option<RunListCursor>,
+    ) -> Result<DurableRunListPage, String> {
+        self.store
+            .list_user_runs_cursor(user_id, limit, cursor)
+            .await
     }
 
     /// Access the underlying store (for advanced queries).
@@ -686,6 +1296,16 @@ impl RunInputProvider for RunEngine {
         let run = match self.store.load_run(user_id, run_id).await {
             Ok(Some(run)) => run,
             Ok(None) => {
+                record_control_poll_attempt(
+                    self.metrics_registry.as_ref(),
+                    "user_input_poll",
+                    "missing",
+                );
+                record_control_poll_error(
+                    self.metrics_registry.as_ref(),
+                    "user_input_poll",
+                    "missing",
+                );
                 let error = format!("run not found while polling deferred input: {run_id}");
                 return RunQueuedInputPoll {
                     next_cursor: after_event_index,
@@ -698,6 +1318,16 @@ impl RunInputProvider for RunEngine {
                     run_id,
                     error = %error,
                     "failed to poll queued user inputs from run store"
+                );
+                record_control_poll_attempt(
+                    self.metrics_registry.as_ref(),
+                    "user_input_poll",
+                    "error",
+                );
+                record_control_poll_error(
+                    self.metrics_registry.as_ref(),
+                    "user_input_poll",
+                    "store",
                 );
                 return RunQueuedInputPoll {
                     next_cursor: after_event_index,
@@ -767,8 +1397,22 @@ impl RunInputProvider for RunEngine {
                     error = %update_error,
                     "failed to auto-heal stale input-queued status after released inputs"
                 );
+                record_control_poll_attempt(
+                    self.metrics_registry.as_ref(),
+                    "user_input_poll",
+                    "auto_heal_error",
+                );
+                record_control_poll_error(
+                    self.metrics_registry.as_ref(),
+                    "user_input_poll",
+                    "auto_heal",
+                );
                 error = Some(update_error);
             }
+        }
+
+        if error.is_none() {
+            record_control_poll_attempt(self.metrics_registry.as_ref(), "user_input_poll", "ok");
         }
 
         RunQueuedInputPoll {
@@ -797,32 +1441,36 @@ impl RunInputProvider for RunEngine {
             | DurableRunStatusKind::Failed => return Ok(()),
             _ => {}
         }
-        self.append_event(
-            user_id,
-            run_id,
-            serde_json::json!({
-                "event_type": "user_inputs_released",
-                "data": { "event_indices": event_indices },
-            }),
-        )
-        .await?;
-        let current =
-            self.store.load_run(user_id, run_id).await?.ok_or_else(|| {
+        let release_event = serde_json::json!({
+            "event_type": "user_inputs_released",
+            "data": { "event_indices": event_indices },
+        });
+        if run.status == STATUS_INPUT_QUEUED {
+            let updated = self
+                .transition_status_with_event_if_current(
+                    user_id,
+                    run_id,
+                    &[STATUS_INPUT_QUEUED],
+                    STATUS_RUNNING,
+                    None,
+                    None,
+                    release_event.clone(),
+                )
+                .await?;
+            if updated {
+                return Ok(());
+            }
+            let current = self.store.load_run(user_id, run_id).await?.ok_or_else(|| {
                 format!("run not found after acknowledging deferred input: {run_id}")
             })?;
-        if current.status != STATUS_INPUT_QUEUED {
-            return Ok(());
+            match durable_run_status_kind(&current.status) {
+                DurableRunStatusKind::Cancelled
+                | DurableRunStatusKind::Completed
+                | DurableRunStatusKind::Failed => return Ok(()),
+                _ => {}
+            }
         }
-        self.persist_status_if_current(
-            user_id,
-            run_id,
-            &[STATUS_INPUT_QUEUED],
-            STATUS_RUNNING,
-            None,
-            None,
-        )
-        .await
-        .map(|_| ())
+        self.append_event(user_id, run_id, release_event).await
     }
 }
 
@@ -934,9 +1582,401 @@ impl astra_server_types::team_orchestrator_traits::RunPersistence for RunEngine 
 mod tests {
     use super::*;
     use astra_services::runs::{DurableRunRecord, InMemoryRunStateStore, RunStateStore};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn test_engine() -> RunEngine {
         RunEngine::new(Arc::new(InMemoryRunStateStore::new()))
+    }
+
+    #[tokio::test]
+    async fn owner_lease_heartbeat_is_disabled_when_store_has_no_interval() {
+        assert!(
+            test_engine()
+                .start_owner_lease_heartbeat("user-1".to_string(), "run-1".to_string())
+                .is_none(),
+            "stores without shared lease state should not spawn a heartbeat task"
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_lease_heartbeat_renews_until_guard_drops() {
+        let store = Arc::new(
+            FlakyBatchTransitionStore::new(0, BatchTransitionFailureMode::FailBeforeStoreWrite)
+                .with_owner_lease_heartbeat(Duration::from_millis(5)),
+        );
+        let engine = RunEngine::new(store.clone());
+        let guard = engine
+            .start_owner_lease_heartbeat("user-1".to_string(), "run-1".to_string())
+            .expect("heartbeat-enabled store should start a guard");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+        while store.lease_renewals() < 2 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            store.lease_renewals() >= 2,
+            "heartbeat should renew the active run lease while the guard is alive"
+        );
+
+        drop(guard);
+        let renewals_after_drop = store.lease_renewals();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(
+            store.lease_renewals(),
+            renewals_after_drop,
+            "dropping the heartbeat guard must stop renewal"
+        );
+    }
+
+    #[derive(Clone, Copy)]
+    enum BatchTransitionFailureMode {
+        FailBeforeStoreWrite,
+        FailAfterStoreWrite,
+        FailAfterStatusWrite,
+        ConcurrentCancelWins,
+    }
+
+    struct FlakyBatchTransitionStore {
+        inner: InMemoryRunStateStore,
+        fail_remaining: AtomicUsize,
+        attempts: AtomicUsize,
+        waiting_queries: AtomicUsize,
+        recoverable_active_queries: AtomicUsize,
+        lease_renewal_interval: Option<Duration>,
+        lease_renewals: AtomicUsize,
+        mode: BatchTransitionFailureMode,
+    }
+
+    impl FlakyBatchTransitionStore {
+        fn new(failures: usize, mode: BatchTransitionFailureMode) -> Self {
+            Self {
+                inner: InMemoryRunStateStore::new(),
+                fail_remaining: AtomicUsize::new(failures),
+                attempts: AtomicUsize::new(0),
+                waiting_queries: AtomicUsize::new(0),
+                recoverable_active_queries: AtomicUsize::new(0),
+                lease_renewal_interval: None,
+                lease_renewals: AtomicUsize::new(0),
+                mode,
+            }
+        }
+
+        fn with_owner_lease_heartbeat(mut self, interval: Duration) -> Self {
+            self.lease_renewal_interval = Some(interval);
+            self
+        }
+
+        fn attempts(&self) -> usize {
+            self.attempts.load(Ordering::SeqCst)
+        }
+
+        fn waiting_queries(&self) -> usize {
+            self.waiting_queries.load(Ordering::SeqCst)
+        }
+
+        fn recoverable_active_queries(&self) -> usize {
+            self.recoverable_active_queries.load(Ordering::SeqCst)
+        }
+
+        fn lease_renewals(&self) -> usize {
+            self.lease_renewals.load(Ordering::SeqCst)
+        }
+
+        fn should_fail_this_attempt(&self) -> bool {
+            self.fail_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RunStateStore for FlakyBatchTransitionStore {
+        async fn insert_run(&self, record: DurableRunRecord) -> Result<(), String> {
+            self.inner.insert_run(record).await
+        }
+
+        async fn load_run(
+            &self,
+            user_id: &str,
+            run_id: &str,
+        ) -> Result<Option<DurableRunRecord>, String> {
+            self.inner.load_run(user_id, run_id).await
+        }
+
+        async fn update_run_status(
+            &self,
+            user_id: &str,
+            run_id: &str,
+            status: &str,
+            waiting_for: Option<&str>,
+            error_message: Option<&str>,
+        ) -> Result<bool, String> {
+            self.inner
+                .update_run_status(user_id, run_id, status, waiting_for, error_message)
+                .await
+        }
+
+        async fn update_run_status_if_current(
+            &self,
+            user_id: &str,
+            run_id: &str,
+            expected_statuses: &[&str],
+            status: &str,
+            waiting_for: Option<&str>,
+            error_message: Option<&str>,
+        ) -> Result<bool, String> {
+            self.inner
+                .update_run_status_if_current(
+                    user_id,
+                    run_id,
+                    expected_statuses,
+                    status,
+                    waiting_for,
+                    error_message,
+                )
+                .await
+        }
+
+        async fn update_run_status_with_event_if_current(
+            &self,
+            user_id: &str,
+            run_id: &str,
+            expected_statuses: &[&str],
+            status: &str,
+            waiting_for: Option<&str>,
+            error_message: Option<&str>,
+            event: serde_json::Value,
+        ) -> Result<bool, String> {
+            self.inner
+                .update_run_status_with_event_if_current(
+                    user_id,
+                    run_id,
+                    expected_statuses,
+                    status,
+                    waiting_for,
+                    error_message,
+                    event,
+                )
+                .await
+        }
+
+        async fn update_run_status_with_events_if_current(
+            &self,
+            user_id: &str,
+            run_id: &str,
+            expected_statuses: &[&str],
+            status: &str,
+            waiting_for: Option<&str>,
+            error_message: Option<&str>,
+            events: &[serde_json::Value],
+        ) -> Result<bool, String> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            if self.should_fail_this_attempt() {
+                match self.mode {
+                    BatchTransitionFailureMode::FailBeforeStoreWrite => {
+                        return Err("transient EOF before commit".to_string());
+                    }
+                    BatchTransitionFailureMode::FailAfterStoreWrite => {
+                        self.inner
+                            .update_run_status_with_events_if_current(
+                                user_id,
+                                run_id,
+                                expected_statuses,
+                                status,
+                                waiting_for,
+                                error_message,
+                                events,
+                            )
+                            .await?;
+                        return Err("transient EOF after commit".to_string());
+                    }
+                    BatchTransitionFailureMode::FailAfterStatusWrite => {
+                        self.inner
+                            .update_run_status_if_current(
+                                user_id,
+                                run_id,
+                                expected_statuses,
+                                status,
+                                waiting_for,
+                                error_message,
+                            )
+                            .await?;
+                        return Err("transient EOF after status-only commit".to_string());
+                    }
+                    BatchTransitionFailureMode::ConcurrentCancelWins => {
+                        self.inner
+                            .update_run_status_with_events_if_current(
+                                user_id,
+                                run_id,
+                                expected_statuses,
+                                STATUS_CANCELLED,
+                                None,
+                                Some("cancelled elsewhere"),
+                                &[serde_json::json!({
+                                    "event_type": "run_finished",
+                                    "data": {"status": STATUS_CANCELLED}
+                                })],
+                            )
+                            .await?;
+                        return Err("transient EOF after concurrent cancel".to_string());
+                    }
+                }
+            }
+            self.inner
+                .update_run_status_with_events_if_current(
+                    user_id,
+                    run_id,
+                    expected_statuses,
+                    status,
+                    waiting_for,
+                    error_message,
+                    events,
+                )
+                .await
+        }
+
+        async fn update_run_usage(
+            &self,
+            user_id: &str,
+            run_id: &str,
+            prompt_tokens: u64,
+            completion_tokens: u64,
+            tool_calls: u32,
+        ) -> Result<bool, String> {
+            self.inner
+                .update_run_usage(
+                    user_id,
+                    run_id,
+                    prompt_tokens,
+                    completion_tokens,
+                    tool_calls,
+                )
+                .await
+        }
+
+        async fn save_checkpoint(
+            &self,
+            user_id: &str,
+            run_id: &str,
+            checkpoint_json: &str,
+        ) -> Result<bool, String> {
+            self.inner
+                .save_checkpoint(user_id, run_id, checkpoint_json)
+                .await
+        }
+
+        async fn load_latest_checkpoint(
+            &self,
+            user_id: &str,
+            run_id: &str,
+            checkpoint_kind: Option<&str>,
+        ) -> Result<Option<DurableRunCheckpointRecord>, String> {
+            self.inner
+                .load_latest_checkpoint(user_id, run_id, checkpoint_kind)
+                .await
+        }
+
+        async fn load_run_projection(
+            &self,
+            user_id: &str,
+            run_id: &str,
+        ) -> Result<Option<DurableRunDisplayProjectionRecord>, String> {
+            self.inner.load_run_projection(user_id, run_id).await
+        }
+
+        async fn rebuild_run_projection(
+            &self,
+            user_id: &str,
+            run_id: &str,
+        ) -> Result<Option<DurableRunDisplayProjectionRecord>, String> {
+            self.inner.rebuild_run_projection(user_id, run_id).await
+        }
+
+        async fn append_events_batch(
+            &self,
+            user_id: &str,
+            run_id: &str,
+            events: &[serde_json::Value],
+        ) -> Result<(), String> {
+            self.inner
+                .append_events_batch(user_id, run_id, events)
+                .await
+        }
+
+        async fn list_user_runs_cursor(
+            &self,
+            user_id: &str,
+            limit: u32,
+            cursor: Option<astra_services::runs::RunListCursor>,
+        ) -> Result<astra_services::runs::DurableRunListPage, String> {
+            self.inner
+                .list_user_runs_cursor(user_id, limit, cursor)
+                .await
+        }
+
+        async fn find_waiting_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
+            self.waiting_queries.fetch_add(1, Ordering::SeqCst);
+            self.inner.find_waiting_runs().await
+        }
+
+        async fn find_running_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
+            self.inner.find_running_runs().await
+        }
+
+        async fn find_recoverable_running_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
+            self.inner.find_recoverable_running_runs().await
+        }
+
+        async fn find_recoverable_active_runs(&self) -> Result<Vec<DurableRunRecord>, String> {
+            self.recoverable_active_queries
+                .fetch_add(1, Ordering::SeqCst);
+            self.inner.find_recoverable_active_runs().await
+        }
+
+        fn owner_lease_renewal_interval(&self) -> Option<Duration> {
+            self.lease_renewal_interval
+        }
+
+        async fn renew_owner_lease(
+            &self,
+            _user_id: &str,
+            _run_id: &str,
+            _expected_statuses: &[&str],
+        ) -> Result<bool, String> {
+            self.lease_renewals.fetch_add(1, Ordering::SeqCst);
+            Ok(true)
+        }
+
+        async fn find_blocking_session_run(
+            &self,
+            user_id: &str,
+            session_id: &str,
+        ) -> Result<Option<DurableRunRecord>, String> {
+            self.inner
+                .find_blocking_session_run(user_id, session_id)
+                .await
+        }
+
+        async fn find_sub_runs(
+            &self,
+            user_id: &str,
+            delegation_id: &str,
+        ) -> Result<Vec<DurableRunRecord>, String> {
+            self.inner.find_sub_runs(user_id, delegation_id).await
+        }
+
+        async fn update_retry_count(
+            &self,
+            user_id: &str,
+            run_id: &str,
+            retry_count: u32,
+        ) -> Result<bool, String> {
+            self.inner
+                .update_retry_count(user_id, run_id, retry_count)
+                .await
+        }
     }
 
     struct FailingLoadRunStore;
@@ -978,6 +2018,32 @@ mod tests {
             Err("store unavailable".into())
         }
 
+        async fn update_run_status_with_event_if_current(
+            &self,
+            _user_id: &str,
+            _run_id: &str,
+            _expected_statuses: &[&str],
+            _status: &str,
+            _waiting_for: Option<&str>,
+            _error_message: Option<&str>,
+            _event: serde_json::Value,
+        ) -> Result<bool, String> {
+            Err("store unavailable".into())
+        }
+
+        async fn update_run_status_with_events_if_current(
+            &self,
+            _user_id: &str,
+            _run_id: &str,
+            _expected_statuses: &[&str],
+            _status: &str,
+            _waiting_for: Option<&str>,
+            _error_message: Option<&str>,
+            _events: &[serde_json::Value],
+        ) -> Result<bool, String> {
+            Err("store unavailable".into())
+        }
+
         async fn update_run_usage(
             &self,
             _user_id: &str,
@@ -1015,6 +2081,14 @@ mod tests {
             Err("store unavailable".into())
         }
 
+        async fn rebuild_run_projection(
+            &self,
+            _user_id: &str,
+            _run_id: &str,
+        ) -> Result<Option<DurableRunDisplayProjectionRecord>, String> {
+            Err("store unavailable".into())
+        }
+
         async fn append_events_batch(
             &self,
             _user_id: &str,
@@ -1024,12 +2098,12 @@ mod tests {
             Err("store unavailable".into())
         }
 
-        async fn list_user_runs(
+        async fn list_user_runs_cursor(
             &self,
             _user_id: &str,
             _limit: u32,
-            _offset: u32,
-        ) -> Result<(Vec<DurableRunRecord>, i64), String> {
+            _cursor: Option<RunListCursor>,
+        ) -> Result<DurableRunListPage, String> {
             Err("store unavailable".into())
         }
 
@@ -1282,6 +2356,252 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_transition_retries_transient_error_before_commit() {
+        let store = Arc::new(FlakyBatchTransitionStore::new(
+            1,
+            BatchTransitionFailureMode::FailBeforeStoreWrite,
+        ));
+        let engine = RunEngine::new(store.clone());
+        engine
+            .start_run("run-terminal-retry", "user-1", "sess-1")
+            .await
+            .unwrap();
+        let terminal_events = vec![serde_json::json!({
+            "event_type": "run_finished",
+            "data": {"status": STATUS_COMPLETED}
+        })];
+
+        let updated = engine
+            .transition_terminal_status_with_events_if_current(
+                "user-1",
+                "run-terminal-retry",
+                &[STATUS_RUNNING],
+                STATUS_COMPLETED,
+                None,
+                None,
+                &terminal_events,
+            )
+            .await
+            .unwrap();
+
+        assert!(updated);
+        assert_eq!(store.attempts(), 2);
+        let run = engine
+            .load_run("user-1", "run-terminal-retry")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.status, STATUS_COMPLETED);
+        assert_eq!(
+            run.events
+                .iter()
+                .filter(
+                    |event| event.get("event_type").and_then(serde_json::Value::as_str)
+                        == Some("run_finished")
+                )
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_transition_reconciles_commit_after_unknown_error() {
+        let store = Arc::new(FlakyBatchTransitionStore::new(
+            1,
+            BatchTransitionFailureMode::FailAfterStoreWrite,
+        ));
+        let engine = RunEngine::new(store.clone());
+        engine
+            .start_run("run-terminal-reconcile", "user-1", "sess-1")
+            .await
+            .unwrap();
+        let terminal_events = vec![serde_json::json!({
+            "event_type": "run_finished",
+            "data": {"status": STATUS_COMPLETED}
+        })];
+
+        let updated = engine
+            .transition_terminal_status_with_events_if_current(
+                "user-1",
+                "run-terminal-reconcile",
+                &[STATUS_RUNNING],
+                STATUS_COMPLETED,
+                None,
+                None,
+                &terminal_events,
+            )
+            .await
+            .unwrap();
+
+        assert!(updated);
+        assert_eq!(store.attempts(), 2);
+        let run = engine
+            .load_run("user-1", "run-terminal-reconcile")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.status, STATUS_COMPLETED);
+        assert_eq!(
+            run.events
+                .iter()
+                .filter(
+                    |event| event.get("event_type").and_then(serde_json::Value::as_str)
+                        == Some("run_finished")
+                )
+                .count(),
+            1,
+            "commit-after-EOF reconcile must not append duplicate terminal events"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_transition_repairs_missing_events_after_status_only_unknown_error() {
+        let store = Arc::new(FlakyBatchTransitionStore::new(
+            1,
+            BatchTransitionFailureMode::FailAfterStatusWrite,
+        ));
+        let engine = RunEngine::new(store.clone());
+        engine
+            .start_run("run-terminal-repair", "user-1", "sess-1")
+            .await
+            .unwrap();
+        let terminal_events = vec![
+            serde_json::json!({
+                "event_type": "run_error",
+                "data": {
+                    "error": "tool failed",
+                    "error_code": "tool_error",
+                    "error_kind": "tool_error"
+                }
+            }),
+            serde_json::json!({
+                "event_type": "run_finished",
+                "data": {
+                    "status": STATUS_FAILED,
+                    "error": "tool failed",
+                    "error_code": "tool_error",
+                    "error_kind": "tool_error"
+                }
+            }),
+        ];
+
+        let updated = engine
+            .transition_terminal_status_with_events_if_current(
+                "user-1",
+                "run-terminal-repair",
+                &[STATUS_RUNNING],
+                STATUS_FAILED,
+                None,
+                Some("tool failed"),
+                &terminal_events,
+            )
+            .await
+            .unwrap();
+
+        assert!(updated);
+        assert_eq!(store.attempts(), 2);
+        let run = engine
+            .load_run("user-1", "run-terminal-repair")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.status, STATUS_FAILED);
+        assert_eq!(
+            run.events
+                .iter()
+                .filter(
+                    |event| event.get("event_type").and_then(serde_json::Value::as_str)
+                        == Some("run_error")
+                )
+                .count(),
+            1
+        );
+        assert_eq!(
+            run.events
+                .iter()
+                .filter(
+                    |event| event.get("event_type").and_then(serde_json::Value::as_str)
+                        == Some("run_finished")
+                )
+                .count(),
+            1
+        );
+        assert!(durable_run_contains_event_batch(&run, &terminal_events));
+    }
+
+    #[tokio::test]
+    async fn terminal_transition_retry_does_not_override_concurrent_cancel() {
+        let store = Arc::new(FlakyBatchTransitionStore::new(
+            1,
+            BatchTransitionFailureMode::ConcurrentCancelWins,
+        ));
+        let engine = RunEngine::new(store.clone());
+        engine
+            .start_run("run-terminal-cancel-race", "user-1", "sess-1")
+            .await
+            .unwrap();
+        let terminal_events = vec![serde_json::json!({
+            "event_type": "run_finished",
+            "data": {"status": STATUS_COMPLETED}
+        })];
+
+        let updated = engine
+            .transition_terminal_status_with_events_if_current(
+                "user-1",
+                "run-terminal-cancel-race",
+                &[STATUS_RUNNING],
+                STATUS_COMPLETED,
+                None,
+                None,
+                &terminal_events,
+            )
+            .await
+            .unwrap();
+
+        assert!(!updated);
+        assert_eq!(store.attempts(), 2);
+        let run = engine
+            .load_run("user-1", "run-terminal-cancel-race")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.status, STATUS_CANCELLED);
+        assert_eq!(
+            run.events.last().and_then(|event| {
+                event
+                    .pointer("/data/status")
+                    .and_then(serde_json::Value::as_str)
+            }),
+            Some(STATUS_CANCELLED)
+        );
+    }
+
+    #[test]
+    fn terminal_reconcile_projection_refresh_is_warn_only() {
+        let source = include_str!("engine.rs");
+        let reconcile_body = source
+            .split("async fn reconcile_terminal_transition_after_store_error")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split("async fn project_delegation_run_if_needed")
+                    .next()
+            })
+            .expect("terminal reconcile body");
+
+        assert!(
+            reconcile_body.contains("project_delegation_run_if_needed"),
+            "terminal reconcile must still refresh delegated run projections"
+        );
+        assert!(
+            !reconcile_body.contains("propagating error")
+                && !reconcile_body.contains(
+                    "terminal transition reconciled but delegation projection refresh failed:"
+                ),
+            "projection refresh failure must not overturn a reconciled durable terminal transition"
+        );
+    }
+
+    #[tokio::test]
     async fn persist_usage_updates() {
         let engine = test_engine();
         engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
@@ -1507,6 +2827,191 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_control_poll_metrics_record_status_and_input_store_errors() {
+        let registry = Arc::new(MetricsRegistry::new());
+        let engine =
+            RunEngine::new(Arc::new(FailingLoadRunStore)).with_metrics_registry(registry.clone());
+
+        let status = engine.check_control_status("user-1", "run-input").await;
+        assert_eq!(status.unwrap_err(), "load failed");
+        let poll = engine.poll_user_inputs("user-1", "run-input", 7).await;
+        assert_eq!(poll.error.as_deref(), Some("load failed"));
+
+        let rendered = registry.render_prometheus();
+        assert!(
+            rendered.contains(
+                "astra_run_control_poll_attempts_total{operation=\"status\",outcome=\"error\"} 1"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "astra_run_control_poll_errors_total{class=\"store\",operation=\"status\"} 1"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "astra_run_control_poll_attempts_total{operation=\"user_input_poll\",outcome=\"error\"} 1"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "astra_run_control_poll_errors_total{class=\"store\",operation=\"user_input_poll\"} 1"
+            ),
+            "{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_control_poll_metrics_record_missing_and_ok_without_high_cardinality() {
+        let registry = Arc::new(MetricsRegistry::new());
+        let engine = test_engine().with_metrics_registry(registry.clone());
+
+        let missing = engine.poll_user_inputs("user-1", "missing-run", 3).await;
+        assert_eq!(
+            missing.error.as_deref(),
+            Some("run not found while polling deferred input: missing-run")
+        );
+        engine
+            .start_run("run-input", "user-1", "sess-input")
+            .await
+            .unwrap();
+        assert_eq!(
+            engine
+                .check_control_status("user-1", "run-input")
+                .await
+                .unwrap(),
+            None
+        );
+        let ok = engine.poll_user_inputs("user-1", "run-input", 0).await;
+        assert_eq!(ok.error, None);
+
+        let rendered = registry.render_prometheus();
+        assert!(
+            rendered.contains(
+                "astra_run_control_poll_attempts_total{operation=\"user_input_poll\",outcome=\"missing\"} 1"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "astra_run_control_poll_errors_total{class=\"missing\",operation=\"user_input_poll\"} 1"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "astra_run_control_poll_attempts_total{operation=\"status\",outcome=\"ok\"} 1"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "astra_run_control_poll_attempts_total{operation=\"user_input_poll\",outcome=\"ok\"} 1"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("user-1")
+                && !rendered.contains("run-input")
+                && !rendered.contains("missing-run"),
+            "metrics must stay low-cardinality: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_metrics_record_startup_actions_without_high_cardinality() {
+        let registry = Arc::new(MetricsRegistry::new());
+        let engine = test_engine().with_metrics_registry(registry.clone());
+        engine
+            .start_run("run-waiting-metric", "user-1", "sess-waiting")
+            .await
+            .unwrap();
+        engine
+            .persist_status(
+                "user-1",
+                "run-waiting-metric",
+                STATUS_WAITING,
+                Some("user_resume"),
+                None,
+            )
+            .await
+            .unwrap();
+        engine
+            .start_run("run-resume-metric", "user-1", "sess-resume")
+            .await
+            .unwrap();
+        engine
+            .persist_checkpoint(
+                "user-1",
+                "run-resume-metric",
+                r#"{"version":"checkpoint_v1","graceful":true,"last_batch_id":"shutdown-run-resume-metric"}"#,
+            )
+            .await
+            .unwrap();
+        engine
+            .start_run("run-crash-metric", "user-1", "sess-crash")
+            .await
+            .unwrap();
+
+        let recovered = engine.recover_active_runs().await.unwrap();
+        assert_eq!(recovered.len(), 3);
+
+        let rendered = registry.render_prometheus();
+        assert!(
+            rendered.contains("astra_run_recovery_scans_total{outcome=\"ok\"} 1"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "astra_run_recovery_runs_total{action=\"preserve_waiting\",outcome=\"ok\"} 1"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "astra_run_recovery_runs_total{action=\"resume_checkpoint\",outcome=\"committed\"} 1"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "astra_run_recovery_runs_total{action=\"fail_crashed\",outcome=\"committed\"} 1"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("user-1")
+                && !rendered.contains("run-waiting-metric")
+                && !rendered.contains("run-resume-metric")
+                && !rendered.contains("run-crash-metric"),
+            "recovery metrics must stay low-cardinality: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_metrics_record_scan_error() {
+        let registry = Arc::new(MetricsRegistry::new());
+        let engine =
+            RunEngine::new(Arc::new(FailingLoadRunStore)).with_metrics_registry(registry.clone());
+
+        let error = engine.recover_active_runs().await.unwrap_err();
+        assert_eq!(error, "store unavailable");
+
+        let rendered = registry.render_prometheus();
+        assert!(
+            rendered.contains("astra_run_recovery_scans_total{outcome=\"error\"} 1"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("user-1") && !rendered.contains("run-"),
+            "scan error metrics must stay low-cardinality: {rendered}"
+        );
+    }
+
+    #[tokio::test]
     async fn poll_user_inputs_keeps_cursor_when_after_index_exceeds_events() {
         let engine = test_engine();
         engine
@@ -1587,6 +3092,16 @@ mod tests {
             .unwrap();
         assert_eq!(run.status, STATUS_RUNNING);
         assert_eq!(run.waiting_for, None);
+        assert_eq!(
+            run.events
+                .iter()
+                .filter(
+                    |event| event.get("event_type").and_then(serde_json::Value::as_str)
+                        == Some("user_inputs_released")
+                )
+                .count(),
+            1
+        );
         let poll = engine.poll_user_inputs("user-1", "run-queued", 0).await;
         assert!(
             poll.inputs.is_empty(),
@@ -1634,6 +3149,13 @@ mod tests {
             .unwrap();
         assert_eq!(run.status, STATUS_PAUSED);
         assert_eq!(run.waiting_for.as_deref(), Some("user_resume"));
+        assert!(
+            run.events.iter().any(|event| {
+                event.get("event_type").and_then(serde_json::Value::as_str)
+                    == Some("user_inputs_released")
+            }),
+            "paused release must still record that delivered inputs were consumed"
+        );
     }
 
     #[tokio::test]
@@ -1724,7 +3246,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_user_runs_pagination() {
+    async fn list_user_runs_cursor_pagination() {
         let engine = test_engine();
         for i in 0..5 {
             engine
@@ -1736,11 +3258,20 @@ mod tests {
             .start_run("run-other", "user-2", "sess-other")
             .await
             .unwrap();
-        let (runs, total) = engine.list_user_runs("user-1", 2, 0).await.unwrap();
-        assert_eq!(total, 5);
+        let first = engine
+            .list_user_runs_cursor("user-1", 2, None)
+            .await
+            .unwrap();
+        let runs = first.runs;
         assert_eq!(runs.len(), 2);
-        let (runs2, _) = engine.list_user_runs("user-1", 10, 3).await.unwrap();
-        assert_eq!(runs2.len(), 2);
+        assert!(first.next_cursor.is_some());
+        assert_eq!(first.total, None);
+        let runs2 = engine
+            .list_user_runs_cursor("user-1", 10, first.next_cursor)
+            .await
+            .unwrap()
+            .runs;
+        assert_eq!(runs2.len(), 3);
     }
 
     #[tokio::test]
@@ -1759,6 +3290,100 @@ mod tests {
         let active = engine.recover_active_runs().await.unwrap();
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].run_id, "run-1");
+    }
+
+    #[tokio::test]
+    async fn recover_active_runs_uses_store_recoverable_active_query() {
+        let store = Arc::new(FlakyBatchTransitionStore::new(
+            0,
+            BatchTransitionFailureMode::FailBeforeStoreWrite,
+        ));
+        let engine = RunEngine::new(store.clone());
+        engine
+            .start_run("run-waiting", "user-1", "sess-waiting")
+            .await
+            .unwrap();
+        engine
+            .persist_status(
+                "user-1",
+                "run-waiting",
+                STATUS_WAITING,
+                Some("user_resume"),
+                None,
+            )
+            .await
+            .unwrap();
+        engine
+            .start_run("run-crashed", "user-1", "sess-crashed")
+            .await
+            .unwrap();
+
+        let recovered = engine.recover_active_runs().await.unwrap();
+
+        assert_eq!(
+            store.recoverable_active_queries(),
+            1,
+            "startup recovery must use the store's owner-scoped active recovery query"
+        );
+        assert_eq!(
+            store.waiting_queries(),
+            0,
+            "startup recovery must not separately query waiting runs outside the owner-scoped recovery path"
+        );
+        assert!(
+            recovered.iter().any(|run| run.run_id == "run-waiting"
+                && run.status == STATUS_WAITING
+                && run.waiting_for.as_deref() == Some("user_resume")),
+            "waiting runs returned by the owner-scoped recovery query must be preserved"
+        );
+        let crashed = engine
+            .load_run("user-1", "run-crashed")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(crashed.status, STATUS_FAILED);
+        assert_eq!(crashed.error_code.as_deref(), Some("crash_recovery"));
+    }
+
+    #[tokio::test]
+    async fn recover_active_runs_does_not_fail_paused_runs() {
+        let engine = test_engine();
+        engine
+            .start_run("run-paused", "user-1", "sess-paused")
+            .await
+            .unwrap();
+        engine
+            .persist_status(
+                "user-1",
+                "run-paused",
+                STATUS_PAUSED,
+                Some("user_resume"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let recovered = engine.recover_active_runs().await.unwrap();
+
+        assert!(
+            recovered.iter().all(|run| run.run_id != "run-paused"),
+            "paused runs are user-held/resumable state, not crash-recovery candidates"
+        );
+        let durable = engine
+            .load_run("user-1", "run-paused")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable.status, STATUS_PAUSED);
+        assert_eq!(durable.waiting_for.as_deref(), Some("user_resume"));
+        assert!(durable.error_code.is_none());
+        assert!(
+            durable
+                .events
+                .iter()
+                .all(|event| event["event_type"] != "run_error"),
+            "startup recovery must not append crash-recovery errors to paused runs"
+        );
     }
 
     #[tokio::test]
@@ -1994,6 +3619,24 @@ mod tests {
             Some("recovered from crash"),
             "error message must indicate crash recovery"
         );
+        assert_eq!(crashed.error_code.as_deref(), Some("crash_recovery"));
+        let crashed_event_types = crashed
+            .events
+            .iter()
+            .filter_map(|event| event.get("event_type").and_then(serde_json::Value::as_str))
+            .collect::<Vec<_>>();
+        assert!(
+            crashed_event_types.ends_with(&["run_error", "run_finished"]),
+            "crash recovery failure must persist a complete terminal event pair"
+        );
+        let run_error = &crashed.events[crashed.events.len() - 2];
+        let run_finished = crashed.events.last().unwrap();
+        assert_eq!(run_error["data"]["error_code"], "crash_recovery");
+        assert_eq!(
+            run_finished["data"]["status"], "failed",
+            "crash recovery run_finished must be self-describing across replay boundaries"
+        );
+        assert_eq!(run_finished["data"]["error_code"], "crash_recovery");
 
         // The waiting run must remain waiting
         let waiting = engine
@@ -2004,6 +3647,52 @@ mod tests {
         assert_eq!(
             waiting.status, "waiting",
             "waiting run must remain waiting for resume"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_active_runs_cas_miss_does_not_overwrite_completed() {
+        let engine = test_engine();
+        engine
+            .start_run("run-race", "user-1", "sess-race")
+            .await
+            .unwrap();
+        let stale_running = engine
+            .load_run("user-1", "run-race")
+            .await
+            .unwrap()
+            .unwrap();
+        engine
+            .persist_status(
+                "user-1",
+                "run-race",
+                astra_core::STATUS_COMPLETED,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let recovered = engine.recover_active_run(stale_running).await;
+
+        assert!(
+            recovered.is_none(),
+            "a CAS-missed completed run must not be reported as recovered"
+        );
+        let durable = engine
+            .load_run("user-1", "run-race")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable.status, astra_core::STATUS_COMPLETED);
+        assert!(durable.error_message.is_none());
+        assert!(durable.error_code.is_none());
+        assert!(
+            durable.events.iter().all(|event| !matches!(
+                event.get("event_type").and_then(serde_json::Value::as_str),
+                Some("run_error" | "run_finished")
+            )),
+            "stale recovery must not append crash-recovery terminal events"
         );
     }
 
@@ -2041,5 +3730,18 @@ mod tests {
             durable.error_message.as_deref(),
             Some("recovered from crash")
         );
+        assert_eq!(durable.error_code.as_deref(), Some("crash_recovery"));
+        let event_types = durable
+            .events
+            .iter()
+            .filter_map(|event| event.get("event_type").and_then(serde_json::Value::as_str))
+            .collect::<Vec<_>>();
+        assert!(
+            event_types.ends_with(&["run_error", "run_finished"]),
+            "input-queued recovery failure must persist a complete terminal event pair"
+        );
+        let run_finished = durable.events.last().unwrap();
+        assert_eq!(run_finished["data"]["status"], "failed");
+        assert_eq!(run_finished["data"]["error_code"], "crash_recovery");
     }
 }

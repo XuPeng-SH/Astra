@@ -53,6 +53,85 @@ struct TranscriptPageItemRow {
     content_hash: String,
 }
 
+const DEFAULT_TURN_OBSERVER_ASYNC_CONCURRENCY: usize = 4;
+const METRIC_TURN_OBSERVER_DISPATCHES_TOTAL: &str = "astra_turn_observer_dispatches_total";
+const METRIC_TURN_OBSERVER_RUNS_TOTAL: &str = "astra_turn_observer_runs_total";
+static TURN_OBSERVER_ASYNC_IN_FLIGHT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+struct TurnObserverAsyncPermit;
+
+impl Drop for TurnObserverAsyncPermit {
+    fn drop(&mut self) {
+        TURN_OBSERVER_ASYNC_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+fn try_acquire_turn_observer_async_permit(limit: usize) -> Option<TurnObserverAsyncPermit> {
+    if limit == 0 {
+        return None;
+    }
+
+    let mut current = TURN_OBSERVER_ASYNC_IN_FLIGHT.load(std::sync::atomic::Ordering::Acquire);
+    loop {
+        if current >= limit {
+            return None;
+        }
+        match TURN_OBSERVER_ASYNC_IN_FLIGHT.compare_exchange_weak(
+            current,
+            current + 1,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        ) {
+            Ok(_) => return Some(TurnObserverAsyncPermit),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn register_turn_observer_metrics(registry: &astra_turn_core::pipeline_metrics::MetricsRegistry) {
+    registry.register_counter(
+        METRIC_TURN_OBSERVER_DISPATCHES_TOTAL,
+        "Server-loop turn observer dispatches by mode and low-cardinality outcome.",
+    );
+    registry.register_counter(
+        METRIC_TURN_OBSERVER_RUNS_TOTAL,
+        "Server-loop turn observer worker runs by mode and low-cardinality outcome.",
+    );
+}
+
+fn record_turn_observer_dispatch_metrics(
+    registry: Option<&Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
+    mode: &'static str,
+    outcome: &'static str,
+) {
+    let Some(registry) = registry else {
+        return;
+    };
+    register_turn_observer_metrics(registry);
+    registry.increment_counter(
+        METRIC_TURN_OBSERVER_DISPATCHES_TOTAL,
+        &[("mode", mode), ("outcome", outcome)],
+        1,
+    );
+}
+
+fn record_turn_observer_run_metrics(
+    registry: Option<&Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
+    mode: &'static str,
+    outcome: &'static str,
+) {
+    let Some(registry) = registry else {
+        return;
+    };
+    register_turn_observer_metrics(registry);
+    registry.increment_counter(
+        METRIC_TURN_OBSERVER_RUNS_TOTAL,
+        &[("mode", mode), ("outcome", outcome)],
+        1,
+    );
+}
+
 fn lifecycle_token_usage_json(
     input_tokens: u64,
     cached_input_tokens: u64,
@@ -115,6 +194,7 @@ pub(crate) struct PostLoopPersistContext {
     pub(crate) hook_db_writer: Option<Arc<dyn TurnHookDbWriter>>,
     pub(crate) observer_worker: Option<Arc<dyn TurnObserverWorker>>,
     pub(crate) tool_event_writer: Option<Arc<dyn TurnToolEventWriter>>,
+    pub(crate) metrics_registry: Option<Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
     pub(crate) csl_manager:
         Option<tokio::sync::Mutex<astra_turn_core::conversation_log::manager::CslManager>>,
 }
@@ -124,8 +204,13 @@ impl PostLoopPersistContext {
     ///
     /// The `loop_success` flag comes from `outcome.is_ok()` (before consuming
     /// the outcome in `finalize_run_events`).
-    pub(crate) async fn run(&self, state: &AgenticLoopState, loop_success: bool) {
-        let _ = loop_success;
+    pub(crate) async fn run(
+        &self,
+        state: &AgenticLoopState,
+        loop_success: bool,
+    ) -> Result<(), String> {
+        let mut errors = Vec::new();
+
         // 0. Persist CSL via CslManager.
         if let Some(ref mgr) = self.csl_manager {
             let mut mgr = mgr.lock().await;
@@ -135,33 +220,40 @@ impl PostLoopPersistContext {
                 .persist_turn(state.session_turn, &messages, &session_state)
                 .await
             {
+                let msg = format!("CSL persist failed: {}", e);
                 tracing::warn!(
                     session_id = %self.session_id,
                     error = %e,
                     "CSL persist failed"
                 );
+                errors.push(msg);
             }
         }
 
         // 1–2. Persist core events + trace detail events in a single MatrixOne
         // transaction so that a crash between writes leaves a consistent state.
-        let _mo_tx = self.persist_core_and_trace_in_transaction(state).await;
+        if let Err(e) = self.persist_core_and_trace_in_transaction(state).await {
+            errors.push(format!("core+trace transaction failed: {}", e));
+        }
 
         // 3. Persist audit-facing tool_call events for session_audit metrics.
         if let Some(ref writer) = self.tool_event_writer {
-            persist_server_loop_tool_events(
+            if let Err(e) = persist_server_loop_tool_events(
                 writer.as_ref(),
                 &self.user_id,
                 &self.session_id,
                 self.agent_id.as_deref(),
                 state,
             )
-            .await;
+            .await
+            {
+                errors.push(format!("tool events persist failed: {}", e));
+            }
         }
 
         // 4. Persist decision audit + skill selection to hook DB.
         if let Some(ref writer) = self.hook_db_writer {
-            persist_server_loop_hook_events(
+            if let Err(e) = persist_server_loop_hook_events(
                 writer.as_ref(),
                 &self.user_id,
                 &self.session_id,
@@ -169,13 +261,25 @@ impl PostLoopPersistContext {
                 state,
                 self.model_name.as_deref(),
             )
-            .await;
+            .await
+            {
+                errors.push(format!("hook events persist failed: {}", e));
+            }
         }
 
         // 5. Fire Memoria observer (cross-session knowledge extraction).
-        if let Some(ref worker) = self.observer_worker {
-            fire_server_loop_observer(worker.as_ref(), &self.user_id, &self.session_id, state)
-                .await;
+        if let Some(worker) = self.observer_worker.clone() {
+            if let Err(e) = fire_server_loop_observer(
+                worker,
+                &self.user_id,
+                &self.session_id,
+                state,
+                self.metrics_registry.clone(),
+            )
+            .await
+            {
+                errors.push(format!("observer fire failed: {}", e));
+            }
         }
 
         // 6. Fire SessionEnd hooks.
@@ -186,7 +290,7 @@ impl PostLoopPersistContext {
         .await;
 
         // 7. Persist runtime promotion events.
-        persist_runtime_promotion_events(
+        if let Err(e) = persist_runtime_promotion_events(
             &self.matrixone,
             self.shared_pool.as_ref(),
             &self.user_id,
@@ -194,10 +298,13 @@ impl PostLoopPersistContext {
             &self.run_id,
             &state.telemetry.promotion_events,
         )
-        .await;
+        .await
+        {
+            errors.push(format!("promotion events persist failed: {}", e));
+        }
 
         // 8. Persist web-agent state projection rows generated by the agentic loop.
-        persist_server_loop_projection_state(
+        if let Err(e) = persist_server_loop_projection_state(
             self.shared_pool.as_ref(),
             &self.user_id,
             &self.session_id,
@@ -206,13 +313,42 @@ impl PostLoopPersistContext {
             self.model_name.as_deref(),
             state,
         )
-        .await;
+        .await
+        {
+            errors.push(format!("projection state persist failed: {}", e));
+        }
+
+        // Use loop_success to conditionally log severity
+        if loop_success && !errors.is_empty() {
+            tracing::warn!(
+                session_id = %self.session_id,
+                run_id = %self.run_id,
+                error_count = errors.len(),
+                "post-loop persistence completed with errors"
+            );
+        } else if !loop_success && !errors.is_empty() {
+            tracing::error!(
+                session_id = %self.session_id,
+                run_id = %self.run_id,
+                error_count = errors.len(),
+                "post-loop persistence failed on failed run"
+            );
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
     }
 
     /// Persist core events and trace detail events in a single MatrixOne
     /// transaction. If the transaction fails, all writes are rolled back
     /// atomically — preventing partial state on crash.
-    async fn persist_core_and_trace_in_transaction(&self, state: &AgenticLoopState) {
+    async fn persist_core_and_trace_in_transaction(
+        &self,
+        state: &AgenticLoopState,
+    ) -> Result<(), String> {
         let Some(pool) = self.shared_pool.as_ref() else {
             // Without a pool, fall back to individual non-transactional calls.
             persist_server_loop_core_events(
@@ -244,12 +380,13 @@ impl PostLoopPersistContext {
                 self.model_name.as_deref(),
             )
             .await;
-            return;
+            return Ok(());
         };
 
         let mut tx = match pool.get().begin().await {
             Ok(tx) => tx,
             Err(error) => {
+                let msg = format!("failed to begin MO transaction: {}", error);
                 tracing::warn!(
                     session_id = %self.session_id,
                     error = %error,
@@ -284,7 +421,7 @@ impl PostLoopPersistContext {
                     self.model_name.as_deref(),
                 )
                 .await;
-                return;
+                return Err(msg);
             }
         };
 
@@ -310,13 +447,21 @@ impl PostLoopPersistContext {
         {
             Ok(()) => {}
             Err(error) => {
+                let msg = format!("core events tx failed: {}", error);
                 tracing::warn!(
                     session_id = %self.session_id,
                     error = %error,
                     "post-loop: core events tx failed, rolling back MO transaction"
                 );
-                let _ = tx.rollback().await;
-                return;
+                // rollback consumes the transaction; cannot use tx after this
+                if let Err(rollback_err) = tx.rollback().await {
+                    tracing::error!(
+                        session_id = %self.session_id,
+                        error = %rollback_err,
+                        "post-loop: rollback also failed after core events tx error"
+                    );
+                }
+                return Err(msg);
             }
         }
 
@@ -335,23 +480,33 @@ impl PostLoopPersistContext {
         )
         .await
         {
+            let msg = format!("detail events tx failed: {}", error);
             tracing::warn!(
                 session_id = %self.session_id,
                 error = %error,
                 "post-loop: detail events tx failed, rolling back MO transaction"
             );
-            let _ = tx.rollback().await;
-            return;
+            if let Err(rb_err) = tx.rollback().await {
+                tracing::error!(
+                    session_id = %self.session_id,
+                    error = %rb_err,
+                    "post-loop: rollback failed after detail events tx failure"
+                );
+            }
+            return Err(msg);
         }
 
         // Best-effort commit: on failure, rollback naturally drops the tx.
         if let Err(error) = tx.commit().await {
+            let msg = format!("MO transaction commit failed: {}", error);
             tracing::warn!(
                 session_id = %self.session_id,
                 error = %error,
                 "post-loop: MO transaction commit failed, writes rolled back"
             );
+            return Err(msg);
         }
+        Ok(())
     }
 }
 
@@ -363,9 +518,9 @@ async fn persist_server_loop_projection_state(
     agent_id: Option<&str>,
     model_name: Option<&str>,
     state: &AgenticLoopState,
-) {
+) -> Result<(), String> {
     let Some(pool) = shared_pool else {
-        return;
+        return Ok(());
     };
     let store = DatabaseStateProjectionStore::new(pool.clone());
     let final_text = state.final_text.trim();
@@ -424,6 +579,10 @@ async fn persist_server_loop_projection_state(
     {
         Ok(row) => row,
         Err(error) => {
+            let error_msg = format!(
+                "failed to inspect post-compaction context manifest count: {}",
+                error
+            );
             tracing::warn!(
                 target: "astra_runtime::state_projection",
                 session_id = %session_id,
@@ -431,13 +590,17 @@ async fn persist_server_loop_projection_state(
                 error = %error,
                 "failed to inspect post-compaction context manifest count"
             );
-            return;
+            return Err(error_msg);
         }
     };
     let post_compaction_count =
         match decode_post_compaction_manifest_count(&post_compaction_count_row) {
             Ok(count) => count,
             Err(error) => {
+                let error_msg = format!(
+                    "failed to decode post-compaction context manifest count: {}",
+                    error
+                );
                 tracing::warn!(
                     target: "astra_runtime::state_projection",
                     session_id = %session_id,
@@ -445,7 +608,7 @@ async fn persist_server_loop_projection_state(
                     error = %error,
                     "failed to decode post-compaction context manifest count"
                 );
-                return;
+                return Err(error_msg);
             }
         };
     if post_compaction_count > 0 {
@@ -480,6 +643,10 @@ async fn persist_server_loop_projection_state(
                     })
                     .await;
                 if let Err(error) = result {
+                    let error_msg = format!(
+                        "failed to persist post-compaction summary projection: {}",
+                        error
+                    );
                     tracing::warn!(
                         target: "astra_runtime::state_projection",
                         session_id = %session_id,
@@ -487,9 +654,11 @@ async fn persist_server_loop_projection_state(
                         error = %error,
                         "failed to persist post-compaction summary projection"
                     );
+                    return Err(error_msg);
                 }
             }
             Ok(results) => {
+                let error_msg = format!("post-compaction invariant check failed: {:?}", results);
                 tracing::warn!(
                     target: "astra_runtime::state_projection",
                     session_id = %session_id,
@@ -497,8 +666,11 @@ async fn persist_server_loop_projection_state(
                     ?results,
                     "post-compaction invariant check failed after loop"
                 );
+                return Err(error_msg);
             }
             Err(error) => {
+                let error_msg =
+                    format!("failed to run post-compaction invariant checks: {}", error);
                 tracing::warn!(
                     target: "astra_runtime::state_projection",
                     session_id = %session_id,
@@ -506,9 +678,11 @@ async fn persist_server_loop_projection_state(
                     error = %error,
                     "failed to run post-compaction invariant checks"
                 );
+                return Err(error_msg);
             }
         }
     }
+    Ok(())
 }
 
 fn truncate_for_projection(text: &str, max_chars: usize) -> String {
@@ -1092,7 +1266,12 @@ pub(crate) async fn persist_session_transcript_items(
             "server-loop",
             "failed to persist transcript items for session {session_id}: {error}"
         );
-        let _ = tx.rollback().await;
+        if let Err(rb_err) = tx.rollback().await {
+            astra_core::agent_error!(
+                "server-loop",
+                "failed to rollback after transcript items failure for session {session_id}: {rb_err}"
+            );
+        }
         return;
     }
     if let Err(error) = tx.commit().await {
@@ -1711,9 +1890,9 @@ async fn persist_server_loop_tool_events(
     session_id: &str,
     agent_id: Option<&str>,
     state: &AgenticLoopState,
-) {
+) -> Result<(), String> {
     if state.telemetry.all_tools_used.is_empty() {
-        return;
+        return Ok(());
     }
 
     let chain_id = server_loop_causal_chain_id("server-loop-tools");
@@ -1738,12 +1917,10 @@ async fn persist_server_loop_tool_events(
     }
 
     let plan = TurnToolEventPersistPlan { events };
-    if let Err(e) = writer.persist(plan).await {
-        astra_core::agent_error!(
-            "server-loop",
-            "failed to persist tool events for session {session_id}: {e}"
-        );
-    }
+    writer
+        .persist(plan)
+        .await
+        .map_err(|e| format!("tool events persist failed: {}", e))
 }
 
 /// Persist decision audit + skill selection to hook DB tables after the
@@ -1758,7 +1935,7 @@ async fn persist_server_loop_hook_events(
     user_message: &str,
     state: &AgenticLoopState,
     model_name: Option<&str>,
-) {
+) -> Result<(), String> {
     // Use the telemetry accumulator — state.telemetry.all_tools_used tracks every
     // tool name across all rounds.  state.messages does NOT carry assistant
     // tool_call objects in the server loop path.
@@ -1819,8 +1996,6 @@ async fn persist_server_loop_hook_events(
                 execution_time_ms: None,
             })
     };
-    let _ = &selected_skills;
-
     let plan = TurnHookDbPersistPlan {
         decision_audit,
         skill_selection,
@@ -1828,23 +2003,76 @@ async fn persist_server_loop_hook_events(
         reflection_lesson: None,
     };
 
-    if let Err(e) = hook_db_writer.persist(plan).await {
-        astra_core::agent_error!(
-            "server-loop",
-            "failed to persist hook events for session {session_id}: {e}"
-        );
-    }
+    hook_db_writer
+        .persist(plan)
+        .await
+        .map_err(|e| format!("hook events persist failed: {}", e))
 }
 
 /// Fire the Memoria observer after the server-driven loop completes.
 /// This sends the conversation messages to the Memoria `/v1/observe` endpoint
 /// for cross-session knowledge extraction.
 async fn fire_server_loop_observer(
-    observer_worker: &dyn TurnObserverWorker,
+    observer_worker: Arc<dyn TurnObserverWorker>,
     user_id: &str,
     session_id: &str,
     state: &AgenticLoopState,
+    metrics_registry: Option<Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
+) -> Result<(), String> {
+    fire_server_loop_observer_with_async_limit(
+        observer_worker,
+        user_id,
+        session_id,
+        state,
+        metrics_registry,
+        DEFAULT_TURN_OBSERVER_ASYNC_CONCURRENCY,
+    )
+    .await;
+    Ok(())
+}
+
+async fn fire_server_loop_observer_with_async_limit(
+    observer_worker: Arc<dyn TurnObserverWorker>,
+    user_id: &str,
+    session_id: &str,
+    state: &AgenticLoopState,
+    metrics_registry: Option<Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
+    async_concurrency_limit: usize,
 ) {
+    let Some(request) = build_server_loop_observer_request(user_id, session_id, state) else {
+        record_turn_observer_dispatch_metrics(metrics_registry.as_ref(), "none", "skipped_empty");
+        return;
+    };
+
+    let Some(permit) = try_acquire_turn_observer_async_permit(async_concurrency_limit) else {
+        record_turn_observer_dispatch_metrics(metrics_registry.as_ref(), "async", "dropped_full");
+        tracing::debug!(
+            session_id = %session_id,
+            concurrency_limit = async_concurrency_limit,
+            "server-loop observer async concurrency full; dropping best-effort request"
+        );
+        return;
+    };
+    record_turn_observer_dispatch_metrics(metrics_registry.as_ref(), "async", "scheduled");
+    let session_id = session_id.to_string();
+    tokio::spawn(async move {
+        let _permit = permit;
+        run_server_loop_observer_request(
+            observer_worker.as_ref(),
+            &session_id,
+            request,
+            "async",
+            metrics_registry.as_ref(),
+        )
+        .await;
+    });
+}
+
+fn build_server_loop_observer_request(
+    user_id: &str,
+    session_id: &str,
+    state: &AgenticLoopState,
+) -> Option<TurnObserverRequest> {
     let messages: Vec<serde_json::Map<String, serde_json::Value>> = state
         .messages
         .iter()
@@ -1852,26 +2080,37 @@ async fn fire_server_loop_observer(
         .collect();
 
     if messages.is_empty() {
-        return;
+        return None;
     }
 
     let turn_count = state
         .session_turn
         .max(state.max_turns.saturating_sub(state.remaining_turns) as u32)
         as i64;
-    let request = TurnObserverRequest {
+    Some(TurnObserverRequest {
         user_id: user_id.to_string(),
         session_id: session_id.to_string(),
         messages,
         turn_count,
         session_start: None,
-    };
+    })
+}
 
+async fn run_server_loop_observer_request(
+    observer_worker: &dyn TurnObserverWorker,
+    session_id: &str,
+    request: TurnObserverRequest,
+    mode: &'static str,
+    metrics_registry: Option<&Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
+) {
     if let Err(e) = observer_worker.run(request).await {
+        record_turn_observer_run_metrics(metrics_registry, mode, "error");
         astra_core::agent_error!(
             "server-loop",
             "failed to run observer for session {session_id}: {e}"
         );
+    } else {
+        record_turn_observer_run_metrics(metrics_registry, mode, "success");
     }
 }
 
@@ -1952,6 +2191,8 @@ pub(crate) fn build_run_turn_complete_event_with_interruption(
 mod tests {
     use super::*;
     use sqlx::Row;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Notify;
     use uuid::Uuid;
 
     static SHARED_BOOTSTRAP: tokio::sync::OnceCell<astra_core::SharedPool> =
@@ -2003,6 +2244,206 @@ mod tests {
             self.plans.lock().expect("capture lock").push(plan);
             Ok(())
         }
+    }
+
+    struct CaptureObserverWorker {
+        calls: AtomicUsize,
+        requests: std::sync::Mutex<Vec<TurnObserverRequest>>,
+        started: Notify,
+        release: Notify,
+        block_until_released: bool,
+    }
+
+    impl CaptureObserverWorker {
+        fn new(block_until_released: bool) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                requests: std::sync::Mutex::new(Vec::new()),
+                started: Notify::new(),
+                release: Notify::new(),
+                block_until_released,
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TurnObserverWorker for CaptureObserverWorker {
+        async fn run(&self, request: TurnObserverRequest) -> Result<(), String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.requests.lock().expect("capture lock").push(request);
+            self.started.notify_waiters();
+            if self.block_until_released {
+                self.release.notified().await;
+            }
+            Ok(())
+        }
+    }
+
+    fn observer_test_state() -> AgenticLoopState {
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.messages = vec![
+            json!({"role": "user", "content": "hello"}),
+            json!({"role": "assistant", "content": "world"}),
+        ];
+        state.session_turn = 3;
+        state.max_turns = 12;
+        state.remaining_turns = 8;
+        state
+    }
+
+    async fn wait_for_observer_calls(worker: &CaptureObserverWorker, expected: usize) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+        loop {
+            if worker.call_count() >= expected {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "observer call count did not reach {expected}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn wait_for_observer_in_flight(expected: usize) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+        loop {
+            let current = TURN_OBSERVER_ASYNC_IN_FLIGHT.load(Ordering::SeqCst);
+            if current == expected {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "observer in-flight count stayed at {current}, expected {expected}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(turn_observer_async)]
+    async fn server_loop_observer_async_does_not_block_caller() {
+        let observer = Arc::new(CaptureObserverWorker::new(true));
+        let started = observer.started.notified();
+        let state = observer_test_state();
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            fire_server_loop_observer_with_async_limit(
+                observer.clone(),
+                "user-1",
+                "session-1",
+                &state,
+                None,
+                DEFAULT_TURN_OBSERVER_ASYNC_CONCURRENCY,
+            ),
+        )
+        .await
+        .expect("async observer dispatch should return without waiting for worker");
+
+        tokio::time::timeout(std::time::Duration::from_millis(500), started)
+            .await
+            .expect("spawned observer should start");
+        wait_for_observer_calls(observer.as_ref(), 1).await;
+        observer.release.notify_waiters();
+        wait_for_observer_in_flight(0).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(turn_observer_async)]
+    async fn server_loop_observer_async_limit_drops_extra_request() {
+        let first = Arc::new(CaptureObserverWorker::new(true));
+        let second = Arc::new(CaptureObserverWorker::new(false));
+        let first_started = first.started.notified();
+        let state = observer_test_state();
+
+        fire_server_loop_observer_with_async_limit(
+            first.clone(),
+            "user-1",
+            "session-1",
+            &state,
+            None,
+            1,
+        )
+        .await;
+        tokio::time::timeout(std::time::Duration::from_millis(500), first_started)
+            .await
+            .expect("first observer should start");
+        wait_for_observer_calls(first.as_ref(), 1).await;
+        wait_for_observer_in_flight(1).await;
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            fire_server_loop_observer_with_async_limit(
+                second.clone(),
+                "user-1",
+                "session-2",
+                &state,
+                None,
+                1,
+            ),
+        )
+        .await
+        .expect("full async observer pool should drop without blocking");
+
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        assert_eq!(second.call_count(), 0);
+        first.release.notify_waiters();
+        wait_for_observer_in_flight(0).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(turn_observer_async)]
+    async fn server_loop_observer_metrics_stay_low_cardinality() {
+        let registry = Arc::new(astra_turn_core::pipeline_metrics::MetricsRegistry::new());
+        let observer = Arc::new(CaptureObserverWorker::new(false));
+        let state = observer_test_state();
+
+        fire_server_loop_observer_with_async_limit(
+            observer.clone(),
+            "user-1",
+            "session-1",
+            &state,
+            Some(registry.clone()),
+            DEFAULT_TURN_OBSERVER_ASYNC_CONCURRENCY,
+        )
+        .await;
+        wait_for_observer_calls(observer.as_ref(), 1).await;
+
+        let rendered = registry.render_prometheus();
+        assert!(
+            rendered.contains(
+                "astra_turn_observer_dispatches_total{mode=\"async\",outcome=\"scheduled\"} 1"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered
+                .contains("astra_turn_observer_runs_total{mode=\"async\",outcome=\"success\"} 1"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("user_id=")
+                && !rendered.contains("session_id=")
+                && !rendered.contains("run_id="),
+            "observer metrics must stay low-cardinality: {rendered}"
+        );
+    }
+
+    #[test]
+    fn server_loop_observer_request_uses_session_turn_count() {
+        let state = observer_test_state();
+        let request = build_server_loop_observer_request("user-1", "session-1", &state)
+            .expect("observer request");
+
+        assert_eq!(request.user_id, "user-1");
+        assert_eq!(request.session_id, "session-1");
+        assert_eq!(request.messages.len(), 2);
+        assert_eq!(request.turn_count, 4);
     }
 
     #[test]
@@ -2113,7 +2554,8 @@ mod tests {
             .collect();
 
         persist_server_loop_tool_events(&writer, "user-1", "session-1", Some("agent-1"), &state)
-            .await;
+            .await
+            .expect("tool event persistence should succeed");
 
         let plans = writer.plans.lock().expect("capture lock");
         assert_eq!(plans.len(), 1);
@@ -2161,7 +2603,8 @@ mod tests {
             &state,
             Some("model-a"),
         )
-        .await;
+        .await
+        .expect("hook event persistence should succeed");
 
         let plans = writer.plans.lock().expect("capture lock");
         assert_eq!(plans.len(), 1);
@@ -2175,7 +2618,9 @@ mod tests {
         let writer = CaptureToolEventWriter::default();
         let state = crate::turn::agentic_loop::host::make_test_loop_state();
 
-        persist_server_loop_tool_events(&writer, "user-1", "session-1", None, &state).await;
+        persist_server_loop_tool_events(&writer, "user-1", "session-1", None, &state)
+            .await
+            .expect("empty tool set persistence should succeed");
 
         let plans = writer.plans.lock().expect("capture lock");
         assert!(plans.is_empty());

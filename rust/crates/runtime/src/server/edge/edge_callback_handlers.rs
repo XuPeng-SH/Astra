@@ -10,8 +10,7 @@ use axum::extract::Extension;
 use super::*;
 
 use astra_services::session_journal::{
-    JournalEvent, JournalWriter, find_latest_approval_decision, find_latest_approval_required,
-    validate_session_id,
+    ApprovalDecisionAppendOutcome, append_approval_decision_for_run_if_absent, validate_session_id,
 };
 use astra_thin_client::ASTRA_EDGE_ID_HEADER;
 use serde::Deserialize;
@@ -157,23 +156,31 @@ pub(crate) async fn post_tool_result_handler(
     validate_tool_result_request(&body)
         .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
     let key = tool_callback_key(&user.user_id, &body.request_id);
-    let mut lock = state.edge_callback_ledger.lock().await;
-    insert_ledger_entry(
-        &mut lock,
-        key.clone(),
-        serde_json::json!({
-            "kind": "tool_result",
-            "user_id": user.user_id,
-            "edge_id": edge_id,
-            "body": serde_json::to_value(&body).map_err(|e| {
-                error_response(
-                    StatusCode::BAD_REQUEST,
-                    format!("failed to serialize tool_result body for ledger: {e}"),
-                )
-            })?,
-        }),
-    )
-    .map_err(|err| ledger_insert_error_response(&key, err))?;
+    let ledger_value = serde_json::json!({
+        "kind": "tool_result",
+        "user_id": user.user_id,
+        "edge_id": edge_id,
+        "body": serde_json::to_value(&body).map_err(|e| {
+            error_response(
+                StatusCode::BAD_REQUEST,
+                format!("failed to serialize tool_result body for ledger: {e}"),
+            )
+        })?,
+    });
+    let ledger_insert_result = {
+        let mut lock = state.edge_callback_ledger.lock().await;
+        insert_ledger_entry(&mut lock, key.clone(), ledger_value)
+    };
+    let (ledger_enqueued, ledger_capacity_exceeded) = match ledger_insert_result {
+        Ok(enqueued) => (enqueued, false),
+        Err(LedgerInsertError::DuplicateKey) => {
+            return Err(ledger_insert_error_response(
+                &key,
+                LedgerInsertError::DuplicateKey,
+            ));
+        }
+        Err(LedgerInsertError::CapacityExceeded) => (false, true),
+    };
 
     // Cross-pod: also call deliver_result so other pods' turn bridges
     // waiting on wait_result() can see this result.
@@ -184,22 +191,40 @@ pub(crate) async fn post_tool_result_handler(
             format!("failed to serialize tool_result for cross-pod delivery: {e}"),
         )
     })?;
-    if let Err(e) = dispatch_svc
-        .deliver_result(
-            &user.user_id,
-            &body.request_id,
-            body.edge_agent_id.as_deref().unwrap_or(""),
-            &result_json,
-        )
+    let edge_agent_id = body.edge_agent_id.as_deref().unwrap_or("");
+    let dispatch_delivered = match dispatch_svc
+        .deliver_result(&user.user_id, &body.request_id, edge_agent_id, &result_json)
         .await
     {
-        tracing::warn!(
-            target: "astra_runtime::edge_callback",
-            user_id = %user.user_id,
-            request_id = %body.request_id,
-            error = %e,
-            "Edge: failed to cross-pod deliver tool result"
-        );
+        Ok(true) => true,
+        Ok(false) => {
+            tracing::warn!(
+                target: "astra_runtime::edge_callback",
+                user_id = %user.user_id,
+                request_id = %body.request_id,
+                edge_agent_id = %edge_agent_id,
+                "Edge: cross-pod tool result did not match an active dispatch row"
+            );
+            false
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "astra_runtime::edge_callback",
+                user_id = %user.user_id,
+                request_id = %body.request_id,
+                edge_agent_id = %edge_agent_id,
+                error = %e,
+                "Edge: failed to cross-pod deliver tool result"
+            );
+            false
+        }
+    };
+
+    if ledger_capacity_exceeded && !dispatch_delivered {
+        return Err(ledger_insert_error_response(
+            &key,
+            LedgerInsertError::CapacityExceeded,
+        ));
     }
 
     tracing::info!(
@@ -214,6 +239,8 @@ pub(crate) async fn post_tool_result_handler(
     Ok(Json(serde_json::json!({
         "ok": true,
         "request_id": body.request_id,
+        "ledger_enqueued": ledger_enqueued,
+        "dispatch_delivered": dispatch_delivered,
     })))
 }
 
@@ -225,88 +252,183 @@ pub(crate) async fn post_approval_respond_handler(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     let edge_id = edge_id_from_headers(&headers);
-    let key = approval_callback_key(&user.user_id, &body.request_id);
-    let mut lock = state.edge_callback_ledger.lock().await;
-    if let Some(session_id) = body.session_id.as_deref() {
-        validate_session_id(session_id)
-            .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
-        let decision = match &body.decision {
-            astra_thin_client::ApprovalDecision::Allow => "allow",
-            astra_thin_client::ApprovalDecision::Deny => "deny",
-            astra_thin_client::ApprovalDecision::AllowSession => "allow_session",
-        };
-        let approval_kind = body.approval_kind.as_ref().map(|kind| match kind {
-            astra_thin_client::ApprovalKind::Standard => "standard",
-            astra_thin_client::ApprovalKind::Explicit => "explicit",
-        });
-        let approval_turn = find_latest_approval_required(session_id, &body.request_id)
-            .map_err(|e| {
-                tracing::warn!(
-                    target: "astra_runtime::edge_callback",
-                    session_id = %session_id,
-                    request_id = %body.request_id,
-                    error = %e,
-                    "approval journal lookup failed, treating as no prior request"
-                );
-            })
-            .ok()
-            .flatten()
-            .and_then(|request| request.turn);
-        let already_recorded = find_latest_approval_decision(session_id, &body.request_id)
-            .map_err(|error| {
-                error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("approval journal lookup failed: {error}"),
-                )
-            })?
-            .is_some_and(|existing| {
-                existing.decision == decision
-                    && existing.reason.as_deref() == body.reason.as_deref()
-                    && existing.tool_name.as_deref() == body.tool_name.as_deref()
-                    && existing.approval_kind.as_deref() == approval_kind
-            });
-        if !already_recorded {
-            let writer = JournalWriter::new(session_id).map_err(|error| {
-                error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("approval journal unavailable: {error}"),
-                )
-            })?;
-            writer
-                .append(&JournalEvent::approval_decision(
-                    Some(session_id),
-                    approval_turn,
-                    &body.request_id,
-                    body.tool_name.as_deref(),
-                    approval_kind,
-                    decision,
-                    body.reason.as_deref(),
-                ))
-                .map_err(|error| {
-                    error_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        format!("approval journal append failed: {error}"),
-                    )
-                })?;
+    let registry = state.metrics_registry();
+    let run_id = body.run_id.trim();
+    if run_id.is_empty() {
+        crate::server::interaction_metrics::record_approval_journal_write(
+            registry.as_ref(),
+            "invalid_run",
+        );
+        return Err(error_response(StatusCode::BAD_REQUEST, "run_id required"));
+    }
+    let session_id = body.session_id.trim();
+    if let Err(error) = validate_session_id(session_id) {
+        crate::server::interaction_metrics::record_approval_journal_write(
+            registry.as_ref(),
+            "invalid_session",
+        );
+        return Err(error_response(StatusCode::BAD_REQUEST, error));
+    }
+    let key = approval_callback_key(&user.user_id, session_id, run_id, &body.request_id);
+    let decision = match &body.decision {
+        astra_thin_client::ApprovalDecision::Allow => "allow",
+        astra_thin_client::ApprovalDecision::Deny => "deny",
+        astra_thin_client::ApprovalDecision::AllowSession => "allow_session",
+    };
+    let approval_kind = body.approval_kind.as_ref().map(|kind| match kind {
+        astra_thin_client::ApprovalKind::Standard => "standard",
+        astra_thin_client::ApprovalKind::Explicit => "explicit",
+    });
+    let approval_turn = match astra_services::session_journal::find_latest_approval_required_for_run(
+        session_id,
+        &body.request_id,
+        run_id,
+    ) {
+        Ok(Some(request)) => {
+            crate::server::interaction_metrics::record_approval_journal_lookup(
+                registry.as_ref(),
+                "required",
+                "hit",
+            );
+            request.turn
+        }
+        Ok(None) => {
+            crate::server::interaction_metrics::record_approval_journal_lookup(
+                registry.as_ref(),
+                "required",
+                "miss",
+            );
+            None
+        }
+        Err(e) => {
+            crate::server::interaction_metrics::record_approval_journal_lookup(
+                registry.as_ref(),
+                "required",
+                "error",
+            );
+            tracing::warn!(
+                target: "astra_runtime::edge_callback",
+                session_id = %session_id,
+                run_id = %run_id,
+                request_id = %body.request_id,
+                error = %e,
+                "approval journal lookup failed, treating as no prior request"
+            );
+            None
+        }
+    };
+    match append_approval_decision_for_run_if_absent(
+        session_id,
+        approval_turn,
+        &body.request_id,
+        run_id,
+        body.tool_name.as_deref(),
+        approval_kind,
+        decision,
+        body.reason.as_deref(),
+    ) {
+        Ok(ApprovalDecisionAppendOutcome::Appended) => {
+            crate::server::interaction_metrics::record_approval_journal_lookup(
+                registry.as_ref(),
+                "decision",
+                "miss",
+            );
+            crate::server::interaction_metrics::record_approval_journal_write(
+                registry.as_ref(),
+                "ok",
+            );
+        }
+        Ok(ApprovalDecisionAppendOutcome::Idempotent) => {
+            crate::server::interaction_metrics::record_approval_journal_lookup(
+                registry.as_ref(),
+                "decision",
+                "hit",
+            );
+            crate::server::interaction_metrics::record_approval_journal_write(
+                registry.as_ref(),
+                "idempotent",
+            );
+        }
+        Ok(ApprovalDecisionAppendOutcome::Conflict(existing)) => {
+            crate::server::interaction_metrics::record_approval_journal_lookup(
+                registry.as_ref(),
+                "decision",
+                "hit",
+            );
+            crate::server::interaction_metrics::record_approval_journal_write(
+                registry.as_ref(),
+                "conflict",
+            );
+            return Err(error_response(
+                StatusCode::CONFLICT,
+                format!(
+                    "approval decision already recorded for request {} run {} as {}",
+                    existing.request_id, run_id, existing.decision
+                ),
+            ));
+        }
+        Err(error) => {
+            crate::server::interaction_metrics::record_approval_journal_lookup(
+                registry.as_ref(),
+                "decision",
+                "error",
+            );
+            crate::server::interaction_metrics::record_approval_journal_write(
+                registry.as_ref(),
+                "error",
+            );
+            return Err(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("approval journal append failed: {error}"),
+            ));
         }
     }
-    let ledger_enqueued = insert_approval_ledger_entry(
-        &mut lock,
-        key.clone(),
-        serde_json::json!({
-            "kind": "approval_respond",
-            "user_id": user.user_id,
-            "edge_id": edge_id,
-            "body": serde_json::to_value(&body).map_err(|e| {
-                error_response(
-                    StatusCode::BAD_REQUEST,
-                    format!("failed to serialize approval_respond body for ledger: {e}"),
-                )
-            })?,
-        }),
-        body.session_id.is_some(),
-    )
-    .map_err(|err| ledger_insert_error_response(&key, err))?;
+    let ledger_value = serde_json::json!({
+        "kind": "approval_respond",
+        "user_id": user.user_id,
+        "edge_id": edge_id,
+        "body": serde_json::to_value(&body).map_err(|e| {
+            error_response(
+                StatusCode::BAD_REQUEST,
+                format!("failed to serialize approval_respond body for ledger: {e}"),
+            )
+        })?,
+    });
+    let ledger_result = {
+        let mut lock = state.edge_callback_ledger.lock().await;
+        let new_key = !lock.contains_key(&key);
+        let ledger_full = lock.len() >= LEDGER_MAX_ENTRIES;
+        match insert_approval_ledger_entry(&mut lock, key.clone(), ledger_value, true) {
+            Ok(enqueued) => {
+                let outcome = if enqueued {
+                    "inserted"
+                } else if new_key && ledger_full {
+                    "durable_fallback"
+                } else {
+                    "idempotent_replay"
+                };
+                Ok((enqueued, outcome))
+            }
+            Err(err) => Err(err),
+        }
+    };
+    let (ledger_enqueued, ledger_outcome) = match ledger_result {
+        Ok(result) => result,
+        Err(err) => {
+            crate::server::interaction_metrics::record_approval_ledger_insert(
+                registry.as_ref(),
+                match err {
+                    LedgerInsertError::CapacityExceeded => "capacity_exceeded",
+                    LedgerInsertError::DuplicateKey => "duplicate_key",
+                },
+            );
+            return Err(ledger_insert_error_response(&key, err));
+        }
+    };
+    crate::server::interaction_metrics::record_approval_ledger_insert(
+        registry.as_ref(),
+        ledger_outcome,
+    );
     tracing::info!(
         target: "astra_runtime::edge_callback",
         request_id = %trace.request_id,
@@ -478,10 +600,151 @@ mod edge_callback_insert_tests {
 
     use super::{
         EdgeRegisterRequest, LedgerInsertError, insert_approval_ledger_entry, insert_ledger_entry,
+        post_approval_respond_handler, post_tool_result_handler,
+    };
+    use crate::server::RequestTrace;
+    use crate::{AppState, HealthChecker, ServiceInfo};
+    use astra_services::{
+        AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
+        AuthTokenRecord, AuthUserRecord, EdgeDispatchRow, EdgeDispatchService,
     };
     use astra_turn_core::edge_ledger::LEDGER_MAX_ENTRIES;
+    use async_trait::async_trait;
+    use axum::{
+        Json,
+        extract::{Extension, State},
+        http::{HeaderMap, StatusCode},
+    };
     use serde_json::json;
     use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct TestHealthChecker;
+
+    #[async_trait]
+    impl HealthChecker for TestHealthChecker {
+        async fn database_healthy(&self) -> bool {
+            true
+        }
+    }
+
+    #[derive(Clone)]
+    struct StaticAuthService;
+
+    #[async_trait]
+    impl AuthService for StaticAuthService {
+        async fn register(
+            &self,
+            _request: AuthRegisterRequestData,
+        ) -> Result<AuthUserRecord, (StatusCode, Json<crate::ErrorResponse>)> {
+            unimplemented!("not used")
+        }
+
+        async fn login(
+            &self,
+            _request: AuthLoginRequestData,
+        ) -> Result<AuthTokenRecord, (StatusCode, Json<crate::ErrorResponse>)> {
+            unimplemented!("not used")
+        }
+
+        async fn refresh(
+            &self,
+            _request: AuthRefreshRequestData,
+        ) -> Result<AuthTokenRecord, (StatusCode, Json<crate::ErrorResponse>)> {
+            unimplemented!("not used")
+        }
+
+        async fn logout(
+            &self,
+            _request: AuthRefreshRequestData,
+        ) -> Result<(), (StatusCode, Json<crate::ErrorResponse>)> {
+            unimplemented!("not used")
+        }
+
+        async fn current_user(
+            &self,
+            _headers: &HeaderMap,
+        ) -> Result<AuthUserRecord, (StatusCode, Json<crate::ErrorResponse>)> {
+            Ok(AuthUserRecord {
+                user_id: "u-approval".into(),
+                username: "approval-user".into(),
+                email: "approval@example.com".into(),
+                display_name: None,
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingEdgeDispatch {
+        deliver_result: bool,
+        delivered: Mutex<Vec<(String, String, String, String)>>,
+    }
+
+    #[async_trait]
+    impl EdgeDispatchService for RecordingEdgeDispatch {
+        async fn insert_dispatch(
+            &self,
+            _user_id: &str,
+            _edge_agent_id: &str,
+            _request_id: &str,
+            _payload_json: &str,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn poll_pending(
+            &self,
+            _user_id: &str,
+            _edge_agent_id: &str,
+        ) -> Result<Vec<EdgeDispatchRow>, String> {
+            Ok(Vec::new())
+        }
+
+        async fn deliver_result(
+            &self,
+            user_id: &str,
+            request_id: &str,
+            edge_agent_id: &str,
+            result_json: &str,
+        ) -> Result<bool, String> {
+            self.delivered.lock().unwrap().push((
+                user_id.to_string(),
+                request_id.to_string(),
+                edge_agent_id.to_string(),
+                result_json.to_string(),
+            ));
+            Ok(self.deliver_result)
+        }
+
+        async fn fail_dispatch(
+            &self,
+            _user_id: &str,
+            _request_id: &str,
+            _reason: &str,
+        ) -> Result<bool, String> {
+            Ok(false)
+        }
+
+        async fn wait_result(
+            &self,
+            _user_id: &str,
+            _request_id: &str,
+            _timeout: std::time::Duration,
+        ) -> Result<Option<String>, String> {
+            Ok(None)
+        }
+
+        async fn cleanup_stale(&self, _older_than: std::time::Duration) -> Result<u64, String> {
+            Ok(0)
+        }
+    }
+
+    fn source_index(source: &str, needle: &str) -> usize {
+        source
+            .find(needle)
+            .unwrap_or_else(|| panic!("source must contain `{needle}`"))
+    }
 
     #[test]
     fn edge_register_request_accepts_runtime_environment_advertisement() {
@@ -514,6 +777,54 @@ mod edge_callback_insert_tests {
         assert_eq!(
             request.capabilities.as_ref().unwrap()["binding"]["runtime"]["provider"],
             "host_process"
+        );
+    }
+
+    #[test]
+    fn tool_result_handler_releases_ledger_lock_before_cross_pod_delivery() {
+        let source = include_str!("edge_callback_handlers.rs");
+        let lock_idx = source_index(
+            source,
+            "let mut lock = state.edge_callback_ledger.lock().await;",
+        );
+        let insert_done_idx =
+            source_index(source, "let (ledger_enqueued, ledger_capacity_exceeded)");
+        let deliver_idx = source_index(source, ".deliver_result(");
+        let capacity_fallback_idx =
+            source_index(source, "if ledger_capacity_exceeded && !dispatch_delivered");
+
+        assert!(
+            lock_idx < insert_done_idx,
+            "tool result handler should only lock around the ledger insert"
+        );
+        assert!(
+            insert_done_idx < deliver_idx,
+            "cross-pod delivery must happen after the ledger lock scope closes"
+        );
+        assert!(
+            deliver_idx < capacity_fallback_idx,
+            "ledger capacity errors should be recoverable when durable dispatch delivery succeeds"
+        );
+    }
+
+    #[test]
+    fn approval_handler_does_not_hold_ledger_lock_while_writing_journal() {
+        let source = include_str!("edge_callback_handlers.rs");
+        let journal_lookup_idx = source_index(source, "find_latest_approval_required_for_run");
+        let journal_append_idx =
+            source_index(source, "append_approval_decision_for_run_if_absent(");
+        let ledger_lock_idx = source_index(
+            source,
+            "let ledger_result = {\n        let mut lock = state.edge_callback_ledger.lock().await;",
+        );
+
+        assert!(
+            journal_lookup_idx < ledger_lock_idx,
+            "approval journal lookup must run before acquiring the ledger lock"
+        );
+        assert!(
+            journal_append_idx < ledger_lock_idx,
+            "approval journal append must run before acquiring the ledger lock"
         );
     }
 
@@ -655,6 +966,173 @@ mod edge_callback_insert_tests {
         )
         .expect("durable fallback path returns Ok(false)");
         assert!(!out, "durable fallback path signals not-enqueued");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn approval_handler_persists_journal_when_ledger_is_full() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let state = AppState::new(ServiceInfo::default(), Arc::new(TestHealthChecker))
+            .with_auth_service(Arc::new(StaticAuthService));
+        {
+            let mut ledger = state.edge_callback_ledger.lock().await;
+            for i in 0..LEDGER_MAX_ENTRIES {
+                ledger.insert(format!("u-approval:tool:filled-{i}"), json!({"i": i}));
+            }
+        }
+
+        let response = post_approval_respond_handler(
+            Extension(RequestTrace {
+                request_id: "trace-approval".into(),
+            }),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(astra_thin_client::ApprovalRespondRequest {
+                request_id: "req-approval-journal".into(),
+                decision: astra_thin_client::ApprovalDecision::Allow,
+                reason: Some("approved in another pod".into()),
+                session_id: "sess-approval-journal".into(),
+                run_id: "run-approval-journal".into(),
+                tool_name: Some("write_file".into()),
+                approval_kind: Some(astra_thin_client::ApprovalKind::Explicit),
+            }),
+        )
+        .await
+        .expect("durable approval response should not fail when local ledger is full");
+
+        assert_eq!(response.0["ok"], true);
+        assert_eq!(response.0["ledger_enqueued"], false);
+
+        let decision = astra_services::session_journal::find_latest_approval_decision_for_run(
+            "sess-approval-journal",
+            "req-approval-journal",
+            "run-approval-journal",
+        )
+        .unwrap()
+        .expect("approval decision should be durable for no-sticky replay");
+        assert_eq!(decision.run_id.as_deref(), Some("run-approval-journal"));
+        assert_eq!(decision.decision, "allow");
+        assert_eq!(decision.reason.as_deref(), Some("approved in another pod"));
+        assert_eq!(decision.tool_name.as_deref(), Some("write_file"));
+        assert_eq!(decision.approval_kind.as_deref(), Some("explicit"));
+
+        let ledger = state.edge_callback_ledger.lock().await;
+        assert_eq!(ledger.len(), LEDGER_MAX_ENTRIES);
+        assert!(
+            !ledger.contains_key(&astra_turn_core::edge_ledger::approval_callback_key(
+                "u-approval",
+                "sess-approval-journal",
+                "run-approval-journal",
+                "req-approval-journal"
+            )),
+            "full local ledger should not be required after durable approval persistence"
+        );
+        drop(ledger);
+
+        let metrics = state.metrics_registry().render_prometheus();
+        assert!(
+            metrics.contains(
+                "astra_interaction_approval_journal_lookup_total{event=\"decision\",outcome=\"miss\"} 1"
+            ),
+            "{metrics}"
+        );
+        assert!(
+            metrics.contains("astra_interaction_approval_journal_write_total{outcome=\"ok\"} 1"),
+            "{metrics}"
+        );
+        assert!(
+            metrics.contains(
+                "astra_interaction_approval_ledger_insert_total{outcome=\"durable_fallback\"} 1"
+            ),
+            "{metrics}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tool_result_handler_uses_dispatch_when_local_ledger_is_full() {
+        let dispatch = Arc::new(RecordingEdgeDispatch {
+            deliver_result: true,
+            delivered: Mutex::new(Vec::new()),
+        });
+        let state = AppState::new(ServiceInfo::default(), Arc::new(TestHealthChecker))
+            .with_auth_service(Arc::new(StaticAuthService))
+            .with_edge_dispatch_service(dispatch.clone());
+        {
+            let mut ledger = state.edge_callback_ledger.lock().await;
+            for i in 0..LEDGER_MAX_ENTRIES {
+                ledger.insert(format!("u-approval:tool:filled-{i}"), json!({"i": i}));
+            }
+        }
+
+        let response = post_tool_result_handler(
+            Extension(RequestTrace {
+                request_id: "trace-tool-dispatch".into(),
+            }),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(astra_thin_client::ToolResultRequest::new_with_hash(
+                "req-tool-dispatch".into(),
+                Some("edge-a".into()),
+                "completed".into(),
+                "tool output".into(),
+                12,
+            )),
+        )
+        .await
+        .expect("dispatch delivery should recover from local ledger capacity");
+
+        assert_eq!(response.0["ok"], true);
+        assert_eq!(response.0["ledger_enqueued"], false);
+        assert_eq!(response.0["dispatch_delivered"], true);
+
+        let ledger = state.edge_callback_ledger.lock().await;
+        assert_eq!(ledger.len(), LEDGER_MAX_ENTRIES);
+        assert!(
+            !ledger.contains_key(&astra_turn_core::edge_ledger::tool_callback_key(
+                "u-approval",
+                "req-tool-dispatch"
+            )),
+            "full local ledger should not be required when dispatch delivery succeeds"
+        );
+        drop(ledger);
+
+        let delivered = dispatch.delivered.lock().unwrap();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].0, "u-approval");
+        assert_eq!(delivered[0].1, "req-tool-dispatch");
+        assert_eq!(delivered[0].2, "edge-a");
+        assert!(delivered[0].3.contains("tool output"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn approval_handler_rejects_empty_run_id() {
+        let state = AppState::new(ServiceInfo::default(), Arc::new(TestHealthChecker))
+            .with_auth_service(Arc::new(StaticAuthService));
+
+        let err = post_approval_respond_handler(
+            Extension(RequestTrace {
+                request_id: "trace-approval-empty-run".into(),
+            }),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(astra_thin_client::ApprovalRespondRequest {
+                request_id: "req-empty-run".into(),
+                decision: astra_thin_client::ApprovalDecision::Allow,
+                reason: None,
+                session_id: "sess-empty-run".into(),
+                run_id: String::new(),
+                tool_name: Some("write_file".into()),
+                approval_kind: Some(astra_thin_client::ApprovalKind::Explicit),
+            }),
+        )
+        .await
+        .expect_err("approval response without run_id must be rejected");
+
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(
+            state.edge_callback_ledger.lock().await.is_empty(),
+            "invalid approval response must not populate same-pod ledger"
+        );
     }
 
     #[test]

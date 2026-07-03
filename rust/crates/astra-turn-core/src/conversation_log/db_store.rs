@@ -21,6 +21,13 @@ use astra_core::{MatrixOneSettings, SharedPool, connect_matrixone};
 
 use super::{CslEntry, CslStore, CslStoreError, materialize, validate_session_id};
 
+const CSL_TRUNCATE_BATCH_LIMIT: i64 = 1000;
+
+const TRUNCATE_BEFORE_SQL: &str = "DELETE FROM conversation_log \
+             WHERE user_id = ? AND session_id = ? AND seq < ? \
+             ORDER BY seq ASC \
+             LIMIT ?";
+
 /// Database-backed CSL store. Each session's entries live in the
 /// `conversation_log` table, keyed by `(user_id, session_id, seq)`.
 ///
@@ -247,18 +254,27 @@ impl CslStore for DbCslStore {
         validate_session_id(session_id)?;
         let pool = self.get_pool().await?;
         self.ensure_owner_access(&pool, session_id).await?;
-        let result = query(
-            "DELETE FROM conversation_log \
-             WHERE user_id = ? AND session_id = ? AND seq < ?",
-        )
-        .bind(&self.user_id)
-        .bind(session_id)
-        .bind(before_seq as i64)
-        .execute(&pool)
-        .await
-        .map_err(|e| CslStoreError::Other(format!("truncate: {e}")))?;
+        let before_seq = i64::try_from(before_seq).unwrap_or(i64::MAX);
+        let mut total_deleted = 0_u64;
+        loop {
+            let deleted = query(TRUNCATE_BEFORE_SQL)
+                .bind(&self.user_id)
+                .bind(session_id)
+                .bind(before_seq)
+                .bind(CSL_TRUNCATE_BATCH_LIMIT)
+                .execute(&pool)
+                .await
+                .map_err(|e| CslStoreError::Other(format!("truncate: {e}")))?
+                .rows_affected();
+            total_deleted = total_deleted.checked_add(deleted).ok_or_else(|| {
+                CslStoreError::Other("truncate: deleted row total overflow".to_string())
+            })?;
+            if deleted == 0 {
+                break;
+            }
+        }
 
-        Ok(result.rows_affected())
+        Ok(total_deleted)
     }
 
     async fn fork(
@@ -359,7 +375,7 @@ mod tests {
     use super::*;
     use crate::conversation_log::{AppendMeta, SessionStateCompact};
     use serde_json::json;
-    use sqlx::query_as;
+    use sqlx::{QueryBuilder, query_as};
 
     fn meta() -> AppendMeta {
         AppendMeta::default()
@@ -413,6 +429,56 @@ mod tests {
         }
     }
 
+    #[test]
+    fn truncate_before_sql_is_owner_scoped_and_batch_bounded() {
+        let normalized = TRUNCATE_BEFORE_SQL
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            normalized.contains("WHERE user_id = ? AND session_id = ? AND seq < ?"),
+            "CSL truncate must stay owner/session scoped"
+        );
+        assert!(
+            normalized.contains("ORDER BY seq ASC"),
+            "CSL truncate must delete in deterministic sequence order"
+        );
+        assert!(
+            normalized.ends_with("LIMIT ?"),
+            "CSL truncate must be batch bounded"
+        );
+        const {
+            assert!(CSL_TRUNCATE_BATCH_LIMIT > 0);
+            assert!(CSL_TRUNCATE_BATCH_LIMIT <= 10_000);
+        };
+    }
+
+    #[test]
+    fn truncate_before_loops_until_batch_is_empty() {
+        let source = include_str!("db_store.rs");
+        let body = source
+            .split("async fn truncate_before")
+            .nth(1)
+            .and_then(|rest| rest.split("async fn fork").next())
+            .expect("truncate_before body");
+        assert!(
+            body.contains("let before_seq = i64::try_from(before_seq).unwrap_or(i64::MAX);"),
+            "truncate_before must not wrap large u64 sequence values into negative BIGINT values"
+        );
+        assert!(
+            body.contains("loop {") && body.contains("if deleted == 0"),
+            "truncate_before must keep pruning batches until no rows remain"
+        );
+        assert!(
+            body.contains("checked_add(deleted)"),
+            "truncate_before must fail loudly on impossible deleted-row overflow"
+        );
+        assert!(
+            body.contains("CSL_TRUNCATE_BATCH_LIMIT"),
+            "truncate_before must bind the batch limit constant"
+        );
+    }
+
     async fn test_store() -> DbCslStore {
         test_store_for("csl-test-user").await
     }
@@ -454,6 +520,18 @@ mod tests {
 
     async fn create_session(store: &DbCslStore, session_id: &str) {
         create_session_for(store, session_id, &store.user_id).await;
+    }
+
+    fn cleanup_pressure_rows(env_key: &str, default: i64, minimum: i64) -> i64 {
+        let rows = std::env::var(env_key)
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(default);
+        assert!(
+            rows >= minimum,
+            "{env_key} must be at least {minimum} rows to exercise pressure cleanup"
+        );
+        rows
     }
 
     async fn create_session_for(store: &DbCslStore, session_id: &str, user_id: &str) {
@@ -799,6 +877,149 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].seq(), 2);
         assert_eq!(entries[1].seq(), 3);
+
+        cleanup(&store, sid).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live DB"]
+    async fn db_truncate_gc_deletes_more_than_one_batch() {
+        let store = test_store().await;
+        let sid = &format!("db-test-truncate-batch-{}", uuid::Uuid::new_v4());
+        cleanup(&store, sid).await;
+        create_session(&store, sid).await;
+
+        let pool = store.get_pool().await.unwrap();
+        let before_seq = CSL_TRUNCATE_BATCH_LIMIT + 5;
+        let total_rows = before_seq + 2;
+
+        let mut builder = QueryBuilder::<sqlx::MySql>::new(
+            "INSERT INTO conversation_log \
+             (user_id, session_id, seq, turn, entry_type, payload) ",
+        );
+        builder.push_values(0..total_rows, |mut row, seq| {
+            let entry = make_delta(seq as u64, (seq + 1) as u32, vec![user_msg("bulk")]);
+            let payload = serde_json::to_string(&entry).expect("serialize CSL test entry");
+            row.push_bind(&store.user_id)
+                .push_bind(sid)
+                .push_bind(seq)
+                .push_bind((seq + 1) as i32)
+                .push_bind(1_i8)
+                .push_bind(payload);
+        });
+        builder
+            .build()
+            .execute(&pool)
+            .await
+            .expect("insert bulk CSL rows");
+
+        let removed = store.truncate_before(sid, before_seq as u64).await.unwrap();
+        assert_eq!(
+            removed, before_seq as u64,
+            "truncate_before must keep deleting beyond one batch"
+        );
+        assert!(
+            removed > CSL_TRUNCATE_BATCH_LIMIT as u64,
+            "test must cross the configured truncate batch limit"
+        );
+
+        let residual: (i64, Option<i64>, Option<i64>) = query_as(
+            "SELECT COUNT(*) AS count, MIN(seq) AS min_seq, MAX(seq) AS max_seq
+             FROM conversation_log
+             WHERE user_id = ? AND session_id = ?",
+        )
+        .bind(&store.user_id)
+        .bind(sid)
+        .fetch_one(&pool)
+        .await
+        .expect("count residual CSL rows");
+        assert_eq!(residual, (2, Some(before_seq), Some(before_seq + 1)));
+
+        cleanup(&store, sid).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live DB pressure run"]
+    async fn db_truncate_gc_pressure_probe() {
+        let store = test_store().await;
+        let sid = &format!("db-test-truncate-pressure-{}", uuid::Uuid::new_v4());
+        cleanup(&store, sid).await;
+        create_session(&store, sid).await;
+
+        let pool = store.get_pool().await.unwrap();
+        let before_seq = cleanup_pressure_rows(
+            "ASTRA_CLEANUP_PRESSURE_CSL_ROWS",
+            CSL_TRUNCATE_BATCH_LIMIT * 5,
+            CSL_TRUNCATE_BATCH_LIMIT + 1,
+        );
+        let tail_rows = 2_i64;
+        let total_rows = before_seq + tail_rows;
+
+        let insert_started = std::time::Instant::now();
+        let mut start = 0_i64;
+        while start < total_rows {
+            let end = (start + CSL_TRUNCATE_BATCH_LIMIT).min(total_rows);
+            let mut builder = QueryBuilder::<sqlx::MySql>::new(
+                "INSERT INTO conversation_log \
+                 (user_id, session_id, seq, turn, entry_type, payload) ",
+            );
+            builder.push_values(start..end, |mut row, seq| {
+                let entry = make_delta(seq as u64, (seq + 1) as u32, vec![user_msg("bulk")]);
+                let payload = serde_json::to_string(&entry).expect("serialize CSL test entry");
+                row.push_bind(&store.user_id)
+                    .push_bind(sid)
+                    .push_bind(seq)
+                    .push_bind((seq + 1) as i32)
+                    .push_bind(1_i8)
+                    .push_bind(payload);
+            });
+            builder
+                .build()
+                .execute(&pool)
+                .await
+                .expect("insert pressure CSL rows");
+            start = end;
+        }
+        let insert_ms = insert_started.elapsed().as_millis();
+
+        let cleanup_started = std::time::Instant::now();
+        let removed = store.truncate_before(sid, before_seq as u64).await.unwrap();
+        let cleanup_ms = cleanup_started.elapsed().as_millis();
+        assert_eq!(
+            removed, before_seq as u64,
+            "truncate_before pressure probe must delete all rows before the boundary"
+        );
+
+        let residual: (i64, Option<i64>, Option<i64>) = query_as(
+            "SELECT COUNT(*) AS count, MIN(seq) AS min_seq, MAX(seq) AS max_seq
+             FROM conversation_log
+             WHERE user_id = ? AND session_id = ?",
+        )
+        .bind(&store.user_id)
+        .bind(sid)
+        .fetch_one(&pool)
+        .await
+        .expect("count residual pressure CSL rows");
+        assert_eq!(
+            residual,
+            (tail_rows, Some(before_seq), Some(before_seq + 1))
+        );
+
+        eprintln!(
+            "CLEANUP_PRESSURE_RESULT {}",
+            serde_json::json!({
+                "path": "conversation_log.truncate_before",
+                "rows_inserted": total_rows,
+                "rows_deleted": removed,
+                "batch_limit": CSL_TRUNCATE_BATCH_LIMIT,
+                "expected_batches": (before_seq + CSL_TRUNCATE_BATCH_LIMIT - 1) / CSL_TRUNCATE_BATCH_LIMIT,
+                "insert_ms": insert_ms,
+                "cleanup_ms": cleanup_ms,
+                "remaining_rows": residual.0,
+                "remaining_min_seq": residual.1,
+                "remaining_max_seq": residual.2,
+            })
+        );
 
         cleanup(&store, sid).await;
     }

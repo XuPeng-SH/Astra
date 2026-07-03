@@ -1675,12 +1675,16 @@ impl InProcessChatTurnBridge {
                         m.fallback_chain,
                     ),
                     Err(e) => {
-                        let error_code = if requested_model_override.is_none() {
-                            astra_core::ErrorKind::MissingModelSelection.as_str()
-                        } else {
-                            "MODEL_NOT_AVAILABLE"
-                        };
-                        yield render_sse_map(&build_stream_error_event(&e, error_code, false));
+                        let message = format!("Model resolution failed: {e}");
+                        let error = astra_core::ClassifiedError::new(
+                            astra_core::classify_model_resolution_error_message(&message),
+                            message,
+                        );
+                        yield render_sse_map(&build_stream_error_event(
+                            &error.message,
+                            error.kind.as_str(),
+                            error.kind.is_retryable(),
+                        ));
                         mark_disconnect_capture_finalized(&disconnect_capture_state);
                         return;
                     }
@@ -5255,8 +5259,16 @@ mod tests {
             _session_id: &str,
             _artifact_kind: Option<&str>,
             _limit: usize,
-        ) -> Result<Vec<StoredSessionArtifact>, astra_services::SessionArtifactStoreError> {
-            Ok(Vec::new())
+            _cursor: Option<astra_services::SessionArtifactListCursor>,
+        ) -> Result<
+            astra_services::SessionArtifactListPage,
+            astra_services::SessionArtifactStoreError,
+        > {
+            Ok(astra_services::SessionArtifactListPage {
+                artifacts: Vec::new(),
+                limit: 0,
+                next_cursor: None,
+            })
         }
     }
 

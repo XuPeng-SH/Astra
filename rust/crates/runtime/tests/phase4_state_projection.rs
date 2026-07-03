@@ -170,6 +170,30 @@ async fn explain_analyze_text(pool: &astra_core::SharedPool, sql: &str) -> Strin
     text
 }
 
+async fn index_columns(pool: &astra_core::SharedPool, table: &str, key: &str) -> Vec<String> {
+    let schema = sqlx::query("SELECT DATABASE() AS schema_name")
+        .fetch_one(pool.get())
+        .await
+        .unwrap()
+        .try_get::<String, _>("schema_name")
+        .unwrap();
+    sqlx::query(
+        "SELECT COLUMN_NAME
+         FROM information_schema.STATISTICS
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND INDEX_NAME = ?
+         ORDER BY SEQ_IN_INDEX",
+    )
+    .bind(schema)
+    .bind(table)
+    .bind(key)
+    .fetch_all(pool.get())
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|row| row.try_get::<String, _>("COLUMN_NAME").unwrap())
+    .collect()
+}
+
 fn assert_plan_uses(plan: &str, index_name: &str) {
     assert!(
         plan.contains(index_name),
@@ -556,13 +580,26 @@ async fn l2_37_bubble_up_writes_one_event_per_ancestor_layer() {
     let plan = explain_analyze_text(
         &pool,
         &format!(
-            "EXPLAIN ANALYZE SELECT id FROM session_state_item_events FORCE INDEX (idx_state_events_owner_session_created) \
+            "EXPLAIN ANALYZE SELECT event_id FROM session_state_item_events FORCE INDEX (idx_state_events_owner_session_created) \
              WHERE user_id = '{}' AND session_id = '{}' AND mutation = 'bubble_up' ORDER BY created_at DESC LIMIT 5",
             user_id, session_id
         ),
     )
     .await;
-    assert_plan_uses(&plan, "idx_state_events_owner_session_created");
+    assert!(
+        plan.contains("session_state_item_events"),
+        "EXPLAIN ANALYZE should execute the state-event history query, got:\n{plan}"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            "session_state_item_events",
+            "idx_state_events_owner_session_created"
+        )
+        .await,
+        ["user_id", "session_id", "created_at", "event_id"],
+        "state-event history index must stay owner/session ordered with event_id tie-breaker"
+    );
 }
 
 #[tokio::test]
@@ -868,6 +905,96 @@ async fn l3_11b_real_run_engine_populates_projection() {
     .unwrap();
     assert_eq!(row.try_get::<i64, _>("delegations").unwrap(), 1);
     assert_eq!(row.try_get::<i64, _>("state_items").unwrap(), 1);
+}
+
+#[tokio::test]
+#[ignore = "requires ASTRA_TEST_DB_IT=1"]
+async fn delegation_projection_refresh_uses_current_run_status() {
+    let pool = setup_pool().await;
+    let (session_id, user_id, root_run_id) = ids();
+    insert_session(&pool, &session_id, &user_id).await;
+    let child_run_id = format!("child-{}", Uuid::new_v4());
+    let delegation_id = format!("delegation-{}", Uuid::new_v4());
+    let projection_store = Arc::new(DatabaseStateProjectionStore::new(pool.clone()));
+    let run_store = Arc::new(DatabaseRunStateStore::new(pool.clone()));
+    let run_engine = astra_runtime::server::run::engine::RunEngine::new(run_store)
+        .with_projection_store(projection_store.clone());
+
+    run_engine
+        .start_run(&root_run_id, &user_id, &session_id)
+        .await
+        .unwrap();
+    run_engine
+        .start_run_ext(
+            &child_run_id,
+            &user_id,
+            &session_id,
+            Some(&root_run_id),
+            Some(&delegation_id),
+            Some("coder"),
+            None,
+        )
+        .await
+        .unwrap();
+    run_engine
+        .persist_status(&user_id, &child_run_id, "completed", None, None)
+        .await
+        .unwrap();
+
+    sqlx::query(
+        "UPDATE session_delegations
+         SET status = 'running'
+         WHERE delegation_id = ? AND user_id = ?",
+    )
+    .bind(&delegation_id)
+    .bind(&user_id)
+    .execute(pool.get())
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE session_state_items
+         SET status = 'running'
+         WHERE session_id = ? AND user_id = ? AND category = 'delegation_state' AND item_key = ?",
+    )
+    .bind(&session_id)
+    .bind(&user_id)
+    .bind(&delegation_id)
+    .execute(pool.get())
+    .await
+    .unwrap();
+
+    projection_store
+        .upsert_delegation_projection_for_run(
+            &user_id,
+            &child_run_id,
+            Some("coder"),
+            Some("late projection refresh"),
+        )
+        .await
+        .unwrap();
+
+    let row = sqlx::query(
+        "SELECT
+          (SELECT status FROM session_delegations WHERE delegation_id = ? AND user_id = ?) AS delegation_status,
+          (SELECT status FROM session_state_items
+           WHERE session_id = ? AND user_id = ? AND category = 'delegation_state' AND item_key = ?) AS state_status",
+    )
+    .bind(&delegation_id)
+    .bind(&user_id)
+    .bind(&session_id)
+    .bind(&user_id)
+    .bind(&delegation_id)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(
+        row.try_get::<String, _>("delegation_status").unwrap(),
+        "completed"
+    );
+    assert_eq!(
+        row.try_get::<String, _>("state_status").unwrap(),
+        "completed"
+    );
 }
 
 #[tokio::test]

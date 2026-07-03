@@ -217,6 +217,12 @@ pub(crate) struct RunProjectionResponse {
 }
 
 #[derive(serde::Serialize)]
+pub(crate) struct RunProjectionRepairResponse {
+    pub repaired: bool,
+    pub projection: RunProjectionResponse,
+}
+
+#[derive(serde::Serialize)]
 pub(crate) struct PromptRequestObservabilityResponse {
     pub request_id: String,
     pub request_hash: String,
@@ -281,21 +287,49 @@ pub(crate) async fn get_run_projection_handler(
 ) -> Result<Json<RunProjectionResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     let user_id = user.user_id.clone();
-    let mut projection = state
+    let projection = state
         .execution
         .run_lifecycle_service
         .get_run_projection(run_id.clone(), user_id.clone(), query.recent_limit)
         .await?;
+    Ok(Json(
+        build_run_projection_response(&state, &user_id, &run_id, projection).await?,
+    ))
+}
+
+pub(crate) async fn repair_run_projection_handler(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<RunProjectionQuery>,
+) -> Result<Json<RunProjectionRepairResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let user_id = user.user_id.clone();
+    let projection = state
+        .execution
+        .run_lifecycle_service
+        .repair_run_projection(run_id.clone(), user_id.clone(), query.recent_limit)
+        .await?;
+    Ok(Json(RunProjectionRepairResponse {
+        repaired: true,
+        projection: build_run_projection_response(&state, &user_id, &run_id, projection).await?,
+    }))
+}
+
+async fn build_run_projection_response(
+    state: &AppState,
+    user_id: &str,
+    run_id: &str,
+    mut projection: astra_services::runs::RunProjectionRecord,
+) -> Result<RunProjectionResponse, (StatusCode, Json<ErrorResponse>)> {
     projection.recent_events =
-        transform_stream_run_events_for_client(&run_id, projection.recent_events);
+        transform_stream_run_events_for_client(run_id, projection.recent_events);
     let projection_lag_events =
         (projection.run_event_high_watermark - projection.projection_event_idx).max(0);
     let (observability_available, prompt_request_count, latest_prompt_request) =
-        load_run_prompt_observability(&state, &user_id, &run_id).await?;
-    let has_durable_projection = projection.run_event_high_watermark
-        == projection.projection_event_idx
-        || projection.projection_event_idx >= 0;
-    Ok(Json(RunProjectionResponse::new(
+        load_run_prompt_observability(state, user_id, run_id).await?;
+    let has_durable_projection = projection.has_durable_projection;
+    Ok(RunProjectionResponse::new(
         projection,
         RunProjectionObservabilityResponse {
             has_durable_projection,
@@ -304,7 +338,7 @@ pub(crate) async fn get_run_projection_handler(
             prompt_request_count,
             latest_prompt_request,
         },
-    )))
+    ))
 }
 
 async fn load_run_prompt_observability(
@@ -401,10 +435,11 @@ pub(crate) async fn list_runs_handler(
     Query(query): Query<RunListQuery>,
 ) -> Result<Json<RunListResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
+    let cursor = query.cursor()?;
     let runs = state
         .execution
         .run_lifecycle_service
-        .list_runs(user.user_id, query.limit, query.offset)
+        .list_runs_cursor(user.user_id, query.limit, cursor)
         .await?;
     Ok(Json(RunListResponse::from(runs)))
 }
@@ -486,7 +521,8 @@ mod tests {
     use axum::{
         Json,
         body::{self, Body},
-        http::{HeaderMap, Request, StatusCode},
+        extract::Query,
+        http::{HeaderMap, Request, StatusCode, Uri},
     };
     use serde_json::json;
     use tokio::sync::Mutex as TokioMutex;
@@ -497,6 +533,9 @@ mod tests {
         AuthService, AuthTokenRecord, AuthUserRecord, ErrorResponse, HealthChecker, ServiceInfo,
         build_app,
     };
+
+    static HTTP_RUN_DB: tokio::sync::OnceCell<astra_core::SharedPool> =
+        tokio::sync::OnceCell::const_new();
 
     #[derive(Clone)]
     struct StubHealthChecker;
@@ -569,6 +608,44 @@ mod tests {
         astra_core::MatrixOneSettings::mock()
     }
 
+    async fn setup_http_run_db_it() -> astra_core::SharedPool {
+        assert_eq!(
+            std::env::var("ASTRA_TEST_DB_IT").as_deref(),
+            Ok("1"),
+            "set ASTRA_TEST_DB_IT=1 for ignored integration tests"
+        );
+        HTTP_RUN_DB
+            .get_or_init(|| async {
+                let settings = astra_core::MatrixOneSettings::from_env();
+                let catalog = std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG")
+                    .unwrap_or_else(|_| "mysql".to_string());
+                astra_services::ensure_core_schema(&settings, &catalog)
+                    .await
+                    .expect("ensure_core_schema");
+                astra_core::SharedPool::new(&settings)
+                    .await
+                    .expect("SharedPool::new")
+            })
+            .await
+            .clone()
+    }
+
+    async fn cleanup_run_http_fixture(pool: &astra_core::SharedPool, user_id: &str, run_id: &str) {
+        for sql in [
+            "DELETE FROM run_display_projections WHERE user_id = ? AND run_id = ?",
+            "DELETE FROM run_checkpoints WHERE user_id = ? AND run_id = ?",
+            "DELETE FROM agent_run_events WHERE user_id = ? AND run_id = ?",
+            "DELETE FROM agent_runs WHERE user_id = ? AND run_id = ?",
+        ] {
+            sqlx::query(sql)
+                .bind(user_id)
+                .bind(run_id)
+                .execute(pool.get())
+                .await
+                .expect("cleanup run HTTP fixture");
+        }
+    }
+
     #[test]
     fn transform_stream_run_events_for_client_uses_client_protocol_shape() {
         let transformed = transform_stream_run_events_for_client(
@@ -615,18 +692,64 @@ mod tests {
     }
 
     #[test]
+    fn list_runs_handler_uses_cursor_pagination_only() {
+        let source = include_str!("handlers.rs");
+        let body = source
+            .split("pub(crate) async fn list_runs_handler")
+            .nth(1)
+            .and_then(|rest| rest.split("pub(crate) async fn pause_run_handler").next())
+            .expect("list_runs_handler body should be present");
+
+        assert!(
+            !body.contains("offset"),
+            "HTTP run list handler must not carry legacy offset pagination"
+        );
+        assert!(
+            body.contains(".list_runs_cursor("),
+            "HTTP run list should use seek pagination for the first page and cursor pages"
+        );
+        assert!(
+            !body.contains(".list_runs("),
+            "HTTP run list must not call the legacy count path"
+        );
+    }
+
+    #[test]
+    fn run_list_query_rejects_legacy_offset_param() {
+        let legacy_uri: Uri = "/runs?limit=10&offset=5".parse().unwrap();
+        assert!(
+            Query::<RunListQuery>::try_from_uri(&legacy_uri).is_err(),
+            "legacy run-list offset query must fail instead of silently returning page one"
+        );
+
+        let cursor_uri: Uri =
+            "/runs?limit=10&after_updated_at=2024-01-02T00:00:00.000000&after_run_id=run-5"
+                .parse()
+                .unwrap();
+        let Query(query) =
+            Query::<RunListQuery>::try_from_uri(&cursor_uri).expect("cursor query should decode");
+        assert!(query.cursor().unwrap().is_some());
+    }
+
+    #[test]
     fn transform_stream_run_events_for_client_emits_usage_and_terminal_status() {
         let transformed = transform_stream_run_events_for_client(
             "run-123",
             vec![
                 json!({
                     "event_type": "run_error",
-                    "data": {"error": "boom"},
+                    "data": {"error": "boom", "error_code": "network", "error_kind": "network"},
                     "index": 10
                 }),
                 json!({
                     "event_type": "run_finished",
-                    "data": {"prompt_tokens": 7, "completion_tokens": 3, "tool_call_count": 2},
+                    "data": {
+                        "prompt_tokens": 7,
+                        "completion_tokens": 3,
+                        "tool_call_count": 2,
+                        "error_code": "network",
+                        "error_kind": "network"
+                    },
                     "index": 11
                 }),
                 json!({
@@ -639,7 +762,18 @@ mod tests {
 
         assert_eq!(
             transformed[0],
-            json!({"type": "run_error", "message": "boom", "error": "boom", "code": "RUN_ERROR", "run_id": "run-123", "index": 10})
+            json!({
+                "type": "run_error",
+                "message": "boom",
+                "error": "boom",
+                "code": "LLM_TRANSPORT_ERROR",
+                "error_code": "network",
+                "error_kind": "network",
+                "retryable": true,
+                "retry_after_ms": 3000,
+                "run_id": "run-123",
+                "index": 10
+            })
         );
         assert_eq!(
             transformed[1],
@@ -647,7 +781,15 @@ mod tests {
         );
         assert_eq!(
             transformed[2],
-            json!({"type": "run_finished", "run_id": "run-123", "status": "failed", "error": "boom", "index": 11})
+            json!({
+                "type": "run_finished",
+                "run_id": "run-123",
+                "status": "failed",
+                "error": "boom",
+                "error_code": "network",
+                "error_kind": "network",
+                "index": 11
+            })
         );
         assert_eq!(
             transformed[3],
@@ -956,6 +1098,184 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn stream_run_http_replays_matrixone_cache_miss_durable_events() {
+        use crate::server::run::engine::RunEngine;
+        use crate::server::run::lifecycle::AgenticRunLifecycleService;
+        use astra_services::runs::{DatabaseRunStateStore, RunStateStore};
+        use sqlx::Row;
+        use uuid::Uuid;
+
+        let shared_pool = setup_http_run_db_it().await;
+        let settings = shared_pool.settings().clone();
+        let user_id = "u1";
+        let run_id = format!("run-replay-http-it-{}", Uuid::new_v4());
+        let session_id = format!("session-replay-http-it-{}", Uuid::new_v4());
+        cleanup_run_http_fixture(&shared_pool, user_id, &run_id).await;
+
+        let store: Arc<dyn RunStateStore> = Arc::new(
+            DatabaseRunStateStore::new(shared_pool.clone())
+                .with_owner_pod_id("stream-replay-http-it-pod"),
+        );
+        let engine = RunEngine::new(store);
+        engine
+            .start_run(&run_id, user_id, &session_id)
+            .await
+            .expect("start durable DB run");
+        let durable_events = vec![
+            json!({
+                "type": "tool_call",
+                "tool_call": {"id": "call-1", "name": "bash", "arguments": {"cmd": "printf ok"}}
+            }),
+            json!({
+                "type": "tool_call_end",
+                "call_id": "call-1",
+                "tool": "bash",
+                "result": "ok"
+            }),
+            json!({
+                "event_type": "approval_required",
+                "data": {
+                    "approval_id": "approval-1",
+                    "request_id": "approval-1",
+                    "tool": "bash",
+                    "approval_kind": "standard"
+                }
+            }),
+            json!({
+                "event_type": "user_input",
+                "data": {
+                    "request_id": "approval-1",
+                    "text": "approved from another pod"
+                }
+            }),
+            json!({
+                "event_type": "text_done",
+                "data": {"full_text": "durable final answer from matrixone"}
+            }),
+            json!({
+                "event_type": "run_finished",
+                "data": {"prompt_tokens": 2, "completion_tokens": 1, "tool_call_count": 1}
+            }),
+        ];
+        let transitioned = engine
+            .transition_status_with_events_if_current(
+                user_id,
+                &run_id,
+                &[astra_core::STATUS_RUNNING],
+                astra_core::STATUS_COMPLETED,
+                None,
+                None,
+                &durable_events,
+            )
+            .await
+            .expect("commit terminal durable DB events");
+        assert!(transitioned);
+
+        let persisted_event_types = sqlx::query(
+            "SELECT event_type FROM agent_run_events
+             WHERE user_id = ? AND run_id = ?
+             ORDER BY event_idx ASC",
+        )
+        .bind(user_id)
+        .bind(&run_id)
+        .fetch_all(shared_pool.get())
+        .await
+        .expect("load persisted event types")
+        .into_iter()
+        .map(|row| row.try_get::<String, _>("event_type").expect("event_type"))
+        .collect::<Vec<_>>();
+        assert_eq!(
+            persisted_event_types,
+            vec![
+                "run_started",
+                "tool_call",
+                "tool_call_end",
+                "approval_required",
+                "user_input",
+                "text_done",
+                "run_finished",
+            ],
+            "cache-miss replay must be backed by semantic durable facts only"
+        );
+
+        let lifecycle = AgenticRunLifecycleService::new(
+            settings,
+            Arc::new(
+                crate::FernetTokenEncryptor::new("0123456789abcdef")
+                    .expect("test encryptor should initialize"),
+            ),
+            Arc::new(TokioMutex::new(HashMap::new())),
+            engine,
+        );
+        let app = build_app(
+            AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+                .with_auth_service(Arc::new(StubAuthService))
+                .with_run_lifecycle_service(Arc::new(lifecycle)),
+        );
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/chat/runs/{run_id}/stream?last_index=1"))
+                    .header("authorization", "Bearer good-token")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("response should be returned");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
+        let body = body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("body should be readable");
+        let text = String::from_utf8(body.to_vec()).expect("sse should be utf8");
+        assert!(
+            text.contains("\"type\":\"tool_call\""),
+            "durable replay should expose tool start boundary: {text}"
+        );
+        assert!(
+            text.contains("\"type\":\"tool_call_end\""),
+            "durable replay should expose tool end boundary: {text}"
+        );
+        assert!(
+            text.contains("\"type\":\"approval_required\"")
+                && text.contains("\"request_id\":\"approval-1\""),
+            "durable replay should expose approval request boundary: {text}"
+        );
+        assert!(
+            text.contains("\"type\":\"user_input\"")
+                && text.contains("\"text\":\"approved from another pod\""),
+            "durable replay should expose approval/user input response boundary: {text}"
+        );
+        assert!(
+            text.contains("\"full_text\":\"durable final answer from matrixone\""),
+            "durable replay should expose final answer text: {text}"
+        );
+        assert!(
+            text.contains("\"type\":\"usage\""),
+            "run_finished usage should still be transformed for the client: {text}"
+        );
+        assert!(
+            text.contains("\"type\":\"run_finished\"") && text.contains("\"status\":\"completed\""),
+            "terminal lifecycle event should still reach the client: {text}"
+        );
+        assert!(
+            !text.contains("text_delta") && !text.contains("agent_live_event"),
+            "cache-miss replay should not require transport-only live deltas: {text}"
+        );
+
+        cleanup_run_http_fixture(&shared_pool, user_id, &run_id).await;
+    }
+
+    #[tokio::test]
     async fn get_run_projection_http_returns_bounded_projection_and_filters_internal_events() {
         use crate::server::run::engine::RunEngine;
         use crate::server::run::lifecycle::AgenticRunLifecycleService;
@@ -1110,6 +1430,10 @@ mod tests {
             Some(&json!(0))
         );
         assert_eq!(
+            json.pointer("/observability/has_durable_projection"),
+            Some(&json!(true))
+        );
+        assert_eq!(
             json.pointer("/observability/observability_available"),
             Some(&json!(false))
         );
@@ -1149,6 +1473,249 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repair_run_projection_http_rebuilds_and_returns_projection() {
+        use crate::server::run::engine::RunEngine;
+        use crate::server::run::lifecycle::AgenticRunLifecycleService;
+        use astra_services::runs::InMemoryRunStateStore;
+
+        let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
+        engine
+            .start_run("run-projection-repair-http", "u1", "session-projection")
+            .await
+            .expect("start durable run");
+        engine
+            .transition_status_with_events_if_current(
+                "u1",
+                "run-projection-repair-http",
+                &[astra_core::STATUS_RUNNING],
+                astra_core::STATUS_FAILED,
+                None,
+                Some("boom"),
+                &[
+                    json!({"event_type": "run_error", "data": {"error": "boom"}}),
+                    json!({"event_type": "run_finished", "data": {"status": "failed"}}),
+                ],
+            )
+            .await
+            .expect("persist terminal transition");
+
+        let lifecycle = AgenticRunLifecycleService::new(
+            test_matrixone(),
+            Arc::new(
+                crate::FernetTokenEncryptor::new("0123456789abcdef")
+                    .expect("test encryptor should initialize"),
+            ),
+            Arc::new(TokioMutex::new(HashMap::new())),
+            engine,
+        );
+
+        let app = build_app(
+            AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+                .with_auth_service(Arc::new(StubAuthService))
+                .with_run_lifecycle_service(Arc::new(lifecycle)),
+        );
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/chat/runs/run-projection-repair-http/projection/repair?recent_limit=2")
+                    .header("authorization", "Bearer good-token")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("response should be returned");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("body should be readable");
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).expect("repair response should be valid json");
+        assert_eq!(json.get("repaired"), Some(&json!(true)));
+        assert_eq!(json.pointer("/projection/status"), Some(&json!("failed")));
+        assert_eq!(
+            json.pointer("/projection/latest_event_type"),
+            Some(&json!("run_finished"))
+        );
+        assert_eq!(
+            json.pointer("/projection/observability/projection_lag_events"),
+            Some(&json!(0))
+        );
+        assert_eq!(
+            json.pointer("/projection/observability/has_durable_projection"),
+            Some(&json!(true))
+        );
+        let recent_events = json
+            .pointer("/projection/recent_events")
+            .and_then(serde_json::Value::as_array)
+            .expect("recent events should be present");
+        assert_eq!(recent_events.len(), 2);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn repair_run_projection_http_repairs_real_database_projection() {
+        use crate::server::run::engine::RunEngine;
+        use crate::server::run::lifecycle::AgenticRunLifecycleService;
+        use astra_services::runs::{DatabaseRunStateStore, RunStateStore};
+        use sqlx::Row;
+        use uuid::Uuid;
+
+        let shared_pool = setup_http_run_db_it().await;
+        let settings = shared_pool.settings().clone();
+        let user_id = "u1";
+        let run_id = format!("run-http-it-{}", Uuid::new_v4());
+        let session_id = format!("session-http-it-{}", Uuid::new_v4());
+        cleanup_run_http_fixture(&shared_pool, user_id, &run_id).await;
+
+        let store: Arc<dyn RunStateStore> = Arc::new(
+            DatabaseRunStateStore::new(shared_pool.clone())
+                .with_owner_pod_id("projection-repair-http-it-pod"),
+        );
+        let engine = RunEngine::new(store);
+        engine
+            .start_run(&run_id, user_id, &session_id)
+            .await
+            .expect("start durable DB run");
+        let checkpoint_saved = engine
+            .persist_checkpoint(
+                user_id,
+                &run_id,
+                r#"{"version":"checkpoint_v2","graceful":true,"last_batch_id":"http-repair-it"}"#,
+            )
+            .await
+            .expect("save checkpoint before terminal transition");
+        assert!(checkpoint_saved);
+        let transitioned = engine
+            .transition_status_with_events_if_current(
+                user_id,
+                &run_id,
+                &[astra_core::STATUS_RUNNING],
+                astra_core::STATUS_FAILED,
+                None,
+                Some("boom"),
+                &[
+                    json!({"event_type": "run_error", "data": {"error": "boom"}}),
+                    json!({"event_type": "run_finished", "data": {"status": "failed"}}),
+                ],
+            )
+            .await
+            .expect("persist terminal transition");
+        assert!(transitioned);
+
+        sqlx::query(
+            "UPDATE run_display_projections
+             SET status = 'running',
+                 error_message = NULL,
+                 projection_event_idx = -1,
+                 latest_event_type = 'stale_event',
+                 latest_checkpoint_id = NULL,
+                 latest_checkpoint_kind = NULL,
+                 latest_checkpoint_version = NULL
+             WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(user_id)
+        .bind(&run_id)
+        .execute(shared_pool.get())
+        .await
+        .expect("corrupt projection");
+
+        let lifecycle = AgenticRunLifecycleService::new(
+            settings,
+            Arc::new(
+                crate::FernetTokenEncryptor::new("0123456789abcdef")
+                    .expect("test encryptor should initialize"),
+            ),
+            Arc::new(TokioMutex::new(HashMap::new())),
+            engine,
+        );
+
+        let app = build_app(
+            AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+                .with_auth_service(Arc::new(StubAuthService))
+                .with_shared_pool(shared_pool.clone())
+                .with_run_lifecycle_service(Arc::new(lifecycle)),
+        );
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/chat/runs/{run_id}/projection/repair?recent_limit=2"
+                    ))
+                    .header("authorization", "Bearer good-token")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("response should be returned");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("body should be readable");
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).expect("repair response should be valid json");
+        assert_eq!(json.get("repaired"), Some(&json!(true)));
+        assert_eq!(json.pointer("/projection/status"), Some(&json!("failed")));
+        assert_eq!(
+            json.pointer("/projection/error_message"),
+            Some(&json!("boom"))
+        );
+        assert_eq!(
+            json.pointer("/projection/latest_event_type"),
+            Some(&json!("run_finished"))
+        );
+        assert_eq!(
+            json.pointer("/projection/latest_checkpoint/checkpoint_version"),
+            Some(&json!("checkpoint_v2"))
+        );
+        assert_eq!(
+            json.pointer("/projection/observability/projection_lag_events"),
+            Some(&json!(0))
+        );
+        let recent_events = json
+            .pointer("/projection/recent_events")
+            .and_then(serde_json::Value::as_array)
+            .expect("recent events should be present");
+        assert_eq!(recent_events.len(), 2);
+
+        let row = sqlx::query(
+            "SELECT status, error_message, projection_event_idx, latest_event_type,
+                    latest_checkpoint_version
+             FROM run_display_projections
+             WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(user_id)
+        .bind(&run_id)
+        .fetch_one(shared_pool.get())
+        .await
+        .expect("load repaired projection row");
+        let db_status: String = row.try_get("status").expect("status");
+        let db_error: Option<String> = row.try_get("error_message").expect("error_message");
+        let db_event_idx: i64 = row
+            .try_get("projection_event_idx")
+            .expect("projection_event_idx");
+        let db_latest_event: Option<String> =
+            row.try_get("latest_event_type").expect("latest_event_type");
+        let db_checkpoint_version: Option<String> = row
+            .try_get("latest_checkpoint_version")
+            .expect("latest_checkpoint_version");
+        assert_eq!(db_status, astra_core::STATUS_FAILED);
+        assert_eq!(db_error.as_deref(), Some("boom"));
+        // `RunEngine::start_run` persists `run_started` at index 0; the
+        // terminal batch then writes `run_error` and `run_finished`.
+        assert_eq!(db_event_idx, 2);
+        assert_eq!(db_latest_event.as_deref(), Some("run_finished"));
+        assert_eq!(db_checkpoint_version.as_deref(), Some("checkpoint_v2"));
+
+        cleanup_run_http_fixture(&shared_pool, user_id, &run_id).await;
+    }
+
+    #[tokio::test]
     async fn get_run_projection_http_hides_foreign_run() {
         use crate::server::run::engine::RunEngine;
         use crate::server::run::lifecycle::AgenticRunLifecycleService;
@@ -1180,6 +1747,48 @@ mod tests {
                 Request::builder()
                     .method("GET")
                     .uri("/chat/runs/run-foreign/projection")
+                    .header("authorization", "Bearer good-token")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("response should be returned");
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn repair_run_projection_http_hides_foreign_run() {
+        use crate::server::run::engine::RunEngine;
+        use crate::server::run::lifecycle::AgenticRunLifecycleService;
+        use astra_services::runs::InMemoryRunStateStore;
+
+        let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
+        engine
+            .start_run("run-foreign-repair", "u2", "session-foreign")
+            .await
+            .expect("start durable run");
+        let lifecycle = AgenticRunLifecycleService::new(
+            test_matrixone(),
+            Arc::new(
+                crate::FernetTokenEncryptor::new("0123456789abcdef")
+                    .expect("test encryptor should initialize"),
+            ),
+            Arc::new(TokioMutex::new(HashMap::new())),
+            engine,
+        );
+
+        let app = build_app(
+            AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+                .with_auth_service(Arc::new(StubAuthService))
+                .with_run_lifecycle_service(Arc::new(lifecycle)),
+        );
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/chat/runs/run-foreign-repair/projection/repair")
                     .header("authorization", "Bearer good-token")
                     .body(Body::empty())
                     .expect("request should build"),

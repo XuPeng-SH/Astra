@@ -215,12 +215,14 @@ pub trait SseStreamHost: Send {
     /// `display_label` is the rich preview string suitable for UI.
     /// Implementations should prefer `display_label` for output and
     /// fall back to `detail` when absent.
+    #[allow(clippy::too_many_arguments)]
     async fn resolve_approval(
         &mut self,
         request_id: &str,
         tool: &str,
         approval_kind: ApprovalKind,
         session_id: Option<&str>,
+        run_id: Option<&str>,
         detail: Option<&str>,
         display_label: Option<&str>,
     ) -> EdgeApprovalResult;
@@ -230,6 +232,7 @@ pub trait SseStreamHost: Send {
         &mut self,
         requests: &[EdgeApprovalRequest],
         session_id: Option<&str>,
+        run_id: Option<&str>,
     ) -> Vec<EdgeApprovalResult> {
         let mut results = Vec::with_capacity(requests.len());
         for request in requests {
@@ -239,6 +242,7 @@ pub trait SseStreamHost: Send {
                     &request.tool,
                     request.approval_kind,
                     session_id,
+                    run_id,
                     request.detail.as_deref(),
                     request.display_label.as_deref(),
                 )
@@ -458,6 +462,7 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
             &mut pending,
             host,
             accum.session_id.as_deref(),
+            accum.run_id.as_deref(),
             &mut tool_results,
             &mut approval_results,
         )
@@ -514,6 +519,7 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
             &mut pending,
             host,
             accum.session_id.as_deref(),
+            accum.run_id.as_deref(),
             &mut tool_results,
             &mut approval_results,
         )
@@ -624,6 +630,7 @@ async fn flush_pending_via_host<H: SseStreamHost>(
     pending: &mut Vec<ChatTurnEdgePending>,
     host: &mut H,
     session_id: Option<&str>,
+    run_id: Option<&str>,
     tool_results: &mut Vec<EdgeToolExecResult>,
     approval_results: &mut Vec<EdgeApprovalResult>,
 ) {
@@ -680,7 +687,7 @@ async fn flush_pending_via_host<H: SseStreamHost>(
     // execute the edit BEFORE the user / ledger granted permission.
     if approval_requests.len() > 1 {
         approval_results.extend(
-            host.resolve_approvals_batch(&approval_requests, session_id)
+            host.resolve_approvals_batch(&approval_requests, session_id, run_id)
                 .await,
         );
     } else if let Some(request) = approval_requests.into_iter().next() {
@@ -690,6 +697,7 @@ async fn flush_pending_via_host<H: SseStreamHost>(
                 &request.tool,
                 request.approval_kind,
                 session_id,
+                run_id,
                 request.detail.as_deref(),
                 request.display_label.as_deref(),
             )
@@ -745,6 +753,7 @@ impl SseStreamHost for NoopSseStreamHost {
         _tool: &str,
         _approval_kind: ApprovalKind,
         _session_id: Option<&str>,
+        _run_id: Option<&str>,
         _detail: Option<&str>,
         _display_label: Option<&str>,
     ) -> EdgeApprovalResult {
@@ -764,6 +773,7 @@ struct RecordingSseStreamHost {
     render_effects: Vec<SseRenderEffect>,
     tool_outputs: std::collections::HashMap<String, String>,
     approval_kinds: Vec<ApprovalKind>,
+    approval_run_ids: Vec<Option<String>>,
     stream_completed: bool,
 }
 
@@ -774,6 +784,7 @@ impl RecordingSseStreamHost {
             render_effects: Vec::new(),
             tool_outputs: std::collections::HashMap::new(),
             approval_kinds: Vec::new(),
+            approval_run_ids: Vec::new(),
             stream_completed: false,
         }
     }
@@ -824,10 +835,13 @@ impl SseStreamHost for RecordingSseStreamHost {
         _tool: &str,
         approval_kind: ApprovalKind,
         _session_id: Option<&str>,
+        run_id: Option<&str>,
         _detail: Option<&str>,
         _display_label: Option<&str>,
     ) -> EdgeApprovalResult {
         self.approval_kinds.push(approval_kind);
+        self.approval_run_ids
+            .push(run_id.map(std::string::ToString::to_string));
         EdgeApprovalResult {
             request_id: request_id.to_string(),
             decision: "allow".to_string(),
@@ -957,9 +971,16 @@ mod tests {
 
     #[tokio::test]
     async fn recording_host_approval_resolved() {
-        let events = sse_event(
-            "approval_required",
-            ",\"request_id\":\"ap-1\",\"tool\":\"write_file\",\"approval_kind\":\"standard\",\"path\":\"src/x.rs\",\"detail\":\"src/x.rs\"",
+        let events = format!(
+            "{}{}",
+            sse_event(
+                "session_info",
+                ",\"session_id\":\"sess-approval\",\"run_id\":\"run-approval\""
+            ),
+            sse_event(
+                "approval_required",
+                ",\"request_id\":\"ap-1\",\"tool\":\"write_file\",\"approval_kind\":\"standard\",\"path\":\"src/x.rs\",\"detail\":\"src/x.rs\"",
+            )
         );
         let chunks = chunks_from_sse(&events);
         let mut stream = stream::iter(chunks);
@@ -976,6 +997,10 @@ mod tests {
         assert_eq!(result.approval_results[0].request_id, "ap-1");
         assert_eq!(result.approval_results[0].decision, "allow");
         assert_eq!(host.approval_kinds, vec![ApprovalKind::Standard]);
+        assert_eq!(
+            host.approval_run_ids,
+            vec![Some("run-approval".to_string())]
+        );
     }
 
     #[tokio::test]
@@ -1079,6 +1104,7 @@ mod tests {
                 _tool: &str,
                 _approval_kind: ApprovalKind,
                 _session_id: Option<&str>,
+                _run_id: Option<&str>,
                 _detail: Option<&str>,
                 _display_label: Option<&str>,
             ) -> EdgeApprovalResult {
@@ -1177,6 +1203,7 @@ mod tests {
                 _tool: &str,
                 _approval_kind: ApprovalKind,
                 _session_id: Option<&str>,
+                _run_id: Option<&str>,
                 _detail: Option<&str>,
                 _display_label: Option<&str>,
             ) -> EdgeApprovalResult {
@@ -1792,6 +1819,7 @@ mod tests {
                 _: Option<&str>,
                 _: Option<&str>,
                 _: Option<&str>,
+                _: Option<&str>,
             ) -> EdgeApprovalResult {
                 EdgeApprovalResult {
                     request_id: rid.to_string(),
@@ -1885,6 +1913,7 @@ mod tests {
                 rid: &str,
                 _: &str,
                 _: ApprovalKind,
+                _: Option<&str>,
                 _: Option<&str>,
                 _: Option<&str>,
                 _: Option<&str>,
@@ -2090,6 +2119,7 @@ mod tests {
                 tool: &str,
                 _approval_kind: ApprovalKind,
                 _session_id: Option<&str>,
+                _run_id: Option<&str>,
                 _detail: Option<&str>,
                 _display_label: Option<&str>,
             ) -> EdgeApprovalResult {
@@ -2234,6 +2264,7 @@ mod tests {
                 rid: &str,
                 tool: &str,
                 _: ApprovalKind,
+                _: Option<&str>,
                 _: Option<&str>,
                 _: Option<&str>,
                 _: Option<&str>,

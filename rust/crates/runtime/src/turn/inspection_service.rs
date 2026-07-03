@@ -28,7 +28,7 @@
 use crate::turn::runtime_policy::TuningPolicy;
 use astra_core::ObservationFacet;
 use astra_core::observation::{TuningJob, TuningSignalType};
-use astra_turn_core::introspect::{CircuitBreakerSnapshot, IntrospectSnapshot};
+use astra_turn_core::introspect::{CircuitBreakerSnapshot, IntrospectSnapshot, turn_budget_label};
 
 use super::providers::{LiveRuntimeProvider, ObservationProvider, SessionStateProvider};
 
@@ -167,7 +167,7 @@ impl InspectionService<'_> {
                 let remaining = self.session.remaining_turns();
                 let max_budget = self.session.max_turns();
                 lines.push(format!(
-                    "live: pressure={:.0}% cache={:.0}% error_rate={:.0}% turns={}/{}",
+                    "live: pressure={:.0}% cache={:.0}% error_rate={:.0}% remaining_turns={}/{}",
                     pressure * 100.0,
                     cache * 100.0,
                     error_rate * 100.0,
@@ -368,6 +368,12 @@ pub fn local_reflect_from_snapshot(
 ) -> String {
     let mut lines: Vec<String> = Vec::new();
     lines.push("## Local Reflect Summary (snapshot fallback)".to_string());
+    if snapshot.snapshot_age_turns > 0 {
+        lines.push(format!(
+            "snapshot_age_turns={}",
+            snapshot.snapshot_age_turns
+        ));
+    }
 
     match facet {
         ObservationFacet::Session | ObservationFacet::Overview => {
@@ -378,10 +384,7 @@ pub fn local_reflect_from_snapshot(
                 pressure * 100.0,
                 cache * 100.0,
             ));
-            lines.push(format!(
-                "turns: completed={} remaining={}",
-                snapshot.turns_completed, snapshot.turns_remaining,
-            ));
+            lines.push(format!("turns: {}", turn_budget_label(snapshot)));
             lines.push(format!("compaction: {}", snapshot.compaction_tier));
             if !snapshot.alerts.is_empty() {
                 lines.push(format!("alerts: {}", snapshot.alerts.join(", ")));
@@ -563,6 +566,7 @@ mod tests {
             cache_hit_ratio: 0.88,
             turns_completed: 3,
             turns_remaining: 7,
+            snapshot_age_turns: 2,
             compaction_tier: "light".to_string(),
             alerts: vec!["test_alert".to_string()],
             circuit_breaker: Some(CircuitBreakerSnapshot {
@@ -577,11 +581,32 @@ mod tests {
         assert!(summary.contains("Local Reflect Summary"));
         assert!(summary.contains("pressure=42%"));
         assert!(summary.contains("cache=88%"));
-        assert!(summary.contains("completed=3"));
-        assert!(summary.contains("remaining=7"));
+        assert!(summary.contains("snapshot_age_turns=2"));
+        assert!(summary.contains("turns: 3/10"));
         assert!(summary.contains("compaction: light"));
         assert!(summary.contains("test_alert"));
         assert!(summary.contains("circuit_breaker: monitoring"));
+    }
+
+    #[test]
+    fn local_reflect_from_snapshot_preserves_unlimited_turn_budget() {
+        let snapshot = IntrospectSnapshot {
+            turns_completed: 3,
+            turns_remaining: 0,
+            turn_budget_unlimited: true,
+            ..Default::default()
+        };
+
+        let summary = local_reflect_from_snapshot(&snapshot, ObservationFacet::Session);
+
+        assert!(
+            summary.contains("turns: 3/∞"),
+            "local reflect fallback must not render unlimited as remaining=0: {summary}"
+        );
+        assert!(
+            !summary.contains("remaining=0"),
+            "local reflect fallback should not expose ambiguous zero remaining turns: {summary}"
+        );
     }
 
     #[test]

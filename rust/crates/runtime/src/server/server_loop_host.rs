@@ -15,9 +15,8 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -65,6 +64,7 @@ use astra_turn_core::bridge_rate_limit_cooldown::{
 };
 use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
 use astra_turn_core::compaction_types::CompactionTier;
+use astra_turn_core::pipeline_metrics::MetricsRegistry;
 use astra_turn_core::thinking_config::ThinkingConfig;
 use astra_turn_core::tool::schema::tool_schema_name;
 use astra_turn_core::tool_schema_prune::filter_tool_schemas_by_excluded_names;
@@ -72,6 +72,173 @@ use astra_turn_core::tool_schema_prune::filter_tool_schemas_by_excluded_names;
 const MAX_PENDING_PROGRESS_AGENTS: usize = 128;
 const MAX_PENDING_PROGRESS_PER_AGENT: usize = 8;
 const MAX_STREAMED_TURN_EVENT_BUFFER: usize = 2_048;
+const AUX_LLM_POLICY_ENV: &str = "ASTRA_AUX_LLM_POLICY";
+const METRIC_LLM_MAIN_ATTEMPTS_TOTAL: &str = "astra_llm_main_attempts_total";
+const METRIC_LLM_MAIN_ATTEMPT_TOKENS_TOTAL: &str = "astra_llm_main_attempt_tokens_total";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuxiliaryLlmPolicy {
+    CapacityAware,
+    Always,
+    Disabled,
+}
+
+impl AuxiliaryLlmPolicy {
+    fn from_env() -> Self {
+        std::env::var(AUX_LLM_POLICY_ENV)
+            .ok()
+            .as_deref()
+            .map(parse_auxiliary_llm_policy)
+            .unwrap_or(Self::CapacityAware)
+    }
+
+    fn as_label(self) -> &'static str {
+        match self {
+            Self::CapacityAware => "capacity_aware",
+            Self::Always => "always",
+            Self::Disabled => "disabled",
+        }
+    }
+}
+
+fn parse_auxiliary_llm_policy(raw: &str) -> AuxiliaryLlmPolicy {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "always" | "on" | "true" | "1" => AuxiliaryLlmPolicy::Always,
+        "disabled" | "disable" | "off" | "false" | "0" => AuxiliaryLlmPolicy::Disabled,
+        "capacity_aware" | "capacity-aware" | "auto" | "" => AuxiliaryLlmPolicy::CapacityAware,
+        _ => AuxiliaryLlmPolicy::CapacityAware,
+    }
+}
+
+fn should_skip_auxiliary_llm_for_capacity() -> Option<&'static str> {
+    let policy = AuxiliaryLlmPolicy::from_env();
+    match policy {
+        AuxiliaryLlmPolicy::Disabled => Some("disabled"),
+        AuxiliaryLlmPolicy::Always => None,
+        AuxiliaryLlmPolicy::CapacityAware => {
+            if crate::llm_provider_admission::ProviderAdmissionConfig::from_env().is_enabled() {
+                Some("provider_admission_enabled")
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn auxiliary_llm_policy_label() -> &'static str {
+    AuxiliaryLlmPolicy::from_env().as_label()
+}
+
+fn llm_main_attempt_metrics_slot() -> &'static RwLock<Option<Arc<MetricsRegistry>>> {
+    static SLOT: OnceLock<RwLock<Option<Arc<MetricsRegistry>>>> = OnceLock::new();
+    SLOT.get_or_init(Default::default)
+}
+
+pub(crate) fn set_llm_main_attempt_metrics_registry(registry: Arc<MetricsRegistry>) {
+    register_llm_main_attempt_metrics(&registry);
+    *llm_main_attempt_metrics_slot()
+        .write()
+        .expect("llm main attempt metrics registry lock poisoned") = Some(registry);
+}
+
+fn llm_main_attempt_metrics_registry() -> Option<Arc<MetricsRegistry>> {
+    llm_main_attempt_metrics_slot()
+        .read()
+        .expect("llm main attempt metrics registry lock poisoned")
+        .clone()
+}
+
+fn register_llm_main_attempt_metrics(registry: &MetricsRegistry) {
+    registry.register_counter(
+        METRIC_LLM_MAIN_ATTEMPTS_TOTAL,
+        "Main server LLM attempts by phase, retry class, and low-cardinality outcome.",
+    );
+    registry.register_counter(
+        METRIC_LLM_MAIN_ATTEMPT_TOKENS_TOTAL,
+        "Estimated main server LLM attempt tokens by phase, retry class, and low-cardinality outcome.",
+    );
+}
+
+fn llm_main_attempt_label(attempt_in_round: u32) -> &'static str {
+    if attempt_in_round == 0 {
+        "initial"
+    } else {
+        "retry"
+    }
+}
+
+fn is_llm_provider_admission_error(error: &astra_core::ClassifiedError) -> bool {
+    let Some(details_json) = error.details_json.as_deref() else {
+        return false;
+    };
+    let Ok(Value::Object(details)) = serde_json::from_str::<Value>(details_json) else {
+        return false;
+    };
+    details.get("source").and_then(Value::as_str) == Some("llm_provider_admission")
+}
+
+fn llm_main_error_outcome(error: &astra_core::ClassifiedError) -> &'static str {
+    if is_llm_provider_admission_error(error) {
+        return "admission_rejected";
+    }
+    match error.kind {
+        astra_core::ErrorKind::RateLimit => "error_rate_limit",
+        astra_core::ErrorKind::ServerError => "error_server_error",
+        astra_core::ErrorKind::Auth => "error_auth",
+        astra_core::ErrorKind::ContextWindow => "error_context_window",
+        astra_core::ErrorKind::InvalidRequest => "error_invalid_request",
+        astra_core::ErrorKind::StreamIdle => "error_stream_idle",
+        astra_core::ErrorKind::StreamTransport => "error_stream_transport",
+        astra_core::ErrorKind::ConnectionPoolExhausted => "error_connection_pool_exhausted",
+        astra_core::ErrorKind::BudgetExhausted => "error_budget_exhausted",
+        astra_core::ErrorKind::ToolRoundsExhausted => "error_tool_rounds_exhausted",
+        astra_core::ErrorKind::Network => "error_network",
+        astra_core::ErrorKind::ToolNotFound => "error_tool_not_found",
+        astra_core::ErrorKind::ToolInvalidArgs => "error_tool_invalid_args",
+        astra_core::ErrorKind::ToolTimeout => "error_tool_timeout",
+        astra_core::ErrorKind::ToolUnavailable => "error_tool_unavailable",
+        astra_core::ErrorKind::ToolBinding => "error_tool_binding",
+        astra_core::ErrorKind::ResourceLimit => "error_resource_limit",
+        astra_core::ErrorKind::DatabaseError => "error_database",
+        astra_core::ErrorKind::Stall => "error_stall",
+        astra_core::ErrorKind::MissingModelSelection => "error_missing_model_selection",
+        astra_core::ErrorKind::Cancelled => "error_cancelled",
+        astra_core::ErrorKind::Unknown => "error_unknown",
+    }
+}
+
+fn llm_main_success_outcome(result: &LlmCallResult, will_retry_for_length: bool) -> &'static str {
+    if will_retry_for_length {
+        return "length_retry";
+    }
+    match result.finish_reason.as_deref() {
+        Some("stop") => "success_stop",
+        Some("tool_calls") => "success_tool_calls",
+        Some("length") => "success_length_cap",
+        Some("content_filter") => "success_content_filter",
+        Some(_) => "success_other",
+        None => "success_unknown_finish",
+    }
+}
+
+fn record_llm_main_attempt_metrics(
+    phase: &'static str,
+    attempt: &'static str,
+    outcome: &'static str,
+    estimated_tokens: u64,
+) {
+    let Some(registry) = llm_main_attempt_metrics_registry() else {
+        return;
+    };
+    register_llm_main_attempt_metrics(&registry);
+    let labels = &[("phase", phase), ("attempt", attempt), ("outcome", outcome)];
+    registry.increment_counter(METRIC_LLM_MAIN_ATTEMPTS_TOTAL, labels, 1);
+    registry.increment_counter(
+        METRIC_LLM_MAIN_ATTEMPT_TOKENS_TOTAL,
+        labels,
+        estimated_tokens.max(1),
+    );
+}
 
 #[derive(Debug)]
 pub(crate) struct RunScopedAgentProgressFilter {
@@ -355,7 +522,17 @@ fn mock_round_error(round: &Value) -> Option<astra_core::ClassifiedError> {
 #[cfg(feature = "bridge-e2e-hooks")]
 fn mock_round_partial_text(error: &astra_core::ClassifiedError) -> Option<String> {
     let details = error.details_json.as_deref()?;
-    let value: Value = serde_json::from_str(details).ok()?;
+    let value: Value = match serde_json::from_str(details) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!(
+                target: "astra_runtime::server_loop",
+                error = %e,
+                "failed to parse error details_json; partial_text unavailable"
+            );
+            return None;
+        }
+    };
     value
         .get("partial_full_text")
         .and_then(Value::as_str)
@@ -462,6 +639,8 @@ impl RequestAwareSummaryClient {
 struct SummaryClientTurnIntentJudge {
     client: Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>,
 }
+
+const RESOLVED_TURN_LLM_CONFIG_CACHE_TTL: Duration = Duration::from_secs(30);
 
 #[async_trait]
 impl astra_services::TurnIntentJudge for SummaryClientTurnIntentJudge {
@@ -862,6 +1041,7 @@ pub struct ServerAgenticLoopHost {
     /// Summary-classifier calls need completion overrides and forwarded
     /// headers, which `LlmConnParams` intentionally does not carry.
     resolved_llm_config: Option<ResolvedTurnLlmConfig>,
+    resolved_llm_config_at: Option<Instant>,
 
     // ── Context ──
     edge_tools: Vec<Value>,
@@ -900,6 +1080,8 @@ pub struct ServerAgenticLoopHost {
 
     // ── Tool execution ──
     edge_callback_ledger: Arc<TokioMutex<HashMap<String, Value>>>,
+    edge_dispatch_service: Option<Arc<dyn EdgeDispatchService>>,
+    approval_audit_context: Option<astra_turn_core::cloud_tool_delivery::ApprovalAuditContext>,
     user_id: String,
     session_id: String,
     workspace_binding: WorkspaceBinding,
@@ -1005,6 +1187,7 @@ pub struct ServerAgenticLoopHostBuilder {
     edge_profile: Map<String, Value>,
     execution_bindings: Option<ExecutionBindingSnapshot>,
     edge_callback_ledger: Arc<TokioMutex<HashMap<String, Value>>>,
+    edge_dispatch_service: Option<Arc<dyn EdgeDispatchService>>,
     user_id: String,
     session_id: String,
     progress_broadcaster: Option<Arc<crate::orchestration::ProgressBroadcaster>>,
@@ -1055,6 +1238,7 @@ impl ServerAgenticLoopHostBuilder {
             edge_profile: Map::new(),
             execution_bindings: None,
             edge_callback_ledger: Arc::new(TokioMutex::new(HashMap::new())),
+            edge_dispatch_service: None,
             user_id,
             session_id,
             progress_broadcaster: None,
@@ -1182,6 +1366,11 @@ impl ServerAgenticLoopHostBuilder {
         ledger: Arc<TokioMutex<HashMap<String, Value>>>,
     ) -> Self {
         self.edge_callback_ledger = ledger;
+        self
+    }
+
+    pub fn with_edge_dispatch_service(mut self, svc: Arc<dyn EdgeDispatchService>) -> Self {
+        self.edge_dispatch_service = Some(svc);
         self
     }
 
@@ -1339,6 +1528,7 @@ impl ServerAgenticLoopHostBuilder {
             resolved_context_window: None,
             resolved_llm_params: None,
             resolved_llm_config: None,
+            resolved_llm_config_at: None,
             edge_tools,
             capabilities: self.capabilities,
             edge_profile: self.edge_profile,
@@ -1351,6 +1541,8 @@ impl ServerAgenticLoopHostBuilder {
             static_tool_catalog_admissible: self.static_tool_catalog_admissible,
             always_load_tool_names,
             edge_callback_ledger: self.edge_callback_ledger,
+            edge_dispatch_service: self.edge_dispatch_service,
+            approval_audit_context: None,
             user_id: self.user_id,
             session_id: self.session_id,
             workspace_binding: schema_workspace.clone(),
@@ -1456,21 +1648,32 @@ impl ServerAgenticLoopHost {
     }
 
     async fn resolve_llm_config_for_state(
-        &self,
+        &mut self,
         state: &AgenticLoopState,
     ) -> Result<ResolvedTurnLlmConfig, String> {
+        if let Some(config) = self.resolved_llm_config.as_ref() {
+            if self.cached_llm_config_matches_state(state) {
+                return Ok(config.clone());
+            }
+            self.clear_resolved_llm_config();
+        }
+
         // Skill-level model override takes precedence over the host-level one.
-        let effective_model_override = self.effective_model_override_for_state(state);
+        let effective_model_override = self
+            .effective_model_override_for_state(state)
+            .map(ToString::to_string);
         let pool_ref = self.shared_pool.as_ref().map(|sp| sp.get());
-        resolve_llm_model_for_turn(
+        let llm_cfg = resolve_llm_model_for_turn(
             &self.matrixone,
             self.encryptor.as_ref(),
-            effective_model_override,
+            effective_model_override.as_deref(),
             pool_ref,
             self.llm_token_service.as_ref(),
             &state.hooks.forward_headers,
         )
-        .await
+        .await?;
+        self.remember_resolved_llm_config(&llm_cfg);
+        Ok(llm_cfg)
     }
 
     fn effective_model_override_for_state<'a>(
@@ -1488,6 +1691,17 @@ impl ServerAgenticLoopHost {
         let Some(config) = self.resolved_llm_config.as_ref() else {
             return false;
         };
+        let Some(inserted_at) = self.resolved_llm_config_at else {
+            return false;
+        };
+        if inserted_at.elapsed() > RESOLVED_TURN_LLM_CONFIG_CACHE_TTL {
+            return false;
+        }
+        if self.llm_token_service.is_some()
+            && config.header_overrides != state.hooks.forward_headers
+        {
+            return false;
+        }
         match self.effective_model_override_for_state(state) {
             Some(requested) => config.model_name.eq_ignore_ascii_case(requested),
             None => true,
@@ -1499,6 +1713,7 @@ impl ServerAgenticLoopHost {
         self.resolved_context_window = None;
         self.resolved_llm_params = None;
         self.resolved_llm_config = None;
+        self.resolved_llm_config_at = None;
     }
 
     fn remember_resolved_llm_config(&mut self, llm_cfg: &ResolvedTurnLlmConfig) {
@@ -1512,6 +1727,7 @@ impl ServerAgenticLoopHost {
             max_output_tokens: 4096,
         });
         self.resolved_llm_config = Some(llm_cfg.clone());
+        self.resolved_llm_config_at = Some(Instant::now());
     }
 
     async fn turn_intent_summary_client(
@@ -1877,6 +2093,13 @@ impl ServerAgenticLoopHost {
 
     pub fn set_execution_metadata(&mut self, metadata: Value) {
         self.execution_metadata = Some(metadata);
+    }
+
+    pub fn set_approval_audit_context(
+        &mut self,
+        context: astra_turn_core::cloud_tool_delivery::ApprovalAuditContext,
+    ) {
+        self.approval_audit_context = Some(context);
     }
 
     pub fn set_agent_live_event_sink(&mut self, agent_id: String, sink: SharedAgentLiveEventSink) {
@@ -2314,7 +2537,7 @@ impl ServerAgenticLoopHost {
         use astra_turn_core::cloud_tool_delivery::{
             cloud_tool_requires_approval_for_delivery, collect_approval_batches,
             local_tool_execution_delivery, sse_maps_through_tool_request,
-            wait_approval_ledger_for_tool, wait_tool_result_ledger_for_tool,
+            wait_approval_ledger_for_tool,
         };
         use astra_turn_core::headless_tool_assembly::{
             ensure_tool_call_ids, parse_flat_tool_call_event,
@@ -2426,7 +2649,7 @@ impl ServerAgenticLoopHost {
                         &self.user_id,
                         tc,
                         ledger_wait,
-                        None,
+                        self.approval_audit_context.as_ref(),
                     )
                     .await
                     {
@@ -2525,13 +2748,9 @@ impl ServerAgenticLoopHost {
                         self.edge_result_fields_with_runtime(&id, &tool_name, &args, None),
                     )
                 } else {
-                    let delivery = wait_tool_result_ledger_for_tool(
-                        &self.edge_callback_ledger,
-                        &self.user_id,
-                        tc,
-                        ledger_wait,
-                    )
-                    .await;
+                    let delivery = self
+                        .wait_tool_result_with_dispatch_fallback(tc, &id, ledger_wait)
+                        .await;
 
                     let duration_ms = started.elapsed().as_millis() as u64;
                     let sse_maps = delivery.sse_maps.clone();
@@ -2612,6 +2831,71 @@ impl ServerAgenticLoopHost {
         }
 
         results
+    }
+
+    async fn wait_tool_result_with_dispatch_fallback(
+        &self,
+        tc: &Value,
+        request_id: &str,
+        ledger_wait: Duration,
+    ) -> astra_turn_core::cloud_tool_delivery::EdgeToolRoundDelivery {
+        use astra_turn_core::cloud_tool_delivery::wait_tool_result_ledger_for_tool;
+        use astra_turn_core::edge_ledger::tool_callback_key;
+
+        let delivery = wait_tool_result_ledger_for_tool(
+            &self.edge_callback_ledger,
+            &self.user_id,
+            tc,
+            ledger_wait,
+        )
+        .await;
+        if !edge_tool_delivery_timed_out(&delivery) {
+            return delivery;
+        }
+
+        let Some(dispatch_service) = &self.edge_dispatch_service else {
+            return delivery;
+        };
+        let result_json = match dispatch_service
+            .wait_result(&self.user_id, request_id, Duration::from_millis(0))
+            .await
+        {
+            Ok(Some(result_json)) => result_json,
+            Ok(None) => return delivery,
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra_runtime::server_loop_host",
+                    user_id = %self.user_id,
+                    session_id = %self.session_id,
+                    request_id = %request_id,
+                    error = %error,
+                    "edge tool ledger timed out and dispatch fallback failed"
+                );
+                return delivery;
+            }
+        };
+
+        let body =
+            serde_json::from_str::<Value>(&result_json).unwrap_or(Value::String(result_json));
+        let key = tool_callback_key(&self.user_id, request_id);
+        {
+            let mut ledger = self.edge_callback_ledger.lock().await;
+            ledger.entry(key).or_insert_with(|| {
+                json!({
+                    "kind": "tool_result",
+                    "user_id": self.user_id.as_str(),
+                    "body": body,
+                })
+            });
+        }
+
+        wait_tool_result_ledger_for_tool(
+            &self.edge_callback_ledger,
+            &self.user_id,
+            tc,
+            Duration::from_millis(0),
+        )
+        .await
     }
 
     fn edge_result_fields_with_runtime(
@@ -3184,6 +3468,16 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             .await;
         }
 
+        if let Some(reason) = should_skip_auxiliary_llm_for_capacity() {
+            tracing::debug!(
+                target: "astra::turn_intent",
+                policy = auxiliary_llm_policy_label(),
+                reason,
+                "turn intent judge skipped by capacity policy"
+            );
+            return None;
+        }
+
         let client = self.turn_intent_summary_client(state).await?;
         let judge = SummaryClientTurnIntentJudge { client };
         crate::turn::agentic::turn_intent::judge_turn_intent_with_llm(
@@ -3200,6 +3494,16 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         &mut self,
         ctx: FactualRetryFallbackJudgeContext<'_>,
     ) -> Option<FactualRetryFallbackDecision> {
+        if let Some(reason) = should_skip_auxiliary_llm_for_capacity() {
+            tracing::debug!(
+                target: "astra::factual_retry_judge",
+                policy = auxiliary_llm_policy_label(),
+                reason,
+                "factual retry fallback judge skipped by capacity policy"
+            );
+            return None;
+        }
+
         let client = self.summary_client()?;
         let messages = factual_retry_fallback_judge_messages(FactualRetryFallbackJudgeInput {
             original_query: ctx.original_query,
@@ -3320,9 +3624,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let mut llm_cfg = match self.resolve_llm_config_for_state(state).await {
             Ok(m) => m,
             Err(e) => {
+                let message = format!("Model resolution failed: {e}");
                 return Err(astra_core::ClassifiedError::new(
-                    astra_core::ErrorKind::Unknown,
-                    format!("Model resolution failed: {e}"),
+                    astra_core::classify_model_resolution_error_message(&message),
+                    message,
                 ));
             }
         };
@@ -3587,6 +3892,37 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let mut streamed_text = String::new();
         let mut streamed_reasoning = String::new();
         let result = loop {
+            let attempt_label = llm_main_attempt_label(attempt_in_round);
+            let admission_estimated_tokens = crate::prompts::estimate_tokens(
+                &llm_messages,
+                state.pinned_tool_schema_tokens as usize,
+                0,
+            )
+            .saturating_add(effective_max_output);
+            match crate::llm_provider_admission::admit_llm_provider_request(
+                self.shared_pool.as_ref(),
+                &llm_cfg.provider,
+                &llm_cfg.model_name,
+                admission_estimated_tokens as u64,
+            )
+            .await
+            {
+                Ok(()) => record_llm_main_attempt_metrics(
+                    "admission",
+                    attempt_label,
+                    "allowed",
+                    admission_estimated_tokens as u64,
+                ),
+                Err(error) => {
+                    record_llm_main_attempt_metrics(
+                        "admission",
+                        attempt_label,
+                        llm_main_error_outcome(&error),
+                        admission_estimated_tokens as u64,
+                    );
+                    return Err(error);
+                }
+            }
             let prompt_round = state
                 .turn_event_buffer
                 .as_ref()
@@ -3712,6 +4048,12 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             let r = match r {
                 Ok(r) => r,
                 Err(ref e) if e.kind == astra_core::ErrorKind::ContextWindow => {
+                    record_llm_main_attempt_metrics(
+                        "call",
+                        attempt_label,
+                        llm_main_error_outcome(e),
+                        admission_estimated_tokens as u64,
+                    );
                     record_full_llm_response_event(
                         state,
                         self.full_llm_capture,
@@ -3793,6 +4135,12 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     });
                 }
                 Err(e) => {
+                    record_llm_main_attempt_metrics(
+                        "call",
+                        attempt_label,
+                        llm_main_error_outcome(&e),
+                        admission_estimated_tokens as u64,
+                    );
                     record_full_llm_response_event(
                         state,
                         self.full_llm_capture,
@@ -3861,6 +4209,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
 
             {
                 let u = crate::turn::token_usage::TokenUsage::from_partial_json_map(&r.usage);
+                crate::llm_provider_admission::record_llm_provider_admission_calibration(
+                    admission_estimated_tokens as u64,
+                    &r.usage,
+                );
                 state.step_recorder.end_llm_round(
                     &llm_cfg.model_name,
                     u.input_tokens,
@@ -3871,6 +4223,15 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 );
             }
 
+            let will_retry_for_length = r.finish_reason.as_deref() == Some("length")
+                && effective_max_output < max_output_tokens * 4;
+            let llm_attempt_outcome = llm_main_success_outcome(&r, will_retry_for_length);
+            record_llm_main_attempt_metrics(
+                "call",
+                attempt_label,
+                llm_attempt_outcome,
+                admission_estimated_tokens as u64,
+            );
             record_full_llm_response_event(
                 state,
                 self.full_llm_capture,
@@ -3879,13 +4240,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 &llm_cfg.model_name,
                 &llm_cfg.provider,
                 attempt_in_round,
-                if r.finish_reason.as_deref() == Some("length")
-                    && effective_max_output < max_output_tokens * 4
-                {
-                    "length_retry"
-                } else {
-                    "success"
-                },
+                llm_attempt_outcome,
                 json!({
                     "finish_reason": r.finish_reason.clone(),
                     "full_text": r.full_text.clone(),
@@ -3895,9 +4250,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 }),
             );
 
-            if r.finish_reason.as_deref() == Some("length")
-                && effective_max_output < max_output_tokens * 4
-            {
+            if will_retry_for_length {
                 let prev = effective_max_output;
                 effective_max_output = (effective_max_output * 2).min(max_output_tokens * 4);
                 attempt_in_round = attempt_in_round.saturating_add(1);
@@ -4054,6 +4407,15 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             || state.compact_tier_applied >= CompactionTier::CompactHistory
             || state.messages.len() <= 10
         {
+            return;
+        }
+        if let Some(reason) = should_skip_auxiliary_llm_for_capacity() {
+            tracing::debug!(
+                target: "astra::pre_turn_compaction",
+                policy = auxiliary_llm_policy_label(),
+                reason,
+                "pre-turn LLM compaction skipped by capacity policy"
+            );
             return;
         }
         let Some(params) = self.resolved_llm_params.clone() else {
@@ -4750,6 +5112,15 @@ fn hidden_execution_boundary_tool_names(visible_tools: &[Value]) -> Vec<String> 
         .collect()
 }
 
+fn edge_tool_delivery_timed_out(
+    delivery: &astra_turn_core::cloud_tool_delivery::EdgeToolRoundDelivery,
+) -> bool {
+    delivery
+        .tool_results
+        .iter()
+        .any(|result| result.status == "timed_out")
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -4762,6 +5133,37 @@ mod tests {
     use astra_turn_core::cloud_summary::SummaryLlmClient;
     use astra_turn_core::edge_ledger::{approval_callback_key, tool_callback_key};
     use astra_turn_core::sse_stream_host::EdgeToolExecResult;
+    use std::ffi::OsString;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::remove_var(key) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.previous.take() {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
 
     fn mock_matrixone() -> MatrixOneSettings {
         MatrixOneSettings::mock()
@@ -4770,6 +5172,110 @@ mod tests {
     fn mock_encryptor() -> Arc<FernetTokenEncryptor> {
         // Use a valid Fernet key for testing
         Arc::new(FernetTokenEncryptor::new("cJ8pxr3t6iJmSYqe6wD7vu2rN_C3ovGUxkC5H3NXFNY=").unwrap())
+    }
+
+    struct NoopAuxiliaryEventWriter;
+
+    #[async_trait::async_trait]
+    impl astra_turn_core::contracts::TurnAuxiliaryEventWriter for NoopAuxiliaryEventWriter {
+        async fn persist_events(
+            &self,
+            _events: Vec<astra_turn_core::contracts::TurnAuxiliaryEventRecord>,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn approval_allow_entry(request_id: &str) -> Value {
+        json!({
+            "kind": "approval_respond",
+            "body": astra_thin_client::ApprovalRespondRequest {
+                request_id: request_id.to_string(),
+                decision: astra_thin_client::ApprovalDecision::Allow,
+                reason: None,
+                session_id: "test-session".to_string(),
+                run_id: "test-run".to_string(),
+                tool_name: None,
+                approval_kind: None,
+            }
+        })
+    }
+
+    fn test_approval_key(user_id: &str, request_id: &str) -> String {
+        approval_callback_key(user_id, "test-session", "test-run", request_id)
+    }
+
+    fn test_approval_audit_context(
+        user_id: &str,
+    ) -> astra_turn_core::cloud_tool_delivery::ApprovalAuditContext {
+        astra_turn_core::cloud_tool_delivery::ApprovalAuditContext {
+            user_id: user_id.to_string(),
+            session_id: "test-session".to_string(),
+            run_id: "test-run".to_string(),
+            turn: 1,
+            agent_id: None,
+            parent_event_id: None,
+            parent_event_ids: Vec::new(),
+            causal_chain_id: "test-approval-chain".to_string(),
+            auxiliary_event_writer: Arc::new(NoopAuxiliaryEventWriter),
+        }
+    }
+
+    struct StaticWaitResultEdgeDispatch {
+        result_json: Option<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl EdgeDispatchService for StaticWaitResultEdgeDispatch {
+        async fn insert_dispatch(
+            &self,
+            _user_id: &str,
+            _edge_agent_id: &str,
+            _request_id: &str,
+            _payload_json: &str,
+        ) -> Result<(), String> {
+            Err("not used".to_string())
+        }
+
+        async fn poll_pending(
+            &self,
+            _user_id: &str,
+            _edge_agent_id: &str,
+        ) -> Result<Vec<astra_services::multi_agent::EdgeDispatchRow>, String> {
+            Err("not used".to_string())
+        }
+
+        async fn deliver_result(
+            &self,
+            _user_id: &str,
+            _request_id: &str,
+            _edge_agent_id: &str,
+            _result_json: &str,
+        ) -> Result<bool, String> {
+            Err("not used".to_string())
+        }
+
+        async fn fail_dispatch(
+            &self,
+            _user_id: &str,
+            _request_id: &str,
+            _reason: &str,
+        ) -> Result<bool, String> {
+            Err("not used".to_string())
+        }
+
+        async fn wait_result(
+            &self,
+            _user_id: &str,
+            _request_id: &str,
+            _timeout: Duration,
+        ) -> Result<Option<String>, String> {
+            Ok(self.result_json.clone())
+        }
+
+        async fn cleanup_stale(&self, _older_than: Duration) -> Result<u64, String> {
+            Err("not used".to_string())
+        }
     }
 
     fn sample_edge_tools() -> Vec<Value> {
@@ -4804,6 +5310,61 @@ mod tests {
             }
         }));
         tools
+    }
+
+    #[test]
+    fn llm_main_attempt_outcome_classifiers_are_stable() {
+        let admission_error = astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::RateLimit,
+            "provider gate rejected request",
+        )
+        .with_details_json(json!({"source": "llm_provider_admission"}).to_string());
+        assert_eq!(
+            llm_main_error_outcome(&admission_error),
+            "admission_rejected"
+        );
+
+        let provider_rate_limit =
+            astra_core::ClassifiedError::new(astra_core::ErrorKind::RateLimit, "provider 429");
+        assert_eq!(
+            llm_main_error_outcome(&provider_rate_limit),
+            "error_rate_limit"
+        );
+
+        let success = LlmCallResult {
+            finish_reason: Some("tool_calls".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            llm_main_success_outcome(&success, false),
+            "success_tool_calls"
+        );
+        assert_eq!(llm_main_success_outcome(&success, true), "length_retry");
+    }
+
+    #[test]
+    #[serial_test::serial(llm_main_attempt_metrics)]
+    fn llm_main_attempt_metrics_render_low_cardinality_series() {
+        let registry = Arc::new(astra_turn_core::pipeline_metrics::MetricsRegistry::new());
+        set_llm_main_attempt_metrics_registry(registry.clone());
+
+        record_llm_main_attempt_metrics("admission", "initial", "allowed", 2_048);
+        record_llm_main_attempt_metrics("call", "initial", "success_stop", 2_048);
+        record_llm_main_attempt_metrics("admission", "retry", "admission_rejected", 4_096);
+
+        let rendered = registry.render_prometheus();
+        assert!(rendered.contains(
+            r#"astra_llm_main_attempts_total{attempt="initial",outcome="allowed",phase="admission"} 1"#
+        ));
+        assert!(rendered.contains(
+            r#"astra_llm_main_attempts_total{attempt="initial",outcome="success_stop",phase="call"} 1"#
+        ));
+        assert!(rendered.contains(
+            r#"astra_llm_main_attempts_total{attempt="retry",outcome="admission_rejected",phase="admission"} 1"#
+        ));
+        assert!(rendered.contains(
+            r#"astra_llm_main_attempt_tokens_total{attempt="retry",outcome="admission_rejected",phase="admission"} 4096"#
+        ));
     }
 
     #[test]
@@ -6465,6 +7026,7 @@ mod tests {
             "s-batch".to_string(),
         )
         .build();
+        host.set_approval_audit_context(test_approval_audit_context("u-batch"));
         // Register write_file as a valid tool so the edge ledger delivery path admits it.
         host.install_runtime_tool_schemas(vec![json!({
             "type": "function",
@@ -6492,12 +7054,12 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
             let mut guard = ledger.lock().await;
             guard.insert(
-                approval_callback_key("u-batch", "w1"),
-                json!({"kind": "approval_respond", "body": {"request_id": "w1", "decision": "allow"}}),
+                test_approval_key("u-batch", "w1"),
+                approval_allow_entry("w1"),
             );
             guard.insert(
-                approval_callback_key("u-batch", "w2"),
-                json!({"kind": "approval_respond", "body": {"request_id": "w2", "decision": "allow"}}),
+                test_approval_key("u-batch", "w2"),
+                approval_allow_entry("w2"),
             );
             drop(guard);
 
@@ -6550,6 +7112,59 @@ mod tests {
         assert_eq!(results[1].request_id, "w2");
         assert_eq!(results[0].status, "ok");
         assert_eq!(results[1].status, "ok");
+    }
+
+    #[tokio::test]
+    async fn wait_tool_result_dispatch_fallback_uses_db_result_after_ledger_timeout() {
+        let body = astra_thin_client::ToolResultRequest::new_with_hash(
+            "r1".to_string(),
+            Some("edge-1".to_string()),
+            "completed".to_string(),
+            "from dispatch".to_string(),
+            17,
+        );
+        let result_json = serde_json::to_string(&body).expect("serialize tool result");
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-dispatch".to_string(),
+            "s-dispatch".to_string(),
+        )
+        .with_edge_dispatch_service(Arc::new(StaticWaitResultEdgeDispatch {
+            result_json: Some(result_json),
+        }))
+        .build();
+        let tool_call = json!({
+            "id": "r1",
+            "type": "function",
+            "function": {"name": "read_file", "arguments": r#"{"path":"a.rs"}"#}
+        });
+
+        let delivery = host
+            .wait_tool_result_with_dispatch_fallback(&tool_call, "r1", Duration::from_millis(1))
+            .await;
+
+        let tool_message = delivery
+            .tool_messages
+            .first()
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_str)
+            .expect("tool message content");
+        assert_eq!(tool_message, "from dispatch");
+        let tool_result = delivery.tool_results.first().expect("structured result");
+        assert_eq!(tool_result.status, "completed");
+        assert_eq!(
+            delivery
+                .sse_maps
+                .first()
+                .and_then(|event| event.get("result"))
+                .and_then(Value::as_str),
+            Some("from dispatch")
+        );
+        assert!(
+            host.edge_callback_ledger.lock().await.is_empty(),
+            "dispatch fallback should consume the synthesized ledger entry"
+        );
     }
 
     #[tokio::test]
@@ -6646,6 +7261,7 @@ mod tests {
                 }
             }),
         ]);
+        host.set_approval_audit_context(test_approval_audit_context("u-mixed"));
         let ledger = host.edge_callback_ledger.clone();
         let tool_calls = vec![
             json!({
@@ -6678,8 +7294,8 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
             ledger.lock().await.insert(
-                approval_callback_key("u-mixed", "w1"),
-                json!({"kind": "approval_respond", "body": {"request_id": "w1", "decision": "allow"}}),
+                test_approval_key("u-mixed", "w1"),
+                approval_allow_entry("w1"),
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
             ledger.lock().await.insert(
@@ -6693,8 +7309,8 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
             ledger.lock().await.insert(
-                approval_callback_key("u-mixed", "w2"),
-                json!({"kind": "approval_respond", "body": {"request_id": "w2", "decision": "allow"}}),
+                test_approval_key("u-mixed", "w2"),
+                approval_allow_entry("w2"),
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
             ledger.lock().await.insert(
@@ -7126,8 +7742,9 @@ mod tests {
         let visible = host.visible_turn_tools(&mut state);
         let names = astra_turn_core::tool::schema::tool_names_from_schemas(&visible);
         assert!(
-            !names.contains("reflect"),
-            "service-unready tools must not be visible to the model: {names:?}"
+            names.contains("reflect"),
+            "reflect is service-ready even without a configured reflect service; \
+             the handler provides local fallback via introspect snapshot: {names:?}"
         );
         assert!(
             names.contains("introspect"),
@@ -7624,6 +8241,166 @@ mod tests {
         assert!(resolved.request_timeout.is_none());
     }
 
+    #[tokio::test]
+    async fn host_model_resolution_reuses_cached_config_for_same_forward_headers() {
+        let mut state = create_test_state();
+        state
+            .hooks
+            .forward_headers
+            .insert("authorization".to_string(), "Bearer first".to_string());
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user-model-cache".to_string(),
+            "session-model-cache".to_string(),
+        )
+        .with_model(Some("gpt-5-mini".to_string()))
+        .with_llm_token_service(Some(LlmTokenServiceConfig {
+            url: "http://catalog-a/api/v1/chat/completions".to_string(),
+            timeout_ms: Some(1000),
+        }))
+        .build();
+
+        let first = host
+            .resolve_llm_config_for_state(&state)
+            .await
+            .expect("first resolution");
+        host.llm_token_service = Some(LlmTokenServiceConfig {
+            url: "http://catalog-b/api/v1/chat/completions".to_string(),
+            timeout_ms: Some(2000),
+        });
+        let second = host
+            .resolve_llm_config_for_state(&state)
+            .await
+            .expect("second resolution");
+
+        assert_eq!(
+            first.completions_url_override,
+            Some("http://catalog-a/api/v1/chat/completions".to_string())
+        );
+        assert_eq!(
+            second.completions_url_override,
+            first.completions_url_override
+        );
+        assert_eq!(second.request_timeout, first.request_timeout);
+        assert_eq!(
+            second
+                .header_overrides
+                .get("authorization")
+                .map(String::as_str),
+            Some("Bearer first")
+        );
+    }
+
+    #[tokio::test]
+    async fn host_model_resolution_invalidates_cached_token_config_when_headers_change() {
+        let mut state = create_test_state();
+        state
+            .hooks
+            .forward_headers
+            .insert("authorization".to_string(), "Bearer first".to_string());
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user-model-cache".to_string(),
+            "session-model-cache".to_string(),
+        )
+        .with_model(Some("gpt-5-mini".to_string()))
+        .with_llm_token_service(Some(LlmTokenServiceConfig {
+            url: "http://catalog-a/api/v1/chat/completions".to_string(),
+            timeout_ms: Some(1000),
+        }))
+        .build();
+
+        let first = host
+            .resolve_llm_config_for_state(&state)
+            .await
+            .expect("first resolution");
+        state
+            .hooks
+            .forward_headers
+            .insert("authorization".to_string(), "Bearer second".to_string());
+        host.llm_token_service = Some(LlmTokenServiceConfig {
+            url: "http://catalog-b/api/v1/chat/completions".to_string(),
+            timeout_ms: Some(2000),
+        });
+        let second = host
+            .resolve_llm_config_for_state(&state)
+            .await
+            .expect("second resolution");
+
+        assert_ne!(
+            second.completions_url_override,
+            first.completions_url_override
+        );
+        assert_eq!(
+            second.completions_url_override,
+            Some("http://catalog-b/api/v1/chat/completions".to_string())
+        );
+        assert_eq!(second.request_timeout, Some(Duration::from_millis(2000)));
+        assert_eq!(
+            second
+                .header_overrides
+                .get("authorization")
+                .map(String::as_str),
+            Some("Bearer second")
+        );
+    }
+
+    #[tokio::test]
+    async fn host_model_resolution_refreshes_after_cache_ttl() {
+        let state = create_test_state();
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user-model-cache".to_string(),
+            "session-model-cache".to_string(),
+        )
+        .with_model(Some("gpt-5-mini".to_string()))
+        .with_llm_token_service(Some(LlmTokenServiceConfig {
+            url: "http://catalog-a/api/v1/chat/completions".to_string(),
+            timeout_ms: Some(1000),
+        }))
+        .build();
+
+        let first = host
+            .resolve_llm_config_for_state(&state)
+            .await
+            .expect("first resolution");
+        host.resolved_llm_config_at =
+            Some(Instant::now() - RESOLVED_TURN_LLM_CONFIG_CACHE_TTL - Duration::from_secs(1));
+        host.llm_token_service = Some(LlmTokenServiceConfig {
+            url: "http://catalog-b/api/v1/chat/completions".to_string(),
+            timeout_ms: Some(2000),
+        });
+        let second = host
+            .resolve_llm_config_for_state(&state)
+            .await
+            .expect("second resolution");
+
+        assert_ne!(
+            second.completions_url_override,
+            first.completions_url_override
+        );
+        assert_eq!(
+            second.completions_url_override,
+            Some("http://catalog-b/api/v1/chat/completions".to_string())
+        );
+        assert_eq!(second.request_timeout, Some(Duration::from_millis(2000)));
+    }
+
+    #[test]
+    fn model_resolution_database_error_maps_to_database_outcome() {
+        let message = "Model resolution failed: DB query: error communicating with database: expected to read 4 bytes, got 0 bytes at EOF";
+        let error = astra_core::ClassifiedError::new(
+            astra_core::classify_model_resolution_error_message(message),
+            message,
+        );
+
+        assert_eq!(error.kind, astra_core::ErrorKind::DatabaseError);
+        assert_eq!(llm_main_error_outcome(&error), "error_database");
+    }
+
     #[cfg(feature = "bridge-e2e-hooks")]
     #[tokio::test(flavor = "current_thread")]
     async fn mock_turn_persists_local_llm_capture_when_session_capture_enabled() {
@@ -7668,8 +8445,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
     async fn execute_turn_persists_full_journal_request_and_response_when_session_capture_enabled()
     {
+        let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
         let temp = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
         let session_id = "00000000-0000-0000-0000-000000000126";
@@ -7760,7 +8539,7 @@ mod tests {
         );
         assert_eq!(
             llm_events[1]["metadata"]["response"]["outcome"].as_str(),
-            Some("success")
+            Some("success_stop")
         );
         assert_eq!(
             llm_events[1]["metadata"]["response"]["response"]["finish_reason"].as_str(),
@@ -7790,7 +8569,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
     async fn execute_turn_persists_full_journal_error_response_when_session_capture_enabled() {
+        let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
         // Collapse llm_client's 1s/2s/4s exponential backoff so the retry
         // loop behind a 500 upstream completes in tens of ms instead of 7s.
         let _backoff = crate::turn::llm::client::set_test_retry_backoff_ms(0);
@@ -7881,7 +8662,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
     async fn execute_turn_does_not_persist_full_journal_events_when_session_capture_disabled() {
+        let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
         let temp = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
         let session_id = "00000000-0000-0000-0000-000000000128";
@@ -8082,9 +8865,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
     async fn factual_retry_fallback_judge_uses_llm_response_selection() {
         use axum::{Router, extract::State, routing::post};
         use tokio::net::TcpListener;
+
+        let _aux_policy = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "always");
 
         #[derive(Default)]
         struct RequestCapture {
@@ -8163,9 +8949,88 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
+    async fn factual_retry_fallback_judge_skips_gateway_when_provider_admission_is_enabled() {
+        use axum::{Router, routing::post};
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        use tokio::net::TcpListener;
+
+        let _aux_policy = EnvVarGuard::remove(AUX_LLM_POLICY_ENV);
+        let _mode = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_MODE", "db_fixed_window");
+        let _rpm = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_RPM", "20");
+
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_for_handler = request_count.clone();
+        let app = Router::new().route(
+            "/gateway/chat/completions",
+            post(move || {
+                let request_count = request_count_for_handler.clone();
+                async move {
+                    request_count.fetch_add(1, AtomicOrdering::SeqCst);
+                    axum::Json(json!({
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": "{\"decision\":\"restore_fallback\",\"confidence\":0.94,\"reason\":\"candidate A answers the UI question\"}"
+                                },
+                                "finish_reason": "stop"
+                            }
+                        ],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+                    }))
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test server should run");
+        });
+
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user-judge".to_string(),
+            "session-judge".to_string(),
+        )
+        .build();
+        host.resolved_llm_params = Some(astra_turn_core::cloud_summary::LlmConnParams {
+            model_name: "gpt-4o-mini".to_string(),
+            api_key: String::new(),
+            base_url: format!("http://{addr}/gateway"),
+            provider: "openai".to_string(),
+            max_output_tokens: 128,
+        });
+
+        let decision = host
+            .judge_factual_retry_fallback(FactualRetryFallbackJudgeContext {
+                original_query: "what do 59% and 117k mean?",
+                fallback_text: "59% is context usage; 117k is token count.",
+                retry_text: "I completed the requested work.",
+            })
+            .await;
+
+        assert_eq!(decision, None);
+        assert_eq!(
+            request_count.load(AtomicOrdering::SeqCst),
+            0,
+            "capacity-aware default must not spend provider RPM on factual retry judge"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
     async fn maybe_pre_turn_compact_uses_inline_summary_prefix() {
         use axum::{Router, extract::State, routing::post};
         use tokio::net::TcpListener;
+
+        let _aux_policy = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "always");
 
         #[derive(Default)]
         struct RequestCapture {
@@ -8292,6 +9157,92 @@ mod tests {
                     .is_some_and(|s| s.contains("You are a conversation summarizer"))
             }),
             "inline path must not fall back to COMPACT_SYSTEM_PROMPT"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
+    async fn maybe_pre_turn_compact_skips_gateway_when_provider_admission_is_enabled() {
+        use axum::{Router, routing::post};
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        use tokio::net::TcpListener;
+
+        let _aux_policy = EnvVarGuard::remove(AUX_LLM_POLICY_ENV);
+        let _mode = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_MODE", "db_fixed_window");
+        let _rpm = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_RPM", "20");
+
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_for_handler = request_count.clone();
+        let app = Router::new().route(
+            "/gateway/chat/completions",
+            post(move || {
+                let request_count = request_count_for_handler.clone();
+                async move {
+                    request_count.fetch_add(1, AtomicOrdering::SeqCst);
+                    axum::Json(json!({
+                        "choices": [
+                            {
+                                "message": { "content": "inline summary" },
+                                "finish_reason": "stop"
+                            }
+                        ],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+                    }))
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test server should run");
+        });
+
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user-inline".to_string(),
+            "session-inline".to_string(),
+        )
+        .build();
+        host.resolved_llm_params = Some(astra_turn_core::cloud_summary::LlmConnParams {
+            model_name: "gpt-4o-mini".to_string(),
+            api_key: String::new(),
+            base_url: format!("http://{addr}/gateway"),
+            provider: "openai".to_string(),
+            max_output_tokens: 128,
+        });
+
+        let mut state = create_test_state();
+        state.max_turn_input_tokens = 100;
+        state.message = "Fix the regression".to_string();
+        for i in 0..6 {
+            state
+                .messages
+                .push(json!({"role": "user", "content": format!("question {i}")}));
+            state
+                .messages
+                .push(json!({"role": "assistant", "content": format!("answer {i}")}));
+        }
+
+        <ServerAgenticLoopHost as crate::turn::agentic_loop::host::AgenticLoopHost>::maybe_pre_turn_compact(
+            &mut host,
+            &mut state,
+            0.95,
+            true,
+        )
+        .await;
+
+        assert_eq!(state.compact_tier_applied, CompactionTier::Normal);
+        assert_eq!(
+            request_count.load(AtomicOrdering::SeqCst),
+            0,
+            "capacity-aware default must not spend provider RPM on pre-turn LLM compaction"
         );
 
         server.abort();
@@ -9362,6 +10313,7 @@ mod tests {
             LlmTokenServiceConfig, TurnIntentJudge, TurnIntentJudgeContext, TurnIntentJudgeError,
         };
         use async_trait::async_trait;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
         struct ScriptedJudge {
             calls: std::sync::Mutex<Vec<TurnIntentJudgeContext>>,
@@ -9411,6 +10363,34 @@ mod tests {
             .build();
             host.set_turn_intent_judge(judge);
             host
+        }
+
+        #[test]
+        fn auxiliary_llm_capacity_policy_parser_is_stable() {
+            assert_eq!(
+                parse_auxiliary_llm_policy("always"),
+                AuxiliaryLlmPolicy::Always
+            );
+            assert_eq!(
+                parse_auxiliary_llm_policy("off"),
+                AuxiliaryLlmPolicy::Disabled
+            );
+            assert_eq!(
+                parse_auxiliary_llm_policy("capacity-aware"),
+                AuxiliaryLlmPolicy::CapacityAware
+            );
+            assert_eq!(
+                parse_auxiliary_llm_policy("surprise"),
+                AuxiliaryLlmPolicy::CapacityAware
+            );
+        }
+
+        #[test]
+        #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
+        fn auxiliary_llm_policy_uses_global_env() {
+            let _aux_policy = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "disabled");
+
+            assert_eq!(AuxiliaryLlmPolicy::from_env(), AuxiliaryLlmPolicy::Disabled);
         }
 
         #[tokio::test]
@@ -9477,9 +10457,12 @@ mod tests {
         }
 
         #[tokio::test]
+        #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
         async fn judge_turn_intent_uses_gateway_llm_when_no_judge_is_injected() {
             use axum::{Router, extract::State, routing::post};
             use tokio::net::TcpListener;
+
+            let _aux_policy = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "always");
 
             #[derive(Default)]
             struct RequestCapture {
@@ -9596,6 +10579,72 @@ mod tests {
             assert!(
                 prompt.contains("不对，我要的是系统性修复，不是临时补丁"),
                 "judge prompt must include the current user message as data"
+            );
+
+            server.abort();
+        }
+
+        #[tokio::test]
+        #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
+        async fn builtin_turn_intent_judge_skips_gateway_when_provider_admission_is_enabled() {
+            use axum::{Router, routing::post};
+            use tokio::net::TcpListener;
+
+            let _aux_policy = EnvVarGuard::remove(AUX_LLM_POLICY_ENV);
+            let _mode = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_MODE", "db_fixed_window");
+            let _rpm = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_RPM", "20");
+            let request_count = Arc::new(AtomicUsize::new(0));
+            let request_count_for_handler = request_count.clone();
+            let app = Router::new().route(
+                "/gateway/chat/completions",
+                post(move || {
+                    let request_count = request_count_for_handler.clone();
+                    async move {
+                        request_count.fetch_add(1, AtomicOrdering::SeqCst);
+                        axum::Json(json!({
+                            "choices": [
+                                {
+                                    "message": {
+                                        "content": "{\"requested_scenario\":\"refactoring\"}"
+                                    },
+                                    "finish_reason": "stop"
+                                }
+                            ],
+                            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+                        }))
+                    }
+                }),
+            );
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind listener");
+            let addr = listener.local_addr().expect("listener addr");
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .await
+                    .expect("test server should run");
+            });
+
+            let mut host = ServerAgenticLoopHostBuilder::new(
+                mock_matrixone(),
+                mock_encryptor(),
+                "u".to_string(),
+                "s".to_string(),
+            )
+            .with_llm_token_service(Some(LlmTokenServiceConfig {
+                url: format!("http://{addr}/gateway/chat/completions"),
+                timeout_ms: Some(2_000),
+            }))
+            .build();
+
+            let mut state = crate::turn::agentic_loop::host::tests::make_state();
+            state.message = "继续，但要系统性一点".to_string();
+
+            assert_eq!(host.judge_turn_intent(&state).await, None);
+            assert_eq!(
+                request_count.load(AtomicOrdering::SeqCst),
+                0,
+                "capacity-aware default must not spend provider RPM on built-in turn intent judge"
             );
 
             server.abort();

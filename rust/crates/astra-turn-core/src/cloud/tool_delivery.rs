@@ -6,7 +6,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use astra_services::session_journal::{JournalEvent, JournalWriter, find_latest_approval_decision};
+use astra_services::InteractionStatus;
+use astra_services::session_journal::{
+    JournalEvent, JournalWriter, find_latest_approval_decision_for_run,
+};
 use astra_thin_client::{ApprovalKind, ApprovalRespondRequest};
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
@@ -254,6 +257,7 @@ fn structured_tool_result(
 pub struct ApprovalAuditContext {
     pub user_id: String,
     pub session_id: String,
+    pub run_id: String,
     pub turn: u32,
     pub agent_id: Option<String>,
     pub parent_event_id: Option<String>,
@@ -286,6 +290,7 @@ fn approval_kind_str(approval_kind: ApprovalKind) -> &'static str {
 
 fn append_approval_timeout_journal_event(
     session_id: &str,
+    run_id: &str,
     turn: u32,
     request_id: &str,
     tool_name: &str,
@@ -293,10 +298,11 @@ fn append_approval_timeout_journal_event(
 ) -> Result<(), String> {
     let writer = JournalWriter::new(session_id).map_err(|error| error.to_string())?;
     writer
-        .append(&JournalEvent::approval_timeout(
+        .append(&JournalEvent::approval_timeout_for_run(
             Some(session_id),
             Some(turn),
             request_id,
+            Some(run_id),
             tool_name,
             approval_kind_str(approval_kind),
         ))
@@ -317,6 +323,7 @@ async fn persist_approval_aux_event(
 ) -> Result<(), String> {
     let metadata = json!({
         "request_id": request_id,
+        "run_id": context.run_id,
         "tool_name": tool_name,
         "approval_kind": approval_kind_str(approval_kind),
         "detail": detail,
@@ -344,17 +351,23 @@ async fn persist_approval_aux_event(
 }
 fn journal_decision_to_cloud_result(
     decision: astra_services::session_journal::ApprovalJournalDecision,
-) -> (CloudApprovalResult, Option<String>, Option<String>) {
+    context: &ApprovalAuditContext,
+) -> Option<(CloudApprovalResult, Option<String>, Option<String>)> {
+    let contract = decision.interaction_contract(&context.session_id, Some(&context.user_id))?;
     let decision_name = decision.decision.clone();
     let reason = decision.reason.clone();
-    let result = match decision_name.as_str() {
-        "allow" | "allow_session" => CloudApprovalResult::Allowed,
-        "deny" => CloudApprovalResult::Denied {
-            reason: reason.clone(),
+    let result = match contract.status {
+        InteractionStatus::Pending => return None,
+        InteractionStatus::Expired | InteractionStatus::Cancelled => CloudApprovalResult::Timeout,
+        InteractionStatus::Resolved => match decision_name.as_str() {
+            "allow" | "allow_session" => CloudApprovalResult::Allowed,
+            "deny" => CloudApprovalResult::Denied {
+                reason: reason.clone(),
+            },
+            _ => CloudApprovalResult::Malformed,
         },
-        _ => CloudApprovalResult::Malformed,
     };
-    (result, Some(decision_name), reason)
+    Some((result, Some(decision_name), reason))
 }
 
 /// After the bridge has yielded `build_approval_required_event`, waits on the approval ledger.
@@ -377,7 +390,23 @@ pub async fn wait_approval_ledger_for_tool(
         .unwrap_or("");
     let approval_kind = tool_approval_kind(tc);
     let detail = tool_approval_detail(tc);
-    let ap_key = approval_callback_key(user_id, id);
+    let Some(context) = approval_audit else {
+        let reason = "approval requires session/run context";
+        return Err(EdgeToolRoundDelivery {
+            sse_maps: vec![build_tool_call_end_event(
+                id,
+                Value::String(denied_tool_content(Some(reason))),
+            )],
+            tool_messages: vec![json!({
+                "role": "tool",
+                "tool_call_id": id,
+                "content": llm_safe_tool_content(&denied_tool_content(Some(reason)), tool_name),
+            })],
+            persist_tool_results: vec![persist_denied_tool_result(tc, Some(reason))],
+            tool_results: vec![],
+        });
+    };
+    let ap_key = approval_callback_key(user_id, &context.session_id, &context.run_id, id);
     let poll = Duration::from_millis(DEFAULT_POLL_INTERVAL_MS);
     let journal_poll = Duration::from_millis(JOURNAL_REPLAY_POLL_INTERVAL_MS);
     let started = Instant::now();
@@ -399,22 +428,23 @@ pub async fn wait_approval_ledger_for_tool(
                 Some(ApprovalOutcomeSource::Ledger),
             );
         }
-        if let Some(context) = approval_audit
-            && last_journal_lookup
-                .map(|last| last.elapsed() >= journal_poll)
-                .unwrap_or(true)
+        if last_journal_lookup
+            .map(|last| last.elapsed() >= journal_poll)
+            .unwrap_or(true)
         {
             last_journal_lookup = Some(Instant::now());
-            match find_latest_approval_decision(&context.session_id, id) {
+            match find_latest_approval_decision_for_run(&context.session_id, id, &context.run_id) {
                 Ok(Some(decision)) => {
-                    let (result, decision_name, reason) =
-                        journal_decision_to_cloud_result(decision);
-                    break (
-                        result,
-                        decision_name,
-                        reason,
-                        Some(ApprovalOutcomeSource::Journal),
-                    );
+                    if let Some((result, decision_name, reason)) =
+                        journal_decision_to_cloud_result(decision, context)
+                    {
+                        break (
+                            result,
+                            decision_name,
+                            reason,
+                            Some(ApprovalOutcomeSource::Journal),
+                        );
+                    }
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -433,68 +463,67 @@ pub async fn wait_approval_ledger_for_tool(
         tokio::time::sleep(poll).await;
     };
 
-    if let Some(context) = approval_audit {
-        match &approval_outcome {
-            CloudApprovalResult::Allowed | CloudApprovalResult::Denied { .. } => {
-                if let Err(error) = persist_approval_aux_event(
-                    context,
-                    "approval_decision",
+    match &approval_outcome {
+        CloudApprovalResult::Allowed | CloudApprovalResult::Denied { .. } => {
+            if let Err(error) = persist_approval_aux_event(
+                context,
+                "approval_decision",
+                id,
+                tool_name,
+                approval_kind,
+                detail.as_deref(),
+                decision_name.as_deref(),
+                outcome_reason.as_deref(),
+                outcome_source,
+            )
+            .await
+            {
+                astra_core::agent_error!(
+                    "approval",
+                    "approval decision audit persist failed for {}: {}",
                     id,
-                    tool_name,
-                    approval_kind,
-                    detail.as_deref(),
-                    decision_name.as_deref(),
-                    outcome_reason.as_deref(),
-                    outcome_source,
-                )
-                .await
-                {
-                    astra_core::agent_error!(
-                        "approval",
-                        "approval decision audit persist failed for {}: {}",
-                        id,
-                        error
-                    );
-                }
+                    error
+                );
             }
-            CloudApprovalResult::Timeout => {
-                if let Err(error) = append_approval_timeout_journal_event(
-                    &context.session_id,
-                    context.turn,
-                    id,
-                    tool_name,
-                    approval_kind,
-                ) {
-                    astra_core::agent_error!(
-                        "approval",
-                        "approval timeout journal persist failed for {}: {}",
-                        id,
-                        error
-                    );
-                }
-                if let Err(error) = persist_approval_aux_event(
-                    context,
-                    "approval_timeout",
-                    id,
-                    tool_name,
-                    approval_kind,
-                    detail.as_deref(),
-                    None,
-                    None,
-                    None,
-                )
-                .await
-                {
-                    astra_core::agent_error!(
-                        "approval",
-                        "approval timeout audit persist failed for {}: {}",
-                        id,
-                        error
-                    );
-                }
-            }
-            CloudApprovalResult::Malformed => {}
         }
+        CloudApprovalResult::Timeout => {
+            if let Err(error) = append_approval_timeout_journal_event(
+                &context.session_id,
+                &context.run_id,
+                context.turn,
+                id,
+                tool_name,
+                approval_kind,
+            ) {
+                astra_core::agent_error!(
+                    "approval",
+                    "approval timeout journal persist failed for {}: {}",
+                    id,
+                    error
+                );
+            }
+            if let Err(error) = persist_approval_aux_event(
+                context,
+                "approval_timeout",
+                id,
+                tool_name,
+                approval_kind,
+                detail.as_deref(),
+                None,
+                None,
+                None,
+            )
+            .await
+            {
+                astra_core::agent_error!(
+                    "approval",
+                    "approval timeout audit persist failed for {}: {}",
+                    id,
+                    error
+                );
+            }
+        }
+        CloudApprovalResult::Malformed => {}
     }
 
     match approval_outcome {
@@ -784,12 +813,14 @@ async fn deliver_approval_block(
     user_id: &str,
     tool_calls: &[Value],
     ledger_wait: Duration,
+    approval_audit: Option<&ApprovalAuditContext>,
 ) -> EdgeToolRoundDelivery {
     let mut out = EdgeToolRoundDelivery::default();
     let mut approved_calls = Vec::new();
 
     for tc in tool_calls {
-        match wait_approval_ledger_for_tool(ledger, user_id, tc, ledger_wait, None).await {
+        match wait_approval_ledger_for_tool(ledger, user_id, tc, ledger_wait, approval_audit).await
+        {
             Ok(()) => approved_calls.push(tc),
             Err(part) => extend_delivery(&mut out, part),
         }
@@ -849,12 +880,14 @@ async fn deliver_approval_block_concurrent(
     user_id: &str,
     tool_calls: &[Value],
     ledger_wait: Duration,
+    approval_audit: Option<&ApprovalAuditContext>,
 ) -> EdgeToolRoundDelivery {
     let mut out = EdgeToolRoundDelivery::default();
     let mut approved_calls = Vec::new();
 
     for tc in tool_calls {
-        match wait_approval_ledger_for_tool(ledger, user_id, tc, ledger_wait, None).await {
+        match wait_approval_ledger_for_tool(ledger, user_id, tc, ledger_wait, approval_audit).await
+        {
             Ok(()) => approved_calls.push(tc),
             Err(part) => extend_delivery(&mut out, part),
         }
@@ -894,6 +927,23 @@ pub async fn deliver_tool_calls_through_edge_ledger(
     tool_calls: &[Value],
     ledger_wait: Duration,
 ) -> EdgeToolRoundDelivery {
+    deliver_tool_calls_through_edge_ledger_with_approval_audit(
+        ledger,
+        user_id,
+        tool_calls,
+        ledger_wait,
+        None,
+    )
+    .await
+}
+
+pub async fn deliver_tool_calls_through_edge_ledger_with_approval_audit(
+    ledger: &Arc<tokio::sync::Mutex<HashMap<String, Value>>>,
+    user_id: &str,
+    tool_calls: &[Value],
+    ledger_wait: Duration,
+    approval_audit: Option<&ApprovalAuditContext>,
+) -> EdgeToolRoundDelivery {
     let tool_calls = crate::headless_tool_assembly::ensure_tool_call_ids(tool_calls);
     let mut out = EdgeToolRoundDelivery::default();
     append_approval_batch_events(&mut out, &collect_approval_batches(&tool_calls));
@@ -910,7 +960,7 @@ pub async fn deliver_tool_calls_through_edge_ledger(
 
         let block = &tool_calls[block_start..block_end];
         let part = if approval_required {
-            deliver_approval_block(ledger, user_id, block, ledger_wait).await
+            deliver_approval_block(ledger, user_id, block, ledger_wait, approval_audit).await
         } else {
             deliver_read_only_block(ledger, user_id, block, ledger_wait).await
         };
@@ -936,6 +986,24 @@ pub async fn deliver_tool_calls_concurrent(
     tool_calls: &[Value],
     ledger_wait: Duration,
 ) -> EdgeToolRoundDelivery {
+    deliver_tool_calls_concurrent_with_approval_audit(
+        ledger,
+        user_id,
+        tool_calls,
+        ledger_wait,
+        None,
+    )
+    .await
+}
+
+#[cfg(test)]
+pub async fn deliver_tool_calls_concurrent_with_approval_audit(
+    ledger: &Arc<tokio::sync::Mutex<HashMap<String, Value>>>,
+    user_id: &str,
+    tool_calls: &[Value],
+    ledger_wait: Duration,
+    approval_audit: Option<&ApprovalAuditContext>,
+) -> EdgeToolRoundDelivery {
     let tool_calls = crate::headless_tool_assembly::ensure_tool_call_ids(tool_calls);
     let mut out = EdgeToolRoundDelivery::default();
     append_approval_batch_events(&mut out, &collect_approval_batches(&tool_calls));
@@ -952,7 +1020,8 @@ pub async fn deliver_tool_calls_concurrent(
 
         let block = &tool_calls[block_start..block_end];
         let part = if approval_required {
-            deliver_approval_block_concurrent(ledger, user_id, block, ledger_wait).await
+            deliver_approval_block_concurrent(ledger, user_id, block, ledger_wait, approval_audit)
+                .await
         } else {
             deliver_read_only_block_concurrent(ledger, user_id, block, ledger_wait).await
         };
@@ -966,7 +1035,26 @@ pub async fn deliver_tool_calls_concurrent(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astra_thin_client::ApprovalDecision;
+    use crate::contracts::TurnAuxiliaryEventRecord;
+    use astra_thin_client::{ApprovalDecision, ApprovalRespondRequest};
+    use async_trait::async_trait;
+    use std::sync::Mutex as StdMutex;
+
+    #[derive(Default)]
+    struct RecordingAuxiliaryEventWriter {
+        events: Arc<StdMutex<Vec<TurnAuxiliaryEventRecord>>>,
+    }
+
+    #[async_trait]
+    impl crate::contracts::TurnAuxiliaryEventWriter for RecordingAuxiliaryEventWriter {
+        async fn persist_events(
+            &self,
+            events: Vec<TurnAuxiliaryEventRecord>,
+        ) -> Result<(), String> {
+            self.events.lock().unwrap().extend(events);
+            Ok(())
+        }
+    }
 
     fn read_tool(id: &str) -> Value {
         json!({
@@ -990,6 +1078,39 @@ mod tests {
             "type": "function",
             "function": {"name": "bash", "arguments": r#"{"command": "rm -rf tmp"}"#}
         })
+    }
+
+    fn approval_entry(request_id: &str, decision: ApprovalDecision, reason: Option<&str>) -> Value {
+        json!({
+            "kind": "approval_respond",
+            "body": ApprovalRespondRequest {
+                request_id: request_id.to_string(),
+                decision,
+                reason: reason.map(str::to_string),
+                session_id: "test-session".to_string(),
+                run_id: "test-run".to_string(),
+                tool_name: None,
+                approval_kind: None,
+            }
+        })
+    }
+
+    fn test_approval_key(user_id: &str, request_id: &str) -> String {
+        approval_callback_key(user_id, "test-session", "test-run", request_id)
+    }
+
+    fn test_approval_audit(user_id: &str) -> ApprovalAuditContext {
+        ApprovalAuditContext {
+            user_id: user_id.to_string(),
+            session_id: "test-session".to_string(),
+            run_id: "test-run".to_string(),
+            turn: 1,
+            agent_id: None,
+            parent_event_id: None,
+            parent_event_ids: Vec::new(),
+            causal_chain_id: "test-approval-chain".to_string(),
+            auxiliary_event_writer: Arc::new(RecordingAuxiliaryEventWriter::default()),
+        }
     }
 
     #[test]
@@ -1020,10 +1141,7 @@ mod tests {
 
     #[test]
     fn parse_allow_from_handler_shape() {
-        let entry = json!({
-            "kind": "approval_respond",
-            "body": {"request_id": "t1", "decision": "allow"}
-        });
+        let entry = approval_entry("t1", ApprovalDecision::Allow, None);
         assert_eq!(
             parse_cloud_approval_outcome(Some(&entry)),
             CloudApprovalResult::Allowed
@@ -1032,10 +1150,7 @@ mod tests {
 
     #[test]
     fn parse_deny_with_reason() {
-        let entry = json!({
-            "kind": "approval_respond",
-            "body": {"request_id": "t1", "decision": "deny", "reason": "nope"}
-        });
+        let entry = approval_entry("t1", ApprovalDecision::Deny, Some("nope"));
         assert_eq!(
             parse_cloud_approval_outcome(Some(&entry)),
             CloudApprovalResult::Denied {
@@ -1305,14 +1420,20 @@ mod tests {
                 json!({"body": {"request_id": "shared-approval", "status": "completed", "output": "tool-result-not-approval"}}),
             );
             guard.insert(
-                approval_callback_key("user-b", "shared-approval"),
-                json!({"kind": "approval_respond", "body": {"request_id": "shared-approval", "decision": "allow"}}),
+                test_approval_key("user-b", "shared-approval"),
+                approval_entry("shared-approval", ApprovalDecision::Allow, None),
             );
         }
 
-        let user_a_result =
-            wait_approval_ledger_for_tool(&ledger, "user-a", &tc, Duration::from_millis(60), None)
-                .await;
+        let user_a_audit = test_approval_audit("user-a");
+        let user_a_result = wait_approval_ledger_for_tool(
+            &ledger,
+            "user-a",
+            &tc,
+            Duration::from_millis(60),
+            Some(&user_a_audit),
+        )
+        .await;
 
         let user_a_delivery = user_a_result.expect_err(
             "user-a must time out instead of consuming a tool-result namespace or user-b approval",
@@ -1324,15 +1445,182 @@ mod tests {
         {
             let guard = ledger.lock().await;
             assert!(guard.contains_key(&tool_callback_key("user-a", "shared-approval")));
-            assert!(guard.contains_key(&approval_callback_key("user-b", "shared-approval")));
+            assert!(guard.contains_key(&test_approval_key("user-b", "shared-approval")));
         }
 
-        wait_approval_ledger_for_tool(&ledger, "user-b", &tc, Duration::from_millis(60), None)
-            .await
-            .expect("user-b should consume its own approval");
+        let user_b_audit = test_approval_audit("user-b");
+        wait_approval_ledger_for_tool(
+            &ledger,
+            "user-b",
+            &tc,
+            Duration::from_millis(60),
+            Some(&user_b_audit),
+        )
+        .await
+        .expect("user-b should consume its own approval");
         let guard = ledger.lock().await;
         assert!(guard.contains_key(&tool_callback_key("user-a", "shared-approval")));
-        assert!(!guard.contains_key(&approval_callback_key("user-b", "shared-approval")));
+        assert!(!guard.contains_key(&test_approval_key("user-b", "shared-approval")));
+    }
+
+    #[tokio::test]
+    async fn approval_wait_without_run_context_fails_closed() {
+        let ledger = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        ledger.lock().await.insert(
+            test_approval_key("user-a", "w-no-context"),
+            approval_entry("w-no-context", ApprovalDecision::Allow, None),
+        );
+
+        let denied = wait_approval_ledger_for_tool(
+            &ledger,
+            "user-a",
+            &write_tool("w-no-context"),
+            Duration::from_millis(10),
+            None,
+        )
+        .await
+        .expect_err("approval without run context must fail closed");
+
+        assert!(
+            denied.persist_tool_results[0]["result"]
+                .as_str()
+                .is_some_and(|result| result.contains("approval requires session/run context"))
+        );
+        assert!(
+            ledger
+                .lock()
+                .await
+                .contains_key(&test_approval_key("user-a", "w-no-context")),
+            "contextless wait must not consume scoped approval entries"
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_wait_replays_journal_decision_when_ledger_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let writer = JournalWriter::new("sess-journal-replay").unwrap();
+        writer
+            .append(&JournalEvent::approval_decision_for_run(
+                Some("sess-journal-replay"),
+                Some(7),
+                "w-journal",
+                Some("run-journal-replay"),
+                Some("write_file"),
+                Some("standard"),
+                "allow",
+                None,
+            ))
+            .unwrap();
+
+        let ledger = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let recorded_events = Arc::new(StdMutex::new(Vec::new()));
+        let audit = ApprovalAuditContext {
+            user_id: "user-a".to_string(),
+            session_id: "sess-journal-replay".to_string(),
+            run_id: "run-journal-replay".to_string(),
+            turn: 7,
+            agent_id: None,
+            parent_event_id: None,
+            parent_event_ids: Vec::new(),
+            causal_chain_id: "chain-journal-replay".to_string(),
+            auxiliary_event_writer: Arc::new(RecordingAuxiliaryEventWriter {
+                events: Arc::clone(&recorded_events),
+            }),
+        };
+
+        wait_approval_ledger_for_tool(
+            &ledger,
+            "user-a",
+            &write_tool("w-journal"),
+            Duration::from_millis(60),
+            Some(&audit),
+        )
+        .await
+        .expect("journal approval decision should allow the tool");
+
+        assert!(
+            ledger.lock().await.is_empty(),
+            "journal replay should not require or leave an in-memory ledger entry"
+        );
+        let events = recorded_events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "approval_decision");
+        assert_eq!(
+            events[0].metadata.as_ref().unwrap()["outcome_source"].as_str(),
+            Some("journal")
+        );
+        assert_eq!(
+            events[0].metadata.as_ref().unwrap()["decision"].as_str(),
+            Some("allow")
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_wait_ignores_journal_decision_from_other_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let writer = JournalWriter::new("sess-journal-cross-run").unwrap();
+        writer
+            .append(&JournalEvent::approval_decision_for_run(
+                Some("sess-journal-cross-run"),
+                Some(7),
+                "w-cross-run",
+                Some("other-run"),
+                Some("write_file"),
+                Some("standard"),
+                "allow",
+                None,
+            ))
+            .unwrap();
+
+        let ledger = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let recorded_events = Arc::new(StdMutex::new(Vec::new()));
+        let audit = ApprovalAuditContext {
+            user_id: "user-a".to_string(),
+            session_id: "sess-journal-cross-run".to_string(),
+            run_id: "target-run".to_string(),
+            turn: 7,
+            agent_id: None,
+            parent_event_id: None,
+            parent_event_ids: Vec::new(),
+            causal_chain_id: "chain-journal-cross-run".to_string(),
+            auxiliary_event_writer: Arc::new(RecordingAuxiliaryEventWriter {
+                events: Arc::clone(&recorded_events),
+            }),
+        };
+
+        let denied = wait_approval_ledger_for_tool(
+            &ledger,
+            "user-a",
+            &write_tool("w-cross-run"),
+            Duration::from_millis(30),
+            Some(&audit),
+        )
+        .await
+        .expect_err("approval decision from another run must not allow this run");
+
+        assert_eq!(
+            denied.persist_tool_results[0]["result"],
+            MSG_APPROVAL_LEDGER_TIMEOUT
+        );
+        let timeout = astra_services::session_journal::read_journal("sess-journal-cross-run")
+            .unwrap()
+            .into_iter()
+            .rev()
+            .find(|event| {
+                event.event_type
+                    == astra_services::session_journal::JournalEventType::ApprovalTimeout
+            })
+            .expect("target run timeout journal");
+        assert_eq!(
+            timeout
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.pointer("/approval/run_id"))
+                .and_then(Value::as_str),
+            Some("target-run")
+        );
     }
 
     #[tokio::test]
@@ -1344,14 +1632,15 @@ mod tests {
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(10)).await;
             l2.lock().await.insert(
-                approval_callback_key(uid, "w1"),
+                test_approval_key(uid, "w1"),
                 json!({
                     "kind": "approval_respond",
                     "body": serde_json::to_value(ApprovalRespondRequest {
                         request_id: "w1".into(),
                         decision: ApprovalDecision::Allow,
                         reason: None,
-                        session_id: None,
+                        session_id: "test-session".into(),
+                        run_id: "test-run".into(),
                         tool_name: None,
                         approval_kind: None,
                     }).unwrap()
@@ -1363,8 +1652,15 @@ mod tests {
                 json!({"body": {"request_id": "w1", "status": "completed", "output": "wrote"}}),
             );
         });
-        let d = deliver_tool_calls_through_edge_ledger(&ledger, uid, &[tc], Duration::from_secs(2))
-            .await;
+        let audit = test_approval_audit(uid);
+        let d = deliver_tool_calls_through_edge_ledger_with_approval_audit(
+            &ledger,
+            uid,
+            &[tc],
+            Duration::from_secs(2),
+            Some(&audit),
+        )
+        .await;
         assert_eq!(
             d.sse_maps[0].get("type").and_then(Value::as_str),
             Some("approval_required")
@@ -1395,22 +1691,30 @@ mod tests {
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(10)).await;
             l2.lock().await.insert(
-                approval_callback_key(uid, "w2"),
+                test_approval_key(uid, "w2"),
                 json!({
                     "kind": "approval_respond",
                     "body": serde_json::to_value(ApprovalRespondRequest {
                         request_id: "w2".into(),
                         decision: ApprovalDecision::Deny,
                         reason: Some("policy".into()),
-                        session_id: None,
+                        session_id: "test-session".into(),
+                        run_id: "test-run".into(),
                         tool_name: None,
                         approval_kind: None,
                     }).unwrap()
                 }),
             );
         });
-        let d = deliver_tool_calls_through_edge_ledger(&ledger, uid, &[tc], Duration::from_secs(2))
-            .await;
+        let audit = test_approval_audit(uid);
+        let d = deliver_tool_calls_through_edge_ledger_with_approval_audit(
+            &ledger,
+            uid,
+            &[tc],
+            Duration::from_secs(2),
+            Some(&audit),
+        )
+        .await;
         assert_eq!(d.sse_maps.len(), 2);
         assert_eq!(
             d.sse_maps[1].get("type").and_then(Value::as_str),
@@ -1432,12 +1736,12 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
             let mut guard = l2.lock().await;
             guard.insert(
-                approval_callback_key(uid, "w1"),
-                json!({"kind": "approval_respond", "body": {"request_id": "w1", "decision": "allow"}}),
+                test_approval_key(uid, "w1"),
+                approval_entry("w1", ApprovalDecision::Allow, None),
             );
             guard.insert(
-                approval_callback_key(uid, "w2"),
-                json!({"kind": "approval_respond", "body": {"request_id": "w2", "decision": "allow"}}),
+                test_approval_key(uid, "w2"),
+                approval_entry("w2", ApprovalDecision::Allow, None),
             );
             drop(guard);
 
@@ -1453,8 +1757,15 @@ mod tests {
             );
         });
 
-        let d = deliver_tool_calls_through_edge_ledger(&ledger, uid, &tcs, Duration::from_secs(2))
-            .await;
+        let audit = test_approval_audit(uid);
+        let d = deliver_tool_calls_through_edge_ledger_with_approval_audit(
+            &ledger,
+            uid,
+            &tcs,
+            Duration::from_secs(2),
+            Some(&audit),
+        )
+        .await;
 
         assert!(
             d.sse_maps
@@ -1511,14 +1822,15 @@ mod tests {
             // Approval for write_file
             tokio::time::sleep(Duration::from_millis(10)).await;
             l2.lock().await.insert(
-                approval_callback_key(uid, "w1"),
+                test_approval_key(uid, "w1"),
                 json!({
                     "kind": "approval_respond",
                     "body": serde_json::to_value(ApprovalRespondRequest {
                         request_id: "w1".into(),
                         decision: ApprovalDecision::Allow,
                         reason: None,
-                        session_id: None,
+                        session_id: "test-session".into(),
+                        run_id: "test-run".into(),
                         tool_name: None,
                         approval_kind: None,
                     }).unwrap()
@@ -1545,7 +1857,15 @@ mod tests {
             }
         });
 
-        let d = deliver_tool_calls_concurrent(&ledger, uid, &tcs, Duration::from_secs(2)).await;
+        let audit = test_approval_audit(uid);
+        let d = deliver_tool_calls_concurrent_with_approval_audit(
+            &ledger,
+            uid,
+            &tcs,
+            Duration::from_secs(2),
+            Some(&audit),
+        )
+        .await;
 
         // SSE events: approval_required + tool_call + tool_request + tool_call_end (write)
         // + 2×(tool_call + tool_request + tool_call_end) (reads)
@@ -1647,8 +1967,8 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
             l2.lock().await.insert(
-                approval_callback_key(uid, "w1"),
-                json!({"kind": "approval_respond", "body": {"request_id": "w1", "decision": "allow"}}),
+                test_approval_key(uid, "w1"),
+                approval_entry("w1", ApprovalDecision::Allow, None),
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
             l2.lock().await.insert(
@@ -1662,8 +1982,8 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
             l2.lock().await.insert(
-                approval_callback_key(uid, "w2"),
-                json!({"kind": "approval_respond", "body": {"request_id": "w2", "decision": "allow"}}),
+                test_approval_key(uid, "w2"),
+                approval_entry("w2", ApprovalDecision::Allow, None),
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
             l2.lock().await.insert(
@@ -1672,8 +1992,15 @@ mod tests {
             );
         });
 
-        let d = deliver_tool_calls_through_edge_ledger(&ledger, uid, &tcs, Duration::from_secs(2))
-            .await;
+        let audit = test_approval_audit(uid);
+        let d = deliver_tool_calls_through_edge_ledger_with_approval_audit(
+            &ledger,
+            uid,
+            &tcs,
+            Duration::from_secs(2),
+            Some(&audit),
+        )
+        .await;
 
         let batch = d
             .sse_maps
@@ -1736,14 +2063,15 @@ mod tests {
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(10)).await;
             l2.lock().await.insert(
-                approval_callback_key(uid, "w1"),
+                test_approval_key(uid, "w1"),
                 json!({
                     "kind": "approval_respond",
                     "body": serde_json::to_value(ApprovalRespondRequest {
                         request_id: "w1".into(),
                         decision: ApprovalDecision::Deny,
                         reason: Some("nope".into()),
-                        session_id: None,
+                        session_id: "test-session".into(),
+                        run_id: "test-run".into(),
                         tool_name: None,
                         approval_kind: None,
                     }).unwrap()
@@ -1756,7 +2084,15 @@ mod tests {
             );
         });
 
-        let d = deliver_tool_calls_concurrent(&ledger, uid, &tcs, Duration::from_secs(2)).await;
+        let audit = test_approval_audit(uid);
+        let d = deliver_tool_calls_concurrent_with_approval_audit(
+            &ledger,
+            uid,
+            &tcs,
+            Duration::from_secs(2),
+            Some(&audit),
+        )
+        .await;
 
         // 2 tool messages: denied write + successful read
         assert_eq!(d.tool_messages.len(), 2);
@@ -1824,9 +2160,7 @@ mod tests {
 
     #[test]
     fn parse_approval_allow_session() {
-        let v = json!({
-            "body": {"request_id": "t1", "decision": "allow_session"}
-        });
+        let v = approval_entry("t1", ApprovalDecision::AllowSession, None);
         assert_eq!(
             parse_cloud_approval_outcome(Some(&v)),
             CloudApprovalResult::Allowed
@@ -1835,9 +2169,7 @@ mod tests {
 
     #[test]
     fn parse_approval_deny_without_reason() {
-        let v = json!({
-            "body": {"request_id": "t1", "decision": "deny"}
-        });
+        let v = approval_entry("t1", ApprovalDecision::Deny, None);
         assert_eq!(
             parse_cloud_approval_outcome(Some(&v)),
             CloudApprovalResult::Denied { reason: None }

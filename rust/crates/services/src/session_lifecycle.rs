@@ -12,6 +12,14 @@ struct SessionDeleteStatement {
     sql: &'static str,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SessionBatchDeleteStatement {
+    label: &'static str,
+    sql: &'static str,
+}
+
+const SESSION_DELETE_BATCH_LIMIT: i64 = 1000;
+
 const SESSION_DELETE_DERIVED_FROM_AGENT_RUNS: &[SessionDeleteStatement] =
     &[SessionDeleteStatement {
         label: "user_skill_evaluations",
@@ -22,8 +30,10 @@ const SESSION_DELETE_DERIVED_FROM_AGENT_RUNS: &[SessionDeleteStatement] =
              )",
     }];
 
-const SESSION_DELETE_AGENT_EVENT_EDGES_SQL: &str =
-    "DELETE FROM agent_event_edges WHERE session_id = ? AND user_id = ?";
+const SESSION_DELETE_AGENT_EVENT_EDGES_SQL: &str = "DELETE FROM agent_event_edges
+         WHERE session_id = ? AND user_id = ?
+         ORDER BY child_event_id ASC, parent_event_id ASC, relation_kind ASC
+         LIMIT ?";
 
 const SESSION_DELETE_TASK_LEASES_SQL: &str = "DELETE FROM task_leases
          WHERE user_id = ?
@@ -142,14 +152,6 @@ const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
         sql: "DELETE FROM session_artifacts WHERE session_id = ? AND user_id = ?",
     },
     SessionDeleteStatement {
-        label: "session_tool_outputs",
-        sql: "DELETE FROM session_tool_outputs WHERE session_id = ? AND user_id = ?",
-    },
-    SessionDeleteStatement {
-        label: "session_tool_output_batches",
-        sql: "DELETE FROM session_tool_output_batches WHERE session_id = ? AND user_id = ?",
-    },
-    SessionDeleteStatement {
         label: "session_device_lease_events",
         sql: "DELETE FROM session_device_lease_events WHERE session_id = ? AND user_id = ?",
     },
@@ -166,24 +168,12 @@ const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
         sql: "DELETE FROM transcript_pages WHERE session_id = ? AND user_id = ?",
     },
     SessionDeleteStatement {
-        label: "conversation_log",
-        sql: "DELETE FROM conversation_log WHERE session_id = ? AND user_id = ?",
-    },
-    SessionDeleteStatement {
         label: "ctx_snapshots",
         sql: "DELETE FROM ctx_snapshots WHERE session_id = ? AND user_id = ?",
     },
     SessionDeleteStatement {
         label: "ctx_decision_audits",
         sql: "DELETE FROM ctx_decision_audits WHERE session_id = ? AND user_id = ?",
-    },
-    SessionDeleteStatement {
-        label: "prompt_deltas",
-        sql: "DELETE FROM prompt_deltas WHERE session_id = ? AND user_id = ?",
-    },
-    SessionDeleteStatement {
-        label: "prompt_request_records",
-        sql: "DELETE FROM prompt_request_records WHERE session_id = ? AND user_id = ?",
     },
     SessionDeleteStatement {
         label: "session_state_revisions",
@@ -220,10 +210,6 @@ const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
     SessionDeleteStatement {
         label: "skill_selection_events",
         sql: "DELETE FROM skill_selection_events WHERE session_id = ? AND user_id = ?",
-    },
-    SessionDeleteStatement {
-        label: "session_sync_log",
-        sql: "DELETE FROM session_sync_log WHERE session_id = ? AND user_id = ?",
     },
     SessionDeleteStatement {
         label: "agent_tasks",
@@ -267,11 +253,62 @@ const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
     },
 ];
 
-const SESSION_DELETE_TERMINAL_TABLES: &[SessionDeleteStatement] = &[
-    SessionDeleteStatement {
-        label: "agent_run_events",
-        sql: "DELETE FROM agent_run_events WHERE session_id = ? AND user_id = ?",
+const SESSION_DELETE_DIRECT_BATCH_TABLES: &[SessionBatchDeleteStatement] = &[
+    SessionBatchDeleteStatement {
+        label: "session_tool_outputs",
+        sql: "DELETE FROM session_tool_outputs
+             WHERE session_id = ? AND user_id = ?
+             ORDER BY created_at ASC, output_id ASC
+             LIMIT ?",
     },
+    SessionBatchDeleteStatement {
+        label: "session_tool_output_batches",
+        sql: "DELETE FROM session_tool_output_batches
+             WHERE session_id = ? AND user_id = ?
+             ORDER BY created_at ASC, batch_id ASC
+             LIMIT ?",
+    },
+    SessionBatchDeleteStatement {
+        label: "conversation_log",
+        sql: "DELETE FROM conversation_log
+             WHERE session_id = ? AND user_id = ?
+             ORDER BY seq ASC
+             LIMIT ?",
+    },
+    SessionBatchDeleteStatement {
+        label: "prompt_deltas",
+        sql: "DELETE FROM prompt_deltas
+             WHERE session_id = ? AND user_id = ?
+             ORDER BY request_id ASC, delta_seq ASC
+             LIMIT ?",
+    },
+    SessionBatchDeleteStatement {
+        label: "prompt_request_records",
+        sql: "DELETE FROM prompt_request_records
+             WHERE session_id = ? AND user_id = ?
+             ORDER BY created_at ASC, request_id ASC
+             LIMIT ?",
+    },
+];
+
+const SESSION_DELETE_TERMINAL_BATCH_TABLES: &[SessionBatchDeleteStatement] = &[
+    SessionBatchDeleteStatement {
+        label: "agent_run_events",
+        sql: "DELETE FROM agent_run_events
+             WHERE session_id = ? AND user_id = ?
+             ORDER BY run_id ASC, event_idx ASC, id ASC
+             LIMIT ?",
+    },
+    SessionBatchDeleteStatement {
+        label: "agent_events",
+        sql: "DELETE FROM agent_events
+             WHERE session_id = ? AND user_id = ?
+             ORDER BY created_at ASC, event_id ASC
+             LIMIT ?",
+    },
+];
+
+const SESSION_DELETE_TERMINAL_TABLES: &[SessionDeleteStatement] = &[
     SessionDeleteStatement {
         label: "run_checkpoints",
         sql: "DELETE FROM run_checkpoints WHERE session_id = ? AND user_id = ?",
@@ -283,10 +320,6 @@ const SESSION_DELETE_TERMINAL_TABLES: &[SessionDeleteStatement] = &[
     SessionDeleteStatement {
         label: "agent_runs",
         sql: "DELETE FROM agent_runs WHERE session_id = ? AND user_id = ?",
-    },
-    SessionDeleteStatement {
-        label: "agent_events",
-        sql: "DELETE FROM agent_events WHERE session_id = ? AND user_id = ?",
     },
     SessionDeleteStatement {
         label: "agent_sessions",
@@ -321,6 +354,33 @@ async fn delete_session_rows_session_user(
         .await
         .map(|result| result.rows_affected())
         .map_err(|source| format!("delete_session.{label}: {source}"))
+}
+
+async fn delete_session_rows_session_user_batched(
+    tx: &mut sqlx::Transaction<'_, MySql>,
+    label: &'static str,
+    statement: &'static str,
+    session_id: &str,
+    user_id: &str,
+) -> Result<u64, String> {
+    let mut total_deleted = 0_u64;
+    loop {
+        let rows_deleted = query(statement)
+            .bind(session_id)
+            .bind(user_id)
+            .bind(SESSION_DELETE_BATCH_LIMIT)
+            .execute(&mut **tx)
+            .await
+            .map(|result| result.rows_affected())
+            .map_err(|source| format!("delete_session.{label}: {source}"))?;
+        total_deleted = total_deleted
+            .checked_add(rows_deleted)
+            .ok_or_else(|| format!("delete_session.{label}: deleted row total overflow"))?;
+        if rows_deleted == 0 {
+            break;
+        }
+    }
+    Ok(total_deleted)
 }
 
 async fn delete_session_rows_session_user_twice(
@@ -496,13 +556,14 @@ pub(crate) async fn hard_delete_session_rows(
         record_table_delete(&mut outcome, statement.label, rows_deleted)?;
     }
 
-    let rows_deleted = query(SESSION_DELETE_AGENT_EVENT_EDGES_SQL)
-        .bind(session_id)
-        .bind(user_id)
-        .execute(&mut **tx)
-        .await
-        .map(|result| result.rows_affected())
-        .map_err(|source| format!("delete_session.agent_event_edges: {source}"))?;
+    let rows_deleted = delete_session_rows_session_user_batched(
+        tx,
+        "agent_event_edges",
+        SESSION_DELETE_AGENT_EVENT_EDGES_SQL,
+        session_id,
+        user_id,
+    )
+    .await?;
     record_table_delete(&mut outcome, "agent_event_edges", rows_deleted)?;
 
     for statement in SESSION_DELETE_SESSION_ORIGIN_TABLES {
@@ -554,8 +615,32 @@ pub(crate) async fn hard_delete_session_rows(
     outcome.session_references_cleared =
         clear_session_provenance_references(tx, session_id, user_id).await?;
 
+    for statement in SESSION_DELETE_DIRECT_BATCH_TABLES {
+        let rows_deleted = delete_session_rows_session_user_batched(
+            tx,
+            statement.label,
+            statement.sql,
+            session_id,
+            user_id,
+        )
+        .await?;
+        record_table_delete(&mut outcome, statement.label, rows_deleted)?;
+    }
+
     for statement in SESSION_DELETE_DIRECT_TABLES {
         let rows_deleted = delete_session_rows_session_user(
+            tx,
+            statement.label,
+            statement.sql,
+            session_id,
+            user_id,
+        )
+        .await?;
+        record_table_delete(&mut outcome, statement.label, rows_deleted)?;
+    }
+
+    for statement in SESSION_DELETE_TERMINAL_BATCH_TABLES {
+        let rows_deleted = delete_session_rows_session_user_batched(
             tx,
             statement.label,
             statement.sql,
@@ -808,6 +893,18 @@ mod tests {
                 );
             }
         }
+        for group in [
+            SESSION_DELETE_DIRECT_BATCH_TABLES,
+            SESSION_DELETE_TERMINAL_BATCH_TABLES,
+        ] {
+            for statement in group {
+                assert!(
+                    labels.insert(statement.label.to_string()),
+                    "duplicate session delete table label: {}",
+                    statement.label
+                );
+            }
+        }
         labels
     }
 
@@ -926,6 +1023,113 @@ mod tests {
         assert!(
             source.contains("rows remain for session/user after delete"),
             "residual verification must fail loudly instead of only auditing rows_affected"
+        );
+    }
+
+    #[test]
+    fn high_growth_session_deletes_are_ordered_batched_and_owner_scoped() {
+        let mut statements: Vec<SessionBatchDeleteStatement> = vec![SessionBatchDeleteStatement {
+            label: "agent_event_edges",
+            sql: SESSION_DELETE_AGENT_EVENT_EDGES_SQL,
+        }];
+        statements.extend_from_slice(SESSION_DELETE_DIRECT_BATCH_TABLES);
+        statements.extend_from_slice(SESSION_DELETE_TERMINAL_BATCH_TABLES);
+
+        let labels = statements
+            .iter()
+            .map(|statement| statement.label)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            labels,
+            BTreeSet::from([
+                "agent_event_edges",
+                "agent_events",
+                "agent_run_events",
+                "conversation_log",
+                "prompt_deltas",
+                "prompt_request_records",
+                "session_tool_output_batches",
+                "session_tool_outputs",
+            ])
+        );
+        for statement in statements {
+            let normalized = statement
+                .sql
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(
+                normalized.contains("session_id = ? AND user_id = ?"),
+                "{} must be scoped by session and owner",
+                statement.label
+            );
+            assert!(
+                normalized.contains(" ORDER BY "),
+                "{} must delete in a deterministic order",
+                statement.label
+            );
+            assert!(
+                normalized.ends_with("LIMIT ?"),
+                "{} must be bounded by the shared batch limit",
+                statement.label
+            );
+        }
+        const {
+            assert!(SESSION_DELETE_BATCH_LIMIT > 0);
+            assert!(SESSION_DELETE_BATCH_LIMIT <= 10_000);
+        };
+    }
+
+    #[test]
+    fn prompt_session_hard_delete_keeps_child_before_parent_in_batched_path() {
+        let labels = SESSION_DELETE_DIRECT_BATCH_TABLES
+            .iter()
+            .map(|statement| statement.label)
+            .collect::<Vec<_>>();
+        let child = labels
+            .iter()
+            .position(|label| *label == "prompt_deltas")
+            .expect("prompt_deltas must use batched session hard delete");
+        let parent = labels
+            .iter()
+            .position(|label| *label == "prompt_request_records")
+            .expect("prompt_request_records must use batched session hard delete");
+
+        assert!(
+            child < parent,
+            "prompt_deltas must be pruned before prompt_request_records to preserve parent-bound cleanup"
+        );
+        assert!(
+            !SESSION_DELETE_DIRECT_TABLES
+                .iter()
+                .any(|statement| statement.label == "prompt_deltas"
+                    || statement.label == "prompt_request_records"),
+            "prompt high-growth tables must not regress to unbounded direct DELETE statements"
+        );
+    }
+
+    #[test]
+    fn high_growth_session_delete_helper_loops_until_empty_batch() {
+        let source = include_str!("session_lifecycle.rs");
+        let helper_body = source
+            .split("async fn delete_session_rows_session_user_batched")
+            .nth(1)
+            .and_then(|rest| {
+                rest.split("async fn delete_session_rows_session_user_twice")
+                    .next()
+            })
+            .expect("batched delete helper body");
+        assert!(
+            helper_body.contains("loop {") && helper_body.contains("if rows_deleted == 0"),
+            "batched delete helper must keep pruning until a batch deletes no rows"
+        );
+        assert!(
+            helper_body.contains("SESSION_DELETE_BATCH_LIMIT"),
+            "batched delete helper must bind the shared batch limit"
+        );
+        assert!(
+            helper_body.contains("checked_add(rows_deleted)"),
+            "batched delete helper must fail loudly on impossible row-total overflow"
         );
     }
 
@@ -1227,6 +1431,23 @@ mod tests {
                     && normalized.contains("tc.user_id = ?");
                 assert!(
                     session_owner_scoped || session_quality_scoped || verification_results_scoped,
+                    "{} must be scoped by session identity and its owner",
+                    statement.label
+                );
+            }
+        }
+        for group in [
+            SESSION_DELETE_DIRECT_BATCH_TABLES,
+            SESSION_DELETE_TERMINAL_BATCH_TABLES,
+        ] {
+            for statement in group {
+                let normalized = statement
+                    .sql
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                assert!(
+                    normalized.contains("session_id = ? AND user_id = ?"),
                     "{} must be scoped by session identity and its owner",
                     statement.label
                 );
