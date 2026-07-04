@@ -65,10 +65,20 @@ async function mockChatApis(page: Page, options: {
           createdAt: '2026-06-07T00:00:01.000Z',
           status: 'complete',
         },
+        assistantMessage: {
+          id: 'queued-assistant-e2e',
+          role: 'assistant',
+          content: '',
+          createdAt: '2026-06-07T00:00:01.001Z',
+          status: 'streaming',
+          reasoning: '',
+          reasoningStatus: 'streaming',
+        },
         activeRun: {
           runId: 'run-e2e',
           status: 'input-queued',
           waitingFor: 'user_input',
+          assistantMessageId: 'queued-assistant-e2e',
         },
       },
     });
@@ -147,16 +157,16 @@ function workSurfacePanel(page: Page) {
 
 async function openWorkSurfaceIfNeeded(page: Page) {
   const surface = workSurfacePanel(page);
-  const workButton = page.getByRole('button', { name: /^Work$/ }).first();
+  const workButton = page.getByRole('button', { name: /^Activity$/ }).first();
   if (await workButton.isVisible().catch(() => false)) {
     await workButton.click();
-    await expect(surface.getByRole('heading', { name: 'Work Surface' })).toBeVisible();
+    await expect(surface.getByRole('heading', { name: 'Activity' })).toBeVisible();
   }
   return surface;
 }
 
 async function closeMobileWorkSurfaceIfOpen(page: Page) {
-  const closeButton = page.getByRole('button', { name: 'Close work surface' }).last();
+  const closeButton = page.getByRole('button', { name: 'Close activity' }).last();
   if (await closeButton.isVisible().catch(() => false)) {
     await closeButton.click();
     await expect(closeButton).not.toBeVisible();
@@ -164,14 +174,17 @@ async function closeMobileWorkSurfaceIfOpen(page: Page) {
 }
 
 test('run-control buttons are mutexed while queueing deferred input', async ({ page }) => {
-  await mockChatApis(page, { activeRunStatus: 'running', queueDelayMs: 400, streamDelayMs: 1000 });
+  await mockChatApis(page, {
+    activeRunStatus: 'running',
+    queueDelayMs: 400,
+    streamDelayMs: 20_000,
+  });
   await page.goto('/e2e/chat-view?status=running');
 
   await typeComposerMessage(page, 'queued follow-up');
   await page.getByRole('button', { name: 'Send message' }).click();
 
   await expect(page.getByRole('button', { name: 'Stop' })).toBeDisabled();
-  await page.getByRole('button', { name: 'Stop' }).click({ force: true });
   await expect(transcriptMessage(page, 'queued follow-up')).toBeVisible();
 });
 
@@ -182,11 +195,11 @@ test('unknown active-run statuses block composer instead of enabling queue mode'
   const composer = page.locator('[data-composer-input="true"]');
   await expect(composer).toHaveAttribute(
     'data-placeholder',
-    'Run status blocked...',
+    'Astra is busy...',
   );
   await expect(composer).toHaveAttribute(
     'aria-label',
-    'Run status is initializing-provider. Stop it or refresh before sending.',
+    'Astra is busy. Stop it or wait to continue.',
   );
   await expect(composer).toHaveAttribute('contenteditable', 'false');
 });
@@ -196,10 +209,40 @@ test('empty streaming assistant shows main-chat typing feedback', async ({ page 
   await page.goto('/e2e/chat-view?status=running&assistant=empty-streaming');
 
   await expect(page.getByRole('status', { name: 'Astra is responding' })).toBeVisible();
-  await expect(page.getByText('Running', { exact: true }).first()).toBeVisible();
+  await expect(page.getByText('Thinking', { exact: true }).first()).toBeVisible();
 });
 
-test('run activity metrics show live counts and open work surface tabs', async ({ page }) => {
+test('reasoning segment completion stays in thinking state while streaming', async ({ page }) => {
+  await mockChatApis(page);
+  await page.goto('/e2e/chat-view?status=idle&reasoning=segmentdone');
+
+  await expect(page.getByText(/Thinking \d+s/).first()).toBeVisible();
+  await expect(page.getByText(/^Thought/)).not.toBeVisible();
+});
+
+test('thinking transcript allows manual scrollback while streaming', async ({ page }) => {
+  await mockChatApis(page, {
+    activeRunStatus: 'running',
+    streamDelayMs: 20_000,
+  });
+  await page.goto('/e2e/chat-view?status=running&long=1&reasoning=segmentdone');
+
+  const scroller = page.getByTestId('chat-scroll-container');
+  await expect(page.getByText(/Thinking \d+s/).first()).toBeVisible();
+  await scroller.evaluate((element) => {
+    element.scrollTop = element.scrollHeight;
+  });
+  const bottomScrollTop = await scroller.evaluate((element) => element.scrollTop);
+
+  await scroller.hover();
+  await page.mouse.wheel(0, -700);
+
+  await expect.poll(async () => scroller.evaluate((element) => element.scrollTop)).toBeLessThan(
+    bottomScrollTop,
+  );
+});
+
+test('activity panel shows live work without main-chat metric chips', async ({ page }) => {
   await mockChatApis(page, {
     activeRunStatus: 'running',
     streamDelayMs: 20_000,
@@ -237,31 +280,29 @@ test('run activity metrics show live counts and open work surface tabs', async (
     },
   });
   await page.goto('/e2e/chat-view?status=running&assistant=empty-streaming');
+  const surface = workSurfacePanel(page);
 
-  const agents = page.getByRole('button', {
-    name: 'Open agents work surface, 1 active',
-  });
-  const tasks = page.getByRole('button', {
-    name: 'Open tasks work surface, 1 active',
-  });
-  const tools = page.getByRole('button', {
-    name: 'Open tools work surface, 1 active',
-  });
-  await expect(agents).toBeVisible();
-  await expect(tasks).toBeVisible();
-  await expect(tools).toBeVisible();
+  await expect(
+    page.getByRole('button', { name: /Open agents activity/i }),
+  ).not.toBeVisible();
+  await expect(
+    page.getByRole('button', { name: /Open tasks activity/i }),
+  ).not.toBeVisible();
+  await expect(
+    page.getByRole('button', { name: /Open tools activity/i }),
+  ).not.toBeVisible();
 
-  await agents.click();
+  await surface.getByRole('button', { name: /Agents/ }).click();
   await expect(
     workSurfacePanel(page).getByText('Review transport routing').first(),
   ).toBeVisible();
   await closeMobileWorkSurfaceIfOpen(page);
 
-  await tools.click();
+  await surface.getByRole('button', { name: /Tools/ }).click();
   await expect(workSurfacePanel(page).getByText('git status --short')).toBeVisible();
   await closeMobileWorkSurfaceIfOpen(page);
 
-  await tasks.click();
+  await surface.getByRole('button', { name: /Tasks/ }).click();
   await expect(workSurfacePanel(page).getByText('Investigate transport routing')).toBeVisible();
 });
 
@@ -272,11 +313,11 @@ test('stop immediately clears the visible run while cancellation is slow', async
   await page.getByRole('button', { name: 'Stop run' }).click();
 
   await expect(transcriptMessage(page, 'Stopped.')).toBeVisible({ timeout: 500 });
-  await expect(page.getByText('Running', { exact: true })).not.toBeVisible();
+  await expect(page.getByText('Thinking', { exact: true })).not.toBeVisible();
   await expect(page.getByRole('button', { name: 'Stop run' })).not.toBeVisible();
 });
 
-test('work surface shows server sandbox binding before tools run', async ({ page }) => {
+test('activity panel hides environment internals before work runs', async ({ page }) => {
   await mockChatApis(page, {
     workSurface: {
       sessionId: 'chat-e2e',
@@ -310,14 +351,13 @@ test('work surface shows server sandbox binding before tools run', async ({ page
   await page.goto('/e2e/chat-view?status=running');
   const surface = await openWorkSurfaceIfNeeded(page);
 
-  await expect(surface.getByText('Workspace', { exact: true })).toBeVisible();
-  await expect(surface.getByText('Executor', { exact: true })).toBeVisible();
-  await expect(surface.getByText('Server sandbox').first()).toBeVisible();
-  await expect(surface.getByText('/tmp/astra-workspaces/chat-e2e')).toBeVisible();
-  await expect(surface.getByText('server local / online')).toBeVisible();
+  await expect(surface.getByRole('heading', { name: 'Activity' })).toBeVisible();
+  await expect(surface.getByText('Workspace', { exact: true })).toHaveCount(0);
+  await expect(surface.getByText('Executor', { exact: true })).toHaveCount(0);
+  await expect(surface.getByText('Server sandbox')).toHaveCount(0);
 });
 
-test('work surface tool cards show executor workspace and transport', async ({ page }) => {
+test('activity tool cards show runtime files and connection', async ({ page }) => {
   await mockChatApis(page, {
     workSurface: {
       sessionId: 'chat-e2e',
@@ -380,13 +420,13 @@ test('work surface tool cards show executor workspace and transport', async ({ p
   await expect(surface.getByRole('heading', { name: 'bash' })).toBeVisible();
   await expect(surface.getByText('MacBook Pro').first()).toBeVisible();
   await expect(surface.getByText('/Users/xupeng/github/astra').first()).toBeVisible();
-  await expect(surface.getByText('Transport', { exact: true })).toBeVisible();
+  await expect(surface.getByText('Connection', { exact: true })).toBeVisible();
   await expect(surface.getByText('edge ledger', { exact: true })).toBeVisible();
-  await expect(surface.getByText('Fallback', { exact: true })).toBeVisible();
+  await expect(surface.getByText('Policy', { exact: true })).toBeVisible();
   await expect(surface.getByText('disabled', { exact: true })).toBeVisible();
 });
 
-test('work surface shows actionable edge executor blocked state', async ({ page }) => {
+test('activity shows actionable execution-environment blocked state', async ({ page }) => {
   await mockChatApis(page, {
     workSurface: {
       sessionId: 'chat-e2e',
@@ -446,13 +486,13 @@ test('work surface shows actionable edge executor blocked state', async ({ page 
 
   await expect(surface.getByText('Run blocked')).toBeVisible();
   await expect(
-    surface.getByText("Error: executor 'MacBook Pro' is offline. Server fallback is disabled."),
+    surface.getByText('Execution environment is offline. Reconnect it or choose another environment.'),
   ).toBeVisible();
   await expect(surface.getByText('/Users/xupeng/github/astra').first()).toBeVisible();
-  await expect(surface.getByText('Fallback disabled')).toBeVisible();
+  await expect(surface.getByText('policy disabled')).toBeVisible();
 });
 
-test('work surface distinguishes transport disconnect from executor offline', async ({ page }) => {
+test('activity distinguishes transport disconnect from executor offline', async ({ page }) => {
   await mockChatApis(page, {
     workSurface: {
       sessionId: 'chat-e2e',
@@ -511,12 +551,14 @@ test('work surface distinguishes transport disconnect from executor offline', as
   const surface = await openWorkSurfaceIfNeeded(page);
 
   await expect(surface.getByText('Run blocked')).toBeVisible();
-  await expect(surface.getByText(/transport 'edge_ws' disconnected/)).toBeVisible();
-  await expect(surface.getByText('transport edge ws')).toBeVisible();
-  await expect(surface.getByText('Fallback disabled')).toBeVisible();
+  await expect(
+    surface.getByText('Execution connection disconnected. Reconnect it or retry after it recovers.'),
+  ).toBeVisible();
+  await expect(surface.getByText('connection edge ws')).toBeVisible();
+  await expect(surface.getByText('policy disabled')).toBeVisible();
 });
 
-test('agent cards expand into live child run details with executor metadata', async ({ page }) => {
+test('agent cards expand into live child run details with runtime metadata', async ({ page }) => {
   const workspace = {
     kind: 'edge_workspace',
     display_name: 'MacBook Pro',
@@ -576,6 +618,10 @@ test('agent cards expand into live child run details with executor metadata', as
       runId: 'child-run-e2e',
       sessionId: 'chat-e2e',
       status: 'running',
+      workspace,
+      executor,
+      transport: 'edge_ws',
+      fallbackPolicy: 'disabled',
       generatedAt: '2026-06-07T00:00:00.000Z',
       events: [
         {
@@ -606,8 +652,10 @@ test('agent cards expand into live child run details with executor metadata', as
   await expect(surface.getByText('live child review finding')).toBeVisible();
   await expect(surface.getByText('/Users/xupeng/github/astra').first()).toBeVisible();
   await expect(surface.getByText('MacBook Pro').first()).toBeVisible();
-  await expect(surface.getByText('transport edge ws').first()).toBeVisible();
-  await expect(surface.getByText('fallback disabled').first()).toBeVisible();
+  await expect(surface.getByText('Connection', { exact: true }).first()).toBeVisible();
+  await expect(surface.getByText('edge ws').first()).toBeVisible();
+  await expect(surface.getByText('Policy', { exact: true }).first()).toBeVisible();
+  await expect(surface.getByText('disabled').first()).toBeVisible();
 });
 
 test('manual scrollback is preserved when a deferred message is appended', async ({ page }) => {

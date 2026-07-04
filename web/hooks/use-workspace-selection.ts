@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getEdgeStatus, updateChatWorkspaceSelection } from "@/lib/api/chats";
+import { isNotFoundError } from "@/lib/api/errors";
 import type { ChatDetail, WorkspaceSelection } from "@/lib/api/types";
 import { useToast } from "@/components/ui/toast";
 
@@ -130,10 +131,10 @@ export function useWorkspaceSelection(params: UseWorkspaceSelectionParams) {
           storeWorkspaceSelectionState(detail.chat.id, previous);
           previousWorkspaceRef.current = previous;
           addToast(
-            `Workspace was not updated. ${
+            `Environment was not updated. ${
               error instanceof Error
                 ? error.message
-                : "Failed to persist workspace selection."
+                : "Failed to save the selected environment."
             }`,
             "warning",
           );
@@ -149,10 +150,14 @@ export function useWorkspaceSelection(params: UseWorkspaceSelectionParams) {
       const status = await getEdgeStatus();
       setEdgeWorkspaces(status.edges);
     } catch (error) {
+      if (isNotFoundError(error)) {
+        setEdgeWorkspaces([]);
+        return;
+      }
       setEdgeWorkspacesError(
         error instanceof Error
           ? error.message
-          : "Failed to load edge workspaces.",
+          : "Failed to load environments.",
       );
     } finally {
       setEdgeWorkspacesLoading(false);

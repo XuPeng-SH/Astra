@@ -1072,13 +1072,9 @@ function finalizeRunningToolForRunStatus(
   if (runStatus === "paused" || runStatus === "interrupted") {
     return {
       ...tool,
-      status: "error",
-      errorKind:
-        tool.errorKind ??
-        stringField(event, "error_kind") ??
-        stringField(event, "kind") ??
-        "interrupted",
-      result: tool.result ?? defaultRunFinishedToolMessage(runStatus),
+      status: "skipped",
+      errorKind: tool.errorKind,
+      result: tool.result ?? defaultRunPausedToolMessage(),
       finishedAt: tool.finishedAt ?? timestamp,
     };
   }
@@ -1158,10 +1154,11 @@ function defaultRunFinishedToolMessage(runStatus: string) {
   if (runStatus === "cancelled") {
     return "Stopped before this tool emitted a final transport result.";
   }
-  if (runStatus === "paused" || runStatus === "interrupted") {
-    return "Run paused before this tool emitted a final transport result.";
-  }
   return "Run failed before this tool emitted a final transport result.";
+}
+
+function defaultRunPausedToolMessage() {
+  return "No final tool event was observed before the run paused.";
 }
 
 function eventIsCancelled(event: Record<string, unknown>) {
@@ -1277,11 +1274,14 @@ function blockedStateFromEvent(
   executor?: ExecutorBinding,
 ): RunBlockedState {
   const reason = blockedReasonFromEvent(event) ?? "blocked";
-  const message =
+  const rawMessage =
     stringField(event, "message") ??
     stringField(event, "error") ??
-    stringifyMaybe(event.result) ??
-    blockedRunMessage(reason);
+    stringifyMaybe(event.result);
+  const message =
+    ACTIONABLE_BLOCKING_ERROR_KINDS.has(reason)
+      ? blockedRunMessage(reason)
+      : (rawMessage ?? blockedRunMessage(reason));
   return {
     reason,
     message,

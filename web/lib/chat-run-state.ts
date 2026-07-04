@@ -68,26 +68,25 @@ function activeRunDisplayLabel(
     return "Stopping";
   }
   if (status === "input-queued") {
-    const base = "Follow-up Queued";
+    const base = "Message Queued";
     if (lastQueuedText) {
       return `${base}: "${compactQueuedText(lastQueuedText)}"`;
     }
     return base;
   }
   if (status === "blocked") {
-    return waitingFor ? `Blocked: ${statusLabel(waitingFor)}` : "Blocked";
+    return waitingFor ? blockedRunLabel(waitingFor) : "Needs Attention";
   }
   if (waitingFor) {
-    const label = statusLabel(waitingFor);
     return isExecutionBoundaryWait(waitingFor)
-      ? `Blocked: ${label}`
-      : `Waiting: ${label}`;
+      ? blockedRunLabel(waitingFor)
+      : waitingRunLabel(waitingFor);
   }
   if (status === "waiting") {
     return "Waiting";
   }
   if (status === "running") {
-    return "Running";
+    return "Thinking";
   }
   if (status === "paused") {
     return "Paused";
@@ -96,6 +95,38 @@ function activeRunDisplayLabel(
     return statusLabel(status);
   }
   return statusLabel(run.status);
+}
+
+function blockedRunLabel(reason: string): string {
+  switch (reason) {
+    case "executor_offline":
+    case "transport_disconnected":
+      return "Environment Offline";
+    case "fallback_disabled":
+    case "workspace_executor_unavailable":
+    case "workspace_path_mismatch":
+      return "Needs File Environment";
+    default:
+      return "Needs Attention";
+  }
+}
+
+function waitingRunLabel(reason: string): string {
+  switch (reason) {
+    case "tool_approval":
+    case "approval":
+      return "Waiting for Approval";
+    case "user_input":
+      return "Waiting for You";
+    case "user_resume":
+      return "Paused";
+    case "task_board_intervention":
+      return "Task Needs Direction";
+    default: {
+      const label = statusLabel(reason);
+      return label ? `Waiting for ${label}` : "Waiting";
+    }
+  }
 }
 
 export type ChatRunUiState = {
@@ -108,6 +139,7 @@ export type ChatRunUiState = {
   composerDisabled: boolean;
   composerPlaceholder: string;
   activeRunLabel: string;
+  taskBoardIntervention: boolean;
 };
 
 export function deriveChatRunUiState(params: {
@@ -120,7 +152,10 @@ export function deriveChatRunUiState(params: {
   lastQueuedText?: string;
 }): ChatRunUiState {
   const activeRunStatus = normalizeChatRunStatus(params.activeRun?.status);
+  const waitingFor = params.activeRun?.waitingFor?.trim() ?? null;
   const hasActiveRun = Boolean(params.activeRun?.runId && activeRunStatus);
+  const taskBoardIntervention =
+    activeRunStatus === "paused" && waitingFor === "task_board_intervention";
   const canQueueDeferredInput = Boolean(
     hasActiveRun &&
     activeRunStatus &&
@@ -145,14 +180,16 @@ export function deriveChatRunUiState(params: {
     activeRunStatus === "cancelling" ||
     activeRunBlocksNewInput;
   const composerPlaceholder =
-    activeRunStatus === "paused"
-      ? "Run paused. Resume or stop it to continue."
+    taskBoardIntervention
+      ? "Task needs direction before continuing."
+      : activeRunStatus === "paused"
+        ? "Paused. Continue or close this run."
       : activeRunStatus === "cancelling"
-        ? "Stopping current run..."
+        ? "Stopping..."
         : activeRunBlocksNewInput
-          ? `Run status is ${params.activeRun?.status ?? "unknown"}. Stop it or refresh before sending.`
+          ? "Astra is busy. Stop it or wait to continue."
           : canQueueDeferredInput
-            ? "Queue a follow-up for the next execution boundary..."
+            ? "Message Astra while it works..."
             : "Reply to Astra...";
   const activeRunLabel = activeRunDisplayLabel(
     params.activeRun,
@@ -170,6 +207,7 @@ export function deriveChatRunUiState(params: {
     composerDisabled,
     composerPlaceholder,
     activeRunLabel,
+    taskBoardIntervention,
   };
 }
 

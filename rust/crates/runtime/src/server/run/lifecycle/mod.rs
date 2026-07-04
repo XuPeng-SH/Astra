@@ -1831,38 +1831,44 @@ impl AgenticRunLifecycleService {
         };
         mgr.set_trace_id(run_id.to_string());
 
-        let mut restored_messages = Vec::new();
+        let restored_messages;
 
+        let mut csl_reusable = true;
         match mgr.load().await {
             Ok(Some(mat)) => {
                 restored_messages = mat.messages;
                 restore_session_state_compact(mat.session_state, loop_state);
             }
             Ok(None) => {
-                self.record_runtime_retrieval_degrade(
-                    user_id,
-                    session_id,
-                    run_id,
-                    RetrievalStage::Structured,
-                    "timeout",
-                )
-                .await;
-                self.record_runtime_retrieval_degrade(
-                    user_id,
-                    session_id,
-                    run_id,
-                    RetrievalStage::Fts,
-                    "empty",
-                )
-                .await;
-                self.record_runtime_retrieval_degrade(
-                    user_id,
-                    session_id,
-                    run_id,
-                    RetrievalStage::Vector,
-                    "stale",
-                )
-                .await;
+                restored_messages = self
+                    .restore_transcript_prompt_messages(user_id, session_id, run_id, "csl_empty")
+                    .await;
+                if restored_messages.is_empty() {
+                    self.record_runtime_retrieval_degrade(
+                        user_id,
+                        session_id,
+                        run_id,
+                        RetrievalStage::Structured,
+                        "timeout",
+                    )
+                    .await;
+                    self.record_runtime_retrieval_degrade(
+                        user_id,
+                        session_id,
+                        run_id,
+                        RetrievalStage::Fts,
+                        "empty",
+                    )
+                    .await;
+                    self.record_runtime_retrieval_degrade(
+                        user_id,
+                        session_id,
+                        run_id,
+                        RetrievalStage::Vector,
+                        "stale",
+                    )
+                    .await;
+                }
             }
             Err(e) => {
                 tracing::warn!(
@@ -1878,18 +1884,135 @@ impl AgenticRunLifecycleService {
                     "timeout",
                 )
                 .await;
+                restored_messages = self
+                    .restore_transcript_prompt_messages(
+                        user_id,
+                        session_id,
+                        run_id,
+                        "csl_load_failed",
+                    )
+                    .await;
+                csl_reusable = matches!(
+                    e,
+                    astra_turn_core::conversation_log::CslStoreError::Serde(_)
+                        | astra_turn_core::conversation_log::CslStoreError::Materialize(_)
+                );
+                if csl_reusable && let Err(reset_error) = mgr.reset().await {
+                    tracing::warn!(
+                        session_id,
+                        run_id,
+                        error = %reset_error,
+                        "CSL reset failed after corrupted log; transcript fallback will not persist CSL this turn"
+                    );
+                    csl_reusable = false;
+                }
             }
         }
 
-        if !restored_messages.is_empty() {
-            if !loop_state.messages.is_empty() {
-                restored_messages.push(loop_state.messages.remove(0));
+        let turn_start_message_count =
+            Self::restore_csl_messages_into_loop_state(restored_messages, loop_state);
+        if !csl_reusable {
+            return None;
+        }
+        mgr.mark_turn_start(turn_start_message_count);
+        Some(mgr)
+    }
+
+    async fn restore_transcript_prompt_messages(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        reason: &'static str,
+    ) -> Vec<Value> {
+        let Some(pool) = self.shared_pool.as_ref() else {
+            return Vec::new();
+        };
+        let rows = match sqlx::query(
+            "SELECT role, content FROM session_transcript_items \
+             WHERE session_id = ? AND user_id = ? ORDER BY item_seq",
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .fetch_all(pool.get())
+        .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::warn!(
+                    session_id,
+                    run_id,
+                    reason,
+                    error = %error,
+                    "transcript prompt-history restore failed"
+                );
+                return Vec::new();
             }
+        };
+
+        let mut messages = Vec::with_capacity(rows.len());
+        for row in rows {
+            let role = match row.try_get::<String, _>("role") {
+                Ok(role) => role,
+                Err(error) => {
+                    tracing::warn!(
+                        session_id,
+                        run_id,
+                        reason,
+                        error = %error,
+                        "transcript prompt-history restore skipped row with invalid role"
+                    );
+                    continue;
+                }
+            };
+            if !matches!(role.as_str(), "user" | "assistant" | "system") {
+                continue;
+            }
+            let content = match row.try_get::<String, _>("content") {
+                Ok(content) => content,
+                Err(error) => {
+                    tracing::warn!(
+                        session_id,
+                        run_id,
+                        reason,
+                        error = %error,
+                        "transcript prompt-history restore skipped row with invalid content"
+                    );
+                    continue;
+                }
+            };
+            if content.trim().is_empty() {
+                continue;
+            }
+            messages.push(json!({
+                "role": role,
+                "content": content,
+            }));
+        }
+
+        let messages = astra_turn_core::prompt_facing::sanitize_prompt_facing_messages(messages);
+        if !messages.is_empty() {
+            tracing::warn!(
+                session_id,
+                run_id,
+                reason,
+                message_count = messages.len(),
+                "restored prompt history from transcript because CSL was unavailable"
+            );
+        }
+        messages
+    }
+
+    fn restore_csl_messages_into_loop_state(
+        mut restored_messages: Vec<Value>,
+        loop_state: &mut AgenticLoopState,
+    ) -> usize {
+        let turn_start_message_count = restored_messages.len();
+        if !restored_messages.is_empty() {
+            restored_messages.append(&mut loop_state.messages);
             loop_state.messages = restored_messages;
         }
-
-        mgr.mark_turn_start(loop_state.messages.len());
-        Some(mgr)
+        turn_start_message_count
     }
 
     async fn record_runtime_retrieval_degrade(
@@ -2193,7 +2316,44 @@ impl AgenticRunLifecycleService {
             match loop_outcome {
                 Ok(AgenticLoopOutcome::Completed) => {
                     if let Some(interruption) = loop_state.interruption.as_ref() {
-                        let interruption_json = interruption.to_json();
+                        let task_board_snapshot = loop_state.hooks.task_board_snapshot.clone();
+                        let task_board_unfinished =
+                            task_board_snapshot.has_completion_blocking_tasks();
+                        let waiting_for = if task_board_unfinished {
+                            Some("task_board_intervention".to_string())
+                        } else if matches!(
+                            interruption.resume_action,
+                            astra_turn_core::interruption::ResumeAction::RequiresIntervention { .. }
+                                | astra_turn_core::interruption::ResumeAction::StartNewSession
+                        ) {
+                            Some("user_intervention".to_string())
+                        } else {
+                            None
+                        };
+                        let mut interruption_json = interruption.to_json();
+                        if let Some(obj) = interruption_json.as_object_mut() {
+                            if let Some(waiting_for) = waiting_for.as_ref() {
+                                obj.insert(
+                                    "waiting_for".to_string(),
+                                    Value::String(waiting_for.clone()),
+                                );
+                            }
+                            if task_board_unfinished {
+                                obj.insert(
+                                    "task_board".to_string(),
+                                    json!({
+                                        "summary": task_board_snapshot.short_summary(),
+                                        "tracked_count": task_board_snapshot.tracked_count,
+                                        "pending_count": task_board_snapshot.pending_count,
+                                        "in_progress_count": task_board_snapshot.in_progress_count,
+                                        "paused_count": task_board_snapshot.paused_count,
+                                        "blocked_count": task_board_snapshot.blocked_count,
+                                        "terminal_non_success_count": task_board_snapshot.terminal_non_success_count,
+                                        "active_tasks": task_board_snapshot.active_tasks,
+                                    }),
+                                );
+                            }
+                        }
                         if !loop_state.final_text.is_empty() {
                             events.push(json!({
                                 "event_type": "text_done",
@@ -2213,11 +2373,14 @@ impl AgenticRunLifecycleService {
                         finished["interruption_kind"] =
                             Value::String(interruption.kind.label().to_string());
                         finished["resumable"] = Value::Bool(interruption.kind.is_resumable());
+                        if let Some(waiting_for) = waiting_for.as_ref() {
+                            finished["waiting_for"] = Value::String(waiting_for.clone());
+                        }
                         events.push(json!({
                             "event_type": "run_finished",
                             "data": finished,
                         }));
-                        (RunStatus::Paused, Some(interruption.user_message.clone()))
+                        (RunStatus::Paused, waiting_for)
                     } else {
                         if !loop_state.final_text.is_empty() {
                             events.push(json!({
@@ -2842,6 +3005,7 @@ impl AgenticRunLifecycleService {
     fn build_runtime_manifest(
         request: &ChatRequestData,
         runtime_capabilities: &PreparedRuntimeCapabilities,
+        workspace_executor_admitted: bool,
     ) -> Option<Value> {
         let selected_model = request.selected_model.as_ref()?;
         let selected_model_json = json!({
@@ -2881,7 +3045,13 @@ impl AgenticRunLifecycleService {
                 "attachments": &request.attachments,
                 "edge_executor_id": &request.edge_executor_id,
                 "capabilities": &request.capabilities,
+                "requested_capabilities": &request.capabilities,
                 "context": turn_context
+            },
+            "capacity_resolution": {
+                "requested_capabilities": &request.capabilities,
+                "workspace_executor_admitted": workspace_executor_admitted,
+                "server_builtin_surface": "server_service_control_plane_only"
             }
         });
 
@@ -4571,8 +4741,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             runs.insert(run_id.clone(), run_state);
         }
 
-        // Provision workspace early so build_initial_state and durable
-        // run_started metadata use the same execution boundary.
+        // Provision explicit workspace bindings early so build_initial_state
+        // and durable run_started metadata use the same execution boundary.
         let cloud_workspace_record = match self
             .provision_cloud_workspace_record(&user_id, &session_id, &request, &run_id)
             .await
@@ -4621,13 +4791,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     ExecutionBindingSnapshot::inferred(workspace, executor)
                 })
             });
-        let tool_runtime_workspace = if let Some(workspace) = cloud_workspace.clone() {
-            Some(workspace)
-        } else if let Some(workspace) = server_workspace.clone() {
-            Some(workspace)
-        } else if (server_side_tool_catalog || requires_runtime_mcp_executor)
-            && execution_bindings.is_some()
+        let tool_runtime_workspace = cloud_workspace.clone().or_else(|| server_workspace.clone());
+        let server_tool_executor_workspace = if let Some(workspace) = tool_runtime_workspace.clone()
         {
+            Some(workspace)
+        } else if !agent_binding_mode || requires_runtime_mcp_executor {
             match self.provision_server_workspace(&session_id) {
                 Ok(workspace) => Some(workspace),
                 Err(error) => {
@@ -4638,6 +4806,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         } else {
             None
         };
+        let _ = server_side_tool_catalog;
 
         if let Err(error) = self
             .persist_run_start(
@@ -4719,7 +4888,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             runtime_capabilities.agent_binding.as_ref(),
         );
         loop_state.context_manifest_user_id = Some(user_id.clone());
-        loop_state.runtime_manifest = Self::build_runtime_manifest(&request, &runtime_capabilities);
+        loop_state.runtime_manifest = Self::build_runtime_manifest(
+            &request,
+            &runtime_capabilities,
+            tool_runtime_workspace.is_some(),
+        );
         // Inject user_id into the harness sink used by DB-persistence tests.
         #[cfg(feature = "harness")]
         loop_state.harness.set_user_id(&user_id);
@@ -4783,7 +4956,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // such as `agent`. For edge-bound runs this workspace is only an
         // internal runtime scratch dir; execution routing still follows the
         // explicit workspace/executor binding and cannot silently fall back.
-        if let Some(workspace) = tool_runtime_workspace {
+        if let Some(workspace) = server_tool_executor_workspace {
             let memoria_base = Some(astra_core::MemoriaSettings::from_env().base_url);
             let task_store = match astra_tools::task_mgmt_matrixone::select_task_store(
                 self.shared_pool.as_ref().map(|p| p.get().clone()),
@@ -5416,8 +5589,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             request.runtime_system_prompt.as_deref(),
         );
 
-        // Provision workspace early for web-agent mode (no edge tools) so
-        // build_initial_state loads stop hooks from the provisioned directory.
+        // Provision explicit workspace bindings early so build_initial_state
+        // and durable run_started metadata use the same execution boundary.
         let cloud_workspace_record = self
             .provision_cloud_workspace_record(&user_id, &session_id, &request, &run_id)
             .await?;
@@ -5455,21 +5628,20 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     ExecutionBindingSnapshot::inferred(workspace, executor)
                 })
             });
-        let stream_agent_spawner = self
-            .server_agent_spawner_for_session(&session_id)
-            .await
-            .spawner;
-        let tool_runtime_workspace = if let Some(workspace) = cloud_workspace.clone() {
-            Some(workspace)
-        } else if let Some(workspace) = server_workspace.clone() {
-            Some(workspace)
-        } else if (server_side_tool_catalog || requires_runtime_mcp_executor)
-            && execution_bindings.is_some()
+        let tool_runtime_workspace = cloud_workspace.clone().or_else(|| server_workspace.clone());
+        let server_tool_executor_workspace = if let Some(workspace) = tool_runtime_workspace.clone()
         {
+            Some(workspace)
+        } else if !agent_binding_mode || requires_runtime_mcp_executor {
             Some(self.provision_server_workspace(&session_id)?)
         } else {
             None
         };
+        let _ = server_side_tool_catalog;
+        let stream_agent_spawner = self
+            .server_agent_spawner_for_session(&session_id)
+            .await
+            .spawner;
 
         // Create bounded live channels. If a client cannot keep up, the host
         // detaches that live stream without cancelling the server-side run.
@@ -5519,7 +5691,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             runtime_capabilities.agent_binding.as_ref(),
         );
         state.context_manifest_user_id = Some(user_id.clone());
-        state.runtime_manifest = Self::build_runtime_manifest(&request, &runtime_capabilities);
+        state.runtime_manifest = Self::build_runtime_manifest(
+            &request,
+            &runtime_capabilities,
+            tool_runtime_workspace.is_some(),
+        );
         // Inject user_id into the harness sink used by DB-persistence tests.
         #[cfg(feature = "harness")]
         state.harness.set_user_id(&user_id);
@@ -5714,7 +5890,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // server tool catalog. For edge-bound runs this uses an internal
         // scratch workspace only; the visible binding still routes local-code
         // tools to edge or blocks when edge is unavailable.
-        if let Some(workspace) = tool_runtime_workspace {
+        if let Some(workspace) = server_tool_executor_workspace {
             let memoria_base = Some(astra_core::MemoriaSettings::from_env().base_url);
             let task_store = match astra_tools::task_mgmt_matrixone::select_task_store(
                 self.shared_pool.as_ref().map(|p| p.get().clone()),

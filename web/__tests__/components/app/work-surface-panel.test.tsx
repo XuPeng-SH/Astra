@@ -40,7 +40,7 @@ describe("WorkSurfacePanel", () => {
       />,
     );
 
-    expect(screen.getByText("Running")).toBeInTheDocument();
+    expect(screen.getByText("Thinking")).toBeInTheDocument();
     expect(screen.queryByText("Run running")).not.toBeInTheDocument();
   });
 
@@ -188,7 +188,7 @@ describe("WorkSurfacePanel", () => {
     expect(screen.getAllByText("read_file").length).toBeGreaterThan(0);
   });
 
-  it("orders subagent cards by most recent update and opens the latest details", async () => {
+  it("keeps subagent card order stable while opening latest details", async () => {
     const loadAgentRun = vi.fn().mockResolvedValue({
       runId: "run-new",
       sessionId: "session-1",
@@ -261,20 +261,24 @@ describe("WorkSurfacePanel", () => {
       />,
     );
 
-    const latest = await screen.findByText("Latest review");
     const older = screen.getByText("Older investigation");
+    const latest = await screen.findByText("Latest review");
     expect(
-      latest.compareDocumentPosition(older) & Node.DOCUMENT_POSITION_FOLLOWING,
+      older.compareDocumentPosition(latest) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
-    expect(screen.getByText("Live output")).toBeInTheDocument();
-    expect(screen.getAllByText("latest card live output").length).toBeGreaterThan(0);
-    expect(screen.getByText("Executor")).toBeInTheDocument();
+    expect(screen.getAllByText("Output").length).toBeGreaterThan(0);
+    expect(
+      screen.getAllByText("latest card live output").length,
+    ).toBeGreaterThan(0);
+    expect(screen.getByText("Runtime")).toBeInTheDocument();
     expect(screen.getAllByText("MacBook Pro").length).toBeGreaterThan(0);
-    expect(screen.getByText("Workspace")).toBeInTheDocument();
-    expect(screen.getByText("/Users/xupeng/github/astra")).toBeInTheDocument();
-    expect(screen.getByText("Transport")).toBeInTheDocument();
+    expect(screen.getByText("Files")).toBeInTheDocument();
+    expect(
+      screen.getAllByText("/Users/xupeng/github/astra").length,
+    ).toBeGreaterThan(0);
+    expect(screen.getByText("Connection")).toBeInTheDocument();
     expect(screen.getByText("edge ws")).toBeInTheDocument();
-    expect(screen.getByText("Fallback")).toBeInTheDocument();
+    expect(screen.getByText("Policy")).toBeInTheDocument();
     expect(screen.getByText("disabled")).toBeInTheDocument();
     await waitFor(() => {
       expect(loadAgentRun).toHaveBeenCalledWith("run-new");
@@ -358,13 +362,15 @@ describe("WorkSurfacePanel", () => {
       />,
     );
 
-    expect(screen.getByText("workspace executor unavailable")).toBeInTheDocument();
+    expect(screen.getByText("Needs file environment")).toBeInTheDocument();
     expect(
       screen.getByText(
-        "Workspace executor unavailable. Choose Server sandbox or a connected edge workspace.",
+        "This request needs a file or command environment. Connect one or choose a sandbox, then retry.",
       ),
     ).toBeInTheDocument();
-    expect(screen.getByText("Orchestrator-managed executor")).toBeInTheDocument();
+    expect(
+      screen.getByText("Orchestrator-managed executor"),
+    ).toBeInTheDocument();
     expect(screen.getByText("/checkout/repo")).toBeInTheDocument();
   });
 
@@ -409,7 +415,7 @@ describe("WorkSurfacePanel", () => {
       />,
     );
 
-    expect(await screen.findByText("Live output")).toBeInTheDocument();
+    await screen.findAllByText("Output");
     expect(
       screen.getAllByText("child review result: no critical issues").length,
     ).toBeGreaterThan(0);

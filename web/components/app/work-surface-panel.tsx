@@ -273,8 +273,8 @@ export function WorkSurfacePanel({
           onClick={toggleWorkSurface}
           aria-label={
             collapsed
-              ? "Expand work surface (Ctrl+T)"
-              : "Collapse work surface (Ctrl+T)"
+              ? "Expand activity panel (Ctrl+T)"
+              : "Collapse activity panel (Ctrl+T)"
           }
         >
           <ChevronRight
@@ -285,7 +285,7 @@ export function WorkSurfacePanel({
           <div className="flex items-center gap-2">
             <ClipboardList className="size-4 text-accent" />
             <h2 className="truncate text-sm font-semibold text-text">
-              Work Surface
+              Activity
             </h2>
             <span className="ml-auto hidden rounded-control border border-border/40 px-2 py-0.5 text-[11px] text-text-muted lg:inline-flex">
               Ctrl+T
@@ -295,7 +295,7 @@ export function WorkSurfacePanel({
             {visibleRunStatus
               ? runStatusHeadline(visibleRunStatus)
               : state.hydrated
-                ? "Session projection"
+                ? "Session activity"
                 : "Waiting for session"}
           </p>
         </div>
@@ -303,7 +303,7 @@ export function WorkSurfacePanel({
           type="button"
           className="inline-flex size-8 items-center justify-center rounded-control text-text-muted transition hover:bg-surface-muted hover:text-text"
           onClick={onRefresh}
-          aria-label="Refresh work surface"
+          aria-label="Refresh activity"
         >
           <RotateCw className={cn("size-4", state.loading && "animate-spin")} />
         </button>
@@ -311,13 +311,12 @@ export function WorkSurfacePanel({
           type="button"
           className="inline-flex size-8 items-center justify-center rounded-control text-text-muted transition hover:bg-surface-muted hover:text-text lg:hidden"
           onClick={() => setMobileOpen(false)}
-          aria-label="Close work surface"
+          aria-label="Close activity"
         >
           <X className="size-4" />
         </button>
       </div>
 
-      <BindingStrip state={state} />
       <RunBlockedBanner blocked={state.blocked} />
 
       <div className="flex shrink-0 border-b border-border/70 px-2 py-2">
@@ -400,7 +399,7 @@ export function WorkSurfacePanel({
         onClick={() => setMobileOpen(true)}
       >
         <ClipboardList className="size-4" />
-        Work
+        Activity
       </button>
       <aside
         className={cn(
@@ -413,11 +412,11 @@ export function WorkSurfacePanel({
             type="button"
             className="flex h-full w-full flex-col items-center gap-3 py-4 text-text-muted transition hover:bg-surface-muted/60 hover:text-text"
             onClick={toggleWorkSurface}
-            aria-label="Expand work surface (Ctrl+T)"
+            aria-label="Expand activity panel (Ctrl+T)"
           >
             <ClipboardList className="size-5" />
             <span className="[writing-mode:vertical-rl] text-xs font-medium">
-              Work
+              Activity
             </span>
             <span className="text-[11px] text-text-muted">Ctrl+T</span>
           </button>
@@ -430,7 +429,7 @@ export function WorkSurfacePanel({
           <button
             type="button"
             className="absolute inset-0 bg-black/20"
-            aria-label="Close work surface"
+            aria-label="Close activity"
             onClick={() => setMobileOpen(false)}
           />
           <aside className="absolute inset-y-0 right-0 flex w-[min(100vw,390px)] flex-col border-l border-border bg-surface shadow-2xl">
@@ -665,9 +664,9 @@ function AgentBoard({
   if (!agents.length) {
     return <EmptySurface loading={loading} label="No subagent activity yet" />;
   }
-  const sorted = [...agents].sort(
-    (left, right) => right.updatedAt - left.updatedAt,
-  );
+  // Preserve projection order while live events stream in. Sorting by
+  // updatedAt makes concurrently running agent cards jump on every event.
+  const sorted = agents;
   return (
     <div className="space-y-2.5">
       {sorted.map((agent) => (
@@ -702,33 +701,32 @@ function AgentCard({
   const progress =
     agent.turn && agent.maxTurns
       ? Math.min(100, Math.round((agent.turn / agent.maxTurns) * 100))
-      : active
-        ? 35
-        : agent.status === "completed"
-          ? 100
-          : 0;
+      : undefined;
   const summary = agent.resultSummary ?? agent.error ?? agent.reason;
   const latestEvent = agent.events?.[agent.events.length - 1];
+  const title = agent.description || agent.agentType || "Subagent";
+  const metaItems = agentCompactMeta(agent);
   return (
     <section
       className={cn(
-        "rounded-card border bg-bg shadow-sm transition-colors",
+        "overflow-hidden rounded-card border bg-bg shadow-sm transition-colors",
+        selected ? "ring-1 ring-accent/25" : "",
         active
-          ? "border-accent/35 bg-accent/5"
+          ? "border-accent/30"
           : failed
-            ? "border-danger/25 bg-danger/5"
+            ? "border-danger/25"
             : "border-border/70",
       )}
     >
       <button
         type="button"
-        className="flex w-full items-start gap-3 p-3 text-left"
+        className="group flex w-full items-start gap-3 p-3 text-left transition-colors hover:bg-surface/70"
         onClick={onSelect}
         aria-expanded={selected}
       >
         <div
           className={cn(
-            "flex size-9 shrink-0 items-center justify-center rounded-control border",
+            "mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-full border",
             active
               ? "border-accent/25 bg-accent/10 text-accent"
               : failed
@@ -742,84 +740,85 @@ function AgentCard({
             <Bot className="size-4" />
           )}
         </div>
-        <div className="min-w-0 flex-1 space-y-2">
-          <div className="flex items-start gap-2">
-            <div className="min-w-0 flex-1">
-              <h3 className="truncate text-sm font-semibold text-text">
-                {agent.agentType ?? agent.agentId}
+        <div className="min-w-0 flex-1">
+          <div className="flex min-w-0 items-start gap-2">
+            <div className="min-w-0 flex-1 space-y-1">
+              <h3 className="line-clamp-2 text-sm font-semibold leading-5 text-text">
+                {title}
               </h3>
-              <p className="mt-0.5 truncate font-mono text-[11px] text-text-muted">
-                {agent.agentId}
-              </p>
+              <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-text-muted">
+                {agent.agentType ? (
+                  <span>{statusLabel(agent.agentType)}</span>
+                ) : null}
+                {metaItems.map((item) => (
+                  <span key={item} className="min-w-0 max-w-full truncate">
+                    {item}
+                  </span>
+                ))}
+              </div>
             </div>
-            <StatusPill status={agent.status} active={active} />
+            <div className="flex shrink-0 items-center gap-1.5">
+              <StatusPill status={agent.status} active={active} />
+              <ChevronRight
+                className={cn(
+                  "size-4 text-text-muted transition-transform",
+                  selected ? "rotate-90" : "group-hover:translate-x-0.5",
+                )}
+              />
+            </div>
           </div>
-          {agent.description ? (
-            <p className="line-clamp-2 text-xs leading-5 text-text-secondary">
-              {agent.description}
-            </p>
+          {latestEvent ? (
+            <div className="mt-2 flex min-w-0 items-center gap-1.5 rounded-[6px] bg-surface-muted/70 px-2 py-1.5 text-xs text-text-secondary">
+              {active ? <MiniLiveDots className="shrink-0" /> : null}
+              <span
+                className={cn(
+                  "shrink-0 text-[11px] font-medium",
+                  failed
+                    ? "text-danger"
+                    : active
+                      ? "text-accent"
+                      : "text-text-muted",
+                )}
+              >
+                {latestEvent.tone === "danger" ? "Issue" : "Latest"}
+              </span>
+              <span className="min-w-0 flex-1 truncate">
+                {latestEvent.label}
+              </span>
+            </div>
+          ) : active ? (
+            <div className="mt-2 flex min-w-0 items-center gap-1.5 rounded-[6px] bg-surface-muted/70 px-2 py-1.5 text-xs text-text-muted">
+              <MiniLiveDots className="shrink-0" />
+              <span>
+                {agent.toolName
+                  ? `Running ${agent.toolName}`
+                  : "Waiting for subagent progress"}
+              </span>
+            </div>
           ) : null}
-          <AgentExecutionMeta agent={agent} />
-          <div className="h-1.5 overflow-hidden rounded-full bg-surface-muted">
-            <div
-              className={cn(
-                "h-full rounded-full transition-all duration-500",
-                failed
-                  ? "bg-danger"
-                  : agent.status === "completed"
-                    ? "bg-success"
-                    : "bg-accent",
-              )}
-              style={{ width: `${Math.max(active ? 8 : 0, progress)}%` }}
-            />
-          </div>
-          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-text-muted">
-            {latestEvent ? (
-              <span className="inline-flex min-w-0 max-w-full items-center gap-1 text-accent">
-                {active ? <MiniLiveDots /> : null}
-                <span className="truncate">{latestEvent.label}</span>
-              </span>
-            ) : null}
-            {agent.turn ? (
-              <span>
-                Turn {agent.turn}
-                {agent.maxTurns ? `/${agent.maxTurns}` : ""}
-              </span>
-            ) : null}
-            {agent.toolName ? (
-              <span className="inline-flex items-center gap-1">
-                <Wrench className="size-3" />
-                {agent.toolName}
-              </span>
-            ) : null}
-            {agent.totalToolCalls ? (
-              <span>{agent.totalToolCalls} tools</span>
-            ) : null}
-            {agent.totalPromptTokens || agent.totalCompletionTokens ? (
-              <span>
-                {(agent.totalPromptTokens ?? 0) +
-                  (agent.totalCompletionTokens ?? 0)}{" "}
-                tokens
-              </span>
-            ) : null}
-            {agent.durationMs ? (
-              <span>{formatDuration(agent.durationMs)}</span>
-            ) : null}
-          </div>
+          {progress !== undefined ? (
+            <div className="mt-2 h-1 overflow-hidden rounded-full bg-surface-muted">
+              <div
+                className={cn(
+                  "h-full rounded-full transition-all duration-500",
+                  failed
+                    ? "bg-danger"
+                    : agent.status === "completed"
+                      ? "bg-success"
+                      : "bg-accent",
+                )}
+                style={{ width: `${Math.max(active ? 8 : 0, progress)}%` }}
+              />
+            </div>
+          ) : null}
           {summary ? (
             <p
               className={cn(
-                "line-clamp-3 text-xs leading-5",
+                "mt-2 line-clamp-2 text-xs leading-5",
                 failed ? "text-danger" : "text-text-muted",
               )}
             >
               {summary}
-            </p>
-          ) : active ? (
-            <p className="text-xs leading-5 text-text-muted">
-              {agent.toolName
-                ? `Running ${agent.toolName}`
-                : "Waiting for subagent progress"}
             </p>
           ) : null}
         </div>
@@ -829,6 +828,34 @@ function AgentCard({
       ) : null}
     </section>
   );
+}
+
+function agentCompactMeta(agent: AgentSurfaceItem) {
+  const items: string[] = [];
+  if (agent.turn) {
+    items.push(
+      `Turn ${agent.turn}${agent.maxTurns ? `/${agent.maxTurns}` : ""}`,
+    );
+  }
+  if (agent.toolName) {
+    items.push(agent.toolName);
+  }
+  if (agent.totalToolCalls) {
+    items.push(`${agent.totalToolCalls} tools`);
+  }
+  if (agent.totalPromptTokens || agent.totalCompletionTokens) {
+    items.push(
+      `${(agent.totalPromptTokens ?? 0) + (agent.totalCompletionTokens ?? 0)} tokens`,
+    );
+  }
+  if (agent.durationMs) {
+    items.push(formatDuration(agent.durationMs));
+  }
+  const runtime = executorMetaValue(agent.executor, agent.workspace);
+  if (runtime) {
+    items.push(runtime);
+  }
+  return items;
 }
 
 function AgentDetails({
@@ -843,19 +870,8 @@ function AgentDetails({
   const updated = new Date(agent.updatedAt);
   const active = isAgentActive(agent.status);
   const ids = [
-    ["Agent", agent.agentId],
-    ["Run", agent.runId],
-    ["Parent", agent.parentRunId],
-    [
-      "Workspace",
-      agent.workspace
-        ? (agent.workspace.cwd ?? workspaceDisplayName(agent.workspace))
-        : undefined,
-    ],
-    [
-      "Executor",
-      agent.executor ? executorDisplayName(agent.executor) : undefined,
-    ],
+    ["Files", workspaceMetaValue(agent.workspace)],
+    ["Runtime", executorMetaValue(agent.executor, agent.workspace)],
   ].filter((entry): entry is [string, string] => Boolean(entry[1]));
   return (
     <div className="border-t border-border/60 px-3 pb-3 pt-2">
@@ -908,11 +924,11 @@ function AgentDetails({
 
 function AgentExecutionMeta({ agent }: { agent: AgentSurfaceItem }) {
   const items = [
-    agent.executor ? executorDisplayName(agent.executor) : undefined,
-    agent.workspace?.cwd,
-    agent.transport ? `transport ${statusLabel(agent.transport)}` : undefined,
+    executorMetaValue(agent.executor, agent.workspace),
+    workspaceMetaValue(agent.workspace),
+    agent.transport ? `connection ${statusLabel(agent.transport)}` : undefined,
     agent.fallbackPolicy
-      ? `fallback ${statusLabel(agent.fallbackPolicy)}`
+      ? `policy ${statusLabel(agent.fallbackPolicy)}`
       : undefined,
   ].filter((item): item is string => Boolean(item));
   if (!items.length) {
@@ -936,7 +952,14 @@ function AgentLiveEvents({
   events: NonNullable<AgentSurfaceItem["events"]>;
   active: boolean;
 }) {
-  const recent = [...events].slice(-8).reverse();
+  const recent = events
+    .filter(
+      (event) =>
+        event.type !== "agent_live_event:output_delta" &&
+        event.type !== "agent_live_event:thinking_delta",
+    )
+    .slice(-8)
+    .reverse();
   const transcript = agentLiveTranscript(events);
   return (
     <div className="rounded-[8px] border border-border/60 bg-surface/50 p-2.5">
@@ -948,14 +971,7 @@ function AgentLiveEvents({
         {active ? <MiniLiveDots className="shrink-0" /> : null}
       </div>
       {transcript ? (
-        <div className="mb-2 rounded-[7px] border border-border/60 bg-bg px-2.5 py-2">
-          <div className="mb-1 text-[10px] font-semibold uppercase text-text-muted">
-            {transcript.label}
-          </div>
-          <div className="max-h-40 overflow-y-auto whitespace-pre-wrap break-words font-mono text-[11px] leading-5 text-text">
-            {transcript.detail}
-          </div>
-        </div>
+        <AgentTranscriptCard transcript={transcript} active={active} />
       ) : null}
       {recent.length ? (
         <div className="space-y-2">
@@ -973,7 +989,67 @@ function AgentLiveEvents({
   );
 }
 
-function agentLiveTranscript(events: NonNullable<AgentSurfaceItem["events"]>) {
+function AgentTranscriptCard({
+  transcript,
+  active,
+}: {
+  transcript: AgentLiveTranscript;
+  active: boolean;
+}) {
+  const [open, setOpen] = useState(active);
+  return (
+    <div className="mb-2">
+      <button
+        type="button"
+        className="group -ml-1 flex w-full min-w-0 items-center gap-2 rounded-[6px] px-1 py-1 text-left transition hover:text-text"
+        aria-expanded={open}
+        aria-label={`${transcript.label}: ${transcript.preview}`}
+        onClick={() => setOpen((value) => !value)}
+      >
+        <span className="inline-flex shrink-0 items-center gap-1.5 text-[11px] font-semibold text-text-secondary">
+          {active && transcript.kind === "thinking" ? (
+            <span className="size-1.5 animate-pulse rounded-full bg-accent" />
+          ) : null}
+          {transcript.label}
+        </span>
+        <span className="min-w-0 flex-1 truncate text-[11px] leading-4 text-text-muted">
+          {transcript.preview}
+        </span>
+        <ChevronRight
+          className={cn(
+            "size-3.5 shrink-0 text-text-muted transition-transform group-hover:text-text-secondary",
+            open && "rotate-90",
+          )}
+        />
+      </button>
+      <div
+        className={cn(
+          "grid transition-[grid-template-rows] duration-200 ease-out",
+          open ? "grid-rows-[1fr]" : "grid-rows-[0fr]",
+        )}
+      >
+        <div className="min-h-0 overflow-hidden">
+          <div className="ml-[5px] max-h-44 overflow-y-auto border-l border-border/70 py-1.5 pl-3 pr-1 text-xs leading-5 text-text-secondary">
+            <p className="whitespace-pre-wrap break-words font-normal">
+              {transcript.detail}
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+type AgentLiveTranscript = {
+  kind: "thinking" | "output";
+  label: string;
+  preview: string;
+  detail: string;
+};
+
+function agentLiveTranscript(
+  events: NonNullable<AgentSurfaceItem["events"]>,
+): AgentLiveTranscript | null {
   const textEvents = events.filter(
     (event) =>
       event.detail &&
@@ -984,16 +1060,19 @@ function agentLiveTranscript(events: NonNullable<AgentSurfaceItem["events"]>) {
     return null;
   }
   const latest = textEvents[textEvents.length - 1];
-  const label =
-    latest.type === "agent_live_event:thinking_delta"
-      ? "Thinking preview"
-      : "Live output";
+  const kind: AgentLiveTranscript["kind"] =
+    latest.type === "agent_live_event:thinking_delta" ? "thinking" : "output";
   const detail = textEvents
     .map((event) => event.detail)
     .filter((detail): detail is string => Boolean(detail))
     .join("\n")
     .slice(-4000);
-  return { label, detail };
+  return {
+    kind,
+    label: kind === "thinking" ? "Thinking" : "Output",
+    preview: firstNonEmptyLine(detail),
+    detail,
+  };
 }
 
 function AgentRunProjection({
@@ -1061,34 +1140,36 @@ function AgentRunBindingSummary({
     rawEx && typeof rawEx === "object" && !Array.isArray(rawEx)
       ? (rawEx as Partial<ExecutorBinding>)
       : null;
+  const files = workspaceMetaValue(workspace);
+  const runtime = executorMetaValue(executor, workspace);
   if (
-    !workspace &&
-    !executor &&
+    !files &&
+    !runtime &&
     !projection.transport &&
     !projection.fallbackPolicy
   ) {
     return null;
   }
   const items = [
-    executor
+    runtime
       ? {
-          label: "Executor",
-          value: executorDisplayName(executor),
+          label: "Runtime",
+          value: runtime,
           detail: executorDetail(executor),
         }
       : null,
-    workspace
+    files
       ? {
-          label: "Workspace",
-          value: workspaceDisplayName(workspace),
-          detail: workspace.cwd ?? workspace.authority ?? undefined,
+          label: "Files",
+          value: files,
+          detail: workspace?.cwd ?? workspace?.authority ?? undefined,
         }
       : null,
     projection.transport
-      ? { label: "Transport", value: statusLabel(projection.transport) }
+      ? { label: "Connection", value: statusLabel(projection.transport) }
       : null,
     projection.fallbackPolicy
-      ? { label: "Fallback", value: statusLabel(projection.fallbackPolicy) }
+      ? { label: "Policy", value: statusLabel(projection.fallbackPolicy) }
       : null,
   ].filter(Boolean) as Array<{
     label: string;
@@ -1199,28 +1280,6 @@ function MiniLiveDots({ className }: { className?: string }) {
   );
 }
 
-function BindingStrip({ state }: { state: WorkSurfaceState }) {
-  const workspace = state.workspace;
-  const executor = state.executor;
-  if (!workspace && !executor) {
-    return null;
-  }
-  return (
-    <div className="grid shrink-0 gap-2 border-b border-border/70 px-4 py-3 text-xs md:grid-cols-2">
-      <BindingItem
-        label="Workspace"
-        value={workspaceDisplayName(workspace)}
-        detail={workspace?.cwd ?? workspace?.authority}
-      />
-      <BindingItem
-        label="Executor"
-        value={executorDisplayName(executor)}
-        detail={executorDetail(executor)}
-      />
-    </div>
-  );
-}
-
 function RunBlockedBanner({
   blocked,
 }: {
@@ -1229,17 +1288,16 @@ function RunBlockedBanner({
   if (!blocked) {
     return null;
   }
-  const executor = executorDisplayName(blocked.executor);
-  const workspace =
-    blocked.workspace?.cwd ?? workspaceDisplayName(blocked.workspace);
+  const runtime = executorMetaValue(blocked.executor, blocked.workspace);
+  const files = workspaceMetaValue(blocked.workspace);
   const fallback = blocked.fallbackPolicy
-    ? `Fallback ${statusLabel(blocked.fallbackPolicy)}`
+    ? `policy ${statusLabel(blocked.fallbackPolicy)}`
     : undefined;
   const details = [
-    executor,
-    workspace,
+    runtime,
+    files,
     blocked.transport
-      ? `transport ${statusLabel(blocked.transport)}`
+      ? `connection ${statusLabel(blocked.transport)}`
       : undefined,
     fallback,
   ].filter((item): item is string => Boolean(item));
@@ -1263,30 +1321,6 @@ function RunBlockedBanner({
           ) : null}
         </div>
       </div>
-    </div>
-  );
-}
-
-function BindingItem({
-  label,
-  value,
-  detail,
-}: {
-  label: string;
-  value: string;
-  detail?: string | null;
-}) {
-  return (
-    <div className="min-w-0">
-      <div className="text-[10px] font-semibold uppercase text-text-muted">
-        {label}
-      </div>
-      <div className="mt-0.5 truncate font-medium text-text">{value}</div>
-      {detail ? (
-        <div className="mt-0.5 truncate font-mono text-[11px] text-text-muted">
-          {detail}
-        </div>
-      ) : null}
     </div>
   );
 }
@@ -1318,6 +1352,7 @@ function ToolCard({ tool }: { tool: ToolSurfaceItem }) {
   const cancelled = tool.status === "cancelled";
   const skipped = tool.status === "skipped";
   const finishedAt = tool.finishedAt ?? tool.startedAt;
+  const displayResult = toolResultForDisplay(tool);
   return (
     <section className="relative pl-9">
       <div
@@ -1377,10 +1412,10 @@ function ToolCard({ tool }: { tool: ToolSurfaceItem }) {
             {tool.arguments ? (
               <StructuredPayload label="Args" value={tool.arguments} />
             ) : null}
-            {tool.result ? (
+            {displayResult ? (
               <StructuredPayload
                 label="Result"
-                value={tool.result}
+                value={displayResult}
                 tone={failed ? "danger" : "muted"}
               />
             ) : running ? (
@@ -1391,6 +1426,22 @@ function ToolCard({ tool }: { tool: ToolSurfaceItem }) {
       </div>
     </section>
   );
+}
+
+function toolResultForDisplay(tool: ToolSurfaceItem) {
+  if (!tool.result) {
+    return undefined;
+  }
+  switch (tool.errorKind) {
+    case "executor_offline":
+    case "transport_disconnected":
+    case "fallback_disabled":
+    case "workspace_executor_unavailable":
+    case "workspace_path_mismatch":
+      return undefined;
+    default:
+      return tool.result;
+  }
 }
 
 function toolActivitySort(left: ToolSurfaceItem, right: ToolSurfaceItem) {
@@ -1415,22 +1466,23 @@ function ToolExecutionMeta({ tool }: { tool: ToolSurfaceItem }) {
     value: string;
     tone?: "default" | "danger";
   }> = [];
-  if (tool.executor) {
+  const runtime = executorMetaValue(tool.executor, tool.workspace);
+  if (runtime) {
     items.push({
-      label: "Executor",
-      value: executorDisplayName(tool.executor),
-      tone: tool.executor.status === "offline" ? "danger" : "default",
+      label: "Runtime",
+      value: runtime,
+      tone: tool.executor?.status === "offline" ? "danger" : "default",
     });
   }
-  const workspace = tool.workspace?.cwd ?? workspaceDisplayName(tool.workspace);
-  if (tool.workspace) {
-    items.push({ label: "Workspace", value: workspace });
+  const files = workspaceMetaValue(tool.workspace);
+  if (files) {
+    items.push({ label: "Files", value: files });
   }
   if (tool.transport) {
-    items.push({ label: "Transport", value: statusLabel(tool.transport) });
+    items.push({ label: "Connection", value: statusLabel(tool.transport) });
   }
   if (tool.fallbackPolicy) {
-    items.push({ label: "Fallback", value: statusLabel(tool.fallbackPolicy) });
+    items.push({ label: "Policy", value: statusLabel(tool.fallbackPolicy) });
   }
   if (tool.route) {
     items.push({ label: "Route", value: statusLabel(tool.route) });
@@ -1441,7 +1493,7 @@ function ToolExecutionMeta({ tool }: { tool: ToolSurfaceItem }) {
   if (tool.errorKind) {
     items.push({
       label: "Reason",
-      value: statusLabel(tool.errorKind),
+      value: toolReasonLabel(tool.errorKind),
       tone: tool.errorKind === "cancelled" ? "default" : "danger",
     });
   }
@@ -1516,10 +1568,10 @@ function ToolFailureNotice({ tool }: { tool: ToolSurfaceItem }) {
 
 function toolFailureMessage(tool: ToolSurfaceItem) {
   if (tool.errorKind === "executor_offline") {
-    return "Executor offline. Reconnect the edge executor or choose another workspace.";
+    return "Execution environment offline. Reconnect it or choose another environment.";
   }
   if (tool.errorKind === "transport_disconnected") {
-    return "Transport disconnected. Reconnect edge before retrying.";
+    return "Execution connection disconnected. Reconnect it before retrying.";
   }
   if (tool.errorKind === "approval_timeout") {
     return "Approval timed out. Review pending approvals and retry.";
@@ -1528,15 +1580,29 @@ function toolFailureMessage(tool: ToolSurfaceItem) {
     return "Tool timed out. Retry or narrow the command.";
   }
   if (tool.errorKind === "fallback_disabled") {
-    return "Fallback disabled. This run will not execute local-code tools on the server.";
+    return "This request needs a file or command environment. Connect one or choose a sandbox, then retry.";
   }
   if (tool.errorKind === "workspace_executor_unavailable") {
-    return "Workspace executor unavailable. Choose Server sandbox or a connected edge workspace.";
+    return "This request needs a file or command environment. Connect one or choose a sandbox, then retry.";
   }
   if (tool.blocked) {
-    return "Tool blocked. Resolve the executor or workspace issue before retrying.";
+    return "Tool blocked. Resolve the execution environment before retrying.";
   }
   return undefined;
+}
+
+function toolReasonLabel(reason: string) {
+  switch (reason) {
+    case "workspace_executor_unavailable":
+    case "fallback_disabled":
+    case "workspace_path_mismatch":
+      return "Needs file environment";
+    case "executor_offline":
+    case "transport_disconnected":
+      return "Environment unavailable";
+    default:
+      return statusLabel(reason);
+  }
 }
 
 function StructuredPayload({
@@ -1653,7 +1719,7 @@ function EmptySurface({ loading, label }: { loading: boolean; label: string }) {
       ) : (
         <Pause className="size-5" />
       )}
-      <p>{loading ? "Loading work surface" : label}</p>
+      <p>{loading ? "Loading activity" : label}</p>
     </div>
   );
 }
@@ -1808,21 +1874,66 @@ function statusLabel(status: string) {
 }
 
 function runStatusHeadline(status: string) {
-  const label = statusLabel(status).trim();
-  return label ? label.charAt(0).toUpperCase() + label.slice(1) : "Active";
+  const normalized = status.trim().toLowerCase();
+  switch (normalized) {
+    case "running":
+      return "Thinking";
+    case "input-queued":
+      return "Message queued";
+    case "waiting":
+      return "Waiting";
+    case "blocked":
+      return "Needs attention";
+    case "paused":
+      return "Paused";
+    case "cancelling":
+      return "Stopping";
+    default: {
+      const label = statusLabel(status).trim();
+      return label ? label.charAt(0).toUpperCase() + label.slice(1) : "Active";
+    }
+  }
+}
+
+function workspaceMetaValue(workspace: WorkspaceBindingLike) {
+  if (!workspace || workspace.kind === "none") {
+    return undefined;
+  }
+  return (
+    workspace.cwd ?? workspace.display_name ?? workspaceDisplayName(workspace)
+  );
+}
+
+function executorMetaValue(
+  executor: ExecutorBindingLike,
+  workspace?: WorkspaceBindingLike,
+) {
+  if (!executor || executor.executor_id === "server-control-plane") {
+    return undefined;
+  }
+  if (executor.display_name === "Astra") {
+    return undefined;
+  }
+  if (
+    executor.kind === "server_local" &&
+    (!workspace || workspace.kind === "none")
+  ) {
+    return undefined;
+  }
+  return executorDisplayName(executor);
 }
 
 function workspaceDisplayName(workspace: WorkspaceBindingLike) {
   return (
     workspace?.display_name ??
-    (workspace?.kind ? statusLabel(workspace.kind) : "Workspace pending")
+    (workspace?.kind ? statusLabel(workspace.kind) : "Files pending")
   );
 }
 
 function executorDisplayName(executor: ExecutorBindingLike) {
   return (
     executor?.display_name ??
-    (executor?.kind ? statusLabel(executor.kind) : "Executor pending")
+    (executor?.kind ? statusLabel(executor.kind) : "Runtime pending")
   );
 }
 
@@ -1846,6 +1957,14 @@ function formatEventTime(timestamp: number) {
     minute: "2-digit",
     second: "2-digit",
   });
+}
+
+function firstNonEmptyLine(text: string) {
+  const line = text.trim().split(/\r?\n/).find(Boolean) ?? "";
+  if (!line) {
+    return "No details yet";
+  }
+  return line.length > 96 ? `${line.slice(0, 93)}...` : line;
 }
 
 function eventType(event: Record<string, unknown>) {

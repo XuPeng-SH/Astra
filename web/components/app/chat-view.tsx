@@ -1,16 +1,11 @@
 "use client";
 
 import {
-  AlertTriangle,
+  Activity,
   Bot,
   ClipboardList,
-  HardDrive,
-  Loader2,
-  MessageSquare,
   MoreVertical,
-  Monitor,
-  RefreshCw,
-  Terminal,
+  Wrench,
   type LucideIcon,
 } from "lucide-react";
 import Link from "next/link";
@@ -34,11 +29,7 @@ import {
 import { useWorkspaceSelection } from "@/hooks/use-workspace-selection";
 import { subscribeChatLifecycleChange } from "@/lib/chat-lifecycle-events";
 import { getChat } from "@/lib/api/chats";
-import type {
-  ChatDetail,
-  EdgeStatusResponse,
-  WorkspaceSelection,
-} from "@/lib/api/types";
+import type { ChatDetail } from "@/lib/api/types";
 import {
   deriveChatRunUiState,
   isTerminalChatRunStatus,
@@ -50,280 +41,10 @@ import {
 import {
   ACTIVE_AGENT_SURFACE_STATUSES,
   createEmptyWorkSurface,
+  type AgentSurfaceItem,
+  type SessionTask,
 } from "@/lib/work-surface";
 import { useToast } from "@/components/ui/toast";
-
-// ── helpers ──────────────────────────────────────────────────────────────────
-
-function runActivityMetricCount(
-  active: number,
-  total: number,
-): RunActivityMetricCount {
-  if (active > 0) {
-    return { active, total, value: active, mode: "active" };
-  }
-  return { active, total, value: total, mode: "item" };
-}
-
-type RunActivityMetricCount = {
-  active: number;
-  total: number;
-  value: number;
-  mode: "active" | "item";
-};
-
-// ── sub-components ──────────────────────────────────────────────────────────
-
-function WorkspaceSelector({
-  selection,
-  explicit,
-  edges,
-  loading,
-  error,
-  disabled,
-  onRefresh,
-  onSelect,
-}: {
-  selection: WorkspaceSelection | null;
-  explicit: boolean;
-  edges: EdgeStatusResponse["edges"];
-  loading: boolean;
-  error: string | null;
-  disabled: boolean;
-  onRefresh: () => void | Promise<void>;
-  onSelect: (selection: WorkspaceSelection) => void;
-}) {
-  const edgeOptions = edges
-    .filter((edge) => edge.workspace_dir?.trim())
-    .map((edge) => ({
-      edgeAgentId: edge.edge_agent_id,
-      displayName: edge.hostname ?? edge.edge_agent_id,
-      cwd: edge.workspace_dir!,
-      connectedSecs: edge.connected_secs,
-    }));
-  const selectedEdge =
-    selection?.kind === "edge_workspace"
-      ? edgeOptions.find(
-          (edge) =>
-            edge.edgeAgentId === selection.edgeAgentId &&
-            edge.cwd === selection.cwd,
-        )
-      : null;
-  const selectedEdgeMissing =
-    explicit && selection?.kind === "edge_workspace" && !selectedEdge;
-  const selectedOfflineLabel =
-    selection?.kind === "edge_workspace"
-      ? `${selection.displayName ?? selection.edgeAgentId} · ${selection.cwd}`
-      : "";
-
-  return (
-    <div className="mb-2 flex flex-wrap items-center gap-2 rounded-[14px] border border-border/70 bg-surface/95 px-3 py-2 text-xs text-text-muted shadow-[0_0.15rem_0.8rem_rgba(28,25,23,0.05)]">
-      <span className="font-medium text-text">Workspace</span>
-      {!explicit || !selection ? (
-        <span className="inline-flex min-w-0 items-center gap-1.5 rounded-full bg-bg px-2.5 py-1.5 font-medium text-text-secondary">
-          <MessageSquare className="size-3.5 shrink-0 text-text-muted" />
-          <span className="truncate">Chat only</span>
-          <span className="hidden border-l border-border pl-1.5 font-normal text-text-muted sm:inline">
-            No code workspace
-          </span>
-        </span>
-      ) : null}
-      <button
-        type="button"
-        disabled={disabled}
-        onClick={() => onSelect({ kind: "server_sandbox" })}
-        className={[
-          "inline-flex max-w-full items-center gap-1.5 rounded-full px-2.5 py-1.5 font-medium transition focus:outline-none focus:ring-2 focus:ring-accent/30 disabled:cursor-not-allowed disabled:opacity-50",
-          explicit && selection?.kind === "server_sandbox"
-            ? "bg-text text-white"
-            : "bg-bg text-text-secondary hover:bg-surface-muted hover:text-text",
-        ].join(" ")}
-      >
-        <HardDrive className="size-3.5 shrink-0" />
-        <span className="truncate">Server sandbox</span>
-      </button>
-      {edgeOptions.map((edge) => {
-        const selected =
-          explicit &&
-          selection?.kind === "edge_workspace" &&
-          selection.edgeAgentId === edge.edgeAgentId &&
-          selection.cwd === edge.cwd;
-        return (
-          <button
-            key={`${edge.edgeAgentId}:${edge.cwd}`}
-            type="button"
-            disabled={disabled}
-            title={`${edge.displayName} · ${edge.cwd}`}
-            onClick={() =>
-              onSelect({
-                kind: "edge_workspace",
-                edgeAgentId: edge.edgeAgentId,
-                displayName: edge.displayName,
-                cwd: edge.cwd,
-              })
-            }
-            className={[
-              "inline-flex min-w-0 max-w-[min(30rem,100%)] items-center gap-1.5 rounded-full px-2.5 py-1.5 font-medium transition focus:outline-none focus:ring-2 focus:ring-accent/30 disabled:cursor-not-allowed disabled:opacity-50",
-              selected
-                ? "bg-text text-white"
-                : "bg-bg text-text-secondary hover:bg-surface-muted hover:text-text",
-            ].join(" ")}
-          >
-            <Monitor className="size-3.5 shrink-0" />
-            <span className="truncate">{edge.displayName}</span>
-            <span
-              className={[
-                "min-w-0 truncate border-l pl-1.5 font-normal",
-                selected
-                  ? "border-white/30 text-white/75"
-                  : "border-border text-text-muted",
-              ].join(" ")}
-            >
-              {edge.cwd}
-            </span>
-            <span className="sr-only">
-              connected for {edge.connectedSecs} seconds
-            </span>
-          </button>
-        );
-      })}
-      <button
-        type="button"
-        disabled={loading}
-        onClick={() => {
-          void onRefresh();
-        }}
-        className="inline-flex size-7 items-center justify-center rounded-full bg-bg text-text-muted transition hover:bg-surface-muted hover:text-text focus:outline-none focus:ring-2 focus:ring-accent/30 disabled:cursor-wait disabled:opacity-60"
-        aria-label="Refresh edge workspaces"
-        title="Refresh edge workspaces"
-      >
-        <RefreshCw
-          className={["size-3.5", loading ? "animate-spin" : ""].join(" ")}
-        />
-      </button>
-      {edgeOptions.length === 0 && !loading ? (
-        <span className="text-text-muted">No edge workspaces online</span>
-      ) : null}
-      {selectedEdgeMissing ? (
-        <div
-          className="flex min-w-0 max-w-full flex-wrap items-center gap-2 rounded-[10px] border border-warning/30 bg-warning/10 px-2.5 py-1.5 text-warning"
-          role="status"
-          aria-label={`Selected edge workspace is offline: ${selectedOfflineLabel}`}
-        >
-          <AlertTriangle className="size-3.5 shrink-0" />
-          <span className="min-w-0 max-w-[min(28rem,100%)] truncate">
-            Edge offline · {selectedOfflineLabel}
-          </span>
-          <button
-            type="button"
-            disabled={disabled}
-            onClick={() => onSelect({ kind: "server_sandbox" })}
-            className="rounded-full bg-bg px-2 py-0.5 font-medium text-text transition hover:bg-surface-muted disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            Use server sandbox
-          </button>
-        </div>
-      ) : null}
-      {error ? (
-        <span className="max-w-full truncate text-warning">{error}</span>
-      ) : null}
-    </div>
-  );
-}
-
-function RunActivityBar({
-  label,
-  agents,
-  tools,
-  tasks,
-  onOpenAgents,
-  onOpenTasks,
-  onOpenTools,
-}: {
-  label: string;
-  agents: RunActivityMetricCount;
-  tools: RunActivityMetricCount;
-  tasks: RunActivityMetricCount;
-  onOpenAgents: () => void;
-  onOpenTasks: () => void;
-  onOpenTools: () => void;
-}) {
-  return (
-    <div className="mb-3 flex flex-wrap items-center gap-2 rounded-[14px] border border-border/70 bg-surface/95 px-3 py-2 text-xs text-text-muted shadow-[0_0.15rem_0.8rem_rgba(28,25,23,0.05)]">
-      <span className="inline-flex min-w-0 items-center gap-2 font-medium text-text">
-        <Loader2 className="size-3.5 animate-spin text-accent" />
-        <span className="truncate">{label}</span>
-      </span>
-      <span
-        className="inline-flex items-center gap-1 pl-0.5"
-        aria-hidden="true"
-      >
-        <span className="size-1.5 animate-bounce rounded-full bg-text-muted" />
-        <span
-          className="size-1.5 animate-bounce rounded-full bg-text-muted"
-          style={{ animationDelay: "120ms" }}
-        />
-        <span
-          className="size-1.5 animate-bounce rounded-full bg-text-muted"
-          style={{ animationDelay: "240ms" }}
-        />
-      </span>
-      <span className="h-4 w-px bg-border" aria-hidden="true" />
-      <RunActivityMetric
-        icon={Bot}
-        label="Agents"
-        value={agents}
-        onClick={onOpenAgents}
-      />
-      <RunActivityMetric
-        icon={ClipboardList}
-        label="Tasks"
-        value={tasks}
-        onClick={onOpenTasks}
-      />
-      <RunActivityMetric
-        icon={Terminal}
-        label="Tools"
-        value={tools}
-        onClick={onOpenTools}
-      />
-    </div>
-  );
-}
-
-function RunActivityMetric({
-  icon: Icon,
-  label,
-  value,
-  onClick,
-}: {
-  icon: LucideIcon;
-  label: string;
-  value: RunActivityMetricCount;
-  onClick: () => void;
-}) {
-  const unitLabel = value.mode === "active" ? "active" : "item";
-  const pluralUnit =
-    value.mode === "active" || value.value === 1 ? unitLabel : `${unitLabel}s`;
-  const title =
-    value.mode === "active"
-      ? `Open ${label} (${value.active} active, ${value.total} total)`
-      : `Open ${label} (${value.total} total)`;
-  return (
-    <button
-      type="button"
-      className="inline-flex min-w-0 items-center gap-1.5 rounded-full bg-bg px-2.5 py-1 font-medium text-text-secondary transition hover:bg-surface-muted hover:text-text focus:outline-none focus:ring-2 focus:ring-accent/30"
-      onClick={onClick}
-      aria-label={`Open ${label.toLowerCase()} work surface, ${value.value} ${pluralUnit}`}
-      title={title}
-    >
-      <Icon className="size-3.5 text-text-muted" />
-      <span className="tabular-nums text-text">{value.value}</span>
-      <span className="hidden sm:inline">{label}</span>
-      <span className="hidden text-text-muted xl:inline">{pluralUnit}</span>
-    </button>
-  );
-}
 
 // ── ChatView ─────────────────────────────────────────────────────────────────
 
@@ -353,6 +74,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
   // ── scrolling ──────────────────────────────────────────────────────────────
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const pinnedRef = useRef(true);
+  const touchStartYRef = useRef<number | null>(null);
   const pendingStartedRef = useRef<string | null>(null);
 
   // ── misc ───────────────────────────────────────────────────────────────────
@@ -377,6 +99,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
     composerDisabled,
     composerPlaceholder,
     activeRunLabel,
+    taskBoardIntervention,
   } = deriveChatRunUiState({
     activeRun: detail.activeRun,
     archived: isArchived,
@@ -413,24 +136,35 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
   const startStream = stream.startStream;
 
   // ── ui state derived from work surface ─────────────────────────────────────
-  const showRunStatusPanel = Boolean(detail.activeRun?.runId && canResumeRun);
-  const agentActivityCount = runActivityMetricCount(
-    workSurface.agents.filter((agent) =>
-      ACTIVE_AGENT_SURFACE_STATUSES.has(agent.status),
-    ).length,
-    workSurface.agents.length,
+  const showRunStatusPanel = Boolean(
+    detail.activeRun?.runId &&
+      (canResumeRun ||
+        activeRunStatus === "blocked" ||
+        activeRunStatus === "waiting"),
   );
-  const toolActivityCount = runActivityMetricCount(
-    workSurface.tools.filter((tool) => tool.status === "running").length,
-    workSurface.tools.length,
-  );
-  const openTaskCount = workSurface.tasks.filter((task) =>
-    ["in_progress", "pending", "paused"].includes(task.status),
+  const openTaskCount = workSurface.tasks.filter(
+    (task) => !isTerminalTaskStatus(task.status),
   ).length;
-  const taskActivityCount = runActivityMetricCount(
-    openTaskCount,
-    workSurface.tasks.length,
-  );
+  const activeAgentCount = workSurface.agents.filter((agent) =>
+    ACTIVE_AGENT_SURFACE_STATUSES.has(agent.status.toLowerCase()),
+  ).length;
+  const agentAttentionCount = workSurface.agents.filter((agent) =>
+    ["failed", "interrupted", "cancelled", "waiting"].includes(
+      agent.status.toLowerCase(),
+    ),
+  ).length;
+  const activeToolCount = workSurface.tools.filter(
+    (tool) =>
+      !tool.finishedAt &&
+      !["success", "error", "cancelled"].includes(tool.status),
+  ).length;
+  const toolAttentionCount = workSurface.tools.filter(
+    (tool) => tool.blocked || tool.status === "error",
+  ).length;
+  const openWorkSurface = (tab: WorkSurfaceTab) => {
+    setWorkSurfaceTab(tab);
+    setWorkSurfaceOpenSignal((value) => value + 1);
+  };
   const activeRunIsVisibleActivity = Boolean(
     detail.activeRun?.runId &&
     activeRunStatus &&
@@ -439,22 +173,25 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
   const workSurfaceActiveRun = activeRunIsVisibleActivity
     ? detail.activeRun
     : undefined;
-  const showRunActivityBar = Boolean(
-    !isArchived && !canResumeRun && (startingRun || activeRunIsVisibleActivity),
-  );
-  const runActivityLabel =
-    stoppingRun || activeRunStatus === "cancelling"
-      ? "Stopping"
-      : startingRun
-        ? "Starting run"
-        : activeRunLabel;
-  const workspaceSelectorDisabled = Boolean(
-    startingRun ||
-    composerDisabled ||
-    (detail.activeRun?.runId &&
-      activeRunStatus &&
-      !isTerminalChatRunStatus(activeRunStatus)),
-  );
+  const showConversationActivityStrip =
+    workSurface.hydrated &&
+    (activeRunIsVisibleActivity ||
+      taskBoardIntervention ||
+      openTaskCount > 0 ||
+      agentAttentionCount > 0 ||
+      toolAttentionCount > 0) &&
+    (workSurface.tasks.length > 0 ||
+      workSurface.agents.length > 0 ||
+      workSurface.tools.length > 0);
+  const conversationActivityKey = showConversationActivityStrip
+    ? [
+        openTaskCount,
+        workSurface.agents.length,
+        workSurface.tools.length,
+        agentAttentionCount,
+        toolAttentionCount,
+      ].join(":")
+    : "";
 
   // ── effects ────────────────────────────────────────────────────────────────
 
@@ -540,6 +277,7 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
     latestMessage?.content,
     latestMessage?.reasoning,
     latestMessage?.artifacts?.length,
+    conversationActivityKey,
   ]);
 
   // Process pending turn
@@ -603,15 +341,10 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
   );
 
   // ── handlers kept at component level ───────────────────────────────────────
-  const openWorkSurfaceTab = (tab: WorkSurfaceTab) => {
-    setWorkSurfaceTab(tab);
-    setWorkSurfaceOpenSignal((n) => n + 1);
-  };
-
   // ── render ─────────────────────────────────────────────────────────────────
   return (
     <div className="astra-chat-view relative flex h-full min-h-0 overflow-hidden bg-bg">
-      <div className="relative flex min-w-0 flex-1 flex-col overflow-hidden bg-bg">
+      <div className="astra-chat-main relative flex min-w-0 flex-1 flex-col overflow-hidden bg-bg">
         <header className="relative z-10 flex min-h-[58px] shrink-0 items-center gap-4 border-b border-border/60 bg-bg/85 px-7 backdrop-blur">
           <Link
             href={
@@ -658,11 +391,30 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
         <div
           ref={scrollRef}
           data-testid="chat-scroll-container"
+          onWheel={(event) => {
+            if (event.deltaY < 0) {
+              pinnedRef.current = false;
+            }
+          }}
+          onTouchStart={(event) => {
+            touchStartYRef.current = event.touches[0]?.clientY ?? null;
+          }}
+          onTouchMove={(event) => {
+            const startY = touchStartYRef.current;
+            const currentY = event.touches[0]?.clientY;
+            if (
+              startY !== null &&
+              currentY !== undefined &&
+              currentY > startY
+            ) {
+              pinnedRef.current = false;
+            }
+          }}
           onScroll={(event) => {
             const target = event.currentTarget;
             pinnedRef.current = isChatScrolledToBottom(target);
           }}
-          className="min-h-0 flex-1 overscroll-contain overflow-y-auto scroll-smooth"
+          className="min-h-0 flex-1 overscroll-contain overflow-y-auto"
         >
           <div className="mx-auto w-full max-w-[860px] px-7 pb-44 pt-10">
             {detail.messages.map((message, index) => (
@@ -670,6 +422,19 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
                 <MessageBubble message={message} />
               </div>
             ))}
+            {showConversationActivityStrip ? (
+              <ConversationWorkCard
+                tasks={workSurface.tasks}
+                agents={workSurface.agents}
+                toolCount={workSurface.tools.length}
+                activeToolCount={activeToolCount}
+                agentAttentionCount={agentAttentionCount}
+                toolAttentionCount={toolAttentionCount}
+                taskBoardIntervention={taskBoardIntervention}
+                active={activeRunIsVisibleActivity}
+                onOpen={openWorkSurface}
+              />
+            ) : null}
           </div>
         </div>
         <ChatDotNavigator
@@ -704,27 +469,6 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
               </div>
             ) : (
               <>
-                {showRunActivityBar ? (
-                  <RunActivityBar
-                    label={runActivityLabel}
-                    agents={agentActivityCount}
-                    tools={toolActivityCount}
-                    tasks={taskActivityCount}
-                    onOpenAgents={() => openWorkSurfaceTab("agents")}
-                    onOpenTasks={() => openWorkSurfaceTab("tasks")}
-                    onOpenTools={() => openWorkSurfaceTab("tools")}
-                  />
-                ) : null}
-                <WorkspaceSelector
-                  selection={ws.workspaceSelection}
-                  explicit={ws.workspaceSelectionExplicit}
-                  edges={ws.edgeWorkspaces}
-                  loading={ws.edgeWorkspacesLoading}
-                  error={ws.edgeWorkspacesError}
-                  disabled={workspaceSelectorDisabled}
-                  onRefresh={ws.refreshEdgeWorkspaces}
-                  onSelect={ws.setWorkspaceSelection}
-                />
                 <Composer
                   disabled={composerDisabled}
                   placeholder={composerPlaceholder}
@@ -765,39 +509,85 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
                   }}
                 />
                 {showRunStatusPanel ? (
-                  <div className="mt-3 flex items-center justify-between gap-3 rounded-[16px] border border-border/70 bg-surface px-4 py-3 text-sm text-text-muted">
-                    <p>
-                      {activeRunStatus === "paused"
-                        ? "This run is paused. Resume to continue or Stop to cancel it."
-                        : activeRunBlocksNewInput
-                          ? `Run status is ${activeRunStatus}. Stop it or refresh before sending new input.`
-                          : "Stopping current run"}
-                    </p>
-                    <div className="flex shrink-0 items-center gap-2">
-                      {canResumeRun ? (
-                        <button
-                          type="button"
-                          onClick={() => {
-                            void stream.resumeActiveRun();
-                          }}
-                          disabled={runControlBusy}
-                          className="rounded-control bg-text px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-text/90 disabled:cursor-not-allowed disabled:opacity-50"
-                        >
-                          {resumingRun ? "Resuming..." : "Resume"}
-                        </button>
-                      ) : null}
-                      {canStopRun ? (
-                        <button
-                          type="button"
-                          onClick={() => {
-                            void stream.stopActiveRun();
-                          }}
-                          disabled={runControlBusy}
-                          className="rounded-control border border-border bg-bg px-3 py-2 text-sm font-medium text-text transition-colors hover:bg-surface-muted disabled:cursor-not-allowed disabled:opacity-50"
-                        >
-                          {stoppingRun ? "Stopping..." : "Stop"}
-                        </button>
-                      ) : null}
+                  <div className="mt-3 rounded-card border border-border/70 bg-surface px-4 py-3 text-sm text-text-muted">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <p className="font-medium text-text">
+                          {taskBoardIntervention
+                            ? "Task needs direction"
+                            : activeRunStatus === "blocked" ||
+                                activeRunStatus === "waiting"
+                              ? activeRunLabel
+                            : activeRunStatus === "paused"
+                              ? "Run paused"
+                              : activeRunBlocksNewInput
+                                ? "Run in progress"
+                                : "Stopping"}
+                        </p>
+                        <p className="mt-1 leading-5">
+                          {taskBoardIntervention
+                            ? "Open the task board or continue the run when you are ready."
+                            : activeRunStatus === "blocked"
+                              ? "Resolve the required environment or stop this run before changing direction."
+                              : activeRunStatus === "waiting"
+                                ? "Astra is waiting for an external action before continuing."
+                            : activeRunStatus === "paused"
+                              ? "Continue this run or close it before changing direction."
+                              : activeRunBlocksNewInput
+                                ? "Wait for the current run or stop it before sending a new message."
+                                : "The stop request is being applied."}
+                        </p>
+                      </div>
+                      <div className="flex shrink-0 items-center gap-2">
+                        {taskBoardIntervention ? (
+                          <button
+                            type="button"
+                            onClick={() => openWorkSurface("tasks")}
+                            className="inline-flex items-center gap-1.5 rounded-control border border-border bg-bg px-3 py-2 text-sm font-medium text-text transition-colors hover:bg-surface-muted"
+                          >
+                            <ClipboardList className="size-4" />
+                            Tasks
+                          </button>
+                        ) : null}
+                        {agentAttentionCount > 0 ? (
+                          <button
+                            type="button"
+                            onClick={() => openWorkSurface("agents")}
+                            className="inline-flex items-center gap-1.5 rounded-control border border-border bg-bg px-3 py-2 text-sm font-medium text-text transition-colors hover:bg-surface-muted"
+                          >
+                            <Bot className="size-4" />
+                            Agents
+                          </button>
+                        ) : null}
+                        {canResumeRun ? (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              void stream.resumeActiveRun();
+                            }}
+                            disabled={runControlBusy}
+                            className="rounded-control bg-text px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-text/90 disabled:cursor-not-allowed disabled:opacity-50"
+                          >
+                            {resumingRun
+                              ? "Continuing..."
+                              : taskBoardIntervention
+                                ? "Continue"
+                                : "Resume"}
+                          </button>
+                        ) : null}
+                        {canStopRun ? (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              void stream.stopActiveRun();
+                            }}
+                            disabled={runControlBusy}
+                            className="rounded-control border border-border bg-bg px-3 py-2 text-sm font-medium text-text transition-colors hover:bg-surface-muted disabled:cursor-not-allowed disabled:opacity-50"
+                          >
+                            {stoppingRun ? "Stopping..." : "Stop"}
+                          </button>
+                        ) : null}
+                      </div>
                     </div>
                   </div>
                 ) : null}
@@ -819,12 +609,303 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
         activeRun={workSurfaceActiveRun}
         tab={workSurfaceTab}
         onTabChange={setWorkSurfaceTab}
-        openSignal={workSurfaceOpenSignal}
         onRefresh={() => {
           void stream.hydrateWorkSurfaceForChat();
         }}
         onLoadAgentRun={stream.loadAgentRunProjection}
+        openSignal={workSurfaceOpenSignal}
       />
     </div>
   );
+}
+
+function ConversationWorkCard({
+  tasks,
+  agents,
+  toolCount,
+  activeToolCount,
+  agentAttentionCount,
+  toolAttentionCount,
+  taskBoardIntervention,
+  active,
+  onOpen,
+}: {
+  tasks: SessionTask[];
+  agents: AgentSurfaceItem[];
+  toolCount: number;
+  activeToolCount: number;
+  agentAttentionCount: number;
+  toolAttentionCount: number;
+  taskBoardIntervention: boolean;
+  active: boolean;
+  onOpen: (tab: WorkSurfaceTab) => void;
+}) {
+  const openTasks = tasks.filter((task) => !isTerminalTaskStatus(task.status));
+  const activeAgents = agents.filter((agent) =>
+    ACTIVE_AGENT_SURFACE_STATUSES.has(agent.status.toLowerCase()),
+  );
+  const attentionAgents = agents.filter((agent) =>
+    ["failed", "interrupted", "cancelled", "waiting"].includes(
+      agent.status.toLowerCase(),
+    ),
+  );
+  const primaryTask = openTasks[0] ?? tasks[0];
+  const primaryAgent = attentionAgents[0] ?? activeAgents[0] ?? agents[0];
+  const needsAttention =
+    taskBoardIntervention || agentAttentionCount > 0 || toolAttentionCount > 0;
+  const title = taskBoardIntervention
+    ? "Needs direction"
+    : needsAttention
+      ? "Needs attention"
+      : active
+        ? "Working"
+        : "Activity";
+  type ConversationActivityDescriptor = {
+    tab: WorkSurfaceTab;
+    icon: LucideIcon;
+    label: string;
+    count: number;
+    activeCount?: number;
+    attention?: number;
+  };
+  const actionCandidates: ConversationActivityDescriptor[] = [
+    {
+      tab: "tasks",
+      icon: ClipboardList,
+      label: "Tasks",
+      count: tasks.length,
+      activeCount: openTasks.length,
+      attention: taskBoardIntervention ? openTasks.length || tasks.length : 0,
+    },
+    {
+      tab: "agents",
+      icon: Bot,
+      label: "Agents",
+      count: agents.length,
+      activeCount: activeAgents.length,
+      attention: agentAttentionCount,
+    },
+    {
+      tab: "tools",
+      icon: Wrench,
+      label: "Tools",
+      count: toolCount,
+      activeCount: activeToolCount,
+      attention: toolAttentionCount,
+    },
+  ];
+  const actions = actionCandidates.filter((action) => action.count > 0);
+  const summary = actions
+    .map((action) => {
+      const activeCount = action.activeCount ?? action.count;
+      const count = activeCount > 0 ? activeCount : action.count;
+      return `${count} ${action.label.toLowerCase()}`;
+    })
+    .join(" · ");
+  const rows = [
+    primaryTask
+      ? {
+          key: "tasks",
+          tab: "tasks" as WorkSurfaceTab,
+          icon: ClipboardList,
+          title: primaryTask.title,
+          meta:
+            taskBoardIntervention && openTasks.length > 1
+              ? `${openTasks.length} open tasks`
+              : statusLabel(primaryTask.status),
+          status: taskBoardIntervention
+            ? "Needs direction"
+            : statusLabel(primaryTask.status),
+          attention: taskBoardIntervention,
+        }
+      : null,
+    primaryAgent
+      ? {
+          key: "agents",
+          tab: "agents" as WorkSurfaceTab,
+          icon: Bot,
+          title:
+            primaryAgent.description || primaryAgent.agentType || "Subagent",
+          meta:
+            activeAgents.length > 1
+              ? `${activeAgents.length} active agents`
+              : primaryAgent.agentType
+                ? statusLabel(primaryAgent.agentType)
+                : undefined,
+          status: statusLabel(primaryAgent.status),
+          attention: attentionAgents.length > 0,
+        }
+      : null,
+  ].filter((row): row is NonNullable<typeof row> => Boolean(row));
+
+  return (
+    <section className="my-3 flex justify-center" aria-label="Background work">
+      <div
+        className={
+          needsAttention
+            ? "w-full max-w-[680px] rounded-card border border-danger/20 bg-danger/5 p-3 shadow-sm"
+            : "w-full max-w-[680px] rounded-card border border-border/70 bg-surface/85 p-3 shadow-sm"
+        }
+      >
+        <div className="flex min-w-0 items-center justify-between gap-3">
+          <div
+            className={
+              needsAttention
+                ? "inline-flex min-w-0 items-center gap-1.5 text-sm font-medium text-danger"
+                : "inline-flex min-w-0 items-center gap-1.5 text-sm font-medium text-text-secondary"
+            }
+          >
+            <Activity
+              className={
+                active && !needsAttention
+                  ? "size-4 shrink-0 animate-pulse"
+                  : "size-4 shrink-0"
+              }
+            />
+            <span className="shrink-0">{title}</span>
+            {summary ? (
+              <span className="truncate text-xs font-normal text-text-muted">
+                {summary}
+              </span>
+            ) : null}
+          </div>
+          {actions.length ? (
+            <div className="flex shrink-0 flex-wrap items-center justify-end gap-1">
+              {actions.map((action) => (
+                <ConversationActivityAction
+                  key={action.tab}
+                  {...action}
+                  onOpen={onOpen}
+                />
+              ))}
+            </div>
+          ) : null}
+        </div>
+        {rows.length ? (
+          <div className="mt-2 divide-y divide-border/60 overflow-hidden rounded-[8px] border border-border/60 bg-bg/70">
+            {rows.map((row) => (
+              <ConversationWorkRow
+                key={row.key}
+                icon={row.icon}
+                title={row.title}
+                meta={row.meta}
+                status={row.status}
+                attention={row.attention}
+                onOpen={() => onOpen(row.tab)}
+              />
+            ))}
+          </div>
+        ) : null}
+      </div>
+    </section>
+  );
+}
+
+function ConversationWorkRow({
+  icon: Icon,
+  title,
+  meta,
+  status,
+  attention,
+  onOpen,
+}: {
+  icon: LucideIcon;
+  title: string;
+  meta?: string;
+  status: string;
+  attention: boolean;
+  onOpen: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onOpen}
+      className="flex w-full min-w-0 items-center gap-2 px-2.5 py-2 text-left transition-colors hover:bg-surface-muted/70"
+    >
+      <Icon
+        className={
+          attention
+            ? "size-4 shrink-0 text-danger"
+            : "size-4 shrink-0 text-accent"
+        }
+      />
+      <span className="min-w-0 flex-1">
+        <span className="block truncate text-sm font-medium text-text">
+          {title}
+        </span>
+        {meta ? (
+          <span className="block truncate text-xs text-text-muted">{meta}</span>
+        ) : null}
+      </span>
+      <span
+        className={
+          attention
+            ? "shrink-0 rounded-full bg-danger/10 px-2 py-0.5 text-[11px] font-medium text-danger"
+            : "shrink-0 rounded-full bg-surface-muted px-2 py-0.5 text-[11px] font-medium text-text-muted"
+        }
+      >
+        {status}
+      </span>
+    </button>
+  );
+}
+
+function ConversationActivityAction({
+  tab,
+  icon: Icon,
+  label,
+  count,
+  attention,
+  onOpen,
+}: {
+  tab: WorkSurfaceTab;
+  icon: LucideIcon;
+  label: string;
+  count: number;
+  attention?: number;
+  onOpen: (tab: WorkSurfaceTab) => void;
+}) {
+  const badge = attention && attention > 0 ? attention : count;
+  const hasAttention = Boolean(attention && attention > 0);
+  return (
+    <button
+      type="button"
+      aria-label={`Open ${label.toLowerCase()} activity`}
+      onClick={() => onOpen(tab)}
+      className={
+        hasAttention
+          ? "inline-flex h-7 items-center gap-1 rounded-full border border-danger/20 bg-bg px-2 text-xs font-medium text-danger transition-colors hover:bg-danger/10"
+          : "inline-flex h-7 items-center gap-1 rounded-full border border-border/70 bg-bg px-2 text-xs font-medium text-text-secondary transition-colors hover:bg-surface-muted"
+      }
+    >
+      <Icon className="size-3.5" />
+      <span>{label}</span>
+      <span
+        className={
+          hasAttention
+            ? "tabular-nums text-danger"
+            : "tabular-nums text-text-muted"
+        }
+      >
+        {badge}
+      </span>
+    </button>
+  );
+}
+
+function isTerminalTaskStatus(status: string) {
+  return [
+    "completed",
+    "complete",
+    "done",
+    "cancelled",
+    "canceled",
+    "failed",
+    "skipped",
+    "archived",
+  ].includes(status.toLowerCase());
+}
+
+function statusLabel(status: string) {
+  return status.replace(/[_-]+/g, " ");
 }

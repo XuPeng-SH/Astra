@@ -417,7 +417,7 @@ function proxyRunStream(params: {
                 chatId,
                 assistantMessageId,
                 {
-                  content: state.assistantText,
+                  content: state.assistantText || state.statusFeedbackText || "",
                   reasoning: state.reasoningText || undefined,
                   reasoningStatus: state.reasoningText
                     ? "streaming"
@@ -635,7 +635,7 @@ export async function POST(
         );
       }
       const effectiveWorkspaceSelection =
-        liveWorkspaceSelection ?? ({ kind: "server_sandbox" } as const);
+        liveWorkspaceSelection ?? null;
       const workspaceBindings = resolveWorkspaceBindings(
         effectiveWorkspaceSelection,
       );

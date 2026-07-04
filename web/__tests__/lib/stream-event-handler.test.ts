@@ -151,7 +151,7 @@ describe("applyStreamEvent", () => {
     );
   });
 
-  it("projects blocked run events into active run state and assistant feedback", () => {
+  it("projects blocked run events into active run state without assistant prose", () => {
     const state = makeState();
 
     applyStreamEvent({ type: "run_started", run_id: "run-1" }, ctx, state);
@@ -175,15 +175,7 @@ describe("applyStreamEvent", () => {
         waitingFor: "transport_disconnected",
       }),
     );
-    expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith(
-      "user-a",
-      "chat-1",
-      "assistant-1",
-      expect.objectContaining({
-        content: "Edge transport disconnected.",
-        status: "streaming",
-      }),
-    );
+    expect(mockUpdateStreamingAssistantMessage).not.toHaveBeenCalled();
     expect(state.runLifecycle).toBe("blocked");
   });
 
@@ -249,16 +241,7 @@ describe("applyStreamEvent", () => {
         waitingFor: "executor_offline",
       }),
     );
-    expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith(
-      "user-a",
-      "chat-1",
-      "assistant-1",
-      expect.objectContaining({
-        content:
-          "Run paused because the selected executor is offline. Reconnect it or choose another workspace.",
-        status: "streaming",
-      }),
-    );
+    expect(mockUpdateStreamingAssistantMessage).not.toHaveBeenCalled();
     expect(state.runLifecycle).toBe("blocked");
   });
 
@@ -285,16 +268,7 @@ describe("applyStreamEvent", () => {
         waitingFor: "workspace_executor_unavailable",
       }),
     );
-    expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith(
-      "user-a",
-      "chat-1",
-      "assistant-1",
-      expect.objectContaining({
-        content:
-          "Run paused because the selected workspace is not connected to an available executor. Choose Server sandbox or a connected edge workspace.",
-        status: "streaming",
-      }),
-    );
+    expect(mockUpdateStreamingAssistantMessage).not.toHaveBeenCalled();
     expect(state.runLifecycle).toBe("blocked");
   });
 
@@ -321,19 +295,11 @@ describe("applyStreamEvent", () => {
         waitingFor: "tool_approval",
       }),
     );
-    expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith(
-      "user-a",
-      "chat-1",
-      "assistant-1",
-      expect.objectContaining({
-        content: "Waiting for tool approval.",
-        status: "streaming",
-      }),
-    );
+    expect(mockUpdateStreamingAssistantMessage).not.toHaveBeenCalled();
     expect(state.runLifecycle).toBe("waiting");
   });
 
-  it("uses readable fallback feedback for blocked events without leaking raw reasons", () => {
+  it("keeps blocked fallback state out of assistant prose", () => {
     const state = makeState();
 
     applyStreamEvent({ type: "run_started", run_id: "run-1" }, ctx, state);
@@ -356,16 +322,7 @@ describe("applyStreamEvent", () => {
         waitingFor: "fallback_disabled",
       }),
     );
-    expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith(
-      "user-a",
-      "chat-1",
-      "assistant-1",
-      expect.objectContaining({
-        content:
-          "Run paused because server fallback is disabled for this workspace.",
-        status: "streaming",
-      }),
-    );
+    expect(mockUpdateStreamingAssistantMessage).not.toHaveBeenCalled();
   });
 
   it("derives waitingFor from run_blocked reason fields", () => {
@@ -392,15 +349,7 @@ describe("applyStreamEvent", () => {
         waitingFor: "fallback_disabled",
       }),
     );
-    expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith(
-      "user-a",
-      "chat-1",
-      "assistant-1",
-      expect.objectContaining({
-        content: "Server fallback is disabled for this workspace.",
-        status: "streaming",
-      }),
-    );
+    expect(mockUpdateStreamingAssistantMessage).not.toHaveBeenCalled();
     expect(state.runLifecycle).toBe("blocked");
   });
 
@@ -430,7 +379,7 @@ describe("applyStreamEvent", () => {
       state,
     );
 
-    expect(state.lastStatus).toBe("streaming");
+    expect(state.lastStatus).toBe("complete");
     expect(state.runLifecycle).toBe("paused");
     expect(mockSetChatActiveRun).toHaveBeenLastCalledWith(
       "user-a",
@@ -446,8 +395,61 @@ describe("applyStreamEvent", () => {
       "chat-1",
       "assistant-1",
       expect.objectContaining({
-        content: "Budget exhausted. You can continue.",
-        status: "streaming",
+        content: "",
+        status: "complete",
+      }),
+    );
+  });
+
+  it("preserves task-board intervention waiting state without assistant prose", () => {
+    const state = makeState();
+
+    applyStreamEvent(
+      {
+        type: "run_interrupted",
+        run_id: "run-task",
+        kind: "empty_completion",
+        resumable: true,
+        waiting_for: "task_board_intervention",
+        message: "Task-board work remains open.",
+        task_board: {
+          summary: "1 in_progress task(s) remain: task-2 Investigate [in_progress]",
+          in_progress_count: 1,
+          active_tasks: ["task-2 Investigate [in_progress]"],
+        },
+      },
+      ctx,
+      state,
+    );
+    applyStreamEvent(
+      {
+        type: "run_finished",
+        run_id: "run-task",
+        status: "paused",
+        interrupted: true,
+        waiting_for: "task_board_intervention",
+      },
+      ctx,
+      state,
+    );
+
+    expect(state.runLifecycle).toBe("paused");
+    expect(mockSetChatActiveRun).toHaveBeenLastCalledWith(
+      "user-a",
+      "chat-1",
+      expect.objectContaining({
+        runId: "run-task",
+        status: "paused",
+        waitingFor: "task_board_intervention",
+      }),
+    );
+    expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith(
+      "user-a",
+      "chat-1",
+      "assistant-1",
+      expect.objectContaining({
+        content: "",
+        status: "complete",
       }),
     );
   });

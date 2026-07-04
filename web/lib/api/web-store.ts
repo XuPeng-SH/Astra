@@ -201,6 +201,7 @@ function stoppedAssistantMessageController(
         ? `${currentMessage.content}${currentMessage.content.endsWith("\n") ? "" : "\n"}\nStopped.`
         : "Stopped.";
       currentMessage.status = "complete";
+      currentMessage.completedAt = nowIso();
       currentMessage.reasoningStatus = "complete";
       currentChat.lastMessageAt = nowIso();
       currentChat.lastMessagePreview = currentMessage.content;
@@ -2484,11 +2485,6 @@ function parseRunSseText(text: string): StreamResult {
       typeof record.assistant_text === "string"
     ) {
       finalText = record.assistant_text;
-    } else if (
-      type === "run_interrupted" &&
-      typeof record.message === "string"
-    ) {
-      finalText = finalText || record.message;
     } else if (type === "run_error") {
       const runError =
         typeof record.message === "string"

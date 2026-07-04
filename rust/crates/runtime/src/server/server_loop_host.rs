@@ -76,6 +76,25 @@ const AUX_LLM_POLICY_ENV: &str = "ASTRA_AUX_LLM_POLICY";
 const METRIC_LLM_MAIN_ATTEMPTS_TOTAL: &str = "astra_llm_main_attempts_total";
 const METRIC_LLM_MAIN_ATTEMPT_TOKENS_TOTAL: &str = "astra_llm_main_attempt_tokens_total";
 
+fn tool_call_function_name(tool_call: &Value) -> Option<&str> {
+    tool_call
+        .get("function")
+        .and_then(|function| function.get("name"))
+        .and_then(Value::as_str)
+        .or_else(|| tool_call.get("name").and_then(Value::as_str))
+}
+
+fn server_owned_tool_name(tool_name: &str) -> bool {
+    crate::server::tool_binding_projection::is_server_control_plane_tool(tool_name)
+        || crate::server::tool_binding_projection::is_server_runtime_tool(tool_name)
+}
+
+fn insert_event_fields(event: &mut Map<String, Value>, fields: &Map<String, Value>) {
+    for (key, value) in fields {
+        event.entry(key.clone()).or_insert_with(|| value.clone());
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AuxiliaryLlmPolicy {
     CapacityAware,
@@ -1055,8 +1074,15 @@ pub struct ServerAgenticLoopHost {
     /// path before the first `sync_valid_tools_to_visible` call; stable
     /// for the rest of the session.
     admissible_extras: Vec<String>,
+    /// Final deferred names for the current wire surface after visible-tool
+    /// overlap and runtime binding filters. Validator reads this instead of
+    /// the raw edge-profile declaration so unavailable tools disappear rather
+    /// than becoming "not yet activated" walls.
+    current_deferred_tool_names: HashSet<String>,
     /// `true` when tools were auto-populated from astra-tools (no CLI connected).
     server_side_tools: bool,
+    /// `true` when the visible wire surface was populated from the server catalog.
+    server_catalog_tool_surface: bool,
     /// `true` when the connected client can answer ask_user prompts.
     interactive_client: bool,
     /// Optional request-level interaction policy override.
@@ -1447,9 +1473,6 @@ impl ServerAgenticLoopHostBuilder {
     }
 
     pub fn build(self) -> ServerAgenticLoopHost {
-        // When no edge tools are provided (web-only mode), populate with
-        // server-side tool schemas from astra-tools so the LLM knows what's available.
-        let server_side_tools = self.server_tool_catalog_enabled && self.edge_tools.is_empty();
         let binding_snapshot = self.execution_bindings.clone().unwrap_or_else(|| {
             ExecutionBindingSnapshot::inferred(
                 WorkspaceBinding {
@@ -1462,10 +1485,24 @@ impl ServerAgenticLoopHostBuilder {
                 ExecutorBinding::server_control_plane(),
             )
         });
+        // When no edge tools are provided, the server owns the schema catalog.
+        // That is not the same as "execute every tool on server": an explicit
+        // edge binding still routes workspace/process tools to the edge
+        // executor, while server-owned control-plane/runtime tools remain
+        // in-process.
+        let auto_server_catalog = self.server_tool_catalog_enabled && self.edge_tools.is_empty();
+        let routes_workspace_tools_to_edge = matches!(
+            binding_snapshot.workspace.kind,
+            WorkspaceBindingKind::EdgeWorkspace
+        ) || matches!(
+            binding_snapshot.executor.kind,
+            ExecutorBindingKind::EdgeAgent
+        );
+        let server_side_tools = auto_server_catalog && !routes_workspace_tools_to_edge;
         let schema_workspace = binding_snapshot.workspace.clone();
         let schema_executor = binding_snapshot.executor.clone();
         let schema_runtime = binding_snapshot.runtime.clone();
-        let edge_tools = if server_side_tools {
+        let edge_tools = if auto_server_catalog {
             capability_filtered_server_tool_schemas(
                 &self.capabilities,
                 &schema_workspace,
@@ -1490,15 +1527,7 @@ impl ServerAgenticLoopHostBuilder {
                     .map(String::from)
             })
             .collect();
-        let admissible_extras = if server_side_tools
-            && matches!(schema_workspace.kind, WorkspaceBindingKind::EdgeWorkspace)
-            && matches!(schema_executor.kind, ExecutorBindingKind::EdgeAgent)
-            && !matches!(schema_executor.status, ExecutorStatus::Online)
-        {
-            hidden_execution_boundary_tool_names(&edge_tools)
-        } else {
-            Vec::new()
-        };
+        let admissible_extras = Vec::new();
         valid_tools.extend(admissible_extras.iter().cloned());
 
         let always_load_tool_names: HashSet<String> = self
@@ -1534,7 +1563,9 @@ impl ServerAgenticLoopHostBuilder {
             edge_profile: self.edge_profile,
             valid_tools,
             admissible_extras,
+            current_deferred_tool_names: HashSet::new(),
             server_side_tools,
+            server_catalog_tool_surface: auto_server_catalog,
             interactive_client: self.interactive_client,
             interaction_mode: self.interaction_mode,
             full_llm_capture: self.full_llm_capture,
@@ -2434,12 +2465,16 @@ impl ServerAgenticLoopHost {
             "total_tokens": u.total_tokens(),
         }));
 
-        let edge_tool_round =
-            if !self.server_side_tools && self.event_tx.is_some() && !tool_calls.is_empty() {
-                self.deliver_edge_tools_via_ledger(&tool_calls).await
-            } else {
-                Vec::new()
-            };
+        let edge_delivery_tool_calls = self.edge_deliverable_tool_calls(&tool_calls, state);
+        let edge_tool_round = if !self.server_side_tools
+            && self.should_deliver_edge_tool_calls(&edge_delivery_tool_calls)
+            && !edge_delivery_tool_calls.is_empty()
+        {
+            self.deliver_edge_tools_via_ledger(&edge_delivery_tool_calls)
+                .await
+        } else {
+            Vec::new()
+        };
 
         let accum = ChatTurnSseAccum {
             full_text: full_text.clone(),
@@ -2517,6 +2552,183 @@ impl ServerAgenticLoopHost {
         })
     }
 
+    fn edge_deliverable_tool_calls(
+        &self,
+        tool_calls: &[Value],
+        state: &AgenticLoopState,
+    ) -> Vec<Value> {
+        tool_calls
+            .iter()
+            .filter(|tool_call| !self.server_catalog_tool_call_runs_on_server(tool_call, state))
+            .cloned()
+            .collect()
+    }
+
+    fn server_catalog_tool_call_runs_on_server(
+        &self,
+        tool_call: &Value,
+        state: &AgenticLoopState,
+    ) -> bool {
+        if !self.server_catalog_tool_surface {
+            return false;
+        }
+        let Some(tool_name) = tool_call_function_name(tool_call) else {
+            return false;
+        };
+        if !server_owned_tool_name(tool_name) {
+            return false;
+        }
+        state
+            .server_tool_executor
+            .as_deref()
+            .is_some_and(|executor| executor.tool_runtime_ready(tool_name))
+    }
+
+    fn should_deliver_edge_tool_calls(&self, tool_calls: &[Value]) -> bool {
+        self.event_tx.is_some()
+            || tool_calls.iter().any(|tool_call| {
+                tool_call_function_name(tool_call)
+                    .is_some_and(|tool_name| self.edge_executor_offline_blocks_tool(tool_name))
+            })
+    }
+
+    fn edge_executor_offline_blocks_tool(&self, tool_name: &str) -> bool {
+        !server_owned_tool_name(tool_name)
+            && matches!(
+                self.workspace_binding.kind,
+                WorkspaceBindingKind::EdgeWorkspace
+            )
+            && matches!(self.executor_binding.kind, ExecutorBindingKind::EdgeAgent)
+            && matches!(self.executor_binding.status, ExecutorStatus::Offline)
+            && astra_runtime_env::ToolRegistry::builtins()
+                .get(tool_name)
+                .is_some()
+    }
+
+    fn edge_executor_offline_result(
+        &mut self,
+        request_id: &str,
+        tool_name: &str,
+        args: &Value,
+    ) -> astra_turn_core::sse_stream_host::EdgeToolExecResult {
+        let output = format!(
+            "Error: edge executor '{}' is offline; reconnect the edge executor before retrying tool '{}'.",
+            self.executor_binding.executor_id, tool_name
+        );
+        let mut fields = binding_event_fields(&self.workspace_binding, &self.executor_binding);
+        fields.insert("call_id".to_string(), Value::String(request_id.to_string()));
+        fields.insert(
+            "tool_call_id".to_string(),
+            Value::String(request_id.to_string()),
+        );
+        fields.insert("tool".to_string(), Value::String(tool_name.to_string()));
+        fields.insert(
+            "error_kind".to_string(),
+            Value::String("executor_offline".to_string()),
+        );
+        fields.insert(
+            "reason".to_string(),
+            Value::String("executor_offline".to_string()),
+        );
+        fields.insert("blocked".to_string(), Value::Bool(true));
+        fields.insert("retryable".to_string(), Value::Bool(true));
+        fields.insert("execution_started".to_string(), Value::Bool(false));
+        fields.insert("side_effects_maybe".to_string(), Value::Bool(false));
+        fields.insert(
+            "next_action".to_string(),
+            Value::String("reconnect_edge_executor".to_string()),
+        );
+        let fields =
+            self.edge_result_fields_with_runtime(request_id, tool_name, args, Some(fields));
+        self.emit_edge_executor_offline_events(request_id, tool_name, &output, &fields);
+
+        astra_turn_core::sse_stream_host::EdgeToolExecResult {
+            request_id: request_id.to_string(),
+            tool: tool_name.to_string(),
+            args: args.clone(),
+            output,
+            tool_result_fields: Some(fields),
+            status: "error".to_string(),
+            duration_ms: 0,
+        }
+    }
+
+    fn emit_edge_executor_offline_events(
+        &mut self,
+        request_id: &str,
+        tool_name: &str,
+        output: &str,
+        fields: &Map<String, Value>,
+    ) {
+        let mut failed = Map::new();
+        failed.insert(
+            "type".to_string(),
+            Value::String("tool_transport_failed".to_string()),
+        );
+        failed.insert("call_id".to_string(), Value::String(request_id.to_string()));
+        failed.insert("tool".to_string(), Value::String(tool_name.to_string()));
+        failed.insert("success".to_string(), Value::Bool(false));
+        failed.insert("status".to_string(), Value::String("error".to_string()));
+        failed.insert(
+            "reason".to_string(),
+            Value::String("executor_offline".to_string()),
+        );
+        failed.insert("output".to_string(), Value::String(output.to_string()));
+        insert_event_fields(&mut failed, fields);
+        self.emit_event(Value::Object(failed));
+
+        let mut executor_event = Map::new();
+        executor_event.insert(
+            "type".to_string(),
+            Value::String("executor_status_changed".to_string()),
+        );
+        executor_event.insert(
+            "session_id".to_string(),
+            Value::String(self.session_id.clone()),
+        );
+        executor_event.insert("status".to_string(), Value::String("offline".to_string()));
+        executor_event.insert(
+            "reason".to_string(),
+            Value::String("executor_offline".to_string()),
+        );
+        executor_event.insert("call_id".to_string(), Value::String(request_id.to_string()));
+        executor_event.insert("tool".to_string(), Value::String(tool_name.to_string()));
+        executor_event.insert("message".to_string(), Value::String(output.to_string()));
+        insert_event_fields(&mut executor_event, fields);
+        self.emit_event(Value::Object(executor_event));
+
+        let mut blocked = Map::new();
+        blocked.insert("type".to_string(), Value::String("run_blocked".to_string()));
+        blocked.insert(
+            "reason".to_string(),
+            Value::String("executor_offline".to_string()),
+        );
+        blocked.insert(
+            "session_id".to_string(),
+            Value::String(self.session_id.clone()),
+        );
+        blocked.insert("call_id".to_string(), Value::String(request_id.to_string()));
+        blocked.insert("tool".to_string(), Value::String(tool_name.to_string()));
+        blocked.insert("message".to_string(), Value::String(output.to_string()));
+        insert_event_fields(&mut blocked, fields);
+        self.emit_event(Value::Object(blocked));
+
+        let mut waiting = Map::new();
+        waiting.insert("type".to_string(), Value::String("run_waiting".to_string()));
+        waiting.insert(
+            "reason".to_string(),
+            Value::String("waiting: executor_offline".to_string()),
+        );
+        waiting.insert(
+            "session_id".to_string(),
+            Value::String(self.session_id.clone()),
+        );
+        waiting.insert("call_id".to_string(), Value::String(request_id.to_string()));
+        waiting.insert("tool".to_string(), Value::String(tool_name.to_string()));
+        insert_event_fields(&mut waiting, fields);
+        self.emit_event(Value::Object(waiting));
+    }
+
     /// Deliver edge tool calls via the ledger protocol.
     ///
     /// For each tool call:
@@ -2560,6 +2772,15 @@ impl ServerAgenticLoopHost {
                 continue;
             }
             let (request_id, tool_name, args) = parse_flat_tool_call_event(tc);
+            if self.edge_executor_offline_blocks_tool(&tool_name) {
+                self.valid_tools.insert(tool_name.clone());
+                results_by_id.insert(
+                    request_id.clone(),
+                    self.edge_executor_offline_result(&request_id, &tool_name, &args),
+                );
+                continue;
+            }
+
             if self.valid_tools.contains(&tool_name) {
                 tool_calls.push(tc.clone());
                 continue;
@@ -3017,10 +3238,11 @@ impl ServerAgenticLoopHost {
             state.server_tool_executor.as_deref(),
         );
         if let Some(executor) = state.server_tool_executor.as_deref() {
-            executor.set_current_activatable_tool_names(activatable_deferred_tool_names);
+            executor.set_current_activatable_tool_names(activatable_deferred_tool_names.clone());
             executor.set_current_searchable_tool_schemas(wire_tools);
             extras.extend(executor.activated_deferred_tool_names());
         }
+        self.current_deferred_tool_names = activatable_deferred_tool_names;
         self.valid_tools = self.admissible_tool_names_for_surface(wire_tools, &extras);
     }
 
@@ -4362,11 +4584,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         //
         // When server_side_tools is true, the headless pipeline uses
         // server_tool_executor and no ledger is needed.
+        let edge_delivery_tool_calls = self.edge_deliverable_tool_calls(&result.tool_calls, state);
         let edge_tool_round = if !self.server_side_tools
-            && self.event_tx.is_some()
-            && !result.tool_calls.is_empty()
+            && self.should_deliver_edge_tool_calls(&edge_delivery_tool_calls)
+            && !edge_delivery_tool_calls.is_empty()
         {
-            self.deliver_edge_tools_via_ledger(&result.tool_calls).await
+            self.deliver_edge_tools_via_ledger(&edge_delivery_tool_calls)
+                .await
         } else {
             Vec::new()
         };
@@ -4540,10 +4764,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
     }
 
     fn deferred_tool_names(&self) -> HashSet<String> {
-        self.deferred_tool_names_from_edge_profile_for_model(
-            self.resolved_model_name.as_deref(),
-            self.resolved_context_window,
-        )
+        self.current_deferred_tool_names.clone()
     }
 
     fn capabilities(&self) -> astra_turn_core::capability::CapabilitySet {
@@ -5088,28 +5309,6 @@ fn normalize_usage_to_canonical(
         }
     }
     raw.clone()
-}
-
-fn hidden_execution_boundary_tool_names(visible_tools: &[Value]) -> Vec<String> {
-    let visible: HashSet<String> = visible_tools
-        .iter()
-        .filter_map(tool_schema_name)
-        .map(str::to_string)
-        .collect();
-    astra_runtime_env::ToolRegistry::builtins()
-        .iter()
-        .filter(|spec| {
-            matches!(
-                spec.required.executor,
-                astra_runtime_env::RequiredExecutor::RuntimeExecutor
-            ) || !matches!(
-                spec.required.workspace,
-                astra_runtime_env::RequiredWorkspace::None
-            )
-        })
-        .map(|spec| spec.name.clone())
-        .filter(|name| !visible.contains(name))
-        .collect()
 }
 
 fn edge_tool_delivery_timed_out(
@@ -6054,6 +6253,74 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn deferred_manifest_filters_workspace_tools_without_runtime_binding() {
+        let mut edge_profile = Map::new();
+        edge_profile.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES
+                .to_string(),
+            json!(["bash"]),
+        );
+        edge_profile.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT
+                .to_string(),
+            json!("<deferred-tools>\nbash\n</deferred-tools>"),
+        );
+        edge_profile.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW
+                .to_string(),
+            json!(200_000),
+        );
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .with_edge_profile(edge_profile)
+        .build();
+        host.resolved_model_name = Some("test-model".to_string());
+        host.resolved_context_window = Some(200_000);
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let executor = Arc::new(
+            crate::server::server_tool_executor::ServerToolExecutor::new(
+                dir.path().to_path_buf(),
+                "test-user".into(),
+                "test-session".into(),
+                None,
+                None,
+            ),
+        );
+        let mut state = create_test_state();
+        state.server_tool_executor = Some(Arc::clone(&executor));
+
+        let visible = host.visible_turn_tools(&mut state);
+        let visible_names = schema_names(&visible);
+        assert!(!visible_names.contains("bash"));
+        assert!(
+            !executor
+                .current_activatable_tool_names_snapshot()
+                .contains("bash"),
+            "unavailable deferred workspace tools must not be activatable"
+        );
+        assert!(
+            !<ServerAgenticLoopHost as AgenticLoopHost>::deferred_tool_names(&host)
+                .contains("bash"),
+            "validator must see the filtered deferred set, not raw edge-profile names"
+        );
+
+        let result = executor
+            .execute_with_metadata("tool_search", &json!({"query": "select:bash"}))
+            .await;
+        let parsed: Value = serde_json::from_str(&result.output).unwrap();
+        assert!(
+            parsed["matches"].as_array().unwrap().is_empty(),
+            "tool_search must not rediscover unavailable workspace tools: {}",
+            result.output
+        );
+    }
+
     #[test]
     fn builder_filters_edge_tools_through_runtime_binding() {
         let host = ServerAgenticLoopHostBuilder::new(
@@ -6182,12 +6449,8 @@ mod tests {
                 "{hidden} must be hidden while the edge runtime is offline"
             );
             assert!(
-                host.valid_tool_names().contains(hidden),
-                "{hidden} should be admitted while hidden so stale calls can report executor_offline"
-            );
-            assert!(
-                host.admissible_extras.contains(&hidden.to_string()),
-                "{hidden} should remain boundary-admissible so stale calls can report executor_offline"
+                !host.valid_tool_names().contains(hidden),
+                "{hidden} must not be admitted while hidden; unavailable tools should disappear from the model surface"
             );
         }
     }

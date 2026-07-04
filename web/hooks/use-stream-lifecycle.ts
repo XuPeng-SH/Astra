@@ -132,6 +132,7 @@ function completeLatestStreamingAssistantAsStopped(messages: ChatMessage[]) {
           content: message.content.trim()
             ? `${message.content}${message.content.endsWith("\n") ? "" : "\n"}\nStopped.`
             : "Stopped.",
+          completedAt: new Date().toISOString(),
           reasoningStatus: "complete" as const,
         }
       : message,
@@ -413,7 +414,7 @@ export function useStreamLifecycle(
             current,
             error instanceof Error
               ? error.message
-              : "Failed to load work surface.",
+              : "Failed to load activity.",
           ),
         );
       }
@@ -501,6 +502,7 @@ export function useStreamLifecycle(
               content:
                 content ||
                 "Astra completed the run without returning visible text.",
+              completedAt: new Date().toISOString(),
               reasoningStatus: "complete",
               status: "complete",
             });
@@ -510,6 +512,7 @@ export function useStreamLifecycle(
             clearActiveRun();
             assistantPatcher.patchNow({
               content: content || "Stopped.",
+              completedAt: new Date().toISOString(),
               reasoningStatus: "complete",
               status: "complete",
             });
@@ -517,8 +520,10 @@ export function useStreamLifecycle(
           onPaused: (content) => {
             assistantPatcher.flushNow();
             assistantPatcher.patchNow({
-              content,
-              status: "streaming",
+              ...(content ? { content } : {}),
+              completedAt: new Date().toISOString(),
+              reasoningStatus: "complete",
+              status: "complete",
             });
           },
         },
@@ -556,6 +561,7 @@ export function useStreamLifecycle(
               streamError instanceof Error
                 ? `${failureMessage} (${streamError.message})`
                 : failureMessage,
+            completedAt: new Date().toISOString(),
             reasoningStatus: "complete",
             status: "failed",
           });
@@ -821,6 +827,7 @@ export function useStreamLifecycle(
               content:
                 content ||
                 "Astra completed the run without returning visible text.",
+              completedAt: new Date().toISOString(),
               reasoningStatus: "complete",
               status: "complete",
             });
@@ -839,6 +846,7 @@ export function useStreamLifecycle(
             );
             assistantPatcher.patchNow({
               content: content || "Stopped.",
+              completedAt: new Date().toISOString(),
               reasoningStatus: "complete",
               status: "complete",
             });
@@ -846,8 +854,10 @@ export function useStreamLifecycle(
           onPaused: (content) => {
             assistantPatcher.flushNow();
             assistantPatcher.patchNow({
-              content,
-              status: "streaming",
+              ...(content ? { content } : {}),
+              completedAt: new Date().toISOString(),
+              reasoningStatus: "complete",
+              status: "complete",
             });
           },
         });
@@ -880,6 +890,7 @@ export function useStreamLifecycle(
           void refreshEdgeWorkspaces();
           assistantPatcher.patchNow({
             content: error.detail,
+            completedAt: new Date().toISOString(),
             reasoningStatus: "complete",
             status: "failed",
           });
@@ -889,6 +900,7 @@ export function useStreamLifecycle(
           error instanceof Error ? error.message : "Astra stream failed.";
         assistantPatcher.patchNow({
           content: `I could not reach the Astra runtime from the web UI. (${message})`,
+          completedAt: new Date().toISOString(),
           status: "failed",
         });
       } finally {
@@ -1023,6 +1035,7 @@ export function useStreamLifecycle(
                 content:
                   content ||
                   "Astra completed the run without returning visible text.",
+                completedAt: new Date().toISOString(),
                 reasoningStatus: "complete",
                 status: "complete",
               });
@@ -1039,6 +1052,7 @@ export function useStreamLifecycle(
               );
               assistantPatcher.patchNow({
                 content: content || "Stopped.",
+                completedAt: new Date().toISOString(),
                 reasoningStatus: "complete",
                 status: "complete",
               });
@@ -1046,8 +1060,10 @@ export function useStreamLifecycle(
             onPaused: (content) => {
               assistantPatcher.flushNow();
               assistantPatcher.patchNow({
-                content,
-                status: "streaming",
+                ...(content ? { content } : {}),
+                completedAt: new Date().toISOString(),
+                reasoningStatus: "complete",
+                status: "complete",
               });
             },
           },
@@ -1075,6 +1091,7 @@ export function useStreamLifecycle(
                 streamError instanceof Error
                   ? `The input was queued, but the web UI could not reconnect to the run stream. (${streamError.message})`
                   : "The input was queued, but the web UI could not reconnect to the run stream.",
+              completedAt: new Date().toISOString(),
               status: "failed",
             });
           })
@@ -1396,6 +1413,7 @@ export function useStreamLifecycle(
                 content:
                   content ||
                   "Astra completed the run without returning visible text.",
+                completedAt: new Date().toISOString(),
                 reasoningStatus: "complete",
                 status: "complete",
               });
@@ -1412,6 +1430,7 @@ export function useStreamLifecycle(
               );
               assistantPatcher.patchNow({
                 content: content || "Stopped.",
+                completedAt: new Date().toISOString(),
                 reasoningStatus: "complete",
                 status: "complete",
               });
@@ -1419,8 +1438,10 @@ export function useStreamLifecycle(
             onPaused: (content) => {
               assistantPatcher.flushNow();
               assistantPatcher.patchNow({
-                content,
-                status: "streaming",
+                ...(content ? { content } : {}),
+                completedAt: new Date().toISOString(),
+                reasoningStatus: "complete",
+                status: "complete",
               });
             },
           },

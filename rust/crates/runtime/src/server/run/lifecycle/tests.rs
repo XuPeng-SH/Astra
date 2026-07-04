@@ -1,7 +1,8 @@
 use super::*;
 use crate::server::run::lifecycle::persistence::{
     build_tool_trace_events, extract_prev_assistant_text, extract_session_state_compact,
-    redact_trace_value, server_loop_causal_chain_id, transcript_page_bounds, transcript_page_seq,
+    messages_for_csl_persist, redact_trace_value, server_loop_causal_chain_id,
+    transcript_page_bounds, transcript_page_seq,
 };
 use astra_services::runs::{
     DatabaseRunStateStore, DurableRunCheckpointRecord, DurableRunDisplayProjectionRecord,
@@ -453,6 +454,116 @@ fn csl_session_state_restore_ignores_legacy_blocked_tools() {
         "legacy CSL blocked_tools must not restore as hard runtime restrictions"
     );
     assert_eq!(state.recent_tools, vec!["read_file"]);
+}
+
+#[test]
+fn csl_restore_turn_start_excludes_current_user_message() {
+    let svc = test_service();
+    let request = test_request("3");
+    let mut state = svc.build_initial_state(
+        "test-user",
+        &request,
+        "session-1",
+        "run-2",
+        None,
+        None,
+        None,
+    );
+    let restored = vec![
+        json!({"role": "user", "content": "1"}),
+        json!({"role": "assistant", "content": "ack 1"}),
+    ];
+
+    let turn_start =
+        AgenticRunLifecycleService::restore_csl_messages_into_loop_state(restored, &mut state);
+
+    assert_eq!(
+        turn_start, 2,
+        "CSL deltas must start before this turn's user message"
+    );
+    assert_eq!(state.messages.len(), 3);
+    assert_eq!(state.messages[0]["content"], "1");
+    assert_eq!(state.messages[1]["content"], "ack 1");
+    assert_eq!(state.messages[2]["content"], "3");
+}
+
+#[tokio::test]
+async fn csl_persist_after_restore_keeps_current_user_message() {
+    use astra_turn_core::conversation_log::file_store::FileCslStore;
+    use astra_turn_core::conversation_log::manager::{CslManager, CslManagerConfig};
+    use astra_turn_core::conversation_log::{CslStore, SessionStateCompact};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn CslStore> = Arc::new(FileCslStore::new(dir.path()));
+    let session_id = "server-csl-current-user";
+    let mut first = CslManager::new(
+        Arc::clone(&store),
+        session_id.to_string(),
+        CslManagerConfig::default(),
+    )
+    .unwrap();
+    first
+        .persist_turn(
+            1,
+            &[
+                json!({"role": "user", "content": "1"}),
+                json!({"role": "assistant", "content": "ack 1"}),
+            ],
+            &SessionStateCompact::default(),
+        )
+        .await
+        .unwrap();
+
+    let svc = test_service();
+    let request = test_request("3");
+    let mut state = svc.build_initial_state(
+        "test-user",
+        &request,
+        "session-1",
+        "run-2",
+        None,
+        None,
+        None,
+    );
+    state.final_text = "ack 3".to_string();
+
+    let mut resumed = CslManager::new(
+        Arc::clone(&store),
+        session_id.to_string(),
+        CslManagerConfig::default(),
+    )
+    .unwrap();
+    let materialized = resumed.load().await.unwrap().unwrap();
+    let turn_start = AgenticRunLifecycleService::restore_csl_messages_into_loop_state(
+        materialized.messages,
+        &mut state,
+    );
+    resumed.mark_turn_start(turn_start);
+
+    let messages = messages_for_csl_persist(&state);
+    resumed
+        .persist_turn(2, &messages, &extract_session_state_compact(&state))
+        .await
+        .unwrap();
+
+    let mut reloaded = CslManager::new(
+        Arc::clone(&store),
+        session_id.to_string(),
+        CslManagerConfig::default(),
+    )
+    .unwrap();
+    let final_state = reloaded.load().await.unwrap().unwrap();
+    let contents = final_state
+        .messages
+        .iter()
+        .map(|message| message["content"].as_str().unwrap_or_default())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        contents,
+        vec!["1", "ack 1", "3", "ack 3"],
+        "restored web runs must persist the current user message into CSL"
+    );
 }
 
 #[test]
@@ -3335,7 +3446,7 @@ fn request_execution_bindings_use_actual_server_workspace_for_server_sandbox() {
 fn server_workspace_binding_decision_respects_explicit_binding_and_edge_tools() {
     let mut request = test_request("hello");
 
-    assert!(request_uses_server_workspace(&request, false));
+    assert!(!request_uses_server_workspace(&request, false));
     assert!(!request_uses_server_workspace(&request, true));
 
     request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
@@ -4632,9 +4743,8 @@ fn finalize_run_events_interrupted_completed_outcome_is_partial_not_completed() 
 
     assert_eq!(status, RunStatus::Paused);
     assert!(
-        error
-            .as_deref()
-            .is_some_and(|msg| msg.to_ascii_lowercase().contains("budget"))
+        error.is_none(),
+        "resumable interruption should be structured paused state, not a run error: {error:?}"
     );
     assert_eq!(events[0]["event_type"], "text_done");
     assert_eq!(events[0]["data"]["partial"], true);
@@ -4854,8 +4964,12 @@ async fn get_run_status_returns_state() {
     assert_eq!(status.run_id, run.run_id);
     assert_eq!(status.status, "running");
     assert_eq!(status.events_count, 1);
-    assert_eq!(status.workspace.as_ref().unwrap()["kind"], "server_sandbox");
+    assert_eq!(status.workspace.as_ref().unwrap()["kind"], "none");
     assert_eq!(status.executor.as_ref().unwrap()["kind"], "server_local");
+    assert_eq!(
+        status.executor.as_ref().unwrap()["executor_id"],
+        "server-control-plane"
+    );
     assert_eq!(status.transport.as_deref(), Some("server_local"));
     assert_eq!(status.fallback_policy.as_deref(), Some("disabled"));
 }
@@ -4925,20 +5039,15 @@ async fn create_run_persists_interaction_mode_into_run_started_event() {
     assert_eq!(durable.events[0]["data"]["interaction_mode"], "auto");
     assert_eq!(durable.events[0]["data"]["suppressed_loop_nudges"], true);
     assert_eq!(durable.events[0]["data"]["interactive_client"], true);
-    assert_eq!(
-        durable.events[0]["data"]["workspace"]["kind"],
-        "server_sandbox"
-    );
-    assert!(
-        durable.events[0]["data"]["workspace"]["cwd"]
-            .as_str()
-            .is_some_and(|cwd| cwd.contains("astra-workspaces")),
-        "{:?}",
-        durable.events[0]
-    );
+    assert_eq!(durable.events[0]["data"]["workspace"]["kind"], "none");
+    assert!(durable.events[0]["data"]["workspace"]["cwd"].is_null());
     assert_eq!(
         durable.events[0]["data"]["executor"]["kind"],
         "server_local"
+    );
+    assert_eq!(
+        durable.events[0]["data"]["executor"]["executor_id"],
+        "server-control-plane"
     );
     assert_eq!(durable.events[0]["data"]["transport"], "server_local");
     assert_eq!(durable.events[0]["data"]["fallback_policy"], "disabled");
@@ -5263,13 +5372,19 @@ async fn list_runs_filters_by_user() {
         for_u1
             .runs
             .iter()
-            .all(|run| run.workspace.as_ref().unwrap()["kind"] == "server_sandbox")
+            .all(|run| run.workspace.as_ref().unwrap()["kind"] == "none")
     );
     assert!(
         for_u1
             .runs
             .iter()
             .all(|run| run.executor.as_ref().unwrap()["kind"] == "server_local")
+    );
+    assert!(
+        for_u1
+            .runs
+            .iter()
+            .all(|run| run.executor.as_ref().unwrap()["executor_id"] == "server-control-plane")
     );
 
     let for_u2 = ok(svc.list_runs_cursor("user-2".into(), 10, None).await);
@@ -5914,8 +6029,9 @@ async fn request_scoped_runtime_skill_resolver_is_installed_from_provider_capabi
     assert_eq!(resolved.forward_headers, vec!["authorization".to_string()]);
     assert_eq!(resolved.required_headers, vec!["authorization".to_string()]);
 
-    let manifest = AgenticRunLifecycleService::build_runtime_manifest(&request, &capabilities)
-        .expect("selected model should produce manifest");
+    let manifest =
+        AgenticRunLifecycleService::build_runtime_manifest(&request, &capabilities, false)
+            .expect("selected model should produce manifest");
     assert!(manifest.get("agent_binding").is_none());
     assert_eq!(
         manifest["request_scoped_runtime"]["discovered_skills"][0]["name"],
@@ -5974,8 +6090,9 @@ fn runtime_manifest_includes_agent_binding_snapshot_without_runtime_auth() {
         }),
     };
 
-    let manifest = AgenticRunLifecycleService::build_runtime_manifest(&request, &capabilities)
-        .expect("selected_model should produce a runtime manifest");
+    let manifest =
+        AgenticRunLifecycleService::build_runtime_manifest(&request, &capabilities, false)
+            .expect("selected_model should produce a runtime manifest");
 
     assert_eq!(manifest["selected_model"]["model"], "test-model");
     assert_eq!(manifest["runtime_profile"], "agent_binding_registry");
