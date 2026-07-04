@@ -622,6 +622,16 @@ impl DefaultToolExecutor {
                 string_to_result(output)
             }
 
+            // ── Display sixel (terminal image rendering) ──────────────
+            "display_sixel" => match args.get("path").and_then(|v| v.as_str()) {
+                Some(path) => crate::display_sixel::display_sixel(path),
+                None => ToolResult::error(
+                    "Error: display_sixel requires a `path` argument (a string path to the \
+                     image file to render)."
+                        .to_string(),
+                ),
+            },
+
             // ── Memory tools (require configured endpoint) ───────────
             "memory" => {
                 let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
