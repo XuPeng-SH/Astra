@@ -2515,6 +2515,13 @@ impl AgenticRunLifecycleService {
         Self::validate_runtime_auth_shape(request, selected_model)?;
         let provider_model_descriptor = Self::provider_model_descriptor(request)?;
         if let Some(gateway_id) = selected_model.gateway.as_deref() {
+            if provider_model_descriptor.is_some() {
+                return Err(error_response_coded(
+                    StatusCode::BAD_REQUEST,
+                    "selected_model.gateway must be absent when capability_descriptors.model_gateway is present",
+                    "selected_model_invalid",
+                ));
+            }
             self.load_active_selected_model_gateway(gateway_id).await?;
         } else if provider_model_descriptor.is_some() {
             Self::validate_provider_runtime_authorized(request)?;
@@ -2526,7 +2533,7 @@ impl AgenticRunLifecycleService {
             return Err(error_response_coded(
                 StatusCode::BAD_REQUEST,
                 "capability_descriptors require provider-authorized request authentication",
-                "external_runtime_context_required",
+                "provider_runtime_context_required",
             ));
         }
         if request.llm_token_service.is_some() {
@@ -2750,10 +2757,10 @@ impl AgenticRunLifecycleService {
             return Err(error_response_coded(
                 StatusCode::BAD_REQUEST,
                 "capability_descriptors.model_gateway is required",
-                "external_runtime_context_required",
+                "provider_runtime_context_required",
             ));
         };
-        astra_services::auth::external::validate_runtime_capability_descriptor(
+        astra_services::auth::provider_request::validate_runtime_capability_descriptor(
             model_gateway,
             "model_gateway",
         )?;
@@ -2767,7 +2774,7 @@ impl AgenticRunLifecycleService {
             return Err(error_response_coded(
                 StatusCode::BAD_REQUEST,
                 "provider runtime descriptors require provider-authorized request authentication",
-                "external_runtime_context_required",
+                "provider_runtime_context_required",
             ));
         }
         Ok(())
@@ -2916,6 +2923,36 @@ impl AgenticRunLifecycleService {
         })
     }
 
+    fn agent_binding_runtime_descriptor<'a>(
+        label: &'static str,
+        descriptor: Option<&'a astra_services::runs::RuntimeCapabilityDescriptorRequest>,
+        expected_id: &str,
+        expected_type: &str,
+    ) -> Result<
+        &'a astra_services::runs::RuntimeCapabilityDescriptorRequest,
+        (StatusCode, Json<ErrorResponse>),
+    > {
+        let descriptor = descriptor.ok_or_else(|| {
+            error_response_coded(
+                StatusCode::BAD_REQUEST,
+                format!("{label} is required when agent_binding is present"),
+                "provider_runtime_context_required",
+            )
+        })?;
+        astra_services::auth::provider_request::validate_runtime_capability_descriptor(
+            descriptor,
+            expected_type,
+        )?;
+        if descriptor.id != expected_id {
+            return Err(error_response_coded(
+                StatusCode::BAD_REQUEST,
+                format!("{label}.id must match agent_binding capability server ref"),
+                "agent_binding_capability_ref_invalid",
+            ));
+        }
+        Ok(descriptor)
+    }
+
     async fn prepare_runtime_capabilities(
         &self,
         request: &ChatRequestData,
@@ -2952,6 +2989,29 @@ impl AgenticRunLifecycleService {
                 "agent_binding_runtime_auth_missing",
             )
         })?;
+        let descriptors = request.capability_descriptors.as_ref().ok_or_else(|| {
+            error_response_coded(
+                StatusCode::BAD_REQUEST,
+                "capability_descriptors is required when agent_binding is present",
+                "provider_runtime_context_required",
+            )
+        })?;
+        let mcp_endpoint_url = Self::agent_binding_runtime_descriptor(
+            "capability_descriptors.mcp",
+            descriptors.mcp.as_ref(),
+            &resolved.mcp_server.id,
+            "mcp",
+        )?
+        .endpoint_url
+        .clone();
+        let skill_endpoint_url = Self::agent_binding_runtime_descriptor(
+            "capability_descriptors.skills",
+            descriptors.skills.as_ref(),
+            &resolved.skill_server.id,
+            "skills",
+        )?
+        .endpoint_url
+        .clone();
         tracing::debug!(
             binding_id = %resolved.binding.id,
             binding_name = %resolved.binding.binding_name,
@@ -2961,13 +3021,13 @@ impl AgenticRunLifecycleService {
         );
         let bundle = runtime_mcp::prepare_agent_binding_mcp_bundle(
             &resolved.mcp_server.id,
-            &resolved.mcp_server.endpoint_url,
+            &mcp_endpoint_url,
             &runtime_auth.authorization,
         )
         .await?;
         let skill_resolver = agent_binding_skill_runtime::prepare_agent_binding_skill_resolver(
             &resolved.skill_server.id,
-            &resolved.skill_server.endpoint_url,
+            &skill_endpoint_url,
             &runtime_auth.authorization,
         )
         .await?;
@@ -3036,11 +3096,29 @@ impl AgenticRunLifecycleService {
         workspace_executor_admitted: bool,
     ) -> Option<Value> {
         let selected_model = request.selected_model.as_ref()?;
-        let selected_model_json = json!({
-            "model": &selected_model.model,
-            "gateway": &selected_model.gateway,
-        });
-        let model_resolution = if selected_model.gateway.is_some() {
+        let selected_model_json = match selected_model.id.as_ref() {
+            Some(id) => json!({
+                "id": id,
+                "model": &selected_model.model,
+            }),
+            None => json!({
+                "model": &selected_model.model,
+            }),
+        };
+        let model_resolution = if let Some(model_gateway) = request
+            .capability_descriptors
+            .as_ref()
+            .and_then(|descriptors| descriptors.model_gateway.as_ref())
+        {
+            json!({
+                "source": "provider_descriptor",
+                "descriptor": {
+                    "id": &model_gateway.id,
+                    "protocol": &model_gateway.protocol,
+                    "invoke_url_present": true
+                }
+            })
+        } else if selected_model.gateway.is_some() {
             json!({
                 "source": "model_gateway",
                 "gateway": &selected_model.gateway,
@@ -3140,10 +3218,22 @@ impl AgenticRunLifecycleService {
         format!("## Agent Binding Instruction\n{}", binding.agent_md)
     }
 
+    fn agent_binding_turn_context_section(context: &Map<String, Value>) -> Option<String> {
+        if context.is_empty() {
+            return None;
+        }
+        let payload = serde_json::to_string_pretty(&Value::Object(context.clone()))
+            .expect("serde_json::Value serialization should not fail");
+        Some(format!(
+            "## Runtime Turn Context\nThe following JSON is provided by the runtime for this turn. Treat it as authoritative MOI context.\n```json\n{payload}\n```"
+        ))
+    }
+
     fn apply_agent_binding_prompt_override(
         edge_profile: &mut Map<String, Value>,
         agent_binding_context: Option<&PreparedAgentBindingLoopContext>,
         runtime_system_prompt: Option<&str>,
+        request_context: Option<&Map<String, Value>>,
     ) {
         let existing = edge_profile
             .get("system_prompt_override")
@@ -3152,13 +3242,21 @@ impl AgenticRunLifecycleService {
             .map(str::to_string);
         let binding_section = agent_binding_context
             .map(|context| Self::agent_binding_prompt_section(&context.binding));
+        let turn_context_section = agent_binding_context
+            .and(request_context)
+            .and_then(Self::agent_binding_turn_context_section);
         let runtime_section = runtime_system_prompt
             .filter(|prompt| !prompt.is_empty())
             .map(str::to_string);
-        let sections = [existing, binding_section, runtime_section]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
+        let sections = [
+            existing,
+            binding_section,
+            turn_context_section,
+            runtime_section,
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
         if sections.is_empty() {
             return;
         }
@@ -4941,6 +5039,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             &mut edge_profile,
             runtime_capabilities.agent_binding.as_ref(),
             request.runtime_system_prompt.as_deref(),
+            request.context.as_ref(),
         );
 
         // Guard: reject if this session already has a blocking run.
@@ -5821,6 +5920,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             &mut edge_profile,
             runtime_capabilities.agent_binding.as_ref(),
             request.runtime_system_prompt.as_deref(),
+            request.context.as_ref(),
         );
 
         // Provision explicit workspace bindings early so build_initial_state

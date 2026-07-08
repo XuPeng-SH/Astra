@@ -1023,73 +1023,6 @@ pub async fn ensure_core_schema(
     .await?;
 
     query(
-        "CREATE TABLE IF NOT EXISTS auth_external_identities (
-            provider_id VARCHAR(64) NOT NULL,
-            external_subject VARCHAR(255) NOT NULL,
-            astra_user_id VARCHAR(64) NOT NULL,
-            username VARCHAR(255) NOT NULL,
-            email VARCHAR(255) NULL,
-            display_name VARCHAR(255) NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (provider_id, external_subject),
-            INDEX idx_auth_external_identities_user (astra_user_id)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-    fail_if_obsolete_shape(
-        &pool,
-        &settings.database,
-        "auth_external_identities",
-        &["provider_id", "external_subject"],
-        &["id"],
-        &["uq_auth_external_identity_provider_subject"],
-    )
-    .await?;
-    ensure_primary_key_shape(
-        &pool,
-        &settings.database,
-        "auth_external_identities",
-        &["provider_id", "external_subject"],
-        "ALTER TABLE auth_external_identities ADD PRIMARY KEY (provider_id, external_subject)",
-    )
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "auth_external_identities",
-        "idx_auth_external_identities_user",
-        &["astra_user_id"],
-        "ALTER TABLE auth_external_identities ADD INDEX idx_auth_external_identities_user (astra_user_id)",
-    )
-    .await?;
-
-    query(
-        "CREATE TABLE IF NOT EXISTS auth_external_sessions (
-            external_session_id VARCHAR(64) PRIMARY KEY,
-            provider_id VARCHAR(64) NOT NULL,
-            astra_user_id VARCHAR(64) NOT NULL,
-            external_subject VARCHAR(255) NOT NULL,
-            provider_scope_id VARCHAR(255) NOT NULL,
-            provider_scope_display_name VARCHAR(255) NULL,
-            encrypted_provider_session_handle TEXT NOT NULL,
-            encrypted_runtime_context_json TEXT NULL,
-            runtime_context_expires_at DATETIME(6) NULL,
-            status VARCHAR(32) NOT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            expires_at DATETIME(6) NOT NULL,
-            INDEX idx_auth_external_sessions_user (astra_user_id),
-            INDEX idx_auth_external_sessions_provider_subject (provider_id, external_subject),
-            INDEX idx_auth_external_sessions_scope (provider_id, provider_scope_id),
-            INDEX idx_auth_external_sessions_status_expires (status, expires_at)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-
-    query(
         "CREATE TABLE IF NOT EXISTS auth_tokens (
             token_id VARCHAR(64) PRIMARY KEY,
             type VARCHAR(50) NOT NULL,
@@ -5994,29 +5927,15 @@ mod tests {
             .nth(1)
             .and_then(|rest| rest.split(")\"").next())
             .expect("auth_user_roles DDL");
-        let external_identities = source
-            .split("CREATE TABLE IF NOT EXISTS auth_external_identities")
-            .nth(1)
-            .and_then(|rest| rest.split(")\"").next())
-            .expect("auth_external_identities DDL");
 
         assert!(
             user_roles.contains("PRIMARY KEY (user_id, role_id)"),
             "auth_user_roles identity is the user/role grant"
         );
         assert!(
-            external_identities.contains("PRIMARY KEY (provider_id, external_subject)"),
-            "auth_external_identities identity is the provider subject link"
+            !user_roles.contains("id BIGINT AUTO_INCREMENT"),
+            "auth_user_roles must not reintroduce a global AUTO_INCREMENT surrogate"
         );
-        for (table, ddl) in [
-            ("auth_user_roles", user_roles),
-            ("auth_external_identities", external_identities),
-        ] {
-            assert!(
-                !ddl.contains("id BIGINT AUTO_INCREMENT"),
-                "{table} must not reintroduce a global AUTO_INCREMENT surrogate"
-            );
-        }
         assert!(
             !user_roles.contains("idx_auth_user_roles_user_id"),
             "auth_user_roles primary key already covers user_id lookups"
@@ -6026,18 +5945,8 @@ mod tests {
             "schema bootstrap must verify auth_user_roles primary-key shape"
         );
         assert!(
-            source.contains(
-                "ALTER TABLE auth_external_identities ADD PRIMARY KEY (provider_id, external_subject)"
-            ),
-            "schema bootstrap must verify auth_external_identities primary-key shape"
-        );
-        assert!(
             source.contains("&[\"uq_auth_user_roles_user_role\"]"),
             "legacy auth_user_roles unique-key-plus-surrogate schemas must fail startup"
-        );
-        assert!(
-            source.contains("&[\"uq_auth_external_identity_provider_subject\"]"),
-            "legacy auth_external_identities unique-key-plus-surrogate schemas must fail startup"
         );
     }
 
@@ -6174,6 +6083,22 @@ mod tests {
             !varchar_width_body.contains("try_get::<Option<u64>, _>(\"CHARACTER_MAXIMUM_LENGTH\")"),
             "varchar width introspection must not decode signed information_schema values as unsigned"
         );
+    }
+
+    #[test]
+    fn retired_external_auth_tables_are_not_dropped_by_schema_bootstrap() {
+        let source = include_str!("storage.rs");
+        let ensure_body = source
+            .split("pub async fn ensure_core_schema")
+            .nth(1)
+            .and_then(|rest| rest.split("#[cfg(test)]").next())
+            .expect("ensure_core_schema body");
+        for table in ["auth_external_sessions", "auth_external_identities"] {
+            assert!(
+                !ensure_body.contains(&format!("DROP TABLE IF EXISTS {table}")),
+                "retired external auth table {table} must be left for an explicit migration, not dropped during startup"
+            );
+        }
     }
 
     #[test]

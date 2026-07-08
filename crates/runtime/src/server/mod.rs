@@ -32,7 +32,6 @@ pub mod delegation;
 pub(crate) mod deployment_tool_policy;
 pub mod device_lease_sweeper;
 mod edge;
-mod external_runtime_context;
 pub mod harness;
 pub(crate) mod header_utils;
 mod http_helpers;
@@ -46,6 +45,7 @@ mod plan_handlers;
 mod platform_handlers;
 mod preferences_handlers;
 mod product_harness_handlers;
+mod provider_runtime_context;
 mod reflect_handlers;
 mod request_trace;
 mod resource_handlers;
@@ -87,8 +87,8 @@ fn external_request_descriptor(
     uri: &Uri,
     headers: &HeaderMap,
     route: &'static str,
-) -> astra_services::ExternalRequestDescriptor {
-    astra_services::ExternalRequestDescriptor {
+) -> astra_services::ProviderRequestDescriptor {
+    astra_services::ProviderRequestDescriptor {
         method: method.as_str().to_string(),
         path: uri.path().to_string(),
         route: Some(route.to_string()),

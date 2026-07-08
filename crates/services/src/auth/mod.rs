@@ -1,6 +1,6 @@
 use crate::storage::database_user_from_row;
 use astra_core::{
-    ErrorResponse, ExternalAuthProviderConfig, JwtSettings, MatrixOneSettings, SharedPool,
+    ErrorResponse, JwtSettings, MatrixOneSettings, ProviderRequestAuthConfig, SharedPool,
     bearer_token, error_response, error_response_coded, internal_error, is_duplicate_key_error,
 };
 use async_trait::async_trait;
@@ -8,7 +8,9 @@ use axum::{
     Json,
     http::{HeaderMap, StatusCode},
 };
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bcrypt::{hash as bcrypt_hash, verify as bcrypt_verify};
+use hmac::{Hmac, Mac};
 
 /// Resolve bcrypt cost from `ASTRA_BCRYPT_COST`, falling back to `bcrypt::DEFAULT_COST` (12).
 /// Tests set a low cost (e.g. `4`) to avoid multi-hundred-millisecond hashing in debug builds;
@@ -24,14 +26,16 @@ fn bcrypt_cost_from_env() -> u32 {
     })
 }
 use chrono::{Duration as ChronoDuration, Utc};
+use serde::Deserialize;
+use sha2::Sha256;
 use sqlx::{MySql, Row, query};
 use tracing::warn;
 use uuid::Uuid;
 
 mod admin;
 mod encryption;
-pub mod external;
 mod jwt;
+pub mod provider_request;
 pub mod session;
 mod validation;
 
@@ -47,17 +51,8 @@ pub use admin::{
 };
 pub use encryption::FernetTokenEncryptor;
 use encryption::sha256_hex;
-pub use external::{
-    ExternalAuthorizeRequestData, ExternalAuthorizedRequest, ExternalCatalogResponse,
-    ExternalLoginRequestData, ExternalProviderClient, ExternalProviderPublicRecord,
-    ExternalRequestDescriptor, ExternalRuntimeContextRequestData, ExternalRuntimeContextResponse,
-    ExternalSessionRecord, HttpExternalProviderClient,
-};
-use external::{
-    ExternalProviderSessionHandle, decrypt_provider_session_handle,
-    encrypt_provider_session_handle, resolve_selected_scope, validate_provider_runtime_context,
-};
 use jwt::{JwtTokenClaims, create_jwt_token, decode_jwt_claims, decode_jwt_claims_with_detail};
+pub use provider_request::{ProviderAuthorizedRequest, ProviderRequestDescriptor};
 pub use session::UnconfiguredSessionService;
 pub use session::{
     DatabaseSessionService, SessionActivityCursor, SessionActivityRecord, SessionCreateRequestData,
@@ -69,6 +64,142 @@ use validation::validate_register_request;
 type AuthHttpError = (StatusCode, Json<ErrorResponse>);
 type ExternalRequestAuthHeaders = Option<(String, String, String)>;
 type ParsedTokenSession = (String, String, Option<String>);
+type HmacSha256 = Hmac<Sha256>;
+const PROVIDER_REQUEST_TOKEN_PREFIX: &str = "moi-provider-v1";
+
+#[derive(Debug, Deserialize)]
+struct ProviderRequestClaims {
+    sub: String,
+    scope: String,
+    provider: String,
+    iat: i64,
+    exp: i64,
+}
+
+fn verify_provider_request_hmac_token(
+    expected_provider: &str,
+    key: &str,
+    bearer_token: &str,
+) -> Result<ProviderAuthorizedRequest, AuthHttpError> {
+    if key.is_empty() || key.trim() != key {
+        return Err(provider_request_auth_error(
+            "Provider request HMAC key is not configured",
+        ));
+    }
+    let token = bearer_token.strip_prefix("Bearer ").ok_or_else(|| {
+        error_response_coded(
+            StatusCode::UNAUTHORIZED,
+            "Provider request token must use Bearer authorization",
+            "provider_request_auth_invalid",
+        )
+    })?;
+    if token.is_empty() || token.trim() != token {
+        return Err(provider_request_auth_error(
+            "Provider request token must not be empty or padded",
+        ));
+    }
+    let mut parts = token.split('.');
+    let Some(prefix) = parts.next() else {
+        return Err(provider_request_auth_error(
+            "Provider request token is malformed",
+        ));
+    };
+    let Some(encoded_claims) = parts.next() else {
+        return Err(provider_request_auth_error(
+            "Provider request token is malformed",
+        ));
+    };
+    let Some(encoded_signature) = parts.next() else {
+        return Err(provider_request_auth_error(
+            "Provider request token is malformed",
+        ));
+    };
+    if parts.next().is_some() || prefix != PROVIDER_REQUEST_TOKEN_PREFIX {
+        return Err(provider_request_auth_error(
+            "Provider request token is malformed",
+        ));
+    }
+    if !verify_provider_request_signature(key.as_bytes(), encoded_claims, encoded_signature) {
+        return Err(provider_request_auth_error(
+            "Provider request token signature is invalid",
+        ));
+    }
+    let claims_bytes = URL_SAFE_NO_PAD
+        .decode(encoded_claims)
+        .map_err(|_| provider_request_auth_error("Provider request token claims are malformed"))?;
+    let claims: ProviderRequestClaims = serde_json::from_slice(&claims_bytes)
+        .map_err(|_| provider_request_auth_error("Provider request token claims are malformed"))?;
+    validate_provider_request_claims(expected_provider, &claims)?;
+    Ok(ProviderAuthorizedRequest {
+        provider_id: expected_provider.to_string(),
+        external_subject: claims.sub,
+        provider_scope_id: claims.scope,
+        request_authorization_id: format!("{PROVIDER_REQUEST_TOKEN_PREFIX}:{encoded_signature}"),
+    })
+}
+
+fn validate_provider_request_claims(
+    expected_provider: &str,
+    claims: &ProviderRequestClaims,
+) -> Result<(), AuthHttpError> {
+    for (field, value) in [
+        ("sub", claims.sub.as_str()),
+        ("scope", claims.scope.as_str()),
+        ("provider", claims.provider.as_str()),
+    ] {
+        if value.is_empty() || value.trim() != value {
+            return Err(provider_request_auth_error(format!(
+                "Provider request claim {field} must not be empty or padded"
+            )));
+        }
+    }
+    if claims.provider != expected_provider {
+        return Err(provider_request_auth_error(
+            "Provider request token provider does not match request provider",
+        ));
+    }
+    if claims.iat <= 0 || claims.exp <= 0 || claims.exp <= claims.iat {
+        return Err(provider_request_auth_error(
+            "Provider request token time claims are invalid",
+        ));
+    }
+    if Utc::now().timestamp() >= claims.exp {
+        return Err(provider_request_auth_error(
+            "Provider request token has expired",
+        ));
+    }
+    Ok(())
+}
+
+fn provider_request_auth_error(message: impl Into<String>) -> AuthHttpError {
+    error_response_coded(
+        StatusCode::UNAUTHORIZED,
+        message.into(),
+        "provider_request_auth_invalid",
+    )
+}
+
+#[cfg(test)]
+fn provider_request_signature(key: &[u8], encoded_claims: &str) -> String {
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC-SHA256 accepts keys of any length");
+    mac.update(encoded_claims.as_bytes());
+    URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+}
+
+fn verify_provider_request_signature(
+    key: &[u8],
+    encoded_claims: &str,
+    encoded_signature: &str,
+) -> bool {
+    let Ok(signature) = URL_SAFE_NO_PAD.decode(encoded_signature) else {
+        return false;
+    };
+    let Ok(mut mac) = HmacSha256::new_from_slice(key) else {
+        return false;
+    };
+    mac.update(encoded_claims.as_bytes());
+    mac.verify_slice(&signature).is_ok()
+}
 
 #[async_trait]
 pub trait AuthService: Send + Sync {
@@ -109,49 +240,9 @@ pub trait AuthService: Send + Sync {
     async fn current_principal_for_request(
         &self,
         headers: &HeaderMap,
-        _request: ExternalRequestDescriptor,
+        _request: ProviderRequestDescriptor,
     ) -> Result<AuthPrincipal, (StatusCode, Json<ErrorResponse>)> {
         self.current_principal(headers).await
-    }
-
-    async fn external_providers(
-        &self,
-    ) -> Result<Vec<ExternalProviderPublicRecord>, (StatusCode, Json<ErrorResponse>)> {
-        Err(error_response(
-            StatusCode::NOT_IMPLEMENTED,
-            "External auth providers are not configured",
-        ))
-    }
-
-    async fn external_login(
-        &self,
-        _request: ExternalLoginRequestData,
-    ) -> Result<AuthTokenRecord, (StatusCode, Json<ErrorResponse>)> {
-        Err(error_response(
-            StatusCode::NOT_IMPLEMENTED,
-            "External auth providers are not configured",
-        ))
-    }
-
-    async fn external_catalog(
-        &self,
-        _principal: &AuthPrincipal,
-    ) -> Result<ExternalCatalogResponse, (StatusCode, Json<ErrorResponse>)> {
-        Err(error_response(
-            StatusCode::NOT_IMPLEMENTED,
-            "External runtime catalog is not configured",
-        ))
-    }
-
-    async fn external_runtime_context(
-        &self,
-        _principal: &AuthPrincipal,
-        _request: ExternalRuntimeContextRequestData,
-    ) -> Result<ExternalRuntimeContextResponse, (StatusCode, Json<ErrorResponse>)> {
-        Err(error_response(
-            StatusCode::NOT_IMPLEMENTED,
-            "External runtime context is not configured",
-        ))
     }
 }
 
@@ -198,18 +289,10 @@ impl AuthPrincipal {
         }
     }
 
-    pub fn is_external(&self) -> bool {
-        matches!(self.origin, AuthPrincipalOrigin::External(_))
-    }
-
-    pub fn is_external_user_session(&self) -> bool {
-        matches!(self.origin, AuthPrincipalOrigin::External(_))
-    }
-
-    pub fn is_external_authorized_request(&self) -> bool {
+    pub fn is_provider_authorized_request(&self) -> bool {
         matches!(
             self.origin,
-            AuthPrincipalOrigin::ExternalAuthorizedRequest(_)
+            AuthPrincipalOrigin::ProviderAuthorizedRequest(_)
         )
     }
 }
@@ -217,21 +300,11 @@ impl AuthPrincipal {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AuthPrincipalOrigin {
     Internal,
-    External(AuthExternalSessionContext),
-    ExternalAuthorizedRequest(AuthExternalAuthorizedRequestContext),
+    ProviderAuthorizedRequest(AuthProviderAuthorizedRequestContext),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AuthExternalSessionContext {
-    pub provider_id: String,
-    pub external_subject: String,
-    pub external_session_id: String,
-    pub provider_scope_id: String,
-    pub provider_scope_display_name: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AuthExternalAuthorizedRequestContext {
+pub struct AuthProviderAuthorizedRequestContext {
     pub provider_id: String,
     pub external_subject: String,
     pub provider_scope_id: String,
@@ -252,8 +325,7 @@ pub struct DatabaseAuthService {
     pool: Option<SharedPool>,
     jwt: JwtSettings,
     encryptor: Option<FernetTokenEncryptor>,
-    external_providers: Vec<ExternalAuthProviderConfig>,
-    external_client: std::sync::Arc<dyn ExternalProviderClient>,
+    provider_request_auth: Vec<ProviderRequestAuthConfig>,
 }
 
 #[derive(Clone, Debug)]
@@ -275,7 +347,10 @@ impl fmt::Debug for DatabaseAuthService {
             .field("pool_configured", &self.pool.is_some())
             .field("jwt", &self.jwt)
             .field("encryptor_configured", &self.encryptor.is_some())
-            .field("external_provider_count", &self.external_providers.len())
+            .field(
+                "provider_request_auth_count",
+                &self.provider_request_auth.len(),
+            )
             .finish()
     }
 }
@@ -312,8 +387,7 @@ impl DatabaseAuthService {
             jwt,
             pool: None,
             encryptor: None,
-            external_providers: Vec::new(),
-            external_client: HttpExternalProviderClient::shared(),
+            provider_request_auth: Vec::new(),
         }
     }
 
@@ -421,7 +495,6 @@ impl DatabaseAuthService {
         username: &str,
         session_id: &str,
         origin: &str,
-        provider_id: Option<&str>,
     ) -> Result<String, String> {
         create_jwt_token(
             &self.jwt,
@@ -431,7 +504,6 @@ impl DatabaseAuthService {
                 token_type: "access".to_string(),
                 sid: Some(session_id.to_string()),
                 origin: Some(origin.to_string()),
-                provider_id: provider_id.map(str::to_string),
                 exp: 0,
                 iat: 0,
                 jti: String::new(),
@@ -445,7 +517,6 @@ impl DatabaseAuthService {
         user_id: &str,
         session_id: &str,
         origin: &str,
-        provider_id: Option<&str>,
     ) -> Result<String, String> {
         create_jwt_token(
             &self.jwt,
@@ -455,7 +526,6 @@ impl DatabaseAuthService {
                 token_type: "refresh".to_string(),
                 sid: Some(session_id.to_string()),
                 origin: Some(origin.to_string()),
-                provider_id: provider_id.map(str::to_string),
                 exp: 0,
                 iat: 0,
                 jti: String::new(),
@@ -484,16 +554,8 @@ impl DatabaseAuthService {
         self
     }
 
-    pub fn with_external_providers(mut self, providers: Vec<ExternalAuthProviderConfig>) -> Self {
-        self.external_providers = providers;
-        self
-    }
-
-    pub fn with_external_provider_client(
-        mut self,
-        client: std::sync::Arc<dyn ExternalProviderClient>,
-    ) -> Self {
-        self.external_client = client;
+    pub fn with_provider_request_auth(mut self, auth: Vec<ProviderRequestAuthConfig>) -> Self {
+        self.provider_request_auth = auth;
         self
     }
 
@@ -501,27 +563,18 @@ impl DatabaseAuthService {
         crate::require_shared_pool(self.pool.as_ref(), "DatabaseAuthService", &self.matrixone)
     }
 
-    fn encryptor(&self) -> Result<&FernetTokenEncryptor, (StatusCode, Json<ErrorResponse>)> {
-        self.encryptor.as_ref().ok_or_else(|| {
-            error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "External auth session encryption is not configured",
-            )
-        })
-    }
-
     fn provider_config(
         &self,
         provider_id: &str,
-    ) -> Result<&ExternalAuthProviderConfig, (StatusCode, Json<ErrorResponse>)> {
-        self.external_providers
+    ) -> Result<&ProviderRequestAuthConfig, (StatusCode, Json<ErrorResponse>)> {
+        self.provider_request_auth
             .iter()
-            .find(|provider| provider.id == provider_id)
+            .find(|provider| provider.provider == provider_id)
             .ok_or_else(|| {
                 error_response_coded(
                     StatusCode::BAD_REQUEST,
-                    format!("Unknown external provider id '{provider_id}'"),
-                    "external_provider_unknown",
+                    format!("Unknown provider id '{provider_id}'"),
+                    "provider_unknown",
                 )
             })
     }
@@ -529,16 +582,16 @@ impl DatabaseAuthService {
     fn external_request_auth_headers(
         headers: &HeaderMap,
     ) -> Result<ExternalRequestAuthHeaders, AuthHttpError> {
-        let provider = header_exact(headers, "x-astra-external-provider")?;
-        let action = header_exact(headers, "x-astra-external-action")?;
+        let provider = header_exact(headers, "x-astra-provider")?;
+        let action = header_exact(headers, "x-astra-provider-action")?;
         match (provider, action) {
             (None, None) => Ok(None),
             (Some(provider), Some(action)) => {
                 if action != "authorize_request" {
                     return Err(error_response_coded(
                         StatusCode::BAD_REQUEST,
-                        "X-Astra-External-Action must be authorize_request",
-                        "external_action_invalid",
+                        "X-Astra-Provider-Action must be authorize_request",
+                        "provider_action_invalid",
                     ));
                 }
                 let token = bearer_token(headers)?;
@@ -546,8 +599,8 @@ impl DatabaseAuthService {
             }
             _ => Err(error_response_coded(
                 StatusCode::BAD_REQUEST,
-                "X-Astra-External-Provider and X-Astra-External-Action must be sent together",
-                "external_request_auth_invalid",
+                "X-Astra-Provider and X-Astra-Provider-Action must be sent together",
+                "provider_request_auth_invalid",
             )),
         }
     }
@@ -569,157 +622,6 @@ impl DatabaseAuthService {
         Ok(row.try_get::<i64, _>("count").unwrap_or(0) > 0)
     }
 
-    async fn fetch_external_session(
-        &self,
-        executor: impl sqlx::Executor<'_, Database = MySql>,
-        session_id: &str,
-        user_id: &str,
-        provider_id: &str,
-    ) -> Result<Option<ExternalSessionDbRecord>, sqlx::Error> {
-        query(
-            "SELECT s.external_session_id, s.provider_id, s.astra_user_id, s.external_subject, \
-                    s.provider_scope_id, s.provider_scope_display_name, \
-                    DATE_FORMAT(s.expires_at, '%Y-%m-%dT%H:%i:%s') AS expires_at, \
-                    s.encrypted_provider_session_handle, \
-                    i.username AS external_username, i.email AS external_email, \
-                    i.display_name AS external_display_name \
-             FROM auth_external_sessions s \
-             JOIN auth_external_identities i \
-               ON i.provider_id = s.provider_id AND i.external_subject = s.external_subject \
-             WHERE s.external_session_id = ? \
-               AND s.astra_user_id = ? \
-               AND s.provider_id = ? \
-               AND s.status = 'active' \
-               AND s.expires_at > NOW() \
-             LIMIT 1",
-        )
-        .bind(session_id)
-        .bind(user_id)
-        .bind(provider_id)
-        .fetch_optional(executor)
-        .await
-        .map(|row| {
-            row.map(|row| ExternalSessionDbRecord {
-                session: ExternalSessionRecord {
-                    external_session_id: row.try_get("external_session_id").unwrap_or_default(),
-                    provider_id: row.try_get("provider_id").unwrap_or_default(),
-                    astra_user_id: row.try_get("astra_user_id").unwrap_or_default(),
-                    external_subject: row.try_get("external_subject").unwrap_or_default(),
-                    provider_scope_id: row.try_get("provider_scope_id").unwrap_or_default(),
-                    provider_scope_display_name: row.try_get("provider_scope_display_name").ok(),
-                },
-                provider_expires_at: row.try_get("expires_at").unwrap_or_default(),
-                encrypted_provider_session_handle: row
-                    .try_get("encrypted_provider_session_handle")
-                    .unwrap_or_default(),
-                external_username: row.try_get("external_username").unwrap_or_default(),
-                external_email: row.try_get("external_email").ok(),
-                external_display_name: row.try_get("external_display_name").ok(),
-            })
-        })
-    }
-
-    async fn fetch_active_external_session(
-        &self,
-        executor: impl sqlx::Executor<'_, Database = MySql>,
-        session_id: &str,
-        user_id: &str,
-        provider_id: &str,
-    ) -> Result<Option<ExternalSessionDbRecord>, sqlx::Error> {
-        query(
-            "SELECT s.external_session_id, s.provider_id, s.astra_user_id, s.external_subject, \
-                    s.provider_scope_id, s.provider_scope_display_name, \
-                    DATE_FORMAT(s.expires_at, '%Y-%m-%dT%H:%i:%s') AS expires_at, \
-                    s.encrypted_provider_session_handle, \
-                    i.username AS external_username, i.email AS external_email, \
-                    i.display_name AS external_display_name \
-             FROM auth_external_sessions s \
-             JOIN auth_external_identities i \
-               ON i.provider_id = s.provider_id AND i.external_subject = s.external_subject \
-             WHERE s.external_session_id = ? \
-               AND s.astra_user_id = ? \
-               AND s.provider_id = ? \
-               AND s.status = 'active' \
-             LIMIT 1",
-        )
-        .bind(session_id)
-        .bind(user_id)
-        .bind(provider_id)
-        .fetch_optional(executor)
-        .await
-        .map(|row| {
-            row.map(|row| ExternalSessionDbRecord {
-                session: ExternalSessionRecord {
-                    external_session_id: row.try_get("external_session_id").unwrap_or_default(),
-                    provider_id: row.try_get("provider_id").unwrap_or_default(),
-                    astra_user_id: row.try_get("astra_user_id").unwrap_or_default(),
-                    external_subject: row.try_get("external_subject").unwrap_or_default(),
-                    provider_scope_id: row.try_get("provider_scope_id").unwrap_or_default(),
-                    provider_scope_display_name: row.try_get("provider_scope_display_name").ok(),
-                },
-                provider_expires_at: row.try_get("expires_at").unwrap_or_default(),
-                encrypted_provider_session_handle: row
-                    .try_get("encrypted_provider_session_handle")
-                    .unwrap_or_default(),
-                external_username: row.try_get("external_username").unwrap_or_default(),
-                external_email: row.try_get("external_email").ok(),
-                external_display_name: row.try_get("external_display_name").ok(),
-            })
-        })
-    }
-
-    fn external_provider_session_expired(expires_at: &str) -> bool {
-        let now = Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
-        expires_at <= now.as_str()
-    }
-
-    async fn external_session_handle(
-        &self,
-        principal: &AuthPrincipal,
-    ) -> Result<
-        (ExternalAuthProviderConfig, ExternalProviderSessionHandle),
-        (StatusCode, Json<ErrorResponse>),
-    > {
-        let AuthPrincipalOrigin::External(external) = &principal.origin else {
-            return Err(error_response(
-                StatusCode::BAD_REQUEST,
-                "External principal is required",
-            ));
-        };
-        let provider = self.provider_config(&external.provider_id)?.clone();
-        let pool = self
-            .get_pool()
-            .await
-            .map_err(|e| map_auth_sqlx(e, "auth.get_pool", None))?;
-        let session = self
-            .fetch_external_session(
-                &pool,
-                &external.external_session_id,
-                &principal.user.user_id,
-                &external.provider_id,
-            )
-            .await
-            .map_err(|e| map_auth_sqlx(e, "external.fetch_session", Some(&pool)))?
-            .ok_or_else(|| {
-                error_response_coded(
-                    StatusCode::UNAUTHORIZED,
-                    "External session expired or revoked",
-                    "external_session_invalid",
-                )
-            })?;
-        let handle = decrypt_provider_session_handle(
-            self.encryptor()?,
-            &session.encrypted_provider_session_handle,
-        )?;
-        Ok((
-            provider,
-            ExternalProviderSessionHandle {
-                provider_session_handle: handle,
-                provider_scope_id: session.session.provider_scope_id,
-            },
-        ))
-    }
-
     fn parse_token_session(
         &self,
         claims: &jwt::JwtClaims,
@@ -734,203 +636,12 @@ impl DatabaseAuthService {
             .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "Invalid token origin"))?;
         match origin.as_str() {
             "internal" => Ok((session_id, origin, None)),
-            "external" => {
-                let provider_id = claims.provider_id.clone().ok_or_else(|| {
-                    error_response(StatusCode::UNAUTHORIZED, "Invalid token provider")
-                })?;
-                Ok((session_id, origin, Some(provider_id)))
-            }
             _ => Err(error_response(
                 StatusCode::UNAUTHORIZED,
                 "Invalid token origin",
             )),
         }
     }
-
-    fn parse_provider_expires_at(
-        &self,
-        raw: &str,
-    ) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
-        chrono::DateTime::parse_from_rfc3339(raw)
-            .map(|dt| {
-                dt.with_timezone(&Utc)
-                    .format("%Y-%m-%d %H:%M:%S")
-                    .to_string()
-            })
-            .map_err(|error| {
-                error_response_coded(
-                    StatusCode::BAD_GATEWAY,
-                    format!("external provider session expiry is invalid: {error}"),
-                    "external_provider_response_invalid",
-                )
-            })
-    }
-
-    async fn complete_external_auth(
-        &self,
-        provider: &ExternalAuthProviderConfig,
-        requested_scope_id: Option<&str>,
-        response: external::ExternalProviderAuthResponse,
-    ) -> Result<AuthTokenRecord, (StatusCode, Json<ErrorResponse>)> {
-        let selected_scope = resolve_selected_scope(requested_scope_id, &response)?;
-        let encrypted_handle =
-            encrypt_provider_session_handle(self.encryptor()?, &response.provider_session_handle)?;
-        let external_subject = response.external_subject.id.clone();
-        let external_username = response.display_info.username.clone();
-        let external_email = response.display_info.email.clone();
-        let external_display_name = response.display_info.nickname.clone();
-        let pool = self
-            .get_pool()
-            .await
-            .map_err(|e| map_auth_sqlx(e, "auth.get_pool", None))?;
-        let now = Utc::now();
-        let external_expires_at = self.parse_provider_expires_at(&response.expires_at)?;
-        let astra_session_id = Uuid::new_v4().to_string();
-        let astra_user_id = Uuid::new_v4().to_string();
-        let internal_username = format!("ext_{}", astra_user_id.replace('-', ""));
-        let internal_email = format!("{internal_username}@external.astra.invalid");
-
-        let mut tx = pool
-            .begin()
-            .await
-            .map_err(|e| map_auth_sqlx(e, "external.begin_tx", Some(&pool)))?;
-        let existing_identity = query(
-            "SELECT astra_user_id FROM auth_external_identities \
-             WHERE provider_id = ? AND external_subject = ? LIMIT 1",
-        )
-        .bind(&provider.id)
-        .bind(&external_subject)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| map_auth_sqlx(e, "external.fetch_identity", Some(&pool)))?;
-
-        let astra_user_id = if let Some(row) = existing_identity {
-            let existing_user_id: String = row.try_get("astra_user_id").unwrap_or_default();
-            query(
-                "UPDATE auth_external_identities \
-                 SET username = ?, email = ?, display_name = ?, updated_at = NOW() \
-                 WHERE provider_id = ? AND external_subject = ?",
-            )
-            .bind(&external_username)
-            .bind(&external_email)
-            .bind(&external_display_name)
-            .bind(&provider.id)
-            .bind(&external_subject)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| map_auth_sqlx(e, "external.update_identity", Some(&pool)))?;
-            existing_user_id
-        } else {
-            query(
-                "INSERT INTO auth_users \
-                 (user_id, username, email, password_hash, display_name, is_active) \
-                 VALUES (?, ?, ?, '', ?, 1)",
-            )
-            .bind(&astra_user_id)
-            .bind(&internal_username)
-            .bind(&internal_email)
-            .bind(&external_display_name)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| map_auth_sqlx(e, "external.insert_auth_user", Some(&pool)))?;
-            query(
-                "INSERT INTO auth_external_identities \
-                 (provider_id, external_subject, astra_user_id, username, email, display_name) \
-                 VALUES (?, ?, ?, ?, ?, ?)",
-            )
-            .bind(&provider.id)
-            .bind(&external_subject)
-            .bind(&astra_user_id)
-            .bind(&external_username)
-            .bind(&external_email)
-            .bind(&external_display_name)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| map_auth_sqlx(e, "external.insert_identity", Some(&pool)))?;
-            astra_user_id
-        };
-
-        query(
-            "INSERT INTO auth_external_sessions \
-             (external_session_id, provider_id, astra_user_id, external_subject, \
-              provider_scope_id, provider_scope_display_name, encrypted_provider_session_handle, \
-              status, expires_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?)",
-        )
-        .bind(&astra_session_id)
-        .bind(&provider.id)
-        .bind(&astra_user_id)
-        .bind(&external_subject)
-        .bind(&selected_scope.id)
-        .bind(&selected_scope.name)
-        .bind(&encrypted_handle)
-        .bind(&external_expires_at)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| map_auth_sqlx(e, "external.insert_session", Some(&pool)))?;
-
-        let access_token = self
-            .create_access_token(
-                &astra_user_id,
-                &external_username,
-                &astra_session_id,
-                "external",
-                Some(&provider.id),
-            )
-            .map_err(internal_error)?;
-        let refresh_token = self
-            .create_refresh_token(
-                &astra_user_id,
-                &astra_session_id,
-                "external",
-                Some(&provider.id),
-            )
-            .map_err(internal_error)?;
-        let refresh_token_hash = sha256_hex(&refresh_token);
-        let refresh_expires_at = self.refresh_token_expires_at_string(now);
-
-        query(
-            "INSERT INTO auth_refresh_tokens \
-             (token_id, user_id, session_id, token_hash, expires_at, is_revoked) \
-             VALUES (?, ?, ?, ?, ?, 0)",
-        )
-        .bind(Uuid::new_v4().to_string())
-        .bind(&astra_user_id)
-        .bind(&astra_session_id)
-        .bind(&refresh_token_hash)
-        .bind(refresh_expires_at)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| map_auth_sqlx(e, "external.insert_refresh_token", Some(&pool)))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| map_auth_sqlx(e, "external.commit_tx", Some(&pool)))?;
-
-        Ok(AuthTokenRecord {
-            access_token,
-            refresh_token,
-            token_type: "bearer".to_string(),
-            expires_in: self.access_token_expires_in_seconds(),
-        })
-    }
-}
-
-#[derive(Clone, Debug)]
-struct ExternalSessionDbRecord {
-    session: ExternalSessionRecord,
-    provider_expires_at: String,
-    encrypted_provider_session_handle: String,
-    external_username: String,
-    external_email: Option<String>,
-    external_display_name: Option<String>,
-}
-
-#[derive(Clone, Debug)]
-struct ExternalSessionRefreshUpdate {
-    encrypted_provider_session_handle: String,
-    provider_scope_id: String,
-    expires_at: String,
 }
 
 fn header_exact(
@@ -944,14 +655,14 @@ fn header_exact(
         error_response_coded(
             StatusCode::BAD_REQUEST,
             format!("{name} must be visible ASCII"),
-            "external_request_auth_invalid",
+            "provider_request_auth_invalid",
         )
     })?;
     if value.is_empty() || value.trim() != value || value.chars().any(char::is_control) {
         return Err(error_response_coded(
             StatusCode::BAD_REQUEST,
             format!("{name} must be a non-empty exact string"),
-            "external_request_auth_invalid",
+            "provider_request_auth_invalid",
         ));
     }
     Ok(Some(value.to_string()))
@@ -1138,10 +849,10 @@ impl AuthService for DatabaseAuthService {
 
         let session_id = Uuid::new_v4().to_string();
         let access_token = self
-            .create_access_token(&user.user_id, &user.username, &session_id, "internal", None)
+            .create_access_token(&user.user_id, &user.username, &session_id, "internal")
             .map_err(internal_error)?;
         let refresh_token = self
-            .create_refresh_token(&user.user_id, &session_id, "internal", None)
+            .create_refresh_token(&user.user_id, &session_id, "internal")
             .map_err(internal_error)?;
         let refresh_token_hash = sha256_hex(&refresh_token);
         let expires_at = self.refresh_token_expires_at_string(Utc::now());
@@ -1195,7 +906,7 @@ impl AuthService for DatabaseAuthService {
             .sub
             .clone()
             .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "Invalid token"))?;
-        let (session_id, origin, provider_id) = self.parse_token_session(&claims)?;
+        let (session_id, origin, _) = self.parse_token_session(&claims)?;
 
         let pool = self
             .get_pool()
@@ -1220,57 +931,6 @@ impl AuthService for DatabaseAuthService {
                 "Token expired or revoked",
             ));
         }
-        let mut external_session_refresh: Option<ExternalSessionRefreshUpdate> = None;
-        if origin == "external" {
-            let provider_id = provider_id.as_deref().ok_or_else(|| {
-                error_response(StatusCode::UNAUTHORIZED, "Invalid token provider")
-            })?;
-            let session = self
-                .fetch_active_external_session(&pool, &session_id, &user_id, provider_id)
-                .await
-                .map_err(|e| map_auth_sqlx(e, "refresh.fetch_external_session", Some(&pool)))?
-                .ok_or_else(|| {
-                    error_response_coded(
-                        StatusCode::UNAUTHORIZED,
-                        "External session is revoked or unknown",
-                        "external_session_invalid",
-                    )
-                })?;
-            if Self::external_provider_session_expired(&session.provider_expires_at) {
-                let provider = self.provider_config(provider_id)?.clone();
-                let provider_session_handle = decrypt_provider_session_handle(
-                    self.encryptor()?,
-                    &session.encrypted_provider_session_handle,
-                )?;
-                let refreshed = self
-                    .external_client
-                    .refresh_session(
-                        &provider,
-                        ExternalProviderSessionHandle {
-                            provider_session_handle,
-                            provider_scope_id: session.session.provider_scope_id,
-                        },
-                    )
-                    .await?;
-                if refreshed.provider_scope_id.is_empty() {
-                    return Err(error_response_coded(
-                        StatusCode::BAD_GATEWAY,
-                        "external provider refresh_session returned empty provider_scope_id",
-                        "external_provider_response_invalid",
-                    ));
-                }
-                let encrypted_provider_session_handle = encrypt_provider_session_handle(
-                    self.encryptor()?,
-                    &refreshed.provider_session_handle,
-                )?;
-                external_session_refresh = Some(ExternalSessionRefreshUpdate {
-                    encrypted_provider_session_handle,
-                    provider_scope_id: refreshed.provider_scope_id,
-                    expires_at: self.parse_provider_expires_at(&refreshed.expires_at)?,
-                });
-            }
-        }
-
         let user = self
             .fetch_user_by_id_or_username(&pool, &user_id, None)
             .await
@@ -1278,16 +938,10 @@ impl AuthService for DatabaseAuthService {
             .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "User not found"))?;
 
         let access_token = self
-            .create_access_token(
-                &user.user_id,
-                &user.username,
-                &session_id,
-                &origin,
-                provider_id.as_deref(),
-            )
+            .create_access_token(&user.user_id, &user.username, &session_id, &origin)
             .map_err(internal_error)?;
         let new_refresh_token = self
-            .create_refresh_token(&user.user_id, &session_id, &origin, provider_id.as_deref())
+            .create_refresh_token(&user.user_id, &session_id, &origin)
             .map_err(internal_error)?;
         let new_refresh_token_hash = sha256_hex(&new_refresh_token);
         let expires_at = self.refresh_token_expires_at_string(Utc::now());
@@ -1313,22 +967,6 @@ impl AuthService for DatabaseAuthService {
         .execute(&mut *tx)
         .await
         .map_err(|e| map_auth_sqlx(e, "refresh.insert_new_refresh_token", Some(&pool)))?;
-        if let Some(update) = external_session_refresh {
-            query(
-                "UPDATE auth_external_sessions \
-                 SET encrypted_provider_session_handle = ?, provider_scope_id = ?, expires_at = ?, updated_at = NOW() \
-                 WHERE external_session_id = ? AND astra_user_id = ? AND provider_id = ? AND status = 'active'",
-            )
-            .bind(update.encrypted_provider_session_handle)
-            .bind(update.provider_scope_id)
-            .bind(update.expires_at)
-            .bind(&session_id)
-            .bind(&user_id)
-            .bind(provider_id.as_deref().unwrap_or_default())
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| map_auth_sqlx(e, "refresh.update_external_session", Some(&pool)))?;
-        }
         tx.commit()
             .await
             .map_err(|e| map_auth_sqlx(e, "refresh.commit_tx", Some(&pool)))?;
@@ -1357,7 +995,7 @@ impl AuthService for DatabaseAuthService {
             .sub
             .clone()
             .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "Invalid token"))?;
-        let (session_id, origin, provider_id) = self.parse_token_session(&claims)?;
+        let (session_id, _, _) = self.parse_token_session(&claims)?;
 
         let pool = self
             .get_pool()
@@ -1383,37 +1021,6 @@ impl AuthService for DatabaseAuthService {
             ));
         }
 
-        if origin == "external" {
-            let provider_id_ref = provider_id.as_deref().ok_or_else(|| {
-                error_response(StatusCode::UNAUTHORIZED, "Invalid token provider")
-            })?;
-            let session = self
-                .fetch_active_external_session(&pool, &session_id, &user_id, provider_id_ref)
-                .await
-                .map_err(|e| map_auth_sqlx(e, "logout.fetch_external_session", Some(&pool)))?
-                .ok_or_else(|| {
-                    error_response_coded(
-                        StatusCode::UNAUTHORIZED,
-                        "External session is revoked or unknown",
-                        "external_session_invalid",
-                    )
-                })?;
-            let provider = self.provider_config(provider_id_ref)?.clone();
-            let provider_session_handle = decrypt_provider_session_handle(
-                self.encryptor()?,
-                &session.encrypted_provider_session_handle,
-            )?;
-            self.external_client
-                .logout(
-                    &provider,
-                    ExternalProviderSessionHandle {
-                        provider_session_handle,
-                        provider_scope_id: session.session.provider_scope_id,
-                    },
-                )
-                .await?;
-        }
-
         let mut tx = pool
             .begin()
             .await
@@ -1424,23 +1031,6 @@ impl AuthService for DatabaseAuthService {
             .execute(&mut *tx)
             .await
             .map_err(|e| map_auth_sqlx(e, "logout.revoke_submitted_token", Some(&pool)))?;
-
-        if origin == "external" {
-            let provider_id = provider_id.ok_or_else(|| {
-                error_response(StatusCode::UNAUTHORIZED, "Invalid token provider")
-            })?;
-            query(
-                "UPDATE auth_external_sessions \
-                 SET status = 'revoked', updated_at = NOW() \
-                 WHERE external_session_id = ? AND astra_user_id = ? AND provider_id = ?",
-            )
-            .bind(&session_id)
-            .bind(&user_id)
-            .bind(provider_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| map_auth_sqlx(e, "logout.revoke_external_session", Some(&pool)))?;
-        }
 
         tx.commit()
             .await
@@ -1476,7 +1066,7 @@ impl AuthService for DatabaseAuthService {
             .sub
             .clone()
             .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "Invalid token"))?;
-        let (session_id, origin, provider_id) = self.parse_token_session(&claims)?;
+        let (session_id, _, _) = self.parse_token_session(&claims)?;
         let pool = self
             .get_pool()
             .await
@@ -1490,39 +1080,6 @@ impl AuthService for DatabaseAuthService {
                 StatusCode::UNAUTHORIZED,
                 "Session expired or revoked",
             ));
-        }
-
-        if origin == "external" {
-            let provider_id = provider_id.ok_or_else(|| {
-                error_response(StatusCode::UNAUTHORIZED, "Invalid token provider")
-            })?;
-            let session = self
-                .fetch_external_session(&pool, &session_id, &user_id, &provider_id)
-                .await
-                .map_err(|e| map_auth_sqlx(e, "current_principal.fetch_external", Some(&pool)))?
-                .ok_or_else(|| {
-                    error_response_coded(
-                        StatusCode::UNAUTHORIZED,
-                        "External session expired or revoked",
-                        "external_session_invalid",
-                    )
-                })?;
-            return Ok(AuthPrincipal {
-                user: AuthUserRecord {
-                    user_id: user_id.clone(),
-                    username: session.external_username,
-                    email: session.external_email.unwrap_or_default(),
-                    display_name: session.external_display_name,
-                },
-                session_id: Some(session_id),
-                origin: AuthPrincipalOrigin::External(AuthExternalSessionContext {
-                    provider_id,
-                    external_subject: session.session.external_subject,
-                    external_session_id: session.session.external_session_id,
-                    provider_scope_id: session.session.provider_scope_id,
-                    provider_scope_display_name: session.session.provider_scope_display_name,
-                }),
-            });
         }
 
         let user = self
@@ -1546,26 +1103,22 @@ impl AuthService for DatabaseAuthService {
     async fn current_principal_for_request(
         &self,
         headers: &HeaderMap,
-        request: ExternalRequestDescriptor,
+        _request: ProviderRequestDescriptor,
     ) -> Result<AuthPrincipal, (StatusCode, Json<ErrorResponse>)> {
         let Some((provider_id, _action, token)) = Self::external_request_auth_headers(headers)?
         else {
             return self.current_principal(headers).await;
         };
         let provider = self.provider_config(&provider_id)?.clone();
-        let authorized = self
-            .external_client
-            .authorize_request(
-                &provider,
-                ExternalAuthorizeRequestData {
-                    provider_id: provider_id.clone(),
-                    token,
-                    request,
-                },
-            )
-            .await?;
+        if provider.auth_type != "hmac" {
+            return Err(provider_request_auth_error(
+                "Provider request auth configuration is unsupported",
+            ));
+        }
+        let authorized =
+            verify_provider_request_hmac_token(&provider.provider, &provider.key, &token)?;
         let user_id = format!(
-            "external_authorized:{}:{}",
+            "provider_authorized:{}:{}",
             authorized.provider_id, authorized.external_subject
         );
         Ok(AuthPrincipal {
@@ -1576,8 +1129,8 @@ impl AuthService for DatabaseAuthService {
                 display_name: None,
             },
             session_id: None,
-            origin: AuthPrincipalOrigin::ExternalAuthorizedRequest(
-                AuthExternalAuthorizedRequestContext {
+            origin: AuthPrincipalOrigin::ProviderAuthorizedRequest(
+                AuthProviderAuthorizedRequestContext {
                     provider_id: authorized.provider_id,
                     external_subject: authorized.external_subject,
                     provider_scope_id: authorized.provider_scope_id,
@@ -1585,53 +1138,6 @@ impl AuthService for DatabaseAuthService {
                 },
             ),
         })
-    }
-
-    async fn external_providers(
-        &self,
-    ) -> Result<Vec<ExternalProviderPublicRecord>, (StatusCode, Json<ErrorResponse>)> {
-        Ok(self
-            .external_providers
-            .iter()
-            .map(ExternalProviderPublicRecord::from)
-            .collect())
-    }
-
-    async fn external_login(
-        &self,
-        request: ExternalLoginRequestData,
-    ) -> Result<AuthTokenRecord, (StatusCode, Json<ErrorResponse>)> {
-        let provider = self.provider_config(&request.provider_id)?.clone();
-        let requested_scope_id = request.scope_id.clone();
-        let response = self
-            .external_client
-            .authenticate(&provider, request)
-            .await?;
-        self.complete_external_auth(&provider, requested_scope_id.as_deref(), response)
-            .await
-    }
-
-    async fn external_catalog(
-        &self,
-        principal: &AuthPrincipal,
-    ) -> Result<ExternalCatalogResponse, (StatusCode, Json<ErrorResponse>)> {
-        let (provider, session) = self.external_session_handle(principal).await?;
-        self.external_client.list_catalog(&provider, session).await
-    }
-
-    async fn external_runtime_context(
-        &self,
-        principal: &AuthPrincipal,
-        request: ExternalRuntimeContextRequestData,
-    ) -> Result<ExternalRuntimeContextResponse, (StatusCode, Json<ErrorResponse>)> {
-        let (provider, session) = self.external_session_handle(principal).await?;
-        let requested_model_id = request.requested_model_id.clone();
-        let context = self
-            .external_client
-            .issue_runtime_context(&provider, session, request)
-            .await?;
-        validate_provider_runtime_context(&provider, &requested_model_id, &context)?;
-        Ok(context)
     }
 }
 
@@ -1742,77 +1248,37 @@ impl AuthService for StubAuthService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
+    use astra_core::ProviderRequestAuthConfig;
     use chrono::Utc;
-    struct AuthorizingProviderClient;
+    use serde_json::json;
 
-    #[async_trait]
-    impl ExternalProviderClient for AuthorizingProviderClient {
-        async fn authorize_request(
-            &self,
-            provider: &ExternalAuthProviderConfig,
-            request: ExternalAuthorizeRequestData,
-        ) -> Result<ExternalAuthorizedRequest, (StatusCode, Json<ErrorResponse>)> {
-            assert_eq!(provider.id, "moi");
-            assert_eq!(request.token, "Bearer provider-token");
-            assert_eq!(request.request.method, "POST");
-            assert_eq!(request.request.path, "/chat/stream");
-            assert!(request.request.body_digest.is_none());
-            Ok(ExternalAuthorizedRequest {
-                provider_id: "moi".to_string(),
-                external_subject: "moi-user-1".to_string(),
-                provider_scope_id: "workspace-1".to_string(),
-                request_authorization_id: "authz-1".to_string(),
-            })
-        }
+    const TEST_PROVIDER_HMAC_KEY: &str = "test-provider-hmac-key";
+    const GOLDEN_PROVIDER_HMAC_KEY: &str = "WrE2irtwGEq1Ih2stZUtgFfLFNv2gVhOAwsBD999QLI";
+    const GOLDEN_PROVIDER_TOKEN: &str = "moi-provider-v1.eyJzdWIiOiJ1c2VyXzEiLCJzY29wZSI6IndvcmtzcGFjZV8xIiwicHJvdmlkZXIiOiJtb2kiLCJpYXQiOjQxMDI0NDQ1MDAsImV4cCI6NDEwMjQ0NDgwMH0.wZS9mRKasIEmreqhzGheguYYPbq1URTYkJoSK3nfW3M";
 
-        async fn authenticate(
-            &self,
-            _provider: &ExternalAuthProviderConfig,
-            _request: ExternalLoginRequestData,
-        ) -> Result<external::ExternalProviderAuthResponse, (StatusCode, Json<ErrorResponse>)>
-        {
-            unimplemented!("not used by header authorization test")
-        }
-
-        async fn list_catalog(
-            &self,
-            _provider: &ExternalAuthProviderConfig,
-            _session: ExternalProviderSessionHandle,
-        ) -> Result<ExternalCatalogResponse, (StatusCode, Json<ErrorResponse>)> {
-            unimplemented!("not used by header authorization test")
-        }
-
-        async fn issue_runtime_context(
-            &self,
-            _provider: &ExternalAuthProviderConfig,
-            _session: ExternalProviderSessionHandle,
-            _request: ExternalRuntimeContextRequestData,
-        ) -> Result<ExternalRuntimeContextResponse, (StatusCode, Json<ErrorResponse>)> {
-            unimplemented!("not used by header authorization test")
-        }
-
-        async fn refresh_session(
-            &self,
-            _provider: &ExternalAuthProviderConfig,
-            _session: ExternalProviderSessionHandle,
-        ) -> Result<external::ExternalRefreshSessionResponse, (StatusCode, Json<ErrorResponse>)>
-        {
-            unimplemented!("not used by header authorization test")
-        }
-
-        async fn logout(
-            &self,
-            _provider: &ExternalAuthProviderConfig,
-            _session: ExternalProviderSessionHandle,
-        ) -> Result<external::ExternalLogoutResponse, (StatusCode, Json<ErrorResponse>)> {
-            unimplemented!("not used by header authorization test")
-        }
+    fn hmac_provider_token(
+        subject: &str,
+        scope: &str,
+        provider: &str,
+        iat: i64,
+        exp: i64,
+    ) -> String {
+        let claims = json!({
+            "sub": subject,
+            "scope": scope,
+            "provider": provider,
+            "iat": iat,
+            "exp": exp,
+        });
+        let encoded_claims =
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).expect("claims json"));
+        let signature =
+            provider_request_signature(TEST_PROVIDER_HMAC_KEY.as_bytes(), &encoded_claims);
+        format!("{PROVIDER_REQUEST_TOKEN_PREFIX}.{encoded_claims}.{signature}")
     }
 
-    #[tokio::test]
-    async fn current_principal_for_request_uses_external_authorization_headers() {
-        let service = DatabaseAuthService::new(
+    fn hmac_provider_service() -> DatabaseAuthService {
+        DatabaseAuthService::new(
             astra_core::MatrixOneSettings::mock(),
             JwtSettings {
                 secret_key: "test-secret-key-for-unit-tests".into(),
@@ -1821,51 +1287,187 @@ mod tests {
                 refresh_token_expire_days: 7,
             },
         )
-        .with_external_providers(vec![ExternalAuthProviderConfig {
-            id: "moi".to_string(),
-            display_name: "MOI".to_string(),
-            external_auth_endpoint: "http://127.0.0.1/external-auth".to_string(),
+        .with_provider_request_auth(vec![ProviderRequestAuthConfig {
+            provider: "moi".to_string(),
+            auth_type: "hmac".to_string(),
+            key: TEST_PROVIDER_HMAC_KEY.to_string(),
         }])
-        .with_external_provider_client(std::sync::Arc::new(AuthorizingProviderClient));
+    }
+
+    #[test]
+    fn provider_request_hmac_golden_vector_uses_encoded_key_bytes() {
+        let mut parts = GOLDEN_PROVIDER_TOKEN.split('.');
+        assert_eq!(parts.next(), Some(PROVIDER_REQUEST_TOKEN_PREFIX));
+        let encoded_claims = parts.next().expect("encoded claims");
+        let encoded_signature = parts.next().expect("encoded signature");
+        assert!(parts.next().is_none());
+
+        assert!(verify_provider_request_signature(
+            GOLDEN_PROVIDER_HMAC_KEY.as_bytes(),
+            encoded_claims,
+            encoded_signature,
+        ));
+        let decoded_key = URL_SAFE_NO_PAD
+            .decode(GOLDEN_PROVIDER_HMAC_KEY)
+            .expect("golden key should be base64url decodable");
+        assert!(!verify_provider_request_signature(
+            &decoded_key,
+            encoded_claims,
+            encoded_signature,
+        ));
+    }
+
+    fn provider_headers(token: &str, provider: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(
             "authorization",
-            "Bearer provider-token"
+            format!("Bearer {token}")
                 .parse()
                 .expect("authorization header"),
         );
         headers.insert(
-            "x-astra-external-provider",
-            "moi".parse().expect("provider header"),
+            "x-astra-provider",
+            provider.parse().expect("provider header"),
         );
         headers.insert(
-            "x-astra-external-action",
+            "x-astra-provider-action",
             "authorize_request".parse().expect("action header"),
         );
+        headers
+    }
 
-        let principal = service
+    fn chat_stream_descriptor() -> ProviderRequestDescriptor {
+        ProviderRequestDescriptor {
+            method: "POST".to_string(),
+            path: "/chat/stream".to_string(),
+            route: Some("/chat/stream".to_string()),
+            request_id: None,
+            body_digest: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn current_principal_for_request_verifies_provider_hmac_token() {
+        let now = Utc::now().timestamp();
+        let token = hmac_provider_token("user_1", "workspace_1", "moi", now, now + 300);
+        let principal = hmac_provider_service()
             .current_principal_for_request(
-                &headers,
-                ExternalRequestDescriptor {
-                    method: "POST".to_string(),
-                    path: "/chat/stream".to_string(),
-                    route: Some("/chat/stream".to_string()),
-                    request_id: None,
-                    body_digest: None,
-                },
+                &provider_headers(&token, "moi"),
+                chat_stream_descriptor(),
             )
             .await
-            .expect("header-authorized request should resolve");
+            .expect("hmac provider request should resolve");
 
+        assert_eq!(principal.user.user_id, "provider_authorized:moi:user_1");
+        assert_eq!(principal.user.username, "user_1");
         match principal.origin {
-            AuthPrincipalOrigin::ExternalAuthorizedRequest(context) => {
+            AuthPrincipalOrigin::ProviderAuthorizedRequest(context) => {
                 assert_eq!(context.provider_id, "moi");
-                assert_eq!(context.external_subject, "moi-user-1");
-                assert_eq!(context.provider_scope_id, "workspace-1");
-                assert_eq!(context.request_authorization_id, "authz-1");
+                assert_eq!(context.external_subject, "user_1");
+                assert_eq!(context.provider_scope_id, "workspace_1");
+                assert!(
+                    context
+                        .request_authorization_id
+                        .starts_with(PROVIDER_REQUEST_TOKEN_PREFIX)
+                );
             }
-            other => panic!("expected external_authorized_request, got {other:?}"),
+            other => panic!("expected provider-authorized request, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn current_principal_for_request_preserves_hmac_subjects_per_user() {
+        let now = Utc::now().timestamp();
+        let service = hmac_provider_service();
+        let first = hmac_provider_token("user_1", "workspace_1", "moi", now, now + 300);
+        let second = hmac_provider_token("user_2", "workspace_1", "moi", now, now + 300);
+
+        let first_principal = service
+            .current_principal_for_request(
+                &provider_headers(&first, "moi"),
+                chat_stream_descriptor(),
+            )
+            .await
+            .expect("first hmac provider request should resolve");
+        let second_principal = service
+            .current_principal_for_request(
+                &provider_headers(&second, "moi"),
+                chat_stream_descriptor(),
+            )
+            .await
+            .expect("second hmac provider request should resolve");
+
+        assert_eq!(
+            first_principal.user.user_id,
+            "provider_authorized:moi:user_1"
+        );
+        assert_eq!(
+            second_principal.user.user_id,
+            "provider_authorized:moi:user_2"
+        );
+        assert_ne!(first_principal.user.user_id, second_principal.user.user_id);
+    }
+
+    #[tokio::test]
+    async fn current_principal_for_request_rejects_expired_hmac_token() {
+        let now = Utc::now().timestamp();
+        let token = hmac_provider_token("user_1", "workspace_1", "moi", now - 600, now - 300);
+        let (status, body) = hmac_provider_service()
+            .current_principal_for_request(
+                &provider_headers(&token, "moi"),
+                chat_stream_descriptor(),
+            )
+            .await
+            .expect_err("expired hmac provider request should be rejected");
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            body.0.error_code.as_deref(),
+            Some("provider_request_auth_invalid")
+        );
+        assert!(body.0.detail.contains("expired"));
+    }
+
+    #[tokio::test]
+    async fn current_principal_for_request_rejects_bad_hmac_signature() {
+        let now = Utc::now().timestamp();
+        let token = hmac_provider_token("user_1", "workspace_1", "moi", now, now + 300);
+        let replacement = if token.ends_with('x') { "y" } else { "x" };
+        let tampered = format!("{}{}", &token[..token.len() - 1], replacement);
+        let (status, body) = hmac_provider_service()
+            .current_principal_for_request(
+                &provider_headers(&tampered, "moi"),
+                chat_stream_descriptor(),
+            )
+            .await
+            .expect_err("tampered hmac provider request should be rejected");
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            body.0.error_code.as_deref(),
+            Some("provider_request_auth_invalid")
+        );
+        assert!(body.0.detail.contains("signature"));
+    }
+
+    #[tokio::test]
+    async fn current_principal_for_request_rejects_provider_mismatch() {
+        let now = Utc::now().timestamp();
+        let token = hmac_provider_token("user_1", "workspace_1", "other", now, now + 300);
+        let (status, body) = hmac_provider_service()
+            .current_principal_for_request(
+                &provider_headers(&token, "moi"),
+                chat_stream_descriptor(),
+            )
+            .await
+            .expect_err("mismatched hmac provider request should be rejected");
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            body.0.error_code.as_deref(),
+            Some("provider_request_auth_invalid")
+        );
+        assert!(body.0.detail.contains("provider"));
     }
 
     #[test]

@@ -2672,13 +2672,13 @@ fn test_agent_binding_record(max_steps: Option<u32>) -> astra_services::AgentBin
                 id: "mcp-main".to_string(),
                 server_type: astra_services::CapabilityServerType::Mcp,
                 transport: astra_services::CapabilityServerTransport::StreamableHttp,
-                endpoint_url: "https://cap.example.com/mcp".to_string(),
+                endpoint_url: None,
             },
             astra_services::CapabilityServerEndpoint {
                 id: "skills-main".to_string(),
                 server_type: astra_services::CapabilityServerType::Skill,
                 transport: astra_services::CapabilityServerTransport::StreamableHttp,
-                endpoint_url: "https://cap.example.com/skills".to_string(),
+                endpoint_url: None,
             },
         ],
         runtime_policy: astra_services::RuntimePolicy {
@@ -2703,13 +2703,13 @@ fn test_agent_binding_create_request() -> astra_services::AgentBindingCreateRequ
                     id: "tools".to_string(),
                     server_type: astra_services::CapabilityServerType::Mcp,
                     transport: astra_services::CapabilityServerTransport::StreamableHttp,
-                    endpoint_url: "https://cap.example.com/mcp".to_string(),
+                    endpoint_url: None,
                 },
                 astra_services::CapabilityServerEndpoint {
                     id: "skills".to_string(),
                     server_type: astra_services::CapabilityServerType::Skill,
                     transport: astra_services::CapabilityServerTransport::StreamableHttp,
-                    endpoint_url: "https://cap.example.com/skills".to_string(),
+                    endpoint_url: None,
                 },
             ],
             runtime_policy: astra_services::RuntimePolicy {
@@ -2732,6 +2732,54 @@ fn runtime_binding_request(id: String, mcp: &str, skills: &str) -> AgentBindingR
     }
 }
 
+struct StaticAgentBindingService {
+    record: astra_services::AgentBindingRecord,
+}
+
+#[async_trait]
+impl astra_services::AgentBindingService for StaticAgentBindingService {
+    async fn create_binding(
+        &self,
+        _request: astra_services::AgentBindingCreateRequestData,
+    ) -> Result<astra_services::AgentBindingRecord, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response_coded(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "static agent binding service does not create bindings",
+            "agent_binding_test_static",
+        ))
+    }
+
+    async fn get_binding(
+        &self,
+        id: String,
+    ) -> Result<astra_services::AgentBindingRecord, (StatusCode, Json<ErrorResponse>)> {
+        if id == self.record.id {
+            return Ok(self.record.clone());
+        }
+        Err(error_response_coded(
+            StatusCode::NOT_FOUND,
+            "agent binding not found",
+            "agent_binding_not_found",
+        ))
+    }
+
+    async fn disable_binding(
+        &self,
+        id: String,
+    ) -> Result<astra_services::AgentBindingRecord, (StatusCode, Json<ErrorResponse>)> {
+        if id == self.record.id {
+            let mut record = self.record.clone();
+            record.status = astra_services::AgentBindingStatus::Disabled;
+            return Ok(record);
+        }
+        Err(error_response_coded(
+            StatusCode::NOT_FOUND,
+            "agent binding not found",
+            "agent_binding_not_found",
+        ))
+    }
+}
+
 async fn service_with_in_memory_binding() -> (
     AgenticRunLifecycleService,
     Arc<astra_services::InMemoryAgentBindingService>,
@@ -2746,6 +2794,38 @@ async fn service_with_in_memory_binding() -> (
     .expect("binding create");
     let service = test_service().with_agent_binding_service(binding_service.clone());
     (service, binding_service, record)
+}
+
+fn legacy_endpoint_agent_binding_record() -> astra_services::AgentBindingRecord {
+    astra_services::AgentBindingRecord {
+        id: "ab_legacy_endpoint_binding_01".to_string(),
+        binding_name: "legacy-endpoint-binding".to_string(),
+        idempotency_key: "idem-legacy-endpoint-binding".to_string(),
+        status: astra_services::AgentBindingStatus::Active,
+        agent_md: "Always follow the binding contract.".to_string(),
+        capability_servers: vec![
+            astra_services::CapabilityServerEndpoint {
+                id: "tools".to_string(),
+                server_type: astra_services::CapabilityServerType::Mcp,
+                transport: astra_services::CapabilityServerTransport::StreamableHttp,
+                endpoint_url: Some("http://127.0.0.1:9/legacy-mcp".to_string()),
+            },
+            astra_services::CapabilityServerEndpoint {
+                id: "skills".to_string(),
+                server_type: astra_services::CapabilityServerType::Skill,
+                transport: astra_services::CapabilityServerTransport::StreamableHttp,
+                endpoint_url: Some("http://127.0.0.1:9/legacy-skills".to_string()),
+            },
+        ],
+        runtime_policy: astra_services::RuntimePolicy {
+            max_steps: Some(5),
+            tool_mode: astra_services::ToolMode::McpGateway,
+        },
+        metadata: None,
+        binding_schema_version: "v1".to_string(),
+        created_at: "2026-06-19T00:00:00Z".to_string(),
+        disabled_at: None,
+    }
 }
 
 #[tokio::test]
@@ -4178,6 +4258,41 @@ async fn validate_request_constraints_accepts_provider_descriptor_without_regist
 }
 
 #[tokio::test]
+async fn validate_request_constraints_rejects_provider_descriptor_with_selected_model_gateway() {
+    let service = test_service();
+    let mut request = test_request("hello");
+    request.provider_runtime_authorized = true;
+    request.selected_model = Some(SelectedModelRequest {
+        id: None,
+        model: "qwen3.7-max".to_string(),
+        gateway: Some("primary-gateway".to_string()),
+    });
+    request.runtime_auth = Some(RuntimeAuthRequest {
+        authorization: "Bearer runtime-grant".to_string(),
+    });
+    request.capability_descriptors =
+        Some(astra_services::runs::RuntimeCapabilityDescriptorsRequest {
+            model_gateway: Some(test_runtime_descriptor(
+                "moi-model-gateway",
+                "model_gateway",
+                "http://127.0.0.1/model-gateway",
+            )),
+            mcp: None,
+            skills: None,
+        });
+
+    let err = service
+        .validate_request_constraints("u1", &request)
+        .await
+        .expect_err("provider descriptor path must not accept selected_model.gateway");
+    assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        err.1.0.error_code.as_deref(),
+        Some("selected_model_invalid")
+    );
+}
+
+#[tokio::test]
 async fn validate_request_constraints_rejects_descriptor_without_provider_authorization() {
     let service = test_service();
     let mut request = test_request("hello");
@@ -4207,7 +4322,7 @@ async fn validate_request_constraints_rejects_descriptor_without_provider_author
     assert_eq!(err.0, StatusCode::BAD_REQUEST);
     assert_eq!(
         err.1.0.error_code.as_deref(),
-        Some("external_runtime_context_required")
+        Some("provider_runtime_context_required")
     );
 }
 
@@ -6212,6 +6327,7 @@ fn agent_binding_prompt_override_appends_stable_section() {
         &mut edge_profile,
         Some(&context),
         None,
+        None,
     );
 
     assert_eq!(
@@ -6236,6 +6352,7 @@ fn agent_binding_prompt_override_appends_runtime_system_prompt() {
         &mut edge_profile,
         Some(&context),
         Some("Runtime SQL scope db_name: retail."),
+        None,
     );
 
     assert_eq!(
@@ -6246,6 +6363,47 @@ fn agent_binding_prompt_override_appends_runtime_system_prompt() {
             "## Agent Binding Instruction\nAlways follow the binding contract.\n\nRuntime SQL scope db_name: retail."
         )
     );
+}
+
+#[test]
+fn agent_binding_prompt_override_appends_moi_turn_context() {
+    let context = PreparedAgentBindingLoopContext {
+        binding: test_agent_binding_record(Some(3)),
+        skill_resolver: None,
+    };
+    let mut edge_profile = serde_json::Map::new();
+    let request_context = json!({
+        "mode": "create",
+        "raw_advice": "Build a GitHub triage agent.",
+        "resources": {
+            "models": [{"name": "qwen3.7-max", "model_name": "qwen3.7-max"}],
+            "tools": [{"name": "GitHub"}],
+            "skills": [{"name": "Artifacts"}],
+            "knowledge_bases": []
+        }
+    })
+    .as_object()
+    .expect("context object")
+    .clone();
+
+    AgenticRunLifecycleService::apply_agent_binding_prompt_override(
+        &mut edge_profile,
+        Some(&context),
+        None,
+        Some(&request_context),
+    );
+
+    let prompt = edge_profile
+        .get("system_prompt_override")
+        .and_then(Value::as_str)
+        .expect("system prompt override");
+    assert!(prompt.contains("## Agent Binding Instruction"));
+    assert!(prompt.contains("## Runtime Turn Context"));
+    assert!(prompt.contains("\"mode\": \"create\""));
+    assert!(prompt.contains("\"raw_advice\": \"Build a GitHub triage agent.\""));
+    assert!(prompt.contains("\"name\": \"GitHub\""));
+    assert!(prompt.contains("\"name\": \"Artifacts\""));
+    assert!(prompt.contains("\"model_name\": \"qwen3.7-max\""));
 }
 
 #[test]
@@ -6267,6 +6425,7 @@ fn build_initial_state_agent_binding_uses_binding_skills_and_max_steps() {
         &mut edge_profile,
         Some(&binding_context),
         None,
+        req.context.as_ref(),
     );
 
     let state = svc.build_initial_state_inner(
@@ -6432,6 +6591,148 @@ async fn request_scoped_runtime_skill_resolver_is_installed_from_provider_capabi
     server.abort();
 }
 
+#[tokio::test]
+async fn agent_binding_runtime_ignores_legacy_endpoint_urls() {
+    use axum::{Router, extract::State, http::HeaderMap, routing::post};
+    use tokio::sync::Mutex;
+
+    #[derive(Default)]
+    struct Capture {
+        mcp_authorization: Mutex<Option<String>>,
+        skill_authorization: Mutex<Option<String>>,
+    }
+
+    async fn mcp_handler(
+        State(capture): State<Arc<Capture>>,
+        headers: HeaderMap,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        *capture.mcp_authorization.lock().await = headers
+            .get(reqwest::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .map(ToString::to_string);
+        Json(json!({
+            "jsonrpc": "2.0",
+            "id": body.get("id").cloned().unwrap_or(Value::Null),
+            "result": {"tools": []}
+        }))
+    }
+
+    async fn skills_handler(
+        State(capture): State<Arc<Capture>>,
+        headers: HeaderMap,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        *capture.skill_authorization.lock().await = headers
+            .get(reqwest::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .map(ToString::to_string);
+        Json(json!({
+            "jsonrpc": "2.0",
+            "id": body.get("id").cloned().unwrap_or(Value::Null),
+            "result": {
+                "skills": [{
+                    "name": "moi-skill",
+                    "description": "Skill from descriptor endpoint",
+                    "when_to_use": "when the binding grants it",
+                    "instructions": "Use the request-scoped endpoint.",
+                    "allowed_tools": [],
+                    "input_schema": {"type": "object"},
+                    "output_schema": {"type": "object"}
+                }]
+            }
+        }))
+    }
+
+    let capture = Arc::new(Capture::default());
+    let app = Router::new()
+        .route("/mcp", post(mcp_handler))
+        .route("/skills", post(skills_handler))
+        .with_state(capture.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind local capability server");
+    let addr = listener.local_addr().expect("listener addr");
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let record = legacy_endpoint_agent_binding_record();
+    let service = test_service().with_agent_binding_service(Arc::new(StaticAgentBindingService {
+        record: record.clone(),
+    }));
+    let mut request = test_request("use binding tools");
+    request.provider_runtime_authorized = true;
+    request.runtime_profile = Some(RuntimeProfileRequest::AgentBindingRegistry);
+    request.agent_binding = Some(runtime_binding_request(record.id, "tools", "skills"));
+    request.runtime_auth = Some(RuntimeAuthRequest {
+        authorization: "Bearer runtime-grant".to_string(),
+    });
+    request.capability_descriptors =
+        Some(astra_services::runs::RuntimeCapabilityDescriptorsRequest {
+            model_gateway: Some(test_runtime_descriptor(
+                "moi-model-gateway",
+                "model_gateway",
+                &format!("http://{addr}/model"),
+            )),
+            mcp: Some(test_runtime_descriptor(
+                "tools",
+                "mcp",
+                &format!("http://{addr}/mcp"),
+            )),
+            skills: Some(test_runtime_descriptor(
+                "skills",
+                "skills",
+                &format!("http://{addr}/skills"),
+            )),
+        });
+
+    let capabilities = service
+        .prepare_runtime_capabilities(&request, &RequestConstraints::default())
+        .await
+        .expect("agent binding descriptors should prepare capabilities");
+
+    assert!(capabilities.mcp_bundle.is_some());
+    let binding_context = capabilities
+        .agent_binding
+        .as_ref()
+        .expect("legacy agent binding should remain runnable");
+    assert_eq!(
+        binding_context.binding.capability_servers[0]
+            .endpoint_url
+            .as_deref(),
+        Some("http://127.0.0.1:9/legacy-mcp")
+    );
+    assert_eq!(
+        binding_context.binding.capability_servers[1]
+            .endpoint_url
+            .as_deref(),
+        Some("http://127.0.0.1:9/legacy-skills")
+    );
+    assert_eq!(
+        capture.mcp_authorization.lock().await.as_deref(),
+        Some("Bearer runtime-grant")
+    );
+    assert_eq!(
+        capture.skill_authorization.lock().await.as_deref(),
+        Some("Bearer runtime-grant")
+    );
+    let manifest =
+        AgenticRunLifecycleService::build_runtime_manifest(&request, &capabilities, false)
+            .expect("selected_model should produce a runtime manifest");
+    assert_eq!(manifest["selected_model"]["model"], "test-model");
+    assert!(manifest["selected_model"].get("gateway").is_none());
+    assert_eq!(
+        manifest["model_resolution"]["source"],
+        "provider_descriptor"
+    );
+    assert_eq!(
+        manifest["model_resolution"]["descriptor"]["id"],
+        "moi-model-gateway"
+    );
+    server.abort();
+}
+
 #[test]
 fn runtime_manifest_preserves_server_only_backbone_without_workspace_executor() {
     let mut request = test_request("answer with server-side context");
@@ -6534,6 +6835,7 @@ fn runtime_manifest_includes_agent_binding_snapshot_without_runtime_auth() {
             .expect("selected_model should produce a runtime manifest");
 
     assert_eq!(manifest["selected_model"]["model"], "test-model");
+    assert!(manifest["selected_model"].get("gateway").is_none());
     assert_eq!(manifest["runtime_profile"], "agent_binding_registry");
     assert_eq!(manifest["turn"]["message"], "use binding tools");
     assert_eq!(manifest["turn"]["parts"][0]["type"], "text");
