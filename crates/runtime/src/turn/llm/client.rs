@@ -360,8 +360,9 @@ pub(crate) struct LlmCallResult {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum LlmStreamUpdate {
-    TextDelta(String),
-    ReasoningDelta(String),
+    Text(String),
+    Reasoning(String),
+    ToolCall { index: usize, tool_call: Value },
 }
 
 pub(crate) type LlmStreamCallback<'a> = dyn FnMut(LlmStreamUpdate) + Send + 'a;
@@ -2444,7 +2445,6 @@ fn build_anthropic_tools(tools: &[Value]) -> Vec<Value> {
 ///
 /// Returns a vec of (chunk_str, is_reasoning) pairs. Callers should route
 /// is_reasoning=true chunks to `reasoning_delta` and false to `text_delta`.
-#[allow(dead_code)] // Reserved for MiniMax M2.7 streaming support
 pub(crate) fn split_think_chunks(content: &str, in_think: &mut bool) -> Vec<(String, bool)> {
     let mut out = Vec::new();
     let mut pos = 0;
@@ -3179,6 +3179,7 @@ async fn collect_llm_stream(
     let mut finish_reason: Option<String> = None;
     let mut accumulated_bytes: usize = 0;
     let mut made_progress = false;
+    let mut in_think = false;
     let partial_result = |full_text: &String,
                           reasoning: &String,
                           tool_calls_map: &HashMap<usize, Map<String, Value>>,
@@ -3304,9 +3305,22 @@ async fn collect_llm_stream(
                     ),
                 });
             }
-            full_text.push_str(content);
-            if let Some(callback) = stream_callback.as_deref_mut() {
-                callback(LlmStreamUpdate::TextDelta(content.to_string()));
+            let chunks = split_think_chunks(content, &mut in_think);
+            for (chunk, is_reasoning) in chunks {
+                if chunk.is_empty() {
+                    continue;
+                }
+                if is_reasoning {
+                    reasoning.push_str(&chunk);
+                    if let Some(callback) = stream_callback.as_deref_mut() {
+                        callback(LlmStreamUpdate::Reasoning(chunk));
+                    }
+                } else {
+                    full_text.push_str(&chunk);
+                    if let Some(callback) = stream_callback.as_deref_mut() {
+                        callback(LlmStreamUpdate::Text(chunk));
+                    }
+                }
             }
             made_progress = true;
         }
@@ -3332,7 +3346,7 @@ async fn collect_llm_stream(
             }
             reasoning.push_str(r);
             if let Some(callback) = stream_callback.as_deref_mut() {
-                callback(LlmStreamUpdate::ReasoningDelta(r.to_string()));
+                callback(LlmStreamUpdate::Reasoning(r.to_string()));
             }
             made_progress = true;
         }
@@ -3407,6 +3421,12 @@ async fn collect_llm_stream(
                             made_progress = true;
                         }
                     }
+                }
+                if let Some(callback) = stream_callback.as_deref_mut() {
+                    callback(LlmStreamUpdate::ToolCall {
+                        index: idx,
+                        tool_call: Value::Object(entry.clone()),
+                    });
                 }
             }
         }
@@ -3606,6 +3626,14 @@ async fn collect_anthropic_llm_stream(
                             ),
                         ]),
                     );
+                    if let Some(callback) = stream_callback.as_deref_mut()
+                        && let Some(tool_call) = tool_calls_map.get(&index)
+                    {
+                        callback(LlmStreamUpdate::ToolCall {
+                            index,
+                            tool_call: Value::Object(tool_call.clone()),
+                        });
+                    }
                     made_progress = true;
                 }
             }
@@ -3634,7 +3662,7 @@ async fn collect_anthropic_llm_stream(
                             }
                             full_text.push_str(text);
                             if let Some(callback) = stream_callback.as_deref_mut() {
-                                callback(LlmStreamUpdate::TextDelta(text.to_string()));
+                                callback(LlmStreamUpdate::Text(text.to_string()));
                             }
                             made_progress = true;
                         }
@@ -3659,7 +3687,7 @@ async fn collect_anthropic_llm_stream(
                             }
                             reasoning.push_str(text);
                             if let Some(callback) = stream_callback.as_deref_mut() {
-                                callback(LlmStreamUpdate::ReasoningDelta(text.to_string()));
+                                callback(LlmStreamUpdate::Reasoning(text.to_string()));
                             }
                             made_progress = true;
                         }
@@ -3711,6 +3739,14 @@ async fn collect_anthropic_llm_stream(
                         {
                             existing.push_str(args);
                             made_progress = true;
+                        }
+                        if let Some(callback) = stream_callback.as_deref_mut()
+                            && let Some(tool_call) = tool_calls_map.get(&index)
+                        {
+                            callback(LlmStreamUpdate::ToolCall {
+                                index,
+                                tool_call: Value::Object(tool_call.clone()),
+                            });
                         }
                     }
                     _ => {}
@@ -3961,18 +3997,18 @@ pub(crate) async fn call_llm_nonstream_fallback_with_request_overrides(
         .send()
         .await
         .map_err(|e| {
+            let elapsed = started.elapsed();
             tracing::warn!(
                 target: "astra_runtime::llm_client",
                 url = %url,
+                elapsed_ms = elapsed.as_millis() as u64,
+                configured_timeout_s = effective_timeout.as_secs(),
                 error = %e,
                 "LLM non-stream fallback send failed"
             );
             astra_core::ClassifiedError::new(
                 astra_core::ErrorKind::Network,
-                format!(
-                    "LLM fallback request failed (timeout {}s): {e}",
-                    effective_timeout.as_secs()
-                ),
+                fallback_send_error_message(&e, effective_timeout, elapsed),
             )
         })?;
     if !resp.status().is_success() {
@@ -4002,6 +4038,23 @@ pub(crate) async fn call_llm_nonstream_fallback_with_request_overrides(
     Ok(parse_nonstream_response_for_provider(
         &v, provider, model_name, started,
     ))
+}
+
+fn fallback_send_error_message(
+    error: &reqwest::Error,
+    effective_timeout: std::time::Duration,
+    elapsed: std::time::Duration,
+) -> String {
+    let action = if error.is_timeout() {
+        "timed out"
+    } else {
+        "failed"
+    };
+    format!(
+        "LLM fallback request {action} after {}ms (configured timeout {}s): {error}",
+        elapsed.as_millis(),
+        effective_timeout.as_secs()
+    )
 }
 
 fn map_bedrock_finish_reason(stop_reason: &str) -> String {
@@ -4284,7 +4337,14 @@ pub(crate) fn parse_openai_sse_json_stream(
                     return;
                 }
             };
-            for block in sse_in.push_lossy_bytes(&bytes) {
+            let blocks = match sse_in.push_bytes(&bytes) {
+                Ok(blocks) => blocks,
+                Err(error) => {
+                    yield Err(format!("invalid UTF-8 in model SSE response: {error}"));
+                    return;
+                }
+            };
+            for block in blocks {
                 if let Err(error) = validate_sse_event_block_json(&block) {
                     yield Err(error);
                     return;
@@ -4298,7 +4358,13 @@ pub(crate) fn parse_openai_sse_json_stream(
                 }
             }
         }
-        let mut buf = sse_in.into_inner();
+        let mut buf = match sse_in.into_inner() {
+            Ok(buf) => buf,
+            Err(error) => {
+                yield Err(format!("invalid UTF-8 in model SSE response: {error}"));
+                return;
+            }
+        };
         let tail = match validated_drain_sse_data_lines(&mut buf, "") {
             Ok(value) => value,
             Err(error) => {
@@ -4867,6 +4933,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parse_openai_sse_json_stream_preserves_utf8_split_across_chunks() {
+        let parts: Vec<Result<Bytes, reqwest::Error>> = vec![
+            Ok(Bytes::from_static(b"data: {\"text\":\"\xe6")),
+            Ok(Bytes::from_static(b"\x88")),
+            Ok(Bytes::from_static(b"\x91\"}\n\n")),
+        ];
+        let st = parse_openai_sse_json_stream(stream::iter(parts));
+        tokio::pin!(st);
+        assert_eq!(st.next().await.unwrap().unwrap(), json!({"text": "我"}));
+        assert!(st.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn parse_openai_sse_json_stream_rejects_invalid_utf8() {
+        let parts: Vec<Result<Bytes, reqwest::Error>> =
+            vec![Ok(Bytes::from_static(b"data: {\"text\":\"\xff\"}\n\n"))];
+        let st = parse_openai_sse_json_stream(stream::iter(parts));
+        tokio::pin!(st);
+        let error = st
+            .next()
+            .await
+            .expect("invalid UTF-8 item")
+            .expect_err("invalid UTF-8 must fail");
+        assert!(error.contains("invalid UTF-8"), "{error}");
+        assert!(st.next().await.is_none());
+    }
+
+    #[tokio::test]
     async fn parse_openai_sse_json_stream_done_terminates() {
         let body = "data: {\"a\":1}\n\ndata: [DONE]\n\n";
         let parts: Vec<Result<Bytes, reqwest::Error>> =
@@ -5000,6 +5094,46 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn collect_llm_stream_routes_inline_think_to_reasoning_before_partial_error() {
+        let err = sample_reqwest_stream_error().await;
+        let d1 = json!({"choices":[{"delta":{"content":"<think>hidden reasoning"}}]});
+        let d2 = json!({"choices":[{"delta":{"content":"</think>visible answer"}}]});
+        let byte_stream = stream::iter(vec![
+            Ok(Bytes::from(format!("data: {d1}\n\n"))),
+            Ok(Bytes::from(format!("data: {d2}\n\n"))),
+            Err(err),
+        ]);
+        let mut updates = Vec::new();
+        let mut callback = |update| updates.push(update);
+        let res = collect_llm_stream(
+            byte_stream,
+            "test-model",
+            Instant::now(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+            Some(&mut callback),
+        )
+        .await
+        .expect_err("transport error");
+        match res {
+            StreamCollectError::Transport { partial, .. } => {
+                assert_eq!(partial.full_text, "visible answer");
+                assert_eq!(partial.reasoning, "hidden reasoning");
+                assert!(!partial.full_text.contains("<think>"));
+            }
+            other => panic!("expected transport error, got {other:?}"),
+        }
+        assert_eq!(
+            updates,
+            vec![
+                LlmStreamUpdate::Reasoning("hidden reasoning".to_string()),
+                LlmStreamUpdate::Text("visible answer".to_string()),
+            ]
+        );
+    }
+
     // Note: Bedrock no longer uses `collect_llm_stream` (see `bridge_llm_stream::
     // call_llm_stream` — it detects Bedrock and invokes the non-stream fallback
     // instead). Bedrock usage extraction is covered by
@@ -5067,9 +5201,9 @@ mod tests {
         assert_eq!(
             updates,
             vec![
-                LlmStreamUpdate::TextDelta("Hi ".to_string()),
-                LlmStreamUpdate::ReasoningDelta("R".to_string()),
-                LlmStreamUpdate::TextDelta("there".to_string()),
+                LlmStreamUpdate::Text("Hi ".to_string()),
+                LlmStreamUpdate::Reasoning("R".to_string()),
+                LlmStreamUpdate::Text("there".to_string()),
             ],
             "callback should receive deltas before aggregate completion",
         );
@@ -5415,6 +5549,49 @@ mod tests {
         format!("http://{addr}")
     }
 
+    async fn spawn_raw_partial_transport_server_with_fallback_disconnect(
+        state: StreamIdleHit,
+    ) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind raw mock llm listener");
+        let addr = listener.local_addr().expect("raw local_addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let state = state.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0_u8; 8192];
+                    let read = socket.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..read]);
+                    let is_stream = req.contains("\"stream\":true");
+                    if is_stream {
+                        state.stream_hits.fetch_add(1, Ordering::SeqCst);
+                        let partial = format!(
+                            "data: {}\n\n",
+                            json!({"choices":[{"delta":{"content":"partial"}}]})
+                        );
+                        let chunk = format!("{:X}\r\n{}\r\n", partial.len(), partial);
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{chunk}"
+                        );
+                        socket
+                            .write_all(response.as_bytes())
+                            .await
+                            .expect("write partial stream response");
+                    } else {
+                        state.fallback_hits.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        format!("http://{addr}")
+    }
+
     async fn mock_429_retry_zero_then_sse(State(Hit(c)): State<Hit>) -> Response {
         let n = c.fetch_add(1, Ordering::SeqCst);
         if n == 0 {
@@ -5608,14 +5785,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn collect_llm_stream_decodes_lossy_utf8_inside_json_string() {
+    async fn collect_llm_stream_rejects_invalid_utf8_inside_json_string() {
         let mut v: Vec<u8> = Vec::new();
         v.extend_from_slice(br#"data: {"choices":[{"delta":{"content":"a"#);
         v.push(0xff);
         v.extend_from_slice(br#""}}]}"#);
         v.extend_from_slice(b"\n\n");
         let stream = stream::iter(vec![Ok(Bytes::from(v))]);
-        let res = collect_llm_stream(
+        let error = collect_llm_stream(
             stream,
             "m",
             Instant::now(),
@@ -5625,8 +5802,14 @@ mod tests {
             None,
         )
         .await
-        .expect("collect");
-        assert_eq!(res.full_text, "a\u{FFFD}");
+        .expect_err("invalid UTF-8 must fail the stream");
+        match error {
+            StreamCollectError::Transport { error, partial } => {
+                assert!(error.contains("invalid UTF-8"), "{error}");
+                assert!(partial.full_text.is_empty());
+            }
+            other => panic!("expected transport error, got {other:?}"),
+        }
     }
 
     // ── Anthropic native stream tests ──────────────────────────────────────
@@ -7225,6 +7408,49 @@ mod tests {
             ),
             "{rendered}"
         );
+    }
+
+    #[tokio::test]
+    async fn call_llm_and_collect_reports_fallback_send_failure_without_timeout_label() {
+        let state = StreamIdleHit {
+            stream_hits: Arc::new(AtomicU32::new(0)),
+            fallback_hits: Arc::new(AtomicU32::new(0)),
+        };
+        let base = spawn_raw_partial_transport_server_with_fallback_disconnect(state.clone()).await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let error = call_llm_and_collect(
+            &messages,
+            &[],
+            "m",
+            None,
+            "k",
+            &base,
+            "openai",
+            None,
+            false,
+            LlmCancel::None,
+            &ThinkingConfig::Off,
+        )
+        .await
+        .expect_err("transport fallback should fail");
+
+        assert!(
+            error.message.contains("LLM fallback request failed after"),
+            "{}",
+            error.message
+        );
+        assert!(
+            error.message.contains("configured timeout"),
+            "{}",
+            error.message
+        );
+        assert!(
+            !error.message.contains("failed (timeout"),
+            "{}",
+            error.message
+        );
+        assert_eq!(state.stream_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(state.fallback_hits.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

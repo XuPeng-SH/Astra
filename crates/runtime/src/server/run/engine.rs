@@ -39,7 +39,8 @@ use astra_services::{
         CapabilityServerRefs, DurableRunCheckpointRecord, DurableRunDisplayProjectionRecord,
         DurableRunListPage, DurableRunRecord, DurableRunStatusKind, GuardedRunStatusTransition,
         GuardedRunStatusTransitionRequest, RequestedTurnInteractionMode, RunListCursor,
-        RunStateStore, RuntimeProfileRequest, SelectedModelRequest, durable_run_status_kind,
+        RunStateStore, RuntimeProfileRequest, SelectedModelRequest, TurnIntentExecutionPolicy,
+        durable_run_status_kind,
     },
 };
 use astra_turn_core::pipeline_metrics::MetricsRegistry;
@@ -137,6 +138,7 @@ impl Drop for RunOwnerLeaseHeartbeat {
 pub struct RunStartContext {
     pub interaction_mode: Option<RequestedTurnInteractionMode>,
     pub interactive_client: Option<bool>,
+    pub turn_intent_policy: TurnIntentExecutionPolicy,
     pub execution_metadata: Option<serde_json::Map<String, serde_json::Value>>,
     pub agent_binding_id: Option<String>,
     pub agent_binding_name: Option<String>,
@@ -153,6 +155,13 @@ fn requested_mode_label(mode: RequestedTurnInteractionMode) -> &'static str {
         RequestedTurnInteractionMode::Auto => "auto",
         RequestedTurnInteractionMode::Deny => "deny",
         RequestedTurnInteractionMode::Headless => "headless",
+    }
+}
+
+fn turn_intent_policy_label(policy: TurnIntentExecutionPolicy) -> &'static str {
+    match policy {
+        TurnIntentExecutionPolicy::Auto => "auto",
+        TurnIntentExecutionPolicy::FixedDefault => "fixed_default",
     }
 }
 
@@ -295,6 +304,10 @@ fn durable_run_contains_event_batch(
 
 fn run_started_event_data(context: &RunStartContext) -> serde_json::Value {
     let mut data = serde_json::Map::new();
+    data.insert(
+        "turn_intent_policy".to_string(),
+        serde_json::Value::String(turn_intent_policy_label(context.turn_intent_policy).to_string()),
+    );
     if let Some(mode_label) = effective_mode_label(context) {
         data.insert(
             "interaction_mode".to_string(),
@@ -1519,6 +1532,7 @@ impl RunInputProvider for RunEngine {
         match durable_run_status_kind(&run.status) {
             DurableRunStatusKind::Cancelled
             | DurableRunStatusKind::Completed
+            | DurableRunStatusKind::Delegated
             | DurableRunStatusKind::Failed => return Ok(()),
             _ => {}
         }
@@ -1547,6 +1561,7 @@ impl RunInputProvider for RunEngine {
             match durable_run_status_kind(&current.status) {
                 DurableRunStatusKind::Cancelled
                 | DurableRunStatusKind::Completed
+                | DurableRunStatusKind::Delegated
                 | DurableRunStatusKind::Failed => return Ok(()),
                 _ => {}
             }
@@ -2272,6 +2287,7 @@ mod tests {
                 RunStartContext {
                     interaction_mode: Some(RequestedTurnInteractionMode::Auto),
                     interactive_client: Some(true),
+                    turn_intent_policy: TurnIntentExecutionPolicy::FixedDefault,
                     execution_metadata: None,
                     ..Default::default()
                 },
@@ -2283,6 +2299,7 @@ mod tests {
         assert_eq!(run.events[0]["data"]["interaction_mode"], "auto");
         assert_eq!(run.events[0]["data"]["suppressed_loop_nudges"], true);
         assert_eq!(run.events[0]["data"]["interactive_client"], true);
+        assert_eq!(run.events[0]["data"]["turn_intent_policy"], "fixed_default");
     }
 
     #[tokio::test]
@@ -2326,6 +2343,7 @@ mod tests {
             capabilities: Vec::new(),
             forward_headers: std::collections::HashMap::new(),
             execution_budget: None,
+            execution_policy: Default::default(),
             explain: false,
             interaction_mode: None,
             interactive_client: false,

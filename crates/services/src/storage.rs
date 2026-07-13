@@ -1,7 +1,8 @@
 use crate::auth::DatabaseUserRecord;
 use crate::auth::session::SessionRecord;
 use astra_core::{
-    DedicatedPool, ErrorResponse, MatrixOneSettings, connect_matrixone, internal_error,
+    DedicatedPool, ErrorResponse, MatrixOneSettings, connect_matrixone, identity::USER_ID_MAX_LEN,
+    internal_error,
 };
 use axum::{Json, http::StatusCode};
 use fs2::FileExt;
@@ -19,6 +20,21 @@ const EDGE_PENDING_DISPATCH_IDENTITY_COLUMNS: &[&str] = &[
     "turn_chain_id",
     "request_id",
 ];
+const EDGE_PENDING_DISPATCH_LEGACY_COLUMNS: &[&str] = &[
+    "user_id",
+    "edge_agent_id",
+    "request_id",
+    "payload_json",
+    "result_json",
+    "status",
+    "pod_id",
+    "dispatched_at",
+    "completed_at",
+    "created_at",
+];
+const EDGE_PENDING_DISPATCH_LEGACY_PRIMARY_KEY: &[&str] = &["user_id", "request_id"];
+const EDGE_PENDING_DISPATCH_LEGACY_ARCHIVE_TABLE: &str =
+    "edge_pending_dispatch_legacy_owner_request_v1";
 
 /// Standard column width for `agent_id` across all tables.
 /// All `agent_id`, `edge_agent_id`, `holder_agent_id`, and `parent_agent_id`
@@ -48,7 +64,7 @@ fn agent_events_create_sql() -> String {
         "CREATE TABLE IF NOT EXISTS agent_events (
             event_id VARCHAR({AGENT_EVENT_ID_LEN}) NOT NULL,
             session_id VARCHAR(64) NOT NULL,
-            user_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
             agent_id VARCHAR(255) NULL,
             agent_version VARCHAR(32) NULL,
             event_type VARCHAR(64) NOT NULL,
@@ -99,7 +115,7 @@ fn agent_events_create_sql() -> String {
 const EVAL_CALIBRATION_ASSESSMENTS_CREATE_SQL: &str =
     "CREATE TABLE IF NOT EXISTS eval_calibration_assessments (
             calibration_id VARCHAR(64) NOT NULL,
-            user_id        VARCHAR(64) NOT NULL,
+            user_id        VARCHAR(128) NOT NULL,
             agent_id       VARCHAR(255),
             session_id     VARCHAR(64) NOT NULL,
             confidence     DECIMAL(5,4) NOT NULL,
@@ -544,6 +560,111 @@ fn validate_schema_identifier(raw: &str, kind: &str) -> Result<(), sqlx::Error> 
     })
 }
 
+const USER_IDENTITY_COLUMN_NAMES: [&str; 6] = [
+    "user_id",
+    "owner_user_id",
+    "scope_user_id",
+    "created_by",
+    "updated_by",
+    "username",
+];
+
+fn identity_column_widening_ddl(
+    table: &str,
+    column: &str,
+    is_nullable: bool,
+) -> Result<String, sqlx::Error> {
+    validate_schema_identifier(table, "matrixone table")?;
+    validate_schema_identifier(column, "matrixone column")?;
+    let nullability = if is_nullable { "NULL" } else { "NOT NULL" };
+    Ok(format!(
+        "ALTER TABLE {} MODIFY COLUMN {} VARCHAR({USER_ID_MAX_LEN}) {nullability}",
+        crate::snapshot_sql::quote_mysql_identifier(table),
+        crate::snapshot_sql::quote_mysql_identifier(column),
+    ))
+}
+
+/// Widens legacy identity columns to the repository-wide principal contract.
+///
+/// This is an explicit, idempotent schema migration. It never truncates data,
+/// changes nullability, or rewrites UUID identifier columns.
+async fn migrate_user_identity_column_widths(
+    pool: &sqlx::Pool<MySql>,
+    database: &str,
+) -> Result<(), sqlx::Error> {
+    validate_schema_identifier(database, "matrixone database")?;
+    let rows = query(
+        "SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, \
+                IS_NULLABLE, COLUMN_DEFAULT \
+         FROM information_schema.COLUMNS \
+         WHERE TABLE_SCHEMA = ? \
+           AND COLUMN_NAME IN \
+               ('user_id', 'owner_user_id', 'scope_user_id', 'created_by', 'updated_by', 'username') \
+         ORDER BY TABLE_NAME, COLUMN_NAME",
+    )
+    .bind(database)
+    .fetch_all(pool)
+    .await?;
+
+    for row in rows {
+        let table: String = row.try_get("TABLE_NAME")?;
+        let column: String = row.try_get("COLUMN_NAME")?;
+        let data_type: String = row.try_get("DATA_TYPE")?;
+        let width: Option<i64> = row.try_get("CHARACTER_MAXIMUM_LENGTH")?;
+        let is_nullable: String = row.try_get("IS_NULLABLE")?;
+        let default_value: Option<String> = row.try_get("COLUMN_DEFAULT")?;
+
+        if !USER_IDENTITY_COLUMN_NAMES.contains(&column.as_str()) {
+            return Err(sqlx::Error::Protocol(format!(
+                "identity column migration selected unexpected column {table}.{column}"
+            )));
+        }
+        if !data_type.eq_ignore_ascii_case("varchar") {
+            return Err(sqlx::Error::Protocol(format!(
+                "identity column {table}.{column} must be VARCHAR, found {data_type}"
+            )));
+        }
+        let width = width.ok_or_else(|| {
+            sqlx::Error::Protocol(format!(
+                "identity column {table}.{column} has no bounded VARCHAR width"
+            ))
+        })?;
+        if width < 0 {
+            return Err(sqlx::Error::Protocol(format!(
+                "identity column {table}.{column} has invalid width {width}"
+            )));
+        }
+        if width >= USER_ID_MAX_LEN as i64 {
+            continue;
+        }
+        if default_value.is_some() {
+            return Err(sqlx::Error::Protocol(format!(
+                "identity column {table}.{column} has a default value that must be preserved by an explicit migration"
+            )));
+        }
+        let is_nullable = match is_nullable.as_str() {
+            "YES" => true,
+            "NO" => false,
+            value => {
+                return Err(sqlx::Error::Protocol(format!(
+                    "identity column {table}.{column} has invalid IS_NULLABLE value {value}"
+                )));
+            }
+        };
+        let ddl = identity_column_widening_ddl(&table, &column, is_nullable)?;
+        query(&ddl).execute(pool).await?;
+        tracing::info!(
+            table,
+            column,
+            previous_width = width,
+            new_width = USER_ID_MAX_LEN,
+            "widened legacy user identity column"
+        );
+    }
+
+    Ok(())
+}
+
 async fn add_column_if_missing(
     pool: &sqlx::Pool<MySql>,
     database: &str,
@@ -602,6 +723,44 @@ async fn add_index_if_missing(
     Ok(())
 }
 
+async fn existing_table_columns(
+    pool: &sqlx::Pool<MySql>,
+    database: &str,
+    table: &str,
+) -> Result<BTreeSet<String>, sqlx::Error> {
+    validate_schema_identifier(database, "matrixone database")?;
+    validate_schema_identifier(table, "matrixone table")?;
+    query(
+        "SELECT COLUMN_NAME FROM information_schema.COLUMNS \
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+    )
+    .bind(database)
+    .bind(table)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|row| row.try_get::<String, _>("COLUMN_NAME"))
+    .collect::<Result<BTreeSet<_>, _>>()
+}
+
+async fn table_exists(
+    pool: &sqlx::Pool<MySql>,
+    database: &str,
+    table: &str,
+) -> Result<bool, sqlx::Error> {
+    validate_schema_identifier(database, "matrixone database")?;
+    validate_schema_identifier(table, "matrixone table")?;
+    query(
+        "SELECT 1 FROM information_schema.TABLES \
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? LIMIT 1",
+    )
+    .bind(database)
+    .bind(table)
+    .fetch_optional(pool)
+    .await
+    .map(|row| row.is_some())
+}
+
 async fn fail_if_obsolete_shape(
     pool: &sqlx::Pool<MySql>,
     database: &str,
@@ -622,21 +781,10 @@ async fn fail_if_obsolete_shape(
         validate_schema_identifier(index, "matrixone index")?;
     }
 
-    let column_rows = query(
-        "SELECT COLUMN_NAME FROM information_schema.COLUMNS \
-         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
-    )
-    .bind(database)
-    .bind(table)
-    .fetch_all(pool)
-    .await?;
-    if column_rows.is_empty() {
+    let columns = existing_table_columns(pool, database, table).await?;
+    if columns.is_empty() {
         return Ok(());
     }
-    let columns = column_rows
-        .into_iter()
-        .map(|row| row.try_get::<String, _>("COLUMN_NAME"))
-        .collect::<Result<BTreeSet<_>, _>>()?;
 
     let index_rows = query(
         "SELECT DISTINCT INDEX_NAME FROM information_schema.STATISTICS \
@@ -675,6 +823,75 @@ async fn fail_if_obsolete_shape(
         "obsolete core schema table {table} requires manual migration before startup: {}",
         reasons.join(", ")
     )))
+}
+
+fn is_legacy_edge_pending_dispatch_shape(
+    columns: &BTreeSet<String>,
+    primary_key: &[String],
+) -> bool {
+    EDGE_PENDING_DISPATCH_LEGACY_COLUMNS
+        .iter()
+        .all(|column| columns.contains(*column))
+        && EDGE_PENDING_DISPATCH_IDENTITY_COLUMNS
+            .iter()
+            .skip(1)
+            .take(3)
+            .all(|column| !columns.contains(*column))
+        && primary_key
+            .iter()
+            .map(String::as_str)
+            .eq(EDGE_PENDING_DISPATCH_LEGACY_PRIMARY_KEY.iter().copied())
+}
+
+async fn migrate_legacy_edge_pending_dispatch_if_needed(
+    pool: &sqlx::Pool<MySql>,
+    database: &str,
+) -> Result<(), sqlx::Error> {
+    let columns = existing_table_columns(pool, database, "edge_pending_dispatch").await?;
+    if columns.is_empty() {
+        return Ok(());
+    }
+    let primary_key =
+        existing_index_columns(pool, database, "edge_pending_dispatch", "PRIMARY").await?;
+    if !is_legacy_edge_pending_dispatch_shape(&columns, &primary_key) {
+        return Ok(());
+    }
+    if table_exists(pool, database, EDGE_PENDING_DISPATCH_LEGACY_ARCHIVE_TABLE).await? {
+        return Err(sqlx::Error::Protocol(format!(
+            "legacy edge_pending_dispatch migration archive {EDGE_PENDING_DISPATCH_LEGACY_ARCHIVE_TABLE} already exists; inspect the previous migration before startup"
+        )));
+    }
+
+    let active_row = query(
+        "SELECT COUNT(*) AS active_rows FROM edge_pending_dispatch \
+         WHERE status IN ('pending', 'dispatched')",
+    )
+    .fetch_one(pool)
+    .await?;
+    let active_rows: i64 = active_row.try_get("active_rows")?;
+    if active_rows != 0 {
+        return Err(sqlx::Error::Protocol(format!(
+            "legacy edge_pending_dispatch contains {active_rows} active rows without session/run/turn identity; drain them with the pre-turn-scoped Astra release before upgrade"
+        )));
+    }
+    let row = query("SELECT COUNT(*) AS total_rows FROM edge_pending_dispatch")
+        .fetch_one(pool)
+        .await?;
+    let total_rows: i64 = row.try_get("total_rows")?;
+    query(&format!(
+        "RENAME TABLE {} TO {}",
+        crate::snapshot_sql::quote_mysql_identifier("edge_pending_dispatch"),
+        crate::snapshot_sql::quote_mysql_identifier(EDGE_PENDING_DISPATCH_LEGACY_ARCHIVE_TABLE),
+    ))
+    .execute(pool)
+    .await?;
+    tracing::info!(
+        legacy_table = "edge_pending_dispatch",
+        archive_table = EDGE_PENDING_DISPATCH_LEGACY_ARCHIVE_TABLE,
+        total_rows,
+        "archived terminal legacy edge dispatch rows before turn-scoped schema creation"
+    );
+    Ok(())
 }
 
 async fn fail_if_required_columns_missing_or_nullable(
@@ -921,11 +1138,16 @@ pub async fn ensure_core_schema(
     }
     let pool = connect_matrixone(settings).await?;
 
+    // Existing deployments may still have UUID-sized identity columns. Widen
+    // them before table-specific shape checks run so every persistence path
+    // observes the same principal contract during startup.
+    migrate_user_identity_column_widths(&pool, &settings.database).await?;
+
     // Auth
     query(
         "CREATE TABLE IF NOT EXISTS auth_users (
-            user_id VARCHAR(64) PRIMARY KEY,
-            username VARCHAR(50) NOT NULL UNIQUE,
+            user_id VARCHAR(128) PRIMARY KEY,
+            username VARCHAR(128) NOT NULL UNIQUE,
             email VARCHAR(255) NOT NULL UNIQUE,
             password_hash VARCHAR(255) NOT NULL,
             display_name VARCHAR(100) NULL,
@@ -949,7 +1171,7 @@ pub async fn ensure_core_schema(
 
     query(
         "CREATE TABLE IF NOT EXISTS auth_user_roles (
-            user_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
             role_id VARCHAR(64) NOT NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (user_id, role_id),
@@ -995,7 +1217,7 @@ pub async fn ensure_core_schema(
     query(
         "CREATE TABLE IF NOT EXISTS auth_refresh_tokens (
             token_id VARCHAR(64) PRIMARY KEY,
-            user_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
             session_id VARCHAR(64) NULL,
             token_hash VARCHAR(255) NOT NULL,
             token_prefix VARCHAR(16) NULL,
@@ -1037,7 +1259,7 @@ pub async fn ensure_core_schema(
             encrypted_value TEXT NULL,
             secret_ref VARCHAR(255) NULL,
             is_active SMALLINT NOT NULL DEFAULT 1,
-            scope_user_id VARCHAR(64) NULL,
+            scope_user_id VARCHAR(128) NULL,
             scope_repo VARCHAR(255) NULL,
             metadata JSON NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
@@ -1068,7 +1290,7 @@ pub async fn ensure_core_schema(
     query(
         "CREATE TABLE IF NOT EXISTS auth_audit_logs (
             log_id VARCHAR(64) PRIMARY KEY,
-            user_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
             action VARCHAR(50) NOT NULL,
             resource_type VARCHAR(50) NULL,
             resource_id VARCHAR(64) NULL,
@@ -1086,7 +1308,7 @@ pub async fn ensure_core_schema(
     query(
         "CREATE TABLE IF NOT EXISTS agent_sessions (
             session_id VARCHAR(64) NOT NULL,
-            user_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
             agent_id VARCHAR(255) NULL,
             title VARCHAR(255) NULL,
             status VARCHAR(20) NOT NULL DEFAULT 'active',
@@ -1229,7 +1451,7 @@ pub async fn ensure_core_schema(
     query(
         "CREATE TABLE IF NOT EXISTS agent_runs (
             run_id VARCHAR(64) NOT NULL,
-            user_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
             session_id VARCHAR(64) NOT NULL,
             parent_run_id VARCHAR(64) NULL,
             root_run_id VARCHAR(64) NOT NULL,
@@ -1397,7 +1619,7 @@ pub async fn ensure_core_schema(
 
     query(
         "CREATE TABLE IF NOT EXISTS agent_session_execution_slots (
-            user_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
             session_id VARCHAR(64) NOT NULL,
             run_id VARCHAR(64) NOT NULL,
             acquired_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
@@ -1441,7 +1663,7 @@ pub async fn ensure_core_schema(
             id VARCHAR(64) NOT NULL,
             run_id VARCHAR(64) NOT NULL,
             event_idx BIGINT NOT NULL,
-            user_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
             session_id VARCHAR(64) NOT NULL,
             event_type VARCHAR(64) NOT NULL,
             event_id VARCHAR(128) NOT NULL,
@@ -1500,7 +1722,7 @@ pub async fn ensure_core_schema(
         "CREATE TABLE IF NOT EXISTS run_checkpoints (
             checkpoint_id VARCHAR(64) NOT NULL,
             run_id VARCHAR(64) NOT NULL,
-            user_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
             session_id VARCHAR(64) NOT NULL,
             node_seq BIGINT NOT NULL DEFAULT 0,
             checkpoint_kind VARCHAR(32) NOT NULL,
@@ -1555,7 +1777,7 @@ pub async fn ensure_core_schema(
     query(
         "CREATE TABLE IF NOT EXISTS run_display_projections (
             run_id VARCHAR(64) NOT NULL,
-            user_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
             session_id VARCHAR(64) NOT NULL,
             status VARCHAR(32) NOT NULL,
             waiting_for VARCHAR(64) NULL,
@@ -1607,7 +1829,7 @@ pub async fn ensure_core_schema(
             batch_id VARCHAR(64) NOT NULL,
             session_id VARCHAR(64) NOT NULL,
             run_id VARCHAR(64) NOT NULL,
-            user_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
             output_count INT NOT NULL,
             payload_bytes BIGINT NOT NULL,
             status VARCHAR(32) NOT NULL DEFAULT 'committed',
@@ -1672,7 +1894,7 @@ pub async fn ensure_core_schema(
             batch_id VARCHAR(64) NOT NULL,
             session_id VARCHAR(64) NOT NULL,
             run_id VARCHAR(64) NOT NULL,
-            user_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
             output_idx INT NOT NULL,
             parent_output_id VARCHAR(64) NULL,
             tool_call_id VARCHAR(128) NULL,
@@ -1787,7 +2009,7 @@ pub async fn ensure_core_schema(
         "CREATE TABLE IF NOT EXISTS session_transcript_items (
             session_id VARCHAR(64) NOT NULL,
             item_seq BIGINT NOT NULL,
-            user_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
             run_id VARCHAR(64) NULL,
             role VARCHAR(32) NOT NULL,
             content LONGTEXT NOT NULL,
@@ -1830,7 +2052,7 @@ pub async fn ensure_core_schema(
     .await?;
     query(
         "CREATE TABLE IF NOT EXISTS transcript_pages (
-            user_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
             session_id VARCHAR(64) NOT NULL,
             page_seq BIGINT NOT NULL,
             start_item_seq BIGINT NOT NULL,
@@ -1880,7 +2102,7 @@ pub async fn ensure_core_schema(
         "CREATE TABLE IF NOT EXISTS prompt_request_records (
             request_id VARCHAR(64) NOT NULL,
             session_id VARCHAR(64) NOT NULL,
-            user_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
             run_id VARCHAR(64) NULL,
             turn BIGINT NOT NULL,
             round BIGINT NOT NULL,
@@ -2008,7 +2230,7 @@ pub async fn ensure_core_schema(
     .await?;
     query(
         "CREATE TABLE IF NOT EXISTS prompt_deltas (
-            user_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
             session_id VARCHAR(64) NOT NULL,
             request_id VARCHAR(64) NOT NULL,
             delta_seq INT NOT NULL,
@@ -2029,7 +2251,7 @@ pub async fn ensure_core_schema(
     query(
         "CREATE TABLE IF NOT EXISTS session_state_revisions (
             session_id VARCHAR(64) NOT NULL,
-            user_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
             monotonic_id BIGINT NOT NULL DEFAULT 0,
             revision_hash VARCHAR(96) NOT NULL,
             device_fingerprint VARCHAR(128) NOT NULL,
@@ -2870,7 +3092,7 @@ pub async fn ensure_core_schema(
 
     query(
         "CREATE TABLE IF NOT EXISTS agent_event_edges (
-            user_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
             session_id VARCHAR(128) NOT NULL,
             child_event_id VARCHAR(128) NOT NULL,
             parent_event_id VARCHAR(128) NOT NULL,
@@ -2902,7 +3124,7 @@ pub async fn ensure_core_schema(
         "CREATE TABLE IF NOT EXISTS harness_snapshots (
             snapshot_id VARCHAR(64) PRIMARY KEY,
             session_id VARCHAR(64) NOT NULL,
-            user_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
             hook_point VARCHAR(32) NOT NULL,
             turn_number INT UNSIGNED NOT NULL DEFAULT 0,
             snapshot_json LONGTEXT NOT NULL,
@@ -3099,7 +3321,7 @@ pub async fn ensure_core_schema(
     query(
         "CREATE TABLE IF NOT EXISTS ctx_snapshots (
             context_capture_id VARCHAR(64) PRIMARY KEY,
-            user_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
             session_id VARCHAR(64) NOT NULL,
             event_id VARCHAR(128) NOT NULL,
             context_data JSON NULL,
@@ -3157,7 +3379,7 @@ pub async fn ensure_core_schema(
     query(
         "CREATE TABLE IF NOT EXISTS ctx_decision_audits (
             decision_id VARCHAR(64) PRIMARY KEY,
-            user_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
             session_id VARCHAR(64) NOT NULL,
             event_id VARCHAR(128) NULL,
             context_capture_id VARCHAR(64) NULL,
@@ -3232,7 +3454,7 @@ pub async fn ensure_core_schema(
         "CREATE TABLE IF NOT EXISTS skill_selection_events (
             event_id VARCHAR(64) PRIMARY KEY,
             session_id VARCHAR(64) NOT NULL,
-            user_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
             agent_id VARCHAR(255) NULL,
             user_query LONGTEXT NULL,
             selected_skills JSON NULL,
@@ -3319,7 +3541,7 @@ pub async fn ensure_core_schema(
         "CREATE TABLE IF NOT EXISTS admin_config (
             config_key VARCHAR(100) PRIMARY KEY,
             config_value TEXT NOT NULL,
-            updated_by VARCHAR(64) NULL,
+            updated_by VARCHAR(128) NULL,
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
         )",
     )
@@ -3329,7 +3551,7 @@ pub async fn ensure_core_schema(
     query(
         "CREATE TABLE IF NOT EXISTS user_preferences (
             pref_id VARCHAR(64) PRIMARY KEY,
-            user_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
             pref_key VARCHAR(100) NOT NULL,
             pref_value LONGTEXT NOT NULL,
             version INT NOT NULL DEFAULT 1,
@@ -3432,7 +3654,7 @@ pub async fn ensure_core_schema(
     query(
         "CREATE TABLE IF NOT EXISTS agent_tasks (
             task_id VARCHAR(64) NOT NULL,
-            user_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
             session_id VARCHAR(64) NULL,
             agent_id VARCHAR(255) NULL,
             parent_task_id VARCHAR(64) NULL,
@@ -3487,7 +3709,7 @@ pub async fn ensure_core_schema(
 
     query(
         "CREATE TABLE IF NOT EXISTS edge_agent_registry (
-            user_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
             registry_id VARCHAR(64) NOT NULL,
             edge_agent_id VARCHAR(255) NOT NULL,
             edge_id VARCHAR(128) NOT NULL,
@@ -3512,9 +3734,10 @@ pub async fn ensure_core_schema(
     )
     .await?;
 
+    migrate_legacy_edge_pending_dispatch_if_needed(&pool, &settings.database).await?;
     query(
         "CREATE TABLE IF NOT EXISTS edge_pending_dispatch (
-            user_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
             session_id VARCHAR(128) NOT NULL,
             run_id VARCHAR(128) NOT NULL,
             turn_chain_id VARCHAR(128) NOT NULL,
@@ -3785,7 +4008,7 @@ pub async fn ensure_core_schema(
     query(
         "CREATE TABLE IF NOT EXISTS task_leases (
             task_id VARCHAR(64) NOT NULL,
-            user_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
             holder_agent_id VARCHAR(255) NOT NULL,
             holder_edge_id VARCHAR(128) NULL,
             expires_at DATETIME(6) NOT NULL,
@@ -3827,7 +4050,7 @@ pub async fn ensure_core_schema(
     query(
         "CREATE TABLE IF NOT EXISTS plan_templates (
             template_id VARCHAR(64) NOT NULL,
-            user_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
             goal_pattern VARCHAR(500) NOT NULL,
             project_type VARCHAR(50) NULL,
             template_json LONGTEXT NOT NULL,
@@ -3857,7 +4080,7 @@ pub async fn ensure_core_schema(
     // `plan_json` just to render a card. Maintained by `PlanRepository::save`.
     query(
         "CREATE TABLE IF NOT EXISTS plans (
-            user_id       VARCHAR(64) NOT NULL,
+            user_id       VARCHAR(128) NOT NULL,
             plan_id       VARCHAR(64) NOT NULL,
             session_id    VARCHAR(64) NULL,
             goal          TEXT NOT NULL,
@@ -3867,7 +4090,7 @@ pub async fn ensure_core_schema(
             plan_md       LONGTEXT NULL,
             progress_pct  INT NOT NULL DEFAULT 0,
             subtask_count INT NOT NULL DEFAULT 0,
-            created_by    VARCHAR(64) NULL,
+            created_by    VARCHAR(128) NULL,
             created_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (user_id, plan_id),
@@ -3901,7 +4124,7 @@ pub async fn ensure_core_schema(
     query(
         "CREATE TABLE IF NOT EXISTS plan_step_runs (
             run_id       VARCHAR(64) NOT NULL,
-            user_id      VARCHAR(64) NOT NULL,
+            user_id      VARCHAR(128) NOT NULL,
             plan_id      VARCHAR(64) NOT NULL,
             subtask_id   VARCHAR(64) NOT NULL,
             attempt      INT NOT NULL,
@@ -3949,7 +4172,7 @@ pub async fn ensure_core_schema(
         "CREATE TABLE IF NOT EXISTS session_checkpoints (
             checkpoint_id VARCHAR(64) NOT NULL,
             session_id VARCHAR(64) NOT NULL,
-            user_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
             number INT NOT NULL,
             turn INT NOT NULL,
             title VARCHAR(500) NULL,
@@ -4018,7 +4241,7 @@ pub async fn ensure_core_schema(
         "CREATE TABLE IF NOT EXISTS session_artifacts (
             artifact_id VARCHAR(64) NOT NULL,
             session_id VARCHAR(64) NOT NULL,
-            user_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
             project_id VARCHAR(128) NULL,
             owner_run_id VARCHAR(128) NULL,
             owner_delegation_id VARCHAR(128) NULL,
@@ -4178,7 +4401,7 @@ pub async fn ensure_core_schema(
         "CREATE TABLE IF NOT EXISTS session_todos (
             session_id VARCHAR(64) NOT NULL,
             todo_id VARCHAR(64) NOT NULL,
-            user_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
             ordinal INT NOT NULL,
             title VARCHAR(512) NOT NULL,
             description TEXT NULL,
@@ -4248,7 +4471,7 @@ pub async fn ensure_core_schema(
     // but its id must never be reused for that owner/session board.
     query(
         "CREATE TABLE IF NOT EXISTS session_todo_counters (
-            user_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
             session_id VARCHAR(64) NOT NULL,
             next_id BIGINT NOT NULL,
             version BIGINT NOT NULL DEFAULT 0,
@@ -4261,7 +4484,7 @@ pub async fn ensure_core_schema(
     query(
         "CREATE TABLE IF NOT EXISTS session_todo_idempotency (
             session_id VARCHAR(64) NOT NULL,
-            user_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
             action VARCHAR(32) NOT NULL,
             idempotency_key VARCHAR(128) NOT NULL,
             args_json LONGTEXT NOT NULL,
@@ -4290,7 +4513,7 @@ pub async fn ensure_core_schema(
             contract_id    VARCHAR(64) NOT NULL,
             task_id        VARCHAR(64) NOT NULL,
             session_id     VARCHAR(64) NOT NULL,
-            user_id        VARCHAR(64) NOT NULL,
+            user_id        VARCHAR(128) NOT NULL,
             goal           TEXT NOT NULL,
             scope_json     JSON,
             subtasks_json  JSON NOT NULL,
@@ -4338,7 +4561,7 @@ pub async fn ensure_core_schema(
             subtask_id     VARCHAR(64) NOT NULL,
             criterion_id   VARCHAR(64) NOT NULL,
             session_id     VARCHAR(64) NOT NULL,
-            user_id        VARCHAR(64) NOT NULL,
+            user_id        VARCHAR(128) NOT NULL,
             status         VARCHAR(20) NOT NULL,
             evidence       LONGTEXT,
             expected       TEXT,
@@ -4455,7 +4678,7 @@ pub async fn ensure_core_schema(
     query(
         "CREATE TABLE IF NOT EXISTS skill_installations (
             installation_id  VARCHAR(36) PRIMARY KEY,
-            user_id          VARCHAR(36) NOT NULL,
+            user_id          VARCHAR(128) NOT NULL,
             skill_name       VARCHAR(128) NOT NULL,
             skill_version    VARCHAR(32) NOT NULL,
             status           VARCHAR(32) NOT NULL DEFAULT 'active',
@@ -4485,7 +4708,7 @@ pub async fn ensure_core_schema(
             is_secret     SMALLINT NOT NULL DEFAULT 0,
             scope_type    VARCHAR(32) NOT NULL DEFAULT 'global',
             scope_id      VARCHAR(36),
-            updated_by    VARCHAR(36),
+            updated_by    VARCHAR(128),
             created_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
             UNIQUE INDEX idx_ss_skill_setting_scope (skill_name, setting_name, scope_type, scope_id),
@@ -4502,8 +4725,8 @@ pub async fn ensure_core_schema(
             domain_port   INT NOT NULL DEFAULT 0,
             is_enabled    SMALLINT NOT NULL DEFAULT 1,
             description   VARCHAR(255),
-            created_by    VARCHAR(36),
-            updated_by    VARCHAR(36),
+            created_by    VARCHAR(128),
+            updated_by    VARCHAR(128),
             created_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
             UNIQUE INDEX idx_rld_host_port (domain_host, domain_port),
@@ -4516,14 +4739,14 @@ pub async fn ensure_core_schema(
     query(
         "CREATE TABLE IF NOT EXISTS skill_resource_bindings (
             binding_id    VARCHAR(36) PRIMARY KEY,
-            user_id       VARCHAR(36) NOT NULL,
+            user_id       VARCHAR(128) NOT NULL,
             skill_name    VARCHAR(128) NOT NULL,
             resource_type VARCHAR(64) NOT NULL,
             resource_key  VARCHAR(128) NOT NULL,
             binding_name  VARCHAR(128) NOT NULL,
             binding_value TEXT,
             is_secret     SMALLINT NOT NULL DEFAULT 0,
-            updated_by    VARCHAR(36),
+            updated_by    VARCHAR(128),
             created_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
             INDEX idx_srb_user_skill (user_id, skill_name),
@@ -4536,7 +4759,7 @@ pub async fn ensure_core_schema(
     query(
         "CREATE TABLE IF NOT EXISTS skill_user_credentials (
             credential_id   VARCHAR(36) PRIMARY KEY,
-            user_id         VARCHAR(36) NOT NULL,
+            user_id         VARCHAR(128) NOT NULL,
             skill_name      VARCHAR(128) NOT NULL,
             credential_name VARCHAR(128) NOT NULL,
             value_encrypted TEXT NOT NULL,
@@ -4551,7 +4774,7 @@ pub async fn ensure_core_schema(
     query(
         "CREATE TABLE IF NOT EXISTS wf_triggers (
             trigger_id   VARCHAR(36) PRIMARY KEY,
-            user_id      VARCHAR(36) NOT NULL,
+            user_id      VARCHAR(128) NOT NULL,
             agent_id     VARCHAR(255) NOT NULL,
             trigger_type VARCHAR(32) NOT NULL,
             name         VARCHAR(128) NOT NULL,
@@ -4578,7 +4801,7 @@ pub async fn ensure_core_schema(
             agent_id       VARCHAR(255) PRIMARY KEY,
             agent_name     VARCHAR(128) NOT NULL,
             agent_type     VARCHAR(64) NOT NULL DEFAULT 'general',
-            owner_user_id  VARCHAR(36) NOT NULL,
+            owner_user_id  VARCHAR(128) NOT NULL,
             is_active      SMALLINT NOT NULL DEFAULT 1,
             agent_config   LONGTEXT,
             data_source    TEXT,
@@ -4596,9 +4819,9 @@ pub async fn ensure_core_schema(
     query(
         "CREATE TABLE IF NOT EXISTS infra_sandbox_metadata (
             sandbox_name VARCHAR(128) PRIMARY KEY,
-            user_id      VARCHAR(36) NOT NULL,
+            user_id      VARCHAR(128) NOT NULL,
             description  TEXT NOT NULL,
-            created_by   VARCHAR(36) NOT NULL,
+            created_by   VARCHAR(128) NOT NULL,
             status       VARCHAR(32) NOT NULL DEFAULT 'active',
             created_at   DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at   DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
@@ -4615,7 +4838,7 @@ pub async fn ensure_core_schema(
         "CREATE TABLE IF NOT EXISTS data_versioning_checkpoints (
             checkpoint_id   VARCHAR(36) PRIMARY KEY,
             checkpoint_name VARCHAR(128) NOT NULL,
-            user_id         VARCHAR(36) NOT NULL,
+            user_id         VARCHAR(128) NOT NULL,
             description     TEXT,
             created_at      DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             UNIQUE INDEX idx_dvc_user_name (user_id, checkpoint_name)
@@ -4629,7 +4852,7 @@ pub async fn ensure_core_schema(
     query(
         "CREATE TABLE IF NOT EXISTS eval_gate_results (
             gate_id         VARCHAR(36) PRIMARY KEY,
-            user_id         VARCHAR(36) NULL,
+            user_id         VARCHAR(128) NULL,
             change_type     VARCHAR(64) NOT NULL,
             change_id       VARCHAR(64) NOT NULL,
             sessions_tested INT NOT NULL DEFAULT 0,
@@ -4648,7 +4871,7 @@ pub async fn ensure_core_schema(
     query(
         "CREATE TABLE IF NOT EXISTS eval_quality_assessments (
             assessment_id VARCHAR(64) PRIMARY KEY,
-            user_id       VARCHAR(36) NULL,
+            user_id       VARCHAR(128) NULL,
             target_id     VARCHAR(64) NOT NULL,
             score         DECIMAL(5,4) NOT NULL,
             step_count    INT NOT NULL DEFAULT 0,
@@ -4671,7 +4894,7 @@ pub async fn ensure_core_schema(
         &pool,
         &settings.database,
         "eval_calibration_assessments",
-        &[("user_id", 64)],
+        &[("user_id", USER_ID_MAX_LEN as u64)],
     )
     .await?;
     ensure_primary_key_shape(
@@ -4713,7 +4936,7 @@ pub async fn ensure_core_schema(
     query(
         "CREATE TABLE IF NOT EXISTS eval_training_datasets (
             dataset_id        VARCHAR(36) PRIMARY KEY,
-            user_id           VARCHAR(36) NOT NULL,
+            user_id           VARCHAR(128) NOT NULL,
             request_json      JSON NULL,
             dataset_json      LONGTEXT NOT NULL,
             sample_count      INT NOT NULL DEFAULT 0,
@@ -4730,7 +4953,7 @@ pub async fn ensure_core_schema(
     query(
         "CREATE TABLE IF NOT EXISTS eval_user_feedback (
             feedback_id   VARCHAR(36) PRIMARY KEY,
-            user_id       VARCHAR(36) NOT NULL,
+            user_id       VARCHAR(128) NOT NULL,
             agent_id      VARCHAR(255),
             session_id    VARCHAR(36),
             turn_id       VARCHAR(36),
@@ -4769,7 +4992,7 @@ pub async fn ensure_core_schema(
     query(
         "CREATE TABLE IF NOT EXISTS team_definitions (
             team_id       VARCHAR(64)  PRIMARY KEY,
-            user_id       VARCHAR(64)  NOT NULL,
+            user_id       VARCHAR(128)  NOT NULL,
             name          VARCHAR(128) NOT NULL,
             description   TEXT,
             coordination  TEXT         NOT NULL,
@@ -4792,7 +5015,7 @@ pub async fn ensure_core_schema(
         "CREATE TABLE IF NOT EXISTS team_execution_history (
             execution_id  VARCHAR(64)  PRIMARY KEY,
             team_id       VARCHAR(64)  NOT NULL,
-            user_id       VARCHAR(64)  NOT NULL,
+            user_id       VARCHAR(128)  NOT NULL,
             `task`        TEXT         NOT NULL,
             status        VARCHAR(32)  NOT NULL DEFAULT 'pending',
             result_json   LONGTEXT,
@@ -4811,7 +5034,7 @@ pub async fn ensure_core_schema(
         "CREATE TABLE IF NOT EXISTS team_snapshots (
             snapshot_id          VARCHAR(64)  PRIMARY KEY,
             team_name            VARCHAR(128) NOT NULL,
-            user_id              VARCHAR(64)  NOT NULL,
+            user_id              VARCHAR(128)  NOT NULL,
             label                VARCHAR(255) DEFAULT '',
             git_commit           VARCHAR(64),
             session_id           VARCHAR(64),
@@ -4827,7 +5050,7 @@ pub async fn ensure_core_schema(
 
     query(
         "CREATE TABLE IF NOT EXISTS conversation_log (
-            user_id       VARCHAR(64) NOT NULL,
+            user_id       VARCHAR(128) NOT NULL,
             session_id    VARCHAR(64) NOT NULL,
             seq           BIGINT NOT NULL,
             turn          INT NOT NULL,
@@ -5255,7 +5478,7 @@ pub async fn cleanup_expired_data(
                ON r.user_id = p.user_id AND r.run_id = p.run_id
              WHERE p.created_at_unix_ms < UNIX_TIMESTAMP(DATE_SUB(NOW(6), INTERVAL {} DAY)) * 1000
                AND (s.session_id IS NULL OR s.status IN ('ended', 'closed', 'cancelled', 'deleting'))
-               AND (p.run_id IS NULL OR r.run_id IS NULL OR r.status IN ('completed', 'failed', 'cancelled'))
+               AND (p.run_id IS NULL OR r.run_id IS NULL OR r.status IN ('completed', 'delegated', 'failed', 'cancelled'))
              ORDER BY p.created_at_unix_ms ASC, p.user_id ASC, p.request_id ASC
              LIMIT ?",
         policy.prompt_request_days
@@ -5425,6 +5648,59 @@ pub async fn cleanup_expired_data(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identity_column_widening_preserves_nullability() {
+        assert_eq!(
+            identity_column_widening_ddl("eval_quality_assessments", "user_id", true)
+                .expect("nullable identity migration DDL"),
+            "ALTER TABLE `eval_quality_assessments` MODIFY COLUMN `user_id` VARCHAR(128) NULL"
+        );
+        assert_eq!(
+            identity_column_widening_ddl("auth_users", "username", false)
+                .expect("required identity migration DDL"),
+            "ALTER TABLE `auth_users` MODIFY COLUMN `username` VARCHAR(128) NOT NULL"
+        );
+    }
+
+    #[test]
+    fn production_ddl_identity_columns_meet_width_contract() {
+        let identity_column = regex::Regex::new(
+            r"(?i)\b(user_id|owner_user_id|scope_user_id|created_by|updated_by|username)\s+VARCHAR\((\d+)\)",
+        )
+        .expect("identity column regex");
+        for (path, source) in [
+            ("storage.rs", include_str!("storage.rs")),
+            (
+                "config_version_cloud.rs",
+                include_str!("config_version_cloud.rs"),
+            ),
+            ("resource_governor.rs", include_str!("resource_governor.rs")),
+            ("workspace_records.rs", include_str!("workspace_records.rs")),
+            (
+                "astra-messaging/db_transport.rs",
+                include_str!("../../astra-messaging/src/db_transport.rs"),
+            ),
+            (
+                "runtime/llm_provider_admission.rs",
+                include_str!("../../runtime/src/llm_provider_admission.rs"),
+            ),
+        ] {
+            for captures in identity_column.captures_iter(source) {
+                let column = captures.get(1).expect("identity column name").as_str();
+                let width = captures
+                    .get(2)
+                    .expect("identity column width")
+                    .as_str()
+                    .parse::<usize>()
+                    .expect("numeric identity column width");
+                assert!(
+                    width >= USER_ID_MAX_LEN,
+                    "{path} defines {column} as VARCHAR({width}), below the {USER_ID_MAX_LEN}-character identity contract"
+                );
+            }
+        }
+    }
 
     struct FakeDatabaseUserRow {
         failed_column: Option<&'static str>,
@@ -5723,7 +5999,7 @@ mod tests {
             .and_then(|rest| rest.split("// Harness diagnostic snapshots").next())
             .expect("agent_event_edges DDL");
         for expected in [
-            "user_id VARCHAR(64) NOT NULL",
+            "user_id VARCHAR(128) NOT NULL",
             "session_id VARCHAR(128) NOT NULL",
             "child_event_id VARCHAR(128) NOT NULL",
             "parent_event_id VARCHAR(128) NOT NULL",
@@ -5934,6 +6210,46 @@ mod tests {
         assert!(
             production_source.contains("&[\"dispatch_id\"]"),
             "legacy dispatch_id schemas must fail startup instead of silently preserving the old hot surrogate"
+        );
+    }
+
+    #[test]
+    fn canonical_owner_request_dispatch_schema_is_migrated_before_turn_scoped_creation() {
+        let columns = EDGE_PENDING_DISPATCH_LEGACY_COLUMNS
+            .iter()
+            .map(|column| (*column).to_string())
+            .collect::<BTreeSet<_>>();
+        let primary_key = EDGE_PENDING_DISPATCH_LEGACY_PRIMARY_KEY
+            .iter()
+            .map(|column| (*column).to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            is_legacy_edge_pending_dispatch_shape(&columns, &primary_key),
+            "the known 48f owner/request schema must select the explicit migration"
+        );
+
+        let mut mixed_columns = columns.clone();
+        mixed_columns.insert("session_id".to_string());
+        assert!(
+            !is_legacy_edge_pending_dispatch_shape(&mixed_columns, &primary_key),
+            "a partially migrated table must not be archived as the known legacy shape"
+        );
+
+        let source = include_str!("storage.rs");
+        let migration_pos = source
+            .find("migrate_legacy_edge_pending_dispatch_if_needed(&pool, &settings.database)")
+            .expect("legacy edge dispatch migration invocation");
+        let create_pos = source
+            .find("CREATE TABLE IF NOT EXISTS edge_pending_dispatch")
+            .expect("turn-scoped edge dispatch CREATE TABLE");
+        assert!(
+            migration_pos < create_pos,
+            "legacy table must be archived before current edge dispatch schema creation"
+        );
+        assert!(
+            source.contains("RENAME TABLE")
+                && source.contains("WHERE status IN ('pending', 'dispatched')"),
+            "migration must preserve terminal history and block active rows without inventing turn identity"
         );
     }
 
@@ -6411,7 +6727,7 @@ mod tests {
         );
         assert!(
             body.contains("s.status IN ('ended', 'closed', 'cancelled', 'deleting')")
-                && body.contains("r.status IN ('completed', 'failed', 'cancelled')"),
+                && body.contains("r.status IN ('completed', 'delegated', 'failed', 'cancelled')"),
             "prompt cleanup must avoid active sessions and non-terminal runs"
         );
         let child_delete = body
@@ -6520,7 +6836,7 @@ mod tests {
         let ddl = EVAL_CALIBRATION_ASSESSMENTS_CREATE_SQL;
         for column in [
             "calibration_id VARCHAR(64) NOT NULL",
-            "user_id        VARCHAR(64) NOT NULL",
+            "user_id        VARCHAR(128) NOT NULL",
             "agent_id       VARCHAR(255)",
             "session_id     VARCHAR(64) NOT NULL",
             "confidence     DECIMAL(5,4) NOT NULL",

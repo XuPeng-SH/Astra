@@ -1499,6 +1499,7 @@ impl ChatWidget {
                     use astra_turn_core::agent_live_event::AgentLiveTermination;
                     let status_str = match termination {
                         AgentLiveTermination::Completed => "completed",
+                        AgentLiveTermination::Delegated => "delegated",
                         AgentLiveTermination::Failed => "failed",
                         AgentLiveTermination::Interrupted => "interrupted",
                         AgentLiveTermination::Cancelled => "cancelled",

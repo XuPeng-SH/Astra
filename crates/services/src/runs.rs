@@ -1,7 +1,7 @@
 use astra_core::{
-    ErrorResponse, STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED, STATUS_INPUT_QUEUED,
-    STATUS_PAUSED, STATUS_RUNNING, STATUS_WAITING, SharedPool, SubRunState, error_response,
-    error_response_coded,
+    ErrorResponse, STATUS_CANCELLED, STATUS_COMPLETED, STATUS_DELEGATED, STATUS_FAILED,
+    STATUS_INPUT_QUEUED, STATUS_PAUSED, STATUS_RUNNING, STATUS_WAITING, SharedPool, SubRunState,
+    error_response, error_response_coded,
 };
 use async_trait::async_trait;
 use axum::{Json, http::StatusCode};
@@ -232,6 +232,25 @@ pub struct ExecutionBudget {
     pub initial_turns: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hard_turn_limit: Option<u32>,
+}
+
+/// Request-scoped execution controls. The default preserves Astra's native
+/// behavior; callers must opt in explicitly to change a policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionPolicyRequest {
+    #[serde(default)]
+    pub turn_intent: TurnIntentExecutionPolicy,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnIntentExecutionPolicy {
+    #[default]
+    Auto,
+    /// Do not call Astra's auxiliary TurnIntent LLM. The request keeps the
+    /// deterministic baseline profile selected when its loop state is built.
+    FixedDefault,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -504,6 +523,7 @@ pub struct ChatRequestData {
     pub capabilities: Vec<String>,
     pub forward_headers: std::collections::HashMap<String, String>,
     pub execution_budget: Option<ExecutionBudget>,
+    pub execution_policy: ExecutionPolicyRequest,
     pub explain: bool,
     pub interaction_mode: Option<RequestedTurnInteractionMode>,
     pub interactive_client: bool,
@@ -569,6 +589,7 @@ impl std::fmt::Debug for ChatRequestData {
                 &RedactedForwardHeadersDebug(&self.forward_headers),
             )
             .field("execution_budget", &self.execution_budget)
+            .field("execution_policy", &self.execution_policy)
             .field("explain", &self.explain)
             .field("interaction_mode", &self.interaction_mode)
             .field("interactive_client", &self.interactive_client)
@@ -795,6 +816,7 @@ pub enum DurableRunStatusKind {
     Waiting,
     Paused,
     Completed,
+    Delegated,
     Failed,
     Cancelled,
     Other,
@@ -807,6 +829,7 @@ pub fn durable_run_status_kind(status: &str) -> DurableRunStatusKind {
         STATUS_WAITING => DurableRunStatusKind::Waiting,
         STATUS_PAUSED => DurableRunStatusKind::Paused,
         STATUS_COMPLETED => DurableRunStatusKind::Completed,
+        STATUS_DELEGATED => DurableRunStatusKind::Delegated,
         STATUS_FAILED => DurableRunStatusKind::Failed,
         STATUS_CANCELLED => DurableRunStatusKind::Cancelled,
         _ => DurableRunStatusKind::Other,
@@ -817,6 +840,7 @@ pub fn durable_run_status_is_terminal(status: &str) -> bool {
     matches!(
         durable_run_status_kind(status),
         DurableRunStatusKind::Completed
+            | DurableRunStatusKind::Delegated
             | DurableRunStatusKind::Failed
             | DurableRunStatusKind::Cancelled
     )
@@ -843,7 +867,7 @@ pub fn durable_run_status_to_subrun_state(status: &str) -> SubRunState {
     match durable_run_status_kind(status) {
         DurableRunStatusKind::Running | DurableRunStatusKind::InputQueued => SubRunState::Running,
         DurableRunStatusKind::Waiting | DurableRunStatusKind::Paused => SubRunState::Paused,
-        DurableRunStatusKind::Completed => SubRunState::Completed,
+        DurableRunStatusKind::Completed | DurableRunStatusKind::Delegated => SubRunState::Completed,
         DurableRunStatusKind::Failed | DurableRunStatusKind::Other => SubRunState::Failed,
         DurableRunStatusKind::Cancelled => SubRunState::Cancelled,
     }
@@ -5407,6 +5431,8 @@ const EXTERNAL_CLIENT_ALLOWLIST: &[&str] = &[
     "run_paused",
     "run_resumed",
     "run_input_queued",
+    "runtime.control.handoff.requested",
+    "runtime.control.handoff.rejected",
     "context_meta",
     "session_info",
     "turn_complete",
@@ -5672,6 +5698,9 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
                 if let Some(interactive_client) = data.get("interactive_client").cloned() {
                     obj.insert("interactive_client".to_string(), interactive_client);
                 }
+                if let Some(turn_intent_policy) = data.get("turn_intent_policy").cloned() {
+                    obj.insert("turn_intent_policy".to_string(), turn_intent_policy);
+                }
                 if let Some(workspace) = data.get("workspace").cloned() {
                     obj.insert("workspace".to_string(), workspace);
                 }
@@ -5690,6 +5719,8 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
                 for key in [
                     "run_id",
                     "status",
+                    "outcome",
+                    "finish_reason",
                     "error",
                     "error_code",
                     "error_kind",
@@ -6299,6 +6330,10 @@ mod tests {
             DurableRunStatusKind::Completed
         );
         assert_eq!(
+            durable_run_status_kind(STATUS_DELEGATED),
+            DurableRunStatusKind::Delegated
+        );
+        assert_eq!(
             durable_run_status_kind(STATUS_FAILED),
             DurableRunStatusKind::Failed
         );
@@ -6312,6 +6347,7 @@ mod tests {
         );
 
         assert!(durable_run_status_is_terminal(STATUS_COMPLETED));
+        assert!(durable_run_status_is_terminal(STATUS_DELEGATED));
         assert!(durable_run_status_is_terminal(STATUS_FAILED));
         assert!(durable_run_status_is_terminal(STATUS_CANCELLED));
         assert!(!durable_run_status_is_terminal(STATUS_RUNNING));
@@ -6364,6 +6400,7 @@ mod tests {
             true,
             true
         ));
+        assert!(!durable_run_status_blocks_session(STATUS_DELEGATED, None));
         assert_eq!(
             durable_run_status_to_subrun_state(STATUS_WAITING),
             SubRunState::Paused
@@ -6375,6 +6412,10 @@ mod tests {
         assert_eq!(
             durable_run_status_to_subrun_state(STATUS_INPUT_QUEUED),
             SubRunState::Running
+        );
+        assert_eq!(
+            durable_run_status_to_subrun_state(STATUS_DELEGATED),
+            SubRunState::Completed
         );
         assert_eq!(
             durable_run_status_to_subrun_state("mystery"),
@@ -7491,6 +7532,7 @@ mod tests {
                     json!({
                         "run_id": "run-1", "session_id": "sess-1", "interaction_mode": "auto",
                         "suppressed_loop_nudges": true, "interactive_client": true,
+                        "turn_intent_policy": "fixed_default",
                         "workspace": {"kind": "server_sandbox", "cwd": "/tmp/astra-workspaces/run-1"},
                         "executor": {"kind": "server_local", "status": "online"},
                         "transport": "server_local"
@@ -7500,6 +7542,7 @@ mod tests {
                     assert_eq!(o["type"], "run_started");
                     assert_eq!(o["run_id"], "run-1");
                     assert_eq!(o["interaction_mode"], "auto");
+                    assert_eq!(o["turn_intent_policy"], "fixed_default");
                 },
             ),
             (
@@ -7980,6 +8023,7 @@ mod tests {
                 initial_turns: Some(10),
                 hard_turn_limit: Some(18),
             }),
+            execution_policy: Default::default(),
             full_llm_capture: false,
             explain: false,
             interaction_mode: None,
@@ -8045,6 +8089,7 @@ mod tests {
             capabilities: Vec::new(),
             forward_headers: std::collections::HashMap::new(),
             execution_budget: None,
+            execution_policy: Default::default(),
             full_llm_capture: false,
             explain: false,
             interaction_mode: None,
@@ -8129,6 +8174,7 @@ mod tests {
                         initial_turns: Some(25),
                         hard_turn_limit: Some(40),
                     }),
+                    execution_policy: Default::default(),
                     full_llm_capture: false,
                     explain: false,
                     interaction_mode: None,

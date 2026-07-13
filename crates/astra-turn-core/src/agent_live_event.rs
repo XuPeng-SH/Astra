@@ -19,6 +19,7 @@ pub struct AgentLiveEvent {
 #[serde(rename_all = "snake_case")]
 pub enum AgentLiveTermination {
     Completed,
+    Delegated,
     Failed,
     /// Execution stopped with resumable state and may continue later.
     Interrupted,

@@ -61,7 +61,7 @@ use crate::{FernetTokenEncryptor, MatrixOneSettings};
 use astra_core::SharedPool;
 use astra_services::LlmTokenServiceConfig;
 use astra_services::multi_agent::EdgeDispatchService;
-use astra_services::runs::RequestedTurnInteractionMode;
+use astra_services::runs::{RequestedTurnInteractionMode, TurnIntentExecutionPolicy};
 use astra_services::{SkillAutoRouteCandidate, SkillAutoRouteJudge, SkillAutoRouteJudgeError};
 use astra_turn_core::agent_live_event::{
     AgentLiveEvent, AgentLiveEventKind, SharedAgentLiveEventSink,
@@ -1136,6 +1136,8 @@ pub struct ServerAgenticLoopHost {
     interactive_client: bool,
     /// Optional request-level interaction policy override.
     interaction_mode: Option<RequestedTurnInteractionMode>,
+    /// Request-scoped policy for Astra's auxiliary TurnIntent LLM.
+    turn_intent_policy: TurnIntentExecutionPolicy,
     /// `true` when this session explicitly requests full LLM request/response capture.
     full_llm_capture: bool,
     /// Whether tool-call validation should admit Astra's static tool catalog
@@ -1173,6 +1175,15 @@ pub struct ServerAgenticLoopHost {
     executor_binding: ExecutorBinding,
     runtime_binding: Option<astra_runtime_env::RuntimeBinding>,
     request_scoped_mcp_provider_ready: bool,
+    /// Request-scoped terminal control metadata supplied by the runtime
+    /// provider. Kept outside the provider-facing tool schemas.
+    runtime_control_tools: crate::turn::terminal_control::RuntimeControlToolSnapshot,
+    /// Request-scoped terminal completion metadata supplied by the runtime
+    /// provider. This is evaluated only after a tool returns structured success.
+    runtime_stop_after_success_tools:
+        crate::turn::tool_completion::RuntimeStopAfterSuccessToolSnapshot,
+    terminal_handoff_window: crate::turn::terminal_control::TerminalHandoffWindow,
+    pending_terminal_control_outcome: Option<crate::turn::terminal_control::TerminalControlOutcome>,
     /// Session-scoped cache for dedup of identical read-only tool invocations
     /// within a short window. Gated by concurrency_safety classification.
     tool_result_cache: astra_turn_core::tool_result_dedup::SharedResultCache,
@@ -1293,6 +1304,7 @@ pub struct ServerAgenticLoopHostBuilder {
     progress_root_run_id: Option<String>,
     interactive_client: bool,
     interaction_mode: Option<RequestedTurnInteractionMode>,
+    turn_intent_policy: TurnIntentExecutionPolicy,
     full_llm_capture: bool,
     static_tool_catalog_admissible: bool,
     event_tx: Option<tokio::sync::mpsc::Sender<Value>>,
@@ -1350,6 +1362,7 @@ impl ServerAgenticLoopHostBuilder {
             progress_root_run_id: None,
             interactive_client: false,
             interaction_mode: None,
+            turn_intent_policy: TurnIntentExecutionPolicy::Auto,
             full_llm_capture: false,
             static_tool_catalog_admissible: true,
             event_tx: None,
@@ -1522,6 +1535,11 @@ impl ServerAgenticLoopHostBuilder {
         interaction_mode: Option<RequestedTurnInteractionMode>,
     ) -> Self {
         self.interaction_mode = interaction_mode;
+        self
+    }
+
+    pub fn with_turn_intent_policy(mut self, policy: TurnIntentExecutionPolicy) -> Self {
+        self.turn_intent_policy = policy;
         self
     }
 
@@ -1724,6 +1742,7 @@ impl ServerAgenticLoopHostBuilder {
             control_plane_provider_catalog_enabled: self.control_plane_tool_catalog_enabled,
             interactive_client: self.interactive_client,
             interaction_mode: self.interaction_mode,
+            turn_intent_policy: self.turn_intent_policy,
             full_llm_capture: self.full_llm_capture,
             static_tool_catalog_admissible: self.static_tool_catalog_admissible,
             always_load_tool_names,
@@ -1736,6 +1755,10 @@ impl ServerAgenticLoopHostBuilder {
             executor_binding: schema_executor.clone(),
             runtime_binding: schema_runtime.clone(),
             request_scoped_mcp_provider_ready: false,
+            runtime_control_tools: Default::default(),
+            runtime_stop_after_success_tools: Default::default(),
+            terminal_handoff_window: Default::default(),
+            pending_terminal_control_outcome: None,
             tool_result_cache: astra_turn_core::tool_result_dedup::new_shared_cache(
                 128,
                 Some(std::time::Duration::from_secs(30)),
@@ -2114,7 +2137,14 @@ impl ServerAgenticLoopHost {
     /// Install runtime MCP tool schemas into the LLM tool surface.
     /// Updates `tool_schemas`, `valid_tools`, and `admissible_extras`
     /// so the LLM sees MCP tools and the validator admits them.
-    pub fn install_runtime_tool_schemas(&mut self, schemas: Vec<Value>) {
+    pub(crate) fn install_runtime_tool_schemas(
+        &mut self,
+        schemas: Vec<Value>,
+        control_tools: crate::turn::terminal_control::RuntimeControlToolSnapshot,
+    ) {
+        self.terminal_handoff_window =
+            crate::turn::terminal_control::TerminalHandoffWindow::for_snapshot(&control_tools);
+        self.runtime_control_tools = control_tools;
         let source_schemas = schemas;
         append_tool_schemas_unique(&mut self.admission_tool_schemas, source_schemas.clone());
         let mut context = self.tool_admission_context();
@@ -2157,6 +2187,13 @@ impl ServerAgenticLoopHost {
         }
         self.request_scoped_mcp_provider_ready |= installed_request_scoped_mcp_schema;
         self.tool_schemas.extend(schemas);
+    }
+
+    pub(crate) fn install_runtime_stop_after_success_tools(
+        &mut self,
+        tools: crate::turn::tool_completion::RuntimeStopAfterSuccessToolSnapshot,
+    ) {
+        self.runtime_stop_after_success_tools = tools;
     }
 
     fn read_plan_resume_hint(&self) -> Option<String> {
@@ -2426,6 +2463,52 @@ impl ServerAgenticLoopHost {
         self.emit_event(json!({
             "type": "reasoning_done",
         }));
+    }
+
+    fn replay_action_window_updates(
+        &mut self,
+        updates: Vec<LlmStreamUpdate>,
+        streamed_text: &mut String,
+        streamed_reasoning: &mut String,
+    ) {
+        for update in updates {
+            match update {
+                LlmStreamUpdate::Text(content) if !content.is_empty() => {
+                    self.emit_event(json!({
+                        "type": "text_delta",
+                        "content": content,
+                    }));
+                    streamed_text.push_str(&content);
+                }
+                LlmStreamUpdate::Reasoning(content) if !content.is_empty() => {
+                    self.emit_event(json!({
+                        "type": "reasoning_delta",
+                        "content": content,
+                    }));
+                    streamed_reasoning.push_str(&content);
+                }
+                LlmStreamUpdate::Text(_)
+                | LlmStreamUpdate::Reasoning(_)
+                | LlmStreamUpdate::ToolCall { .. } => {}
+            }
+        }
+    }
+
+    fn record_terminal_control_outcome(
+        &mut self,
+        outcome: &crate::turn::terminal_control::TerminalControlOutcome,
+    ) {
+        match outcome {
+            crate::turn::terminal_control::TerminalControlOutcome::Passthrough => {}
+            crate::turn::terminal_control::TerminalControlOutcome::Requested(request) => {
+                self.emit_event(request.event());
+                self.pending_terminal_control_outcome = Some(outcome.clone());
+            }
+            crate::turn::terminal_control::TerminalControlOutcome::Rejected(rejection) => {
+                self.emit_event(rejection.event());
+                self.pending_terminal_control_outcome = Some(outcome.clone());
+            }
+        }
     }
 
     /// Access collected SSE events from the last turn.
@@ -2751,10 +2834,30 @@ impl ServerAgenticLoopHost {
             sleep_ms_or_llm_cancel(delay_ms, llm_cancel_for_state(state)).await?;
         }
 
-        if !reasoning.is_empty() {
+        let terminal_control_outcome =
+            crate::turn::terminal_control::evaluate_terminal_control_actions(
+                &mut self.terminal_handoff_window,
+                &self.runtime_control_tools,
+                &full_text,
+                &tool_calls,
+            );
+        let terminal_handoff_requested = matches!(
+            terminal_control_outcome,
+            crate::turn::terminal_control::TerminalControlOutcome::Requested(_)
+        );
+        let hold_action_window_projection = self.terminal_handoff_window.is_open();
+        let suppress_source_projection =
+            terminal_handoff_requested || hold_action_window_projection;
+        let suppress_tool_execution = !matches!(
+            terminal_control_outcome,
+            crate::turn::terminal_control::TerminalControlOutcome::Passthrough
+        );
+        self.record_terminal_control_outcome(&terminal_control_outcome);
+
+        if !suppress_source_projection && !reasoning.is_empty() {
             self.push_reasoning_events(&reasoning);
         }
-        if !full_text.is_empty() {
+        if !suppress_source_projection && !full_text.is_empty() {
             self.emit_event(json!({ "type": "text_delta", "content": &full_text }));
         }
         // Tool_call dedup — two distinct concerns, two distinct scopes:
@@ -2785,7 +2888,7 @@ impl ServerAgenticLoopHost {
         //   `skill_invocation_costs_exactly_two_llm_rounds_today`
         //   `interleaved_tool_and_text_rounds_preserve_event_order_and_history`
         let mut round_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for tc in &tool_calls {
+        for tc in tool_calls.iter().filter(|_| !suppress_tool_execution) {
             let key = match tc.get("id").and_then(Value::as_str) {
                 Some(id) if !id.is_empty() => format!("id:{id}"),
                 _ => format!("raw:{tc}"),
@@ -2827,9 +2930,12 @@ impl ServerAgenticLoopHost {
             "total_tokens": u.total_tokens(),
         }));
 
-        let edge_tool_round = self
-            .maybe_deliver_edge_bound_tools_via_ledger(state, &tool_calls)
-            .await;
+        let edge_tool_round = if suppress_tool_execution {
+            Vec::new()
+        } else {
+            self.maybe_deliver_edge_bound_tools_via_ledger(state, &tool_calls)
+                .await
+        };
 
         let accum = ChatTurnSseAccum {
             full_text: full_text.clone(),
@@ -4331,6 +4437,18 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         &mut self,
         state: &AgenticLoopState,
     ) -> crate::turn::agentic_loop::host::TurnIntentJudgeOutcome {
+        if self.turn_intent_policy == TurnIntentExecutionPolicy::FixedDefault {
+            tracing::info!(
+                target: "astra::turn_intent",
+                operation = "turn_intent.phase",
+                status = "skipped",
+                policy = "fixed_default",
+                reason = "request_execution_policy",
+                duration_ms = 0_u64,
+                "turn intent judge skipped by request execution policy"
+            );
+            return crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::FixedDefault;
+        }
         let has_prior_assistant_turn = state
             .messages
             .iter()
@@ -4355,29 +4473,73 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         }
 
         if let Some(reason) = should_skip_auxiliary_llm_for_capacity() {
-            tracing::debug!(
+            tracing::info!(
                 target: "astra::turn_intent",
+                operation = "turn_intent.phase",
+                status = "skipped",
                 policy = auxiliary_llm_policy_label(),
                 reason,
+                duration_ms = 0_u64,
                 "turn intent judge skipped by capacity policy"
             );
             return crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Unavailable;
         }
 
+        let phase_started_at = Instant::now();
+        let model_resolution_started_at = Instant::now();
         let Some(client) = self.turn_intent_summary_client(state).await else {
+            let duration_ms = phase_started_at.elapsed().as_millis() as u64;
+            tracing::info!(
+                target: "astra::turn_intent",
+                operation = "turn_intent.phase",
+                status = "skipped",
+                reason = "model_resolution_unavailable",
+                model_resolution_ms = model_resolution_started_at.elapsed().as_millis() as u64,
+                duration_ms,
+                "turn intent phase completed"
+            );
             return crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Unavailable;
         };
+        let model_resolution_ms = model_resolution_started_at.elapsed().as_millis() as u64;
+        let (model_name, provider) = self
+            .resolved_llm_config
+            .as_ref()
+            .map(|config| (config.model_name.clone(), config.provider.clone()))
+            .or_else(|| {
+                self.resolved_llm_params
+                    .as_ref()
+                    .map(|params| (params.model_name.clone(), params.provider.clone()))
+            })
+            .unwrap_or_default();
         let judge = SummaryClientTurnIntentJudge { client };
-        crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::from_optional_intent(
-            crate::turn::agentic::turn_intent::judge_turn_intent_with_llm(
-                &judge,
-                &user_intent,
-                turn_count,
-                &state.recent_tools,
-                has_prior_assistant_turn,
-            )
-            .await,
+        let result = crate::turn::agentic::turn_intent::judge_turn_intent_with_llm(
+            &judge,
+            &user_intent,
+            turn_count,
+            &state.recent_tools,
+            has_prior_assistant_turn,
         )
+        .await;
+        let outcome =
+            crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::from_optional_intent(result);
+        let duration_ms = phase_started_at.elapsed().as_millis() as u64;
+        let judge_ms = duration_ms.saturating_sub(model_resolution_ms);
+        tracing::info!(
+            target: "astra::turn_intent",
+            operation = "turn_intent.phase",
+            status = match &outcome {
+                crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Intent(_) => "success",
+                crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::FixedDefault => "skipped",
+                crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Unavailable => "no_intent",
+            },
+            model = %model_name,
+            provider = %provider,
+            model_resolution_ms,
+            judge_ms,
+            duration_ms,
+            "turn intent phase completed"
+        );
+        outcome
     }
 
     async fn judge_skill_auto_route(
@@ -4428,6 +4590,11 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         }
     }
 
+    fn take_terminal_control_outcome(
+        &mut self,
+    ) -> Option<crate::turn::terminal_control::TerminalControlOutcome> {
+        self.pending_terminal_control_outcome.take()
+    }
     fn turn_start_lifecycle_summary(&self, state: &AgenticLoopState) -> String {
         if let Some(summary) = &self.turn_start_lifecycle_summary {
             let plan_hint = self.read_plan_resume_hint();
@@ -4810,6 +4977,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let mut attempt_in_round = 0_u32;
         let mut streamed_text = String::new();
         let mut streamed_reasoning = String::new();
+        let mut first_stream_update_turn_ms: Option<u64> = None;
+        let mut first_visible_text_turn_ms: Option<u64> = None;
+        let started_with_action_window = self.terminal_handoff_window.is_open();
+        let mut action_window_updates = Vec::new();
         let result = loop {
             let attempt_label = llm_main_attempt_label(attempt_in_round);
             let admission_estimated_tokens = crate::prompts::estimate_tokens(
@@ -4894,12 +5065,47 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             state.step_recorder.begin_llm_round(&llm_cfg.model_name);
             let llm_round_start = std::time::Instant::now();
             let llm_cancel = llm_cancel_for_state(state);
+            let mut attempt_first_stream_update_ms: Option<u64> = None;
+            let mut attempt_first_visible_text_ms: Option<u64> = None;
             let r = {
                 let mut attempt_text = String::new();
                 let mut attempt_reasoning = String::new();
+                let mut first_streamed_tool_index = None;
                 let mut on_stream_update = |update: LlmStreamUpdate| match update {
-                    LlmStreamUpdate::TextDelta(content) => {
+                    LlmStreamUpdate::Text(content) => {
+                        if !content.is_empty() {
+                            attempt_first_stream_update_ms.get_or_insert_with(|| {
+                                llm_round_start.elapsed().as_millis() as u64
+                            });
+                            first_stream_update_turn_ms
+                                .get_or_insert_with(|| turn_started.elapsed().as_millis() as u64);
+                        }
                         attempt_text.push_str(&content);
+                        if self.terminal_handoff_window.is_open() {
+                            action_window_updates.push(LlmStreamUpdate::Text(content.clone()));
+                            if !content.is_empty() {
+                                self.terminal_handoff_window.close();
+                                attempt_first_visible_text_ms.get_or_insert_with(|| {
+                                    llm_round_start.elapsed().as_millis() as u64
+                                });
+                                first_visible_text_turn_ms.get_or_insert_with(|| {
+                                    turn_started.elapsed().as_millis() as u64
+                                });
+                                self.replay_action_window_updates(
+                                    std::mem::take(&mut action_window_updates),
+                                    &mut streamed_text,
+                                    &mut streamed_reasoning,
+                                );
+                            }
+                            return;
+                        }
+                        if !content.is_empty() {
+                            attempt_first_visible_text_ms.get_or_insert_with(|| {
+                                llm_round_start.elapsed().as_millis() as u64
+                            });
+                            first_visible_text_turn_ms
+                                .get_or_insert_with(|| turn_started.elapsed().as_millis() as u64);
+                        }
                         if streamed_text.starts_with(&attempt_text) {
                             return;
                         }
@@ -4919,8 +5125,12 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                             streamed_text.push_str(&content);
                         }
                     }
-                    LlmStreamUpdate::ReasoningDelta(content) => {
+                    LlmStreamUpdate::Reasoning(content) => {
                         attempt_reasoning.push_str(&content);
+                        if self.terminal_handoff_window.is_open() {
+                            action_window_updates.push(LlmStreamUpdate::Reasoning(content));
+                            return;
+                        }
                         if streamed_reasoning.starts_with(&attempt_reasoning) {
                             return;
                         }
@@ -4938,6 +5148,29 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                                 "content": content,
                             }));
                             streamed_reasoning.push_str(&content);
+                        }
+                    }
+                    LlmStreamUpdate::ToolCall { index, tool_call } => {
+                        if !self.terminal_handoff_window.is_open() {
+                            return;
+                        }
+                        let first_index = *first_streamed_tool_index.get_or_insert(index);
+                        if index != first_index {
+                            return;
+                        }
+                        if matches!(
+                            crate::turn::terminal_control::classify_complete_streamed_first_tool(
+                                &self.runtime_control_tools,
+                                &tool_call,
+                            ),
+                            Some(crate::turn::terminal_control::StreamedFirstToolAction::Ordinary)
+                        ) {
+                            self.terminal_handoff_window.close();
+                            self.replay_action_window_updates(
+                                std::mem::take(&mut action_window_updates),
+                                &mut streamed_text,
+                                &mut streamed_reasoning,
+                            );
                         }
                     }
                 };
@@ -5170,6 +5403,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             );
 
             if will_retry_for_length {
+                if started_with_action_window {
+                    action_window_updates.clear();
+                }
                 let prev = effective_max_output;
                 effective_max_output = (effective_max_output * 2).min(max_output_tokens * 4);
                 attempt_in_round = attempt_in_round.saturating_add(1);
@@ -5222,8 +5458,39 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             .await;
         }
 
+        let terminal_control_outcome =
+            crate::turn::terminal_control::evaluate_terminal_control_actions(
+                &mut self.terminal_handoff_window,
+                &self.runtime_control_tools,
+                &result.full_text,
+                &result.tool_calls,
+            );
+        let terminal_handoff_requested = matches!(
+            terminal_control_outcome,
+            crate::turn::terminal_control::TerminalControlOutcome::Requested(_)
+        );
+        let hold_action_window_projection = self.terminal_handoff_window.is_open();
+        let suppress_source_projection =
+            terminal_handoff_requested || hold_action_window_projection;
+        let suppress_tool_execution = !matches!(
+            terminal_control_outcome,
+            crate::turn::terminal_control::TerminalControlOutcome::Passthrough
+        );
+        if started_with_action_window && !suppress_source_projection {
+            self.replay_action_window_updates(
+                action_window_updates,
+                &mut streamed_text,
+                &mut streamed_reasoning,
+            );
+        }
+        if !suppress_source_projection && !result.full_text.is_empty() {
+            first_visible_text_turn_ms
+                .get_or_insert_with(|| turn_started.elapsed().as_millis() as u64);
+        }
+        self.record_terminal_control_outcome(&terminal_control_outcome);
+
         // ── 4. Emit SSE events for client ───────────────────────────────
-        if !result.full_text.is_empty() {
+        if !suppress_source_projection && !result.full_text.is_empty() {
             if streamed_text.is_empty() {
                 self.emit_event(json!({
                     "type": "text_delta",
@@ -5240,7 +5507,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 streamed_text.push_str(suffix);
             }
         }
-        if result.reasoning.is_empty() {
+        if suppress_source_projection {
+            // Reasoning remains available in the full LLM trace/capture but is
+            // intentionally absent from the parent projection.
+        } else if result.reasoning.is_empty() {
             if !streamed_reasoning.is_empty() {
                 self.emit_event(json!({ "type": "reasoning_done" }));
             }
@@ -5258,7 +5528,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             }
             self.emit_event(json!({ "type": "reasoning_done" }));
         }
-        if !result.full_text.is_empty() && streamed_text == result.full_text {
+        if !suppress_source_projection
+            && !result.full_text.is_empty()
+            && streamed_text == result.full_text
+        {
             state.final_text_streamed = true;
         }
         if !result.usage.is_empty() {
@@ -5278,9 +5551,12 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // Web+Edge/server+edge runs have a runtime executor and must execute
         // workspace tools through the executor transport. The browser ledger
         // is only for thin clients that can execute local tools themselves.
-        let edge_tool_round = self
-            .maybe_deliver_edge_bound_tools_via_ledger(state, &result.tool_calls)
-            .await;
+        let edge_tool_round = if suppress_tool_execution {
+            Vec::new()
+        } else {
+            self.maybe_deliver_edge_bound_tools_via_ledger(state, &result.tool_calls)
+                .await
+        };
 
         // ── 6. Build turn result ────────────────────────────────────────
         let ttft_ms = Some(turn_started.elapsed().as_millis() as u64);
@@ -5448,6 +5724,15 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
 
     fn valid_tool_names(&self) -> &HashSet<String> {
         &self.valid_tools
+    }
+
+    fn stop_after_successful_tool_round(
+        &self,
+        records: &[astra_services::session_journal::ToolCallRecord],
+        results: &[Value],
+    ) -> Option<String> {
+        self.runtime_stop_after_success_tools
+            .successful_tool_name(records, results)
     }
 
     fn deferred_tool_names(&self) -> HashSet<String> {
@@ -6548,14 +6833,17 @@ mod tests {
         assert!(names.contains("tool_search"));
         assert!(!names.contains("mcp__tools__query"));
 
-        host.install_runtime_tool_schemas(vec![json!({
-            "type": "function",
-            "function": {
-                "name": "mcp__tools__query",
-                "description": "Binding-discovered MCP tool",
-                "parameters": { "type": "object", "properties": {} }
-            }
-        })]);
+        host.install_runtime_tool_schemas(
+            vec![json!({
+                "type": "function",
+                "function": {
+                    "name": "mcp__tools__query",
+                    "description": "Binding-discovered MCP tool",
+                    "parameters": { "type": "object", "properties": {} }
+                }
+            })],
+            Default::default(),
+        );
 
         assert!(host.valid_tool_names().contains("mcp__tools__query"));
         let selected = host.edge_ledger_tool_calls_for_delivery(&[json!({
@@ -6584,14 +6872,17 @@ mod tests {
         .with_static_tool_catalog_admissible(false)
         .build();
 
-        host.install_runtime_tool_schemas(vec![json!({
-            "type": "function",
-            "function": {
-                "name": "mcp__tools__query",
-                "description": "Binding-discovered MCP tool",
-                "parameters": { "type": "object", "properties": {} }
-            }
-        })]);
+        host.install_runtime_tool_schemas(
+            vec![json!({
+                "type": "function",
+                "function": {
+                    "name": "mcp__tools__query",
+                    "description": "Binding-discovered MCP tool",
+                    "parameters": { "type": "object", "properties": {} }
+                }
+            })],
+            Default::default(),
+        );
 
         let admission = host.tool_admission_snapshot_entries();
         let entry = admission
@@ -6634,14 +6925,17 @@ mod tests {
         .with_disabled_tool_offers(disabled)
         .build();
 
-        host.install_runtime_tool_schemas(vec![json!({
-            "type": "function",
-            "function": {
-                "name": "mcp__tools__query",
-                "description": "Binding-discovered MCP tool",
-                "parameters": { "type": "object", "properties": {} }
-            }
-        })]);
+        host.install_runtime_tool_schemas(
+            vec![json!({
+                "type": "function",
+                "function": {
+                    "name": "mcp__tools__query",
+                    "description": "Binding-discovered MCP tool",
+                    "parameters": { "type": "object", "properties": {} }
+                }
+            })],
+            Default::default(),
+        );
 
         assert!(
             !host.valid_tool_names().contains("mcp__tools__query"),
@@ -6673,24 +6967,27 @@ mod tests {
         .with_provider_allowed_tools(allowed)
         .build();
 
-        host.install_runtime_tool_schemas(vec![
-            json!({
-                "type": "function",
-                "function": {
-                    "name": "mcp__tools__query",
-                    "description": "Binding-discovered MCP query tool",
-                    "parameters": { "type": "object", "properties": {} }
-                }
-            }),
-            json!({
-                "type": "function",
-                "function": {
-                    "name": "mcp__tools__status",
-                    "description": "Binding-discovered MCP status tool",
-                    "parameters": { "type": "object", "properties": {} }
-                }
-            }),
-        ]);
+        host.install_runtime_tool_schemas(
+            vec![
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": "mcp__tools__query",
+                        "description": "Binding-discovered MCP query tool",
+                        "parameters": { "type": "object", "properties": {} }
+                    }
+                }),
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": "mcp__tools__status",
+                        "description": "Binding-discovered MCP status tool",
+                        "parameters": { "type": "object", "properties": {} }
+                    }
+                }),
+            ],
+            Default::default(),
+        );
 
         let names = schema_names(&host.tool_schemas);
         assert!(!names.contains("mcp__tools__query"));
@@ -6714,14 +7011,17 @@ mod tests {
         .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
 
-        host.install_runtime_tool_schemas(vec![json!({
-            "type": "function",
-            "function": {
-                "name": "mcp__tools__query",
-                "description": "Binding-discovered MCP tool",
-                "parameters": { "type": "object", "properties": {} }
-            }
-        })]);
+        host.install_runtime_tool_schemas(
+            vec![json!({
+                "type": "function",
+                "function": {
+                    "name": "mcp__tools__query",
+                    "description": "Binding-discovered MCP tool",
+                    "parameters": { "type": "object", "properties": {} }
+                }
+            })],
+            Default::default(),
+        );
 
         assert!(host.valid_tool_names().contains("mcp__tools__query"));
         let selected = host.edge_ledger_tool_calls_for_delivery(&[
@@ -8813,14 +9113,17 @@ mod tests {
         .build();
         host.set_approval_audit_context(test_approval_audit_context("u-batch", "s-batch"));
         // Register write_file as a valid tool so the edge ledger delivery path admits it.
-        host.install_runtime_tool_schemas(vec![json!({
-            "type": "function",
-            "function": {
-                "name": "write_file",
-                "description": "Write file contents",
-                "parameters": {"type": "object", "properties": {}}
-            }
-        })]);
+        host.install_runtime_tool_schemas(
+            vec![json!({
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "description": "Write file contents",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            })],
+            Default::default(),
+        );
         let ledger = host.edge_callback_ledger.clone();
         let tool_calls = vec![
             json!({
@@ -8982,14 +9285,17 @@ mod tests {
         .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
         // Register read_file as a valid tool so the edge ledger delivery path admits it.
-        host.install_runtime_tool_schemas(vec![json!({
-            "type": "function",
-            "function": {
-                "name": "read_file",
-                "description": "Read file contents",
-                "parameters": {"type": "object", "properties": {}}
-            }
-        })]);
+        host.install_runtime_tool_schemas(
+            vec![json!({
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read file contents",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            })],
+            Default::default(),
+        );
         host.set_execution_metadata(json!({
             "workspace": {
                 "kind": "edge_workspace",
@@ -9048,24 +9354,27 @@ mod tests {
         .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
         // Register read_file and write_file as valid tools so the edge ledger delivery path admits them.
-        host.install_runtime_tool_schemas(vec![
-            json!({
-                "type": "function",
-                "function": {
-                    "name": "read_file",
-                    "description": "Read file contents",
-                    "parameters": {"type": "object", "properties": {}}
-                }
-            }),
-            json!({
-                "type": "function",
-                "function": {
-                    "name": "write_file",
-                    "description": "Write file contents",
-                    "parameters": {"type": "object", "properties": {}}
-                }
-            }),
-        ]);
+        host.install_runtime_tool_schemas(
+            vec![
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "description": "Read file contents",
+                        "parameters": {"type": "object", "properties": {}}
+                    }
+                }),
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": "write_file",
+                        "description": "Write file contents",
+                        "parameters": {"type": "object", "properties": {}}
+                    }
+                }),
+            ],
+            Default::default(),
+        );
         host.set_approval_audit_context(test_approval_audit_context("u-mixed", "s-mixed"));
         let ledger = host.edge_callback_ledger.clone();
         let tool_calls = vec![
@@ -9461,6 +9770,73 @@ mod tests {
         (
             format!("http://{addr}/gateway/chat/completions"),
             requests,
+            server,
+        )
+    }
+
+    #[derive(Clone)]
+    struct DelayedGatewayState {
+        delay: Duration,
+        completed: Arc<AtomicBool>,
+        initial_events: Vec<Value>,
+        final_events: Vec<Value>,
+    }
+
+    async fn spawn_delayed_streaming_gateway(
+        delay: Duration,
+        initial_events: Vec<Value>,
+        final_events: Vec<Value>,
+    ) -> (String, Arc<AtomicBool>, tokio::task::JoinHandle<()>) {
+        use axum::{
+            Router,
+            body::{Body, Bytes},
+            extract::State,
+            http::header,
+            response::Response,
+            routing::post,
+        };
+        use std::convert::Infallible;
+        use tokio::net::TcpListener;
+
+        async fn handler(State(state): State<DelayedGatewayState>) -> Response {
+            let stream = async_stream::stream! {
+                for event in state.initial_events {
+                    yield Ok::<Bytes, Infallible>(Bytes::from(format!("data: {event}\n\n")));
+                }
+                tokio::time::sleep(state.delay).await;
+                state.completed.store(true, Ordering::SeqCst);
+                for event in state.final_events {
+                    yield Ok::<Bytes, Infallible>(Bytes::from(format!("data: {event}\n\n")));
+                }
+                yield Ok::<Bytes, Infallible>(Bytes::from("data: [DONE]\n\n"));
+            };
+            Response::builder()
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from_stream(stream))
+                .expect("delayed gateway response")
+        }
+
+        let completed = Arc::new(AtomicBool::new(false));
+        let app = Router::new()
+            .route("/gateway/chat/completions", post(handler))
+            .with_state(DelayedGatewayState {
+                delay,
+                completed: completed.clone(),
+                initial_events,
+                final_events,
+            });
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind delayed gateway listener");
+        let addr = listener.local_addr().expect("delayed gateway address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("delayed gateway server should run");
+        });
+        (
+            format!("http://{addr}/gateway/chat/completions"),
+            completed,
             server,
         )
     }
@@ -10587,6 +10963,396 @@ mod tests {
                 .any(|name| name.contains("llm_capture_t0_r0_server_loop_host_success")),
             "expected local llm capture file, got {files:?}"
         );
+    }
+
+    #[cfg(feature = "bridge-e2e-hooks")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn mock_terminal_handoff_keeps_reasoning_private_and_skips_tool_delivery() {
+        let public_name = "mcp__provider__arbitrary_control_name";
+        let metadata = json!({
+            "control": {
+                "kind": "moi.control.handoff.v1",
+                "terminal": true,
+                "policy_id": "authoring.handoff.v1",
+                "ui_visibility": "hidden"
+            }
+        });
+        let descriptor =
+            crate::turn::terminal_control::RuntimeControlToolDescriptor::from_metadata(
+                public_name,
+                Some(&metadata),
+            )
+            .expect("valid control metadata")
+            .expect("control descriptor");
+        let snapshot =
+            crate::turn::terminal_control::RuntimeControlToolSnapshot::new(vec![descriptor]);
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user-handoff".to_string(),
+            "".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .with_test_llm_rounds(vec![json!({
+            "reasoning": "private routing analysis",
+            "tool_calls": [{
+                "id": "call-handoff",
+                "type": "function",
+                "function": {
+                    "name": public_name,
+                    "arguments": r#"{"action":"revise_current_agent"}"#
+                }
+            }],
+            "usage": {"prompt_tokens": 13, "completion_tokens": 3}
+        })])
+        .build();
+        host.install_runtime_tool_schemas(
+            vec![json!({
+                "type": "function",
+                "function": {
+                    "name": public_name,
+                    "description": "Transfer runtime control",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"action": {"type": "string"}},
+                        "required": ["action"]
+                    }
+                }
+            })],
+            snapshot,
+        );
+        let mut state = create_test_state();
+        state.message = "revise the current agent".to_string();
+        state.user_intent = state.message.clone();
+
+        let result = host
+            .run_one_mock_turn_for_test(&mut state)
+            .await
+            .expect("mock terminal handoff turn");
+        let events = host.take_emitted_events();
+
+        assert!(result.edge_tool_round.is_empty());
+        assert!(events.iter().any(|event| {
+            event.get("type").and_then(Value::as_str) == Some("runtime.control.handoff.requested")
+        }));
+        assert!(events.iter().all(|event| {
+            !matches!(
+                event.get("type").and_then(Value::as_str),
+                Some("reasoning_delta" | "reasoning_done" | "text_delta" | "tool_call")
+            )
+        }));
+        assert!(matches!(
+            host.take_terminal_control_outcome(),
+            Some(crate::turn::terminal_control::TerminalControlOutcome::Requested(_))
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
+    async fn text_first_control_window_streams_before_provider_completion() {
+        let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
+        let delay = Duration::from_millis(750);
+        let (gateway_url, provider_completed, server) = spawn_delayed_streaming_gateway(
+            delay,
+            vec![
+                json!({"choices":[{"delta":{"reasoning_content":"private preface"}}]}),
+                json!({"choices":[{"delta":{"content":"visible first"}}]}),
+            ],
+            vec![
+                json!({"choices":[{"delta":{"content":" tail"}}]}),
+                json!({
+                    "choices":[{"delta":{},"finish_reason":"stop"}],
+                    "usage":{"prompt_tokens":8,"completion_tokens":4}
+                }),
+            ],
+        )
+        .await;
+        let public_name = "mcp__provider__runtime_control";
+        let descriptor =
+            crate::turn::terminal_control::RuntimeControlToolDescriptor::from_metadata(
+                public_name,
+                Some(&json!({
+                    "control": {
+                        "kind": "moi.control.handoff.v1",
+                        "terminal": true,
+                        "policy_id": "authoring.handoff.v1"
+                    }
+                })),
+            )
+            .expect("valid control metadata")
+            .expect("control descriptor");
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user-stream-window".to_string(),
+            "".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .with_llm_token_service(Some(LlmTokenServiceConfig {
+            url: gateway_url,
+            timeout_ms: Some(3000),
+        }))
+        .build();
+        host.install_runtime_tool_schemas(
+            vec![json!({
+                "type": "function",
+                "function": {
+                    "name": public_name,
+                    "description": "Transfer runtime control",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            })],
+            crate::turn::terminal_control::RuntimeControlToolSnapshot::new(vec![descriptor]),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        host.set_event_tx(tx);
+        let mut state = create_test_state();
+        state.message = "answer normally".to_string();
+        state.user_intent = state.message.clone();
+
+        let observe_first_text = async {
+            let mut visible_order = Vec::new();
+            loop {
+                let event = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+                    .await
+                    .expect("text delta must arrive before delayed provider completion")
+                    .expect("event channel remains open");
+                let event_type = event
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if matches!(event_type, "reasoning_delta" | "text_delta") {
+                    visible_order.push(event_type.to_string());
+                }
+                if event_type == "text_delta" {
+                    assert_eq!(event["content"].as_str(), Some("visible first"));
+                    assert!(
+                        !provider_completed.load(Ordering::SeqCst),
+                        "text-first control window waited for the full provider response"
+                    );
+                    break visible_order;
+                }
+            }
+        };
+
+        let (result, visible_order) =
+            tokio::join!(host.execute_turn(&mut state), observe_first_text);
+        let result = result.expect("text-first turn");
+        assert_eq!(visible_order, vec!["reasoning_delta", "text_delta"]);
+        assert_eq!(result.accum.full_text, "visible first tail");
+        assert!(provider_completed.load(Ordering::SeqCst));
+        assert!(matches!(
+            host.take_terminal_control_outcome(),
+            None | Some(crate::turn::terminal_control::TerminalControlOutcome::Passthrough)
+        ));
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
+    async fn ordinary_tool_first_closes_control_window_before_provider_completion() {
+        let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
+        let ordinary_tool = "mcp__provider__status";
+        let terminal_tool = "mcp__provider__runtime_control";
+        let delay = Duration::from_millis(750);
+        let (gateway_url, provider_completed, server) = spawn_delayed_streaming_gateway(
+            delay,
+            vec![
+                json!({"choices":[{"delta":{"reasoning_content":"ordinary tool reasoning"}}]}),
+                json!({
+                    "choices":[{"delta":{"tool_calls":[{
+                        "index":0,
+                        "id":"call-status",
+                        "type":"function",
+                        "function":{"name":ordinary_tool,"arguments":"{}"}
+                    }]}}]
+                }),
+            ],
+            vec![json!({
+                "choices":[{"delta":{},"finish_reason":"tool_calls"}],
+                "usage":{"prompt_tokens":8,"completion_tokens":4}
+            })],
+        )
+        .await;
+        let descriptor =
+            crate::turn::terminal_control::RuntimeControlToolDescriptor::from_metadata(
+                terminal_tool,
+                Some(&json!({
+                    "control": {
+                        "kind": "moi.control.handoff.v1",
+                        "terminal": true,
+                        "policy_id": "authoring.handoff.v1"
+                    }
+                })),
+            )
+            .expect("valid control metadata")
+            .expect("control descriptor");
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user-tool-window".to_string(),
+            "".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .with_llm_token_service(Some(LlmTokenServiceConfig {
+            url: gateway_url,
+            timeout_ms: Some(3000),
+        }))
+        .build();
+        host.install_runtime_tool_schemas(
+            vec![
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": ordinary_tool,
+                        "description": "Read provider status",
+                        "parameters": {"type": "object", "properties": {}}
+                    }
+                }),
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": terminal_tool,
+                        "description": "Transfer runtime control",
+                        "parameters": {"type": "object", "properties": {}}
+                    }
+                }),
+            ],
+            crate::turn::terminal_control::RuntimeControlToolSnapshot::new(vec![descriptor]),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        host.set_event_tx(tx);
+        let mut state = create_test_state();
+        state.message = "check status".to_string();
+        state.user_intent = state.message.clone();
+
+        let observe_reasoning_release = async {
+            loop {
+                let event = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+                    .await
+                    .expect("ordinary tool must release buffered reasoning before completion")
+                    .expect("event channel remains open");
+                if event.get("type").and_then(Value::as_str) == Some("reasoning_delta") {
+                    assert_eq!(event["content"].as_str(), Some("ordinary tool reasoning"));
+                    assert!(
+                        !provider_completed.load(Ordering::SeqCst),
+                        "ordinary tool action waited for the full provider response"
+                    );
+                    break;
+                }
+            }
+        };
+
+        let (result, ()) = tokio::join!(host.execute_turn(&mut state), observe_reasoning_release);
+        let result = result.expect("ordinary tool-first turn");
+        assert_eq!(result.accum.tool_calls.len(), 1);
+        assert_eq!(
+            result.accum.tool_calls[0]["function"]["name"].as_str(),
+            Some(ordinary_tool)
+        );
+        assert!(provider_completed.load(Ordering::SeqCst));
+        assert!(host.take_terminal_control_outcome().is_none());
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
+    async fn streamed_terminal_handoff_never_projects_buffered_reasoning() {
+        let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
+        let terminal_tool = "mcp__provider__runtime_control";
+        let (gateway_url, provider_completed, server) = spawn_delayed_streaming_gateway(
+            Duration::from_millis(200),
+            vec![
+                json!({"choices":[{"delta":{"reasoning_content":"private handoff reasoning"}}]}),
+                json!({
+                    "choices":[{"delta":{"tool_calls":[{
+                        "index":0,
+                        "id":"call-handoff",
+                        "type":"function",
+                        "function":{
+                            "name":terminal_tool,
+                            "arguments":r#"{"action":"revise_current_agent"}"#
+                        }
+                    }]}}]
+                }),
+            ],
+            vec![json!({
+                "choices":[{"delta":{},"finish_reason":"tool_calls"}],
+                "usage":{"prompt_tokens":8,"completion_tokens":4}
+            })],
+        )
+        .await;
+        let descriptor =
+            crate::turn::terminal_control::RuntimeControlToolDescriptor::from_metadata(
+                terminal_tool,
+                Some(&json!({
+                    "control": {
+                        "kind": "moi.control.handoff.v1",
+                        "terminal": true,
+                        "policy_id": "authoring.handoff.v1"
+                    }
+                })),
+            )
+            .expect("valid control metadata")
+            .expect("control descriptor");
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user-terminal-stream".to_string(),
+            "".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .with_llm_token_service(Some(LlmTokenServiceConfig {
+            url: gateway_url,
+            timeout_ms: Some(3000),
+        }))
+        .build();
+        host.install_runtime_tool_schemas(
+            vec![json!({
+                "type": "function",
+                "function": {
+                    "name": terminal_tool,
+                    "description": "Transfer runtime control",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"action": {"type": "string"}},
+                        "required": ["action"]
+                    }
+                }
+            })],
+            crate::turn::terminal_control::RuntimeControlToolSnapshot::new(vec![descriptor]),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        host.set_event_tx(tx);
+        let mut state = create_test_state();
+        state.message = "revise the agent".to_string();
+        state.user_intent = state.message.clone();
+
+        let result = host.execute_turn(&mut state).await.expect("terminal turn");
+        assert!(result.edge_tool_round.is_empty());
+        assert!(provider_completed.load(Ordering::SeqCst));
+        let mut streamed_events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            streamed_events.push(event);
+        }
+        assert!(streamed_events.iter().any(|event| {
+            event.get("type").and_then(Value::as_str) == Some("runtime.control.handoff.requested")
+        }));
+        assert!(streamed_events.iter().all(|event| {
+            !matches!(
+                event.get("type").and_then(Value::as_str),
+                Some("reasoning_delta" | "reasoning_done" | "text_delta" | "tool_call")
+            )
+        }));
+        assert!(matches!(
+            host.take_terminal_control_outcome(),
+            Some(crate::turn::terminal_control::TerminalControlOutcome::Requested(_))
+        ));
+        server.abort();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -12356,6 +13122,7 @@ mod tests {
     mod turn_intent_judge_wiring {
         use super::*;
         use astra_config::user_profile::{Scenario, TurnContinuationMode, TurnIntent};
+        use astra_services::runs::TurnIntentExecutionPolicy;
         use astra_services::{
             LlmTokenServiceConfig, SkillAutoRouteJudge, SkillAutoRouteJudgeContext,
             SkillAutoRouteJudgeError, TurnIntentJudge, TurnIntentJudgeContext,
@@ -12454,6 +13221,22 @@ mod tests {
             host
         }
 
+        fn host_with_turn_intent_policy_and_judge(
+            policy: TurnIntentExecutionPolicy,
+            judge: Arc<dyn TurnIntentJudge>,
+        ) -> ServerAgenticLoopHost {
+            let mut host = ServerAgenticLoopHostBuilder::new(
+                mock_matrixone(),
+                mock_encryptor(),
+                "u".to_string(),
+                "s".to_string(),
+            )
+            .with_turn_intent_policy(policy)
+            .build();
+            host.set_turn_intent_judge(judge);
+            host
+        }
+
         fn host_with_skill_route_judge(
             judge: Arc<dyn SkillAutoRouteJudge>,
         ) -> ServerAgenticLoopHost {
@@ -12531,6 +13314,27 @@ mod tests {
             assert!(
                 call.has_prior_assistant_turn,
                 "must surface the prior-assistant signal so the judge can detect follow-ups"
+            );
+        }
+
+        #[tokio::test]
+        async fn fixed_default_turn_intent_policy_skips_even_an_injected_judge() {
+            let judge = ScriptedJudge::ok(
+                TurnIntent::default().with_requested_scenario(Scenario::CodeReview),
+            );
+            let mut host = host_with_turn_intent_policy_and_judge(
+                TurnIntentExecutionPolicy::FixedDefault,
+                judge.clone() as Arc<dyn TurnIntentJudge>,
+            );
+            let state = crate::turn::agentic_loop::host::tests::make_state();
+
+            assert_eq!(
+                host.judge_turn_intent(&state).await,
+                crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::FixedDefault
+            );
+            assert!(
+                judge.calls().is_empty(),
+                "fixed policy must not invoke the intent LLM"
             );
         }
 
