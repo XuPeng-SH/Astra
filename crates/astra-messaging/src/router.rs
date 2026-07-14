@@ -56,6 +56,25 @@ impl AgentMailbox {
         self.router.clone()
     }
 
+    /// Resolve an agent inside this mailbox's own delegation namespace.
+    ///
+    /// Callers should not reach through the mailbox to its router for direct
+    /// addressing: the mailbox owns the namespace boundary and transports own
+    /// the authoritative lookup implementation.
+    pub async fn resolve_delegation_agent(
+        &self,
+        agent_id: &str,
+    ) -> Result<AgentAddress, MailboxError> {
+        let delegation_id = self
+            .delegation_id
+            .as_deref()
+            .filter(|delegation_id| !delegation_id.is_empty())
+            .ok_or_else(|| {
+                MailboxError::Protocol("mailbox is not part of a delegation namespace".to_string())
+            })?;
+        self.router.resolve_agent(delegation_id, agent_id).await
+    }
+
     /// Non-blocking: get the next available message, if any.
     pub fn try_recv(&mut self) -> Option<Arc<AgentMessage>> {
         if let Some(msg) = self.buffered.get_mut().pop_front() {
@@ -95,6 +114,28 @@ impl AgentMailbox {
                 (msgs, true)
             }
             None => (msgs, false),
+        }
+    }
+
+    /// Confirm durable consumption after the caller has converted the messages
+    /// into runtime state. A failed confirmation leaves the transport claim
+    /// recoverable for redelivery instead of silently losing the message.
+    pub async fn acknowledge_received(
+        &self,
+        messages: &[Arc<AgentMessage>],
+    ) -> Result<(), MailboxError> {
+        let mut stream = self.stream.lock().await;
+        let mut first_error = None;
+        for message in messages {
+            if let Err(error) = stream.acknowledge(message).await
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
     }
 
@@ -193,6 +234,7 @@ impl AgentMailbox {
                     // Check if this is our response
                     if msg.correlation_id.as_deref() == Some(&request_id) {
                         self.buffered.get_mut().extend(skipped.drain(..));
+                        self.stream.lock().await.acknowledge(&msg).await?;
                         if let MessagePayload::Response { data, accepted, .. } = &msg.payload {
                             return Ok(PermissionOutcome {
                                 accepted: *accepted,
@@ -263,8 +305,8 @@ pub struct AgentMailboxRouter {
     delegation_tracker: Arc<dyn DelegationLookup>,
     /// run_id → registered AgentAddress (for resolving Parent targets).
     address_registry: tokio::sync::RwLock<std::collections::HashMap<String, AgentAddress>>,
-    /// agent_id → AgentAddress (for resolving agent_id-only Direct targets from send_tool).
-    agent_id_index: tokio::sync::RwLock<std::collections::HashMap<String, AgentAddress>>,
+    /// Serializes check-and-register so registration ownership is atomic.
+    registration_gate: tokio::sync::Mutex<()>,
 }
 
 impl AgentMailboxRouter {
@@ -276,7 +318,7 @@ impl AgentMailboxRouter {
             transport,
             delegation_tracker,
             address_registry: tokio::sync::RwLock::new(std::collections::HashMap::new()),
-            agent_id_index: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            registration_gate: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -286,50 +328,32 @@ impl AgentMailboxRouter {
         addr: AgentAddress,
         delegation_id: Option<String>,
     ) -> Result<AgentMailbox, MailboxError> {
+        let _registration = self.registration_gate.lock().await;
+        self.register_inner(addr, delegation_id).await
+    }
+
+    async fn register_inner(
+        self: &Arc<Self>,
+        addr: AgentAddress,
+        delegation_id: Option<String>,
+    ) -> Result<AgentMailbox, MailboxError> {
         self.transport
             .register(addr.clone(), delegation_id.clone())
             .await?;
 
-        {
-            // Acquire both locks atomically to avoid TOCTOU race between
-            // address_registry and agent_id_index.
-            let mut reg = self.address_registry.write().await;
-            let mut idx = self.agent_id_index.write().await;
-
-            // Insert new address — but first clean up any stale entry for this agent_id
-            // to avoid a window where both old and new run_ids coexist.
-            if let Some(existing) = idx.get(&addr.agent_id) {
-                if existing == &addr {
-                    // Already registered with same address — no-op.
-                } else {
-                    tracing::warn!(
-                        target: "astra_runtime::messaging",
-                        agent_id = %addr.agent_id,
-                        existing = %existing,
-                        new_addr = %addr,
-                        "agent_id already registered; overwriting address index",
-                    );
-                    // Clean up stale entry from address_registry (both locks held).
-                    reg.remove(&existing.run_id.clone());
-                }
-            }
-            reg.insert(addr.run_id.clone(), addr.clone());
-            idx.insert(addr.agent_id.clone(), addr.clone());
-        }
+        self.address_registry
+            .write()
+            .await
+            .insert(addr.run_id.clone(), addr.clone());
 
         let stream = match self.transport.subscribe(&addr).await {
             Ok(stream) => stream,
             Err(err) => {
-                {
-                    let mut reg = self.address_registry.write().await;
-                    let mut idx = self.agent_id_index.write().await;
-                    if reg.get(&addr.run_id) == Some(&addr) {
-                        reg.remove(&addr.run_id);
-                    }
-                    if idx.get(&addr.agent_id) == Some(&addr) {
-                        idx.remove(&addr.agent_id);
-                    }
+                let mut reg = self.address_registry.write().await;
+                if reg.get(&addr.run_id) == Some(&addr) {
+                    reg.remove(&addr.run_id);
                 }
+                drop(reg);
                 if let Err(unregister_err) = self.transport.unregister(&addr).await {
                     tracing::warn!(
                         target: "astra_runtime::messaging",
@@ -353,16 +377,8 @@ impl AgentMailboxRouter {
 
     /// Unregister an agent (typically on completion or failure).
     pub async fn unregister(&self, addr: &AgentAddress) -> Result<(), MailboxError> {
-        {
-            // Keep lock ordering consistent with register() to avoid cross-lock races.
-            let mut reg = self.address_registry.write().await;
-            let mut idx = self.agent_id_index.write().await;
-
-            reg.remove(&addr.run_id);
-            if idx.get(&addr.agent_id) == Some(addr) {
-                idx.remove(&addr.agent_id);
-            }
-        }
+        let _registration = self.registration_gate.lock().await;
+        self.address_registry.write().await.remove(&addr.run_id);
         self.transport.unregister(addr).await
     }
 
@@ -376,11 +392,20 @@ impl AgentMailboxRouter {
         self.delegation_tracker.get_depth(run_id).await
     }
 
-    /// List all registered agent IDs.
-    ///
-    /// Used by the send_message tool to display broadcast recipients.
-    pub async fn list_registered_agents(&self) -> Vec<String> {
-        self.agent_id_index.read().await.keys().cloned().collect()
+    /// List live agents in one delegation namespace.
+    pub async fn list_registered_agents(
+        &self,
+        delegation_id: &str,
+    ) -> Result<Vec<AgentAddress>, MailboxError> {
+        self.transport.list_agents(delegation_id).await
+    }
+
+    pub async fn resolve_agent(
+        &self,
+        delegation_id: &str,
+        agent_id: &str,
+    ) -> Result<AgentAddress, MailboxError> {
+        self.transport.resolve_agent(delegation_id, agent_id).await
     }
 
     /// Check whether a specific run_id is registered in the address registry.
@@ -399,11 +424,7 @@ impl AgentMailboxRouter {
         addr: AgentAddress,
         delegation_id: Option<String>,
     ) -> Result<Option<AgentMailbox>, MailboxError> {
-        // Fast path: check under read lock. If present, skip registration.
-        // There is a small TOCTOU window between this check and register(),
-        // but register() handles re-registration gracefully (overwrites with
-        // warning), and in practice the same parent_run_id (UUID) is never
-        // registered concurrently.
+        let _registration = self.registration_gate.lock().await;
         if self
             .address_registry
             .read()
@@ -412,7 +433,7 @@ impl AgentMailboxRouter {
         {
             return Ok(None);
         }
-        self.register(addr, delegation_id).await.map(Some)
+        self.register_inner(addr, delegation_id).await.map(Some)
     }
 
     /// Resolve the address of a parent run.
@@ -453,33 +474,16 @@ impl AgentMailboxRouter {
         }
     }
 
-    /// Resolve a Direct target that may have an empty run_id (from send_tool).
-    ///
-    /// The send_tool only knows the peer's agent_id, not its run_id. This method
-    /// looks up the full address from the agent_id_index populated during register().
-    async fn resolve_direct_addr(&self, address: &AgentAddress) -> AgentAddress {
-        if !address.run_id.is_empty() {
-            return address.clone();
-        }
-        // Empty run_id — resolve by agent_id.
-        if let Some(full_addr) = self.agent_id_index.read().await.get(&address.agent_id) {
-            return full_addr.clone();
-        }
-        // Not found in index — return as-is, transport will return AgentNotFound.
-        address.clone()
-    }
-
-    /// Send a message, resolving `Parent`, `Broadcast`, and agent_id-only `Direct` targets.
+    /// Send a message, resolving `Parent` and `Broadcast` targets. Direct
+    /// targets must already carry their canonical run identity.
     pub async fn send(&self, msg: AgentMessage) -> Result<(), MailboxError> {
         let target = msg.to.clone();
         match target {
             MessageTarget::Direct { ref address } => {
-                let resolved = self.resolve_direct_addr(address).await;
-                let resolved_msg = AgentMessage {
-                    to: MessageTarget::Direct { address: resolved },
-                    ..msg
-                };
-                self.transport.send(Arc::new(resolved_msg)).await
+                if address.run_id.is_empty() {
+                    return Err(MailboxError::InvalidAddress(address.clone()));
+                }
+                self.transport.send(Arc::new(msg)).await
             }
             MessageTarget::Broadcast { delegation_id } => {
                 self.transport
@@ -511,6 +515,29 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use tokio::sync::RwLock;
+
+    struct AckRecordingStream {
+        acknowledged: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl MessageStream for AckRecordingStream {
+        async fn recv(&mut self) -> Option<Arc<AgentMessage>> {
+            None
+        }
+
+        fn try_recv(&mut self) -> Option<Arc<AgentMessage>> {
+            None
+        }
+
+        async fn acknowledge(&mut self, message: &AgentMessage) -> Result<(), MailboxError> {
+            self.acknowledged
+                .lock()
+                .expect("ack recorder lock")
+                .push(message.id.clone());
+            Ok(())
+        }
+    }
 
     /// Simple in-memory mock for DelegationLookup (no runtime dependency).
     struct MockDelegation {
@@ -590,6 +617,19 @@ mod tests {
         ) -> Result<Box<dyn MessageStream>, MailboxError> {
             Err(MailboxError::Transport("subscribe failed".into()))
         }
+        async fn resolve_agent(
+            &self,
+            _delegation_id: &str,
+            agent_id: &str,
+        ) -> Result<AgentAddress, MailboxError> {
+            Err(MailboxError::AgentNotFound(AgentAddress::new("", agent_id)))
+        }
+        async fn list_agents(
+            &self,
+            _delegation_id: &str,
+        ) -> Result<Vec<AgentAddress>, MailboxError> {
+            Ok(Vec::new())
+        }
         async fn send(&self, _msg: Arc<AgentMessage>) -> Result<(), MailboxError> {
             unreachable!()
         }
@@ -628,6 +668,66 @@ mod tests {
             MessagePayload::Text { content, .. } => assert_eq!(content, "check this"),
             _ => panic!("expected text"),
         }
+    }
+
+    #[tokio::test]
+    async fn direct_send_requires_canonical_run_identity() {
+        let transport = Arc::new(InProcessTransport::new());
+        let router = Arc::new(AgentMailboxRouter::new(transport, tracker()));
+        let sender = addr("run-sender", "sender");
+        let message = AgentMessage::new(
+            sender,
+            MessageTarget::Direct {
+                address: AgentAddress::new("", "worker"),
+            },
+            MessagePayload::Text {
+                content: "hello".into(),
+                summary: None,
+            },
+        );
+
+        assert!(matches!(
+            router.send(message).await,
+            Err(MailboxError::InvalidAddress(address)) if address.run_id.is_empty()
+        ));
+    }
+
+    #[tokio::test]
+    async fn mailbox_confirms_consumption_only_when_caller_acknowledges() {
+        let acknowledged = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let router = Arc::new(AgentMailboxRouter::new(
+            Arc::new(InProcessTransport::new()),
+            tracker(),
+        ));
+        let mailbox = AgentMailbox {
+            address: addr("run-review", "reviewer"),
+            delegation_id: None,
+            stream: tokio::sync::Mutex::new(Box::new(AckRecordingStream {
+                acknowledged: Arc::clone(&acknowledged),
+            })),
+            buffered: tokio::sync::Mutex::new(VecDeque::new()),
+            router,
+        };
+        let message = Arc::new(AgentMessage::new(
+            addr("run-code", "coder"),
+            MessageTarget::Direct {
+                address: addr("run-review", "reviewer"),
+            },
+            MessagePayload::Text {
+                content: "review this".into(),
+                summary: None,
+            },
+        ));
+
+        assert!(acknowledged.lock().expect("ack recorder lock").is_empty());
+        mailbox
+            .acknowledge_received(std::slice::from_ref(&message))
+            .await
+            .unwrap();
+        assert_eq!(
+            acknowledged.lock().expect("ack recorder lock").as_slice(),
+            [message.id.as_str()]
+        );
     }
 
     #[tokio::test]
@@ -696,50 +796,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unregister_old_run_keeps_current_agent_id_mapping() {
+    async fn agent_resolution_is_scoped_by_delegation() {
         let transport = Arc::new(InProcessTransport::new());
         let router = Arc::new(AgentMailboxRouter::new(transport, tracker()));
 
-        let sender = addr("r0", "sender");
-        let old = addr("r-old", "worker");
-        let current = addr("r-new", "worker");
+        let first = addr("run-a", "worker");
+        let second = addr("run-b", "worker");
+        let first_mailbox = router
+            .register(first.clone(), Some("delegation-a".into()))
+            .await
+            .unwrap();
+        let _second_mailbox = router
+            .register(second.clone(), Some("delegation-b".into()))
+            .await
+            .unwrap();
 
-        let _sender_mailbox = router.register(sender.clone(), None).await.unwrap();
-        let _old_mailbox = router.register(old.clone(), None).await.unwrap();
-        let mut current_mailbox = router.register(current.clone(), None).await.unwrap();
-
-        let send_to_agent_id_only = |content: &str| {
-            AgentMessage::new(
-                sender.clone(),
-                MessageTarget::Direct {
-                    address: AgentAddress::new("", "worker"),
-                },
-                MessagePayload::Text {
-                    content: content.into(),
-                    summary: None,
-                },
-            )
-        };
-
-        router.send(send_to_agent_id_only("before")).await.unwrap();
-        let first = current_mailbox
-            .try_recv()
-            .expect("should resolve to current run");
-        match &first.payload {
-            MessagePayload::Text { content, .. } => assert_eq!(content, "before"),
-            other => panic!("expected text, got {other:?}"),
-        }
-
-        router.unregister(&old).await.unwrap();
-
-        router.send(send_to_agent_id_only("after")).await.unwrap();
-        let second = current_mailbox
-            .try_recv()
-            .expect("stale unregister must not remove current mapping");
-        match &second.payload {
-            MessagePayload::Text { content, .. } => assert_eq!(content, "after"),
-            other => panic!("expected text, got {other:?}"),
-        }
+        assert_eq!(
+            router
+                .resolve_agent("delegation-a", "worker")
+                .await
+                .unwrap(),
+            first
+        );
+        assert_eq!(
+            router
+                .resolve_agent("delegation-b", "worker")
+                .await
+                .unwrap(),
+            second
+        );
+        assert_eq!(
+            first_mailbox
+                .resolve_delegation_agent("worker")
+                .await
+                .unwrap(),
+            first,
+            "mailbox-level resolution must stay inside its delegation namespace"
+        );
+        assert_eq!(
+            router.list_registered_agents("delegation-a").await.unwrap(),
+            vec![first]
+        );
     }
 
     #[tokio::test]
@@ -756,6 +853,5 @@ mod tests {
         assert_eq!(transport.registered.load(AtomicOrdering::Relaxed), 1);
         assert_eq!(transport.unregistered.load(AtomicOrdering::Relaxed), 1);
         assert!(router.address_registry.read().await.is_empty());
-        assert!(router.agent_id_index.read().await.is_empty());
     }
 }

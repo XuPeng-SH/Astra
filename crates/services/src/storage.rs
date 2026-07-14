@@ -863,21 +863,17 @@ async fn migrate_legacy_edge_pending_dispatch_if_needed(
     }
 
     let active_row = query(
-        "SELECT COUNT(*) AS active_rows FROM edge_pending_dispatch \
-         WHERE status IN ('pending', 'dispatched')",
+        "SELECT 1 AS active_row FROM edge_pending_dispatch \
+         WHERE status IN ('pending', 'dispatched') LIMIT 1",
     )
-    .fetch_one(pool)
+    .fetch_optional(pool)
     .await?;
-    let active_rows: i64 = active_row.try_get("active_rows")?;
-    if active_rows != 0 {
-        return Err(sqlx::Error::Protocol(format!(
-            "legacy edge_pending_dispatch contains {active_rows} active rows without session/run/turn identity; drain them with the pre-turn-scoped Astra release before upgrade"
-        )));
+    if active_row.is_some() {
+        return Err(sqlx::Error::Protocol(
+            "legacy edge_pending_dispatch contains active rows without session/run/turn identity; drain them with the pre-turn-scoped Astra release before upgrade"
+                .to_string(),
+        ));
     }
-    let row = query("SELECT COUNT(*) AS total_rows FROM edge_pending_dispatch")
-        .fetch_one(pool)
-        .await?;
-    let total_rows: i64 = row.try_get("total_rows")?;
     query(&format!(
         "RENAME TABLE {} TO {}",
         crate::snapshot_sql::quote_mysql_identifier("edge_pending_dispatch"),
@@ -888,7 +884,6 @@ async fn migrate_legacy_edge_pending_dispatch_if_needed(
     tracing::info!(
         legacy_table = "edge_pending_dispatch",
         archive_table = EDGE_PENDING_DISPATCH_LEGACY_ARCHIVE_TABLE,
-        total_rows,
         "archived terminal legacy edge dispatch rows before turn-scoped schema creation"
     );
     Ok(())
@@ -1497,7 +1492,7 @@ pub async fn ensure_core_schema(
             INDEX idx_agent_runs_owner_root_depth (user_id, root_run_id, depth, created_at),
             INDEX idx_agent_runs_owner_parent_status_updated (user_id, parent_run_id, status, updated_at),
             INDEX idx_agent_runs_owner_retry_of (user_id, retry_of),
-            INDEX idx_agent_runs_status_lease (status, owner_lease_expires_at),
+            INDEX idx_agent_runs_recovery_scan (status, owner_lease_expires_at, updated_at, user_id, run_id),
             INDEX idx_agent_runs_owner_lease (owner_pod_id, owner_lease_expires_at),
             INDEX idx_agent_runs_binding (agent_binding_id, created_at),
             INDEX idx_agent_runs_model_gateway (selected_model_gateway, created_at)
@@ -1526,6 +1521,7 @@ pub async fn ensure_core_schema(
         "idx_agent_runs_parent",
         "idx_agent_runs_retry_of",
         "idx_agent_runs_user_updated",
+        "idx_agent_runs_status_lease",
     ] {
         drop_index_if_present(&pool, &settings.database, "agent_runs", removed_index).await?;
     }
@@ -1554,6 +1550,17 @@ pub async fn ensure_core_schema(
             "idx_agent_runs_owner_retry_of",
             &["user_id", "retry_of"][..],
             "ALTER TABLE agent_runs ADD INDEX idx_agent_runs_owner_retry_of (user_id, retry_of)",
+        ),
+        (
+            "idx_agent_runs_recovery_scan",
+            &[
+                "status",
+                "owner_lease_expires_at",
+                "updated_at",
+                "user_id",
+                "run_id",
+            ][..],
+            "ALTER TABLE agent_runs ADD INDEX idx_agent_runs_recovery_scan (status, owner_lease_expires_at, updated_at, user_id, run_id)",
         ),
     ] {
         ensure_index_shape(
@@ -1668,6 +1675,8 @@ pub async fn ensure_core_schema(
             event_type VARCHAR(64) NOT NULL,
             event_id VARCHAR(128) NOT NULL,
             agent_id VARCHAR(255) NULL,
+            subject_run_id VARCHAR(64) NULL,
+            interaction_request_id VARCHAR(128) NULL,
             idempotency_key VARCHAR(128) NULL,
             event_hash VARCHAR(64) NOT NULL,
             producer_pod_id VARCHAR(128) NULL,
@@ -1679,11 +1688,29 @@ pub async fn ensure_core_schema(
             UNIQUE KEY uq_run_event_idx (user_id, run_id, event_idx),
             UNIQUE KEY uq_run_event_idempotency (user_id, run_id, idempotency_key),
             INDEX idx_agent_run_events_owner_session_run_idx (user_id, session_id, run_id, event_idx),
+            INDEX idx_agent_run_events_owner_session_subject (user_id, session_id, event_type, subject_run_id, event_idx),
+            INDEX idx_agent_run_events_interaction (user_id, run_id, interaction_request_id, event_type, event_idx),
             INDEX idx_agent_run_events_user_created (user_id, created_at),
             INDEX idx_agent_run_events_event_id (event_id)
         )",
     )
     .execute(&pool)
+    .await?;
+    add_column_if_missing(
+        &pool,
+        &settings.database,
+        "agent_run_events",
+        "subject_run_id",
+        "ALTER TABLE agent_run_events ADD COLUMN subject_run_id VARCHAR(64) NULL",
+    )
+    .await?;
+    add_column_if_missing(
+        &pool,
+        &settings.database,
+        "agent_run_events",
+        "interaction_request_id",
+        "ALTER TABLE agent_run_events ADD COLUMN interaction_request_id VARCHAR(128) NULL",
+    )
     .await?;
     for (index, expected_columns, ddl) in [
         (
@@ -1700,6 +1727,28 @@ pub async fn ensure_core_schema(
             "idx_agent_run_events_owner_session_run_idx",
             &["user_id", "session_id", "run_id", "event_idx"][..],
             "ALTER TABLE agent_run_events ADD INDEX idx_agent_run_events_owner_session_run_idx (user_id, session_id, run_id, event_idx)",
+        ),
+        (
+            "idx_agent_run_events_owner_session_subject",
+            &[
+                "user_id",
+                "session_id",
+                "event_type",
+                "subject_run_id",
+                "event_idx",
+            ][..],
+            "ALTER TABLE agent_run_events ADD INDEX idx_agent_run_events_owner_session_subject (user_id, session_id, event_type, subject_run_id, event_idx)",
+        ),
+        (
+            "idx_agent_run_events_interaction",
+            &[
+                "user_id",
+                "run_id",
+                "interaction_request_id",
+                "event_type",
+                "event_idx",
+            ][..],
+            "ALTER TABLE agent_run_events ADD INDEX idx_agent_run_events_interaction (user_id, run_id, interaction_request_id, event_type, event_idx)",
         ),
     ] {
         ensure_index_shape(
@@ -2013,6 +2062,7 @@ pub async fn ensure_core_schema(
             run_id VARCHAR(64) NULL,
             role VARCHAR(32) NOT NULL,
             content LONGTEXT NOT NULL,
+            payload_json LONGTEXT NULL,
             source_event_id VARCHAR(128) NULL,
             source_event_idx BIGINT NULL,
             content_hash VARCHAR(128) NOT NULL,
@@ -2030,6 +2080,14 @@ pub async fn ensure_core_schema(
         "session_transcript_items",
         &["user_id", "session_id", "item_seq"],
         "ALTER TABLE session_transcript_items ADD PRIMARY KEY (user_id, session_id, item_seq)",
+    )
+    .await?;
+    add_column_if_missing(
+        &pool,
+        &settings.database,
+        "session_transcript_items",
+        "payload_json",
+        "ALTER TABLE session_transcript_items ADD COLUMN payload_json LONGTEXT NULL",
     )
     .await?;
     ensure_index_shape(
@@ -2855,73 +2913,6 @@ pub async fn ensure_core_schema(
             &pool,
             &settings.database,
             "session_delegations",
-            index,
-            expected_columns,
-            ddl,
-        )
-        .await?;
-    }
-
-    // PR #330 plan-driven todo tracking. NAMING: distinct from
-    // `session_todos` (Tier 1 task scratchpad created further below)
-    // because the two schemas are incompatible — earlier revisions
-    // shared the name, which caused the second `CREATE TABLE IF NOT
-    // EXISTS` to silently no-op and code that expected the other
-    // shape to fail with `column does not exist`. The two tables now
-    // co-exist with disjoint columns and disjoint consumers:
-    //   - `session_plan_todos`: `state_projection` + plan/backlog pool
-    //   - `session_todos`     : `astra_tools::task_mgmt` (TaskManager)
-    query(
-        "CREATE TABLE IF NOT EXISTS session_plan_todos (
-            todo_id VARCHAR(128) PRIMARY KEY,
-            user_id VARCHAR(128) NOT NULL,
-            session_id VARCHAR(128) NOT NULL,
-            plan_id VARCHAR(128) NULL,
-            parent_todo_id VARCHAR(128) NULL,
-            backlog_pool_id VARCHAR(128) NULL,
-            title VARCHAR(255) NOT NULL,
-            status VARCHAR(32) NOT NULL DEFAULT 'active',
-            priority INT NOT NULL DEFAULT 0,
-            depth INT NOT NULL DEFAULT 0,
-            token_estimate INT NOT NULL DEFAULT 0,
-            payload_json LONGTEXT NULL,
-            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            INDEX idx_session_plan_todos_owner_active (user_id, session_id, status, priority, updated_at),
-            INDEX idx_session_plan_todos_pool (user_id, backlog_pool_id, status, updated_at),
-            INDEX idx_session_plan_todos_owner_tree (user_id, session_id, parent_todo_id, priority)
-        )",
-    )
-    .execute(&pool)
-    .await?;
-    for removed_index in [
-        "idx_session_plan_todos_active",
-        "idx_session_plan_todos_tree",
-    ] {
-        drop_index_if_present(
-            &pool,
-            &settings.database,
-            "session_plan_todos",
-            removed_index,
-        )
-        .await?;
-    }
-    for (index, expected_columns, ddl) in [
-        (
-            "idx_session_plan_todos_owner_active",
-            &["user_id", "session_id", "status", "priority", "updated_at"][..],
-            "ALTER TABLE session_plan_todos ADD INDEX idx_session_plan_todos_owner_active (user_id, session_id, status, priority, updated_at)",
-        ),
-        (
-            "idx_session_plan_todos_owner_tree",
-            &["user_id", "session_id", "parent_todo_id", "priority"][..],
-            "ALTER TABLE session_plan_todos ADD INDEX idx_session_plan_todos_owner_tree (user_id, session_id, parent_todo_id, priority)",
-        ),
-    ] {
-        ensure_index_shape(
-            &pool,
-            &settings.database,
-            "session_plan_todos",
             index,
             expected_columns,
             ddl,

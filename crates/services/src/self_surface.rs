@@ -2017,6 +2017,7 @@ fn event_type_name(event_type: &JournalEventType) -> String {
         JournalEventType::DelegationCompleted => "delegation_completed",
         JournalEventType::AgentSpawned => "agent_spawned",
         JournalEventType::AgentTerminated => "agent_terminated",
+        JournalEventType::TranscriptItem => "transcript_item",
         JournalEventType::VerificationCompleted => "verification_completed",
         JournalEventType::PlanEdit => "plan_edit",
         JournalEventType::PlanLifecycle => "plan_lifecycle",
@@ -2304,6 +2305,7 @@ mod tests {
                 memoria_ms: None,
                 session_lineage: None,
                 coordination: None,
+                transcript_item: None,
                 edge_policy: None,
                 context_assembly_trace: None,
                 routing_domain_hint: Some("code".to_string()),
@@ -2342,6 +2344,11 @@ mod tests {
             snapshot.environment.discovered_skills,
             vec!["goal-driven-evolution".to_string()]
         );
+        assert_eq!(
+            snapshot.run.totals.total_tool_calls, 1,
+            "durable turn tool records must project into the self snapshot"
+        );
+        assert_eq!(snapshot.run.totals.failure_events, 0);
         assert_eq!(snapshot.recent_steps.len(), 2);
         assert_eq!(snapshot.recent_decisions.len(), 1);
         assert!(snapshot.acceptance.ok);

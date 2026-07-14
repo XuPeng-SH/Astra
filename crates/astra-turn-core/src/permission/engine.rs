@@ -47,6 +47,9 @@
 //! added here first and consumed by call sites instead of being copied.
 
 use astra_sandbox::{GitSafetyViolation, is_soft_violation, validate_git_command};
+use astra_tools::agent_tool_contract::{
+    AgentAction, AgentFanoutAction, agent_action_from_args, agent_fanout_action_from_args,
+};
 use serde_json::Value;
 
 use crate::action_compensation::{explicit_approval_reason, primary_approval_reason};
@@ -116,6 +119,7 @@ pub enum DecisionSource {
         origin: RuleOrigin,
     },
     ReadShortCircuit,
+    InternalOrchestration,
     SessionOverride {
         allowed: bool,
     },
@@ -625,11 +629,23 @@ pub fn evaluate_permission(
                     .unwrap_or("Access to path outside project boundary")
                     .to_string();
                 let action = sandbox_expand_action_label(inner_tool);
+                let directory = args
+                    .get("directory")
+                    .and_then(Value::as_str)
+                    .filter(|directory| !directory.trim().is_empty());
                 let decision = HardDecision::NeedExternal {
                     prompt: ApprovalPrompt {
                         tool: tool_name.to_string(),
-                        header: format!("{inner_tool} wants to {action} outside the project"),
-                        detail: None,
+                        header: directory
+                            .map(|directory| {
+                                format!("{inner_tool} wants to {action} in {directory}")
+                            })
+                            .unwrap_or_else(|| {
+                                format!("{inner_tool} wants to {action} outside the project")
+                            }),
+                        detail: directory.map(|directory| {
+                            format!("Approve temporary sandbox access to {directory}")
+                        }),
                         reason,
                         risk_tags: risk_tags.clone(),
                     },
@@ -984,6 +1000,23 @@ pub fn evaluate_permission(
         "no allow rule matched",
     );
 
+    if ctx.mode() != PermissionMode::Deny && is_internal_orchestration_control(tool_name, args) {
+        let decision = HardDecision::Allow;
+        push_matched(
+            &mut trace,
+            EvaluationStep::Mode,
+            &decision,
+            "internal orchestration control",
+        );
+        return envelope(
+            decision,
+            DecisionSource::InternalOrchestration,
+            trace,
+            will_save,
+            risk_tags,
+        );
+    }
+
     let mode = ctx.mode();
     let (decision, mode_label) = if mode.auto_resolves_approval_prompts() {
         (HardDecision::Allow, mode.to_string())
@@ -1253,34 +1286,10 @@ fn resolve_git_safety_guard(
     }
 
     if ctx.mode().skips_human_approval_prompts() {
-        if has_hard_violation {
-            let reason = format!("Git safety hard violation (bypass denied): {joined_reasons}");
-            return GuardResolution::Return {
-                decision: HardDecision::Deny {
-                    reason: reason.clone(),
-                },
-                source: DecisionSource::GitSafety {
-                    violation: reason.clone(),
-                },
-                detail: reason,
-                skipped_notes,
-            };
-        }
-        if ctx.inherited.allowed_tools.is_some() {
-            skipped_notes.push(format!(
-                "bypass mode git violation, deferring to allowlist: {joined_reasons}",
-            ));
-            return GuardResolution::Continue(skipped_notes);
-        }
-        let reason = format!("Git safety (bypass): {joined_reasons}");
-        return GuardResolution::Return {
-            decision: HardDecision::Allow,
-            source: DecisionSource::GitSafety {
-                violation: reason.clone(),
-            },
-            detail: reason,
-            skipped_notes,
-        };
+        skipped_notes.push(format!(
+            "git risk retained as advisory in bypass mode: {joined_reasons}",
+        ));
+        return GuardResolution::Continue(skipped_notes);
     }
 
     if ctx.mode().auto_allows_soft_git_policy() && !has_hard_violation {
@@ -1290,15 +1299,10 @@ fn resolve_git_safety_guard(
             ));
             return GuardResolution::Continue(skipped_notes);
         }
-        let reason = format!("Git safety (auto-allow): {joined_reasons}");
-        return GuardResolution::Return {
-            decision: HardDecision::Allow,
-            source: DecisionSource::GitSafety {
-                violation: reason.clone(),
-            },
-            detail: reason,
-            skipped_notes,
-        };
+        skipped_notes.push(format!(
+            "soft git risk retained as advisory in auto mode: {joined_reasons}",
+        ));
+        return GuardResolution::Continue(skipped_notes);
     }
 
     let reason = format!("Git safety: {joined_reasons}");
@@ -1505,6 +1509,20 @@ fn accept_edits_auto_allows(tool_name: &str, args: &Value) -> bool {
         ),
         (Some(CloudGatedToolKind::Write), AllowMatchTarget::Prefix(_))
     )
+}
+
+fn is_internal_orchestration_control(tool_name: &str, args: &Value) -> bool {
+    match tool_name {
+        "agent" => matches!(
+            agent_action_from_args(args),
+            Ok(AgentAction::Spawn | AgentAction::GetResult | AgentAction::SendMessage)
+        ),
+        "agent_fanout" => matches!(
+            agent_fanout_action_from_args(args),
+            Ok(AgentFanoutAction::Start | AgentFanoutAction::GetResults)
+        ),
+        _ => false,
+    }
 }
 
 fn content_aware_fingerprint(tool_name: &str, args: &Value) -> ApprovalFingerprint {
@@ -1801,6 +1819,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn sandbox_expand_prompt_uses_the_requested_directory_when_available() {
+        let ctx = crate::permission::types::PermissionSyncContext::new(
+            crate::permission::types::InheritedPermissions {
+                mode: crate::permission::types::PermissionMode::Prompt,
+                ..Default::default()
+            },
+        );
+        let envelope = evaluate_permission(
+            "sandbox_expand:bash",
+            &serde_json::json!({
+                "reason": "The current tool sandbox needs a broader workspace boundary.",
+                "directory": "/workspace/astra"
+            }),
+            &ctx,
+        );
+
+        match envelope.decision {
+            HardDecision::NeedExternal { prompt } => {
+                assert_eq!(prompt.header, "bash wants to execute in /workspace/astra");
+                assert_eq!(
+                    prompt.detail.as_deref(),
+                    Some("Approve temporary sandbox access to /workspace/astra")
+                );
+            }
+            other => panic!("sandbox scope should prompt; got {other:?}"),
+        }
+    }
+
     /// Catastrophic-command checks (the `rm -rf /` circuit breaker)
     /// run inside `SafetyMiddleware`, which must precede everything
     /// the user could relax.
@@ -1973,6 +2020,128 @@ mod tests {
 
         assert!(matches!(envelope.decision, HardDecision::Allow));
         assert_eq!(envelope.source, DecisionSource::ReadShortCircuit);
+    }
+
+    #[test]
+    fn prompt_mode_allows_agent_lifecycle_control_without_external_approval() {
+        let ctx = crate::permission::types::PermissionSyncContext::new(
+            crate::permission::types::InheritedPermissions {
+                mode: crate::permission::types::PermissionMode::Prompt,
+                ..Default::default()
+            },
+        );
+
+        for (tool, args) in [
+            (
+                "agent",
+                serde_json::json!({
+                    "action": "spawn",
+                    "description": "Review",
+                    "prompt": "Check the diff"
+                }),
+            ),
+            (
+                "agent",
+                serde_json::json!({
+                    "action": "get_result",
+                    "agent_id": "agent-1"
+                }),
+            ),
+            (
+                "agent_fanout",
+                serde_json::json!({
+                    "action": "start",
+                    "group_id": "review",
+                    "target_count": 1,
+                    "slots": [{"id": "slot-1", "prompt": "Review"}]
+                }),
+            ),
+            (
+                "agent_fanout",
+                serde_json::json!({
+                    "action": "get_results",
+                    "group_id": "review"
+                }),
+            ),
+        ] {
+            let envelope = evaluate_permission(tool, &args, &ctx);
+            assert!(
+                matches!(envelope.decision, HardDecision::Allow),
+                "{tool} {args} should be internal orchestration control; got {:?} from {:?}",
+                envelope.decision,
+                envelope.source
+            );
+            assert_eq!(envelope.source, DecisionSource::InternalOrchestration);
+        }
+    }
+
+    #[test]
+    fn prompt_mode_still_prompts_agent_actions_that_can_mutate_runtime_state() {
+        let ctx = crate::permission::types::PermissionSyncContext::new(
+            crate::permission::types::InheritedPermissions {
+                mode: crate::permission::types::PermissionMode::Prompt,
+                ..Default::default()
+            },
+        );
+
+        for (tool, args) in [
+            (
+                "agent",
+                serde_json::json!({
+                    "action": "run_chain",
+                    "prompt": "Run the release pipeline"
+                }),
+            ),
+            (
+                "agent_fanout",
+                serde_json::json!({
+                    "action": "stop_slot",
+                    "group_id": "review",
+                    "slot_index": 0
+                }),
+            ),
+        ] {
+            let envelope = evaluate_permission(tool, &args, &ctx);
+            assert!(
+                matches!(envelope.decision, HardDecision::NeedExternal { .. }),
+                "{tool} {args} should still route through prompt mode; got {:?} from {:?}",
+                envelope.decision,
+                envelope.source
+            );
+            assert_eq!(
+                envelope.source,
+                DecisionSource::Mode {
+                    mode: "prompt".to_string()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn ask_rule_precedes_internal_orchestration_short_circuit() {
+        let ctx = crate::permission::types::PermissionSyncContext::new(
+            crate::permission::types::InheritedPermissions {
+                mode: crate::permission::types::PermissionMode::Prompt,
+                ask_rules: vec![crate::permission::types::PermissionRule::tool("agent")],
+                ..Default::default()
+            },
+        );
+
+        let envelope = evaluate_permission(
+            "agent",
+            &serde_json::json!({
+                "action": "spawn",
+                "description": "Review",
+                "prompt": "Check the diff"
+            }),
+            &ctx,
+        );
+
+        assert!(matches!(
+            envelope.decision,
+            HardDecision::NeedExternal { .. }
+        ));
+        assert!(matches!(envelope.source, DecisionSource::AskRule { .. }));
     }
 
     #[test]
@@ -2655,6 +2824,41 @@ mod tests {
     }
 
     #[test]
+    fn bypass_git_advisory_does_not_skip_later_execute_boundary() {
+        let ctx = crate::permission::types::PermissionSyncContext::root(
+            crate::permission::types::PermissionMode::Bypass,
+        );
+        let envelope = evaluate_permission(
+            "bash",
+            &serde_json::json!({"command": "cd /workspace && git status | bash"}),
+            &ctx,
+        );
+
+        assert!(matches!(envelope.decision, HardDecision::Deny { .. }));
+        assert!(matches!(
+            envelope.source,
+            DecisionSource::ExecuteHardDeny { .. }
+        ));
+        assert!(envelope.risk_tags.contains(&RiskTag::BashExecute));
+    }
+
+    #[test]
+    fn bypass_allows_read_only_cd_git_pipeline_without_approval() {
+        let ctx = crate::permission::types::PermissionSyncContext::root(
+            crate::permission::types::PermissionMode::Bypass,
+        );
+        let envelope = evaluate_permission(
+            "bash",
+            &serde_json::json!({
+                "command": "cd /workspace && git diff origin/main...HEAD --stat | awk '{print $1}'"
+            }),
+            &ctx,
+        );
+
+        assert!(matches!(envelope.decision, HardDecision::Allow));
+    }
+
+    #[test]
     fn structured_git_force_push_feature_branch_is_soft_in_auto_mode() {
         let ctx = crate::permission::types::PermissionSyncContext::root(
             crate::permission::types::PermissionMode::Auto,
@@ -2671,7 +2875,6 @@ mod tests {
         );
 
         assert!(matches!(envelope.decision, HardDecision::Allow));
-        assert!(matches!(envelope.source, DecisionSource::GitSafety { .. }));
         assert!(envelope.risk_tags.contains(&RiskTag::GitDestructive));
     }
 
@@ -2692,7 +2895,6 @@ mod tests {
         );
 
         assert!(matches!(envelope.decision, HardDecision::Allow));
-        assert!(matches!(envelope.source, DecisionSource::GitSafety { .. }));
         assert!(envelope.risk_tags.contains(&RiskTag::GitDestructive));
     }
 
@@ -2721,7 +2923,7 @@ mod tests {
     }
 
     #[test]
-    fn structured_git_force_push_protected_branch_is_denied_in_bypass_mode() {
+    fn structured_git_force_push_protected_branch_is_advisory_in_bypass_mode() {
         let ctx = crate::permission::types::PermissionSyncContext::root(
             crate::permission::types::PermissionMode::Bypass,
         );
@@ -2736,17 +2938,12 @@ mod tests {
             &ctx,
         );
 
-        assert!(matches!(
-            envelope.decision,
-            HardDecision::Deny { ref reason }
-                if reason.contains("Git safety hard violation")
-        ));
-        assert!(matches!(envelope.source, DecisionSource::GitSafety { .. }));
+        assert!(matches!(envelope.decision, HardDecision::Allow));
         assert!(envelope.risk_tags.contains(&RiskTag::GitDestructive));
     }
 
     #[test]
-    fn git_worktree_destructive_bash_requires_approval_in_auto_mode() {
+    fn git_worktree_destructive_bash_is_advisory_in_auto_mode() {
         let ctx = crate::permission::types::PermissionSyncContext::root(
             crate::permission::types::PermissionMode::Auto,
         );
@@ -2758,16 +2955,14 @@ mod tests {
             &ctx,
         );
 
-        assert!(matches!(
-            envelope.decision,
-            HardDecision::NeedExternal { .. }
-        ));
-        assert!(
-            matches!(envelope.source, DecisionSource::GitSafety { ref violation } if violation.contains("git restore")),
-            "{:?}",
-            envelope.source
-        );
+        assert!(matches!(envelope.decision, HardDecision::Allow));
         assert!(envelope.risk_tags.contains(&RiskTag::GitDestructive));
+        assert!(
+            envelope
+                .trace
+                .iter()
+                .any(|step| step.note.contains("soft git risk retained as advisory"))
+        );
     }
 
     #[test]
@@ -2795,7 +2990,7 @@ mod tests {
     }
 
     #[test]
-    fn git_worktree_destructive_broad_session_override_does_not_fall_through() {
+    fn git_worktree_destructive_broad_session_override_remains_advisory() {
         let args = serde_json::json!({
             "command": "git restore --staged --worktree crates/foo/src/lib.rs"
         });
@@ -2811,11 +3006,7 @@ mod tests {
 
         let envelope = evaluate_permission("bash", &args, &ctx);
 
-        assert!(matches!(
-            envelope.decision,
-            HardDecision::NeedExternal { .. }
-        ));
-        assert!(matches!(envelope.source, DecisionSource::GitSafety { .. }));
+        assert!(matches!(envelope.decision, HardDecision::Allow));
         assert!(
             envelope.trace.iter().any(|step| step
                 .note
@@ -2826,7 +3017,7 @@ mod tests {
     }
 
     #[test]
-    fn git_worktree_destructive_prefix_session_override_does_not_fall_through() {
+    fn git_worktree_destructive_prefix_session_override_remains_advisory() {
         let args = serde_json::json!({
             "command": "git restore --staged --worktree crates/foo/src/lib.rs"
         });
@@ -2845,11 +3036,7 @@ mod tests {
 
         let envelope = evaluate_permission("bash", &args, &ctx);
 
-        assert!(matches!(
-            envelope.decision,
-            HardDecision::NeedExternal { .. }
-        ));
-        assert!(matches!(envelope.source, DecisionSource::GitSafety { .. }));
+        assert!(matches!(envelope.decision, HardDecision::Allow));
         assert!(
             envelope.trace.iter().any(|step| step
                 .note

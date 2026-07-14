@@ -19,8 +19,13 @@ pub(crate) use crate::cli::permission_manager::PermissionMode;
 pub(crate) struct StatusContext {
     pub model: Option<String>,
     pub cwd: Option<String>,
-    /// Tuple `(used, limit)` in tokens.
-    pub token_budget: Option<(u64, u64)>,
+    /// One request's usable context-window occupancy.
+    pub context_window: Option<astra_turn_types::ContextWindowUsage>,
+    /// The displayed occupancy belongs to the preceding completed request
+    /// while the next request is still being assembled. Keeping it visible
+    /// avoids a false "unknown/zero" gap, while this bit prevents presenting
+    /// stale evidence as the current request.
+    pub context_window_is_previous: bool,
     pub current_objective: Option<String>,
     pub turn_elapsed: Option<Duration>,
     pub permission_mode: PermissionMode,
@@ -52,8 +57,12 @@ pub(crate) struct StatusContext {
 pub(crate) struct BackgroundTaskCounts {
     /// Running shell tasks.
     pub running: usize,
+    /// Tasks with an accepted cancellation request awaiting a terminal result.
+    pub stopping: usize,
     /// Shell tasks waiting for input.
     pub waiting: usize,
+    /// Last-observed task snapshots without a live runtime handle.
+    pub stale_snapshots: usize,
     /// Failed typed tasks needing attention.
     pub failed_shells: usize,
     pub failed_local_agents: usize,
@@ -90,7 +99,9 @@ impl BackgroundTaskCounts {
 
     pub(crate) fn is_empty(self) -> bool {
         self.running == 0
+            && self.stopping == 0
             && self.waiting == 0
+            && self.stale_snapshots == 0
             && self.failed_total() == 0
             && self.unavailable_total() == 0
             && self.local_agents == 0
@@ -103,10 +114,13 @@ impl BackgroundTaskCounts {
         rows: &[crate::tui::bottom_pane::background_task_view::BackgroundTaskRow],
     ) -> Self {
         use crate::tui::bottom_pane::background_task_view::{
-            BackgroundTaskKind, BackgroundTaskStatus,
+            BackgroundTaskKind, BackgroundTaskStatus, LiveControlState,
         };
         let mut counts = Self::default();
         for row in rows {
+            if matches!(row.live_control, LiveControlState::StaleHandle) {
+                counts.stale_snapshots += 1;
+            }
             match row.status {
                 BackgroundTaskStatus::Running | BackgroundTaskStatus::Pending => match row.kind {
                     BackgroundTaskKind::Shell => counts.running += 1,
@@ -116,6 +130,7 @@ impl BackgroundTaskCounts {
                     BackgroundTaskKind::Monitor => counts.monitors += 1,
                 },
                 BackgroundTaskStatus::WaitingForInput => counts.waiting += 1,
+                BackgroundTaskStatus::Stopping => counts.stopping += 1,
                 BackgroundTaskStatus::Interrupted | BackgroundTaskStatus::Failed => {
                     match row.kind {
                         BackgroundTaskKind::Shell => counts.failed_shells += 1,
@@ -145,6 +160,7 @@ pub(crate) struct BackgroundTaskFanoutSummary {
     pub title: String,
     pub target_count: usize,
     pub running: usize,
+    pub stopping: usize,
     pub done: usize,
     pub failed: usize,
     pub stopped: usize,
@@ -182,6 +198,9 @@ impl BackgroundTaskFanoutSummary {
                 | crate::tui::bottom_pane::background_task_view::BackgroundTaskStatus::WaitingForInput => {
                     group.running += 1;
                 }
+                crate::tui::bottom_pane::background_task_view::BackgroundTaskStatus::Stopping => {
+                    group.stopping += 1;
+                }
                 crate::tui::bottom_pane::background_task_view::BackgroundTaskStatus::Completed => {
                     group.done += 1;
                 }
@@ -200,7 +219,9 @@ impl BackgroundTaskFanoutSummary {
 
         groups
             .into_iter()
-            .filter(|group| group.running > 0 || group.failed > 0 || group.unavailable > 0)
+            .filter(|group| {
+                group.running > 0 || group.stopping > 0 || group.failed > 0 || group.unavailable > 0
+            })
             .collect()
     }
 
@@ -212,6 +233,9 @@ impl BackgroundTaskFanoutSummary {
                 self.running,
                 self.target_count.max(self.running)
             ));
+        }
+        if self.stopping > 0 {
+            parts.push(format!("{} stopping", self.stopping));
         }
         if self.done > 0 {
             parts.push(format!("{} done", self.done));
@@ -296,6 +320,16 @@ fn background_task_count_parts(counts: BackgroundTaskCounts) -> Vec<String> {
             "need input",
         ));
     }
+    if counts.stopping > 0 {
+        parts.push(format!("{} stopping", counts.stopping));
+    }
+    if counts.stale_snapshots > 0 {
+        parts.push(pluralize_with_count(
+            counts.stale_snapshots,
+            "stale snapshot",
+            "stale snapshots",
+        ));
+    }
     for (count, singular, plural) in [
         (counts.unavailable_shells, "shell", "shells"),
         (
@@ -371,14 +405,15 @@ fn permission_mode_label(mode: PermissionMode) -> &'static str {
 impl StatusLine {
     /// Build a status line from context.
     pub fn from_context(ctx: &StatusContext) -> Self {
-        let muted = Style::default().fg(Color::Gray);
+        let theme = crate::tui::theme::current();
+        let muted = Style::default().fg(theme.dim);
         let mut out = Self::default();
 
         // ── Left: stable agent context, not a second live-status bar ─
         if let Some(model) = ctx.model.as_deref() {
             out.left.push(Segment::styled(
                 format_model_label(model, MODEL_MAX_WIDTH),
-                Style::default().fg(Color::White),
+                Style::default().fg(theme.path_file),
             ));
         }
 
@@ -394,16 +429,14 @@ impl StatusLine {
             PermissionMode::Auto => {
                 out.left.push(Segment::styled(
                     permission_mode_label(ctx.permission_mode),
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(theme.warn).add_modifier(Modifier::BOLD),
                 ));
             }
             PermissionMode::Bypass => {
                 out.left.push(Segment::styled(
                     permission_mode_label(ctx.permission_mode),
                     Style::default()
-                        .fg(Color::Magenta)
+                        .fg(theme.accent)
                         .add_modifier(Modifier::BOLD),
                 ));
             }
@@ -411,22 +444,22 @@ impl StatusLine {
                 out.left.push(Segment::styled(
                     permission_mode_label(ctx.permission_mode),
                     Style::default()
-                        .fg(Color::Blue)
+                        .fg(theme.command)
                         .add_modifier(Modifier::BOLD),
                 ));
             }
             PermissionMode::AcceptEdits => {
                 out.left.push(Segment::styled(
                     permission_mode_label(ctx.permission_mode),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(theme.link).add_modifier(Modifier::BOLD),
                 ));
             }
             PermissionMode::Deny => {
                 out.left.push(Segment::styled(
                     permission_mode_label(ctx.permission_mode),
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(theme.error)
+                        .add_modifier(Modifier::BOLD),
                 ));
             }
         }
@@ -438,7 +471,7 @@ impl StatusLine {
                 format!("⏸ {} pending", ctx.pending_approvals)
             };
             out.left
-                .push(Segment::styled(text, Style::default().fg(Color::Yellow)));
+                .push(Segment::styled(text, Style::default().fg(theme.warn)));
         }
 
         // Task-board chip. `▶` = collapsed (Ctrl+T to expand),
@@ -454,7 +487,7 @@ impl StatusLine {
                 let (text, style) = if open == 0 {
                     (
                         format!("{glyph} {total} done"),
-                        Style::default().fg(Color::Green),
+                        Style::default().fg(theme.success),
                     )
                 } else {
                     (format!("{glyph} {open}/{total}"), muted)
@@ -467,11 +500,11 @@ impl StatusLine {
             out.left.push(Segment::styled(
                 summary.text(),
                 Style::default().fg(if summary.failed > 0 {
-                    Color::Red
+                    theme.error
                 } else if summary.unavailable > 0 {
-                    Color::Yellow
+                    theme.warn
                 } else {
-                    Color::Magenta
+                    theme.accent
                 }),
             ));
         }
@@ -484,9 +517,9 @@ impl StatusLine {
         {
             let parts = background_task_count_parts(counts);
             let style = if counts.failed_total() > 0 {
-                Style::default().fg(Color::Red)
+                Style::default().fg(theme.error)
             } else if counts.waiting > 0 {
-                Style::default().fg(Color::Yellow)
+                Style::default().fg(theme.warn)
             } else {
                 muted
             };
@@ -497,22 +530,37 @@ impl StatusLine {
         if let Some(cwd) = ctx.cwd.as_deref() {
             out.right.push(Segment::styled(
                 truncate_cwd(cwd, CWD_MAX_WIDTH),
-                Style::default().fg(Color::Green),
+                Style::default().fg(theme.path_file),
             ));
         }
 
-        if let Some((used, limit)) = ctx.token_budget {
-            if limit > 0 {
-                let pct = (used as f32 / limit as f32) * 100.0;
+        if let Some(usage) = ctx.context_window {
+            if usage.limit_tokens > 0 {
+                let pct = (usage.used_tokens as f32 / usage.limit_tokens as f32) * 100.0;
                 let style = if pct >= BUDGET_ERROR_PERCENT {
-                    Style::default().fg(Color::Red)
+                    Style::default().fg(theme.error)
                 } else if pct >= BUDGET_WARN_PERCENT {
-                    Style::default().fg(Color::Yellow)
+                    Style::default().fg(theme.warn)
                 } else {
                     muted
                 };
+                let approximation = matches!(
+                    usage.source,
+                    astra_turn_types::ContextWindowUsageSource::Estimated
+                )
+                .then_some("~")
+                .unwrap_or("");
+                let scope = if ctx.context_window_is_previous {
+                    "last "
+                } else {
+                    ""
+                };
                 out.right.push(Segment::styled(
-                    format!("{pct:.0}% ({})", format_tokens_compact(used)),
+                    format!(
+                        "Ctx {scope}{approximation}{pct:.0}% · {}/{}",
+                        format_tokens_compact(usage.used_tokens),
+                        format_tokens_compact(usage.limit_tokens),
+                    ),
                     style,
                 ));
             }
@@ -554,15 +602,35 @@ impl StatusLine {
         }
         let surface = crate::tui::style::footer_surface_style();
         let bg = surface.bg.unwrap_or(Color::Reset);
-        let sep = Span::styled(" · ", Style::default().fg(Color::Gray).bg(bg));
+        let sep = Span::styled(
+            " · ",
+            Style::default().fg(crate::tui::theme::current().dim).bg(bg),
+        );
 
         let mut right_segments = self.right.clone();
-        if !should_render_budget_segment(area.width, &self.left, &right_segments)
-            && right_segments.len() >= 2
+        while right_segments.len() > 1
+            && status_line_total_width(&self.left, &right_segments) > usize::from(area.width)
         {
-            right_segments.remove(1);
+            // Context capacity is operational state. Drop optional decoration
+            // by meaning, not by its incidental position in the vector.
+            let remove_index = right_segments
+                .iter()
+                .rposition(|segment| segment.text.starts_with('$'))
+                .or_else(|| {
+                    right_segments
+                        .iter()
+                        .rposition(|segment| segment.text.starts_with("⎇ "))
+                })
+                .or_else(|| {
+                    right_segments
+                        .iter()
+                        .position(|segment| !segment.text.starts_with("Ctx "))
+                });
+            let Some(remove_index) = remove_index else {
+                break;
+            };
+            right_segments.remove(remove_index);
         }
-
         tighten_primary_right_segment(&self.left, &mut right_segments, area.width);
         let mut ordered = ordered_render_segments(&self.left, &right_segments);
         loop {
@@ -576,6 +644,19 @@ impl StatusLine {
                 Widget::render(Line::from(all), area, buf);
                 break;
             }
+            if compact_last_context_segment(&mut ordered, area.width) {
+                continue;
+            }
+            if ordered
+                .last()
+                .is_some_and(|segment| segment.text.starts_with("Ctx "))
+                && ordered.len() > 2
+            {
+                // Keep the primary left identity and capacity signal; shed a
+                // secondary left chip before discarding context altogether.
+                ordered.remove(ordered.len() - 2);
+                continue;
+            }
             ordered.pop();
         }
     }
@@ -587,7 +668,7 @@ fn should_render_cost(ctx: &StatusContext) -> bool {
 
 fn is_dense_footer_context(ctx: &StatusContext) -> bool {
     let mut signals = 0usize;
-    if ctx.token_budget.is_some() {
+    if ctx.context_window.is_some() {
         signals += 1;
     }
     if ctx.git_branch.is_some() {
@@ -628,6 +709,20 @@ fn ordered_render_segments(left: &[Segment], right: &[Segment]) -> Vec<Segment> 
     ordered
 }
 
+fn status_line_total_width(left: &[Segment], right: &[Segment]) -> usize {
+    let segments = left.len() + right.len();
+    if segments == 0 {
+        return 0;
+    }
+    let segment_width: usize = left
+        .iter()
+        .chain(right.iter())
+        .map(|seg| seg.text.width())
+        .sum();
+    let separator_width = segments.saturating_sub(1) * " · ".width();
+    2 + segment_width + separator_width + 2
+}
+
 fn tighten_ordered_cwd_segment(ordered: &mut [Segment], total_width: u16) {
     if ordered.len() < 2 {
         return;
@@ -654,7 +749,7 @@ fn tighten_ordered_cwd_segment(ordered: &mut [Segment], total_width: u16) {
 }
 
 fn tighten_primary_right_segment(left: &[Segment], right: &mut [Segment], total_width: u16) {
-    if left.is_empty() || right.is_empty() {
+    if left.is_empty() || right.is_empty() || right[0].text.starts_with("Ctx ") {
         return;
     }
 
@@ -791,6 +886,68 @@ fn truncate_end(text: &str, max_width: usize) -> String {
     format!("{head}…")
 }
 
+fn compact_last_context_segment(ordered: &mut [Segment], total_width: u16) -> bool {
+    let Some(last_text) = ordered.last().map(|seg| seg.text.as_str()) else {
+        return false;
+    };
+    if !last_text.starts_with("Ctx ") {
+        return false;
+    }
+
+    let sep_w = " · ".width();
+    let lead_indent = 2usize;
+    let trailing_margin = 2usize;
+    let fixed_width: usize = ordered
+        .iter()
+        .take(ordered.len().saturating_sub(1))
+        .map(|seg| seg.text.width())
+        .sum::<usize>()
+        + ordered.len().saturating_sub(1) * sep_w
+        + lead_indent
+        + trailing_margin;
+    let available = usize::from(total_width).saturating_sub(fixed_width);
+    if last_text.width() <= available {
+        return false;
+    }
+
+    let compact = compact_context_text(last_text, available);
+    if compact == last_text {
+        return false;
+    }
+    if let Some(last) = ordered.last_mut() {
+        last.text = compact;
+    }
+    true
+}
+
+fn compact_context_text(text: &str, max_width: usize) -> String {
+    if text.width() <= max_width {
+        return text.to_string();
+    }
+    if max_width <= 1 {
+        return "…".to_string();
+    }
+
+    let Some((prefix, tokens)) = text.rsplit_once(" · ") else {
+        return truncate_end(text, max_width);
+    };
+    let limit = tokens
+        .rsplit_once('/')
+        .map(|(_, limit)| limit)
+        .unwrap_or(tokens);
+    let limit_only = format!("…/{limit}");
+    if limit_only.width() > max_width {
+        return truncate_end(&limit_only, max_width);
+    }
+
+    let with_prefix = format!("{prefix} · {limit_only}");
+    if with_prefix.width() <= max_width {
+        with_prefix
+    } else {
+        limit_only
+    }
+}
+
 fn truncate_left_segments_to_fit(
     segments: &[Segment],
     right_width: usize,
@@ -829,26 +986,17 @@ fn truncate_left_segments_to_fit(
     }
 }
 
-fn should_render_budget_segment(total_width: u16, left: &[Segment], right: &[Segment]) -> bool {
-    if right.len() < 2 {
-        return true;
-    }
-    let left_primary = left.first().map(|seg| seg.text.width()).unwrap_or_default();
-    let cwd_width = right
-        .first()
-        .map(|seg| seg.text.width())
-        .unwrap_or_default();
-    let budget_width = right.get(1).map(|seg| seg.text.width()).unwrap_or_default();
-    let minimum_useful = 2 + left_primary + 2 + cwd_width.min(14) + 3 + budget_width;
-    usize::from(total_width) >= minimum_useful
-}
-
 /// "25000" → "25k"; preserves exact count under 1k.
 fn format_tokens_compact(n: u64) -> String {
     if n < 1_000 {
         n.to_string()
     } else if n < 1_000_000 {
-        format!("{}k", n / 1_000)
+        let rounded_k = (n + 500) / 1_000;
+        if rounded_k >= 1_000 {
+            "1.0M".to_string()
+        } else {
+            format!("{rounded_k}k")
+        }
     } else {
         format!("{:.1}M", n as f64 / 1_000_000.0)
     }

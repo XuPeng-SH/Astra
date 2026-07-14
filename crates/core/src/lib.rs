@@ -505,7 +505,6 @@ pub const STATUS_FAILED: &str = "failed";
 pub const STATUS_PAUSED: &str = "paused";
 pub const STATUS_CANCELLED: &str = "cancelled";
 pub const STATUS_WAITING: &str = "waiting";
-pub const STATUS_INPUT_QUEUED: &str = "input-queued";
 pub const STATUS_VERIFICATION_FAILED: &str = "verification_failed";
 
 // ─── Sub-Run State Machine ──────────────────────────────────────────────────
@@ -515,7 +514,9 @@ pub const STATUS_VERIFICATION_FAILED: &str = "verification_failed";
 /// ```text
 /// Created ──► Running ──┬──► Completed
 ///                       ├──► Failed
-///                       ├──► Paused ──► Running (resume)
+///                       ├──► Waiting ──┬──► Running (dependency resolved)
+///                       │              └──► terminal (durable recovery settles)
+///                       ├──► Paused ───► Running (explicit resume)
 ///                       ├──► Cancelled
 ///                       └──► VerificationFailed
 /// ```
@@ -528,6 +529,9 @@ pub enum SubRunState {
     Running,
     Completed,
     Failed,
+    /// Recoverable wait on an external dependency or execution boundary.
+    Waiting,
+    /// Explicitly paused execution that requires a resume action.
     Paused,
     Cancelled,
     VerificationFailed,
@@ -551,9 +555,16 @@ impl SubRunState {
             (SubRunState::Created, SubRunState::Running)
                 | (SubRunState::Running, SubRunState::Completed)
                 | (SubRunState::Running, SubRunState::Failed)
+                | (SubRunState::Running, SubRunState::Waiting)
                 | (SubRunState::Running, SubRunState::Paused)
                 | (SubRunState::Running, SubRunState::Cancelled)
                 | (SubRunState::Running, SubRunState::VerificationFailed)
+                | (SubRunState::Waiting, SubRunState::Running)
+                | (SubRunState::Waiting, SubRunState::Paused)
+                | (SubRunState::Waiting, SubRunState::Completed)
+                | (SubRunState::Waiting, SubRunState::Failed)
+                | (SubRunState::Waiting, SubRunState::Cancelled)
+                | (SubRunState::Waiting, SubRunState::VerificationFailed)
                 | (SubRunState::Paused, SubRunState::Running)
                 | (SubRunState::Paused, SubRunState::Cancelled)
         )
@@ -575,20 +586,21 @@ impl SubRunState {
         self == SubRunState::Completed
     }
 
-    /// Convert to the canonical string constant (backward-compatible).
+    /// Convert to the canonical durable status.
     pub fn as_str(self) -> &'static str {
         match self {
             SubRunState::Created => "created",
             SubRunState::Running => STATUS_RUNNING,
             SubRunState::Completed => STATUS_COMPLETED,
             SubRunState::Failed => STATUS_FAILED,
+            SubRunState::Waiting => STATUS_WAITING,
             SubRunState::Paused => STATUS_PAUSED,
             SubRunState::Cancelled => STATUS_CANCELLED,
             SubRunState::VerificationFailed => STATUS_VERIFICATION_FAILED,
         }
     }
 
-    /// Parse from a status string (backward-compatible).
+    /// Parse a canonical durable status.
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<SubRunState> {
         match s {
@@ -596,6 +608,7 @@ impl SubRunState {
             "running" => Some(SubRunState::Running),
             "completed" => Some(SubRunState::Completed),
             "failed" => Some(SubRunState::Failed),
+            "waiting" => Some(SubRunState::Waiting),
             "paused" => Some(SubRunState::Paused),
             "cancelled" => Some(SubRunState::Cancelled),
             "verification_failed" => Some(SubRunState::VerificationFailed),
@@ -1149,6 +1162,19 @@ mod tests {
                 .unwrap(),
             SubRunState::Paused
         );
+        // Waiting is recoverable when its dependency resolves.
+        assert_eq!(
+            SubRunState::Running
+                .try_transition(SubRunState::Waiting)
+                .unwrap(),
+            SubRunState::Waiting
+        );
+        assert_eq!(
+            SubRunState::Waiting
+                .try_transition(SubRunState::Running)
+                .unwrap(),
+            SubRunState::Running
+        );
         // Running → Cancelled
         assert_eq!(
             SubRunState::Running
@@ -1217,6 +1243,7 @@ mod tests {
     fn terminal_states_are_correct() {
         assert!(!SubRunState::Created.is_terminal());
         assert!(!SubRunState::Running.is_terminal());
+        assert!(!SubRunState::Waiting.is_terminal());
         assert!(!SubRunState::Paused.is_terminal());
         assert!(SubRunState::Completed.is_terminal());
         assert!(SubRunState::Failed.is_terminal());
@@ -1239,6 +1266,7 @@ mod tests {
             SubRunState::Running,
             SubRunState::Completed,
             SubRunState::Failed,
+            SubRunState::Waiting,
             SubRunState::Paused,
             SubRunState::Cancelled,
             SubRunState::VerificationFailed,
@@ -1260,6 +1288,7 @@ mod tests {
             SubRunState::Running,
             SubRunState::Completed,
             SubRunState::Failed,
+            SubRunState::Waiting,
             SubRunState::Paused,
             SubRunState::Cancelled,
             SubRunState::VerificationFailed,
@@ -1274,6 +1303,21 @@ mod tests {
                     to
                 );
             }
+        }
+    }
+
+    #[test]
+    fn waiting_projection_can_settle_from_durable_authority() {
+        for terminal in [
+            SubRunState::Completed,
+            SubRunState::Failed,
+            SubRunState::Cancelled,
+            SubRunState::VerificationFailed,
+        ] {
+            let settled = SubRunState::Waiting
+                .try_transition(terminal)
+                .expect("waiting projection must accept durable terminal state");
+            assert_eq!(settled, terminal);
         }
     }
 

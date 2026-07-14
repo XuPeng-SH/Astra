@@ -24,6 +24,13 @@ pub trait MessageStream: Send {
     /// Non-blocking: return a message if one is already buffered.
     fn try_recv(&mut self) -> Option<Arc<AgentMessage>>;
 
+    /// Confirm that a delivered message has been consumed by the runtime.
+    /// Durable transports override this; in-process delivery is already owned
+    /// by the receiver once dequeued and therefore uses the no-op default.
+    async fn acknowledge(&mut self, _message: &AgentMessage) -> Result<(), MailboxError> {
+        Ok(())
+    }
+
     /// Drain all currently buffered messages without blocking.
     fn drain(&mut self) -> Vec<Arc<AgentMessage>> {
         let mut msgs = Vec::new();
@@ -79,6 +86,18 @@ pub trait MessageTransport: Send + Sync {
     /// Must be called after `register`. Returns a stream that yields messages
     /// addressed to this agent (both direct and broadcast).
     async fn subscribe(&self, addr: &AgentAddress) -> Result<Box<dyn MessageStream>, MailboxError>;
+
+    /// Resolve an agent inside one delegation namespace. Implementations for
+    /// distributed deployments must use shared state, not process-local
+    /// registration caches.
+    async fn resolve_agent(
+        &self,
+        delegation_id: &str,
+        agent_id: &str,
+    ) -> Result<AgentAddress, MailboxError>;
+
+    /// List live members of one delegation namespace.
+    async fn list_agents(&self, delegation_id: &str) -> Result<Vec<AgentAddress>, MailboxError>;
 
     /// Send a message to a single agent (`MessageTarget::Direct`).
     async fn send(&self, msg: Arc<AgentMessage>) -> Result<(), MailboxError>;

@@ -54,6 +54,8 @@ pub fn send_message_tool_schema() -> Value {
 pub struct SendResult {
     /// Human-readable result text to return to the LLM.
     pub display: String,
+    /// Successfully delivered logical message, regardless of ack policy.
+    pub sent_message: Option<Arc<AgentMessage>>,
     /// If the message was sent successfully with requires_ack, the message_id.
     pub tracked_message: Option<Arc<AgentMessage>>,
 }
@@ -64,6 +66,7 @@ pub async fn execute_send_message(mailbox: &AgentMailbox, args: &Value) -> SendR
         None => {
             return SendResult {
                 display: "Error: 'target' parameter is required.".to_string(),
+                sent_message: None,
                 tracked_message: None,
             };
         }
@@ -74,6 +77,7 @@ pub async fn execute_send_message(mailbox: &AgentMailbox, args: &Value) -> SendR
         None => {
             return SendResult {
                 display: "Error: 'content' parameter is required.".to_string(),
+                sent_message: None,
                 tracked_message: None,
             };
         }
@@ -89,8 +93,10 @@ pub async fn execute_send_message(mailbox: &AgentMailbox, args: &Value) -> SendR
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    // Resolve target
-    let target = match target_str.to_lowercase().as_str() {
+    // Resolve target. Direct addresses must be fully qualified before they
+    // enter the router so transports keep a single canonical invariant.
+    let normalized_target = target_str.trim();
+    let target = match normalized_target.to_ascii_lowercase().as_str() {
         "parent" | "orchestrator" => MessageTarget::Parent,
         "broadcast" | "all" | "peers" => {
             match mailbox.delegation_id.clone().filter(|s| !s.is_empty()) {
@@ -100,17 +106,41 @@ pub async fn execute_send_message(mailbox: &AgentMailbox, args: &Value) -> SendR
                         display:
                             "Error: cannot broadcast — agent is not part of a delegation group."
                                 .to_string(),
+                        sent_message: None,
                         tracked_message: None,
                     };
                 }
             }
         }
-        agent_id => MessageTarget::Direct {
-            address: super::types::AgentAddress {
-                run_id: String::new(), // Router resolves by agent_id within delegation group
-                agent_id: agent_id.to_string(),
-            },
-        },
+        _ => {
+            if mailbox
+                .delegation_id
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .is_none()
+            {
+                return SendResult {
+                    display: format!(
+                        "Error: cannot send to agent '{normalized_target}' — current agent is not part of a delegation group."
+                    ),
+                    sent_message: None,
+                    tracked_message: None,
+                };
+            };
+            let address = match mailbox.resolve_delegation_agent(normalized_target).await {
+                Ok(address) => address,
+                Err(error) => {
+                    return SendResult {
+                        display: format!(
+                            "Failed to resolve agent '{normalized_target}' in delegation group: {error}"
+                        ),
+                        sent_message: None,
+                        tracked_message: None,
+                    };
+                }
+            };
+            MessageTarget::Direct { address }
+        }
     };
 
     // Build payload based on message_type
@@ -148,14 +178,16 @@ pub async fn execute_send_message(mailbox: &AgentMailbox, args: &Value) -> SendR
 
     match mailbox.send((*msg).clone()).await {
         Ok(()) => {
-            let tracked = if requires_ack { Some(msg) } else { None };
+            let tracked = requires_ack.then(|| Arc::clone(&msg));
             SendResult {
                 display: format!("✓ Message sent to {target_display}."),
+                sent_message: Some(Arc::clone(&msg)),
                 tracked_message: tracked,
             }
         }
         Err(e) => SendResult {
             display: format!("Failed to send message to {target_display}: {e}"),
+            sent_message: None,
             tracked_message: None,
         },
     }

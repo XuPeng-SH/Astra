@@ -246,13 +246,14 @@ fn build_skill_listing_section_with_budget_and_caps(
              route through `agent_fanout` instead of skill execution or an \
              `agents:[...]` payload. If `agent_fanout` is not present in \
              `tools[]`, first call `tool_search(query=\"select:agent_fanout\")` \
-             to fetch its full schema. Then call \
-             `agent_fanout(action='start', target_count=N, \
-             slots=[{id:'api', description:'Short UI label', prompt:'Full child task prompt'}], \
-             defaults={agent_type:'code-review'})`. \
+             to fetch its full schema. Then submit one complete JSON argument \
+             object with `agent_fanout(action='start', ...)`, and later collect \
+             with `agent_fanout(action='get_results', ...)`. JSON-call syntax is still required; these strings name the route. \
+             For example submit an argument \
+             object, for example \
+             `{\"action\":\"start\",\"target_count\":2,\"slots\":[{\"id\":\"api\",\"description\":\"API review\",\"prompt\":\"Review the API and report findings.\"},{\"id\":\"ui\",\"description\":\"UI review\",\"prompt\":\"Review the UI and report findings.\"}]}`. \
              Put each child's full brief in that slot's `prompt`, then collect \
-             with `agent_fanout(action='get_results', \
-             group_id=...)`. Skills usually run sequentially inside the \
+             with `{\"action\":\"get_results\",\"group_id\":\"returned-group-id\"}`. Skills usually run sequentially inside the \
              parent turn, which contradicts the user's explicit fan-out intent.",
         );
     } else {
@@ -674,7 +675,8 @@ fn coding_discipline_section() -> &'static str {
 fn turn_discipline_section() -> &'static str {
     "\n## Turn Discipline\n\
      - **Announce once, briefly**: before your first tool call, write ONE sentence saying what you're about to do. Don't narrate every step.\n\
-     - **End with a short summary**: close the turn with 1-2 sentences stating what changed and what's next. This is the deliverable — not a list of tools you ran.\n\
+     - **End with a short summary**: close the turn with 1-2 sentences stating what changed and its verification status. This is the deliverable — not a list of tools you ran.\n\
+     - **Stop when the requested outcome is complete**: end with the result; do not append an optional \"what next?\" question or ask permission for unrelated follow-up work. Ask only when a concrete missing decision blocks the current request.\n\
      - **No externalized reasoning**: deliberation belongs in <think> blocks. Skip \"Let me think...\" / \"Hmm\" / \"Actually, wait\" — noise, not content.\n\
      - **Lead with the answer**: \"The bug is on line 42 because X\" beats \"Looking at the code, I notice line 42 might be relevant, let me investigate…\".\n\
      - **Match depth to task**: short question → short answer.\n\
@@ -970,10 +972,9 @@ fn task_type_section(task_type: Option<&str>, tool_names: &[&str]) -> String {
                    5. **If a read fails**: degrade your conclusion for that file. Say \"could not verify\" — do NOT claim it is fine.\n\
                   \n\
                   ### Output\n\
-                  - Summary: 1–3 bullets on the change and risk.\n\
-                  - Findings: 0–5 material issues only; label must-fix/should-fix/suggestion, cite file:line, and give the fix. If none, say \"None\".\n\
-                  - Verification: say what you checked and what you could not verify\n\
-                  - Verdict: LGTM or Needs changes. NEVER say LGTM if you had read errors on logic-changed files.\n\
+                  Return exactly one JSON object and no surrounding prose or markdown fences:\n\
+                  {{\"summary\":\"1–3 concise points on change and risk\",\"findings\":[{{\"severity\":\"critical|high|medium|low|info\",\"summary\":\"material issue and fix\",\"evidence\":[\"file:line and observed fact\"]}}],\"verification\":\"what was checked and what remains unverified\",\"verdict\":\"lgtm|needs_changes\"}}\n\
+                  Emit 0–5 material findings. Use severity=critical only for evidence that must reach ancestor runs immediately; map any must-fix concern to high or critical severity rather than a separate label. Use an empty findings array when there are no findings. NEVER say LGTM when evidence is incomplete; NEVER use verdict=lgtm when reads failed on logic-changed files.\n\
                   \n\
                   ### Anti-patterns (NEVER do these)\n\
                    {git_antipattern}\n\
@@ -2040,6 +2041,15 @@ mod tests {
             p.contains("Default budget: no more than 3 read_file calls"),
             "should bound read_file fanout for review turns"
         );
+        assert!(
+            p.contains("\"severity\":\"critical|high|medium|low|info\"")
+                && p.contains("Return exactly one JSON object"),
+            "review output must match the delegated finding wire contract"
+        );
+        assert!(
+            !p.contains("label must-fix/should-fix/suggestion"),
+            "the previous prose review contract must not remain prompt-facing"
+        );
 
         let p_no_read_file = build_main_system_prompt(&["git", "bash"], "", Some("code_review"));
         assert!(
@@ -2344,6 +2354,11 @@ mod tests {
         assert!(p.contains("user's language"));
         assert!(p.contains("Code changes"));
         assert!(p.contains("Build/test output"));
+
+        // Turn completion must not manufacture another user decision.
+        assert!(p.contains("Stop when the requested outcome is complete"));
+        assert!(p.contains("do not append an optional \"what next?\" question"));
+        assert!(p.contains("concrete missing decision blocks the current request"));
 
         // Error recovery
         assert!(p.contains("Tool Error Recovery"));
@@ -3228,7 +3243,7 @@ mod tests {
         assert!(section.text.contains("&lt;skill&gt;metadata&lt;/skill&gt;"));
         assert!(!section.text.contains("<skill>metadata</skill>"));
         assert!(section.text.contains("does not provide sub-agent fan-out"));
-        assert!(!section.text.contains("agent_fanout(action='start'"));
+        assert!(!section.text.contains("\"action\":\"start\""));
     }
 
     #[test]
@@ -3246,8 +3261,8 @@ mod tests {
             build_skill_listing_section_with_context_window_and_caps(&skills, Some(200_000), false)
                 .expect("skill listing should render when fanout is unavailable");
 
-        assert!(with_fanout.text.contains("agent_fanout(action='start'"));
-        assert!(!without_fanout.text.contains("agent_fanout(action='start'"));
+        assert!(with_fanout.text.contains("\"action\":\"start\""));
+        assert!(!without_fanout.text.contains("\"action\":\"start\""));
         assert!(
             without_fanout
                 .text

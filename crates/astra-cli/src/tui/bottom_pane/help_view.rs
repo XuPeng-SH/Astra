@@ -11,8 +11,13 @@ use super::view::{BottomPaneView, CancellationEvent, ViewCompletion};
 use crate::cli::command_registry::{self, CommandGroup, CommandMeta};
 
 const MAX_CMD_ROWS: usize = 10;
-const HELP_HINT: &str =
-    "←/→ switch group  ↑/↓ browse  Enter select  Ctrl+B background bash/agent  Esc close";
+
+fn help_hint() -> String {
+    format!(
+        "←/→ switch group  ↑/↓ browse  Enter select  /<name> searches all actions  {} background  Esc close",
+        crate::tui::background_shortcut::ctrl_b_background_shortcut()
+    )
+}
 
 struct GroupData {
     group: CommandGroup,
@@ -33,7 +38,7 @@ impl HelpView {
             .iter()
             .filter_map(|&g| {
                 let cmds: Vec<&'static CommandMeta> = command_registry::commands_by_group(g)
-                    .filter(|m| !m.is_alias && !m.name.contains(' '))
+                    .filter(|m| m.is_primary() && !m.name.contains(' '))
                     .collect();
                 if cmds.is_empty() {
                     None
@@ -75,11 +80,11 @@ impl BottomPaneView for HelpView {
             .add_modifier(Modifier::BOLD);
         let mut y = area.y;
 
-        // Tab bar: ⚡Core  📂Workspace  🔭Observability ...
+        // Plain semantic tabs stay aligned across fonts and terminals.
         {
             let mut spans: Vec<Span> = vec![Span::raw("  ")];
             for (i, gd) in self.groups.iter().enumerate() {
-                let label = format!("{}{}", gd.group.icon(), gd.group.title());
+                let label = gd.group.title().to_string();
                 if i == self.active_tab {
                     spans.push(Span::styled(label, sel));
                 } else {
@@ -151,7 +156,7 @@ impl BottomPaneView for HelpView {
             y += 1;
         }
         if y < area.bottom() {
-            let hint = Line::from(Span::styled(format!("  {HELP_HINT}"), dim));
+            let hint = Line::from(Span::styled(format!("  {}", help_hint()), dim));
             Widget::render(hint, Rect::new(area.x, y, area.width, 1), buf);
         }
     }
@@ -218,7 +223,10 @@ impl BottomPaneView for HelpView {
     fn completion(&self) -> Option<ViewCompletion> {
         if self.completed {
             Some(ViewCompletion {
-                result: self.accepted.clone(),
+                result: self
+                    .accepted
+                    .clone()
+                    .map(super::view::ViewResult::InsertCommand),
                 reopen: None,
             })
         } else {
@@ -227,6 +235,6 @@ impl BottomPaneView for HelpView {
     }
 
     fn hint_keys(&self) -> Option<String> {
-        Some(HELP_HINT.to_string())
+        Some(help_hint())
     }
 }

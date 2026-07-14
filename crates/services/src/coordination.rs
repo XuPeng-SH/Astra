@@ -108,7 +108,8 @@ pub fn agent_result_status_to_subrun_state(status: &str) -> SubRunState {
         AgentResultStatusKind::Completed | AgentResultStatusKind::Delegated => {
             SubRunState::Completed
         }
-        AgentResultStatusKind::Waiting | AgentResultStatusKind::Paused => SubRunState::Paused,
+        AgentResultStatusKind::Waiting => SubRunState::Waiting,
+        AgentResultStatusKind::Paused => SubRunState::Paused,
         AgentResultStatusKind::Cancelled => SubRunState::Cancelled,
         AgentResultStatusKind::VerificationFailed => SubRunState::VerificationFailed,
         AgentResultStatusKind::Failed
@@ -359,8 +360,6 @@ pub enum AggregationStrategy {
     AllResults,
     /// Majority/consensus among results.
     Consensus,
-    /// Use an LLM to synthesize a merged result.
-    LlmGuided { prompt_template: String },
 }
 
 // ─── Delegation Request / Result ────────────────────────────────────────────
@@ -370,6 +369,9 @@ pub enum AggregationStrategy {
 pub struct DelegationRequest {
     /// Unique delegation ID.
     pub delegation_id: String,
+    /// Canonical parent session identity. This scopes child run persistence,
+    /// transcript recovery, and runtime tools; it is not task prompt context.
+    pub session_id: String,
     /// Parent run ID (for hierarchy tracking).
     pub parent_run_id: String,
     /// Task description/prompt for the delegated agents.
@@ -400,7 +402,7 @@ pub struct AgentResult {
     /// Run ID for this agent's execution.
     pub run_id: String,
     /// Status taxonomy for a delegated sub-run result:
-    /// `completed`, `failed`, `timeout`, `waiting`, `paused`,
+    /// `completed`, `delegated`, `failed`, `timeout`, `waiting`, `paused`,
     /// `cancelled`, `partial`, or `verification_failed`.
     pub status: String,
     /// The agent's output/response.
@@ -469,6 +471,11 @@ impl DelegationResult {
 
         Self {
             delegation_id: delegation_id.to_string(),
+            // Execution settlement and result synthesis are deliberately
+            // separate. A successful agent is allowed to produce no text;
+            // absence of an aggregate must not rewrite completed work as a
+            // partial execution failure. Strategy-specific synthesis status
+            // should be surfaced separately by the caller.
             status: if all_ok {
                 DELEGATION_RESULT_STATUS_COMPLETED.to_string()
             } else if any_unfinished {
@@ -637,54 +644,82 @@ pub fn aggregate_results(
     match strategy {
         AggregationStrategy::FirstSuccess => results
             .iter()
-            .find(|r| r.is_success())
-            .and_then(|r| r.output.clone()),
+            .filter(|result| result.is_success())
+            .find_map(|result| {
+                result
+                    .output
+                    .as_deref()
+                    .filter(|output| !output.trim().is_empty())
+                    .map(str::to_string)
+            }),
 
         AggregationStrategy::AllResults => {
             let outputs: Vec<String> = results
                 .iter()
                 .filter(|r| r.is_success())
                 .filter_map(|r| r.output.clone())
+                .filter(|output| !output.trim().is_empty())
                 .collect();
             if outputs.is_empty() {
                 None
             } else {
-                Some(outputs.join("\n---\n"))
+                // Cap aggregated output to prevent unbounded concatenation.
+                // 64KB allows ~1000 typical agent responses while preventing
+                // memory exhaustion in pathological cases.
+                const MAX_AGGREGATED_BYTES: usize = 65_536;
+                let mut joined = String::new();
+                for (i, output) in outputs.iter().enumerate() {
+                    let separator = if i == 0 { "" } else { "\n---\n" };
+                    if joined.len() + separator.len() + output.len() > MAX_AGGREGATED_BYTES {
+                        let marker = format!(
+                            "\n... ({} more results truncated, {} total exceeded {} byte cap)",
+                            outputs.len() - i,
+                            outputs.len(),
+                            MAX_AGGREGATED_BYTES
+                        );
+                        let content_limit = MAX_AGGREGATED_BYTES.saturating_sub(marker.len());
+                        while joined.len() > content_limit {
+                            joined.pop();
+                        }
+                        joined.push_str(&marker);
+                        debug_assert!(joined.len() <= MAX_AGGREGATED_BYTES);
+                        break;
+                    }
+                    joined.push_str(separator);
+                    joined.push_str(output);
+                }
+                Some(joined)
             }
         }
 
         AggregationStrategy::Consensus => {
-            // Simple majority: find the most common output
-            let mut counts: HashMap<&str, usize> = HashMap::new();
-            for r in results.iter().filter(|r| r.is_success()) {
-                if let Some(ref out) = r.output {
-                    *counts.entry(out.as_str()).or_default() += 1;
-                }
+            // Consensus is a strict-majority contract, not an arbitrary
+            // plurality. Normalize only transport-insignificant whitespace;
+            // semantic synthesis belongs to the parent agent and must not be
+            // guessed with fuzzy string similarity.
+            let outputs: Vec<&str> = results
+                .iter()
+                .filter(|result| result.is_success())
+                .filter_map(|result| result.output.as_deref())
+                .filter(|output| !output.trim().is_empty())
+                .collect();
+            let mut counts: HashMap<String, (usize, &str)> = HashMap::new();
+            for output in &outputs {
+                let normalized = output
+                    .lines()
+                    .map(str::trim_end)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    .trim()
+                    .to_string();
+                let entry = counts.entry(normalized).or_insert((0, output));
+                entry.0 += 1;
             }
             counts
-                .into_iter()
-                .max_by_key(|(_, count)| *count)
-                .map(|(output, _)| output.to_string())
-        }
-
-        AggregationStrategy::LlmGuided { .. } => {
-            // LLM-guided aggregation requires an LLM call — return all outputs
-            // formatted for the caller to pass to an LLM.
-            let outputs: Vec<String> = results
-                .iter()
-                .filter(|r| r.is_success())
-                .enumerate()
-                .filter_map(|(i, r)| {
-                    r.output
-                        .as_ref()
-                        .map(|o| format!("Agent {} ({}):\n{}", i + 1, r.agent_id, o))
-                })
-                .collect();
-            if outputs.is_empty() {
-                None
-            } else {
-                Some(outputs.join("\n\n"))
-            }
+                .into_values()
+                .filter(|(count, _)| count.saturating_mul(2) > outputs.len())
+                .max_by_key(|(count, _)| *count)
+                .map(|(_, output)| output.trim().to_string())
         }
     }
 }
@@ -958,6 +993,7 @@ mod tests {
         reg.register(system_agent("s2")).unwrap();
 
         let req = DelegationRequest {
+            session_id: "test-session".into(),
             delegation_id: "d1".into(),
             parent_run_id: "run-1".into(),
             task: "analyze code".into(),
@@ -983,6 +1019,7 @@ mod tests {
         reg.register(system_agent("s1")).unwrap();
 
         let req = DelegationRequest {
+            session_id: "test-session".into(),
             delegation_id: "d1".into(),
             parent_run_id: "run-1".into(),
             task: "deep".into(),
@@ -1003,12 +1040,41 @@ mod tests {
     }
 
     #[test]
+    fn validate_delegation_honors_explicit_profile_depth_above_default() {
+        let mut reg = AgentProfileRegistry::new();
+        let mut source = orchestrator();
+        source.max_delegation_depth = 6;
+        reg.register(source).unwrap();
+        reg.register(system_agent("s1")).unwrap();
+
+        let req = DelegationRequest {
+            session_id: "test-session".into(),
+            delegation_id: "d-deep".into(),
+            parent_run_id: "run-deep".into(),
+            task: "bounded recursive orchestration".into(),
+            pattern: CoordinationPattern::Sequential {
+                agent_ids: vec!["s1".into()],
+                stop_on_success: true,
+                timeout_sec: 0,
+            },
+            user_id: "u1".into(),
+            depth: 4,
+            delegation_chain: vec!["root".into(), "planner".into()],
+            context: HashMap::new(),
+            execution_metadata: None,
+        };
+
+        assert!(reg.validate_delegation(&req, "orch-1").is_ok());
+    }
+
+    #[test]
     fn validate_delegation_wrong_tier() {
         let mut reg = AgentProfileRegistry::new();
         reg.register(system_agent("s1")).unwrap();
         reg.register(orchestrator()).unwrap();
 
         let req = DelegationRequest {
+            session_id: "test-session".into(),
             delegation_id: "d1".into(),
             parent_run_id: "run-1".into(),
             task: "upward".into(),
@@ -1035,6 +1101,7 @@ mod tests {
         reg.register(user_agent("u2")).unwrap();
 
         let req = DelegationRequest {
+            session_id: "test-session".into(),
             delegation_id: "d1".into(),
             parent_run_id: "run-1".into(),
             task: "help".into(),
@@ -1058,6 +1125,7 @@ mod tests {
     fn validate_delegation_unknown_source() {
         let reg = AgentProfileRegistry::new();
         let req = DelegationRequest {
+            session_id: "test-session".into(),
             delegation_id: "d1".into(),
             parent_run_id: "run-1".into(),
             task: "test".into(),
@@ -1083,6 +1151,7 @@ mod tests {
         reg.register(orchestrator()).unwrap();
 
         let req = DelegationRequest {
+            session_id: "test-session".into(),
             delegation_id: "d1".into(),
             parent_run_id: "run-1".into(),
             task: "test".into(),
@@ -1112,6 +1181,7 @@ mod tests {
         reg.register(system_agent("reviewer")).unwrap();
 
         let req = DelegationRequest {
+            session_id: "test-session".into(),
             delegation_id: "d1".into(),
             parent_run_id: "run-1".into(),
             task: "write and review".into(),
@@ -1146,6 +1216,7 @@ mod tests {
         reg.register(system_agent("critic")).unwrap();
 
         let req = DelegationRequest {
+            session_id: "test-session".into(),
             delegation_id: "d1".into(),
             parent_run_id: "run-1".into(),
             task: "write with review".into(),
@@ -1238,6 +1309,31 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_all_results_enforces_strict_byte_cap_without_invalid_utf8() {
+        let results = vec![
+            make_result("a1", &"界".repeat(30_000)),
+            make_result("a2", &"second".repeat(20_000)),
+        ];
+        let out = aggregate_results(&AggregationStrategy::AllResults, &results).unwrap();
+        assert!(out.len() <= 65_536);
+        assert!(out.contains("results truncated"));
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn aggregation_ignores_blank_success_output() {
+        let results = vec![make_result("a1", "  \n"), make_result("a2", "answer")];
+        assert_eq!(
+            aggregate_results(&AggregationStrategy::FirstSuccess, &results).as_deref(),
+            Some("answer")
+        );
+        assert_eq!(
+            aggregate_results(&AggregationStrategy::AllResults, &results).as_deref(),
+            Some("answer")
+        );
+    }
+
+    #[test]
     fn aggregate_consensus() {
         let results = vec![
             make_result("a1", "yes"),
@@ -1249,19 +1345,24 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_llm_guided_formats_outputs() {
-        let results = vec![make_result("a1", "output1"), make_result("a2", "output2")];
-        let out = aggregate_results(
-            &AggregationStrategy::LlmGuided {
-                prompt_template: "merge: {outputs}".into(),
-            },
-            &results,
-        )
-        .unwrap();
-        assert!(out.contains("Agent 1 (a1)"));
-        assert!(out.contains("Agent 2 (a2)"));
-        assert!(out.contains("output1"));
-        assert!(out.contains("output2"));
+    fn aggregate_consensus_requires_a_strict_majority() {
+        let results = vec![
+            make_result("a1", "alpha"),
+            make_result("a2", "beta"),
+            make_result("a3", "gamma"),
+        ];
+        assert!(aggregate_results(&AggregationStrategy::Consensus, &results).is_none());
+    }
+
+    #[test]
+    fn aggregate_consensus_ignores_transport_whitespace_only() {
+        let results = vec![
+            make_result("a1", "answer  \r\nsecond line\n"),
+            make_result("a2", "answer\nsecond line"),
+            make_result("a3", "different"),
+        ];
+        let out = aggregate_results(&AggregationStrategy::Consensus, &results);
+        assert_eq!(out.as_deref(), Some("answer  \r\nsecond line"));
     }
 
     // ── DelegationResult ───
@@ -1275,6 +1376,15 @@ mod tests {
         assert_eq!(dr.total_completion_tokens, 100);
         assert_eq!(dr.total_tool_calls, 6);
         assert_eq!(dr.aggregated_output.as_deref(), Some("merged"));
+    }
+
+    #[test]
+    fn successful_execution_without_synthesized_text_remains_completed() {
+        let mut result = make_result("a1", "ignored");
+        result.output = None;
+        let delegation = DelegationResult::from_results("d1", vec![result], None);
+        assert_eq!(delegation.status, DELEGATION_RESULT_STATUS_COMPLETED);
+        assert!(delegation.aggregated_output.is_none());
     }
 
     #[test]
@@ -1349,11 +1459,14 @@ mod tests {
         assert!(agent_result_status_is_unfinished(
             AGENT_RESULT_STATUS_PAUSED
         ));
+        assert!(!agent_result_status_is_unfinished(
+            AGENT_RESULT_STATUS_DELEGATED
+        ));
         assert!(!agent_result_status_is_failure(AGENT_RESULT_STATUS_PAUSED));
         assert!(make_unfinished("a2").is_unfinished());
         assert_eq!(
             agent_result_status_to_subrun_state(AGENT_RESULT_STATUS_WAITING),
-            SubRunState::Paused
+            SubRunState::Waiting
         );
         assert_eq!(
             agent_result_status_to_subrun_state(AGENT_RESULT_STATUS_VERIFICATION_FAILED),
@@ -1449,6 +1562,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn delegated_child_resolves_parent_to_completed() {
+        // Regression: Delegated is a terminal-success status (maps to
+        // SubRunState::Completed). A child that terminated as Delegated
+        // must NOT classify the parent delegation as unfinished.
+        let make_delegated = |agent_id: &str| AgentResult {
+            agent_id: agent_id.into(),
+            run_id: format!("run-{agent_id}"),
+            status: AGENT_RESULT_STATUS_DELEGATED.into(),
+            output: Some("nested delegation completed".into()),
+            error: None,
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            tool_calls: 3,
+        };
+
+        // All-Delegated: parent should be Completed
+        let all_delegated =
+            DelegationResult::from_results("d-del", vec![make_delegated("a1")], None);
+        assert_eq!(
+            delegation_result_status_kind(&all_delegated.status),
+            DelegationResultStatusKind::Completed,
+            "Delegated children must aggregate to Completed, not Unfinished"
+        );
+        assert!(all_delegated.is_success());
+        assert!(!all_delegated.is_unfinished());
+
+        // Mixed completed + delegated: still all-success → Completed
+        let mixed = DelegationResult::from_results(
+            "d-mix",
+            vec![make_result("a1", "one"), make_delegated("a2")],
+            None,
+        );
+        assert_eq!(
+            delegation_result_status_kind(&mixed.status),
+            DelegationResultStatusKind::Completed,
+        );
+    }
+
     // ── Serialization ───
 
     #[test]
@@ -1476,6 +1628,7 @@ mod tests {
     #[test]
     fn delegation_request_round_trip() {
         let req = DelegationRequest {
+            session_id: "test-session".into(),
             delegation_id: "d1".into(),
             parent_run_id: "run-1".into(),
             task: "test".into(),

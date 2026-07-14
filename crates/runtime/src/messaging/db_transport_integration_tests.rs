@@ -7,7 +7,9 @@
 //! ASTRA_TEST_DB_URL="mysql://root:111@127.0.0.1:6001/astra_test" cargo test -p astra-runtime db_transport_integration
 //! ```
 //!
-//! If `ASTRA_TEST_DB_URL` is not set, all tests in this module are skipped.
+//! If `ASTRA_TEST_DB_URL` is not set, all tests in this module are skipped. If
+//! it is set, connection failure or timeout fails the suite: an explicitly
+//! requested online test can never silently degrade into a skip.
 
 #[cfg(test)]
 mod tests {
@@ -25,36 +27,39 @@ mod tests {
         AgentAddress::new(run, agent)
     }
 
-    /// Connect to test DB or skip the test.
+    /// Connect to the explicitly configured test DB. Absence means the online
+    /// suite was not requested; a configured but unhealthy endpoint is a real
+    /// test failure and must never be reported as a skip.
     async fn test_pool() -> Option<sqlx::Pool<sqlx::MySql>> {
         let url = match std::env::var("ASTRA_TEST_DB_URL") {
             Ok(u) => u,
             Err(_) => return None,
         };
-        match sqlx::mysql::MySqlPoolOptions::new()
+        let connect = sqlx::mysql::MySqlPoolOptions::new()
             .max_connections(5)
             .acquire_timeout(Duration::from_secs(3))
-            .connect(&url)
-            .await
-        {
-            Ok(pool) => Some(pool),
-            Err(e) => {
-                eprintln!("⚠ DB connection failed (skipping): {e}");
-                None
-            }
+            .connect(&url);
+        match tokio::time::timeout(Duration::from_secs(5), connect).await {
+            Ok(Ok(pool)) => Some(pool),
+            Ok(Err(error)) => panic!("configured ASTRA_TEST_DB_URL is not usable: {error}"),
+            Err(_) => panic!("configured ASTRA_TEST_DB_URL did not connect within 5s"),
         }
     }
 
     /// Clean up test messages between tests.
     async fn cleanup(pool: &sqlx::Pool<sqlx::MySql>) {
-        sqlx::query("DELETE FROM agent_message_broadcast_delivery WHERE consumer_id LIKE '%run-%' OR delegation_id LIKE 'del-%' OR message_id LIKE 'test-%'")
+        sqlx::query("DELETE FROM agent_message_broadcast_delivery WHERE consumer_id LIKE '%@run-db-%' OR consumer_id LIKE '%@run-directory-%' OR delegation_id IN ('del-db-bcast-ttl', 'del-db-test', 'del-directory-a', 'del-directory-b') OR message_id LIKE 'test-%'")
             .execute(pool)
             .await
             .expect("cleanup messaging DB transport broadcast delivery fixture rows");
-        sqlx::query("DELETE FROM agent_message_queue WHERE message_id LIKE 'test-%' OR from_run_id LIKE 'run-%'")
+        sqlx::query("DELETE FROM agent_message_queue WHERE message_id LIKE 'test-%' OR from_run_id LIKE 'run-db-%' OR from_run_id LIKE 'run-directory-%'")
             .execute(pool)
             .await
             .expect("cleanup messaging DB transport fixture rows");
+        sqlx::query("DELETE FROM agent_mailbox_directory WHERE delegation_id IN ('del-db-bcast-ttl', 'del-db-test', 'del-directory-a', 'del-directory-b')")
+            .execute(pool)
+            .await
+            .expect("cleanup messaging directory fixture rows");
     }
 
     macro_rules! skip_without_db {
@@ -71,6 +76,7 @@ mod tests {
     // ── Schema ──────────────────────────────────────────────────────────────
 
     #[tokio::test]
+    #[serial_test::serial(db_transport_online)]
     async fn ensure_schema_is_idempotent() {
         skip_without_db!(pool);
         // Call twice — should not error.
@@ -78,9 +84,72 @@ mod tests {
         ensure_schema(&pool).await.unwrap();
     }
 
+    #[tokio::test]
+    #[serial_test::serial(db_transport_online)]
+    async fn mailbox_directory_resolves_across_replicas_and_isolates_delegations() {
+        skip_without_db!(pool);
+        let first_replica = DatabaseTransport::new(pool.clone());
+        let second_replica = DatabaseTransport::new(pool.clone());
+        let first = addr("run-directory-a", "reviewer");
+        let second = addr("run-directory-b", "reviewer");
+
+        first_replica
+            .register(first.clone(), Some("del-directory-a".into()))
+            .await
+            .unwrap();
+        second_replica
+            .register(second.clone(), Some("del-directory-b".into()))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            second_replica
+                .resolve_agent("del-directory-a", "reviewer")
+                .await
+                .unwrap(),
+            first
+        );
+        assert_eq!(
+            first_replica
+                .resolve_agent("del-directory-b", "reviewer")
+                .await
+                .unwrap(),
+            second
+        );
+        assert_eq!(
+            first_replica.list_agents("del-directory-a").await.unwrap(),
+            vec![first.clone()]
+        );
+
+        let competing_replica = DatabaseTransport::new(pool.clone());
+        let competing = addr("run-directory-competing", "reviewer");
+        assert!(
+            competing_replica
+                .register(competing.clone(), Some("del-directory-a".into()))
+                .await
+                .is_err(),
+            "a live scoped identity must have exactly one mailbox owner"
+        );
+
+        first_replica.unregister(&first).await.unwrap();
+        assert!(
+            second_replica
+                .resolve_agent("del-directory-a", "reviewer")
+                .await
+                .is_err()
+        );
+        competing_replica
+            .register(competing.clone(), Some("del-directory-a".into()))
+            .await
+            .expect("released scoped identity should be reclaimable immediately");
+        competing_replica.unregister(&competing).await.unwrap();
+        second_replica.unregister(&second).await.unwrap();
+    }
+
     // ── Direct Messages ─────────────────────────────────────────────────────
 
     #[tokio::test]
+    #[serial_test::serial(db_transport_online)]
     async fn direct_message_send_and_receive() {
         skip_without_db!(pool);
 
@@ -119,6 +188,7 @@ mod tests {
             }
             other => panic!("expected Text, got: {other:?}"),
         }
+        stream_b.acknowledge(&received).await.unwrap();
 
         let status = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -155,6 +225,7 @@ mod tests {
     // ── Broadcast ───────────────────────────────────────────────────────────
 
     #[tokio::test]
+    #[serial_test::serial(db_transport_online)]
     async fn broadcast_delivers_to_all_members() {
         skip_without_db!(pool);
 
@@ -193,22 +264,21 @@ mod tests {
         transport.broadcast(del, msg).await.unwrap();
 
         // All members should receive (including sender, matching InProcessTransport behavior).
-        let r1 = tokio::time::timeout(Duration::from_secs(2), stream_w1.recv()).await;
-        let r2 = tokio::time::timeout(Duration::from_secs(2), stream_w2.recv()).await;
-        let r_leader = tokio::time::timeout(Duration::from_secs(2), stream_leader.recv()).await;
-
-        assert!(
-            r1.is_ok() && r1.unwrap().is_some(),
-            "worker-1 should receive broadcast"
-        );
-        assert!(
-            r2.is_ok() && r2.unwrap().is_some(),
-            "worker-2 should receive broadcast"
-        );
-        assert!(
-            r_leader.is_ok() && r_leader.unwrap().is_some(),
-            "leader should receive own broadcast"
-        );
+        let r1 = tokio::time::timeout(Duration::from_secs(2), stream_w1.recv())
+            .await
+            .expect("worker-1 broadcast timeout")
+            .expect("worker-1 stream closed");
+        let r2 = tokio::time::timeout(Duration::from_secs(2), stream_w2.recv())
+            .await
+            .expect("worker-2 broadcast timeout")
+            .expect("worker-2 stream closed");
+        let r_leader = tokio::time::timeout(Duration::from_secs(2), stream_leader.recv())
+            .await
+            .expect("leader broadcast timeout")
+            .expect("leader stream closed");
+        stream_w1.acknowledge(&r1).await.unwrap();
+        stream_w2.acknowledge(&r2).await.unwrap();
+        stream_leader.acknowledge(&r_leader).await.unwrap();
 
         cleanup(&pool).await;
     }
@@ -216,6 +286,7 @@ mod tests {
     // ── Multiple Messages in Order ──────────────────────────────────────────
 
     #[tokio::test]
+    #[serial_test::serial(db_transport_online)]
     async fn messages_arrive_in_fifo_order() {
         skip_without_db!(pool);
 
@@ -253,6 +324,7 @@ mod tests {
             if let MessagePayload::Text { content, .. } = &msg.payload {
                 received.push(content.clone());
             }
+            stream_b.acknowledge(&msg).await.unwrap();
         }
         assert_eq!(received, vec!["msg-0", "msg-1", "msg-2", "msg-3", "msg-4"]);
 
@@ -262,6 +334,7 @@ mod tests {
     // ── TTL Expiry ──────────────────────────────────────────────────────────
 
     #[tokio::test]
+    #[serial_test::serial(db_transport_online)]
     async fn expired_direct_messages_are_marked_failed() {
         skip_without_db!(pool);
 
@@ -313,6 +386,7 @@ mod tests {
             }
             _ => panic!("unexpected payload"),
         }
+        stream_b.acknowledge(&received).await.unwrap();
 
         let status = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -338,6 +412,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(db_transport_online)]
     async fn invalid_direct_payloads_are_marked_failed() {
         skip_without_db!(pool);
 
@@ -400,6 +475,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(db_transport_online)]
     async fn direct_failure_identity_uses_message_id() {
         skip_without_db!(pool);
 
@@ -463,6 +539,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(db_transport_online)]
     async fn ack_message_requires_matching_consumer_and_clears_claim_metadata() {
         skip_without_db!(pool);
 
@@ -558,6 +635,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(db_transport_online)]
     async fn nack_message_requires_matching_consumer_and_clears_claim_metadata() {
         skip_without_db!(pool);
 
@@ -635,6 +713,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(db_transport_online)]
     async fn current_claim_fetch_excludes_preexisting_claimed_rows_with_other_token() {
         skip_without_db!(pool);
 
@@ -708,6 +787,7 @@ mod tests {
             }
             other => panic!("expected Text, got: {other:?}"),
         }
+        stream.acknowledge(&received).await.unwrap();
 
         let extra = tokio::time::timeout(Duration::from_millis(300), stream.recv()).await;
         assert!(
@@ -735,6 +815,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(db_transport_online)]
     async fn expired_broadcast_messages_are_marked_failed() {
         skip_without_db!(pool);
 
@@ -802,6 +883,7 @@ mod tests {
     // ── Cleanup Utilities ───────────────────────────────────────────────────
 
     #[tokio::test]
+    #[serial_test::serial(db_transport_online)]
     async fn cleanup_expired_removes_old_messages() {
         skip_without_db!(pool);
 
@@ -835,6 +917,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(db_transport_online)]
     async fn cleanup_older_than_preserves_pending_and_claimed_messages() {
         skip_without_db!(pool);
 
@@ -999,6 +1082,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(db_transport_online)]
     async fn reclaim_stale_requeues_retryable_and_dead_letters_exhausted_messages() {
         skip_without_db!(pool);
 
@@ -1103,6 +1187,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(db_transport_online)]
     async fn register_starts_cleanup_scheduler_and_reclaims_stale_claims() {
         skip_without_db!(pool);
 
@@ -1167,6 +1252,7 @@ mod tests {
     // ── Unregister stops stream ─────────────────────────────────────────────
 
     #[tokio::test]
+    #[serial_test::serial(db_transport_online)]
     async fn unregister_stops_poll_task() {
         skip_without_db!(pool);
 
@@ -1192,6 +1278,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(db_transport_online)]
     async fn unregister_releases_claimed_rows_immediately() {
         skip_without_db!(pool);
 
@@ -1289,6 +1376,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(db_transport_online)]
     async fn shutdown_releases_claimed_rows_immediately() {
         skip_without_db!(pool);
 
@@ -1388,6 +1476,7 @@ mod tests {
     // ── Subscribe requires registration ─────────────────────────────────────
 
     #[tokio::test]
+    #[serial_test::serial(db_transport_online)]
     async fn subscribe_requires_registration() {
         skip_without_db!(pool);
 
@@ -1399,6 +1488,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(db_transport_online)]
     async fn shutdown_rejects_new_local_operations() {
         skip_without_db!(pool);
 

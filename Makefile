@@ -49,6 +49,7 @@ help:
 	@echo "  make test               - test-offline + test-online (Rust DB online; optional SDK remote E2E if ASTRA_SDK_ONLINE_E2E=1)"
 	@echo "  make test-offline       - Rust workspace + bridge-e2e-hooks + @astra/sdk (30s per case via profile=strict; override: NEXTEST_OFFLINE_PROFILE=<profile>)"
 	@echo "  make test-online        - Rust #[ignore] + Matrix E2E (30s per case via profile=strict-online; see .config/nextest.toml)"
+	@echo "  make test-memoria-online-contract - Real Memoria missing-ID/circuit-recovery contract (explicit)"
 	@echo "  make test-runtime-profiles - Server-only + server+edge + managed runtime + CLI-local profile guardrails"
 	@echo "  make test-server-only   - Focused Web/runtime tests for server-only access surface"
 	@echo "  make test-server-edge   - Focused tests for edge provider protocol and routing"
@@ -302,7 +303,7 @@ dev-deps-wait:
 .PHONY: dev-db-connect
 dev-db-connect:
 	@set -a; [ -f .env ] && . ./.env; set +a; \
-	mysql --protocol=TCP -h$${MATRIXONE_HOST:-127.0.0.1} -P$${MATRIXONE_PORT:-6001} -u$${MATRIXONE_USER:-root} -p$${MATRIXONE_PASSWORD:-111}
+	scripts/dev/mysql-client.sh
 
 # ============================================================================
 # API Server (Source Code Mode)
@@ -752,23 +753,9 @@ dev-seed:
 	@printf "Are you sure? [y/N] "; read REPLY; \
 	[ "$$REPLY" = "y" ] || [ "$$REPLY" = "Y" ] || { echo "Cancelled"; exit 1; }
 	@set -a; [ -f .env ] && . ./.env; set +a; \
-	DB_HOST=$${MATRIXONE_HOST:-127.0.0.1}; \
-	DB_PORT=$${MATRIXONE_PORT:-6001}; \
-	DB_USER=$${MATRIXONE_USER:-root}; \
-	DB_PASS=$${MATRIXONE_PASSWORD:-111}; \
 	DB_NAME=$${ASTRA_DATABASE:-astra_runtime}; \
 	SQL="DROP DATABASE IF EXISTS $$DB_NAME; CREATE DATABASE $$DB_NAME;"; \
-	run_mysql_ddl() { mysql --protocol=TCP -h"$$DB_HOST" -P"$$DB_PORT" -u"$$DB_USER" -p"$$DB_PASS" "$$@" -e "$$SQL"; }; \
-	mysql_ssl_disable_arg() { \
-		if mysql --no-defaults --skip-ssl --version >/dev/null 2>&1 && [ -z "$$(mysql --no-defaults --skip-ssl --version 2>&1 >/dev/null)" ]; then printf '%s\n' "--skip-ssl"; \
-		elif mysql --no-defaults --ssl=0 --version >/dev/null 2>&1 && [ -z "$$(mysql --no-defaults --ssl=0 --version 2>&1 >/dev/null)" ]; then printf '%s\n' "--ssl=0"; \
-		elif mysql --no-defaults --ssl-mode=DISABLED --version >/dev/null 2>&1 && [ -z "$$(mysql --no-defaults --ssl-mode=DISABLED --version 2>&1 >/dev/null)" ]; then printf '%s\n' "--ssl-mode=DISABLED"; \
-		fi; \
-	}; \
-	MYSQL_SSL_ARG=$$(mysql_ssl_disable_arg); \
-	run_mysql_ddl 2>/dev/null || { \
-		if [ -n "$$MYSQL_SSL_ARG" ]; then run_mysql_ddl "$$MYSQL_SSL_ARG"; else run_mysql_ddl; fi; \
-	}
+	scripts/dev/mysql-client.sh -e "$$SQL"
 	@$(MAKE) dev-api-restart-debug build-cli-debug
 	@sleep 2
 	@echo "Registering admin (admin@mo.com)..."
@@ -1041,11 +1028,10 @@ test-runtime-bridge-hooks: sweep
 # Ignored tests: opt-in via env vars (see `make test-online`). Enable with:
 #   ASTRA_TEST_DB_IT=1   -> all online/Matrix ignored integration tests (--ignored)
 #
-# Single `cargo nextest run` covers every `#[ignore]` integration binary
-# across astra-runtime / astra-services / astra-plan. nextest itself
-# tracks TIMEOUT/FAIL per-case, emits per-case status lines during the
-# run, and prints the standard `Summary [ … ]` at the end — same UX as
-# `make test-offline`. No per-suite tee/log bookkeeping needed.
+# This helper owns the astra-runtime / astra-plan integration binaries.
+# astra-services integration binaries run in test-online's core lane, beside
+# the astra-services ignored lib tests, so their test-binary linking and live-DB
+# time are charged to core. `make test-online` remains the complete online suite.
 #
 # Optional serial mode: ASTRA_TEST_DB_IT_TEST_THREADS=1 -> -j 1
 .PHONY: test-ignored-integration
@@ -1062,23 +1048,32 @@ test-ignored-integration:
 		else \
 			echo "Running online integration tests (ignored; live MatrixOne; bridge-e2e-hooks enabled for system_matrix_http_e2e)..."; \
 		fi; \
-		FAILED=""; \
 		PERF_FAILED=""; \
-		CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) \
-			-p astra-runtime -p astra-services -p astra-plan \
-			--features astra-runtime/bridge-e2e-hooks \
-			--tests --run-ignored only \
-			$(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG \
-			-E 'not test(/perf_benchmark_/)' \
-				|| FAILED="$$FAILED integration"; \
-		echo "Running online performance benchmarks in an isolated serial lane (blocking unless ASTRA_STRICT_ONLINE_PERF=0)..."; \
-		CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) \
-			-p astra-runtime \
-			--features astra-runtime/bridge-e2e-hooks \
-			--tests --run-ignored only \
-			$(NEXTEST_ONLINE_FLAGS) -j 1 \
-			-E 'test(/perf_benchmark_/)' \
-			|| PERF_FAILED=1; \
+		if [ "$$JOBS_FLAG" = "-j 1" ] && [ "$${ASTRA_STRICT_ONLINE_PERF:-1}" != "0" ]; then \
+			echo "Running runtime/plan integration and performance tests in one serial build..."; \
+			CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) \
+				-p astra-runtime -p astra-plan \
+				--features astra-runtime/bridge-e2e-hooks \
+				--tests --run-ignored only \
+				$(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG \
+					|| FAILED="$$FAILED runtime-plan-perf"; \
+		else \
+			CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) \
+				-p astra-runtime -p astra-plan \
+				--features astra-runtime/bridge-e2e-hooks \
+				--tests --run-ignored only \
+				$(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG \
+				-E 'not test(/perf_benchmark_/)' \
+					|| FAILED="$$FAILED integration"; \
+			echo "Running online performance benchmarks in an isolated serial lane (blocking unless ASTRA_STRICT_ONLINE_PERF=0)..."; \
+			CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) \
+				-p astra-runtime \
+				--features astra-runtime/bridge-e2e-hooks \
+				--tests --run-ignored only \
+				$(NEXTEST_ONLINE_FLAGS) -j 1 \
+				-E 'test(/perf_benchmark_/)' \
+					|| PERF_FAILED=1; \
+		fi; \
 		if [ -n "$$FAILED" ]; then \
 			echo "❌ test-ignored-integration: failed lanes:$$FAILED"; \
 			exit 1; \
@@ -1107,30 +1102,18 @@ test-online:
 	RUNTIME_IGNORED_DB="$${TEST_DB_BASE}_runtime_ignored"; \
 	INTEGRATION_DB="$${TEST_DB_BASE}_integration"; \
 	ONLINE_LANE=$${ASTRA_ONLINE_LANE:-all}; \
+	ONLINE_JOBS_FLAG=""; \
+	if [ "$${ASTRA_TEST_DB_IT_TEST_THREADS:-}" = "1" ]; then ONLINE_JOBS_FLAG="-j 1"; fi; \
 	case "$$ONLINE_LANE" in \
 		all) DB_NAMES="$$RUNTIME_IGNORED_DB $$INTEGRATION_DB" ;; \
 		core) DB_NAMES="$$RUNTIME_IGNORED_DB" ;; \
 		integration) DB_NAMES="$$INTEGRATION_DB" ;; \
 		*) echo "❌ invalid ASTRA_ONLINE_LANE=$$ONLINE_LANE (expected all, core, or integration)"; exit 2 ;; \
 	esac; \
-	DB_HOST=$${MATRIXONE_HOST:-127.0.0.1}; \
-	DB_PORT=$${MATRIXONE_PORT:-6001}; \
-	DB_USER=$${MATRIXONE_USER:-root}; \
-	DB_PASS=$${MATRIXONE_PASSWORD:-111}; \
 	echo "Running online lane=$$ONLINE_LANE; recreating test databases: $$DB_NAMES ..."; \
-	run_mysql_ddl() { _sql=$$1; shift; mysql --protocol=TCP -h"$$DB_HOST" -P"$$DB_PORT" -u"$$DB_USER" -p"$$DB_PASS" "$$@" -e "$$_sql"; }; \
-	mysql_ssl_disable_arg() { \
-		if mysql --no-defaults --skip-ssl --version >/dev/null 2>&1 && [ -z "$$(mysql --no-defaults --skip-ssl --version 2>&1 >/dev/null)" ]; then printf '%s\n' "--skip-ssl"; \
-		elif mysql --no-defaults --ssl=0 --version >/dev/null 2>&1 && [ -z "$$(mysql --no-defaults --ssl=0 --version 2>&1 >/dev/null)" ]; then printf '%s\n' "--ssl=0"; \
-		elif mysql --no-defaults --ssl-mode=DISABLED --version >/dev/null 2>&1 && [ -z "$$(mysql --no-defaults --ssl-mode=DISABLED --version 2>&1 >/dev/null)" ]; then printf '%s\n' "--ssl-mode=DISABLED"; \
-		fi; \
-	}; \
-	MYSQL_SSL_ARG=$$(mysql_ssl_disable_arg); \
 	for DB_NAME in $$DB_NAMES; do \
 		SQL="DROP DATABASE IF EXISTS $$DB_NAME; CREATE DATABASE $$DB_NAME;"; \
-		run_mysql_ddl "$$SQL" 2>/dev/null || { \
-			if [ -n "$$MYSQL_SSL_ARG" ]; then run_mysql_ddl "$$SQL" "$$MYSQL_SSL_ARG"; else run_mysql_ddl "$$SQL"; fi; \
-		} 2>/dev/null || true; \
+		scripts/dev/mysql-client.sh -e "$$SQL" 2>/dev/null || true; \
 	done; \
 	FAILED=""; \
 	if [ "$$ONLINE_LANE" != "integration" ]; then \
@@ -1138,21 +1121,22 @@ test-online:
 		ASTRA_DATABASE=$$RUNTIME_IGNORED_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
 			ASTRA_TEST_DB_IT=1 \
 			CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) \
-				--lib --bins --run-ignored only $(NEXTEST_ONLINE_FLAGS) \
+				--lib --bins --run-ignored only $(NEXTEST_ONLINE_FLAGS) $$ONLINE_JOBS_FLAG \
 				-E 'not test(/durable_run_event_pressure_probe/)' \
 				|| FAILED="$$FAILED astra-runtime-ignored"; \
 		echo "Running astra-turn-core db-store ignored tests (live DB=$$RUNTIME_IGNORED_DB; nextest profile=$(NEXTEST_ONLINE_PROFILE))..."; \
 		ASTRA_DATABASE=$$RUNTIME_IGNORED_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
 			ASTRA_TEST_DB_IT=1 \
 			CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) -p astra-turn-core \
-				--features db-store --lib --run-ignored only $(NEXTEST_ONLINE_FLAGS) \
+				--features db-store --lib --run-ignored only $(NEXTEST_ONLINE_FLAGS) $$ONLINE_JOBS_FLAG \
 				|| FAILED="$$FAILED astra-turn-core-db-store"; \
-		echo "Running astra-services ignored lib tests (live DB=$$RUNTIME_IGNORED_DB; nextest profile=$(NEXTEST_ONLINE_PROFILE))..."; \
+		echo "Running astra-services ignored lib/integration tests (live DB=$$RUNTIME_IGNORED_DB; nextest profile=$(NEXTEST_ONLINE_PROFILE))..."; \
 		ASTRA_DATABASE=$$RUNTIME_IGNORED_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
+			ASTRA_TEST_DATABASE=$$RUNTIME_IGNORED_DB \
 			ASTRA_TEST_DB_IT=1 \
 			CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) -p astra-services \
-				--lib --run-ignored only $(NEXTEST_ONLINE_FLAGS) \
-				|| FAILED="$$FAILED astra-services-db-store"; \
+				--lib --tests --run-ignored only $(NEXTEST_ONLINE_FLAGS) $$ONLINE_JOBS_FLAG \
+				|| FAILED="$$FAILED astra-services-online"; \
 	fi; \
 	if [ "$$ONLINE_LANE" != "core" ]; then \
 		echo "Running ignored integration suites (live DB=$$INTEGRATION_DB; nextest profile=$(NEXTEST_ONLINE_PROFILE))..."; \
@@ -1173,6 +1157,11 @@ test-online:
 	else \
 		echo "Skipping @astra/sdk remote E2E (set ASTRA_SDK_ONLINE_E2E=1 with API running, or: make test-sdk-online)"; \
 	fi
+	@if [ "$${ASTRA_MEMORIA_ONLINE:-}" = "1" ]; then \
+		$(MAKE) test-memoria-online-contract; \
+	else \
+		echo "Skipping real Memoria contract (set ASTRA_MEMORIA_ONLINE=1, or: make test-memoria-online-contract)"; \
+	fi
 	@echo ""
 	@echo "NOTE: live-LLM suite (real provider APIs, reads .models.yaml) auto-skips unless"
 	@echo "      ASTRA_LIVE_LLM=1 is set. Run it explicitly with: make test-live-llm"
@@ -1180,6 +1169,16 @@ test-online:
 # Explicit cleanup pressure probes. This is intentionally not part of
 # test-online because pressure timings are operational evidence, not a normal
 # per-case correctness budget.
+.PHONY: test-memoria-online-contract
+test-memoria-online-contract:
+	@if [ ! -f .env ]; then echo "❌ .env is required for the real Memoria contract"; exit 2; fi
+	@set -a; . ./.env; set +a; \
+		if [ -z "$$MEMORIA_MASTER_KEY" ]; then \
+			echo "❌ MEMORIA_MASTER_KEY is required for the real Memoria contract"; exit 2; \
+		fi; \
+		ASTRA_MEMORIA_ONLINE=1 $(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-tools \
+			--test memoria_online_contract -- --ignored
+
 .PHONY: test-cleanup-pressure
 test-cleanup-pressure:
 	@python3 scripts/load/cleanup_pressure_probe.py \
@@ -1504,23 +1503,13 @@ db-reset:
 		else \
 			DB_NAME=dev_agent; \
 		fi; \
-		DB_HOST=$${MATRIXONE_HOST:-127.0.0.1}; \
-		DB_PORT=$${MATRIXONE_PORT:-6001}; \
-		DB_USER=$${MATRIXONE_USER:-root}; \
-		DB_PASS=$${MATRIXONE_PASSWORD:-111}; \
 		SQL="DROP DATABASE IF EXISTS $$DB_NAME; CREATE DATABASE $$DB_NAME;"; \
-		run_mysql_ddl() { mysql --protocol=TCP -h"$$DB_HOST" -P"$$DB_PORT" -u"$$DB_USER" -p"$$DB_PASS" "$$@" -e "$$SQL"; }; \
-		mysql_ssl_disable_arg() { \
-			if mysql --no-defaults --ssl-mode=DISABLED --version >/dev/null 2>&1; then printf '%s\n' "--ssl-mode=DISABLED"; \
-			elif mysql --no-defaults --ssl=0 --version >/dev/null 2>&1; then printf '%s\n' "--ssl=0"; \
-			elif mysql --no-defaults --skip-ssl --version >/dev/null 2>&1; then printf '%s\n' "--skip-ssl"; \
-			fi; \
-		}; \
-		MYSQL_SSL_ARG=$$(mysql_ssl_disable_arg); \
-		run_mysql_ddl 2>/dev/null || { \
-			if [ -n "$$MYSQL_SSL_ARG" ]; then run_mysql_ddl "$$MYSQL_SSL_ARG"; else run_mysql_ddl; fi; \
-		}; \
+		scripts/dev/mysql-client.sh -e "$$SQL"; \
 		echo "✅ Database reset complete"; \
 	else \
 		echo "Cancelled"; \
 	fi
+
+.PHONY: test-mysql-client
+test-mysql-client:
+	@bash scripts/dev/test-mysql-client.sh

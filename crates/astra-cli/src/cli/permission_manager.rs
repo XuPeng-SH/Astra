@@ -271,8 +271,7 @@ fn sandbox_expand_sensitive_target_denial(name: &str, args: &serde_json::Value) 
     if !name.starts_with("sandbox_expand:") {
         return None;
     }
-    let reason = args.get("reason").and_then(serde_json::Value::as_str)?;
-    let target = parse_sandbox_target_path(reason)?;
+    let target = sandbox_expand_target_path(args)?;
     if !sandbox_expand_target_is_sensitive(&target) {
         return None;
     }
@@ -280,6 +279,18 @@ fn sandbox_expand_sensitive_target_denial(name: &str, args: &serde_json::Value) 
         "Sensitive path cannot be approved through sandbox expansion: {}",
         target.display()
     ))
+}
+
+fn sandbox_expand_target_path(args: &serde_json::Value) -> Option<PathBuf> {
+    args.get("directory")
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            args.get("reason")
+                .and_then(serde_json::Value::as_str)
+                .and_then(parse_sandbox_target_path)
+        })
 }
 
 /// Check whether a sandbox-expansion target is a sensitive path
@@ -563,18 +574,6 @@ pub(crate) struct PermissionModeMirror {
 impl PermissionModeMirror {
     pub(crate) fn current(&self) -> PermissionMode {
         decode_mode_for_mirror(self.inner.load(std::sync::atomic::Ordering::Acquire))
-    }
-
-    /// Stage a new mode without borrowing the `PermissionManager`.
-    /// The owning manager picks this up on its next turn boundary
-    /// via [`PermissionManager::pull_mode_from_mirror`]. Used by
-    /// mid-turn Shift+Tab where the agentic loop holds `&mut state`
-    /// and the UI cannot reach the manager directly.
-    pub(crate) fn stage(&self, mode: PermissionMode) {
-        self.inner.store(
-            encode_mode_for_mirror(mode),
-            std::sync::atomic::Ordering::Release,
-        );
     }
 
     /// Test-only constructor: build a mirror from a pre-encoded u8.
@@ -1332,21 +1331,6 @@ impl PermissionManager {
     pub(crate) fn mode_mirror_handle(&self) -> PermissionModeMirror {
         PermissionModeMirror {
             inner: std::sync::Arc::clone(&self.mode_mirror),
-        }
-    }
-
-    /// Re-sync `self.mode` from the atomic mirror. Used at turn
-    /// boundaries when a UI event (mid-turn Shift+Tab) wrote to the
-    /// mirror without being able to borrow `&mut self`. Cheap; no-op
-    /// when already in sync.
-    pub(crate) fn pull_mode_from_mirror(&mut self) {
-        let mirror =
-            decode_mode_for_mirror(self.mode_mirror.load(std::sync::atomic::Ordering::Acquire));
-        if self.mode != mirror {
-            self.mode = mirror;
-            if let Some(session_id) = self.active_session_id.as_deref() {
-                persist_permission_mode_to_workspace(session_id, mirror);
-            }
         }
     }
 
@@ -3109,9 +3093,9 @@ impl PermissionManager {
         let side_effect = Self::classify_with_args(name, args);
 
         // Step 2: Git safety approval gate.
-        // Broad overrides cannot skip this gate. Auto/Bypass can resolve soft
-        // findings without prompting; hard findings remain denied/prompted by
-        // mode policy.
+        // Broad overrides cannot skip this gate. Bypass suppresses approval
+        // interaction for every Git finding; true execution/path boundaries
+        // are enforced by the independent safety and sandbox gates below.
         if side_effect == SideEffect::Execute {
             let git_violations = Self::check_git_safety(args);
             if !git_violations.is_empty() {
@@ -3129,10 +3113,6 @@ impl PermissionManager {
                     return false;
                 }
                 if self.mode.skips_human_approval_prompts() {
-                    if has_hard {
-                        eprintln!("  {}", "  Git safety hard violation — blocked".red());
-                        return false;
-                    }
                     return true;
                 }
                 // Soft-only violations: respect auto mode and session overrides.
@@ -3146,8 +3126,8 @@ impl PermissionManager {
                         return allowed;
                     }
                 }
-                // Hard git findings still require explicit approval in Auto.
-                // Bypass is the explicit "do not interrupt me" mode.
+                // Execution-redirection Git findings still require explicit
+                // approval in Auto. Bypass is the explicit no-prompt mode.
                 if self.mode == PermissionMode::Auto && has_hard {
                     eprintln!(
                         "  {}",
@@ -3387,11 +3367,7 @@ impl PermissionManager {
                     GateOutcome::Deny("Sandbox expansion denied for session".into())
                 };
             }
-            let reason = args
-                .get("reason")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("Access to path outside project boundary");
-            if let Some(target) = parse_sandbox_target_path(reason)
+            if let Some(target) = sandbox_expand_target_path(args)
                 && self.path_under_trusted_root(&target)
             {
                 return GateOutcome::Allow;
@@ -5690,28 +5666,25 @@ mod tests {
         assert!(pm.recent_rejections().is_empty());
     }
 
-    // ── Security: session overrides cannot bypass safety checks ──────────────
+    // ── Risk evidence remains separate from true safety boundaries ──────────
 
     #[test]
-    fn broad_session_override_cannot_bypass_git_safety() {
-        // CRITICAL: a broad "bash" approval must not cover destructive git.
-        // Only an exact command approval can reuse this gate.
+    fn auto_mode_keeps_worktree_destructive_as_advisory() {
         let mut pm = PermissionManager::new(false);
         pm.set_mode(PermissionMode::Auto);
         pm.session_overrides.insert(bare_fp("bash"), true);
         let args = serde_json::json!({
             "command": "git restore --staged --worktree crates/foo/src/lib.rs"
         });
-        // Must NOT be Allow in Auto; broad overrides are too wide here.
         let decision = pm.check_nonblocking("bash", &args);
         assert!(
-            matches!(decision, GateOutcome::NeedApproval { .. }),
-            "broad session override must not bypass git safety: got {decision:?}"
+            matches!(decision, GateOutcome::Allow),
+            "worktree mutation is risk evidence, not a hard boundary: got {decision:?}"
         );
     }
 
     #[test]
-    fn exact_session_override_allows_same_bounded_git_safety_request_only() {
+    fn auto_mode_does_not_require_per_path_approvals_for_worktree_mutation() {
         let mut pm = PermissionManager::new(false);
         pm.set_mode(PermissionMode::Auto);
         let args = serde_json::json!({
@@ -5730,8 +5703,8 @@ mod tests {
         });
         let sibling_decision = pm.check_nonblocking("bash", &sibling);
         assert!(
-            matches!(sibling_decision, GateOutcome::NeedApproval { .. }),
-            "exact git approval must not widen to sibling commands: got {sibling_decision:?}"
+            matches!(sibling_decision, GateOutcome::Allow),
+            "Auto mode should not interrupt for another workspace path: got {sibling_decision:?}"
         );
     }
 
@@ -6277,6 +6250,21 @@ mod tests {
         });
 
         let decision = pm.check_nonblocking("sandbox_expand:bash", &args);
+
+        assert!(matches!(decision, GateOutcome::Allow));
+    }
+
+    #[test]
+    fn agent_spawn_does_not_prompt_in_prompt_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+        let args = serde_json::json!({
+            "action": "spawn",
+            "description": "Review",
+            "prompt": "Check the diff"
+        });
+
+        let decision = pm.check_nonblocking("agent", &args);
 
         assert!(matches!(decision, GateOutcome::Allow));
     }
@@ -7128,19 +7116,25 @@ mod tests {
     }
 
     #[test]
-    fn bypass_mode_denies_git_hard_violation_without_prompt() {
+    fn bypass_mode_keeps_git_risk_as_evidence_without_prompting() {
         let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Bypass, dir.path());
         let args = serde_json::json!({
             "command": "git restore --staged --worktree crates/foo/src/lib.rs"
         });
 
-        match pm.check_nonblocking("bash", &args) {
-            GateOutcome::Deny(reason) => {
-                assert!(reason.contains("Git safety hard violation"), "{reason}");
-            }
-            other => panic!("expected hard git denial in bypass mode, got {other:?}"),
-        }
+        assert!(matches!(
+            pm.check_nonblocking("bash", &args),
+            GateOutcome::Allow
+        ));
+
+        let read_only_compound = serde_json::json!({
+            "command": "cd /home/xupeng/astra && git diff origin/main...HEAD --stat | awk '{print $1}'"
+        });
+        assert!(matches!(
+            pm.check_nonblocking("bash", &read_only_compound),
+            GateOutcome::Allow
+        ));
     }
 
     #[test]
@@ -7474,7 +7468,7 @@ mod tests {
     }
 
     #[test]
-    fn cloud_preflight_reuses_engine_for_hard_git_policy() {
+    fn cloud_preflight_keeps_git_risk_advisory_in_bypass() {
         let dir = tempfile::tempdir().unwrap();
         let mut auto = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
 
@@ -7501,18 +7495,25 @@ mod tests {
             "quiet Auto cannot prompt for hard git, so it must fail closed"
         );
 
-        let mut bypass = PermissionManager::with_project_mode(PermissionMode::Bypass, dir.path());
-        let bypass_decision = bypass.preflight_cloud_approval_decision(
-            "bash",
-            Some("git push --force origin main"),
-            ApprovalKind::Standard,
-            false,
-        );
-        assert_eq!(
-            bypass_decision,
-            Some(astra_thin_client::ApprovalDecision::Deny),
-            "Bypass skips approval prompts, but hard git policy still applies"
-        );
+        for (command, quiet) in [
+            ("git push --force origin main", false),
+            ("git -c core.fsmonitor=/tmp/hook status", false),
+            ("git restore --staged --worktree .", true),
+        ] {
+            let mut bypass =
+                PermissionManager::with_project_mode(PermissionMode::Bypass, dir.path());
+            let bypass_decision = bypass.preflight_cloud_approval_decision(
+                "bash",
+                Some(command),
+                ApprovalKind::Standard,
+                quiet,
+            );
+            assert_eq!(
+                bypass_decision,
+                Some(astra_thin_client::ApprovalDecision::Allow),
+                "cloud Bypass must match local Bypass for {command}: explicit Git risk is evidence, not a hidden deny"
+            );
+        }
     }
 
     #[test]
@@ -8429,10 +8430,10 @@ mod tests {
 
     // ── Mode mirror lifecycle ──────────────────────────────────
     //
-    // The mirror lets the TUI inner-tick path read the live mode
-    // and lets mid-turn Shift+Tab stage a new mode while the
-    // agentic loop holds `&mut state`. These tests pin both
-    // directions of the contract.
+    // The mirror lets the TUI inner-tick path read the active mode while the
+    // agentic loop holds `&mut state`. Pending picker selections remain in
+    // the UI intent lane until the turn ends, so this value is never merely a
+    // future policy. These tests pin that contract.
 
     #[test]
     fn mode_mirror_encode_and_current() {
@@ -8472,33 +8473,17 @@ mod tests {
     }
 
     #[test]
-    fn mode_mirror_stage_pull_lifecycle() {
+    fn mode_mirror_tracks_only_active_manager_policy() {
         let mut pm = PermissionManager::new(false);
-        let mirror = pm.mode_mirror_handle();
 
-        // stage() does NOT mutate pm.mode(); only pull does
         assert_eq!(pm.mode(), PermissionMode::Prompt);
-        mirror.stage(PermissionMode::Plan);
-        assert_eq!(
-            pm.mode(),
-            PermissionMode::Prompt,
-            "stage alone must not mutate self.mode; the host must pull explicitly"
-        );
-        pm.pull_mode_from_mirror();
-        assert_eq!(
-            pm.mode(),
-            PermissionMode::Plan,
-            "pull_mode_from_mirror must adopt the staged mode"
-        );
-
-        // pull is a no-op when nothing was staged (idempotent)
-        pm.pull_mode_from_mirror();
-        assert_eq!(pm.mode(), PermissionMode::Plan);
-
-        // handles are clonable and share the same mirror
+        // Handles are clonable and report the manager's active mode. A
+        // staged UI selection lives outside this mirror until the current
+        // turn ends, so the footer can never label it as already active.
         let h1 = pm.mode_mirror_handle();
         let h2 = pm.mode_mirror_handle();
-        h1.stage(PermissionMode::Auto);
+        pm.set_mode(PermissionMode::Auto);
+        assert_eq!(h1.current(), PermissionMode::Auto);
         assert_eq!(h2.current(), PermissionMode::Auto);
     }
 

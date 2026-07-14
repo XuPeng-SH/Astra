@@ -393,6 +393,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
 
         let mut state = AgenticLoopState {
             messages,
+            run_transcript_capture: None,
             volatile_pending: Vec::new(),
             recent_rounds: Vec::new(),
             tool_results: Vec::new(),
@@ -405,6 +406,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             recursion_depth: child_recursion_depth,
             final_text: String::new(),
             final_text_streamed: false,
+            final_output_ready_notified: false,
             total_prompt: 0,
             total_completion: 0,
             total_cache_read: 0,
@@ -465,7 +467,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
                 token: self.cancel_token.clone(),
             },
             messaging: Default::default(),
-            deferred_input: Default::default(),
+            user_intents: Default::default(),
             error_recovery: Default::default(),
             run_control: None,
             pipeline_session: Some(
@@ -782,7 +784,7 @@ mod tests {
                 None,
                 None,
                 &allowed_tools,
-                crate::turn::agentic_recursion_guard::MAX_AGENT_RECURSION_DEPTH,
+                crate::turn::agentic_recursion_guard::ABSOLUTE_MAX_AGENT_RECURSION_DEPTH,
                 None,
                 None,
             )
@@ -790,7 +792,7 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            err.contains("recursion depth") && err.contains("reached maximum"),
+            err.contains("recursion depth") && err.contains("absolute safety ceiling"),
             "error must cite depth limit; got: {err}"
         );
     }

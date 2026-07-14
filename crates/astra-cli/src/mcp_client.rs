@@ -11,16 +11,27 @@ pub use astra_mcp::{
 
 /// Connect an MCP server and register any `skill://` resources it exposes.
 pub async fn connect_and_discover_skills(
-    manager: &mut McpClientManager,
+    manager: &std::sync::Arc<tokio::sync::RwLock<McpClientManager>>,
     config: McpServerConfig,
     skill_registry: &astra_runtime::skills::UnifiedSkillRegistry,
 ) -> Result<usize, McpError> {
     let server_name = config.name.clone();
-    manager.connect(config).await?;
-
-    let Some(conn) = manager.get(&server_name) else {
+    let roots = manager.read().await.roots().clone();
+    let prepared = match McpClientManager::prepare_connection(config, roots).await {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            manager
+                .write()
+                .await
+                .record_connection_failure(server_name.clone());
+            return Err(error);
+        }
+    };
+    let Some(prepared) = prepared else {
         return Ok(0);
     };
+    let conn = prepared.connection();
+    manager.write().await.install_prepared_connection(prepared);
 
     let skill_resources = conn.discover_skill_resources().await;
     let mut registered = 0usize;

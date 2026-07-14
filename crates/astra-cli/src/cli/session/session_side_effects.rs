@@ -1,63 +1,112 @@
 use crate::cli::session::session_state::SessionState;
 use crate::cli::stream::streaming_types::StreamResult;
 use astra_services::session_journal;
+use std::collections::BTreeSet;
 use std::time::Instant;
 
 /// Cloud journal ingestion is server-owned; CLI keeps the local journal path.
-fn enqueue_ingestion(
-    _state: &SessionState,
-    event: &session_journal::JournalEvent,
-    schedule_background_drain: bool,
-) {
-    let store = astra_services::SyncOutboxStore::local();
-    if event
-        .session_id
-        .as_deref()
-        .is_none_or(|session_id| session_id.trim().is_empty())
-    {
-        if let Err(error) = store.record_skipped_journal_event(
-            event,
-            astra_services::SyncOutboxSkipKind::MissingSessionId,
-            "journal event has no session_id and cannot be delivered to /events",
-        ) {
+fn enqueue_ingestion(_state: &SessionState, event: &session_journal::JournalEvent) {
+    enqueue_ingestion_batch(_state, std::slice::from_ref(event));
+}
+
+/// Notify the asynchronous journal→outbox projector about every source session
+/// represented by an appended journal batch. The local journal is canonical;
+/// the projector owns durable outbox batching and crash recovery by source
+/// watermark, so this turn-local call never waits for its lock or fsync.
+fn enqueue_ingestion_batch(_state: &SessionState, events: &[session_journal::JournalEvent]) {
+    enqueue_ingestion_events(events);
+}
+
+/// Schedule journal-to-outbox projection for records written by a deferred
+/// local sidecar. The journal is already durable at this point; this is only a
+/// latency hint for the independently recoverable projector.
+pub(crate) fn enqueue_ingestion_events(events: &[session_journal::JournalEvent]) {
+    let mut source_sessions = BTreeSet::new();
+    for event in events {
+        if event
+            .session_id
+            .as_deref()
+            .is_none_or(|session_id| session_id.trim().is_empty())
+        {
             tracing::warn!(
                 target: "astra_cli::cloud_sync",
-                ?error,
                 event_type = ?event.event_type,
-                "failed to record skipped sync outbox event"
+                "skipping journal-to-outbox projection hint for event without a session_id"
             );
+            continue;
         }
-        tracing::warn!(
-            target: "astra_cli::cloud_sync",
-            event_type = ?event.event_type,
-            "skipping sync outbox enqueue for journal event without a session_id"
-        );
+        source_sessions.insert(event.session_id.as_deref().unwrap_or_default().to_string());
+    }
+    let scheduled = !source_sessions.is_empty()
+        && source_sessions.iter().all(|session_id| {
+            crate::cli::cloud_sync::schedule_sync_outbox_journal_ingestion(session_id).accepted()
+        });
+    if !scheduled {
+        // Non-interactive one-shot/tests can append journals without a Tokio
+        // runtime. They still need a correct durable outbox boundary; this
+        // fallback is outside the live TUI completion path.
+        enqueue_ingestion_batch_without_runtime(events);
+    }
+}
+
+fn enqueue_ingestion_batch_without_runtime(events: &[session_journal::JournalEvent]) {
+    if events.is_empty() {
         return;
     }
-    match store.enqueue_journal_event(event) {
-        Ok(_) if schedule_background_drain => crate::cli::cloud_sync::schedule_sync_outbox_drain(),
-        Ok(_) => {}
-        Err(error) => {
-            tracing::warn!(
-                target: "astra_cli::cloud_sync",
-                ?error,
-                event_type = ?event.event_type,
-                session_id = event.session_id.as_deref().unwrap_or(""),
-                "failed to enqueue journal event into durable sync outbox"
-            );
+    let store = astra_services::SyncOutboxStore::local();
+    let mut deliverable = Vec::with_capacity(events.len());
+    for event in events {
+        if event
+            .session_id
+            .as_deref()
+            .is_none_or(|session_id| session_id.trim().is_empty())
+        {
+            if let Err(error) = store.record_skipped_journal_event(
+                event,
+                astra_services::SyncOutboxSkipKind::MissingSessionId,
+                "journal event has no session_id and cannot be delivered to /events",
+            ) {
+                tracing::warn!(
+                    target: "astra_cli::cloud_sync",
+                    ?error,
+                    event_type = ?event.event_type,
+                    "failed to record skipped sync outbox event"
+                );
+            }
+            continue;
         }
+        deliverable.push(event.clone());
+    }
+    if deliverable.is_empty() {
+        return;
+    }
+    match store.enqueue_journal_events(&deliverable) {
+        Ok(_) => {}
+        Err(error) => tracing::warn!(
+            target: "astra_cli::cloud_sync",
+            ?error,
+            event_count = deliverable.len(),
+            "failed to enqueue journal events into durable sync outbox"
+        ),
     }
 }
 
 pub(crate) fn enqueue_ingestion_pub(state: &SessionState, event: &session_journal::JournalEvent) {
-    enqueue_ingestion(state, event, true);
+    enqueue_ingestion(state, event);
+}
+
+pub(crate) fn enqueue_ingestion_batch_pub(
+    state: &SessionState,
+    events: &[session_journal::JournalEvent],
+) {
+    enqueue_ingestion_batch(state, events);
 }
 
 pub(crate) fn enqueue_ingestion_for_immediate_drain_pub(
-    state: &SessionState,
+    _state: &SessionState,
     event: &session_journal::JournalEvent,
 ) {
-    enqueue_ingestion(state, event, false);
+    enqueue_ingestion_batch_without_runtime(std::slice::from_ref(event));
 }
 
 pub(crate) fn drop_unattributed_memory_recalls_at_turn_end(session_id: Option<&str>) -> usize {
@@ -227,8 +276,6 @@ pub(crate) fn append_one_shot_journal_events(
     let Some(session_id) = session_id.filter(|sid| !sid.is_empty()) else {
         return Ok(());
     };
-    let writer = session_journal::JournalWriter::new(session_id)
-        .map_err(|error| format!("failed to create session journal for {session_id}: {error}"))?;
     let existing_events = match session_journal::read_journal(session_id) {
         Ok(events) => events,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
@@ -239,17 +286,30 @@ pub(crate) fn append_one_shot_journal_events(
         }
     };
 
-    let mut prompt_events = existing_events.clone();
-    prompt_events.extend_from_slice(&result.turn_observability_events);
-    let turn = journal_prompt_turns(&prompt_events).len() as u32;
-    if turn == 0 {
-        return Ok(());
-    }
+    // A completed user turn is the primary durable fact. LLM request/response
+    // snapshots are optional diagnostics, so their absence must not suppress
+    // turn persistence. A user turn can also span several model rounds, making
+    // the number of model requests the wrong sequence source.
+    let turn = existing_events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.event_type,
+                session_journal::JournalEventType::Turn
+                    | session_journal::JournalEventType::TurnError
+            )
+        })
+        .filter_map(|event| event.turn)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
     if existing_events.iter().any(|event| {
         event.turn == Some(turn) && event.event_type == session_journal::JournalEventType::Turn
     }) {
         return Ok(());
     }
+    let writer = session_journal::JournalWriter::new(session_id)
+        .map_err(|error| format!("failed to create session journal for {session_id}: {error}"))?;
 
     let mut append_events = build_bridge_pipeline_journal_events(
         Some(session_id),
@@ -257,6 +317,18 @@ pub(crate) fn append_one_shot_journal_events(
         model_id.unwrap_or("unknown"),
         &result.turn_observability_events,
     )?;
+    // The stream keeps context assembly as a deferred sidecar so it is only
+    // made durable alongside a settled turn. The interactive commit path does
+    // this already; one-shot chat must preserve the same evidence or a later
+    // `self trace` / resume inspection incorrectly reports that no context was
+    // assembled.
+    if let Some((_, trace_json)) = &result.pending_context_assembly_trace {
+        append_events.push(session_journal::JournalEvent::context_assembly_recorded(
+            Some(session_id),
+            turn,
+            trace_json.clone(),
+        ));
+    }
     append_events.push(
         session_journal::JournalEvent::turn(
             Some(session_id),
@@ -275,6 +347,7 @@ pub(crate) fn append_one_shot_journal_events(
             result.tools_used.clone(),
             result.budget_used,
         )
+        .with_tool_calls(result.tool_call_records.clone())
         .with_run_id(result.run_id.as_deref())
         .with_budget_pressure(result.budget_pressure)
         .with_cache_tokens(result.cache_read_tokens, result.cache_creation_tokens),
@@ -401,7 +474,7 @@ fn journal_prompt_snapshot_from_messages(
         tools,
         provider,
         model,
-        cache_eligible_tokens as usize,
+        usize::try_from(cache_eligible_tokens).unwrap_or(usize::MAX),
     )
 }
 
@@ -460,6 +533,130 @@ mod tests {
         .expect_err("directory journal path should surface an error");
 
         assert!(error.contains("failed to read session journal"), "{error}");
+    }
+
+    #[test]
+    fn append_one_shot_journal_events_persists_turns_without_full_llm_observability() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let sid = format!("one-shot-primary-turn-{}", uuid::Uuid::new_v4());
+        let writer = session_journal::JournalWriter::new(&sid).unwrap();
+        writer
+            .append(&session_journal::JournalEvent::session_start(
+                Some(&sid),
+                Some("test-model"),
+            ))
+            .unwrap();
+
+        let mut first = crate::tests::stub_stream_result_with_records(
+            "first answer",
+            vec![session_journal::ToolCallRecord {
+                name: "read_file".to_string(),
+                ok: true,
+                ms: 4,
+                ..Default::default()
+            }],
+        );
+        first.prompt_tokens = 11;
+        first.completion_tokens = 7;
+        first.pending_context_assembly_trace = Some((
+            41,
+            serde_json::json!({
+                "turn_id": "runtime-round-41",
+                "token_budget": {"max_tokens": 128000, "total_used": 2048},
+                "tools": {"visible_tools": [{"tool_name": "read_file"}]}
+            }),
+        ));
+        append_one_shot_journal_events(
+            Some(&sid),
+            Some("test-model"),
+            "first question",
+            &first,
+            Instant::now(),
+        )
+        .unwrap();
+
+        let second = crate::tests::stub_stream_result("second answer");
+        append_one_shot_journal_events(
+            Some(&sid),
+            Some("test-model"),
+            "second question",
+            &second,
+            Instant::now(),
+        )
+        .unwrap();
+
+        let events = session_journal::read_journal(&sid).unwrap();
+        assert!(events.iter().all(|event| {
+            !matches!(
+                event.event_type,
+                session_journal::JournalEventType::LlmRequestFull
+                    | session_journal::JournalEventType::LlmResponseFull
+            )
+        }));
+        let turns: Vec<_> = events
+            .iter()
+            .filter(|event| event.event_type == session_journal::JournalEventType::Turn)
+            .collect();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].turn, Some(1));
+        assert_eq!(turns[0].user_input.as_deref(), Some("first question"));
+        assert_eq!(turns[0].assistant_output.as_deref(), Some("first answer"));
+        assert_eq!(turns[0].tokens_in, Some(11));
+        assert_eq!(turns[0].tokens_out, Some(7));
+        assert_eq!(
+            turns[0]
+                .tool_calls
+                .as_ref()
+                .map(|calls| calls.iter().filter(|call| call.was_executed()).count()),
+            Some(1)
+        );
+        assert_eq!(turns[1].turn, Some(2));
+        assert_eq!(turns[1].user_input.as_deref(), Some("second question"));
+        assert_eq!(turns[1].assistant_output.as_deref(), Some("second answer"));
+        let traces: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event.event_type == session_journal::JournalEventType::ContextAssemblyRecorded
+            })
+            .collect();
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0].turn, Some(1));
+        assert_eq!(
+            traces[0]
+                .context_assembly_trace
+                .as_ref()
+                .and_then(|trace| trace.get("turn_id"))
+                .and_then(serde_json::Value::as_str),
+            Some("runtime-round-41")
+        );
+
+        // Tool events may carry an internal agentic-round number. They must
+        // not advance the externally visible user-turn sequence.
+        let mut tool_event = session_journal::JournalEvent::base_public(
+            session_journal::JournalEventType::ToolCallError,
+            Some(&sid),
+        );
+        tool_event.turn = Some(99);
+        session_journal::JournalWriter::new(&sid)
+            .unwrap()
+            .append(&tool_event)
+            .unwrap();
+        append_one_shot_journal_events(
+            Some(&sid),
+            Some("test-model"),
+            "third question",
+            &crate::tests::stub_stream_result("third answer"),
+            Instant::now(),
+        )
+        .unwrap();
+
+        let events = session_journal::read_journal(&sid).unwrap();
+        let turns: Vec<_> = events
+            .iter()
+            .filter(|event| event.event_type == session_journal::JournalEventType::Turn)
+            .collect();
+        assert_eq!(turns.len(), 3);
+        assert_eq!(turns[2].turn, Some(3));
     }
 
     #[cfg(unix)]

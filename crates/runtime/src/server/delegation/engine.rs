@@ -42,8 +42,13 @@ fn canonical_agent_id(id: &str) -> String {
 
 use astra_services::coordination::{
     AGENT_RESULT_STATUS_FAILED, AgentProfile, AgentProfileRegistry, AgentResult,
-    AggregationStrategy, CoordinationPattern, DelegationRequest, DelegationResult,
-    agent_result_status_to_subrun_state, aggregate_results,
+    AgentResultStatusKind, AggregationStrategy, CoordinationPattern, DelegationRequest,
+    DelegationResult, DelegationResultStatusKind, agent_result_status_kind,
+    agent_result_status_to_subrun_state, aggregate_results, delegation_result_status_kind,
+};
+use astra_services::delegated_findings::{
+    DelegatedFindingEnvelope, DelegatedFindingParse, MAX_DELEGATED_FINDING_SUMMARY_CHARS,
+    truncate_chars,
 };
 use astra_services::runs::{
     DurableRunStatusKind, durable_run_status_kind, durable_run_status_to_subrun_state,
@@ -52,13 +57,418 @@ use astra_services::{BubbleUpTarget, DatabaseStateProjectionStore, LlmTokenServi
 
 pub use astra_core::SubRunState;
 use astra_core::{
-    InvalidTransition, STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED, STATUS_INPUT_QUEUED,
+    InvalidTransition, STATUS_CANCELLED, STATUS_COMPLETED, STATUS_DELEGATED, STATUS_FAILED,
     STATUS_PAUSED, STATUS_RUNNING, STATUS_VERIFICATION_FAILED, STATUS_WAITING,
 };
 
 use crate::server::run::engine::RunEngine;
 use astra_messaging::router::AgentMailboxRouter;
 use astra_prompts::team_prompts;
+
+/// Grace period for cooperative children to publish a canonical terminal
+/// result after their parent is cancelled. Keep this comfortably above a
+/// scheduler tick, but below the interactive cancellation latency budget.
+/// 500ms allows time for durable state persistence (DB write + fsync).
+const FANOUT_CANCELLATION_DRAIN_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(500);
+
+/// After `abort_all()`, bound the final drain of join handles so a task stuck
+/// in uninterruptible blocking I/O cannot hold the parent turn indefinitely.
+const FANOUT_ABORT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Bound the total time spent reconciling missing children through the
+/// durable authority after an abort drain. A slow durable store must not
+/// hold the parent turn indefinitely. On timeout, children remain explicitly
+/// unfinished so recovery can still observe the eventual durable winner.
+const DELEGATION_RECONCILIATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Await one operation within a deadline shared by the whole reconciliation
+/// batch. Once the budget is exhausted, later operations are not polled. This
+/// prevents fanout width from multiplying cancellation latency.
+async fn await_with_shared_deadline<T>(
+    deadline: &mut Option<tokio::time::Instant>,
+    budget: std::time::Duration,
+    future: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    let deadline = *deadline.get_or_insert_with(|| tokio::time::Instant::now() + budget);
+    if tokio::time::Instant::now() >= deadline {
+        return None;
+    }
+    tokio::time::timeout_at(deadline, future).await.ok()
+}
+
+/// Abort once, then drain as many join results as become available within one
+/// shared deadline. A per-handle timeout multiplies cancellation latency by
+/// fanout width; waiting for only one handle loses settlement evidence for the
+/// rest. Returning `None` means the bounded projection drain ended, not that
+/// every child reached a durable terminal state.
+async fn abort_and_join_next_bounded<T: Send + 'static>(
+    tasks: &mut tokio::task::JoinSet<T>,
+    deadline: &mut Option<tokio::time::Instant>,
+    scope: &'static str,
+) -> Option<Result<T, tokio::task::JoinError>> {
+    let deadline = *deadline.get_or_insert_with(|| {
+        tasks.abort_all();
+        tokio::time::Instant::now() + FANOUT_ABORT_DRAIN_TIMEOUT
+    });
+    match tokio::time::timeout_at(deadline, tasks.join_next()).await {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::error!(
+                target: "astra_runtime::delegation",
+                scope,
+                timeout_ms = FANOUT_ABORT_DRAIN_TIMEOUT.as_millis(),
+                "aborted child join drain reached its shared deadline; durable reconciliation remains authoritative"
+            );
+            None
+        }
+    }
+}
+
+/// State projection is an observability aid, not a copy of the full run tree.
+/// Keep the source, its nearest ancestors, and the root within this write
+/// budget. The canonical transcript and durable run hierarchy remain complete.
+const MAX_FINDING_BUBBLE_TARGETS: usize = 8;
+
+/// Protect recovery from corrupt or externally imported parent maps while
+/// remaining far above the supported delegation depth of normal profiles.
+const MAX_ANCESTRY_TRAVERSAL: usize = 64;
+
+const VERIFICATION_RETRY_BASE_DELAY_MS: u64 = 200;
+const VERIFICATION_RETRY_MAX_DELAY_MS: u64 = 2_000;
+const VERIFICATION_RETRY_JITTER_MS: u64 = 100;
+
+const METRIC_DELEGATION_EXECUTIONS_TOTAL: &str = "astra_delegation_executions_total";
+const METRIC_DELEGATION_DURATION_MS_TOTAL: &str = "astra_delegation_duration_ms_total";
+const METRIC_DELEGATION_SUB_RUNS_TOTAL: &str = "astra_delegation_sub_runs_total";
+const METRIC_DELEGATION_TOKENS_TOTAL: &str = "astra_delegation_tokens_total";
+
+fn register_delegation_metrics(registry: &astra_turn_core::pipeline_metrics::MetricsRegistry) {
+    registry.register_counter(
+        METRIC_DELEGATION_EXECUTIONS_TOTAL,
+        "Delegation executions by coordination pattern and terminal outcome.",
+    );
+    registry.register_counter(
+        METRIC_DELEGATION_DURATION_MS_TOTAL,
+        "Total delegation wall time in milliseconds by pattern and outcome.",
+    );
+    registry.register_counter(
+        METRIC_DELEGATION_SUB_RUNS_TOTAL,
+        "Delegated sub-runs by pattern and canonical terminal status.",
+    );
+    registry.register_counter(
+        METRIC_DELEGATION_TOKENS_TOTAL,
+        "Delegated agent tokens by pattern and token kind.",
+    );
+}
+
+fn delegation_outcome_label(result: &Result<DelegationResult, String>) -> &'static str {
+    match result {
+        Ok(result) => match delegation_result_status_kind(&result.status) {
+            DelegationResultStatusKind::Completed => "completed",
+            DelegationResultStatusKind::Partial => "partial",
+            DelegationResultStatusKind::Unfinished => "unfinished",
+            DelegationResultStatusKind::Failed | DelegationResultStatusKind::Other => "failed",
+        },
+        Err(_) => "error",
+    }
+}
+
+fn sub_run_status_label(status: &str) -> &'static str {
+    match agent_result_status_kind(status) {
+        AgentResultStatusKind::Completed | AgentResultStatusKind::Delegated => "completed",
+        AgentResultStatusKind::Waiting => "waiting",
+        AgentResultStatusKind::Paused => "paused",
+        AgentResultStatusKind::Cancelled => "cancelled",
+        AgentResultStatusKind::Timeout => "timeout",
+        AgentResultStatusKind::VerificationFailed => "verification_failed",
+        AgentResultStatusKind::Partial => "partial",
+        AgentResultStatusKind::Failed | AgentResultStatusKind::Other => "failed",
+    }
+}
+
+fn record_delegation_metrics(
+    registry: Option<&Arc<astra_turn_core::pipeline_metrics::MetricsRegistry>>,
+    pattern: &str,
+    elapsed: std::time::Duration,
+    result: &Result<DelegationResult, String>,
+) {
+    let Some(registry) = registry else { return };
+    let outcome = delegation_outcome_label(result);
+    let labels = [("pattern", pattern), ("outcome", outcome)];
+    registry.increment_counter(METRIC_DELEGATION_EXECUTIONS_TOTAL, &labels, 1);
+    registry.increment_counter(
+        METRIC_DELEGATION_DURATION_MS_TOTAL,
+        &labels,
+        u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+    );
+    if let Ok(result) = result {
+        for sub_run in &result.agent_results {
+            registry.increment_counter(
+                METRIC_DELEGATION_SUB_RUNS_TOTAL,
+                &[
+                    ("pattern", pattern),
+                    ("status", sub_run_status_label(&sub_run.status)),
+                ],
+                1,
+            );
+        }
+        registry.increment_counter(
+            METRIC_DELEGATION_TOKENS_TOTAL,
+            &[("pattern", pattern), ("kind", "prompt")],
+            result.total_prompt_tokens,
+        );
+        registry.increment_counter(
+            METRIC_DELEGATION_TOKENS_TOTAL,
+            &[("pattern", pattern), ("kind", "completion")],
+            result.total_completion_tokens,
+        );
+    }
+}
+
+/// Bounded exponential delay for verification retries. The stable per-run
+/// jitter prevents a failed fanout from synchronizing its retries while
+/// keeping behavior deterministic enough to diagnose and test.
+fn verification_retry_delay(retry_attempt: u32, run_id: &str) -> std::time::Duration {
+    let exponent = retry_attempt.saturating_sub(2).min(4);
+    let exponential = VERIFICATION_RETRY_BASE_DELAY_MS
+        .saturating_mul(1_u64 << exponent)
+        .min(VERIFICATION_RETRY_MAX_DELAY_MS);
+    let hash = run_id.bytes().fold(0xcbf29ce484222325_u64, |hash, byte| {
+        hash.wrapping_mul(0x100000001b3) ^ u64::from(byte)
+    });
+    std::time::Duration::from_millis(
+        exponential.saturating_add(hash % (VERIFICATION_RETRY_JITTER_MS + 1)),
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AncestryTermination {
+    RootReached,
+    Cycle { repeated_run_id: String },
+    TraversalLimit { next_run_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AncestryWalk {
+    ancestors: Vec<String>,
+    termination: AncestryTermination,
+}
+
+fn ancestry_from_parents(parents: &HashMap<String, String>, run_id: &str) -> AncestryWalk {
+    let mut chain = Vec::new();
+    let mut current = run_id.to_string();
+    let mut visited = HashSet::from([current.clone()]);
+    while chain.len() < MAX_ANCESTRY_TRAVERSAL {
+        let Some(parent) = parents.get(&current) else {
+            return AncestryWalk {
+                ancestors: chain,
+                termination: AncestryTermination::RootReached,
+            };
+        };
+        if !visited.insert(parent.clone()) {
+            return AncestryWalk {
+                ancestors: chain,
+                termination: AncestryTermination::Cycle {
+                    repeated_run_id: parent.clone(),
+                },
+            };
+        }
+        chain.push(parent.clone());
+        current = parent.clone();
+    }
+    let termination = parents
+        .get(&current)
+        .map_or(AncestryTermination::RootReached, |next| {
+            AncestryTermination::TraversalLimit {
+                next_run_id: next.clone(),
+            }
+        });
+    AncestryWalk {
+        ancestors: chain,
+        termination,
+    }
+}
+
+fn cancelled_agent_result(agent_id: &str, run_id: &str) -> AgentResult {
+    AgentResult {
+        agent_id: agent_id.to_string(),
+        run_id: run_id.to_string(),
+        status: STATUS_CANCELLED.to_string(),
+        output: None,
+        error: Some("cancelled by parent run".to_string()),
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        tool_calls: 0,
+    }
+}
+
+fn cancellation_reconciliation_pending_result(attempted: &AgentResult) -> AgentResult {
+    AgentResult {
+        agent_id: attempted.agent_id.clone(),
+        run_id: attempted.run_id.clone(),
+        status: STATUS_WAITING.to_string(),
+        output: None,
+        error: Some(format!(
+            "durable cancellation reconciliation exceeded the shared {}ms deadline; authoritative child state is still unknown",
+            DELEGATION_RECONCILIATION_TIMEOUT.as_millis()
+        )),
+        // Terminal authority is unknown, but work already observed by the
+        // parent is still a fact. Keep it visible so a reconciliation timeout
+        // cannot turn into silent usage under-counting.
+        prompt_tokens: attempted.prompt_tokens,
+        completion_tokens: attempted.completion_tokens,
+        tool_calls: attempted.tool_calls,
+    }
+}
+
+/// Convert the richer delegated-agent outcome taxonomy to the canonical
+/// durable run lifecycle. Details such as timeout/partial/verification failure
+/// remain on `AgentResult`; the run row intentionally stores only lifecycle
+/// states understood by every control-plane consumer.
+fn durable_status_for_agent_result(status: &str) -> &'static str {
+    match agent_result_status_kind(status) {
+        AgentResultStatusKind::Completed => STATUS_COMPLETED,
+        AgentResultStatusKind::Delegated => STATUS_DELEGATED,
+        AgentResultStatusKind::Waiting => STATUS_WAITING,
+        AgentResultStatusKind::Paused => STATUS_PAUSED,
+        AgentResultStatusKind::Cancelled => STATUS_CANCELLED,
+        AgentResultStatusKind::Timeout
+        | AgentResultStatusKind::VerificationFailed
+        | AgentResultStatusKind::Partial
+        | AgentResultStatusKind::Failed
+        | AgentResultStatusKind::Other => STATUS_FAILED,
+    }
+}
+
+/// Commit an executor result and return the outcome permitted by durable
+/// authority. A pause/cancel/terminal CAS winner must shape the result returned
+/// to the parent; otherwise the database, tracker, and aggregation can report
+/// contradictory facts for the same child run.
+async fn reconcile_agent_result_with_durable_authority(
+    run_engine: &RunEngine,
+    user_id: &str,
+    mut result: AgentResult,
+) -> AgentResult {
+    let attempted_status = durable_status_for_agent_result(&result.status);
+    let persistence = run_engine
+        .persist_delegation_outcome_status(
+            user_id,
+            &result.run_id,
+            attempted_status,
+            None,
+            result.error.as_deref(),
+        )
+        .await;
+    if matches!(persistence, Ok(true)) {
+        return result;
+    }
+
+    let persistence_detail = match &persistence {
+        Ok(false) => "outcome lost its durable status compare-and-set".to_string(),
+        Err(error) => format!("could not commit delegated outcome: {error}"),
+        Ok(true) => unreachable!(),
+    };
+    let durable = match run_engine.load_run(user_id, &result.run_id).await {
+        Ok(Some(durable)) => durable,
+        Ok(None) => {
+            result.status = STATUS_FAILED.to_string();
+            result.output = None;
+            result.error = Some(format!(
+                "{persistence_detail}; durable run {} is missing",
+                result.run_id
+            ));
+            return result;
+        }
+        Err(load_error) => {
+            result.status = STATUS_FAILED.to_string();
+            result.output = None;
+            result.error = Some(format!(
+                "{persistence_detail}; failed to load durable winner for run {}: {load_error}",
+                result.run_id
+            ));
+            return result;
+        }
+    };
+
+    // A replay can lose its CAS because the exact same terminal fact is
+    // already durable. Preserve the richer executor taxonomy/output in that
+    // idempotent case; no competing authority disagrees with it.
+    if durable.status == attempted_status {
+        return result;
+    }
+
+    tracing::info!(
+        target: "astra_runtime::delegation",
+        run_id = %result.run_id,
+        executor_status = %result.status,
+        attempted_durable_status = attempted_status,
+        durable_status = %durable.status,
+        "replaced stale delegated executor outcome with durable authority"
+    );
+    result.output = None;
+    match durable_run_status_kind(&durable.status) {
+        DurableRunStatusKind::Running => {
+            // `running` is not a terminal AgentResult. Project it as a
+            // recoverable wait so parent aggregation remains unfinished.
+            result.status = STATUS_WAITING.to_string();
+            result.error = None;
+        }
+        DurableRunStatusKind::Waiting | DurableRunStatusKind::Paused => {
+            result.status = durable.status;
+            result.error = None;
+        }
+        DurableRunStatusKind::Completed | DurableRunStatusKind::Delegated => {
+            result.status = durable.status;
+            result.error = None;
+        }
+        DurableRunStatusKind::Cancelled => {
+            result.status = STATUS_CANCELLED.to_string();
+            result.error = durable
+                .error_message
+                .or_else(|| Some("cancelled by a concurrent durable control decision".to_string()));
+        }
+        DurableRunStatusKind::Failed | DurableRunStatusKind::Other => {
+            result.status = STATUS_FAILED.to_string();
+            result.error = durable.error_message.or(Some(persistence_detail));
+        }
+    }
+    result
+}
+
+/// Reconcile a parent-cancelled child without allowing durable storage latency
+/// to hold the parent indefinitely. Timeout is an unknown fact, not evidence
+/// that cancellation committed: project the child as recoverably waiting so a
+/// later durable recovery can still supply the authoritative terminal state.
+async fn reconcile_after_parent_cancellation_bounded(
+    run_engine: &RunEngine,
+    user_id: &str,
+    result: AgentResult,
+    deadline: &mut Option<tokio::time::Instant>,
+    scope: &'static str,
+) -> AgentResult {
+    let run_id = result.run_id.clone();
+    let pending = cancellation_reconciliation_pending_result(&result);
+    let result = await_with_shared_deadline(
+        deadline,
+        DELEGATION_RECONCILIATION_TIMEOUT,
+        reconcile_agent_result_with_durable_authority(run_engine, user_id, result),
+    )
+    .await;
+    match result {
+        Some(result) => result,
+        None => {
+            tracing::error!(
+                target: "astra_runtime::delegation",
+                scope,
+                run_id,
+                timeout_ms = DELEGATION_RECONCILIATION_TIMEOUT.as_millis(),
+                "durable cancellation reconciliation timed out; preserving an unfinished projection for recovery"
+            );
+            pending
+        }
+    }
+}
 
 fn normalize_context_allowlist_entry(entry: &str, key: &str) -> Result<String, String> {
     let normalized = entry.trim().to_ascii_lowercase();
@@ -108,19 +518,96 @@ fn parse_request_skill_sources_from_context(
     Ok(Some(parsed))
 }
 
-fn critical_finding_summary_from_agent_result(result: &AgentResult) -> Option<String> {
-    let text = [result.output.as_deref(), result.error.as_deref()]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join("\n");
-    let lower = text.to_ascii_lowercase();
-    if lower.contains("critical finding") || lower.contains("critical") || lower.contains("blocker")
-    {
-        Some(text.chars().take(1_000).collect())
-    } else {
-        None
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CriticalFindingExtraction {
+    summary: Option<String>,
+    contract_error: Option<String>,
+    used_legacy_review_format: bool,
+}
+
+/// Extract typed findings and operational child failures. Free-form success
+/// prose never becomes a cross-run signal. The one accepted prose shape is the
+/// exact previous review contract, isolated in `DelegatedFindingEnvelope` as a
+/// deployment-window migration.
+fn critical_finding_from_agent_result(result: &AgentResult) -> CriticalFindingExtraction {
+    let mut extraction = CriticalFindingExtraction::default();
+    if let Some(output) = result.output.as_deref() {
+        match DelegatedFindingEnvelope::parse(output) {
+            DelegatedFindingParse::Structured(envelope) => {
+                extraction.summary = envelope.critical_summary();
+            }
+            DelegatedFindingParse::LegacyReview(envelope) => {
+                extraction.used_legacy_review_format = true;
+                extraction.summary = envelope.critical_summary();
+            }
+            DelegatedFindingParse::Unstructured => {}
+            DelegatedFindingParse::MalformedJson(error) => {
+                extraction.contract_error = Some(error);
+            }
+            DelegatedFindingParse::ResourceLimitExceeded(error) => {
+                extraction.contract_error = Some(error);
+            }
+        }
     }
+
+    // User/parent cancellation is already explicit lifecycle evidence and is
+    // not a critical defect. Failed, timed-out, or verification-failed work
+    // must remain visible even when no structured review envelope was emitted.
+    if result.is_failure() && result.status != STATUS_CANCELLED {
+        let failure = match result
+            .error
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(error) => {
+                let error = truncate_chars(error, MAX_DELEGATED_FINDING_SUMMARY_CHARS);
+                format!(
+                    "Delegated agent '{}' failed with status '{}': {error}",
+                    result.agent_id, result.status
+                )
+            }
+            None => format!(
+                "Delegated agent '{}' failed with status '{}'",
+                result.agent_id, result.status
+            ),
+        };
+        extraction.summary = Some(truncate_chars(
+            &match extraction.summary.take() {
+                Some(finding) => format!("{finding}\n\nOperational failure:\n{failure}"),
+                None => failure,
+            },
+            MAX_DELEGATED_FINDING_SUMMARY_CHARS,
+        ));
+    }
+    extraction
+}
+
+fn finding_bubble_targets(
+    session_id: &str,
+    run_id: &str,
+    source_depth: u32,
+    ancestry: &[String],
+) -> Vec<BubbleUpTarget> {
+    let mut targets = vec![BubbleUpTarget {
+        session_id: session_id.to_string(),
+        run_id: run_id.to_string(),
+        depth: source_depth,
+    }];
+    let ancestor_budget = MAX_FINDING_BUBBLE_TARGETS.saturating_sub(1);
+    let mut selected = (0..ancestry.len().min(ancestor_budget)).collect::<Vec<_>>();
+    if ancestry.len() > ancestor_budget && ancestor_budget > 0 {
+        selected.pop();
+        selected.push(ancestry.len() - 1);
+    }
+    for idx in selected {
+        targets.push(BubbleUpTarget {
+            session_id: session_id.to_string(),
+            run_id: ancestry[idx].clone(),
+            depth: source_depth.saturating_sub((idx as u32) + 1),
+        });
+    }
+    targets
 }
 
 async fn bubble_up_critical_finding_from_tracker(
@@ -131,25 +618,24 @@ async fn bubble_up_critical_finding_from_tracker(
     run_id: String,
     summary: String,
 ) {
-    let source_depth = tracker.get_depth(&run_id).await.unwrap_or(0);
-    let mut targets = vec![BubbleUpTarget {
-        session_id: session_id.clone(),
-        run_id: run_id.clone(),
-        depth: source_depth,
-    }];
-    for (idx, parent_run_id) in tracker
-        .get_ancestry(&run_id)
-        .await
-        .into_iter()
-        .take(4)
-        .enumerate()
-    {
-        targets.push(BubbleUpTarget {
-            session_id: session_id.clone(),
-            run_id: parent_run_id,
-            depth: source_depth.saturating_sub((idx as u32) + 1),
-        });
+    let (source_depth, ancestry) = tracker.finding_lineage_snapshot(&run_id).await;
+    match &ancestry.termination {
+        AncestryTermination::RootReached => {}
+        AncestryTermination::Cycle { repeated_run_id } => tracing::warn!(
+            target: "astra_runtime::delegation",
+            run_id,
+            repeated_run_id,
+            "delegated finding ancestry is cyclic; publishing the complete acyclic prefix"
+        ),
+        AncestryTermination::TraversalLimit { next_run_id } => tracing::error!(
+            target: "astra_runtime::delegation",
+            run_id,
+            next_run_id,
+            traversal_limit = MAX_ANCESTRY_TRAVERSAL,
+            "delegated finding ancestry exceeded the corruption guard; root projection is incomplete"
+        ),
     }
+    let targets = finding_bubble_targets(&session_id, &run_id, source_depth, &ancestry.ancestors);
     if let Err(error) = projection_store
         .bubble_up_finding(
             &user_id,
@@ -176,6 +662,10 @@ async fn bubble_up_critical_finding_from_tracker(
 pub struct SubRunConfig {
     /// Unique ID for this sub-run.
     pub run_id: String,
+    /// Durable parent run that delegated this child. This is identity data for
+    /// the run tree, never prompt context; a delegated sub-run cannot exist
+    /// without it.
+    pub parent_run_id: String,
     /// Agent profile executing this sub-run.
     pub agent_profile: AgentProfile,
     /// The task/prompt for this sub-run.
@@ -529,18 +1019,28 @@ pub trait CheckpointGate: Send + Sync {
 // SubRunRecord and DelegationProgress are now defined in astra-server-types.
 pub use astra_server_types::team_orchestrator_traits::{DelegationProgress, SubRunRecord};
 
-/// In-memory tracker for delegation hierarchies and pause state.
+/// Canonical in-memory projection of the durable delegation hierarchy.
 ///
-/// Optionally persists state changes to a session journal for crash recovery.
+/// Keeping the records, delegation membership, and parent edges behind one
+/// lock makes insertion/recovery/cleanup atomic. A run lookup is O(1) instead
+/// of scanning every user's delegation, which also removes an avoidable
+/// cross-tenant performance coupling in server deployments.
+#[derive(Default)]
+struct DelegationTrackerState {
+    runs: HashMap<String, SubRunRecord>,
+    delegation_runs: HashMap<String, Vec<String>>,
+    parents: HashMap<String, String>,
+    pause_flags: HashMap<String, Arc<AtomicBool>>,
+    cancel_tokens: HashMap<String, Arc<tokio_util::sync::CancellationToken>>,
+}
+
+/// Process-local projection for live delegation controls.
+///
+/// Durable run records are authoritative and rebuild this projection after a
+/// restart. The optional session journal is diagnostic evidence, not the
+/// source of truth for recovery.
 pub struct DelegationTracker {
-    /// delegation_id → sub-run records
-    delegations: RwLock<HashMap<String, Vec<SubRunRecord>>>,
-    /// run_id → parent_run_id (for quick lookups)
-    parents: RwLock<HashMap<String, String>>,
-    /// run_id → cooperative pause flag (shared with the sub-run's loop)
-    pause_flags: RwLock<HashMap<String, Arc<AtomicBool>>>,
-    /// run_id → cancellation token (shared with the sub-run's loop)
-    cancel_tokens: RwLock<HashMap<String, Arc<tokio_util::sync::CancellationToken>>>,
+    state: RwLock<DelegationTrackerState>,
     /// Optional session ID for journal persistence.
     session_id: Option<String>,
     /// Real-time progress per delegation.
@@ -552,10 +1052,7 @@ pub struct DelegationTracker {
 impl DelegationTracker {
     pub fn new() -> Self {
         Self {
-            delegations: RwLock::new(HashMap::new()),
-            parents: RwLock::new(HashMap::new()),
-            pause_flags: RwLock::new(HashMap::new()),
-            cancel_tokens: RwLock::new(HashMap::new()),
+            state: RwLock::new(DelegationTrackerState::default()),
             session_id: None,
             progress: RwLock::new(HashMap::new()),
             progress_broadcaster: None,
@@ -565,10 +1062,7 @@ impl DelegationTracker {
     /// Create a tracker with journal persistence enabled.
     pub fn with_session(session_id: String) -> Self {
         Self {
-            delegations: RwLock::new(HashMap::new()),
-            parents: RwLock::new(HashMap::new()),
-            pause_flags: RwLock::new(HashMap::new()),
-            cancel_tokens: RwLock::new(HashMap::new()),
+            state: RwLock::new(DelegationTrackerState::default()),
             session_id: Some(session_id),
             progress: RwLock::new(HashMap::new()),
             progress_broadcaster: None,
@@ -631,9 +1125,7 @@ impl DelegationTracker {
     /// Called at startup to recover delegation state after a crash.
     /// Only records with `parent_run_id` set are considered (sub-runs).
     pub async fn load_from_run_records(&self, records: &[astra_services::runs::DurableRunRecord]) {
-        let mut delegations = self.delegations.write().await;
-        let mut parents = self.parents.write().await;
-        let mut pause_flags = self.pause_flags.write().await;
+        let mut state = self.state.write().await;
 
         for rec in records {
             let (Some(parent_run_id), Some(delegation_id)) =
@@ -647,12 +1139,14 @@ impl DelegationTracker {
                 parent_run_id: parent_run_id.clone(),
                 delegation_id: delegation_id.clone(),
                 agent_id: rec.agent_id.clone().unwrap_or_default(),
-                depth: 0, // Depth not stored in DB; 0 is safe for recovered records
+                depth: rec.depth,
                 state: match durable_run_status_kind(&rec.status) {
                     DurableRunStatusKind::Other => {
-                        eprintln!(
-                            "[delegation-tracker] unknown status '{}' for run '{}', defaulting to Failed",
-                            rec.status, rec.run_id
+                        tracing::warn!(
+                            target: "astra_runtime::delegation",
+                            status = %rec.status,
+                            run_id = %rec.run_id,
+                            "recovered delegation run has unknown durable status; projecting failed"
                         );
                         SubRunState::Failed
                     }
@@ -661,16 +1155,22 @@ impl DelegationTracker {
                 retry_of: rec.retry_of.clone(),
             };
 
-            delegations
+            let delegation_runs = state
+                .delegation_runs
                 .entry(delegation_id.clone())
-                .or_default()
-                .push(sub);
-            parents.insert(rec.run_id.clone(), parent_run_id.clone());
+                .or_default();
+            if !delegation_runs.contains(&rec.run_id) {
+                delegation_runs.push(rec.run_id.clone());
+            }
+            state
+                .parents
+                .insert(rec.run_id.clone(), parent_run_id.clone());
+            state.runs.insert(rec.run_id.clone(), sub);
 
             // Re-create pause flags for paused sub-runs
             if rec.status == STATUS_PAUSED {
                 let flag = Arc::new(AtomicBool::new(true));
-                pause_flags.insert(rec.run_id.clone(), flag);
+                state.pause_flags.insert(rec.run_id.clone(), flag);
             }
         }
     }
@@ -682,14 +1182,38 @@ impl DelegationTracker {
         let delegation_id = record.delegation_id.clone();
         let agent_id = record.agent_id.clone();
 
+        let mut state = self.state.write().await;
+        if let Some(existing) = state.runs.get(&run_id) {
+            if existing.parent_run_id != parent_id || existing.delegation_id != delegation_id {
+                tracing::warn!(
+                    target: "astra_runtime::delegation",
+                    run_id,
+                    existing_parent_run_id = %existing.parent_run_id,
+                    attempted_parent_run_id = %parent_id,
+                    existing_delegation_id = %existing.delegation_id,
+                    attempted_delegation_id = %delegation_id,
+                    "ignored conflicting duplicate sub-run identity"
+                );
+            }
+            return;
+        }
+        state
+            .delegation_runs
+            .entry(delegation_id.clone())
+            .or_default()
+            .push(run_id.clone());
+        state.parents.insert(run_id.clone(), parent_id.clone());
+        state.runs.insert(run_id.clone(), record);
+        drop(state);
+
         // Emit SSE event for web clients
         if let Some(ref broadcaster) = self.progress_broadcaster {
             use crate::orchestration::{AgentProgressEvent, ProgressEventType};
             broadcaster.emit(AgentProgressEvent {
                 agent_id: agent_id.clone(),
+                run_id: run_id.clone(),
+                parent_run_id: parent_id.clone(),
                 event_type: ProgressEventType::AgentSpawned {
-                    run_id: run_id.clone(),
-                    parent_run_id: parent_id.clone(),
                     agent_type: "delegated".to_string(),
                     description: format!("Sub-run for delegation {}", delegation_id),
                     fanout_slot: None,
@@ -701,54 +1225,58 @@ impl DelegationTracker {
                 metadata: None,
             });
         }
-
-        // LOCK ORDER: delegations → parents (matches `cleanup_delegation` and
-        // `load_from_run_records`). Both maps must be inserted into atomically
-        // so concurrent `is_sub_run` cannot observe the parents map without the
-        // matching delegations entry (and vice-versa).
-        let mut delegations = self.delegations.write().await;
-        let mut parents = self.parents.write().await;
-        delegations.entry(delegation_id).or_default().push(record);
-        parents.insert(run_id, parent_id);
     }
 
     /// Get all sub-runs for a delegation.
     pub async fn get_sub_runs(&self, delegation_id: &str) -> Vec<SubRunRecord> {
-        self.delegations
-            .read()
-            .await
+        let state = self.state.read().await;
+        state
+            .delegation_runs
             .get(delegation_id)
-            .cloned()
-            .unwrap_or_default()
+            .into_iter()
+            .flatten()
+            .filter_map(|run_id| state.runs.get(run_id).cloned())
+            .collect()
     }
 
     /// Get the parent run ID for a given run.
     pub async fn get_parent(&self, run_id: &str) -> Option<String> {
-        self.parents.read().await.get(run_id).cloned()
+        self.state.read().await.parents.get(run_id).cloned()
     }
 
     /// Check if a run is a sub-run (has a parent).
     pub async fn is_sub_run(&self, run_id: &str) -> bool {
-        self.parents.read().await.contains_key(run_id)
+        self.state.read().await.parents.contains_key(run_id)
     }
 
     /// Get the recorded delegation depth for a run, if known.
     pub async fn get_depth(&self, run_id: &str) -> Option<u32> {
-        for records in self.delegations.read().await.values() {
-            for record in records {
-                if record.run_id == run_id {
-                    return Some(record.depth);
-                }
-            }
-        }
-        None
+        self.state
+            .read()
+            .await
+            .runs
+            .get(run_id)
+            .map(|record| record.depth)
+    }
+
+    /// Read depth and ancestry from one atomic hierarchy snapshot.
+    async fn finding_lineage_snapshot(&self, run_id: &str) -> (u32, AncestryWalk) {
+        let state = self.state.read().await;
+        let depth = state
+            .runs
+            .get(run_id)
+            .map(|record| record.depth)
+            .unwrap_or(0);
+        let ancestry = ancestry_from_parents(&state.parents, run_id);
+        (depth, ancestry)
     }
 
     /// Get all sub-run IDs for a given parent run across all delegations.
     pub async fn get_children(&self, parent_run_id: &str) -> Vec<String> {
-        self.parents
+        self.state
             .read()
             .await
+            .parents
             .iter()
             .filter(|(_, parent)| parent.as_str() == parent_run_id)
             .map(|(child, _)| child.clone())
@@ -757,38 +1285,28 @@ impl DelegationTracker {
 
     /// Get the agent_id for a run. Returns `None` for top-level (non-sub) runs.
     pub async fn get_agent_id(&self, run_id: &str) -> Option<String> {
-        for records in self.delegations.read().await.values() {
-            for record in records {
-                if record.run_id == run_id {
-                    return Some(record.agent_id.clone());
-                }
-            }
-        }
-        None
+        self.state
+            .read()
+            .await
+            .runs
+            .get(run_id)
+            .map(|record| record.agent_id.clone())
     }
 
     /// Get the current state of a sub-run by its run_id.
     pub async fn get_sub_run_state(&self, run_id: &str) -> Option<SubRunState> {
-        for records in self.delegations.read().await.values() {
-            for record in records {
-                if record.run_id == run_id {
-                    return Some(record.state);
-                }
-            }
-        }
-        None
+        self.state
+            .read()
+            .await
+            .runs
+            .get(run_id)
+            .map(|record| record.state)
     }
 
     /// Get the full ancestry chain (run_id → parent → grandparent → ...).
     pub async fn get_ancestry(&self, run_id: &str) -> Vec<String> {
-        let parents = self.parents.read().await;
-        let mut chain = Vec::new();
-        let mut current = run_id.to_string();
-        while let Some(parent) = parents.get(&current) {
-            chain.push(parent.clone());
-            current = parent.clone();
-        }
-        chain
+        let state = self.state.read().await;
+        ancestry_from_parents(&state.parents, run_id).ancestors
     }
 
     // ── Pause / Resume ──────────────────────────────────────────────────────
@@ -798,22 +1316,23 @@ impl DelegationTracker {
     /// Returns the flag so the caller can pass it into [`SubRunConfig::pause_flag`].
     pub async fn register_pause_flag(&self, run_id: &str) -> Arc<AtomicBool> {
         let flag = Arc::new(AtomicBool::new(false));
-        self.pause_flags
+        self.state
             .write()
             .await
+            .pause_flags
             .insert(run_id.to_string(), flag.clone());
         flag
     }
 
     /// Get the pause flag for a sub-run, if registered.
     pub async fn get_pause_flag(&self, run_id: &str) -> Option<Arc<AtomicBool>> {
-        self.pause_flags.read().await.get(run_id).cloned()
+        self.state.read().await.pause_flags.get(run_id).cloned()
     }
 
     /// Set the pause flag for a single sub-run.
     /// Returns `true` if the flag existed and was set.
     pub async fn pause_sub_run(&self, run_id: &str) -> bool {
-        if let Some(flag) = self.pause_flags.read().await.get(run_id) {
+        if let Some(flag) = self.state.read().await.pause_flags.get(run_id) {
             flag.store(true, Ordering::SeqCst);
             self.persist_event(
                 astra_services::session_journal::JournalEventType::SyncMarker,
@@ -828,7 +1347,7 @@ impl DelegationTracker {
     /// Clear the pause flag for a single sub-run.
     /// Returns `true` if the flag existed and was cleared.
     pub async fn resume_sub_run(&self, run_id: &str) -> bool {
-        if let Some(flag) = self.pause_flags.read().await.get(run_id) {
+        if let Some(flag) = self.state.read().await.pause_flags.get(run_id) {
             flag.store(false, Ordering::SeqCst);
             self.persist_event(
                 astra_services::session_journal::JournalEventType::SyncMarker,
@@ -843,11 +1362,15 @@ impl DelegationTracker {
     /// Pause ALL sub-runs belonging to a delegation.
     /// Returns the number of sub-runs paused.
     pub async fn pause_delegation(&self, delegation_id: &str) -> usize {
-        let records = self.get_sub_runs(delegation_id).await;
-        let flags = self.pause_flags.read().await;
+        let state = self.state.read().await;
+        let run_ids = state
+            .delegation_runs
+            .get(delegation_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
         let mut count = 0;
-        for record in &records {
-            if let Some(flag) = flags.get(&record.run_id) {
+        for run_id in run_ids {
+            if let Some(flag) = state.pause_flags.get(run_id) {
                 flag.store(true, Ordering::SeqCst);
                 count += 1;
             }
@@ -858,11 +1381,15 @@ impl DelegationTracker {
     /// Resume ALL sub-runs belonging to a delegation.
     /// Returns the number of sub-runs resumed.
     pub async fn resume_delegation(&self, delegation_id: &str) -> usize {
-        let records = self.get_sub_runs(delegation_id).await;
-        let flags = self.pause_flags.read().await;
+        let state = self.state.read().await;
+        let run_ids = state
+            .delegation_runs
+            .get(delegation_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
         let mut count = 0;
-        for record in &records {
-            if let Some(flag) = flags.get(&record.run_id) {
+        for run_id in run_ids {
+            if let Some(flag) = state.pause_flags.get(run_id) {
                 flag.store(false, Ordering::SeqCst);
                 count += 1;
             }
@@ -873,11 +1400,14 @@ impl DelegationTracker {
     /// Pause ALL sub-runs that have a given parent run ID.
     /// Returns the number of sub-runs paused.
     pub async fn pause_children_of(&self, parent_run_id: &str) -> usize {
-        let children = self.get_children(parent_run_id).await;
-        let flags = self.pause_flags.read().await;
+        let state = self.state.read().await;
         let mut count = 0;
-        for child_id in &children {
-            if let Some(flag) = flags.get(child_id) {
+        for child_id in state
+            .parents
+            .iter()
+            .filter_map(|(child, parent)| (parent == parent_run_id).then_some(child))
+        {
+            if let Some(flag) = state.pause_flags.get(child_id) {
                 flag.store(true, Ordering::SeqCst);
                 count += 1;
             }
@@ -888,11 +1418,14 @@ impl DelegationTracker {
     /// Resume ALL sub-runs that have a given parent run ID.
     /// Returns the number of sub-runs resumed.
     pub async fn resume_children_of(&self, parent_run_id: &str) -> usize {
-        let children = self.get_children(parent_run_id).await;
-        let flags = self.pause_flags.read().await;
+        let state = self.state.read().await;
         let mut count = 0;
-        for child_id in &children {
-            if let Some(flag) = flags.get(child_id) {
+        for child_id in state
+            .parents
+            .iter()
+            .filter_map(|(child, parent)| (parent == parent_run_id).then_some(child))
+        {
+            if let Some(flag) = state.pause_flags.get(child_id) {
                 flag.store(false, Ordering::SeqCst);
                 count += 1;
             }
@@ -906,10 +1439,47 @@ impl DelegationTracker {
         run_id: &str,
         token: Arc<tokio_util::sync::CancellationToken>,
     ) {
-        self.cancel_tokens
+        self.state
             .write()
             .await
+            .cancel_tokens
             .insert(run_id.to_string(), token);
+    }
+
+    /// Request cancellation of one non-terminal sub-run.
+    ///
+    /// This deliberately does not write a terminal status. The owning
+    /// executor must observe its cancellation token, finish its current
+    /// boundary, and report the canonical cancelled outcome exactly once;
+    /// eagerly writing `cancelled` here would race that result and make an
+    /// interrupted child look settled before it has stopped. Cancellation is
+    /// deliberately distinct from pause: the engine installs a token for
+    /// every active child, and a cancel request must never turn into a paused
+    /// run in an executor that observes only one of the two signals.
+    pub async fn request_cancel_sub_run(&self, run_id: &str) -> bool {
+        {
+            // Completion needs the state write lock. Validate liveness and
+            // signal the token under one read guard so a terminal transition
+            // cannot slip between the two operations and acquire a spurious
+            // post-completion cancellation marker.
+            let state = self.state.read().await;
+            let Some(record) = state
+                .runs
+                .get(run_id)
+                .filter(|record| !record.state.is_terminal())
+            else {
+                return false;
+            };
+            let Some(cancel_token) = state.cancel_tokens.get(&record.run_id) else {
+                return false;
+            };
+            cancel_token.cancel();
+        }
+        self.persist_event(
+            astra_services::session_journal::JournalEventType::SyncMarker,
+            serde_json::json!({ "action": "cancel_requested", "run_id": run_id }),
+        );
+        true
     }
 
     /// Cancel ALL sub-runs in the subtree rooted at `parent_run_id`.
@@ -919,28 +1489,15 @@ impl DelegationTracker {
     /// sub-runs spawned by cancelled children executing — which was the
     /// historical bug.
     ///
-    /// Returns the number of cancel tokens fired (one per descendant that
-    /// has a registered token; descendants without a token are still pause-
-    /// flagged for cooperative loops).
-    ///
-    /// Lock order: `parents → pause_flags → cancel_tokens` (canonical engine
-    /// order; matches `cleanup_delegation` and the load path). Reversing
-    /// this order permits an ABBA deadlock with concurrent cleanup.
+    /// Returns the number of live children that accepted the cancellation
+    /// request. A cancellation token is installed for every executable child;
+    /// cancellation never piggybacks on the separate pause flag.
     pub async fn cancel_children_of(&self, parent_run_id: &str) -> usize {
         let descendants = self.collect_descendants(parent_run_id).await;
-        if descendants.is_empty() {
-            return 0;
-        }
-        let flags = self.pause_flags.read().await;
-        let tokens = self.cancel_tokens.read().await;
         let mut count = 0;
-        for child_id in &descendants {
-            if let Some(token) = tokens.get(child_id) {
-                token.cancel();
+        for child_id in descendants {
+            if self.request_cancel_sub_run(&child_id).await {
                 count += 1;
-            }
-            if let Some(flag) = flags.get(child_id) {
-                flag.store(true, Ordering::SeqCst);
             }
         }
         count
@@ -951,12 +1508,12 @@ impl DelegationTracker {
     /// minimizing the time a freshly-spawned grandchild has to do work
     /// before being cancelled. Cycle-safe via `visited`.
     async fn collect_descendants(&self, root: &str) -> Vec<String> {
-        let parents = self.parents.read().await;
+        let state = self.state.read().await;
         // Build child-by-parent index once so the walk is O(N) total
         // rather than O(N) per level.
         let mut by_parent: std::collections::HashMap<&str, Vec<&str>> =
             std::collections::HashMap::new();
-        for (child, parent) in parents.iter() {
+        for (child, parent) in state.parents.iter() {
             by_parent
                 .entry(parent.as_str())
                 .or_default()
@@ -984,9 +1541,10 @@ impl DelegationTracker {
 
     /// Check if a sub-run is currently paused.
     pub async fn is_paused(&self, run_id: &str) -> bool {
-        self.pause_flags
+        self.state
             .read()
             .await
+            .pause_flags
             .get(run_id)
             .is_some_and(|f| f.load(Ordering::Acquire))
     }
@@ -1001,42 +1559,36 @@ impl DelegationTracker {
         run_id: &str,
         to: SubRunState,
     ) -> Result<SubRunState, InvalidTransition> {
-        let mut delegations = self.delegations.write().await;
-        for records in delegations.values_mut() {
-            for record in records.iter_mut() {
-                if record.run_id == run_id {
-                    let new_state = record.state.try_transition(to)?;
-                    record.state = new_state;
+        let mut state = self.state.write().await;
+        if let Some(record) = state.runs.get_mut(run_id) {
+            let new_state = record.state.try_transition(to)?;
+            record.state = new_state;
 
-                    // Capture values before releasing the lock
-                    let delegation_id = record.delegation_id.clone();
-                    let agent_id = record.agent_id.clone();
-                    let parent_run_id = record.parent_run_id.clone();
-                    let depth = record.depth;
-                    let retry_of = record.retry_of.clone();
-                    drop(delegations);
+            let delegation_id = record.delegation_id.clone();
+            let agent_id = record.agent_id.clone();
+            let parent_run_id = record.parent_run_id.clone();
+            let depth = record.depth;
+            let retry_of = record.retry_of.clone();
+            drop(state);
 
-                    if new_state == SubRunState::Running {
-                        self.persist_event(
-                            astra_services::session_journal::JournalEventType::DelegationSubRunStarted,
-                            serde_json::json!({
-                                "delegation_id": delegation_id,
-                                "sub_run_id": run_id,
-                                "parent_run_id": parent_run_id,
-                                "agent_id": agent_id,
-                                "status": new_state.as_str(),
-                                "depth": depth,
-                                "retry_of": retry_of,
-                            }),
-                        );
-                    }
-
-                    // Update progress tracking
-                    self.update_progress(&delegation_id, &agent_id, new_state)
-                        .await;
-                    return Ok(new_state);
-                }
+            if new_state == SubRunState::Running {
+                self.persist_event(
+                    astra_services::session_journal::JournalEventType::DelegationSubRunStarted,
+                    serde_json::json!({
+                        "delegation_id": delegation_id,
+                        "sub_run_id": run_id,
+                        "parent_run_id": parent_run_id,
+                        "agent_id": agent_id,
+                        "status": new_state.as_str(),
+                        "depth": depth,
+                        "retry_of": retry_of,
+                    }),
+                );
             }
+
+            self.update_progress(&delegation_id, &agent_id, new_state)
+                .await;
+            return Ok(new_state);
         }
         // Run not tracked — allow the transition (e.g. root runs)
         Ok(to)
@@ -1076,7 +1628,10 @@ impl DelegationTracker {
             return;
         }
 
-        debug_assert_eq!(result_state, SubRunState::Paused);
+        debug_assert!(matches!(
+            result_state,
+            SubRunState::Waiting | SubRunState::Paused
+        ));
         self.set_sub_run_result_state(run_id, result_state, error, output_preview, false)
             .await;
     }
@@ -1092,34 +1647,55 @@ impl DelegationTracker {
         // Transition state in record
         let mut delegation_id = None;
         let mut agent_id = None;
+        let mut parent_run_id = None;
         let mut final_state = result_state;
+        let mut transition_applied = false;
         {
-            let mut delegations = self.delegations.write().await;
-            for records in delegations.values_mut() {
-                for record in records.iter_mut() {
-                    if record.run_id == run_id {
-                        // Best-effort: if transition fails, force the requested result state.
-                        record.state = record
-                            .state
-                            .try_transition(result_state)
-                            .unwrap_or(result_state);
-                        final_state = record.state;
-                        delegation_id = Some(record.delegation_id.clone());
-                        agent_id = Some(record.agent_id.clone());
-                        break;
-                    }
+            let mut state = self.state.write().await;
+            if let Some(record) = state.runs.get_mut(run_id) {
+                if record.state == result_state {
+                    // Executor completion can race recovery/replay. The
+                    // already-projected state is the idempotent authority; do
+                    // not emit a duplicate terminal event.
+                    return;
                 }
-                if delegation_id.is_some() {
-                    break;
-                }
+                let previous_state = record.state;
+                let Ok(next_state) = previous_state.try_transition(result_state) else {
+                    tracing::error!(
+                        target: "astra_runtime::delegation",
+                        run_id,
+                        from = previous_state.as_str(),
+                        to = result_state.as_str(),
+                        "rejected illegal delegated sub-run result transition"
+                    );
+                    return;
+                };
+                record.state = next_state;
+                final_state = record.state;
+                transition_applied = true;
+                delegation_id = Some(record.delegation_id.clone());
+                agent_id = Some(record.agent_id.clone());
+                parent_run_id = Some(record.parent_run_id.clone());
             }
+        }
+
+        if !transition_applied {
+            tracing::warn!(
+                target: "astra_runtime::delegation",
+                run_id,
+                to = result_state.as_str(),
+                "ignored result for an untracked delegated sub-run"
+            );
+            return;
         }
 
         // Note: pause flags are NOT removed here — they are cleaned up
         // in cleanup_delegation() when the entire delegation completes.
 
         // Update progress + emit SSE event
-        if let (Some(did), Some(aid)) = (delegation_id, agent_id) {
+        if let (Some(did), Some(aid), Some(parent_run_id)) =
+            (delegation_id, agent_id, parent_run_id)
+        {
             if emit_completion_event {
                 self.persist_journal_entry(
                     astra_services::session_journal::JournalEvent::delegation_sub_run_completed(
@@ -1163,6 +1739,9 @@ impl DelegationTracker {
                             total_tokens: (0, 0),
                             duration_ms: 0,
                         },
+                        SubRunState::Waiting => ProgressEventType::Waiting {
+                            reason: error.unwrap_or("external_dependency").to_string(),
+                        },
                         SubRunState::Cancelled => ProgressEventType::Cancelled {
                             reason: format!("Sub-run {} cancelled", run_id),
                         },
@@ -1172,6 +1751,8 @@ impl DelegationTracker {
                     };
                     broadcaster.emit(AgentProgressEvent {
                         agent_id: aid,
+                        run_id: run_id.to_string(),
+                        parent_run_id,
                         event_type,
                         timestamp_epoch_ms: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -1190,8 +1771,18 @@ impl DelegationTracker {
     /// progress entries, pause flags, parent mappings, and delegation records.
     /// Call after the delegation lifecycle is fully complete.
     pub async fn cleanup_delegation(&self, delegation_id: &str) -> Result<(), String> {
-        // Gather run_ids before cleanup
-        let records = self.get_sub_runs(delegation_id).await;
+        // The hierarchy projection is one atomic state: no child can appear
+        // between terminality validation and index cleanup.
+        let mut state = self.state.write().await;
+        let run_ids = state
+            .delegation_runs
+            .get(delegation_id)
+            .cloned()
+            .unwrap_or_default();
+        let records: Vec<SubRunRecord> = run_ids
+            .iter()
+            .filter_map(|run_id| state.runs.get(run_id).cloned())
+            .collect();
         let non_terminal: Vec<String> = records
             .iter()
             .filter(|record| !record.state.is_terminal())
@@ -1203,76 +1794,58 @@ impl DelegationTracker {
                 non_terminal.join(", ")
             ));
         }
-        let run_ids: Vec<String> = records.iter().map(|r| r.run_id.clone()).collect();
-
-        // Acquire locks in consistent order: delegations → parents → pause_flags → cancel_tokens → progress
-        // (same order as load_from_run_records to prevent deadlock)
-        let mut delegations = self.delegations.write().await;
-        let mut parents = self.parents.write().await;
-        let mut pause_flags = self.pause_flags.write().await;
-        let mut cancel_tokens = self.cancel_tokens.write().await;
-        let mut progress_map = self.progress.write().await;
-
-        delegations.remove(delegation_id);
-        for rid in &run_ids {
-            parents.remove(rid);
-            pause_flags.remove(rid);
-            cancel_tokens.remove(rid);
+        state.delegation_runs.remove(delegation_id);
+        for run_id in &run_ids {
+            state.runs.remove(run_id);
+            state.parents.remove(run_id);
+            state.pause_flags.remove(run_id);
+            state.cancel_tokens.remove(run_id);
         }
+        drop(state);
+
+        let mut progress_map = self.progress.write().await;
         progress_map.remove(delegation_id);
         Ok(())
     }
 
     /// Get the full retry chain for a run: [original, retry1, retry2, ...]
     pub async fn get_retry_chain(&self, run_id: &str) -> Vec<String> {
-        let delegations = self.delegations.read().await;
+        let state = self.state.read().await;
+        let Some(record) = state.runs.get(run_id) else {
+            return vec![run_id.to_string()];
+        };
+        let Some(group) = state.delegation_runs.get(&record.delegation_id) else {
+            return vec![run_id.to_string()];
+        };
 
-        // Find which delegation this run belongs to
-        for records in delegations.values() {
-            // First find the original (walk backward via retry_of)
-            let mut original_id = run_id.to_string();
-            let mut visited = std::collections::HashSet::new();
-            loop {
-                if !visited.insert(original_id.clone()) {
-                    break; // Cycle detected
-                }
-                let found = records
-                    .iter()
-                    .find(|r| r.run_id == original_id && r.retry_of.is_some());
-                match found {
-                    Some(r) => {
-                        original_id = r.retry_of.clone().unwrap_or_else(|| {
-                            unreachable!("guarded by retry_of.is_some() check above")
-                        })
-                    }
-                    None => break,
-                }
-            }
-
-            // Now collect forward: original → retries
-            let mut chain = vec![original_id.clone()];
-            let mut current = original_id;
-            visited.clear();
-            loop {
-                if !visited.insert(current.clone()) {
-                    break; // Cycle detected
-                }
-                let next = records
-                    .iter()
-                    .find(|r| r.retry_of.as_deref() == Some(&current));
-                match next {
-                    Some(r) => {
-                        chain.push(r.run_id.clone());
-                        current = r.run_id.clone();
-                    }
-                    None => break,
-                }
-            }
-            if chain.len() > 1 || chain.first().map(|s| s.as_str()) == Some(run_id) {
-                return chain;
-            }
+        let mut original_id = run_id.to_string();
+        let mut visited = HashSet::new();
+        while visited.insert(original_id.clone()) {
+            let Some(previous) = state
+                .runs
+                .get(&original_id)
+                .and_then(|record| record.retry_of.as_ref())
+            else {
+                break;
+            };
+            original_id = previous.clone();
         }
-        vec![run_id.to_string()]
+
+        let mut chain = vec![original_id.clone()];
+        let mut current = original_id;
+        visited.clear();
+        while visited.insert(current.clone()) {
+            let next = group.iter().find_map(|candidate| {
+                state
+                    .runs
+                    .get(candidate)
+                    .filter(|record| record.retry_of.as_deref() == Some(current.as_str()))
+            });
+            let Some(next) = next else { break };
+            chain.push(next.run_id.clone());
+            current = next.run_id.clone();
+        }
+        chain
     }
 
     // ── Progress Tracking ───────────────────────────────────────────────────
@@ -1378,11 +1951,29 @@ pub struct DelegationEngine {
 }
 
 impl DelegationEngine {
+    /// Reserved context key. Session identity is a typed request field, but
+    /// remove a user/model-provided key with this name if it appears in task
+    /// context so it cannot masquerade as runtime metadata in a child prompt.
+    const SESSION_ID_CONTEXT_KEY: &'static str = "session_id";
+
+    fn session_id_for(request: &DelegationRequest) -> String {
+        request.session_id.clone()
+    }
+
+    fn child_task_context(request: &DelegationRequest) -> HashMap<String, serde_json::Value> {
+        let mut context = request.context.clone();
+        context.remove(Self::SESSION_ID_CONTEXT_KEY);
+        context
+    }
+
     pub fn new(
         registry: Arc<RwLock<AgentProfileRegistry>>,
         run_engine: Arc<RunEngine>,
         tracker: Arc<DelegationTracker>,
     ) -> Self {
+        if let Some(metrics) = run_engine.metrics_registry() {
+            register_delegation_metrics(metrics);
+        }
         #[cfg(debug_assertions)]
         eprintln!(
             "  ⚠ DelegationEngine: using StubSubRunExecutor — call with_executor() for production"
@@ -1406,6 +1997,9 @@ impl DelegationEngine {
         tracker: Arc<DelegationTracker>,
         executor: Arc<dyn SubRunExecutor>,
     ) -> Self {
+        if let Some(metrics) = run_engine.metrics_registry() {
+            register_delegation_metrics(metrics);
+        }
         Self {
             registry,
             run_engine,
@@ -1586,7 +2180,23 @@ impl DelegationEngine {
             return;
         };
         for result in results {
-            if let Some(summary) = critical_finding_summary_from_agent_result(result) {
+            let extraction = critical_finding_from_agent_result(result);
+            if let Some(error) = extraction.contract_error.as_deref() {
+                tracing::warn!(
+                    target: "astra_runtime::delegation",
+                    run_id = %result.run_id,
+                    error,
+                    "delegated finding output violated the bounded JSON contract"
+                );
+            }
+            if extraction.used_legacy_review_format {
+                tracing::debug!(
+                    target: "astra_runtime::delegation",
+                    run_id = %result.run_id,
+                    "accepted previous delegated review format during deployment migration"
+                );
+            }
+            if let Some(summary) = extraction.summary {
                 bubble_up_critical_finding_from_tracker(
                     projection_store.clone(),
                     self.tracker.clone(),
@@ -1700,28 +2310,6 @@ impl DelegationEngine {
                         // Exhausted retries — mark as verification failure
                         let verification_error =
                             format!("verification gate failed after {attempt} attempts: {reason}");
-                        self.tracker
-                            .complete_sub_run_with_result(
-                                &current.run_id,
-                                SubRunState::VerificationFailed,
-                                Some(verification_error.as_str()),
-                                current.output.as_deref(),
-                            )
-                            .await;
-                        astra_core::log_persist!(
-                            self.run_engine
-                                .persist_status(
-                                    user_id,
-                                    &current.run_id,
-                                    STATUS_VERIFICATION_FAILED,
-                                    None,
-                                    Some(&reason),
-                                )
-                                .await,
-                            "delegation",
-                            &current.run_id,
-                            "verification_failed"
-                        );
                         return AgentResult {
                             status: STATUS_VERIFICATION_FAILED.to_string(),
                             error: Some(verification_error),
@@ -1737,28 +2325,6 @@ impl DelegationEngine {
                         Err(error) => {
                             let retry_error =
                                 format!("verification retry template unavailable: {error}");
-                            self.tracker
-                                .complete_sub_run_with_result(
-                                    &original_run_id,
-                                    SubRunState::Failed,
-                                    Some(retry_error.as_str()),
-                                    current.output.as_deref(),
-                                )
-                                .await;
-                            astra_core::log_persist!(
-                                self.run_engine
-                                    .persist_status(
-                                        user_id,
-                                        &original_run_id,
-                                        STATUS_FAILED,
-                                        None,
-                                        Some(retry_error.as_str()),
-                                    )
-                                    .await,
-                                "delegation",
-                                &original_run_id,
-                                "retry_template_unavailable"
-                            );
                             return AgentResult {
                                 status: STATUS_FAILED.to_string(),
                                 error: Some(retry_error),
@@ -1768,6 +2334,33 @@ impl DelegationEngine {
                     };
                     let retry_run_id = retry_config.run_id.clone();
                     let retry_depth = self.tracker.get_depth(&original_run_id).await.unwrap_or(0);
+
+                    let retry_delay = verification_retry_delay(attempt, &original_run_id);
+                    tracing::debug!(
+                        target: "astra_runtime::delegation",
+                        run_id = %original_run_id,
+                        retry_attempt = attempt,
+                        retry_delay_ms = retry_delay.as_millis(),
+                        "verification retry scheduled with bounded backoff"
+                    );
+                    let cancelled_during_backoff =
+                        if let Some(token) = retry_config.cancel_token.as_ref() {
+                            tokio::select! {
+                                _ = tokio::time::sleep(retry_delay) => false,
+                                _ = token.cancelled() => true,
+                            }
+                        } else {
+                            tokio::time::sleep(retry_delay).await;
+                            false
+                        };
+                    if cancelled_during_backoff {
+                        let cancellation = "cancelled during verification retry backoff";
+                        return AgentResult {
+                            status: STATUS_CANCELLED.to_string(),
+                            error: Some(cancellation.to_string()),
+                            ..current
+                        };
+                    }
 
                     astra_core::log_persist!(
                         self.run_engine
@@ -1842,13 +2435,26 @@ impl DelegationEngine {
                         ),
                     );
 
-                    // Mark the original as verification-failed before retrying
+                    // Close the original attempt before retrying. The original
+                    // executor success was deliberately not committed yet;
+                    // verification is part of the terminal outcome contract.
+                    let rejected = reconcile_agent_result_with_durable_authority(
+                        &self.run_engine,
+                        user_id,
+                        AgentResult {
+                            status: STATUS_VERIFICATION_FAILED.to_string(),
+                            error: Some(reason.clone()),
+                            ..current.clone()
+                        },
+                    )
+                    .await;
+                    let rejected_state = agent_result_status_to_subrun_state(&rejected.status);
                     self.tracker
-                        .complete_sub_run_with_result(
+                        .apply_sub_run_result_state(
                             &original_run_id,
-                            SubRunState::VerificationFailed,
-                            Some(reason.as_str()),
-                            current.output.as_deref(),
+                            rejected_state,
+                            rejected.error.as_deref(),
+                            rejected.output.as_deref(),
                         )
                         .await;
 
@@ -1892,45 +2498,17 @@ impl DelegationEngine {
                     } else {
                         retry_exec.await
                     } {
-                        Ok(r) => {
-                            let result_state = agent_result_status_to_subrun_state(&r.status);
-                            self.tracker
-                                .apply_sub_run_result_state(
-                                    &r.run_id,
-                                    result_state,
-                                    r.error.as_deref(),
-                                    r.output.as_deref(),
-                                )
-                                .await;
-                            astra_core::log_persist!(
-                                self.run_engine
-                                    .persist_status(
-                                        user_id,
-                                        &r.run_id,
-                                        &r.status,
-                                        None,
-                                        r.error.as_deref(),
-                                    )
-                                    .await,
-                                "delegation",
-                                &r.run_id,
-                                "status"
-                            );
-                            current = r;
-                        }
+                        Ok(result) => current = result,
                         Err(e) => {
-                            self.tracker
-                                .complete_sub_run_with_result(
-                                    &retry_run_id,
-                                    SubRunState::Failed,
-                                    Some(e.as_str()),
-                                    None,
-                                )
-                                .await;
                             return AgentResult {
+                                agent_id: retry_agent_id,
+                                run_id: retry_run_id,
                                 status: STATUS_FAILED.to_string(),
                                 error: Some(format!("retry execution failed: {e}")),
-                                ..current
+                                output: None,
+                                prompt_tokens: 0,
+                                completion_tokens: 0,
+                                tool_calls: 0,
                             };
                         }
                     }
@@ -1965,11 +2543,35 @@ impl DelegationEngine {
 
     pub async fn execute_with_forward_headers(
         &self,
+        request: DelegationRequest,
+        source_agent_id: &str,
+        cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
+        forward_headers: HashMap<String, String>,
+        llm_token_service: Option<LlmTokenServiceConfig>,
+    ) -> Result<DelegationResult, String> {
+        self.execute_with_forward_headers_and_live_events(
+            request,
+            source_agent_id,
+            cancel_token,
+            forward_headers,
+            llm_token_service,
+            None,
+        )
+        .await
+    }
+
+    /// Execute one delegation with an optional request-scoped child live lane.
+    /// The sink is deliberately an argument rather than engine state: a shared
+    /// engine can serve concurrent sessions, and a stale TUI receiver must
+    /// never observe another request's children.
+    pub async fn execute_with_forward_headers_and_live_events(
+        &self,
         mut request: DelegationRequest,
         source_agent_id: &str,
         cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
         forward_headers: HashMap<String, String>,
         llm_token_service: Option<LlmTokenServiceConfig>,
+        live_event_sink: Option<astra_turn_core::agent_live_event::SharedAgentLiveEventSink>,
     ) -> Result<DelegationResult, String> {
         request
             .context
@@ -1997,11 +2599,7 @@ impl DelegationEngine {
                 request.depth,
             )?;
 
-        let session_id = request
-            .context
-            .get("session_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("delegation");
+        let session_id = Self::session_id_for(&request);
 
         // Extract pattern name and agent_ids for journal event.
         let (pattern_name, agent_ids_for_journal): (&str, Vec<String>) = match &request.pattern {
@@ -2026,9 +2624,9 @@ impl DelegationEngine {
 
         // Journal: delegation started
         Self::write_journal_event(
-            session_id,
+            &session_id,
             astra_services::session_journal::JournalEvent::delegation_started(
-                Some(session_id),
+                Some(&session_id),
                 &request.delegation_id,
                 &request.parent_run_id,
                 pattern_name,
@@ -2054,7 +2652,10 @@ impl DelegationEngine {
                 run_id: request.parent_run_id.clone(),
                 agent_id: source_agent_id.to_string(),
             };
-            match router.register_if_absent(parent_addr, None).await {
+            match router
+                .register_if_absent(parent_addr, Some(request.delegation_id.clone()))
+                .await
+            {
                 Ok(mb) => mb, // Some(mailbox) if newly registered, None if already present
                 Err(e) => {
                     tracing::warn!(
@@ -2074,6 +2675,7 @@ impl DelegationEngine {
         // Drop impl, which spawns a background unregister task. On the normal
         // path, we unregister explicitly below for proper error handling.
 
+        let execution_started_at = std::time::Instant::now();
         let result = match &request.pattern {
             CoordinationPattern::FanOut {
                 agent_ids,
@@ -2090,6 +2692,7 @@ impl DelegationEngine {
                     child_recursion_depth,
                     *timeout_sec,
                     cancel_token.as_ref(),
+                    live_event_sink.as_ref(),
                 )
                 .await
             }
@@ -2108,6 +2711,7 @@ impl DelegationEngine {
                     child_recursion_depth,
                     *timeout_sec,
                     cancel_token.as_ref(),
+                    live_event_sink.as_ref(),
                 )
                 .await
             }
@@ -2126,6 +2730,7 @@ impl DelegationEngine {
                     child_recursion_depth,
                     *timeout_sec,
                     cancel_token.as_ref(),
+                    live_event_sink.as_ref(),
                 )
                 .await
             }
@@ -2147,6 +2752,7 @@ impl DelegationEngine {
                     child_recursion_depth,
                     *timeout_sec,
                     cancel_token.as_ref(),
+                    live_event_sink.as_ref(),
                 )
                 .await
             }
@@ -2169,6 +2775,7 @@ impl DelegationEngine {
                     child_recursion_depth,
                     *timeout_sec,
                     cancel_token.as_ref(),
+                    live_event_sink.as_ref(),
                 )
                 .await
             }
@@ -2193,14 +2800,14 @@ impl DelegationEngine {
 
         // Journal: delegation completed
         if let Ok(ref dr) = result {
-            self.bubble_up_critical_agent_results(&request.user_id, session_id, &dr.agent_results)
+            self.bubble_up_critical_agent_results(&request.user_id, &session_id, &dr.agent_results)
                 .await;
             let succeeded = dr.agent_results.iter().filter(|r| r.is_success()).count();
             let failed = dr.agent_results.len() - succeeded;
             Self::write_journal_event(
-                session_id,
+                &session_id,
                 astra_services::session_journal::JournalEvent::delegation_completed(
-                    Some(session_id),
+                    Some(&session_id),
                     &request.delegation_id,
                     pattern_name,
                     dr.agent_results.len(),
@@ -2211,6 +2818,12 @@ impl DelegationEngine {
                 ),
             );
         }
+        record_delegation_metrics(
+            self.run_engine.metrics_registry(),
+            pattern_name,
+            execution_started_at.elapsed(),
+            &result,
+        );
 
         // Note: cleanup_delegation() is intentionally NOT called here.
         // The caller (e.g., TeamExecutionOrchestrator) should call
@@ -2220,7 +2833,8 @@ impl DelegationEngine {
         result
     }
 
-    /// Write a journal event (best-effort, non-blocking).
+    /// Write a journal event synchronously on the local diagnostic path.
+    /// Durable run state is committed separately by `RunEngine`.
     fn write_journal_event(session_id: &str, event: astra_services::session_journal::JournalEvent) {
         if let Ok(writer) = astra_services::session_journal::JournalWriter::new(session_id) {
             if let Err(e) = writer.append(&event) {
@@ -2241,6 +2855,7 @@ impl DelegationEngine {
         child_recursion_depth: u8,
         timeout_sec: u64,
         cancel_token: Option<&Arc<tokio_util::sync::CancellationToken>>,
+        live_event_sink: Option<&astra_turn_core::agent_live_event::SharedAgentLiveEventSink>,
     ) -> Result<DelegationResult, String> {
         let reg = self.registry.read().await;
         let has_gate = self.gate.is_some();
@@ -2250,7 +2865,6 @@ impl DelegationEngine {
             AggregationStrategy::FirstSuccess => "FirstSuccess",
             AggregationStrategy::AllResults => "AllResults",
             AggregationStrategy::Consensus => "Consensus",
-            AggregationStrategy::LlmGuided { .. } => "LlmGuided",
         };
         let budget_prompt = Self::extract_budget_prompt(&request.context);
         let agent_id_strs: Vec<&str> = agent_ids.iter().map(|s| s.as_str()).collect();
@@ -2259,17 +2873,13 @@ impl DelegationEngine {
         let mut configs = Vec::new();
         for agent_id in agent_ids {
             let sub_run_id = uuid::Uuid::new_v4().to_string();
-            let session_id = request
-                .context
-                .get("session_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("delegation");
+            let session_id = Self::session_id_for(request);
 
             self.run_engine
                 .start_run_ext(
                     &sub_run_id,
                     &request.user_id,
-                    session_id,
+                    &session_id,
                     Some(&request.parent_run_id),
                     Some(&request.delegation_id),
                     Some(agent_id),
@@ -2302,7 +2912,7 @@ impl DelegationEngine {
             }
 
             self.run_engine
-                .persist_status(
+                .persist_delegation_outcome_status(
                     &request.user_id,
                     &sub_run_id,
                     STATUS_RUNNING,
@@ -2383,17 +2993,13 @@ impl DelegationEngine {
 
             configs.push(SubRunConfig {
                 run_id: sub_run_id,
+                parent_run_id: request.parent_run_id.clone(),
                 agent_profile: profile,
                 task: enhanced_task,
-                session_id: request
-                    .context
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("delegation")
-                    .to_string(),
+                session_id: Self::session_id_for(request),
                 user_id: request.user_id.clone(),
                 previous_output: None,
-                context: request.context.clone(),
+                context: Self::child_task_context(request),
                 forward_headers: forward_headers.clone(),
                 llm_token_service: llm_token_service.cloned(),
                 request_constraints: request_constraints.clone(),
@@ -2403,7 +3009,7 @@ impl DelegationEngine {
                 checkpoint_gate: None,
                 mailbox,
                 progress_emitter: None,
-                live_event_sink: None,
+                live_event_sink: live_event_sink.cloned(),
                 cancel_token: Some(child_cancel),
                 inherited_prefix,
                 execution_metadata: request.execution_metadata.clone(),
@@ -2469,43 +3075,54 @@ impl DelegationEngine {
 
         // Use JoinSet for abort-on-drop semantics: if caller times out before
         // collecting all results, remaining tasks are aborted automatically.
-        let mut join_set: tokio::task::JoinSet<(Result<AgentResult, String>, String, String)> =
+        let mut join_set: tokio::task::JoinSet<(AgentResult, String, String)> =
             tokio::task::JoinSet::new();
         // Track agent_id/run_id for panic recovery (JoinSet doesn't preserve spawn order)
         let mut id_map: HashMap<tokio::task::Id, (String, String)> = HashMap::new();
 
         for config in configs {
             let executor = self.executor.clone();
-            let run_engine = self.run_engine.clone();
-            let tracker = self.tracker.clone();
             let sem = semaphore.clone();
             let cancel = cancel_token.cloned();
             let agent_timeout = per_agent_timeout;
             // Capture identity before moving config into the closure (panic context)
             let captured_agent_id = config.agent_profile.agent_id.clone();
             let captured_run_id = config.run_id.clone();
-            let request_user_id = config.user_id.clone();
             let abort_handle = join_set.spawn(async move {
-                // audit-#5: do not panic if the semaphore was closed during shutdown.
-                let _permit = match sem {
-                    Some(ref s) => match s.acquire().await {
-                        Ok(p) => Some(p),
-                        Err(_) => {
-                            tracing::info!(
-                                target: "astra_runtime::delegation",
-                                "semaphore closed during shutdown; proceeding without permit"
-                            );
-                            None
-                        }
-                    },
-                    None => None,
-                };
                 let run_id = config.run_id.clone();
                 let agent_id = config.agent_profile.agent_id.clone();
 
-                // Layer timeouts: per-agent timeout wraps execution,
-                // cancellation token wraps that.
+                // Cancellation must interrupt queueing for a concurrency
+                // permit. Once execution starts, the child receives its own
+                // cancellation token and gets the bounded drain window below
+                // to publish a canonical terminal result.
                 let exec_future = async {
+                    // A closed semaphore means the scheduler is shutting down;
+                    // preserving the existing no-panic behavior is safe here.
+                    let _permit = match sem {
+                        Some(ref s) => match if let Some(token) = cancel.as_ref() {
+                            tokio::select! {
+                                biased;
+                                _ = token.cancelled() => return Ok(cancelled_agent_result(&agent_id, &run_id)),
+                                permit = s.acquire() => permit,
+                            }
+                        } else {
+                            s.acquire().await
+                        } {
+                            Ok(p) => Some(p),
+                            Err(_) => {
+                                tracing::info!(
+                                    target: "astra_runtime::delegation",
+                                    "semaphore closed during shutdown; proceeding without permit"
+                                );
+                                None
+                            }
+                        },
+                        None => None,
+                    };
+                    if cancel.as_ref().is_some_and(|token| token.is_cancelled()) {
+                        return Ok(cancelled_agent_result(&agent_id, &run_id));
+                    }
                     match agent_timeout {
                         Some(dur) => {
                             match tokio::time::timeout(dur, executor.execute(config)).await {
@@ -2519,81 +3136,76 @@ impl DelegationEngine {
                         None => executor.execute(config).await,
                     }
                 };
-
-                let result = if let Some(ref token) = cancel {
-                    tokio::select! {
-                        r = exec_future => r,
-                        _ = token.cancelled() => Err("cancelled by budget timeout".to_string()),
-                    }
-                } else {
-                    exec_future.await
+                let result = match exec_future.await {
+                    Ok(result) => result,
+                    Err(error) => AgentResult {
+                        agent_id: agent_id.clone(),
+                        run_id: run_id.clone(),
+                        status: STATUS_FAILED.to_string(),
+                        output: None,
+                        error: Some(error),
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        tool_calls: 0,
+                    },
                 };
-                // Determine final state and persist
-                let final_state = match &result {
-                    Ok(r) => {
-                        astra_core::log_persist!(
-                            run_engine
-                                .persist_status(
-                                    &request_user_id,
-                                    &run_id,
-                                    &r.status,
-                                    None,
-                                    r.error.as_deref(),
-                                )
-                                .await,
-                            "delegation",
-                            &run_id,
-                            "status"
-                        );
-                        agent_result_status_to_subrun_state(&r.status)
-                    }
-                    Err(e) => {
-                        astra_core::log_persist!(
-                            run_engine
-                                .persist_status(
-                                    &request_user_id,
-                                    &run_id,
-                                    STATUS_FAILED,
-                                    None,
-                                    Some(e.as_str()),
-                                )
-                                .await,
-                            "delegation",
-                            &run_id,
-                            "status"
-                        );
-                        SubRunState::Failed
-                    }
-                };
-                let (error, output_preview) = match &result {
-                    Ok(r) => (r.error.as_deref(), r.output.as_deref()),
-                    Err(e) => (Some(e.as_str()), None),
-                };
-                tracker
-                    .apply_sub_run_result_state(&run_id, final_state, error, output_preview)
-                    .await;
                 (result, agent_id, run_id)
             });
             id_map.insert(abort_handle.id(), (captured_agent_id, captured_run_id));
         }
 
         let mut results = Vec::new();
-        // Cancellation-aware collection: if the cancel token fires while we're
-        // waiting for results, abort all remaining tasks and drain what's left.
-        // Without this, the loop blocks until all tasks complete even after cancel.
-        let mut cancelled = false;
+        // Cancellation-aware collection: let children observe their token and
+        // publish their canonical `cancelled` result before resorting to an
+        // abort. This wait is bounded so a stuck persistence/executor path
+        // cannot hold the parent turn indefinitely.
+        let mut cancellation_drain_deadline = None;
+        let mut abort_drain_deadline = None;
+        let mut cancellation_reconciliation_deadline = None;
         while let Some(join_result) = {
-            if cancelled {
-                // After abort_all, drain remaining results without waiting.
-                join_set.join_next().await
+            if abort_drain_deadline.is_some() {
+                abort_and_join_next_bounded(&mut join_set, &mut abort_drain_deadline, "fanout")
+                    .await
+            } else if let Some(deadline) = cancellation_drain_deadline {
+                match tokio::time::timeout_at(deadline, join_set.join_next()).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        tracing::warn!(
+                            target: "astra_runtime::delegation",
+                            timeout_ms = FANOUT_CANCELLATION_DRAIN_TIMEOUT.as_millis(),
+                            "fanout cancellation drain timed out; aborting unacknowledged children"
+                        );
+                        abort_and_join_next_bounded(
+                            &mut join_set,
+                            &mut abort_drain_deadline,
+                            "fanout",
+                        )
+                        .await
+                    }
+                }
             } else if let Some(token) = cancel_token {
                 tokio::select! {
                     biased;
                     r = join_set.join_next() => r,
                     _ = token.cancelled() => {
-                        cancelled = true;
-                        join_set.abort_all();
-                        join_set.join_next().await
+                        let deadline = tokio::time::Instant::now() + FANOUT_CANCELLATION_DRAIN_TIMEOUT;
+                        cancellation_drain_deadline = Some(deadline);
+                        match tokio::time::timeout_at(deadline, join_set.join_next()).await {
+                            Ok(result) => result,
+                            Err(_) => {
+                                tracing::warn!(
+                                    target: "astra_runtime::delegation",
+                                    timeout_ms = FANOUT_CANCELLATION_DRAIN_TIMEOUT.as_millis(),
+                                    "fanout cancellation drain timed out; aborting unacknowledged children"
+                                );
+                                abort_and_join_next_bounded(
+                                    &mut join_set,
+                                    &mut abort_drain_deadline,
+                                    "fanout",
+                                )
+                                .await
+                            }
+                        }
                     }
                 }
             } else {
@@ -2601,48 +3213,18 @@ impl DelegationEngine {
             }
         } {
             match join_result {
-                Ok((Ok(result), _, _)) => results.push(result),
-                Ok((Err(e), agent_id, run_id)) => {
-                    results.push(AgentResult {
-                        agent_id,
-                        run_id,
-                        status: STATUS_FAILED.to_string(),
-                        output: None,
-                        error: Some(e),
-                        prompt_tokens: 0,
-                        completion_tokens: 0,
-                        tool_calls: 0,
-                    });
-                }
+                Ok((result, _, _)) => results.push(result),
                 Err(e) => {
                     // JoinError (panic) — look up identity from id_map using task ID
                     let (panic_agent_id, panic_run_id) = id_map
                         .get(&e.id())
                         .cloned()
                         .unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string()));
-                    astra_core::log_persist!(
-                        self.run_engine
-                            .persist_status(
-                                &request.user_id,
-                                &panic_run_id,
-                                STATUS_FAILED,
-                                None,
-                                Some(&format!("task panicked: {e}"))
-                            )
-                            .await,
-                        "delegation",
-                        &panic_run_id,
-                        "status"
-                    );
+                    if e.is_cancelled() && cancel_token.is_some_and(|token| token.is_cancelled()) {
+                        results.push(cancelled_agent_result(&panic_agent_id, &panic_run_id));
+                        continue;
+                    }
                     let panic_error = format!("task join error (panic): {e}");
-                    self.tracker
-                        .complete_sub_run_with_result(
-                            &panic_run_id,
-                            SubRunState::Failed,
-                            Some(panic_error.as_str()),
-                            None,
-                        )
-                        .await;
                     results.push(AgentResult {
                         agent_id: panic_agent_id,
                         run_id: panic_run_id,
@@ -2654,6 +3236,24 @@ impl DelegationEngine {
                         tool_calls: 0,
                     });
                 }
+            }
+        }
+
+        // A shared abort deadline can expire before every JoinSet entry yields
+        // a projection result. Do not silently shrink result cardinality: use
+        // the spawn identity map to reconcile each missing child through the
+        // durable run authority. This keeps parent aggregation complete even
+        // when local task cleanup is only partially observable.
+        if cancel_token.is_some_and(|token| token.is_cancelled()) {
+            let mut settled_run_ids = results
+                .iter()
+                .map(|result| result.run_id.clone())
+                .collect::<HashSet<_>>();
+            for (agent_id, run_id) in id_map.values() {
+                if !settled_run_ids.insert(run_id.clone()) {
+                    continue;
+                }
+                results.push(cancelled_agent_result(agent_id, run_id));
             }
         }
 
@@ -2689,6 +3289,7 @@ impl DelegationEngine {
                             );
                             Ok(SubRunConfig {
                                 run_id: uuid::Uuid::new_v4().to_string(),
+                                parent_run_id: request.parent_run_id.clone(),
                                 agent_profile: profile,
                                 task,
                                 session_id: sess,
@@ -2704,7 +3305,7 @@ impl DelegationEngine {
                                 checkpoint_gate: None,
                                 mailbox: None,
                                 progress_emitter: None,
-                                live_event_sink: None,
+                                live_event_sink: live_event_sink.cloned(),
                                 cancel_token: cancel_for_retry.clone(),
                                 inherited_prefix,
                                 execution_metadata: request.execution_metadata.clone(),
@@ -2720,6 +3321,38 @@ impl DelegationEngine {
             }
             results = gated_results;
         }
+
+        let mut authoritative_results = Vec::with_capacity(results.len());
+        for result in results {
+            let result = if cancel_token.is_some_and(|token| token.is_cancelled()) {
+                reconcile_after_parent_cancellation_bounded(
+                    &self.run_engine,
+                    &request.user_id,
+                    result,
+                    &mut cancellation_reconciliation_deadline,
+                    "fanout",
+                )
+                .await
+            } else {
+                reconcile_agent_result_with_durable_authority(
+                    &self.run_engine,
+                    &request.user_id,
+                    result,
+                )
+                .await
+            };
+            let final_state = agent_result_status_to_subrun_state(&result.status);
+            self.tracker
+                .apply_sub_run_result_state(
+                    &result.run_id,
+                    final_state,
+                    result.error.as_deref(),
+                    result.output.as_deref(),
+                )
+                .await;
+            authoritative_results.push(result);
+        }
+        let results = authoritative_results;
 
         let aggregated = aggregate_results(aggregation, &results);
         Ok(DelegationResult::from_results(
@@ -2742,6 +3375,7 @@ impl DelegationEngine {
         child_recursion_depth: u8,
         timeout_sec: u64,
         cancel_token: Option<&Arc<tokio_util::sync::CancellationToken>>,
+        live_event_sink: Option<&astra_turn_core::agent_live_event::SharedAgentLiveEventSink>,
     ) -> Result<DelegationResult, String> {
         let reg = self.registry.read().await;
         let mut results = Vec::new();
@@ -2764,17 +3398,13 @@ impl DelegationEngine {
             }
 
             let sub_run_id = uuid::Uuid::new_v4().to_string();
-            let session_id = request
-                .context
-                .get("session_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("delegation");
+            let session_id = Self::session_id_for(request);
 
             self.run_engine
                 .start_run_ext(
                     &sub_run_id,
                     &request.user_id,
-                    session_id,
+                    &session_id,
                     Some(&request.parent_run_id),
                     Some(&request.delegation_id),
                     Some(agent_id),
@@ -2807,7 +3437,7 @@ impl DelegationEngine {
             }
 
             self.run_engine
-                .persist_status(
+                .persist_delegation_outcome_status(
                     &request.user_id,
                     &sub_run_id,
                     STATUS_RUNNING,
@@ -2877,17 +3507,13 @@ impl DelegationEngine {
 
             let config = SubRunConfig {
                 run_id: sub_run_id.clone(),
+                parent_run_id: request.parent_run_id.clone(),
                 agent_profile: profile,
                 task: enhanced_task,
-                session_id: request
-                    .context
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("delegation")
-                    .to_string(),
+                session_id: Self::session_id_for(request),
                 user_id: request.user_id.clone(),
                 previous_output: previous_output.clone(),
-                context: request.context.clone(),
+                context: Self::child_task_context(request),
                 forward_headers: forward_headers.clone(),
                 llm_token_service: llm_token_service.cloned(),
                 request_constraints: request_constraints.clone(),
@@ -2897,7 +3523,7 @@ impl DelegationEngine {
                 checkpoint_gate: None,
                 mailbox,
                 progress_emitter: None,
-                live_event_sink: None,
+                live_event_sink: live_event_sink.cloned(),
                 cancel_token: Some(child_cancel),
                 inherited_prefix: None,
                 execution_metadata: request.execution_metadata.clone(),
@@ -2920,79 +3546,24 @@ impl DelegationEngine {
             };
 
             let result = match exec_result {
-                Ok(r) => {
-                    astra_core::log_persist!(
-                        self.run_engine
-                            .persist_status(
-                                &request.user_id,
-                                &sub_run_id,
-                                &r.status,
-                                None,
-                                r.error.as_deref(),
-                            )
-                            .await,
-                        "delegation",
-                        &sub_run_id,
-                        "status"
-                    );
-                    let final_state = agent_result_status_to_subrun_state(&r.status);
-                    self.tracker
-                        .apply_sub_run_result_state(
-                            &sub_run_id,
-                            final_state,
-                            r.error.as_deref(),
-                            r.output.as_deref(),
-                        )
-                        .await;
-                    r
-                }
-                Err(e) => {
-                    astra_core::log_persist!(
-                        self.run_engine
-                            .persist_status(
-                                &request.user_id,
-                                &sub_run_id,
-                                STATUS_FAILED,
-                                None,
-                                Some(e.as_str()),
-                            )
-                            .await,
-                        "delegation",
-                        &sub_run_id,
-                        "status"
-                    );
-                    self.tracker
-                        .complete_sub_run_with_result(
-                            &sub_run_id,
-                            SubRunState::Failed,
-                            Some(e.as_str()),
-                            None,
-                        )
-                        .await;
-                    AgentResult {
-                        agent_id: agent_id.clone(),
-                        run_id: sub_run_id,
-                        status: STATUS_FAILED.to_string(),
-                        output: None,
-                        error: Some(e),
-                        prompt_tokens: 0,
-                        completion_tokens: 0,
-                        tool_calls: 0,
-                    }
-                }
+                Ok(result) => result,
+                Err(error) => AgentResult {
+                    agent_id: agent_id.clone(),
+                    run_id: sub_run_id.clone(),
+                    status: STATUS_FAILED.to_string(),
+                    output: None,
+                    error: Some(error),
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    tool_calls: 0,
+                },
             };
-
             // ── Verification gate with retry for sequential sub-runs ──
             let result = if self.gate.is_some() {
                 let delegation_id = request.delegation_id.clone();
-                let sess = request
-                    .context
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("delegation")
-                    .to_string();
+                let sess = Self::session_id_for(request);
                 let uid = request.user_id.clone();
-                let ctx = request.context.clone();
+                let ctx = Self::child_task_context(request);
                 let prev = previous_output.clone();
                 let cancel_for_retry = cancel_token.cloned();
                 let profile_for_retry = reg.get(agent_id).cloned();
@@ -3013,6 +3584,7 @@ impl DelegationEngine {
                         })?;
                         Ok(SubRunConfig {
                             run_id: uuid::Uuid::new_v4().to_string(),
+                            parent_run_id: request.parent_run_id.clone(),
                             agent_profile: profile,
                             task: retry_task.clone(),
                             session_id: sess.clone(),
@@ -3028,7 +3600,7 @@ impl DelegationEngine {
                             checkpoint_gate: None,
                             mailbox: None,
                             progress_emitter: None,
-                            live_event_sink: None,
+                            live_event_sink: live_event_sink.cloned(),
                             cancel_token: cancel_for_retry.clone(),
                             inherited_prefix: None,
                             execution_metadata: request.execution_metadata.clone(),
@@ -3043,6 +3615,21 @@ impl DelegationEngine {
             } else {
                 result
             };
+            let result = reconcile_agent_result_with_durable_authority(
+                &self.run_engine,
+                &request.user_id,
+                result,
+            )
+            .await;
+            let final_state = agent_result_status_to_subrun_state(&result.status);
+            self.tracker
+                .apply_sub_run_result_state(
+                    &result.run_id,
+                    final_state,
+                    result.error.as_deref(),
+                    result.output.as_deref(),
+                )
+                .await;
 
             // Feed output to the next stage (pipeline semantics).
             previous_output = result.output.clone();
@@ -3074,6 +3661,7 @@ impl DelegationEngine {
         child_recursion_depth: u8,
         timeout_sec: u64,
         cancel_token: Option<&Arc<tokio_util::sync::CancellationToken>>,
+        live_event_sink: Option<&astra_turn_core::agent_live_event::SharedAgentLiveEventSink>,
     ) -> Result<DelegationResult, String> {
         let reg = self.registry.read().await;
         let mut results = Vec::new();
@@ -3105,16 +3693,12 @@ impl DelegationEngine {
 
             // ── Producer sub-run ──
             let prod_run_id = uuid::Uuid::new_v4().to_string();
-            let session_id = request
-                .context
-                .get("session_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("delegation");
+            let session_id = Self::session_id_for(request);
             self.run_engine
                 .start_run_ext(
                     &prod_run_id,
                     &request.user_id,
-                    session_id,
+                    &session_id,
                     Some(&request.parent_run_id),
                     Some(&request.delegation_id),
                     Some(producer_id),
@@ -3143,7 +3727,7 @@ impl DelegationEngine {
                 );
             }
             self.run_engine
-                .persist_status(
+                .persist_delegation_outcome_status(
                     &request.user_id,
                     &prod_run_id,
                     STATUS_RUNNING,
@@ -3152,6 +3736,12 @@ impl DelegationEngine {
                 )
                 .await?;
             let prod_pause = self.tracker.register_pause_flag(&prod_run_id).await;
+            let prod_cancel = cancel_token
+                .map(|token| Arc::new(token.child_token()))
+                .unwrap_or_else(|| Arc::new(tokio_util::sync::CancellationToken::new()));
+            self.tracker
+                .register_cancel_token(&prod_run_id, prod_cancel.clone())
+                .await;
             self.run_engine
                 .append_event(
                     &request.user_id,
@@ -3201,17 +3791,13 @@ impl DelegationEngine {
 
             let prod_config = SubRunConfig {
                 run_id: prod_run_id.clone(),
+                parent_run_id: request.parent_run_id.clone(),
                 agent_profile: producer_profile.clone(),
                 task: prod_enhanced_task,
-                session_id: request
-                    .context
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("delegation")
-                    .to_string(),
+                session_id: Self::session_id_for(request),
                 user_id: request.user_id.clone(),
                 previous_output: last_producer_output.clone(),
-                context: request.context.clone(),
+                context: Self::child_task_context(request),
                 forward_headers: forward_headers.clone(),
                 llm_token_service: llm_token_service.cloned(),
                 request_constraints: request_constraints.clone(),
@@ -3221,8 +3807,8 @@ impl DelegationEngine {
                 checkpoint_gate: None,
                 mailbox: prod_mailbox,
                 progress_emitter: None,
-                live_event_sink: None,
-                cancel_token: cancel_token.cloned(),
+                live_event_sink: live_event_sink.cloned(),
+                cancel_token: Some(prod_cancel),
                 inherited_prefix: None,
                 execution_metadata: request.execution_metadata.clone(),
 
@@ -3244,79 +3830,24 @@ impl DelegationEngine {
                 None => self.executor.execute(prod_config).await,
             };
             let prod_result = match prod_exec {
-                Ok(r) => {
-                    astra_core::log_persist!(
-                        self.run_engine
-                            .persist_status(
-                                &request.user_id,
-                                &prod_run_id,
-                                &r.status,
-                                None,
-                                r.error.as_deref(),
-                            )
-                            .await,
-                        "delegation",
-                        &prod_run_id,
-                        "status"
-                    );
-                    let final_state = agent_result_status_to_subrun_state(&r.status);
-                    self.tracker
-                        .apply_sub_run_result_state(
-                            &prod_run_id,
-                            final_state,
-                            r.error.as_deref(),
-                            r.output.as_deref(),
-                        )
-                        .await;
-                    r
-                }
-                Err(e) => {
-                    astra_core::log_persist!(
-                        self.run_engine
-                            .persist_status(
-                                &request.user_id,
-                                &prod_run_id,
-                                STATUS_FAILED,
-                                None,
-                                Some(e.as_str()),
-                            )
-                            .await,
-                        "delegation",
-                        &prod_run_id,
-                        "status"
-                    );
-                    self.tracker
-                        .complete_sub_run_with_result(
-                            &prod_run_id,
-                            SubRunState::Failed,
-                            Some(e.as_str()),
-                            None,
-                        )
-                        .await;
-                    AgentResult {
-                        agent_id: producer_id.to_string(),
-                        run_id: prod_run_id,
-                        status: STATUS_FAILED.to_string(),
-                        output: None,
-                        error: Some(e),
-                        prompt_tokens: 0,
-                        completion_tokens: 0,
-                        tool_calls: 0,
-                    }
-                }
+                Ok(result) => result,
+                Err(error) => AgentResult {
+                    agent_id: producer_id.to_string(),
+                    run_id: prod_run_id.clone(),
+                    status: STATUS_FAILED.to_string(),
+                    output: None,
+                    error: Some(error),
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    tool_calls: 0,
+                },
             };
-
             // ── Gate on producer output before reviewer sees it ──
             let prod_result = if self.gate.is_some() {
                 let did = request.delegation_id.clone();
-                let sess = request
-                    .context
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("delegation")
-                    .to_string();
+                let sess = Self::session_id_for(request);
                 let uid = request.user_id.clone();
-                let ctx = request.context.clone();
+                let ctx = Self::child_task_context(request);
                 let prev = last_producer_output.clone();
                 let cancel_for_retry = cancel_token.cloned();
                 let pp = producer_profile.clone();
@@ -3329,6 +3860,7 @@ impl DelegationEngine {
                     || {
                         Ok(SubRunConfig {
                             run_id: uuid::Uuid::new_v4().to_string(),
+                            parent_run_id: request.parent_run_id.clone(),
                             agent_profile: pp.clone(),
                             task: prod_retry_task.clone(),
                             session_id: sess.clone(),
@@ -3344,7 +3876,7 @@ impl DelegationEngine {
                             checkpoint_gate: None,
                             mailbox: None,
                             progress_emitter: None,
-                            live_event_sink: None,
+                            live_event_sink: live_event_sink.cloned(),
                             cancel_token: cancel_for_retry.clone(),
                             inherited_prefix: None,
                             execution_metadata: request.execution_metadata.clone(),
@@ -3359,6 +3891,21 @@ impl DelegationEngine {
             } else {
                 prod_result
             };
+            let prod_result = reconcile_agent_result_with_durable_authority(
+                &self.run_engine,
+                &request.user_id,
+                prod_result,
+            )
+            .await;
+            let final_state = agent_result_status_to_subrun_state(&prod_result.status);
+            self.tracker
+                .apply_sub_run_result_state(
+                    &prod_result.run_id,
+                    final_state,
+                    prod_result.error.as_deref(),
+                    prod_result.output.as_deref(),
+                )
+                .await;
 
             last_producer_output = prod_result.output.clone();
             results.push(prod_result);
@@ -3369,7 +3916,7 @@ impl DelegationEngine {
                 .start_run_ext(
                     &rev_run_id,
                     &request.user_id,
-                    session_id,
+                    &session_id,
                     Some(&request.parent_run_id),
                     Some(&request.delegation_id),
                     Some(reviewer_id),
@@ -3398,7 +3945,7 @@ impl DelegationEngine {
                 );
             }
             self.run_engine
-                .persist_status(
+                .persist_delegation_outcome_status(
                     &request.user_id,
                     &rev_run_id,
                     STATUS_RUNNING,
@@ -3407,6 +3954,12 @@ impl DelegationEngine {
                 )
                 .await?;
             let rev_pause = self.tracker.register_pause_flag(&rev_run_id).await;
+            let rev_cancel = cancel_token
+                .map(|token| Arc::new(token.child_token()))
+                .unwrap_or_else(|| Arc::new(tokio_util::sync::CancellationToken::new()));
+            self.tracker
+                .register_cancel_token(&rev_run_id, rev_cancel.clone())
+                .await;
             self.run_engine
                 .append_event(
                     &request.user_id,
@@ -3444,17 +3997,13 @@ impl DelegationEngine {
 
             let rev_config = SubRunConfig {
                 run_id: rev_run_id.clone(),
+                parent_run_id: request.parent_run_id.clone(),
                 agent_profile: reviewer_profile.clone(),
                 task: rev_enhanced_task,
-                session_id: request
-                    .context
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("delegation")
-                    .to_string(),
+                session_id: Self::session_id_for(request),
                 user_id: request.user_id.clone(),
                 previous_output: last_producer_output.clone(),
-                context: request.context.clone(),
+                context: Self::child_task_context(request),
                 forward_headers: forward_headers.clone(),
                 llm_token_service: llm_token_service.cloned(),
                 request_constraints: request_constraints.clone(),
@@ -3464,8 +4013,8 @@ impl DelegationEngine {
                 checkpoint_gate: None,
                 mailbox: rev_mailbox,
                 progress_emitter: None,
-                live_event_sink: None,
-                cancel_token: cancel_token.cloned(),
+                live_event_sink: live_event_sink.cloned(),
+                cancel_token: Some(rev_cancel),
                 inherited_prefix: None,
                 execution_metadata: request.execution_metadata.clone(),
 
@@ -3487,67 +4036,33 @@ impl DelegationEngine {
                 None => self.executor.execute(rev_config).await,
             };
             let rev_result = match rev_exec {
-                Ok(r) => {
-                    astra_core::log_persist!(
-                        self.run_engine
-                            .persist_status(
-                                &request.user_id,
-                                &rev_run_id,
-                                &r.status,
-                                None,
-                                r.error.as_deref(),
-                            )
-                            .await,
-                        "delegation",
-                        &rev_run_id,
-                        "status"
-                    );
-                    let final_state = agent_result_status_to_subrun_state(&r.status);
-                    self.tracker
-                        .apply_sub_run_result_state(
-                            &rev_run_id,
-                            final_state,
-                            r.error.as_deref(),
-                            r.output.as_deref(),
-                        )
-                        .await;
-                    r
-                }
-                Err(e) => {
-                    astra_core::log_persist!(
-                        self.run_engine
-                            .persist_status(
-                                &request.user_id,
-                                &rev_run_id,
-                                STATUS_FAILED,
-                                None,
-                                Some(e.as_str()),
-                            )
-                            .await,
-                        "delegation",
-                        &rev_run_id,
-                        "status"
-                    );
-                    self.tracker
-                        .complete_sub_run_with_result(
-                            &rev_run_id,
-                            SubRunState::Failed,
-                            Some(e.as_str()),
-                            None,
-                        )
-                        .await;
-                    AgentResult {
-                        agent_id: reviewer_id.to_string(),
-                        run_id: rev_run_id,
-                        status: STATUS_FAILED.to_string(),
-                        output: None,
-                        error: Some(e),
-                        prompt_tokens: 0,
-                        completion_tokens: 0,
-                        tool_calls: 0,
-                    }
-                }
+                Ok(result) => result,
+                Err(error) => AgentResult {
+                    agent_id: reviewer_id.to_string(),
+                    run_id: rev_run_id.clone(),
+                    status: STATUS_FAILED.to_string(),
+                    output: None,
+                    error: Some(error),
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    tool_calls: 0,
+                },
             };
+            let rev_result = reconcile_agent_result_with_durable_authority(
+                &self.run_engine,
+                &request.user_id,
+                rev_result,
+            )
+            .await;
+            let final_state = agent_result_status_to_subrun_state(&rev_result.status);
+            self.tracker
+                .apply_sub_run_result_state(
+                    &rev_run_id,
+                    final_state,
+                    rev_result.error.as_deref(),
+                    rev_result.output.as_deref(),
+                )
+                .await;
             results.push(rev_result);
         }
 
@@ -3576,6 +4091,7 @@ impl DelegationEngine {
         child_recursion_depth: u8,
         timeout_sec: u64,
         cancel_token: Option<&Arc<tokio_util::sync::CancellationToken>>,
+        live_event_sink: Option<&astra_turn_core::agent_live_event::SharedAgentLiveEventSink>,
     ) -> Result<DelegationResult, String> {
         let reg = self.registry.read().await;
         let profile = reg
@@ -3592,11 +4108,7 @@ impl DelegationEngine {
             .cloned()
             .unwrap_or_else(|| serde_json::json!([]));
 
-        let session_id = request
-            .context
-            .get("session_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("delegation");
+        let session_id = Self::session_id_for(request);
 
         // Spawn fork children in parallel, respecting optional max_parallel limit.
         let max_parallel = request
@@ -3609,7 +4121,7 @@ impl DelegationEngine {
         } else {
             None
         };
-        let mut handles: tokio::task::JoinSet<(Result<AgentResult, String>, String, String)> =
+        let mut handles: tokio::task::JoinSet<(AgentResult, String, String)> =
             tokio::task::JoinSet::new();
         let mut fork_id_map: HashMap<tokio::task::Id, (String, String)> = HashMap::new();
         for (i, task) in tasks.iter().enumerate() {
@@ -3618,7 +4130,7 @@ impl DelegationEngine {
                 .start_run_ext(
                     &run_id,
                     &request.user_id,
-                    session_id,
+                    &session_id,
                     Some(&request.parent_run_id),
                     Some(&request.delegation_id),
                     Some(agent_id),
@@ -3648,7 +4160,13 @@ impl DelegationEngine {
             }
             if let Err(e) = self
                 .run_engine
-                .persist_status(&request.user_id, &run_id, "running", Some("fork"), None)
+                .persist_delegation_outcome_status(
+                    &request.user_id,
+                    &run_id,
+                    STATUS_RUNNING,
+                    Some("fork"),
+                    None,
+                )
                 .await
             {
                 astra_core::agent_warn!(
@@ -3657,6 +4175,12 @@ impl DelegationEngine {
                 );
             }
             let pause_flag = self.tracker.register_pause_flag(&run_id).await;
+            let child_cancel = cancel_token
+                .map(|token| Arc::new(token.child_token()))
+                .unwrap_or_else(|| Arc::new(tokio_util::sync::CancellationToken::new()));
+            self.tracker
+                .register_cancel_token(&run_id, child_cancel.clone())
+                .await;
 
             let fork_mailbox = if let Some(router) = &self.mailbox_router {
                 let addr = astra_messaging::types::AgentAddress {
@@ -3680,7 +4204,7 @@ impl DelegationEngine {
             };
 
             // Build fork-specific context: parent messages + fork instruction
-            let mut fork_context = request.context.clone();
+            let mut fork_context = Self::child_task_context(request);
             fork_context.insert("fork_index".to_string(), serde_json::json!(i));
             fork_context.insert("parent_messages".to_string(), parent_messages.clone());
             fork_context.insert("is_fork_child".to_string(), serde_json::json!(true));
@@ -3700,9 +4224,10 @@ impl DelegationEngine {
 
             let config = SubRunConfig {
                 run_id: run_id.clone(),
+                parent_run_id: request.parent_run_id.clone(),
                 agent_profile: fork_profile,
                 task: fork_task,
-                session_id: session_id.to_string(),
+                session_id: session_id.clone(),
                 user_id: request.user_id.clone(),
                 previous_output: None,
                 context: fork_context,
@@ -3715,8 +4240,8 @@ impl DelegationEngine {
                 checkpoint_gate: None,
                 mailbox: fork_mailbox,
                 progress_emitter: None,
-                live_event_sink: None,
-                cancel_token: cancel_token.cloned(),
+                live_event_sink: live_event_sink.cloned(),
+                cancel_token: Some(child_cancel),
                 inherited_prefix: None,
                 execution_metadata: request.execution_metadata.clone(),
 
@@ -3740,24 +4265,40 @@ impl DelegationEngine {
             let captured_run_id = config.run_id.clone();
             let request_user_id = config.user_id.clone();
             let abort_handle = handles.spawn(async move {
-                // audit-#5: do not panic if the semaphore was closed during shutdown.
-                let _permit = match sem {
-                    Some(ref s) => match s.acquire().await {
-                        Ok(p) => Some(p),
-                        Err(_) => {
-                            tracing::info!(
-                                target: "astra_runtime::delegation",
-                                "semaphore closed during shutdown; proceeding without permit"
-                            );
-                            None
-                        }
-                    },
-                    None => None,
-                };
                 let run_id = config.run_id.clone();
                 let agent_id = config.agent_profile.agent_id.clone();
 
                 let exec_future = async {
+                    // Cancellation must also release tasks still waiting for a
+                    // fanout permit; queued work has not failed merely because
+                    // its parent was cancelled.
+                    let _permit = match sem {
+                        Some(ref s) => match if let Some(token) = cancel_for_spawn.as_ref() {
+                            tokio::select! {
+                                biased;
+                                _ = token.cancelled() => return Ok(cancelled_agent_result(&agent_id, &run_id)),
+                                permit = s.acquire() => permit,
+                            }
+                        } else {
+                            s.acquire().await
+                        } {
+                            Ok(p) => Some(p),
+                            Err(_) => {
+                                tracing::info!(
+                                    target: "astra_runtime::delegation",
+                                    "semaphore closed during shutdown; proceeding without permit"
+                                );
+                                None
+                            }
+                        },
+                        None => None,
+                    };
+                    if cancel_for_spawn
+                        .as_ref()
+                        .is_some_and(|token| token.is_cancelled())
+                    {
+                        return Ok(cancelled_agent_result(&agent_id, &run_id));
+                    }
                     match per_child_timeout {
                         Some(dur) => {
                             match tokio::time::timeout(dur, executor.execute(config)).await {
@@ -3771,75 +4312,84 @@ impl DelegationEngine {
                         None => executor.execute(config).await,
                     }
                 };
-
-                let result = if let Some(token) = cancel_for_spawn {
-                    tokio::select! {
-                        r = exec_future => r,
-                        _ = token.cancelled() => {
-                            Err("cancelled by budget timeout".to_string())
-                        }
-                    }
-                } else {
-                    exec_future.await
+                let result = match exec_future.await {
+                    Ok(result) => result,
+                    Err(error) => AgentResult {
+                        agent_id: agent_id.clone(),
+                        run_id: run_id.clone(),
+                        status: STATUS_FAILED.to_string(),
+                        output: None,
+                        error: Some(error),
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        tool_calls: 0,
+                    },
                 };
-                let final_state = match &result {
-                    Ok(r) => {
-                        if let Err(e) = run_engine
-                            .persist_status(
-                                &request_user_id,
-                                &run_id,
-                                &r.status,
-                                None,
-                                r.error.as_deref(),
-                            )
-                            .await
-                        {
-                            astra_core::agent_warn!(
-                                "delegation",
-                                "Fork: failed to persist final status for {run_id}: {e}"
-                            );
-                        }
-                        agent_result_status_to_subrun_state(&r.status)
-                    }
-                    Err(e) => {
-                        if let Err(pe) = run_engine
-                            .persist_status(&request_user_id, &run_id, "failed", None, Some(e))
-                            .await
-                        {
-                            astra_core::agent_warn!(
-                                "delegation",
-                                "Fork: failed to persist error status for {run_id}: {pe}"
-                            );
-                        }
-                        SubRunState::Failed
-                    }
-                };
-                let (error, output_preview) = match &result {
-                    Ok(r) => (r.error.as_deref(), r.output.as_deref()),
-                    Err(e) => (Some(e.as_str()), None),
-                };
+                let result = reconcile_agent_result_with_durable_authority(
+                    &run_engine,
+                    &request_user_id,
+                    result,
+                )
+                .await;
+                let final_state = agent_result_status_to_subrun_state(&result.status);
                 tracker
-                    .apply_sub_run_result_state(&run_id, final_state, error, output_preview)
+                    .apply_sub_run_result_state(
+                        &run_id,
+                        final_state,
+                        result.error.as_deref(),
+                        result.output.as_deref(),
+                    )
                     .await;
                 (result, agent_id, run_id)
             });
             fork_id_map.insert(abort_handle.id(), (captured_agent_id, captured_run_id));
         }
 
-        // Collect all results (cancellation-aware, abort-on-drop via JoinSet)
+        // As in the regular fanout path, first let cancellation propagate to
+        // children and only force-abort after a finite acknowledgement window.
         let mut results = Vec::with_capacity(tasks.len());
-        let mut fork_cancelled = false;
+        let mut cancellation_drain_deadline = None;
+        let mut abort_drain_deadline = None;
+        let mut cancellation_reconciliation_deadline = None;
         while let Some(join_result) = {
-            if fork_cancelled {
-                handles.join_next().await
+            if abort_drain_deadline.is_some() {
+                abort_and_join_next_bounded(&mut handles, &mut abort_drain_deadline, "fork").await
+            } else if let Some(deadline) = cancellation_drain_deadline {
+                match tokio::time::timeout_at(deadline, handles.join_next()).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        tracing::warn!(
+                            target: "astra_runtime::delegation",
+                            timeout_ms = FANOUT_CANCELLATION_DRAIN_TIMEOUT.as_millis(),
+                            "fork cancellation drain timed out; aborting unacknowledged children"
+                        );
+                        abort_and_join_next_bounded(&mut handles, &mut abort_drain_deadline, "fork")
+                            .await
+                    }
+                }
             } else if let Some(token) = cancel_token {
                 tokio::select! {
                     biased;
                     r = handles.join_next() => r,
                     _ = token.cancelled() => {
-                        fork_cancelled = true;
-                        handles.abort_all();
-                        handles.join_next().await
+                        let deadline = tokio::time::Instant::now() + FANOUT_CANCELLATION_DRAIN_TIMEOUT;
+                        cancellation_drain_deadline = Some(deadline);
+                        match tokio::time::timeout_at(deadline, handles.join_next()).await {
+                            Ok(result) => result,
+                            Err(_) => {
+                                tracing::warn!(
+                                    target: "astra_runtime::delegation",
+                                    timeout_ms = FANOUT_CANCELLATION_DRAIN_TIMEOUT.as_millis(),
+                                    "fork cancellation drain timed out; aborting unacknowledged children"
+                                );
+                                abort_and_join_next_bounded(
+                                    &mut handles,
+                                    &mut abort_drain_deadline,
+                                    "fork",
+                                )
+                                .await
+                            }
+                        }
                     }
                 }
             } else {
@@ -3847,58 +4397,87 @@ impl DelegationEngine {
             }
         } {
             match join_result {
-                Ok((Ok(r), _, _)) => results.push(r),
-                Ok((Err(e), agent_id, run_id)) => results.push(AgentResult {
-                    agent_id,
-                    run_id,
-                    status: "failed".to_string(),
-                    output: None,
-                    error: Some(e),
-                    prompt_tokens: 0,
-                    completion_tokens: 0,
-                    tool_calls: 0,
-                }),
+                Ok((result, _, _)) => results.push(result),
                 Err(e) => {
                     let (panic_agent_id, panic_run_id) = fork_id_map
                         .get(&e.id())
                         .cloned()
                         .unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string()));
-                    if let Err(e2) = self
-                        .run_engine
-                        .persist_status(
+                    if e.is_cancelled() && cancel_token.is_some_and(|token| token.is_cancelled()) {
+                        let reconciled = reconcile_after_parent_cancellation_bounded(
+                            &self.run_engine,
                             &request.user_id,
-                            &panic_run_id,
-                            STATUS_FAILED,
-                            None,
-                            Some(&format!("fork task panicked: {e}")),
-                        )
-                        .await
-                    {
-                        astra_core::agent_warn!(
-                            "delegation",
-                            "Fork: failed to persist panic status for {panic_run_id}: {e2}"
-                        );
-                    }
-                    let panic_error = format!("fork task panicked: {e}");
-                    self.tracker
-                        .complete_sub_run_with_result(
-                            &panic_run_id,
-                            SubRunState::Failed,
-                            Some(panic_error.as_str()),
-                            None,
+                            cancelled_agent_result(&panic_agent_id, &panic_run_id),
+                            &mut cancellation_reconciliation_deadline,
+                            "fork",
                         )
                         .await;
-                    results.push(AgentResult {
-                        agent_id: panic_agent_id,
-                        run_id: panic_run_id,
-                        status: "failed".to_string(),
-                        output: None,
-                        error: Some(panic_error),
-                        prompt_tokens: 0,
-                        completion_tokens: 0,
-                        tool_calls: 0,
-                    });
+                        self.tracker
+                            .apply_sub_run_result_state(
+                                &panic_run_id,
+                                agent_result_status_to_subrun_state(&reconciled.status),
+                                reconciled.error.as_deref(),
+                                reconciled.output.as_deref(),
+                            )
+                            .await;
+                        results.push(reconciled);
+                        continue;
+                    }
+                    let panic_error = format!("fork task panicked: {e}");
+                    let panic_result = reconcile_agent_result_with_durable_authority(
+                        &self.run_engine,
+                        &request.user_id,
+                        AgentResult {
+                            agent_id: panic_agent_id,
+                            run_id: panic_run_id.clone(),
+                            status: STATUS_FAILED.to_string(),
+                            output: None,
+                            error: Some(panic_error),
+                            prompt_tokens: 0,
+                            completion_tokens: 0,
+                            tool_calls: 0,
+                        },
+                    )
+                    .await;
+                    self.tracker
+                        .apply_sub_run_result_state(
+                            &panic_run_id,
+                            agent_result_status_to_subrun_state(&panic_result.status),
+                            panic_result.error.as_deref(),
+                            panic_result.output.as_deref(),
+                        )
+                        .await;
+                    results.push(panic_result);
                 }
+            }
+        }
+
+        if cancel_token.is_some_and(|token| token.is_cancelled()) {
+            let mut settled_run_ids = results
+                .iter()
+                .map(|result| result.run_id.clone())
+                .collect::<HashSet<_>>();
+            for (agent_id, run_id) in fork_id_map.values() {
+                if !settled_run_ids.insert(run_id.clone()) {
+                    continue;
+                }
+                let reconciled = reconcile_after_parent_cancellation_bounded(
+                    &self.run_engine,
+                    &request.user_id,
+                    cancelled_agent_result(agent_id, run_id),
+                    &mut cancellation_reconciliation_deadline,
+                    "fork",
+                )
+                .await;
+                self.tracker
+                    .apply_sub_run_result_state(
+                        run_id,
+                        agent_result_status_to_subrun_state(&reconciled.status),
+                        reconciled.error.as_deref(),
+                        reconciled.output.as_deref(),
+                    )
+                    .await;
+                results.push(reconciled);
             }
         }
 
@@ -3945,7 +4524,7 @@ impl DelegationEngine {
             .transition_status_with_event_if_current(
                 user_id,
                 run_id,
-                &[STATUS_RUNNING, STATUS_WAITING, STATUS_INPUT_QUEUED],
+                &[STATUS_RUNNING],
                 STATUS_PAUSED,
                 Some(waiting_for),
                 None,
@@ -4069,38 +4648,19 @@ impl DelegationEngine {
         count
     }
 
-    /// Cancel all non-terminal sub-runs spawned by a parent run.
-    /// Returns the number of sub-runs whose status was persisted as cancelled.
-    pub async fn cancel_children_of(&self, user_id: &str, parent_run_id: &str) -> usize {
-        self.tracker.cancel_children_of(parent_run_id).await;
-        let mut persisted = 0;
-        for child_id in self.tracker.get_children(parent_run_id).await {
-            // Only persist cancelled status for non-terminal sub-runs to avoid
-            // overwriting completed/failed status in the durable store.
-            let is_terminal = self
-                .tracker
-                .get_sub_run_state(&child_id)
-                .await
-                .map_or(false, |s| s.is_terminal());
-            if !is_terminal {
-                astra_core::log_persist!(
-                    self.run_engine
-                        .persist_status(
-                            user_id,
-                            &child_id,
-                            STATUS_CANCELLED,
-                            Some("parent_cancel"),
-                            None,
-                        )
-                        .await,
-                    "delegation",
-                    &child_id,
-                    "cancel"
-                );
-                persisted += 1;
-            }
-        }
-        persisted
+    /// Request cancellation of one local delegated child. Terminal state is
+    /// owned by the executor result, so the caller must wait for its normal
+    /// lifecycle event instead of treating this acknowledgement as completion.
+    pub async fn cancel_sub_run(&self, run_id: &str) -> bool {
+        self.tracker.request_cancel_sub_run(run_id).await
+    }
+
+    /// Request cancellation of every non-terminal sub-run in the parent's
+    /// subtree. The executor owns each terminal result; persisting
+    /// `cancelled` here would make durable state claim the work had stopped
+    /// before the child had actually reached its cancellation boundary.
+    pub async fn cancel_children_of(&self, parent_run_id: &str) -> usize {
+        self.tracker.cancel_children_of(parent_run_id).await
     }
 
     /// Extract budget awareness prompt from delegation context.
@@ -4215,8 +4775,78 @@ mod tests {
         assert!(message.contains("do not invent a replacement"), "{message}");
     }
 
+    #[test]
+    fn parent_cancellation_is_projected_as_cancelled_not_failed() {
+        let result = cancelled_agent_result("reviewer", "run-cancelled");
+        assert_eq!(result.status, STATUS_CANCELLED);
+        assert!(result.is_failure());
+        assert_eq!(
+            agent_result_status_to_subrun_state(&result.status),
+            SubRunState::Cancelled
+        );
+    }
+
+    #[test]
+    fn cancellation_reconciliation_timeout_preserves_recoverable_unknown_state() {
+        let attempted = AgentResult {
+            agent_id: "reviewer".to_string(),
+            run_id: "run-reconcile-pending".to_string(),
+            status: STATUS_COMPLETED.to_string(),
+            output: Some("locally observed output".to_string()),
+            error: None,
+            prompt_tokens: 12,
+            completion_tokens: 4,
+            tool_calls: 1,
+        };
+        let result = cancellation_reconciliation_pending_result(&attempted);
+
+        assert_eq!(result.status, STATUS_WAITING);
+        assert!(result.is_unfinished());
+        assert_eq!(result.output, None, "uncommitted output must not leak");
+        assert_eq!(result.prompt_tokens, 12);
+        assert_eq!(result.completion_tokens, 4);
+        assert_eq!(result.tool_calls, 1);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("authoritative child state is still unknown"))
+        );
+        assert_eq!(
+            agent_result_status_to_subrun_state(&result.status),
+            SubRunState::Waiting
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconciliation_deadline_is_shared_across_the_whole_batch() {
+        let budget = std::time::Duration::from_secs(2);
+        let mut deadline = None;
+        let started = tokio::time::Instant::now();
+
+        assert!(
+            await_with_shared_deadline(&mut deadline, budget, std::future::pending::<()>(),)
+                .await
+                .is_none()
+        );
+        assert_eq!(tokio::time::Instant::now() - started, budget);
+
+        let exhausted_at = tokio::time::Instant::now();
+        assert!(
+            await_with_shared_deadline(&mut deadline, budget, std::future::pending::<()>(),)
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            tokio::time::Instant::now(),
+            exhausted_at,
+            "a shared deadline must not restart for each child"
+        );
+    }
+
     fn fan_out_request(agents: Vec<&str>) -> DelegationRequest {
         DelegationRequest {
+            session_id: "test-session".into(),
             delegation_id: "del-1".into(),
             parent_run_id: "parent-1".into(),
             task: "test task".into(),
@@ -4240,6 +4870,57 @@ mod tests {
         DelegationEngine::ensure_source_in_delegation_chain(&mut request, "orch");
 
         assert_eq!(request.delegation_chain, vec!["orch".to_string()]);
+    }
+
+    #[test]
+    fn verification_retry_backoff_is_bounded_exponential_with_stable_jitter() {
+        let first = verification_retry_delay(2, "run-a");
+        let second = verification_retry_delay(3, "run-a");
+        let saturated = verification_retry_delay(20, "run-a");
+
+        assert!((200..=300).contains(&(first.as_millis() as u64)));
+        assert!((400..=500).contains(&(second.as_millis() as u64)));
+        assert!((2_000..=2_100).contains(&(saturated.as_millis() as u64)));
+        assert_eq!(first, verification_retry_delay(2, "run-a"));
+    }
+
+    #[test]
+    fn delegation_metrics_expose_low_cardinality_outcomes_and_usage() {
+        let registry = Arc::new(astra_turn_core::pipeline_metrics::MetricsRegistry::new());
+        register_delegation_metrics(&registry);
+        let result = Ok(DelegationResult::from_results(
+            "d1",
+            vec![AgentResult {
+                agent_id: "reviewer".into(),
+                run_id: "run-1".into(),
+                status: "completed".into(),
+                output: Some("done".into()),
+                error: None,
+                prompt_tokens: 120,
+                completion_tokens: 30,
+                tool_calls: 2,
+            }],
+            Some("done".into()),
+        ));
+
+        record_delegation_metrics(
+            Some(&registry),
+            "fan_out",
+            std::time::Duration::from_millis(25),
+            &result,
+        );
+
+        let rendered = registry.render_prometheus();
+        assert!(rendered.contains(
+            "astra_delegation_executions_total{outcome=\"completed\",pattern=\"fan_out\"} 1"
+        ));
+        assert!(rendered.contains(
+            "astra_delegation_sub_runs_total{pattern=\"fan_out\",status=\"completed\"} 1"
+        ));
+        assert!(
+            rendered
+                .contains("astra_delegation_tokens_total{kind=\"prompt\",pattern=\"fan_out\"} 120")
+        );
     }
 
     #[test]
@@ -4452,6 +5133,164 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delegation_tracker_ancestry_returns_full_acyclic_prefix_on_mid_chain_cycle() {
+        let tracker = DelegationTracker::new();
+        for (run_id, parent_run_id, depth) in
+            [("a", "b", 4), ("b", "c", 3), ("c", "d", 2), ("d", "b", 1)]
+        {
+            tracker
+                .record_sub_run(SubRunRecord {
+                    run_id: run_id.into(),
+                    parent_run_id: parent_run_id.into(),
+                    delegation_id: format!("d-{run_id}"),
+                    agent_id: run_id.into(),
+                    depth,
+                    state: SubRunState::Created,
+                    retry_of: None,
+                })
+                .await;
+        }
+
+        assert_eq!(tracker.get_ancestry("a").await, vec!["b", "c", "d"]);
+    }
+
+    #[tokio::test]
+    async fn delegation_tracker_preserves_supported_deep_ancestry() {
+        let tracker = DelegationTracker::new();
+        for depth in 1..=32 {
+            tracker
+                .record_sub_run(SubRunRecord {
+                    run_id: format!("run-{depth}"),
+                    parent_run_id: format!("run-{}", depth - 1),
+                    delegation_id: format!("d-{depth}"),
+                    agent_id: format!("agent-{depth}"),
+                    depth,
+                    state: SubRunState::Created,
+                    retry_of: None,
+                })
+                .await;
+        }
+
+        let ancestry = tracker.get_ancestry("run-32").await;
+        assert_eq!(ancestry.len(), 32);
+        assert_eq!(ancestry.first().map(String::as_str), Some("run-31"));
+        assert_eq!(ancestry.last().map(String::as_str), Some("run-0"));
+    }
+
+    #[test]
+    fn ancestry_corruption_guard_reports_truncation_instead_of_looking_complete() {
+        let parents = (1..=MAX_ANCESTRY_TRAVERSAL + 1)
+            .map(|depth| (format!("run-{depth}"), format!("run-{}", depth - 1)))
+            .collect::<HashMap<_, _>>();
+
+        let walk = ancestry_from_parents(&parents, &format!("run-{}", MAX_ANCESTRY_TRAVERSAL + 1));
+
+        assert_eq!(walk.ancestors.len(), MAX_ANCESTRY_TRAVERSAL);
+        assert_eq!(
+            walk.termination,
+            AncestryTermination::TraversalLimit {
+                next_run_id: "run-0".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn delegated_critical_findings_are_typed_and_failures_remain_visible() {
+        let result = |output: Option<&str>, status: &str, error: Option<&str>| AgentResult {
+            agent_id: "reviewer".into(),
+            run_id: "run-review".into(),
+            status: status.into(),
+            output: output.map(str::to_string),
+            error: error.map(str::to_string),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            tool_calls: 0,
+        };
+
+        assert_eq!(
+            critical_finding_from_agent_result(&result(
+                Some("This prose mentions a critical blocker but carries no typed finding."),
+                STATUS_COMPLETED,
+                None,
+            )),
+            CriticalFindingExtraction::default()
+        );
+        assert_eq!(
+            critical_finding_from_agent_result(&result(
+                Some(r#"{"findings":[{"severity":"high","summary":"Not critical"}]}"#),
+                STATUS_COMPLETED,
+                None,
+            ))
+            .summary,
+            None
+        );
+
+        let summary = critical_finding_from_agent_result(&result(
+            Some(r#"{"findings":[{"severity":"Critical","summary":"Tenant boundary bypass","evidence":["events.rs:42","cross-user request accepted"]}]}"#),
+            STATUS_COMPLETED,
+            None,
+        ))
+        .summary
+        .expect("structured critical finding");
+        assert_eq!(
+            summary,
+            "Tenant boundary bypass\nEvidence:\n- events.rs:42\n- cross-user request accepted"
+        );
+
+        let failed = critical_finding_from_agent_result(&result(
+            None,
+            STATUS_FAILED,
+            Some("review process crashed"),
+        ));
+        assert_eq!(
+            failed.summary.as_deref(),
+            Some("Delegated agent 'reviewer' failed with status 'failed': review process crashed")
+        );
+
+        let cancelled = critical_finding_from_agent_result(&result(
+            None,
+            STATUS_CANCELLED,
+            Some("cancelled by user"),
+        ));
+        assert!(cancelled.summary.is_none());
+    }
+
+    #[test]
+    fn malformed_finding_json_is_observable_without_becoming_a_finding() {
+        let result = AgentResult {
+            agent_id: "reviewer".into(),
+            run_id: "run-review".into(),
+            status: STATUS_COMPLETED.into(),
+            output: Some(r#"{"findings":["#.into()),
+            error: None,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            tool_calls: 0,
+        };
+
+        let extraction = critical_finding_from_agent_result(&result);
+        assert!(extraction.summary.is_none());
+        assert!(extraction.contract_error.is_some());
+    }
+
+    #[test]
+    fn finding_projection_targets_are_bounded_and_keep_the_root() {
+        let ancestry = (0..32)
+            .map(|idx| format!("ancestor-{idx}"))
+            .collect::<Vec<_>>();
+        let targets = finding_bubble_targets("session", "source", 32, &ancestry);
+
+        assert_eq!(targets.len(), MAX_FINDING_BUBBLE_TARGETS);
+        assert_eq!(targets[0].run_id, "source");
+        assert_eq!(targets[1].run_id, "ancestor-0");
+        assert_eq!(
+            targets.last().map(|target| target.run_id.as_str()),
+            Some("ancestor-31")
+        );
+        assert_eq!(targets.last().map(|target| target.depth), Some(0));
+    }
+
+    #[tokio::test]
     async fn fan_out_spawns_sub_runs() {
         let (reg, engine, tracker) = setup();
         let de = DelegationEngine::new(reg, engine.clone(), tracker.clone());
@@ -4489,6 +5328,7 @@ mod tests {
         let de = DelegationEngine::new(reg, engine.clone(), tracker.clone());
 
         let req = DelegationRequest {
+            session_id: "test-session".into(),
             delegation_id: "del-seq".into(),
             parent_run_id: "parent-2".into(),
             task: "sequential test".into(),
@@ -4516,6 +5356,7 @@ mod tests {
         let de = DelegationEngine::new(reg, engine.clone(), tracker.clone());
 
         let req = DelegationRequest {
+            session_id: "test-session".into(),
             delegation_id: "del-pipe".into(),
             parent_run_id: "parent-3".into(),
             task: "pipeline test".into(),
@@ -4552,6 +5393,7 @@ mod tests {
         let de = DelegationEngine::new(reg, engine.clone(), tracker.clone());
 
         let req = DelegationRequest {
+            session_id: "test-session".into(),
             delegation_id: "del-adv".into(),
             parent_run_id: "parent-4".into(),
             task: "adversarial test".into(),
@@ -4590,6 +5432,7 @@ mod tests {
 
         // User agent cannot delegate
         let req = DelegationRequest {
+            session_id: "test-session".into(),
             delegation_id: "bad".into(),
             parent_run_id: "p".into(),
             task: "fail".into(),
@@ -4615,6 +5458,7 @@ mod tests {
 
         // Orchestrator max depth is 3; request at depth=5 should fail
         let req = DelegationRequest {
+            session_id: "test-session".into(),
             delegation_id: "deep".into(),
             parent_run_id: "p".into(),
             task: "too deep".into(),
@@ -4640,6 +5484,7 @@ mod tests {
         let de = DelegationEngine::new(reg, engine.clone(), tracker.clone());
 
         let req1 = DelegationRequest {
+            session_id: "test-session".into(),
             delegation_id: "del-A".into(),
             parent_run_id: "pA".into(),
             task: "a".into(),
@@ -4655,6 +5500,7 @@ mod tests {
             execution_metadata: None,
         };
         let req2 = DelegationRequest {
+            session_id: "test-session".into(),
             delegation_id: "del-B".into(),
             parent_run_id: "pB".into(),
             task: "b".into(),
@@ -4707,6 +5553,470 @@ mod tests {
                 completion_tokens: 20,
                 tool_calls: 1,
             })
+        }
+    }
+
+    #[derive(Debug)]
+    struct NoopLiveSink;
+
+    impl astra_turn_core::agent_live_event::AgentLiveEventSink for NoopLiveSink {
+        fn send(
+            &self,
+            _event: astra_turn_core::agent_live_event::AgentLiveEvent,
+        ) -> Result<(), astra_turn_core::agent_live_event::AgentLiveSendError> {
+            Ok(())
+        }
+
+        fn send_gap(
+            &self,
+            _gap: astra_turn_core::agent_live_event::AgentLiveGap,
+        ) -> Result<(), astra_turn_core::agent_live_event::AgentLiveSendError> {
+            Ok(())
+        }
+    }
+
+    struct CapturedRunBinding {
+        parent_run_id: Option<String>,
+        session_id: String,
+        task_context: HashMap<String, serde_json::Value>,
+        has_live_event_sink: bool,
+        cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
+    }
+
+    struct CaptureRunBindingExecutor {
+        bindings: Arc<std::sync::Mutex<Vec<CapturedRunBinding>>>,
+    }
+
+    #[async_trait]
+    impl SubRunExecutor for CaptureRunBindingExecutor {
+        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+            self.bindings.lock().unwrap().push(CapturedRunBinding {
+                parent_run_id: Some(config.parent_run_id.clone()),
+                session_id: config.session_id.clone(),
+                task_context: config.context.clone(),
+                has_live_event_sink: config.live_event_sink.is_some(),
+                cancel_token: config.cancel_token.clone(),
+            });
+            Ok(AgentResult {
+                agent_id: config.agent_profile.agent_id,
+                run_id: config.run_id,
+                status: "completed".into(),
+                output: Some("completed".into()),
+                error: None,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                tool_calls: 0,
+            })
+        }
+    }
+
+    struct BlockingCancelExecutor {
+        started_tx: tokio::sync::mpsc::UnboundedSender<String>,
+        cancel_observed: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl SubRunExecutor for BlockingCancelExecutor {
+        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+            let cancel_token = config
+                .cancel_token
+                .clone()
+                .expect("every delegated child has a cancellation token");
+            self.started_tx
+                .send(config.run_id.clone())
+                .expect("test observes the child start");
+            cancel_token.cancelled().await;
+            self.cancel_observed.notify_one();
+            self.release.notified().await;
+            Ok(AgentResult {
+                agent_id: config.agent_profile.agent_id,
+                run_id: config.run_id,
+                status: STATUS_CANCELLED.into(),
+                output: None,
+                error: None,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                tool_calls: 0,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn delegation_binds_child_identity_and_live_lane_per_execution() {
+        let (registry, run_engine, tracker) = setup();
+        let bindings = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = DelegationEngine::with_executor(
+            registry,
+            run_engine,
+            tracker,
+            Arc::new(CaptureRunBindingExecutor {
+                bindings: bindings.clone(),
+            }),
+        );
+        let request = DelegationRequest {
+            session_id: "session-1".into(),
+            delegation_id: "delegation-live-1".into(),
+            parent_run_id: "run-root-1".into(),
+            task: "inspect the implementation".into(),
+            pattern: CoordinationPattern::Sequential {
+                agent_ids: vec!["coder".into()],
+                stop_on_success: false,
+                timeout_sec: 0,
+            },
+            user_id: "user-1".into(),
+            depth: 0,
+            delegation_chain: Vec::new(),
+            context: HashMap::new(),
+            execution_metadata: None,
+        };
+
+        engine
+            .execute_with_forward_headers_and_live_events(
+                request,
+                "orch",
+                None,
+                HashMap::new(),
+                None,
+                Some(Arc::new(NoopLiveSink)),
+            )
+            .await
+            .unwrap();
+
+        let bindings = bindings.lock().unwrap();
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].parent_run_id.as_deref(), Some("run-root-1"));
+        assert_eq!(bindings[0].session_id, "session-1");
+        assert!(
+            !bindings[0].task_context.contains_key("session_id"),
+            "runtime session identity must not be injected into the child task prompt"
+        );
+        assert!(bindings[0].has_live_event_sink);
+        assert!(bindings[0].cancel_token.is_some());
+    }
+
+    #[tokio::test]
+    async fn adversarial_and_fork_children_receive_independent_cancel_tokens() {
+        let (registry, run_engine, tracker) = setup();
+        let bindings = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = DelegationEngine::with_executor(
+            registry,
+            run_engine,
+            tracker,
+            Arc::new(CaptureRunBindingExecutor {
+                bindings: bindings.clone(),
+            }),
+        );
+
+        engine
+            .execute(
+                DelegationRequest {
+                    session_id: "test-session".into(),
+                    delegation_id: "delegation-adversarial-cancel".into(),
+                    parent_run_id: "run-root-adversarial".into(),
+                    task: "review the implementation".into(),
+                    pattern: CoordinationPattern::AdversarialReview {
+                        producer_id: "coder".into(),
+                        reviewer_id: "reviewer".into(),
+                        max_rounds: 1,
+                        acceptance_threshold: 1.0,
+                        timeout_sec: 0,
+                    },
+                    user_id: "user-1".into(),
+                    depth: 0,
+                    delegation_chain: Vec::new(),
+                    context: HashMap::new(),
+                    execution_metadata: None,
+                },
+                "orch",
+                None,
+            )
+            .await
+            .unwrap();
+        engine
+            .execute(
+                fork_request("delegation-fork-cancel", vec!["a", "b"], "writer"),
+                "orch",
+                None,
+            )
+            .await
+            .unwrap();
+
+        let bindings = bindings.lock().unwrap();
+        assert_eq!(bindings.len(), 4);
+        let cancel_tokens: Vec<_> = bindings
+            .iter()
+            .map(|binding| binding.cancel_token.as_ref().expect("child cancel token"))
+            .collect();
+        for (index, cancel_token) in cancel_tokens.iter().enumerate() {
+            for other in cancel_tokens.iter().skip(index + 1) {
+                assert!(
+                    !Arc::ptr_eq(cancel_token, other),
+                    "sibling delegated runs need independent cancellation tokens"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn parent_cancel_waits_for_child_executor_before_recording_terminal_state() {
+        use std::time::Duration;
+
+        let (registry, run_engine, tracker) = setup();
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel_observed = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let engine = Arc::new(DelegationEngine::with_executor(
+            registry,
+            run_engine.clone(),
+            tracker.clone(),
+            Arc::new(BlockingCancelExecutor {
+                started_tx,
+                cancel_observed: cancel_observed.clone(),
+                release: release.clone(),
+            }),
+        ));
+        let mut request = fan_out_request(vec!["coder"]);
+        request.delegation_id = "delegation-cancel-awaits-executor".into();
+        request.parent_run_id = "parent-cancel-awaits-executor".into();
+
+        let execution = {
+            let engine = engine.clone();
+            tokio::spawn(async move { engine.execute(request, "orch", None).await })
+        };
+        let child_run_id = tokio::time::timeout(Duration::from_secs(1), started_rx.recv())
+            .await
+            .expect("child should begin promptly")
+            .expect("test executor reports the run id");
+
+        assert_eq!(
+            engine
+                .cancel_children_of("parent-cancel-awaits-executor")
+                .await,
+            1
+        );
+        tokio::time::timeout(Duration::from_secs(1), cancel_observed.notified())
+            .await
+            .expect("child should observe cancellation promptly");
+        assert_eq!(
+            tracker.get_sub_run_state(&child_run_id).await,
+            Some(SubRunState::Running),
+            "a cancellation request must not pre-write the terminal tracker state"
+        );
+        assert_eq!(
+            run_engine
+                .load_run("user-1", &child_run_id)
+                .await
+                .expect("durable record loads")
+                .expect("child durable record exists")
+                .status,
+            STATUS_RUNNING,
+            "durable state must not claim cancellation before executor completion"
+        );
+
+        release.notify_one();
+        execution
+            .await
+            .expect("delegation task joins")
+            .expect("delegation completes");
+        assert_eq!(
+            tracker.get_sub_run_state(&child_run_id).await,
+            Some(SubRunState::Cancelled)
+        );
+        assert_eq!(
+            run_engine
+                .load_run("user-1", &child_run_id)
+                .await
+                .expect("durable record loads")
+                .expect("child durable record exists")
+                .status,
+            STATUS_CANCELLED
+        );
+    }
+
+    #[tokio::test]
+    async fn fanout_cancellation_waits_for_the_childs_canonical_cancelled_result() {
+        use std::time::Duration;
+
+        let (registry, run_engine, tracker) = setup();
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel_observed = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let engine = Arc::new(DelegationEngine::with_executor(
+            registry,
+            run_engine.clone(),
+            tracker.clone(),
+            Arc::new(BlockingCancelExecutor {
+                started_tx,
+                cancel_observed: cancel_observed.clone(),
+                release: release.clone(),
+            }),
+        ));
+        let parent_cancel = Arc::new(tokio_util::sync::CancellationToken::new());
+        let mut request = fan_out_request(vec!["coder"]);
+        request.delegation_id = "delegation-parent-cancel".into();
+        request.parent_run_id = "parent-fanout-cancel".into();
+
+        let execution = {
+            let engine = engine.clone();
+            let parent_cancel = parent_cancel.clone();
+            tokio::spawn(async move { engine.execute(request, "orch", Some(parent_cancel)).await })
+        };
+        let mut execution = Box::pin(execution);
+        let child_run_id = tokio::time::timeout(Duration::from_secs(1), started_rx.recv())
+            .await
+            .expect("child should begin promptly")
+            .expect("test executor reports the run id");
+
+        parent_cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(1), cancel_observed.notified())
+            .await
+            .expect("child should observe parent cancellation promptly");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), execution.as_mut())
+                .await
+                .is_err(),
+            "fanout must wait for its child to publish a canonical terminal result"
+        );
+
+        release.notify_one();
+        let result = execution
+            .await
+            .expect("delegation task joins")
+            .expect("delegation completes");
+        assert_eq!(result.agent_results[0].status, STATUS_CANCELLED);
+        assert_eq!(
+            tracker.get_sub_run_state(&child_run_id).await,
+            Some(SubRunState::Cancelled)
+        );
+        assert_eq!(
+            run_engine
+                .load_run("user-1", &child_run_id)
+                .await
+                .expect("durable record loads")
+                .expect("child durable record exists")
+                .status,
+            STATUS_CANCELLED
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_cancellation_preserves_the_childs_canonical_cancelled_result() {
+        use std::time::Duration;
+
+        let (registry, run_engine, tracker) = setup();
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel_observed = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let engine = Arc::new(DelegationEngine::with_executor(
+            registry,
+            run_engine.clone(),
+            tracker.clone(),
+            Arc::new(BlockingCancelExecutor {
+                started_tx,
+                cancel_observed: cancel_observed.clone(),
+                release: release.clone(),
+            }),
+        ));
+        let parent_cancel = Arc::new(tokio_util::sync::CancellationToken::new());
+        let request = fork_request("delegation-fork-parent-cancel", vec!["inspect"], "writer");
+
+        let execution = {
+            let engine = engine.clone();
+            let parent_cancel = parent_cancel.clone();
+            tokio::spawn(async move { engine.execute(request, "orch", Some(parent_cancel)).await })
+        };
+        let child_run_id = tokio::time::timeout(Duration::from_secs(1), started_rx.recv())
+            .await
+            .expect("fork child should begin promptly")
+            .expect("test executor reports the run id");
+
+        parent_cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(1), cancel_observed.notified())
+            .await
+            .expect("fork child should observe parent cancellation promptly");
+        release.notify_one();
+
+        let result = execution
+            .await
+            .expect("fork delegation task joins")
+            .expect("fork delegation completes");
+        assert_eq!(result.agent_results.len(), 1);
+        assert_eq!(result.agent_results[0].status, STATUS_CANCELLED);
+        assert_eq!(
+            tracker.get_sub_run_state(&child_run_id).await,
+            Some(SubRunState::Cancelled)
+        );
+        assert_eq!(
+            run_engine
+                .load_run("user-1", &child_run_id)
+                .await
+                .expect("durable record loads")
+                .expect("fork child durable record exists")
+                .status,
+            STATUS_CANCELLED
+        );
+    }
+
+    #[tokio::test]
+    async fn fanout_cancellation_releases_children_queued_for_a_permit() {
+        use std::time::Duration;
+
+        let (registry, run_engine, tracker) = setup();
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel_observed = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let engine = DelegationEngine::with_executor(
+            registry,
+            run_engine,
+            tracker,
+            Arc::new(BlockingCancelExecutor {
+                started_tx,
+                cancel_observed: cancel_observed.clone(),
+                release: release.clone(),
+            }),
+        );
+        let parent_cancel = Arc::new(tokio_util::sync::CancellationToken::new());
+        let mut request = fan_out_request(vec!["coder", "reviewer"]);
+        request.delegation_id = "delegation-cancel-queued".into();
+        request.parent_run_id = "parent-cancel-queued".into();
+        request
+            .context
+            .insert("team_max_parallel".into(), serde_json::json!(1));
+
+        let execution = {
+            let parent_cancel = parent_cancel.clone();
+            tokio::spawn(async move { engine.execute(request, "orch", Some(parent_cancel)).await })
+        };
+        let _first_child = tokio::time::timeout(Duration::from_secs(1), started_rx.recv())
+            .await
+            .expect("one child should acquire the only permit")
+            .expect("test executor reports the run id");
+
+        parent_cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(1), cancel_observed.notified())
+            .await
+            .expect("running child should observe cancellation");
+        release.notify_one();
+
+        let result = execution
+            .await
+            .expect("delegation task joins")
+            .expect("delegation completes");
+        assert_eq!(result.agent_results.len(), 2);
+        assert!(
+            result
+                .agent_results
+                .iter()
+                .all(|result| result.status == STATUS_CANCELLED),
+            "both running and queued children must report cancellation"
+        );
+        if let Ok(Some(unexpected_run_id)) =
+            tokio::time::timeout(Duration::from_millis(50), started_rx.recv()).await
+        {
+            panic!(
+                "queued child {unexpected_run_id} began execution after its parent was cancelled"
+            );
         }
     }
 
@@ -4846,6 +6156,7 @@ mod tests {
         let (_, _, _, de) = setup_with_executor(Arc::new(EchoExecutor));
 
         let req = DelegationRequest {
+            session_id: "test-session".into(),
             delegation_id: "del-pipe".into(),
             parent_run_id: "p".into(),
             task: "build code".into(),
@@ -4889,6 +6200,7 @@ mod tests {
         let (_, _, _, de) = setup_with_executor(Arc::new(EchoExecutor));
 
         let req = DelegationRequest {
+            session_id: "test-session".into(),
             delegation_id: "del-early".into(),
             parent_run_id: "p".into(),
             task: "find answer".into(),
@@ -4945,6 +6257,7 @@ mod tests {
         let (_, _, tracker, de) = setup_with_executor(Arc::new(EchoExecutor));
 
         let req = DelegationRequest {
+            session_id: "test-session".into(),
             delegation_id: "del-adv".into(),
             parent_run_id: "p".into(),
             task: "write code".into(),
@@ -5045,6 +6358,7 @@ mod tests {
         ctx.insert("test_key".to_string(), serde_json::json!("test_value"));
 
         let req = DelegationRequest {
+            session_id: "test-session".into(),
             delegation_id: "ctx-test".into(),
             parent_run_id: "p".into(),
             task: "check context".into(),
@@ -5102,6 +6416,7 @@ mod tests {
         );
 
         let req = DelegationRequest {
+            session_id: "test-session".into(),
             delegation_id: "fh-test".into(),
             parent_run_id: "p".into(),
             task: "check headers".into(),
@@ -5170,6 +6485,7 @@ mod tests {
         );
 
         let req = DelegationRequest {
+            session_id: "test-session".into(),
             delegation_id: "llm-token-test".into(),
             parent_run_id: "p".into(),
             task: "check llm token service".into(),
@@ -5240,6 +6556,7 @@ mod tests {
         );
 
         let req = DelegationRequest {
+            session_id: "test-session".into(),
             delegation_id: "fh-context-test".into(),
             parent_run_id: "p".into(),
             task: "check serialized headers".into(),
@@ -5397,6 +6714,7 @@ mod tests {
         );
 
         let req = DelegationRequest {
+            session_id: "test-session".into(),
             delegation_id: "wt-test".into(),
             parent_run_id: "p".into(),
             task: "check worktree".into(),
@@ -5432,6 +6750,7 @@ mod tests {
         let executor = StubSubRunExecutor;
         let config = SubRunConfig {
             run_id: "r1".into(),
+            parent_run_id: "parent-r1".into(),
             agent_profile: AgentProfile::new("test", "Test", AgentTier::User),
             task: "hello world".into(),
             session_id: "s1".into(),
@@ -5575,6 +6894,140 @@ mod tests {
         assert_eq!(resumed.status, STATUS_RUNNING);
         assert!(resumed.waiting_for.is_none());
         assert_eq!(resumed.events.last().unwrap()["event_type"], "run_resumed");
+    }
+
+    #[tokio::test]
+    async fn waiting_sub_run_retains_its_required_context_when_parent_pauses() {
+        let (_, engine, tracker, de) = setup_with_executor(Arc::new(EchoExecutor));
+        engine
+            .start_run_ext(
+                "sub-waiting",
+                "user-1",
+                "session-live",
+                Some("parent-live"),
+                Some("delegation-live"),
+                Some("coder"),
+                None,
+            )
+            .await
+            .unwrap();
+        tracker
+            .record_sub_run(SubRunRecord {
+                run_id: "sub-waiting".into(),
+                parent_run_id: "parent-live".into(),
+                delegation_id: "delegation-live".into(),
+                agent_id: "coder".into(),
+                depth: 1,
+                state: SubRunState::Waiting,
+                retry_of: None,
+            })
+            .await;
+        tracker.register_pause_flag("sub-waiting").await;
+        assert!(
+            engine
+                .persist_delegation_outcome_status(
+                    "user-1",
+                    "sub-waiting",
+                    STATUS_WAITING,
+                    Some("user_input"),
+                    None,
+                )
+                .await
+                .unwrap()
+        );
+
+        assert_eq!(de.pause_children_of("user-1", "parent-live").await, 0);
+        assert!(!tracker.is_paused("sub-waiting").await);
+        let durable = engine
+            .load_run("user-1", "sub-waiting")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable.status, STATUS_WAITING);
+        assert_eq!(durable.waiting_for.as_deref(), Some("user_input"));
+    }
+
+    #[tokio::test]
+    async fn durable_control_decision_replaces_stale_executor_result() {
+        for (run_id, durable_status) in [
+            ("stale-after-pause", STATUS_PAUSED),
+            ("stale-after-cancel", STATUS_CANCELLED),
+        ] {
+            let (_, engine, _) = setup();
+            engine
+                .start_run(run_id, "user-1", "session-1")
+                .await
+                .unwrap();
+            engine
+                .persist_status(
+                    "user-1",
+                    run_id,
+                    durable_status,
+                    Some("control-plane"),
+                    None,
+                )
+                .await
+                .unwrap();
+
+            let authoritative = reconcile_agent_result_with_durable_authority(
+                &engine,
+                "user-1",
+                AgentResult {
+                    agent_id: "coder".into(),
+                    run_id: run_id.into(),
+                    status: STATUS_COMPLETED.into(),
+                    output: Some("stale executor output".into()),
+                    error: None,
+                    prompt_tokens: 3,
+                    completion_tokens: 5,
+                    tool_calls: 1,
+                },
+            )
+            .await;
+
+            assert_eq!(authoritative.status, durable_status);
+            assert!(authoritative.output.is_none());
+            if durable_status == STATUS_CANCELLED {
+                assert!(authoritative.error.is_some());
+            } else {
+                assert!(authoritative.error.is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn identical_terminal_replay_preserves_richer_agent_result() {
+        let (_, engine, _) = setup();
+        let run_id = "completed-result-replay";
+        engine
+            .start_run(run_id, "user-1", "session-1")
+            .await
+            .unwrap();
+        assert!(
+            engine
+                .persist_delegation_outcome_status("user-1", run_id, STATUS_COMPLETED, None, None,)
+                .await
+                .unwrap()
+        );
+
+        let replayed = reconcile_agent_result_with_durable_authority(
+            &engine,
+            "user-1",
+            AgentResult {
+                agent_id: "coder".into(),
+                run_id: run_id.into(),
+                status: STATUS_COMPLETED.into(),
+                output: Some("full answer".into()),
+                error: None,
+                prompt_tokens: 3,
+                completion_tokens: 5,
+                tool_calls: 1,
+            },
+        )
+        .await;
+
+        assert_eq!(replayed.status, STATUS_COMPLETED);
+        assert_eq!(replayed.output.as_deref(), Some("full answer"));
     }
 
     // ─── Verification Gate Tests ────────────────────────────────────────────
@@ -5738,6 +7191,7 @@ mod tests {
             .with_gate(gate);
 
         let req = DelegationRequest {
+            session_id: "test-session".into(),
             delegation_id: "del-seq-gate".into(),
             parent_run_id: "parent-1".into(),
             task: "sequential gate test".into(),
@@ -5767,6 +7221,7 @@ mod tests {
             .with_gate(gate);
 
         let req = DelegationRequest {
+            session_id: "test-session".into(),
             delegation_id: "del-seq-gate-prompt".into(),
             parent_run_id: "parent-1".into(),
             task: "sequential gate test".into(),
@@ -5796,6 +7251,7 @@ mod tests {
             .with_gate(gate);
 
         let req = DelegationRequest {
+            session_id: "test-session".into(),
             delegation_id: "del-adv-gate-prompt".into(),
             parent_run_id: "parent-1".into(),
             task: "adversarial gate test".into(),
@@ -5887,10 +7343,7 @@ mod tests {
         let mut req = fan_out_request(vec!["coder"]);
         req.delegation_id = "del-journal-retry".into();
         req.parent_run_id = "parent-journal-retry".into();
-        req.context.insert(
-            "session_id".into(),
-            serde_json::Value::String("sess-journal-retry".into()),
-        );
+        req.session_id = "sess-journal-retry".into();
 
         let result = de.execute(req, "orch", None).await.unwrap();
         assert_eq!(result.agent_results.len(), 1);
@@ -6044,6 +7497,7 @@ mod tests {
             .with_gate(Arc::new(AlwaysFailGate));
 
         let req = DelegationRequest {
+            session_id: "test-session".into(),
             delegation_id: "del-seq-fail".into(),
             parent_run_id: "parent-1".into(),
             task: "will fail".into(),
@@ -6284,7 +7738,7 @@ mod tests {
                 parent_run_id: Some("parent-1".into()),
                 root_run_id: Some("parent-1".into()),
                 ancestor_path: Some("parent-1/sub-2".into()),
-                depth: 1,
+                depth: 2,
                 delegation_id: Some("del-1".into()),
                 agent_id: Some("reviewer".into()),
                 retry_of: Some("sub-1".into()),
@@ -6420,18 +7874,18 @@ mod tests {
                 .and_then(|sub| sub.retry_of.as_deref()),
             Some("sub-1")
         );
-        assert_eq!(
-            tracker.get_sub_run_state("sub-3").await,
-            Some(SubRunState::Paused)
-        );
-
+        assert_eq!(tracker.get_depth("sub-2").await, Some(2));
         // Paused sub-run gets pause flag
         let flag = tracker.get_pause_flag("sub-2").await;
         assert!(flag.is_some());
         assert!(flag.unwrap().load(Ordering::SeqCst)); // paused = true
 
-        // Waiting sub-run maps to paused tracker state but does not recreate
-        // a cooperative pause flag.
+        // Waiting is a distinct recoverable state and does not recreate a
+        // cooperative pause flag.
+        assert_eq!(
+            tracker.get_sub_run_state("sub-3").await,
+            Some(SubRunState::Waiting)
+        );
         assert!(tracker.get_pause_flag("sub-3").await.is_none());
 
         // Completed sub-run has no pause flag
@@ -6473,6 +7927,7 @@ mod tests {
 
     fn fork_request(del_id: &str, tasks: Vec<&str>, agent_id: &str) -> DelegationRequest {
         DelegationRequest {
+            session_id: "test-session".into(),
             delegation_id: del_id.into(),
             parent_run_id: format!("parent-{del_id}"),
             task: "fork test".into(),
@@ -6776,6 +8231,7 @@ mod tests {
         let de = DelegationEngine::with_executor(reg, engine, tracker, Arc::new(EchoExecutor));
 
         let req = DelegationRequest {
+            session_id: "test-session".into(),
             delegation_id: "del-seq-chain".into(),
             parent_run_id: "p1".into(),
             task: "chained task".into(),
@@ -6940,6 +8396,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(new, SubRunState::Completed);
+    }
+
+    #[tokio::test]
+    async fn tracker_recording_is_idempotent_by_durable_run_identity() {
+        let tracker = DelegationTracker::new();
+        let mut record = SubRunRecord {
+            run_id: "r1".into(),
+            parent_run_id: "parent".into(),
+            delegation_id: "d1".into(),
+            agent_id: "a1".into(),
+            depth: 1,
+            state: SubRunState::Created,
+            retry_of: None,
+        };
+        tracker.record_sub_run(record.clone()).await;
+        record.state = SubRunState::Running;
+        tracker.record_sub_run(record).await;
+
+        let records = tracker.get_sub_runs("d1").await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].state, SubRunState::Created);
+        assert_eq!(tracker.get_depth("r1").await, Some(1));
+        assert_eq!(tracker.get_agent_id("r1").await.as_deref(), Some("a1"));
     }
 
     #[tokio::test]
@@ -7232,6 +8711,7 @@ mod tests {
         let (_, _engine, _tracker, de) = setup_with_executor(slow);
 
         let req = DelegationRequest {
+            session_id: "test-session".into(),
             delegation_id: "timeout-test".into(),
             parent_run_id: "p".into(),
             task: "slow task".into(),
@@ -7274,6 +8754,7 @@ mod tests {
             .with_gate(Arc::new(FailThenPassGate::new(1)));
 
         let req = DelegationRequest {
+            session_id: "test-session".into(),
             delegation_id: "gate-timeout".into(),
             parent_run_id: "p".into(),
             task: "gated slow retry".into(),
@@ -7336,6 +8817,7 @@ mod tests {
         let (_, _engine, _tracker, de) = setup_with_executor(slow);
 
         let req = DelegationRequest {
+            session_id: "test-session".into(),
             delegation_id: "seq-timeout".into(),
             parent_run_id: "p".into(),
             task: "slow pipeline".into(),
@@ -7374,6 +8856,7 @@ mod tests {
         let (_, _engine, _tracker, de) = setup_with_executor(slow);
 
         let req = DelegationRequest {
+            session_id: "test-session".into(),
             delegation_id: "no-timeout".into(),
             parent_run_id: "p".into(),
             task: "quick task".into(),
@@ -7452,6 +8935,72 @@ mod tests {
         assert_eq!(count, 2, "both children must be cancelled");
         assert!(token1.is_cancelled(), "child1 token must be cancelled");
         assert!(token2.is_cancelled(), "child2 token must be cancelled");
+        assert_eq!(
+            tracker.get_sub_run_state(child1).await,
+            Some(SubRunState::Running),
+            "a cancellation request is not a fabricated terminal outcome"
+        );
+        assert_eq!(
+            tracker.get_sub_run_state(child2).await,
+            Some(SubRunState::Running),
+            "the executor reports the eventual terminal state"
+        );
+    }
+
+    #[tokio::test]
+    async fn single_cancel_request_signals_only_the_target_and_keeps_outcome_pending() {
+        let tracker = DelegationTracker::new();
+        tracker
+            .record_sub_run(SubRunRecord {
+                run_id: "child-cancel".into(),
+                parent_run_id: "parent-run".into(),
+                delegation_id: "deleg-1".into(),
+                agent_id: "reviewer".into(),
+                depth: 1,
+                state: SubRunState::Running,
+                retry_of: None,
+            })
+            .await;
+        let pause_flag = tracker.register_pause_flag("child-cancel").await;
+        let cancel_token = Arc::new(tokio_util::sync::CancellationToken::new());
+        tracker
+            .register_cancel_token("child-cancel", cancel_token.clone())
+            .await;
+
+        assert!(tracker.request_cancel_sub_run("child-cancel").await);
+        assert!(
+            !pause_flag.load(Ordering::Acquire),
+            "cancellation must not be misclassified as a pause"
+        );
+        assert!(cancel_token.is_cancelled());
+        assert_eq!(
+            tracker.get_sub_run_state("child-cancel").await,
+            Some(SubRunState::Running),
+            "the executor owns the terminal cancelled outcome"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_sub_run_rejects_late_cancellation_without_signalling_token() {
+        let tracker = DelegationTracker::new();
+        tracker
+            .record_sub_run(SubRunRecord {
+                run_id: "child-complete".into(),
+                parent_run_id: "parent-run".into(),
+                delegation_id: "deleg-1".into(),
+                agent_id: "reviewer".into(),
+                depth: 1,
+                state: SubRunState::Completed,
+                retry_of: None,
+            })
+            .await;
+        let cancel_token = Arc::new(tokio_util::sync::CancellationToken::new());
+        tracker
+            .register_cancel_token("child-complete", cancel_token.clone())
+            .await;
+
+        assert!(!tracker.request_cancel_sub_run("child-complete").await);
+        assert!(!cancel_token.is_cancelled());
     }
 
     /// Regression: the SSE Failed event for a non-Completed/Paused/Cancelled
@@ -7602,16 +9151,10 @@ mod tests {
         );
     }
 
-    /// Lock-order regression: cancel_children_of and cleanup_delegation
-    /// must agree on the canonical lock order
-    /// (delegations → parents → pause_flags → cancel_tokens → progress).
-    ///
-    /// History: cancel_children_of used to take cancel_tokens THEN pause_flags
-    /// while cleanup_delegation takes pause_flags THEN cancel_tokens — a
-    /// classic ABBA deadlock under contention. This stress test interleaves
-    /// many concurrent calls of both and asserts everything completes within
-    /// a generous wall-clock budget. With reverse lock order the test would
-    /// hang and trip the timeout.
+    /// Concurrency regression: cancellation traversal and delegation cleanup
+    /// can interleave while a parent is being torn down. The cancellation path
+    /// takes short-lived per-run snapshots rather than holding tracker locks
+    /// across the subtree walk, so the pair must complete without deadlock.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn cancel_children_of_does_not_deadlock_with_cleanup_delegation() {
         use std::time::Duration;
@@ -7730,7 +9273,7 @@ mod tests {
 
         let token = Arc::new(tokio_util::sync::CancellationToken::new());
         tracker.register_cancel_token(child, token.clone()).await;
-        assert!(tracker.cancel_tokens.read().await.contains_key(child));
+        assert!(tracker.state.read().await.cancel_tokens.contains_key(child));
 
         // Complete the sub-run so cleanup_delegation can proceed
         tracker
@@ -7739,7 +9282,7 @@ mod tests {
 
         tracker.cleanup_delegation(deleg_id).await.unwrap();
         assert!(
-            !tracker.cancel_tokens.read().await.contains_key(child),
+            !tracker.state.read().await.cancel_tokens.contains_key(child),
             "cancel_tokens must be cleaned up after delegation cleanup"
         );
     }
