@@ -60,6 +60,7 @@ async fn schema_rationalization_runtime_contract() {
         "skill_marketplace_stats",
         "skill_quality_reports",
         "task_verification_results",
+        "tool_exactly_once_results",
     ] {
         assert!(
             !table_exists(&pool, &schema, removed).await,
@@ -1626,20 +1627,64 @@ async fn phase2_web_hydration_schema_contract() {
         "auth audit lookups must be observable by owner/resource recency"
     );
     assert_eq!(
-        primary_key_columns(&pool, &schema, "tool_exactly_once_results").await,
-        ["user_id", "session_id", "dedup_key"],
-        "tool exactly-once recovery must dedupe within the owner/session boundary"
+        primary_key_columns(&pool, &schema, "tool_invocation_ledger").await,
+        [
+            "user_id",
+            "session_id",
+            "run_id",
+            "turn_chain_id",
+            "invocation_id"
+        ],
+        "tool invocation durability must use the complete owner/run/turn/invocation identity"
     );
     assert!(
+        column_names(&pool, &schema, "tool_invocation_ledger")
+            .await
+            .iter()
+            .any(|column| column == "outcome_json"),
+        "tool invocation terminal state and replay outcome must share one durable row"
+    );
+    assert!(
+        column_names(&pool, &schema, "tool_invocation_ledger")
+            .await
+            .iter()
+            .any(|column| column == "decision_json"),
+        "prepared invocation resume requires the complete frozen decision, not only its hash"
+    );
+    let invocation_columns = column_names(&pool, &schema, "tool_invocation_ledger").await;
+    assert!(
+        invocation_columns
+            .iter()
+            .any(|column| column == "dispatch_owner"),
+        "provider dispatch completion must be fenced by an explicit worker owner"
+    );
+    assert!(
+        invocation_columns
+            .iter()
+            .any(|column| column == "dispatch_lease_expires_at"),
+        "abandoned provider dispatches require a durable liveness deadline"
+    );
+    assert!(
+        invocation_columns
+            .iter()
+            .any(|column| column == "completion_source_json"),
+        "non-dispatched cache completion requires durable, typed provenance"
+    );
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "semantic_read_observations").await,
+        ["user_id", "session_id", "key_id"],
+        "semantic observations must be owner/session scoped and content addressed"
+    );
+    assert_eq!(
         index_columns(
             &pool,
             &schema,
-            "tool_exactly_once_results",
-            "idx_tool_exactly_once_session"
+            "semantic_read_observations",
+            "idx_semantic_read_observations_session_state_access"
         )
-        .await
-        .is_empty(),
-        "tool_exactly_once_results must not keep a redundant session/user index; the owner-first primary key covers owner/session cleanup"
+        .await,
+        ["user_id", "session_id", "state", "last_accessed_at"],
+        "capacity and deterministic LRU operations require one session/state/access index"
     );
 
     let revision_columns = column_names(&pool, &schema, "session_state_revisions").await;

@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 
 use tokio_util::sync::CancellationToken;
 
@@ -39,14 +40,17 @@ use astra_turn_core::sync_utils::{rwlock_read_clone_or_default, rwlock_write_res
 use astra_turn_core::tool::schema::{
     prompt_schema_conflicting_tool_names, retain_tool_schemas_by_names, tool_schema_name,
 };
+use astra_turn_types::{ProviderCallOutcome, ProviderCallPayload};
 use async_trait::async_trait;
 
 use crate::orchestration::AgentToolContext;
+use crate::server::semantic_read_freshness::{
+    ProviderSemanticFreshnessSource, resolve_provider_semantic_freshness,
+};
 use crate::server::server_bash_execution::execute_server_bash;
 use crate::server::tool_admission::{ToolAdmissionContext, ToolHiddenReason};
 use crate::server::tool_ask_user::{AskUserExecutionContext, execute_ask_user};
 use crate::server::tool_database_snapshots::{self, DatabaseSnapshotRollbackJournal};
-use crate::server::tool_exactly_once;
 use crate::server::tool_execution_result::{result_metadata_str, tool_result_from_output};
 use crate::server::tool_local_execution::{
     LocalToolExecutionLifecycle, LocalToolPreflight, LocalToolPreflightContext,
@@ -56,7 +60,10 @@ use crate::server::tool_local_execution::{
 use crate::server::tool_plan_gate::{
     PlanModeSnapshot, is_plan_mode_blocked_tool, plan_mode_authoring_active,
 };
-use crate::server::tool_route_runtime::{ToolRouteRuntimeContext, execute_tool_route_with_events};
+use crate::server::tool_route_runtime::{
+    ToolRouteRuntimeContext, execute_tool_route_with_events,
+    execute_tool_route_with_events_at_route,
+};
 use crate::server::tool_session_config::{execute_adjust_config, execute_compress_context};
 use crate::server::tool_session_state_rollback::{
     self, RollbackSessionStateContext, SessionStateRestoreContext, SessionStateRollbackAction,
@@ -110,6 +117,12 @@ enum ExecutorToolReadiness {
     MissingService(Capability),
 }
 
+struct PendingSemanticReadFill {
+    claim: Box<crate::server::semantic_read_observation_runtime::SemanticReadFillClaim>,
+    decision: crate::server::tool_invocation_decision::ToolInvocationDecisionSnapshot,
+    arguments: Value,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RuntimeEnvironmentDenial {
     UnknownTool,
@@ -122,6 +135,13 @@ enum RuntimeEnvironmentDenial {
     RuntimeCapabilityMissing(String),
     RuntimeSurfaceDenied(String),
     PolicyDenied(String),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum ProviderPolicyLookup {
+    NotProvider,
+    Resolved(astra_turn_core::provider_resolution::ResolvedInvocationPolicy),
+    MissingPolicy { public_alias: String },
 }
 
 impl RuntimeEnvironmentDenial {
@@ -238,9 +258,15 @@ pub struct RuntimeToolExecutor {
     pub(crate) database_snapshot_journal: Arc<Mutex<DatabaseSnapshotRollbackJournal>>,
     /// Session-state rollback journal for bounded self-mod and task undo.
     pub(crate) session_state_journal: Arc<Mutex<SessionStateRollbackJournal>>,
-    /// Exactly-once executor for crash recovery deduplication.
-    /// When active (Some), checks idempotency cache before executing tools.
-    exactly_once_executor: Option<tool_exactly_once::ExactlyOnceState>,
+    /// Logical-invocation delivery ledger. Unlike the legacy semantic cache,
+    /// this is keyed by owner/run/turn/invocation identity.
+    invocation_ledger: Option<crate::server::tool_invocation_runtime::RuntimeToolInvocationLedger>,
+    /// Freshness-bound successful read observations. This remains explicitly
+    /// disabled until the cluster rollout proves every ledger reader supports
+    /// non-dispatched cache completion records.
+    semantic_read_observation_store: Option<
+        crate::server::semantic_read_observation_runtime::RuntimeSemanticReadObservationStore,
+    >,
 
     // ── Governor ────────────────────────────────────────────────��─────────────
     /// Sandbox policy for tool execution.
@@ -300,6 +326,15 @@ pub struct RuntimeToolExecutor {
     /// activation reaches MCP tools without treating arbitrary schemas as
     /// server-owned capacity.
     request_scoped_mcp_schemas: Arc<std::sync::RwLock<Vec<Value>>>,
+    /// Exact descriptor-keyed policy index for the same request-scoped MCP
+    /// surface. Batching and permission both resolve through this session-local
+    /// index; no process-global name classification is mutated.
+    provider_policy_index:
+        Arc<std::sync::RwLock<astra_turn_core::provider_resolution::ResolvedProviderPolicyIndex>>,
+    /// Optional provider-neutral snapshot source for revision evidence. The
+    /// source cannot authorize reuse; it only supplies facts for an already
+    /// trusted freshness-bound provider policy.
+    semantic_read_freshness_source: Option<Arc<dyn ProviderSemanticFreshnessSource>>,
     /// Deferred tool names whose full schema has been fetched via
     /// `tool_search(query="select:NAME")` in this session.
     activated_deferred_tools: Arc<std::sync::RwLock<HashSet<String>>>,
@@ -404,6 +439,8 @@ impl RuntimeToolExecutor {
             plan_resume_hint_handle: None,
             plan_authoring_active_handle: None,
             request_scoped_mcp_schemas: Arc::new(std::sync::RwLock::new(Vec::new())),
+            provider_policy_index: Arc::new(std::sync::RwLock::new(Default::default())),
+            semantic_read_freshness_source: None,
             activated_deferred_tools: Arc::new(std::sync::RwLock::new(HashSet::new())),
             current_searchable_tool_names: Arc::new(std::sync::RwLock::new(None)),
             current_selected_tool_offers: Arc::new(std::sync::RwLock::new(HashMap::new())),
@@ -417,7 +454,8 @@ impl RuntimeToolExecutor {
             enforce_server_tool_capabilities: false,
             server_service_tools_enabled: true,
             control_plane_tools_enabled: true,
-            exactly_once_executor: None,
+            invocation_ledger: None,
+            semantic_read_observation_store: None,
         }
     }
 
@@ -448,19 +486,46 @@ impl RuntimeToolExecutor {
         self
     }
 
-    /// Enable exactly-once execution for crash recovery deduplication.
-    /// When enabled, tools are checked against an idempotency cache before execution.
-    /// The cache is warmed from the event store and (when available) the DB on creation
-    /// to survive restarts.
-    pub async fn enable_exactly_once(&mut self) {
-        self.exactly_once_executor = Some(
-            tool_exactly_once::enable_exactly_once(
-                &self.user_id,
-                &self.session_id,
+    pub fn with_semantic_read_freshness_source(
+        mut self,
+        source: Arc<dyn ProviderSemanticFreshnessSource>,
+    ) -> Self {
+        self.semantic_read_freshness_source = Some(source);
+        self
+    }
+
+    /// Bind logical invocation delivery to the durable database ledger.
+    /// Local/test executors use the same state machine through an in-memory
+    /// adapter until a shared pool is attached.
+    pub fn enable_durable_invocations(&mut self) {
+        self.invocation_ledger = Some(
+            crate::server::tool_invocation_runtime::RuntimeToolInvocationLedger::new(
                 self.context_manifest_pool.clone(),
-            )
-            .await,
+            ),
         );
+    }
+
+    /// Enable semantic read reuse only after the deployment has established
+    /// that every runtime reader understands the v1 observation contract and
+    /// non-dispatched ledger completions. Keeping this separate from durable
+    /// invocation setup is the rolling-upgrade capability gate.
+    pub fn enable_semantic_read_cache_after_cluster_upgrade(
+        &mut self,
+        limits: astra_turn_types::SemanticReadCacheLimits,
+    ) -> Result<(), String> {
+        if self.invocation_ledger.is_none() {
+            return Err(
+                "durable invocation ledger must be enabled before semantic read cache".to_string(),
+            );
+        }
+        self.semantic_read_observation_store = Some(
+            crate::server::semantic_read_observation_runtime::RuntimeSemanticReadObservationStore::new(
+                self.context_manifest_pool.clone(),
+                limits,
+            )
+            .map_err(|error| error.to_string())?,
+        );
+        Ok(())
     }
 
     // ── Session tool wrappers (delegate to extracted module functions) ──────
@@ -491,7 +556,12 @@ impl RuntimeToolExecutor {
 
     // ── Task work-surface event emission ─────────────────────────────────
 
-    pub(super) async fn emit_task_board_snapshot(&self, reason: &str, args: &Value) {
+    pub(super) async fn emit_task_board_snapshot(
+        &self,
+        reason: &str,
+        trusted_run_id: Option<&str>,
+        args: &Value,
+    ) {
         if !self.work_surface_events.is_configured() {
             return;
         }
@@ -502,6 +572,7 @@ impl RuntimeToolExecutor {
         let event = crate::server::tool_work_surface_events::task_board_snapshot_event(
             &self.session_id,
             reason,
+            trusted_run_id,
             args,
             tasks,
         );
@@ -573,6 +644,39 @@ impl RuntimeToolExecutor {
             "request_scoped_mcp_schemas",
         );
         *guard = schemas;
+    }
+
+    pub fn set_provider_policy_index(
+        &self,
+        index: astra_turn_core::provider_resolution::ResolvedProviderPolicyIndex,
+    ) {
+        let mut guard =
+            rwlock_write_reset_on_poison(&self.provider_policy_index, "provider_policy_index");
+        *guard = index;
+    }
+
+    pub(crate) fn provider_policy_lookup(&self, public_alias: &str) -> ProviderPolicyLookup {
+        if let Some(policy) = self
+            .provider_policy_index
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .resolve(public_alias)
+            .cloned()
+        {
+            return ProviderPolicyLookup::Resolved(policy);
+        }
+
+        let belongs_to_provider_surface = self
+            .request_scoped_mcp_schemas_snapshot("provider_policy_lookup")
+            .iter()
+            .any(|schema| tool_schema_name(schema) == Some(public_alias));
+        if belongs_to_provider_surface {
+            ProviderPolicyLookup::MissingPolicy {
+                public_alias: public_alias.to_string(),
+            }
+        } else {
+            ProviderPolicyLookup::NotProvider
+        }
     }
 
     pub fn set_current_searchable_tool_schemas(&self, schemas: &[Value]) {
@@ -783,11 +887,13 @@ impl RuntimeToolExecutor {
         if let Some(agent_binding_mcp) = &self.agent_binding_mcp {
             return match agent_binding_mcp.call_tool_by_mcp_name(name, args).await {
                 Ok(result) => tool_result_from_mcp_tool_call_result(result),
-                Err(error) => astra_tools::ToolResult::error(
+                Err(error) => mcp_call_error_result(
                     super::runtime_mcp::redact_mcp_error_text(&format!(
                         "Agent Binding MCP tool '{name}' failed on server '{}': {error}",
                         agent_binding_mcp.server_name()
                     )),
+                    error.side_effects_maybe(),
+                    error.is_timeout(),
                 ),
             };
         }
@@ -803,9 +909,13 @@ impl RuntimeToolExecutor {
             .await
         {
             Ok(result) => tool_result_from_mcp_tool_call_result(result),
-            Err(e) => astra_tools::ToolResult::error(super::runtime_mcp::redact_mcp_error_text(
-                &format!("MCP tool '{name}' failed: {e}"),
-            )),
+            Err(error) => mcp_call_error_result(
+                super::runtime_mcp::redact_mcp_error_text(&format!(
+                    "MCP tool '{name}' failed: {error}"
+                )),
+                error.side_effects_maybe(),
+                error.is_timeout(),
+            ),
         }
     }
 
@@ -1367,10 +1477,18 @@ impl RuntimeToolExecutor {
     }
 
     pub(super) fn binding_event_fields(&self) -> Map<String, Value> {
-        let mut fields = binding_event_fields(
+        self.binding_event_fields_for(
             self.execution_binding.workspace(),
             self.execution_binding.executor(),
-        );
+        )
+    }
+
+    fn binding_event_fields_for(
+        &self,
+        workspace: &WorkspaceBinding,
+        executor: &ExecutorBinding,
+    ) -> Map<String, Value> {
+        let mut fields = binding_event_fields(workspace, executor);
         fields.insert(
             "capacity_provider_coverage".to_string(),
             serde_json::to_value(self.capacity_provider_coverage()).unwrap_or(Value::Null),
@@ -1446,6 +1564,22 @@ impl RuntimeToolExecutor {
             name,
             args,
         );
+        if let Some(offer) = self.selected_offer_for_request(&request) {
+            request = Self::request_with_selected_offer_route(request, offer.route);
+            request = request.with_selected_offer(offer);
+        }
+        request
+    }
+
+    fn tool_execution_request_for_invocation(
+        &self,
+        identity: &astra_turn_types::ToolInvocationIdentity,
+        name: &str,
+        args: &Value,
+    ) -> ToolExecutionRequest {
+        let mut request = self
+            .execution_binding
+            .tool_execution_request_for_invocation(identity, name, args);
         if let Some(offer) = self.selected_offer_for_request(&request) {
             request = Self::request_with_selected_offer_route(request, offer.route);
             request = request.with_selected_offer(offer);
@@ -1594,36 +1728,436 @@ impl RuntimeToolExecutor {
     pub async fn execute_with_metadata(&self, name: &str, args: &Value) -> astra_tools::ToolResult {
         let request = self.tool_execution_request(name, args);
 
-        // Early cancel check before route-boundary event emission.
-        if let Some(token) = self.cancel_token.as_ref() {
-            if token.is_cancelled() {
-                return self
-                    .tool_execution_service
-                    .cancelled_before_route_result(&request);
-            }
-        }
-
-        execute_tool_route_with_events(
-            ToolRouteRuntimeContext {
-                execution_service: &self.tool_execution_service,
-                local_transport: self,
-                work_surface_events: &self.work_surface_events,
-                session_id: &self.session_id,
-                binding_fields: self.binding_event_fields(),
-                cancel_token: self.cancel_token.clone(),
-            },
-            request,
-        )
-        .await
+        self.execute_request_with_metadata(request).await
     }
 
-    /// Execute a tool locally on the server (no edge routing).
-    async fn execute_local_with_metadata(
+    /// Execute one validated logical invocation without projecting durable
+    /// identity into provider-authored arguments.
+    pub async fn execute_invocation_with_metadata(
         &self,
+        run_id: &str,
+        turn_chain_id: &str,
+        invocation_id: &str,
         name: &str,
         args: &Value,
+        resolved_provider_policy: Option<
+            &astra_turn_core::provider_resolution::ResolvedInvocationPolicy,
+        >,
+        permission_grant: Option<
+            &crate::server::tool_execution_binding::ToolPermissionGrantSnapshot,
+        >,
+    ) -> astra_tools::ToolResult {
+        let identity = match astra_turn_types::ToolInvocationIdentity::new(
+            &self.user_id,
+            &self.session_id,
+            run_id,
+            turn_chain_id,
+            invocation_id,
+        ) {
+            Ok(identity) => identity,
+            Err(error) => {
+                return astra_tools::ToolResult::error(
+                    serde_json::json!({
+                        "status": "failed",
+                        "error": error.to_string(),
+                        "error_kind": astra_core::ErrorKind::ToolBinding.as_str(),
+                        "retryable": false,
+                    })
+                    .to_string(),
+                );
+            }
+        };
+        let mut request = self.tool_execution_request_for_invocation(&identity, name, args);
+        request.policy.resolved_provider_policy = resolved_provider_policy.cloned();
+        request.policy.permission_grant = permission_grant.cloned();
+        self.execute_request_with_metadata(request).await
+    }
+
+    async fn execute_request_with_metadata(
+        &self,
+        mut request: ToolExecutionRequest,
+    ) -> astra_tools::ToolResult {
+        // Cancellation before the durable prepare boundary is known not to
+        // have dispatched and must not leave a stranded ledger row.
+        if let Some(token) = self.cancel_token.as_ref()
+            && token.is_cancelled()
+        {
+            return self
+                .tool_execution_service
+                .cancelled_before_route_result(&request);
+        }
+
+        request.policy.admission_snapshot = Some(
+            self.tool_execution_service
+                .invocation_admission_snapshot(&request)
+                .await,
+        );
+        let durable_invocation = if request.policy.permission_grant.is_some() {
+            let route = self.tool_execution_service.routing_decision(&request);
+            let decision = match crate::server::tool_invocation_decision::ToolInvocationDecisionSnapshot::resolve(
+                &request,
+                route,
+                self.tool_execution_service.tool_registry(),
+            ) {
+                Ok(decision) => decision,
+                Err(error) => {
+                    return astra_tools::ToolResult::error(
+                        serde_json::json!({
+                            "status": "failed",
+                            "error": error.to_string(),
+                            "error_kind": astra_core::ErrorKind::ToolBinding.as_str(),
+                            "retryable": false,
+                        })
+                        .to_string(),
+                    );
+                }
+            };
+            let fingerprint = match decision.fingerprint(&request.args) {
+                Ok(fingerprint) => fingerprint,
+                Err(error) => {
+                    return astra_tools::ToolResult::error(
+                        serde_json::json!({
+                            "status": "failed",
+                            "error": error.to_string(),
+                            "error_kind": astra_core::ErrorKind::ToolBinding.as_str(),
+                            "retryable": false,
+                        })
+                        .to_string(),
+                    );
+                }
+            };
+            let durable_decision = match decision.durable() {
+                Ok(decision) => decision,
+                Err(error) => {
+                    return astra_tools::ToolResult::error(
+                        serde_json::json!({
+                            "status": "failed",
+                            "error": error.to_string(),
+                            "error_kind": astra_core::ErrorKind::ToolBinding.as_str(),
+                            "retryable": false,
+                        })
+                        .to_string(),
+                    );
+                }
+            };
+            let identity = match astra_turn_types::ToolInvocationIdentity::new(
+                &request.user_id,
+                &request.session_id,
+                &request.run_id,
+                &request.turn_chain_id,
+                &request.tool_call_id,
+            ) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    return astra_tools::ToolResult::error(
+                        serde_json::json!({
+                            "status": "failed",
+                            "error": error.to_string(),
+                            "error_kind": astra_core::ErrorKind::ToolBinding.as_str(),
+                            "retryable": false,
+                        })
+                        .to_string(),
+                    );
+                }
+            };
+            let Some(ledger) = self.invocation_ledger.as_ref() else {
+                return crate::server::tool_invocation_runtime::ledger_unavailable_result(
+                    &identity,
+                    "runtime ledger is not configured",
+                );
+            };
+            let frozen_decision = match ledger
+                .prepare_for_execution(&identity, &fingerprint, &durable_decision, |decision| {
+                    crate::server::tool_invocation_decision::ToolInvocationDecisionSnapshot::from_durable(decision)
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                })
+                .await
+            {
+                Ok(crate::server::tool_invocation_runtime::InvocationPrepareDisposition::Prepared {
+                    decision,
+                }) => decision,
+                Ok(crate::server::tool_invocation_runtime::InvocationPrepareDisposition::Return(result)) => return result,
+                Err(error) => {
+                    return crate::server::tool_invocation_runtime::ledger_unavailable_result(
+                        &identity, error,
+                    );
+                }
+            };
+            let frozen = match crate::server::tool_invocation_decision::ToolInvocationDecisionSnapshot::from_durable(&frozen_decision) {
+                Ok(frozen) => frozen,
+                Err(error) => {
+                    return crate::server::tool_invocation_runtime::ledger_unavailable_result(
+                        &identity, error,
+                    );
+                }
+            };
+            frozen.apply_to_request(&mut request);
+            let current_freshness =
+                self.resolve_current_semantic_read_freshness(&frozen, &identity, &request.args);
+            let semantic_cache_key = match current_freshness.as_ref() {
+                Some(freshness) => frozen.semantic_read_cache_key(&request.args, freshness),
+                None => Ok(None),
+            };
+            let semantic_cache_key = match semantic_cache_key {
+                Ok(key) => key,
+                Err(error) => {
+                    tracing::warn!(
+                        user_id = %identity.user_id,
+                        session_id = %identity.session_id,
+                        run_id = %identity.run_id,
+                        turn_chain_id = %identity.turn_chain_id,
+                        invocation_id = %identity.invocation_id,
+                        semantic_read_cache_state = "key_construction_failed",
+                        %error,
+                        "semantic read cache key construction failed; executing uncached"
+                    );
+                    None
+                }
+            };
+            tracing::debug!(
+                user_id = %identity.user_id,
+                session_id = %identity.session_id,
+                run_id = %identity.run_id,
+                turn_chain_id = %identity.turn_chain_id,
+                invocation_id = %identity.invocation_id,
+                policy_decision_id = %frozen_decision.decision_id,
+                semantic_read_cache = frozen.semantic_cache.trace_state(),
+                semantic_read_cache_key_id = semantic_cache_key.as_ref().map(|key| key.key_id.as_str()),
+                "resolved frozen tool invocation decision"
+            );
+            let cache_fill = match crate::server::semantic_read_observation_runtime::before_dispatch(
+                self.semantic_read_observation_store.as_ref(),
+                ledger,
+                &identity,
+                semantic_cache_key.as_ref(),
+            )
+            .await
+            {
+                crate::server::semantic_read_observation_runtime::SemanticReadBeforeDispatch::Proceed(fill) => fill,
+                crate::server::semantic_read_observation_runtime::SemanticReadBeforeDispatch::Return(result) => return result,
+            };
+            let cache_fill = cache_fill.map(|claim| PendingSemanticReadFill {
+                claim,
+                decision: frozen.clone(),
+                arguments: request.args.clone(),
+            });
+            match ledger.dispatch_prepared(&identity).await {
+                Ok(
+                    crate::server::tool_invocation_runtime::InvocationBeginDisposition::Execute {
+                        decision,
+                        owner_id,
+                    },
+                ) => {
+                    if decision != frozen_decision {
+                        if let Some(fill) = cache_fill.as_ref() {
+                            crate::server::semantic_read_observation_runtime::abandon_fill(
+                                &identity,
+                                &fill.claim,
+                                "dispatch decision changed after prepare",
+                            )
+                            .await;
+                        }
+                        return crate::server::tool_invocation_runtime::ledger_unavailable_result(
+                            &identity,
+                            "dispatch returned a different frozen decision",
+                        );
+                    }
+                    Some((ledger, identity, frozen.route, owner_id, cache_fill))
+                }
+                Ok(crate::server::tool_invocation_runtime::InvocationBeginDisposition::Return(
+                    result,
+                )) => {
+                    if let Some(fill) = cache_fill.as_ref() {
+                        crate::server::semantic_read_observation_runtime::abandon_fill(
+                            &identity,
+                            &fill.claim,
+                            "logical invocation completed before dispatch claim",
+                        )
+                        .await;
+                    }
+                    return result;
+                }
+                Err(error) => {
+                    if let Some(fill) = cache_fill.as_ref() {
+                        crate::server::semantic_read_observation_runtime::abandon_fill(
+                            &identity,
+                            &fill.claim,
+                            "provider dispatch claim failed",
+                        )
+                        .await;
+                    }
+                    return crate::server::tool_invocation_runtime::ledger_unavailable_result(
+                        &identity, error,
+                    );
+                }
+            }
+        } else {
+            None
+        };
+
+        let route_binding_fields =
+            self.binding_event_fields_for(&request.workspace, &request.executor);
+        let route_context = ToolRouteRuntimeContext {
+            execution_service: &self.tool_execution_service,
+            local_transport: self,
+            work_surface_events: &self.work_surface_events,
+            session_id: &self.session_id,
+            binding_fields: route_binding_fields,
+            cancel_token: self.cancel_token.clone(),
+        };
+        let lease_heartbeat =
+            durable_invocation
+                .as_ref()
+                .map(|(ledger, identity, _, owner_id, _)| {
+                    ledger.start_lease_heartbeat(identity.clone(), owner_id.clone())
+                });
+        let result = match durable_invocation.as_ref() {
+            Some((_, _, route, _, _)) => {
+                execute_tool_route_with_events_at_route(route_context, request, *route).await
+            }
+            None => execute_tool_route_with_events(route_context, request).await,
+        };
+        match durable_invocation {
+            Some((ledger, identity, _, owner_id, cache_fill)) => {
+                let route_outcome = cache_fill.as_ref().map(|_| {
+                    crate::server::tool_invocation_runtime::terminal_outcome_from_result(&result)
+                });
+                let result = ledger.finish(&identity, &owner_id, result).await;
+                if let Some(heartbeat) = lease_heartbeat {
+                    heartbeat.stop().await;
+                }
+                if let (Some(fill), Some(outcome)) = (cache_fill, route_outcome) {
+                    let revalidated_key = self
+                        .resolve_current_semantic_read_freshness(
+                            &fill.decision,
+                            &identity,
+                            &fill.arguments,
+                        )
+                        .as_ref()
+                        .and_then(|freshness| {
+                            match fill
+                                .decision
+                                .semantic_read_cache_key(&fill.arguments, freshness)
+                            {
+                                Ok(key) => key,
+                                Err(error) => {
+                                    tracing::warn!(
+                                        user_id = %identity.user_id,
+                                        session_id = %identity.session_id,
+                                        run_id = %identity.run_id,
+                                        turn_chain_id = %identity.turn_chain_id,
+                                        invocation_id = %identity.invocation_id,
+                                        semantic_read_cache_state = "revalidation_key_failed",
+                                        %error,
+                                        "semantic read freshness revalidation could not build a cache key"
+                                    );
+                                    None
+                                }
+                            }
+                        });
+                    crate::server::semantic_read_observation_runtime::settle_fill(
+                        ledger,
+                        &identity,
+                        fill.claim,
+                        outcome,
+                        revalidated_key.as_ref(),
+                    )
+                    .await;
+                }
+                result
+            }
+            None => result,
+        }
+    }
+
+    fn resolve_current_semantic_read_freshness(
+        &self,
+        decision: &crate::server::tool_invocation_decision::ToolInvocationDecisionSnapshot,
+        identity: &astra_turn_types::ToolInvocationIdentity,
+        arguments: &Value,
+    ) -> Option<astra_turn_types::SemanticReadFreshnessContext> {
+        if !decision.requires_semantic_read_freshness() {
+            return None;
+        }
+        let Some(policy) = decision.provider_policy.as_ref() else {
+            tracing::warn!(
+                user_id = %identity.user_id,
+                session_id = %identity.session_id,
+                run_id = %identity.run_id,
+                turn_chain_id = %identity.turn_chain_id,
+                invocation_id = %identity.invocation_id,
+                semantic_read_cache_state = "invalid_frozen_policy",
+                "freshness-required decision has no exact provider descriptor; executing uncached"
+            );
+            return None;
+        };
+
+        let facts = match resolve_provider_semantic_freshness(
+            self.semantic_read_freshness_source.as_deref(),
+            &policy.descriptor,
+            arguments,
+        ) {
+            Ok(facts) => facts,
+            Err(reason) => {
+                match reason {
+                    astra_turn_types::SemanticReadFreshnessUnavailableReason::SourceFailed => {
+                        tracing::warn!(
+                            provider_binding = %policy.descriptor.identity.provider_binding,
+                            native_tool_id = %policy.descriptor.identity.native_tool_id,
+                            semantic_read_cache_state = "freshness_source_failed",
+                            "provider semantic freshness source failed; executing uncached"
+                        );
+                    }
+                    astra_turn_types::SemanticReadFreshnessUnavailableReason::SourceNotConfigured
+                    | astra_turn_types::SemanticReadFreshnessUnavailableReason::RevisionUnavailable => {
+                        tracing::debug!(
+                            provider_binding = %policy.descriptor.identity.provider_binding,
+                            native_tool_id = %policy.descriptor.identity.native_tool_id,
+                            semantic_read_cache_state = "freshness_unavailable",
+                            ?reason,
+                            "provider semantic freshness unavailable; executing uncached"
+                        );
+                    }
+                    astra_turn_types::SemanticReadFreshnessUnavailableReason::InvalidEvidence => {
+                        tracing::warn!(
+                            provider_binding = %policy.descriptor.identity.provider_binding,
+                            native_tool_id = %policy.descriptor.identity.native_tool_id,
+                            semantic_read_cache_state = "freshness_invalid",
+                            "provider semantic freshness evidence was invalid; executing uncached"
+                        );
+                    }
+                }
+                return None;
+            }
+        };
+        let security_scope = serde_json::json!({
+            "contract_version": "semantic-read-security-scope-v1",
+            "user_id": identity.user_id.as_str(),
+            "session_id": identity.session_id.as_str(),
+        })
+        .to_string();
+        match astra_turn_types::SemanticReadFreshnessContext::new(&security_scope, facts) {
+            Ok(context) => Some(context),
+            Err(error) => {
+                tracing::warn!(
+                    provider_binding = %policy.descriptor.identity.provider_binding,
+                    native_tool_id = %policy.descriptor.identity.native_tool_id,
+                    semantic_read_cache_state = "freshness_invalid",
+                    %error,
+                    "provider semantic freshness evidence was invalid; executing uncached"
+                );
+                None
+            }
+        }
+    }
+    async fn execute_local_with_metadata(
+        &self,
+        request: &ToolExecutionRequest,
         cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
+        let name = request.tool_name.as_str();
+        let args = &request.args;
         if let LocalToolPreflight::ShortCircuit(result) =
             self.run_local_tool_preflight(name, args).await
         {
@@ -1635,7 +2169,6 @@ impl RuntimeToolExecutor {
             aggregate_output_bytes: &self.aggregate_output_bytes,
             memoria_client: &self.memoria_client,
             progress_callback: self.progress_callback.as_deref(),
-            exactly_once_executor: self.exactly_once_executor.as_ref(),
         };
         let call_id = lifecycle.start(name, args).await;
 
@@ -1643,7 +2176,17 @@ impl RuntimeToolExecutor {
             _ if self.tool_engine.contains(name) => {
                 if let Some(result) = self
                     .tool_engine
-                    .execute(name, self, args, cancel_token)
+                    .execute_invocation(
+                        name,
+                        self,
+                        args,
+                        astra_tools::tool_engine::ToolInvocationMetadata {
+                            run_id: non_empty_identity(&request.run_id),
+                            turn_chain_id: non_empty_identity(&request.turn_chain_id),
+                            tool_call_id: non_empty_identity(&request.tool_call_id),
+                        },
+                        cancel_token,
+                    )
                     .await
                 {
                     result
@@ -1666,7 +2209,7 @@ impl RuntimeToolExecutor {
             }
         };
 
-        let result = lifecycle.finish(name, args, &call_id, result).await;
+        let result = lifecycle.finish(name, &call_id, result).await;
         if name == "tool_search" && !result.is_error {
             self.record_tool_search_activation_output(&result.output);
         }
@@ -1695,7 +2238,6 @@ impl RuntimeToolExecutor {
                 workspace_root: &self.workspace_root,
                 workspace_binding: self.execution_binding.workspace(),
                 approval_gate: self.approval_gate.as_deref(),
-                exactly_once_executor: self.exactly_once_executor.as_ref(),
                 plan_mode_authoring_active,
             },
             name,
@@ -1756,6 +2298,10 @@ impl RuntimeToolExecutor {
         )
         .await
     }
+}
+
+fn non_empty_identity(value: &str) -> Option<&str> {
+    (!value.is_empty()).then_some(value)
 }
 
 fn dedupe_tool_schema_pool(pool: &mut Vec<Value>) {
@@ -1966,29 +2512,6 @@ mod runtime_environment_denial_tests {
     }
 }
 
-fn server_local_tool_arguments(request: &ToolExecutionRequest) -> Value {
-    let Some(map) = request.args.as_object() else {
-        return request.args.clone();
-    };
-    let mut args = map.clone();
-    if !request.run_id.is_empty() {
-        args.insert("_run_id".to_string(), Value::String(request.run_id.clone()));
-    }
-    if !request.turn_chain_id.is_empty() {
-        args.insert(
-            "_turn_chain_id".to_string(),
-            Value::String(request.turn_chain_id.clone()),
-        );
-    }
-    if !request.tool_call_id.is_empty() {
-        args.insert(
-            "_tool_call_id".to_string(),
-            Value::String(request.tool_call_id.clone()),
-        );
-    }
-    Value::Object(args)
-}
-
 // ─── ToolExecutor trait implementation ────────────────────────────────────────
 //
 // This allows RuntimeToolExecutor to be used polymorphically wherever
@@ -2014,8 +2537,7 @@ impl ServerLocalToolTransport for RuntimeToolExecutor {
                 .await;
         }
         spawn_resource_tool_call_recording(&self.user_id, self.resource_governor.as_ref());
-        let args = server_local_tool_arguments(request);
-        self.execute_local_with_metadata(&request.tool_name, &args, cancel_token)
+        self.execute_local_with_metadata(request, cancel_token)
             .await
     }
 }
@@ -2042,18 +2564,83 @@ impl ToolExecutor for RuntimeToolExecutor {
 }
 
 fn tool_result_from_mcp_tool_call_result(result: McpToolCallResult) -> astra_tools::ToolResult {
-    let mut tool_result = astra_tools::ToolResult::text(result.output);
-    let Some(structured_content) = result.structured_content else {
-        return tool_result;
+    let (payload, is_error) = match result.into_provider_outcome() {
+        ProviderCallOutcome::Success(payload) => (payload, false),
+        ProviderCallOutcome::ToolFailure(payload) => (payload, true),
+        ProviderCallOutcome::Rejected(rejection) => {
+            let mut result = astra_tools::ToolResult::error(rejection.message);
+            result.metadata = Some(Map::from_iter([(
+                "providerRejection".to_string(),
+                json!({
+                    "code": rejection.code,
+                    "retryable": rejection.retryable,
+                }),
+            )]));
+            return result;
+        }
     };
-    let metadata = tool_result.metadata.get_or_insert_with(Map::new);
-    if let Some(artifacts) = structured_content.get("artifacts") {
-        metadata.insert("artifacts".to_string(), artifacts.clone());
+    tool_result_from_provider_payload(payload, is_error)
+}
+
+fn mcp_call_error_result(
+    message: String,
+    side_effects_maybe: bool,
+    timed_out: bool,
+) -> astra_tools::ToolResult {
+    let mut result = astra_tools::ToolResult::error(message);
+    result.metadata = Some(Map::from_iter([
+        ("status".to_string(), Value::String("failed".to_string())),
+        (
+            "error_kind".to_string(),
+            Value::String(
+                if timed_out {
+                    astra_core::ErrorKind::ToolTimeout
+                } else {
+                    astra_core::ErrorKind::StreamTransport
+                }
+                .as_str()
+                .to_string(),
+            ),
+        ),
+        (
+            "side_effects_maybe".to_string(),
+            Value::Bool(side_effects_maybe),
+        ),
+        ("retryable".to_string(), Value::Bool(!side_effects_maybe)),
+    ]));
+    result
+}
+
+fn tool_result_from_provider_payload(
+    payload: ProviderCallPayload,
+    is_error: bool,
+) -> astra_tools::ToolResult {
+    let mut tool_result = if is_error {
+        astra_tools::ToolResult::error(payload.text)
+    } else {
+        astra_tools::ToolResult::text(payload.text)
+    };
+    if let Some(structured_content) = payload.structured_content {
+        let metadata = tool_result.metadata.get_or_insert_with(Map::new);
+        if let Some(artifacts) = structured_content.get("artifacts") {
+            metadata.insert("artifacts".to_string(), artifacts.clone());
+        }
+        if let Some(artifact) = structured_content.get("artifact") {
+            metadata.insert("artifact".to_string(), artifact.clone());
+        }
+        metadata.insert("structuredContent".to_string(), structured_content);
     }
-    if let Some(artifact) = structured_content.get("artifact") {
-        metadata.insert("artifact".to_string(), artifact.clone());
+    if let Some(protocol_metadata) = payload.protocol_metadata {
+        let encoded = protocol_metadata.to_string().into_bytes();
+        tool_result.metadata.get_or_insert_with(Map::new).insert(
+            "providerProtocolMetadataSummary".to_string(),
+            json!({
+                "contentHash": format!("{:x}", Sha256::digest(&encoded)),
+                "originalBytes": encoded.len(),
+                "rawProjected": false,
+            }),
+        );
     }
-    metadata.insert("structuredContent".to_string(), structured_content);
     tool_result
 }
 
@@ -2062,6 +2649,7 @@ fn tool_result_from_mcp_tool_call_result(result: McpToolCallResult) -> astra_too
 mod tests {
     use std::ffi::OsString;
     use std::path::Path;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::{Mutex as StdMutex, MutexGuard, OnceLock};
 
     use super::*;
@@ -2089,7 +2677,41 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn mcp_timeout_result_is_non_retryable_unknown_outcome_evidence() {
+        let result = mcp_call_error_result("MCP timed out".to_string(), true, true);
+        let metadata = result.metadata.as_ref().unwrap();
+
+        assert!(result.is_error);
+        assert_eq!(metadata["error_kind"], "tool_timeout");
+        assert_eq!(metadata["side_effects_maybe"], true);
+        assert_eq!(metadata["retryable"], false);
+    }
+
     struct ReadyReflectService;
+
+    struct StaticSemanticFreshnessSource {
+        calls: AtomicUsize,
+        response: Result<
+            crate::server::semantic_read_freshness::ProviderSemanticFreshnessEvidence,
+            crate::server::semantic_read_freshness::ProviderSemanticFreshnessSourceError,
+        >,
+    }
+
+    impl crate::server::semantic_read_freshness::ProviderSemanticFreshnessSource
+        for StaticSemanticFreshnessSource
+    {
+        fn resolve(
+            &self,
+            _request: crate::server::semantic_read_freshness::ProviderSemanticFreshnessRequest<'_>,
+        ) -> Result<
+            crate::server::semantic_read_freshness::ProviderSemanticFreshnessEvidence,
+            crate::server::semantic_read_freshness::ProviderSemanticFreshnessSourceError,
+        > {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.response.clone()
+        }
+    }
 
     #[async_trait]
     impl astra_services::ReflectService for ReadyReflectService {
@@ -2153,6 +2775,8 @@ mod tests {
         let result = tool_result_from_mcp_tool_call_result(McpToolCallResult {
             output: "created file".to_string(),
             structured_content: Some(structured_content.clone()),
+            protocol_metadata: None,
+            is_error: false,
         });
 
         assert_eq!(result.output, "created file");
@@ -2163,6 +2787,34 @@ mod tests {
             metadata.get("artifacts"),
             structured_content.get("artifacts")
         );
+    }
+
+    #[test]
+    fn mcp_tool_call_result_conversion_preserves_typed_error_even_when_output_says_ok() {
+        let result = tool_result_from_mcp_tool_call_result(McpToolCallResult {
+            output: "ok".to_string(),
+            structured_content: Some(json!({"errorCode": "WRITE_REJECTED"})),
+            protocol_metadata: Some(json!({"requestId": "request-1"})),
+            is_error: true,
+        });
+
+        assert!(result.is_error);
+        assert_eq!(result.output, "ok");
+        let metadata = result.metadata.expect("preserved provider result metadata");
+        assert_eq!(
+            metadata.get("structuredContent"),
+            Some(&json!({"errorCode": "WRITE_REJECTED"}))
+        );
+        let protocol_summary = metadata
+            .get("providerProtocolMetadataSummary")
+            .expect("bounded protocol metadata summary");
+        assert_eq!(protocol_summary["rawProjected"], false);
+        assert_eq!(protocol_summary["originalBytes"], 25);
+        assert_eq!(
+            protocol_summary["contentHash"].as_str().map(str::len),
+            Some(64)
+        );
+        assert!(!Value::Object(metadata).to_string().contains("request-1"));
     }
 
     #[test]
@@ -2519,6 +3171,254 @@ mod tests {
             Some("no_request_scoped_mcp_provider_bound")
         );
         assert!(mcp.capabilities.is_empty());
+    }
+
+    #[test]
+    fn provider_policy_lookup_distinguishes_non_provider_missing_and_resolved() {
+        let (exec, _dir) = test_executor();
+        assert!(matches!(
+            exec.provider_policy_lookup("mcp__tools__query"),
+            ProviderPolicyLookup::NotProvider
+        ));
+
+        let discovery = astra_turn_types::ProviderDiscoverySnapshot::new(
+            astra_turn_types::ProviderIdentity::new("provider").unwrap(),
+            astra_turn_types::ProviderBindingRef::new("binding").unwrap(),
+            astra_turn_types::ProviderProtocolId::new("mcp").unwrap(),
+            vec![astra_turn_types::ProviderToolDeclaration {
+                native_tool_id: astra_turn_types::NativeToolId::new("query").unwrap(),
+                native_tool_name: "query".to_string(),
+                title: None,
+                description: Some("Query".to_string()),
+                input_schema: json!({"type": "object"}),
+                output_schema: None,
+                claims: Default::default(),
+                task_support: Default::default(),
+                extension_fields: Default::default(),
+            }],
+        )
+        .unwrap();
+        let resolved = crate::server::runtime_mcp::resolve_mcp_snapshot("tools", &discovery)
+            .expect("MCP snapshot should resolve");
+        let schemas = astra_mcp::mcp_resolved_provider_snapshot_to_schemas_checked(&resolved)
+            .expect("resolved schemas should project");
+        exec.set_request_scoped_mcp_schemas(schemas);
+        assert!(matches!(
+            exec.provider_policy_lookup("mcp__tools__query"),
+            ProviderPolicyLookup::MissingPolicy { .. }
+        ));
+
+        let expected_descriptor = resolved.descriptors[0].descriptor_ref();
+        let index =
+            astra_turn_core::provider_resolution::ResolvedProviderPolicyIndex::from_snapshots(&[
+                resolved,
+            ])
+            .unwrap();
+        exec.set_provider_policy_index(index);
+        match exec.provider_policy_lookup("mcp__tools__query") {
+            ProviderPolicyLookup::Resolved(policy) => {
+                assert_eq!(policy.descriptor, expected_descriptor);
+                assert!(policy.requires_approval());
+            }
+            other => panic!("expected resolved provider policy, got {other:?}"),
+        }
+    }
+
+    fn semantic_read_provider_policy(
+        cache: astra_turn_types::ResolvedSemanticCacheBaseline,
+    ) -> astra_turn_core::provider_resolution::ResolvedInvocationPolicy {
+        astra_turn_core::provider_resolution::ResolvedInvocationPolicy {
+            descriptor: astra_turn_types::ResolvedToolDescriptorRef::new(
+                astra_turn_types::ToolIdentity::new(
+                    astra_turn_types::ProviderBindingRef::new("binding-a").unwrap(),
+                    astra_turn_types::NativeToolId::new("native-read").unwrap(),
+                ),
+                "descriptor-v1",
+            )
+            .unwrap(),
+            effect: astra_turn_types::ResolvedToolEffect::ReadOnly,
+            parallelizable: true,
+            approval:
+                astra_turn_core::provider_resolution::ProviderApprovalBaseline::NoAdditionalApproval,
+            idempotency: astra_turn_types::ResolvedToolIdempotency::PureRead,
+            semantic_cache: cache,
+            diagnostics: Vec::new(),
+        }
+    }
+
+    fn freeze_provider_read_decision(
+        request: &mut ToolExecutionRequest,
+    ) -> (
+        astra_turn_types::ToolInvocationIdentity,
+        crate::server::tool_invocation_decision::ToolInvocationDecisionSnapshot,
+    ) {
+        request.policy.admission_snapshot = Some(Default::default());
+        if request.run_id.is_empty() {
+            request.run_id = "test-run".to_string();
+        }
+        if request.turn_chain_id.is_empty() {
+            request.turn_chain_id = "test-turn".to_string();
+        }
+        if request.tool_call_id.is_empty() {
+            request.tool_call_id = "test-call".to_string();
+        }
+        let identity = astra_turn_types::ToolInvocationIdentity::new(
+            &request.user_id,
+            &request.session_id,
+            &request.run_id,
+            &request.turn_chain_id,
+            &request.tool_call_id,
+        )
+        .unwrap();
+        let decision =
+            crate::server::tool_invocation_decision::ToolInvocationDecisionSnapshot::resolve(
+                request,
+                crate::server::tool_route_selection::ToolExecutionRouteKind::RequestScopedMcp,
+                &astra_runtime_env::ToolRegistry::builtins(),
+            )
+            .unwrap();
+        (identity, decision)
+    }
+
+    #[test]
+    fn semantic_freshness_source_is_policy_gated_and_astra_security_scoped() {
+        let source = Arc::new(StaticSemanticFreshnessSource {
+            calls: AtomicUsize::new(0),
+            response: Ok(
+                crate::server::semantic_read_freshness::ProviderSemanticFreshnessEvidence::Current {
+                    facts: vec![astra_turn_types::SemanticFreshnessFact::new(
+                        astra_turn_types::SemanticFreshnessScope::Resource,
+                        "resource-a",
+                        "rev-1",
+                    )
+                    .unwrap()],
+                },
+            ),
+        });
+        let (exec, _dir) = test_executor();
+        let exec = exec.with_semantic_read_freshness_source(source.clone());
+        let mut eligible = exec.tool_execution_request("public-alias", &json!({"query": "a"}));
+        eligible.policy.resolved_provider_policy = Some(semantic_read_provider_policy(
+            astra_turn_types::ResolvedSemanticCacheBaseline::FreshnessBound,
+        ));
+        let (eligible_identity, eligible_decision) = freeze_provider_read_decision(&mut eligible);
+        let first_context = exec
+            .resolve_current_semantic_read_freshness(
+                &eligible_decision,
+                &eligible_identity,
+                &eligible.args,
+            )
+            .expect("available freshness");
+        assert_eq!(source.calls.load(Ordering::Relaxed), 1);
+
+        let mut ineligible = exec.tool_execution_request("public-alias", &json!({"query": "a"}));
+        ineligible.policy.resolved_provider_policy = Some(semantic_read_provider_policy(
+            astra_turn_types::ResolvedSemanticCacheBaseline::Disabled,
+        ));
+        let (ineligible_identity, ineligible_decision) =
+            freeze_provider_read_decision(&mut ineligible);
+        assert!(
+            exec.resolve_current_semantic_read_freshness(
+                &ineligible_decision,
+                &ineligible_identity,
+                &ineligible.args,
+            )
+            .is_none()
+        );
+        assert_eq!(source.calls.load(Ordering::Relaxed), 1);
+
+        let other_dir = TempDir::new().unwrap();
+        let other = RuntimeToolExecutor::new(
+            other_dir.path().to_path_buf(),
+            "other-user".to_string(),
+            "other-session".to_string(),
+            None,
+            None,
+        )
+        .with_semantic_read_freshness_source(source.clone());
+        let mut other_request =
+            other.tool_execution_request("public-alias", &json!({"query": "a"}));
+        other_request.policy.resolved_provider_policy = Some(semantic_read_provider_policy(
+            astra_turn_types::ResolvedSemanticCacheBaseline::FreshnessBound,
+        ));
+        let (other_identity, other_decision) = freeze_provider_read_decision(&mut other_request);
+        let other_context = other
+            .resolve_current_semantic_read_freshness(
+                &other_decision,
+                &other_identity,
+                &other_request.args,
+            )
+            .expect("available freshness");
+        assert_ne!(
+            first_context.security_scope_id,
+            other_context.security_scope_id
+        );
+        assert_ne!(first_context.context_id, other_context.context_id);
+
+        let same_user_dir = TempDir::new().unwrap();
+        let same_user_other_session = RuntimeToolExecutor::new(
+            same_user_dir.path().to_path_buf(),
+            eligible.user_id.clone(),
+            "other-session".to_string(),
+            None,
+            None,
+        )
+        .with_semantic_read_freshness_source(source);
+        let mut same_user_request =
+            same_user_other_session.tool_execution_request("public-alias", &json!({"query": "a"}));
+        same_user_request.policy.resolved_provider_policy = Some(semantic_read_provider_policy(
+            astra_turn_types::ResolvedSemanticCacheBaseline::FreshnessBound,
+        ));
+        let (same_user_identity, same_user_decision) =
+            freeze_provider_read_decision(&mut same_user_request);
+        let same_user_context = same_user_other_session
+            .resolve_current_semantic_read_freshness(
+                &same_user_decision,
+                &same_user_identity,
+                &same_user_request.args,
+            )
+            .expect("available freshness");
+        assert_ne!(
+            first_context.security_scope_id,
+            same_user_context.security_scope_id
+        );
+        assert_ne!(first_context.context_id, same_user_context.context_id);
+    }
+
+    #[test]
+    fn missing_or_invalid_freshness_evidence_executes_uncached() {
+        let (exec, _dir) = test_executor();
+        let mut missing = exec.tool_execution_request("public-alias", &Value::Null);
+        missing.policy.resolved_provider_policy = Some(semantic_read_provider_policy(
+            astra_turn_types::ResolvedSemanticCacheBaseline::FreshnessBound,
+        ));
+        let (missing_identity, missing_decision) = freeze_provider_read_decision(&mut missing);
+        assert!(
+            exec.resolve_current_semantic_read_freshness(
+                &missing_decision,
+                &missing_identity,
+                &missing.args,
+            )
+            .is_none()
+        );
+
+        let invalid_source = Arc::new(StaticSemanticFreshnessSource {
+            calls: AtomicUsize::new(0),
+            response: Ok(
+                crate::server::semantic_read_freshness::ProviderSemanticFreshnessEvidence::Current {
+                    facts: Vec::new(),
+                },
+            ),
+        });
+        let exec = exec.with_semantic_read_freshness_source(invalid_source);
+        assert!(
+            exec.resolve_current_semantic_read_freshness(
+                &missing_decision,
+                &missing_identity,
+                &missing.args,
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -3822,122 +4722,405 @@ esac
         }
     }
 
-    #[tokio::test]
-    async fn exactly_once_cache_ignores_internal_tool_metadata() {
-        use astra_pipeline::step_protocol::{CachedToolResult, IdempotencyKey};
+    fn semantic_cache_contract(
+        label: &str,
+    ) -> (
+        Value,
+        astra_turn_types::ToolInvocationDecision,
+        astra_turn_types::ToolInvocationFingerprint,
+        astra_turn_types::SemanticReadCacheKey,
+    ) {
+        let arguments = json!({"query": label});
+        let decision =
+            astra_turn_types::ToolInvocationDecision::new(&json!({"policy": label})).unwrap();
+        let tool =
+            astra_turn_types::DurableToolReference::built_in("semantic-read-test", "contract-v1")
+                .unwrap();
+        let fingerprint = astra_turn_types::ToolInvocationFingerprint::new(
+            tool.clone(),
+            &arguments,
+            &decision.decision_id,
+        )
+        .unwrap();
+        let freshness = astra_turn_types::SemanticReadFreshnessContext::new(
+            "test-user:test-session",
+            vec![
+                astra_turn_types::SemanticFreshnessFact::new(
+                    astra_turn_types::SemanticFreshnessScope::Resource,
+                    "resource-a",
+                    "revision-1",
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let key = astra_turn_types::SemanticReadCacheKey::new(
+            tool,
+            &arguments,
+            &decision.decision_id,
+            &freshness,
+        )
+        .unwrap();
+        (arguments, decision, fingerprint, key)
+    }
 
-        let (mut exec, _dir) = test_executor();
-        exec.enable_exactly_once().await;
-
-        let public_first_args = json!({"action": "create", "title": "cached first"});
-        let replay_first_args = json!({
-            "action": "create",
-            "title": "cached first",
-            "_tool_call_id": "call-replayed",
-            "_run_id": "run-replayed"
-        });
-        let second_args = json!({
-            "action": "create",
-            "title": "live second",
-            "_tool_call_id": "call-live"
-        });
-        let first_key = IdempotencyKey::semantic("task_board", &public_first_args);
-        {
-            let executor = exec
-                .exactly_once_executor
-                .as_ref()
-                .expect("exactly-once executor")
-                .in_memory
-                .lock()
-                .expect("exactly-once lock");
-            assert!(
-                executor.cache().check(&first_key).is_none(),
-                "precondition: first key should start empty"
-            );
-        }
-        {
-            let mut executor = exec
-                .exactly_once_executor
-                .as_ref()
-                .expect("exactly-once executor")
-                .in_memory
-                .lock()
-                .expect("exactly-once lock");
-            executor.cache_mut().record(
-                &first_key,
-                CachedToolResult {
-                    tool_name: "task_board".to_string(),
-                    output: "cached-first".to_string(),
-                    is_error: false,
-                    cached_at: 1,
-                    context_signature: None,
-                },
-            );
-        }
-
-        let first = exec
-            .execute_local_with_metadata("task_board", &replay_first_args, None)
-            .await;
-        assert_eq!(first.output, "cached-first");
-
-        let second = exec
-            .execute_local_with_metadata("task_board", &second_args, None)
-            .await;
-        assert!(
-            second.output.contains("\"success\":true"),
-            "second tool should execute normally: {second:?}"
-        );
-
-        let second_key = IdempotencyKey::semantic(
-            "task_board",
-            &json!({"action": "create", "title": "live second"}),
-        );
-        let executor = exec
-            .exactly_once_executor
-            .as_ref()
-            .expect("exactly-once executor")
-            .in_memory
-            .lock()
-            .expect("exactly-once lock");
-        assert!(
-            executor.cache().check(&second_key).is_some(),
-            "live tool should be recorded under sanitized semantic args"
-        );
+    fn semantic_test_identity(invocation_id: &str) -> astra_turn_types::ToolInvocationIdentity {
+        astra_turn_types::ToolInvocationIdentity::new(
+            "test-user",
+            "test-session",
+            "run-1",
+            "turn-1",
+            invocation_id,
+        )
+        .unwrap()
     }
 
     #[tokio::test]
-    async fn exactly_once_record_skips_failed_tool_results() {
-        use astra_pipeline::step_protocol::IdempotencyKey;
-
+    async fn semantic_read_fill_requires_durable_success_before_a_distinct_invocation_hits() {
         let (mut exec, _dir) = test_executor();
-        exec.enable_exactly_once().await;
-
-        let args = json!({"command": "curl https://example.invalid"});
-        let result = astra_tools::ToolResult {
-            output: "network timeout".to_string(),
-            is_error: true,
-            metadata: None,
-            exit_semantics: None,
+        exec.enable_durable_invocations();
+        exec.enable_semantic_read_cache_after_cluster_upgrade(
+            astra_turn_types::SemanticReadCacheLimits::default(),
+        )
+        .unwrap();
+        let ledger = exec.invocation_ledger.as_ref().unwrap().clone();
+        let (_arguments, decision, fingerprint, key) = semantic_cache_contract("status");
+        let first_identity = semantic_test_identity("call-1");
+        ledger
+            .prepare_for_execution(&first_identity, &fingerprint, &decision, |_| Ok(()))
+            .await
+            .unwrap();
+        let fill = match crate::server::semantic_read_observation_runtime::before_dispatch(
+            exec.semantic_read_observation_store.as_ref(),
+            &ledger,
+            &first_identity,
+            Some(&key),
+        )
+        .await
+        {
+            crate::server::semantic_read_observation_runtime::SemanticReadBeforeDispatch::Proceed(Some(fill)) => fill,
+            _ => panic!("first read should claim a fill"),
         };
-        tool_exactly_once::record_result(
-            exec.exactly_once_executor.as_ref(),
-            "bash",
-            &args,
-            &result,
+        let dispatch_owner = match ledger.dispatch_prepared(&first_identity).await.unwrap() {
+            crate::server::tool_invocation_runtime::InvocationBeginDisposition::Execute {
+                owner_id,
+                ..
+            } => owner_id,
+            crate::server::tool_invocation_runtime::InvocationBeginDisposition::Return(_) => {
+                panic!("first read should dispatch")
+            }
+        };
+        let raw = astra_tools::ToolResult::text("provider result".to_string());
+        let outcome = crate::server::tool_invocation_runtime::terminal_outcome_from_result(&raw);
+        let durable = ledger.finish(&first_identity, &dispatch_owner, raw).await;
+        assert!(!durable.is_error);
+        crate::server::semantic_read_observation_runtime::settle_fill(
+            &ledger,
+            &first_identity,
+            fill,
+            outcome,
+            Some(&key),
         )
         .await;
 
-        let key = IdempotencyKey::semantic("bash", &args);
-        let executor = exec
-            .exactly_once_executor
-            .as_ref()
-            .expect("exactly-once executor")
-            .in_memory
-            .lock()
-            .expect("exactly-once lock");
+        let second_identity = semantic_test_identity("call-2");
+        ledger
+            .prepare_for_execution(&second_identity, &fingerprint, &decision, |_| Ok(()))
+            .await
+            .unwrap();
+        let hit = match crate::server::semantic_read_observation_runtime::before_dispatch(
+            exec.semantic_read_observation_store.as_ref(),
+            &ledger,
+            &second_identity,
+            Some(&key),
+        )
+        .await
+        {
+            crate::server::semantic_read_observation_runtime::SemanticReadBeforeDispatch::Return(result) => result,
+            crate::server::semantic_read_observation_runtime::SemanticReadBeforeDispatch::Proceed(_) => {
+                panic!("durably published observation should be reused")
+            }
+        };
+        assert_eq!(hit.output, "provider result");
+        assert_eq!(
+            hit.metadata.as_ref().unwrap()["semantic_read_cache_state"],
+            "hit"
+        );
+        let second_record = ledger.get(&second_identity).await.unwrap().unwrap();
+        assert_eq!(
+            second_record.dispatch_certainty,
+            astra_turn_types::DispatchCertainty::NotDispatched
+        );
+        assert_eq!(second_record.attempt_count, 0);
+    }
+
+    #[tokio::test]
+    async fn semantic_read_fill_is_abandoned_when_freshness_changes_during_dispatch() {
+        let (mut exec, _dir) = test_executor();
+        exec.enable_durable_invocations();
+        exec.enable_semantic_read_cache_after_cluster_upgrade(
+            astra_turn_types::SemanticReadCacheLimits::default(),
+        )
+        .unwrap();
+        let ledger = exec.invocation_ledger.as_ref().unwrap().clone();
+        let (arguments, decision, fingerprint, key) = semantic_cache_contract("moving-resource");
+        let identity = semantic_test_identity("call-moving-resource");
+        ledger
+            .prepare_for_execution(&identity, &fingerprint, &decision, |_| Ok(()))
+            .await
+            .unwrap();
+        let fill = match crate::server::semantic_read_observation_runtime::before_dispatch(
+            exec.semantic_read_observation_store.as_ref(),
+            &ledger,
+            &identity,
+            Some(&key),
+        )
+        .await
+        {
+            crate::server::semantic_read_observation_runtime::SemanticReadBeforeDispatch::Proceed(
+                Some(fill),
+            ) => fill,
+            _ => panic!("first read should claim a fill"),
+        };
+        let dispatch_owner = match ledger.dispatch_prepared(&identity).await.unwrap() {
+            crate::server::tool_invocation_runtime::InvocationBeginDisposition::Execute {
+                owner_id,
+                ..
+            } => owner_id,
+            crate::server::tool_invocation_runtime::InvocationBeginDisposition::Return(_) => {
+                panic!("first read should dispatch")
+            }
+        };
+        let raw = astra_tools::ToolResult::text("provider result".to_string());
+        let outcome = crate::server::tool_invocation_runtime::terminal_outcome_from_result(&raw);
+        let durable = ledger.finish(&identity, &dispatch_owner, raw).await;
+        assert!(!durable.is_error);
+        let changed_freshness = astra_turn_types::SemanticReadFreshnessContext::new(
+            "test-user:test-session",
+            vec![
+                astra_turn_types::SemanticFreshnessFact::new(
+                    astra_turn_types::SemanticFreshnessScope::Resource,
+                    "resource-a",
+                    "revision-2",
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let changed_key = astra_turn_types::SemanticReadCacheKey::new(
+            key.tool.clone(),
+            &arguments,
+            &decision.decision_id,
+            &changed_freshness,
+        )
+        .unwrap();
+        crate::server::semantic_read_observation_runtime::settle_fill(
+            &ledger,
+            &identity,
+            fill,
+            outcome,
+            Some(&changed_key),
+        )
+        .await;
+
+        let next_identity = semantic_test_identity("call-after-resource-change");
+        ledger
+            .prepare_for_execution(&next_identity, &fingerprint, &decision, |_| Ok(()))
+            .await
+            .unwrap();
+        let next = crate::server::semantic_read_observation_runtime::before_dispatch(
+            exec.semantic_read_observation_store.as_ref(),
+            &ledger,
+            &next_identity,
+            Some(&key),
+        )
+        .await;
+        let crate::server::semantic_read_observation_runtime::SemanticReadBeforeDispatch::Proceed(
+            Some(next_fill),
+        ) = next
+        else {
+            panic!("changed freshness must leave no reusable observation");
+        };
+        crate::server::semantic_read_observation_runtime::abandon_fill(
+            &next_identity,
+            &next_fill,
+            "test cleanup",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn semantically_successful_payload_with_uncertain_dispatch_is_never_published() {
+        let (mut exec, _dir) = test_executor();
+        exec.enable_durable_invocations();
+        exec.enable_semantic_read_cache_after_cluster_upgrade(
+            astra_turn_types::SemanticReadCacheLimits::default(),
+        )
+        .unwrap();
+        let ledger = exec.invocation_ledger.as_ref().unwrap().clone();
+        let (_arguments, decision, fingerprint, key) = semantic_cache_contract("uncertain");
+        let first_identity = semantic_test_identity("call-uncertain-1");
+        ledger
+            .prepare_for_execution(&first_identity, &fingerprint, &decision, |_| Ok(()))
+            .await
+            .unwrap();
+        let fill = match crate::server::semantic_read_observation_runtime::before_dispatch(
+            exec.semantic_read_observation_store.as_ref(),
+            &ledger,
+            &first_identity,
+            Some(&key),
+        )
+        .await
+        {
+            crate::server::semantic_read_observation_runtime::SemanticReadBeforeDispatch::Proceed(Some(fill)) => fill,
+            _ => panic!("first read should claim a fill"),
+        };
+        let dispatch_owner = match ledger.dispatch_prepared(&first_identity).await.unwrap() {
+            crate::server::tool_invocation_runtime::InvocationBeginDisposition::Execute {
+                owner_id,
+                ..
+            } => owner_id,
+            crate::server::tool_invocation_runtime::InvocationBeginDisposition::Return(_) => {
+                panic!("first read should dispatch")
+            }
+        };
+        let mut ambiguous = astra_tools::ToolResult::text("unacknowledged payload".to_string());
+        ambiguous.metadata = Some(Map::from_iter([(
+            "side_effects_maybe".to_string(),
+            Value::Bool(true),
+        )]));
+        let outcome =
+            crate::server::tool_invocation_runtime::terminal_outcome_from_result(&ambiguous);
+        let durable = ledger
+            .finish(&first_identity, &dispatch_owner, ambiguous)
+            .await;
+        assert_eq!(
+            durable.metadata.as_ref().unwrap()["durable_invocation_state"],
+            "outcome_unknown"
+        );
+        crate::server::semantic_read_observation_runtime::settle_fill(
+            &ledger,
+            &first_identity,
+            fill,
+            outcome,
+            Some(&key),
+        )
+        .await;
+
+        let second_identity = semantic_test_identity("call-uncertain-2");
+        ledger
+            .prepare_for_execution(&second_identity, &fingerprint, &decision, |_| Ok(()))
+            .await
+            .unwrap();
+        let next = crate::server::semantic_read_observation_runtime::before_dispatch(
+            exec.semantic_read_observation_store.as_ref(),
+            &ledger,
+            &second_identity,
+            Some(&key),
+        )
+        .await;
+        let crate::server::semantic_read_observation_runtime::SemanticReadBeforeDispatch::Proceed(
+            Some(fill),
+        ) = next
+        else {
+            panic!("uncertain provider outcome must leave no reusable observation");
+        };
+        crate::server::semantic_read_observation_runtime::abandon_fill(
+            &second_identity,
+            &fill,
+            "test cleanup",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn route_boundary_replays_only_the_same_logical_invocation() {
+        use crate::server::tool_execution_binding::{
+            ToolPermissionGrantSnapshot, ToolPermissionGrantSource,
+        };
+
+        let (mut exec, _dir) = test_executor();
+        exec.enable_durable_invocations();
+        let grant = ToolPermissionGrantSnapshot {
+            source: ToolPermissionGrantSource::ImplicitPolicy,
+            reason: None,
+            updates_hash: None,
+        };
+        let args = json!({"action": "create", "title": "intentional duplicate"});
+
+        let first = exec
+            .execute_invocation_with_metadata(
+                "run-1",
+                "turn-1",
+                "call-1",
+                "task_board",
+                &args,
+                None,
+                Some(&grant),
+            )
+            .await;
         assert!(
-            executor.cache().check(&key).is_none(),
-            "server executor must not cache failed exactly-once results"
+            !first.is_error,
+            "first invocation should execute: {first:?}"
+        );
+        assert_eq!(
+            first.metadata.as_ref().unwrap()["durable_invocation_state"],
+            "succeeded"
+        );
+
+        let replay = exec
+            .execute_invocation_with_metadata(
+                "run-1",
+                "turn-1",
+                "call-1",
+                "task_board",
+                &args,
+                None,
+                Some(&grant),
+            )
+            .await;
+        assert_eq!(replay.output, first.output);
+        assert_eq!(replay.metadata.as_ref().unwrap()["invocation_replay"], true);
+
+        let second = exec
+            .execute_invocation_with_metadata(
+                "run-1",
+                "turn-1",
+                "call-2",
+                "task_board",
+                &args,
+                None,
+                Some(&grant),
+            )
+            .await;
+        assert!(
+            !second.is_error,
+            "distinct invocation should execute: {second:?}"
+        );
+        assert_ne!(
+            second.output, first.output,
+            "equal arguments with distinct invocation IDs are distinct intent"
+        );
+
+        let conflict = exec
+            .execute_invocation_with_metadata(
+                "run-1",
+                "turn-1",
+                "call-1",
+                "task_board",
+                &json!({"action": "create", "title": "different intent"}),
+                None,
+                Some(&grant),
+            )
+            .await;
+        assert!(conflict.is_error);
+        assert_eq!(
+            conflict.metadata.as_ref().unwrap()["error_kind"],
+            "tool_invocation_ledger"
+        );
+        assert_eq!(
+            conflict.metadata.as_ref().unwrap()["side_effects_maybe"],
+            false
         );
     }
 

@@ -41,6 +41,10 @@ pub struct HeadlessToolRoundCtx<'a, E: EdgeToolRoundRow> {
     pub token: &'a str,
     pub current_user_id: Option<&'a str>,
     pub current_session_id: Option<&'a String>,
+    /// Durable run identity for server-side tool invocations.
+    pub current_run_id: Option<&'a str>,
+    /// Durable causal turn identity. This may span retries/resume of one visible turn.
+    pub current_turn_chain_id: Option<&'a str>,
     pub tool_calls: &'a [Value],
     pub edge_tool_round: &'a [E],
     pub reasoning_content: &'a str,
@@ -210,6 +214,8 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
         token,
         current_user_id,
         current_session_id,
+        current_run_id,
+        current_turn_chain_id,
         tool_calls,
         edge_tool_round,
         reasoning_content,
@@ -271,6 +277,8 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
             token,
             current_user_id,
             current_session_id,
+            current_run_id,
+            current_turn_chain_id,
             tool_calls,
             edge_tool_round,
             by_sig: edge_callback_outputs,
@@ -306,7 +314,19 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
 
     // Partition indices into batches: consecutive read-only tools run concurrently,
     // non-read-only tools run serially (one at a time).
-    let batches = partition_tool_batches(&indices, tool_calls);
+    let batches = partition_tool_batches_with_provider_policy(&indices, tool_calls, |tool_name| {
+        runtime_tool_executor.and_then(|executor| {
+            match executor.provider_policy_lookup(tool_name) {
+                crate::server::runtime_tool_executor::ProviderPolicyLookup::NotProvider => None,
+                crate::server::runtime_tool_executor::ProviderPolicyLookup::Resolved(policy) => {
+                    Some(policy.parallelizable)
+                }
+                crate::server::runtime_tool_executor::ProviderPolicyLookup::MissingPolicy {
+                    ..
+                } => Some(false),
+            }
+        })
+    });
     'outer: for batch in &batches {
         if let Some((aborted_count, aborted_tools)) = step_deadline.step_timeout_abort(
             &indices,
@@ -348,10 +368,22 @@ pub(crate) enum ToolBatch {
     Serial(HeadlessRoundToolIdx),
 }
 
+#[cfg(test)]
 pub(crate) fn partition_tool_batches(
     indices: &[HeadlessRoundToolIdx],
     tool_calls: &[Value],
 ) -> Vec<ToolBatch> {
+    partition_tool_batches_with_provider_policy(indices, tool_calls, |_| None)
+}
+
+pub(crate) fn partition_tool_batches_with_provider_policy<F>(
+    indices: &[HeadlessRoundToolIdx],
+    tool_calls: &[Value],
+    provider_parallelizable: F,
+) -> Vec<ToolBatch>
+where
+    F: Fn(&str) -> Option<bool>,
+{
     use astra_turn_core::headless_tool_assembly::READ_ONLY_TOOLS;
     use astra_turn_core::tool_policy::is_tool_concurrency_safe;
 
@@ -373,9 +405,14 @@ pub(crate) fn partition_tool_batches(
             HeadlessRoundToolIdx::SyntheticEdge(_) => ("synthetic_edge", None),
         };
 
-        let is_readonly = READ_ONLY_TOOLS.contains(&tool_name)
-            || tool_name == "synthetic_edge"
-            || is_tool_concurrency_safe(tool_name, tool_args.as_ref());
+        let is_readonly = if tool_name == "synthetic_edge" {
+            true
+        } else if let Some(parallelizable) = provider_parallelizable(tool_name) {
+            parallelizable
+        } else {
+            READ_ONLY_TOOLS.contains(&tool_name)
+                || is_tool_concurrency_safe(tool_name, tool_args.as_ref())
+        };
 
         if is_readonly {
             concurrent_buf.push(idx);
@@ -442,5 +479,40 @@ mod tests {
             matches!(batches.as_slice(), [ToolBatch::Serial(_)]),
             "agent.send_message mutates mailbox ordering and must stay serial"
         );
+    }
+
+    #[test]
+    fn partition_batches_dynamic_tools_from_the_resolved_provider_policy() {
+        let calls = vec![
+            json!({
+                "id": "r1",
+                "function": {"name": "provider__read", "arguments": "{}"}
+            }),
+            json!({
+                "id": "r2",
+                "function": {"name": "provider__read_two", "arguments": "{}"}
+            }),
+            json!({
+                "id": "w1",
+                "function": {"name": "provider__unknown", "arguments": "{}"}
+            }),
+        ];
+        let batches = partition_tool_batches_with_provider_policy(
+            &[server_idx(0), server_idx(1), server_idx(2)],
+            &calls,
+            |name| match name {
+                "provider__read" | "provider__read_two" => Some(true),
+                "provider__unknown" => Some(false),
+                _ => None,
+            },
+        );
+
+        match batches.as_slice() {
+            [ToolBatch::Concurrent(reads), ToolBatch::Serial(write)] => {
+                assert_eq!(reads, &[server_idx(0), server_idx(1)]);
+                assert_eq!(*write, server_idx(2));
+            }
+            _ => panic!("resolved provider reads should batch before the serial unknown tool"),
+        }
     }
 }

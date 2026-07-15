@@ -1606,20 +1606,20 @@ fn build_server_skill_executor(
     // Wire skill checkpoint manager for crash recovery resume.
     // This allows skills to resume from their last checkpoint instead of starting over.
     #[cfg(feature = "crash-recovery")]
-    {
+    let isolated = {
         let checkpoint_dir = astra_services::session_journal::journal_file_path(session_id)
             .parent()
             .unwrap_or(std::path::Path::new("."))
             .join("skill_checkpoints");
-        let checkpoint_manager = Arc::new(std::sync::Mutex::new(
+        let checkpoint_manager = Arc::new(TokioMutex::new(
             astra_pipeline::skill_checkpoint::SkillCheckpointManager::new(checkpoint_dir),
         ));
         let isolated = IsolatedSkillExecutor::with_checkpoint_manager(
             Arc::new(subrun_executor),
             checkpoint_manager,
         );
-        let isolated = Arc::new(isolated);
-    }
+        Arc::new(isolated)
+    };
     #[cfg(not(feature = "crash-recovery"))]
     let isolated = Arc::new(IsolatedSkillExecutor::new(Arc::new(subrun_executor)));
 
@@ -4256,6 +4256,26 @@ impl AgenticRunLifecycleService {
             }
         });
 
+        if let Some(bundle) = runtime_capabilities.mcp_bundle.as_ref() {
+            manifest["provider_snapshot_refs"] = Value::Array(
+                bundle
+                    .provider_snapshots
+                    .iter()
+                    .map(|snapshot| {
+                        json!({
+                            "provider_identity": snapshot.provider_identity.as_str(),
+                            "binding_ref": snapshot.binding_ref.as_str(),
+                            "protocol": snapshot.protocol.as_str(),
+                            "content_hash": &snapshot.content_hash,
+                            "discovery_content_hash": &snapshot.discovery_snapshot_hash,
+                            "resolver_version": snapshot.resolver_version.as_str(),
+                            "tool_count": snapshot.descriptors.len(),
+                        })
+                    })
+                    .collect(),
+            );
+        }
+
         if let (Some(binding_request), Some(binding_context)) = (
             request.agent_binding.as_ref(),
             runtime_capabilities.agent_binding.as_ref(),
@@ -6880,11 +6900,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     ));
             }
 
-            // Enable exactly-once tool execution for crash recovery dedup.
-            // This prevents side-effect tools (github_create_issue, task create, etc.)
-            // from re-executing when a session resumes after a crash.
-            executor.enable_exactly_once().await;
-
             // Apply shared ToolExecutionService (with admin-controllable disabled_tool_offers)
             // or fall back to building one from deployment config.
             if let Some(ref shared_tes) = self.tool_execution_service {
@@ -6914,6 +6929,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     executor.set_agent_binding_mcp(agent_binding_mcp.clone());
                 }
                 executor.set_request_scoped_mcp_schemas(bundle.schemas.clone());
+                executor.set_provider_policy_index(bundle.provider_policy_index.clone());
             }
             // Wire the plan repository so enter/exit_plan_mode tools work and
             // the write-tool guard can check `active_plan_id`.
@@ -6927,6 +6943,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     astra_plan::CloudPlanRepository::new(shared.get().clone()),
                 ));
             }
+            // Select the database ledger only after composition has attached
+            // its shared pool; offline composition selects the in-memory
+            // adapter explicitly.
+            executor.enable_durable_invocations();
             // Share the host's plan-resume hint slot so tool-triggered
             // plan-mode changes refresh the system prompt mid-run.
             executor.set_plan_resume_hint_handle(host.plan_resume_hint_handle());
@@ -7982,11 +8002,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     ));
             }
 
-            // Enable exactly-once tool execution for crash recovery dedup.
-            // This prevents side-effect tools (github_create_issue, task create, etc.)
-            // from re-executing when a session resumes after a crash.
-            executor.enable_exactly_once().await;
-
             // Apply shared ToolExecutionService (with admin-controllable disabled_tool_offers)
             // or fall back to building one from deployment config.
             if let Some(ref shared_tes) = self.tool_execution_service {
@@ -8017,6 +8032,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     executor.set_agent_binding_mcp(agent_binding_mcp.clone());
                 }
                 executor.set_request_scoped_mcp_schemas(bundle.schemas.clone());
+                executor.set_provider_policy_index(bundle.provider_policy_index.clone());
             }
             if let Some(shared) = &self.shared_pool {
                 executor.set_context_manifest_pool(shared.clone());
@@ -8028,6 +8044,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     astra_plan::CloudPlanRepository::new(shared.get().clone()),
                 ));
             }
+            executor.enable_durable_invocations();
             if let Some(observability_session) = state.telemetry.observability_session.clone() {
                 executor.set_observability_session(observability_session);
             }
@@ -10737,10 +10754,14 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 ));
             }
 
-            // Enable exactly-once tool execution for crash recovery dedup.
-            // This prevents side-effect tools (github_create_issue, task create, etc.)
-            // from re-executing when a session resumes after a crash.
-            executor.enable_exactly_once().await;
+            if let Some(pool) = self.shared_pool.as_ref() {
+                executor.set_context_manifest_pool(pool.clone());
+                executor = executor.with_workspace_artifact_store(
+                    astra_services::DatabaseSessionArtifactStore::new(self.matrixone.clone())
+                        .with_pool(pool.clone()),
+                );
+            }
+            executor.enable_durable_invocations();
 
             // Apply shared ToolExecutionService (with admin-controllable disabled_tool_offers)
             // or fall back to building one from deployment config.
@@ -10751,13 +10772,6 @@ impl SubRunExecutor for ServerSubRunExecutor {
                     ToolExecutionService::builder(),
                     &load_deployment_tool_policy(),
                 );
-                if let Some(pool) = self.shared_pool.as_ref() {
-                    executor.set_context_manifest_pool(pool.clone());
-                    executor = executor.with_workspace_artifact_store(
-                        astra_services::DatabaseSessionArtifactStore::new(self.matrixone.clone())
-                            .with_pool(pool.clone()),
-                    );
-                }
                 if let Some(pool) = &self.edge_connection_pool {
                     builder = builder.edge_connection_pool(pool.clone());
                 }

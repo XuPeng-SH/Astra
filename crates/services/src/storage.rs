@@ -2032,25 +2032,98 @@ pub async fn ensure_core_schema(
         .await?;
     }
 
+    // Retired semantic name+arguments dedup storage. Durable delivery is owned
+    // by `tool_invocation_ledger`; keeping this table would preserve a second,
+    // contradictory authority for external side effects.
+    query("DROP TABLE IF EXISTS tool_exactly_once_results")
+        .execute(&pool)
+        .await?;
+
     query(
-        "CREATE TABLE IF NOT EXISTS tool_exactly_once_results (
-            user_id      VARCHAR(128) NOT NULL,
-            session_id   VARCHAR(128) NOT NULL,
-            dedup_key    VARCHAR(128) NOT NULL,
-            key_json     JSON NOT NULL,
-            result_json  JSON NOT NULL,
-            recorded_at  BIGINT UNSIGNED NOT NULL DEFAULT 0,
-            PRIMARY KEY (user_id, session_id, dedup_key)
+        "CREATE TABLE IF NOT EXISTS tool_invocation_ledger (
+            user_id             VARCHAR(128) NOT NULL,
+            session_id          VARCHAR(128) NOT NULL,
+            run_id              VARCHAR(128) NOT NULL,
+            turn_chain_id       VARCHAR(128) NOT NULL,
+            invocation_id       VARCHAR(128) NOT NULL,
+            fingerprint_json    JSON NOT NULL,
+            decision_json       JSON NOT NULL,
+            state               VARCHAR(32) NOT NULL,
+            dispatch_certainty  VARCHAR(32) NOT NULL,
+            attempt_count       BIGINT UNSIGNED NOT NULL DEFAULT 0,
+            dispatch_owner      VARCHAR(64) NULL,
+            dispatch_lease_expires_at DATETIME(6) NULL,
+            outcome_json        JSON NULL,
+            completion_source_json JSON NULL,
+            created_at          DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at          DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (user_id, session_id, run_id, turn_chain_id, invocation_id),
+            INDEX idx_tool_invocation_updated (updated_at)
         )",
     )
     .execute(&pool)
     .await?;
-    drop_index_if_present(
+    add_column_if_missing(
         &pool,
         &settings.database,
-        "tool_exactly_once_results",
-        "idx_tool_exactly_once_session",
+        "tool_invocation_ledger",
+        "decision_json",
+        "ALTER TABLE tool_invocation_ledger ADD COLUMN decision_json JSON NULL",
     )
+    .await?;
+    add_column_if_missing(
+        &pool,
+        &settings.database,
+        "tool_invocation_ledger",
+        "dispatch_owner",
+        "ALTER TABLE tool_invocation_ledger ADD COLUMN dispatch_owner VARCHAR(64) NULL",
+    )
+    .await?;
+    add_column_if_missing(
+        &pool,
+        &settings.database,
+        "tool_invocation_ledger",
+        "dispatch_lease_expires_at",
+        "ALTER TABLE tool_invocation_ledger ADD COLUMN dispatch_lease_expires_at DATETIME(6) NULL",
+    )
+    .await?;
+    add_column_if_missing(
+        &pool,
+        &settings.database,
+        "tool_invocation_ledger",
+        "outcome_json",
+        "ALTER TABLE tool_invocation_ledger ADD COLUMN outcome_json JSON NULL",
+    )
+    .await?;
+    add_column_if_missing(
+        &pool,
+        &settings.database,
+        "tool_invocation_ledger",
+        "completion_source_json",
+        "ALTER TABLE tool_invocation_ledger ADD COLUMN completion_source_json JSON NULL",
+    )
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS semantic_read_observations (
+            user_id             VARCHAR(128) NOT NULL,
+            session_id          VARCHAR(128) NOT NULL,
+            key_id              VARCHAR(71) NOT NULL,
+            key_json            JSON NOT NULL,
+            state               VARCHAR(16) NOT NULL,
+            fill_owner          VARCHAR(64) NULL,
+            fill_lease_expires_at DATETIME(6) NULL,
+            observation_json    JSON NULL,
+            observation_bytes   BIGINT UNSIGNED NULL,
+            created_at          DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at          DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            last_accessed_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (user_id, session_id, key_id),
+            INDEX idx_semantic_read_observations_session_state_access
+                (user_id, session_id, state, last_accessed_at)
+        )",
+    )
+    .execute(&pool)
     .await?;
 
     // ── Web transcript hydration + device lease state (Phase 2 / G13+G19+G25) ──

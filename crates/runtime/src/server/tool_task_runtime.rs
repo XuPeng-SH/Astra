@@ -115,7 +115,7 @@ pub(crate) struct TaskToolOutcome {
 }
 
 pub(crate) fn public_task_arguments(args: &Value) -> Value {
-    crate::server::tool_exactly_once::public_tool_arguments(args)
+    astra_turn_types::canonical_public_tool_arguments(args)
 }
 
 pub(crate) async fn task_list(task_manager: &TaskManager, args: &Value) -> String {
@@ -311,6 +311,7 @@ fn task_tool_result(output: String, rollback: Option<TaskMutationRollback>) -> T
 pub(super) async fn execute_with_executor(
     executor: &RuntimeToolExecutor,
     args: &Value,
+    run_id: Option<&str>,
 ) -> astra_tools::ToolResult {
     let outcome = execute_task_tool(&executor.task_manager(), args).await;
     if let Some(rollback) = outcome.rollback {
@@ -323,7 +324,7 @@ pub(super) async fn execute_with_executor(
             },
         );
         executor
-            .emit_task_board_snapshot(rollback.event_reason, args)
+            .emit_task_board_snapshot(rollback.event_reason, run_id, args)
             .await;
     }
     outcome.result

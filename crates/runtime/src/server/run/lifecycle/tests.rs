@@ -589,7 +589,7 @@ async fn csl_persist_after_restore_keeps_current_user_message() {
 }
 
 #[test]
-fn restore_step_checkpoint_runtime_state_restores_replay_guards_and_runtime_state() {
+fn restore_step_checkpoint_runtime_state_rejects_event_cache_and_restores_runtime_state() {
     let svc = test_service();
     let request = test_request("resume");
     let mut state = svc.build_initial_state(
@@ -601,28 +601,12 @@ fn restore_step_checkpoint_runtime_state_restores_replay_guards_and_runtime_stat
         None,
         None,
     );
-    let idem_key = astra_pipeline::step_protocol::IdempotencyKey::semantic(
-        "read_file",
-        &json!({"path": "src/lib.rs"}),
-    );
-    let mut idempotency_cache = astra_pipeline::step_protocol::InMemoryIdempotencyCache::new();
-    idempotency_cache.record(
-        &idem_key,
-        astra_pipeline::step_protocol::CachedToolResult {
-            tool_name: "read_file".into(),
-            output: "cached contents".into(),
-            is_error: false,
-            cached_at: 123,
-            context_signature: None,
-        },
-    );
     let restored = astra_pipeline::step_restore::RestoredSession {
         messages: Vec::new(),
         budget_remaining_tokens: 0,
         budget_remaining_rounds: 0,
         blocked_tools: vec!["flaky_tool".into()],
         recent_tools: vec!["read_file".into(), "bash".into()],
-        idempotency_cache,
         resume_turn: 0,
         protocol_version: astra_pipeline::step_protocol::PROTOCOL_VERSION,
         completed_tool_results: HashMap::new(),
@@ -637,17 +621,21 @@ fn restore_step_checkpoint_runtime_state_restores_replay_guards_and_runtime_stat
             "consecutive_futile_attempts": 1,
         })),
         pipeline_state: None,
+        cache_restore_report: astra_pipeline::step_restore::CacheRestoreReport {
+            rejected_unverified_entries: 1,
+            rejected_context_bound_entries: 1,
+            ..Default::default()
+        },
     };
 
     restore_step_checkpoint_runtime_state(restored, "2026-06-13", &mut state);
 
     assert!(state.restricted_tools.contains("flaky_tool"));
     assert_eq!(state.recent_tools, vec!["read_file", "bash"]);
-    let cached = state
-        .idempotency_cache
-        .check(&idem_key)
-        .expect("idempotency cache should be restored");
-    assert_eq!(cached.output, "cached contents");
+    assert!(
+        state.idempotency_cache.is_empty(),
+        "event-derived semantic observations must not cross the recovery boundary"
+    );
     assert_eq!(state.consecutive_context_window_errors, 5);
     assert_eq!(state.compaction_effectiveness.attempt_count, 6);
     assert_eq!(
@@ -8254,6 +8242,31 @@ fn runtime_manifest_includes_agent_binding_snapshot_without_runtime_auth() {
     request.attachments = vec![json!({"id": "att-1", "kind": "file"})];
     request.edge_executor_id = Some("edge-1".to_string());
     request.capabilities = vec!["bash".to_string(), "fs".to_string()];
+    let provider_snapshot = astra_turn_types::ProviderDiscoverySnapshot::new(
+        astra_turn_types::ProviderIdentity::new("capability-server-tools").unwrap(),
+        astra_turn_types::ProviderBindingRef::new("tools").unwrap(),
+        astra_turn_types::ProviderProtocolId::new("mcp").unwrap(),
+        vec![astra_turn_types::ProviderToolDeclaration {
+            native_tool_id: astra_turn_types::NativeToolId::new("query").unwrap(),
+            native_tool_name: "query".to_string(),
+            title: Some("Query".to_string()),
+            description: Some("Query data".to_string()),
+            input_schema: json!({"type": "object"}),
+            output_schema: None,
+            claims: Default::default(),
+            task_support: Default::default(),
+            extension_fields: Default::default(),
+        }],
+    )
+    .unwrap();
+    let provider_snapshot = runtime_mcp::resolve_mcp_snapshot("tools", &provider_snapshot)
+        .expect("test discovery snapshot should resolve");
+    let provider_snapshot_hash = provider_snapshot.content_hash.clone();
+    let provider_policy_index =
+        astra_turn_core::provider_resolution::ResolvedProviderPolicyIndex::from_snapshots(
+            std::slice::from_ref(&provider_snapshot),
+        )
+        .unwrap();
     let capabilities = PreparedRuntimeCapabilities {
         mcp_bundle: Some(runtime_mcp::RuntimeMcpBundle {
             schemas: vec![json!({
@@ -8264,6 +8277,8 @@ fn runtime_manifest_includes_agent_binding_snapshot_without_runtime_auth() {
                     "parameters": {"type": "object"}
                 }
             })],
+            provider_snapshots: vec![provider_snapshot],
+            provider_policy_index,
             control_tools: Default::default(),
             stop_after_success_tools: Default::default(),
             manager: None,
@@ -8299,6 +8314,26 @@ fn runtime_manifest_includes_agent_binding_snapshot_without_runtime_auth() {
     assert_eq!(
         manifest["agent_binding"]["discovered_skills"][0]["name"],
         "binding-only"
+    );
+    assert_eq!(
+        manifest["provider_snapshot_refs"][0]["provider_identity"],
+        "capability-server-tools"
+    );
+    assert_eq!(
+        manifest["provider_snapshot_refs"][0]["binding_ref"],
+        "tools"
+    );
+    assert_eq!(manifest["provider_snapshot_refs"][0]["protocol"], "mcp");
+    assert_eq!(
+        manifest["provider_snapshot_refs"][0]["content_hash"],
+        provider_snapshot_hash
+    );
+    assert_eq!(manifest["provider_snapshot_refs"][0]["tool_count"], 1);
+    assert!(
+        manifest["provider_snapshot_refs"][0]
+            .get("tool_declarations")
+            .is_none(),
+        "runtime manifest must project a bounded reference, not the declaration graph"
     );
     let serialized = serde_json::to_string(&manifest).expect("runtime manifest should serialize");
     assert!(!serialized.contains("secret-runtime-token"));
