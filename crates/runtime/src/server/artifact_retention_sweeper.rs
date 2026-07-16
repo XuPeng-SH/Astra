@@ -1,16 +1,18 @@
 use super::*;
 use astra_services::db_row::{RowDecoder, RowExt};
+use futures_util::{StreamExt, stream};
 use sqlx::Row;
 use uuid::Uuid;
 
 const SWEEP_INTERVAL_SECS: u64 = 3_600;
+const RETENTION_APPLY_MAX_CONCURRENCY: usize = 8;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ArtifactRetentionSweepOutcome {
     pub scanned: usize,
     pub corrupt_rows_skipped: usize,
     pub marked_expiring: usize,
-    pub archived_cold: usize,
+    pub referenced_retained: usize,
     pub extended: usize,
     pub expired: usize,
     pub backlog_overflow_warning: bool,
@@ -25,6 +27,7 @@ struct ArtifactRetentionRow {
     referenced_by_manifest_count: i64,
     referenced_by_state_items_count: i64,
     referenced_by_citation_count: i64,
+    referenced_by_durable_count: i64,
 }
 
 fn decode_artifact_retention_row(row: &impl RowExt) -> Result<ArtifactRetentionRow, String> {
@@ -46,6 +49,7 @@ fn decode_artifact_retention_row(row: &impl RowExt) -> Result<ArtifactRetentionR
         referenced_by_manifest_count: dec.non_negative_i64("referenced_by_manifest_count")?,
         referenced_by_state_items_count: dec.non_negative_i64("referenced_by_state_items_count")?,
         referenced_by_citation_count: dec.non_negative_i64("referenced_by_citation_count")?,
+        referenced_by_durable_count: dec.non_negative_i64("referenced_by_durable_count")?,
     })
 }
 
@@ -61,12 +65,31 @@ pub async fn run_artifact_retention_gc_once(
     let rows = sqlx::query(
         "SELECT artifact_id, user_id, session_id, retention_policy,
                 referenced_by_manifest_count, referenced_by_state_items_count,
-                referenced_by_citation_count
+                referenced_by_citation_count,
+                (SELECT COUNT(*) FROM session_artifact_references refs
+                 WHERE refs.user_id = session_artifacts.user_id
+                   AND refs.session_id = session_artifacts.session_id
+                   AND refs.artifact_id = session_artifacts.artifact_id)
+                    AS referenced_by_durable_count
          FROM session_artifacts FORCE INDEX (idx_artifacts_retention)
          WHERE retention_until IS NOT NULL
            AND retention_until <= DATE_ADD(NOW(6), INTERVAL 7 DAY)
            AND (status <=> 'active' OR status <=> 'expiring')
            AND retention_policy <> 'permanent'
+           AND (
+               retention_policy = 'project_long_term'
+               OR (
+                   referenced_by_manifest_count = 0
+                   AND referenced_by_state_items_count = 0
+                   AND referenced_by_citation_count = 0
+                   AND NOT EXISTS (
+                       SELECT 1 FROM session_artifact_references refs
+                       WHERE refs.user_id = session_artifacts.user_id
+                         AND refs.session_id = session_artifacts.session_id
+                         AND refs.artifact_id = session_artifacts.artifact_id
+                   )
+               )
+           )
          ORDER BY retention_until ASC
          LIMIT ?",
     )
@@ -92,26 +115,52 @@ pub async fn run_artifact_retention_gc_once(
             );
         }
     }
-    for row in rows {
-        let artifact = match decode_artifact_retention_row(&row) {
-            Ok(artifact) => artifact,
-            Err(error) => {
+    // Each artifact is an independent lifecycle CAS. Bound concurrency to the
+    // same order of magnitude as the service DB pool so a large retention
+    // batch does not turn one network round trip per artifact into a serial
+    // head-of-line delay, while still preserving explicit backpressure.
+    let mut pending = stream::iter(rows)
+        .map(|row| {
+            let pool = pool.clone();
+            async move {
+                let artifact = match decode_artifact_retention_row(&row) {
+                    Ok(artifact) => artifact,
+                    Err(error) => {
+                        return Ok(ArtifactRetentionProcessOutcome::Corrupt(error));
+                    }
+                };
+                apply_artifact_retention_policy(&pool, &artifact)
+                    .await
+                    .map(ArtifactRetentionProcessOutcome::Applied)
+            }
+        })
+        .buffer_unordered(RETENTION_APPLY_MAX_CONCURRENCY);
+    let mut first_apply_error = None;
+    while let Some(result) = pending.next().await {
+        match result {
+            Ok(ArtifactRetentionProcessOutcome::Corrupt(error)) => {
                 outcome.corrupt_rows_skipped += 1;
                 tracing::warn!(
                     target: "astra_runtime::artifact_retention_sweeper",
                     error = %error,
                     "skipping corrupt artifact retention row"
                 );
-                continue;
             }
-        };
-        match apply_artifact_retention_policy(&pool, &artifact).await? {
-            ArtifactRetentionAction::MarkedExpiring => outcome.marked_expiring += 1,
-            ArtifactRetentionAction::ArchivedCold => outcome.archived_cold += 1,
-            ArtifactRetentionAction::Extended => outcome.extended += 1,
-            ArtifactRetentionAction::Expired => outcome.expired += 1,
-            ArtifactRetentionAction::Noop => {}
+            Ok(ArtifactRetentionProcessOutcome::Applied(action)) => {
+                record_artifact_retention_action(&mut outcome, action);
+            }
+            Err(error) if first_apply_error.is_none() => first_apply_error = Some(error),
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra_runtime::artifact_retention_sweeper",
+                    error = %error,
+                    "additional artifact retention update failed while draining bounded batch"
+                );
+            }
         }
+    }
+    if let Some(error) = first_apply_error {
+        return Err(error);
     }
     Ok(outcome)
 }
@@ -173,9 +222,27 @@ async fn record_artifact_retention_backlog_warning(
 enum ArtifactRetentionAction {
     Noop,
     MarkedExpiring,
-    ArchivedCold,
+    ReferencedRetained,
     Extended,
     Expired,
+}
+
+enum ArtifactRetentionProcessOutcome {
+    Corrupt(String),
+    Applied(ArtifactRetentionAction),
+}
+
+fn record_artifact_retention_action(
+    outcome: &mut ArtifactRetentionSweepOutcome,
+    action: ArtifactRetentionAction,
+) {
+    match action {
+        ArtifactRetentionAction::MarkedExpiring => outcome.marked_expiring += 1,
+        ArtifactRetentionAction::ReferencedRetained => outcome.referenced_retained += 1,
+        ArtifactRetentionAction::Extended => outcome.extended += 1,
+        ArtifactRetentionAction::Expired => outcome.expired += 1,
+        ArtifactRetentionAction::Noop => {}
+    }
 }
 
 async fn apply_artifact_retention_policy(
@@ -210,42 +277,37 @@ async fn apply_artifact_retention_policy(
     let refs = artifact
         .referenced_by_manifest_count
         .saturating_add(artifact.referenced_by_state_items_count)
-        .saturating_add(artifact.referenced_by_citation_count);
+        .saturating_add(artifact.referenced_by_citation_count)
+        .saturating_add(artifact.referenced_by_durable_count);
     if refs > 0 {
-        let cold_ref = format!(
-            "cold_storage://session/{}/artifacts/{}",
-            artifact.session_id, artifact.artifact_id
-        );
-        let rows_affected = sqlx::query(
-            "UPDATE session_artifacts
-             SET status = 'active',
-                 cold_storage_ref = COALESCE(cold_storage_ref, ?),
-                 retention_until = DATE_ADD(NOW(6), INTERVAL 365 DAY),
-                 updated_at = NOW(6)
-             WHERE user_id = ? AND session_id = ? AND artifact_id = ?
-               AND (status <=> 'active' OR status <=> 'expiring')",
-        )
-        .bind(cold_ref)
-        .bind(&artifact.user_id)
-        .bind(&artifact.session_id)
-        .bind(&artifact.artifact_id)
-        .execute(pool.get())
-        .await?
-        .rows_affected();
-        return Ok(if rows_affected > 0 {
-            ArtifactRetentionAction::ArchivedCold
-        } else {
-            ArtifactRetentionAction::Noop
-        });
+        // A durable reference is a reachability edge, not permission to
+        // rewrite the owner's retention policy. Owner-specific lifecycle
+        // code releases the edge; only then may the ordinary sweeper expire
+        // the artifact at its original deadline. This branch closes a race
+        // where a reference is added after the candidate query.
+        return Ok(ArtifactRetentionAction::ReferencedRetained);
     }
 
     let expired_rows = sqlx::query(
         "UPDATE session_artifacts
-         SET status = 'expired', updated_at = NOW(6)
+         SET status = 'expired',
+             content_json = '{\"expired\":true,\"reason\":\"retention_elapsed\"}',
+             metadata = '{\"retentionExpired\":true}',
+             cold_storage_ref = NULL,
+             updated_at = NOW(6)
          WHERE user_id = ? AND session_id = ? AND artifact_id = ?
            AND (status <=> 'active' OR status <=> 'expiring')
            AND retention_until IS NOT NULL
-           AND retention_until <= NOW(6)",
+           AND retention_until <= NOW(6)
+           AND referenced_by_manifest_count = 0
+           AND referenced_by_state_items_count = 0
+           AND referenced_by_citation_count = 0
+           AND NOT EXISTS (
+               SELECT 1 FROM session_artifact_references refs
+               WHERE refs.user_id = session_artifacts.user_id
+                 AND refs.session_id = session_artifacts.session_id
+                 AND refs.artifact_id = session_artifacts.artifact_id
+           )",
     )
     .bind(&artifact.user_id)
     .bind(&artifact.session_id)
@@ -263,7 +325,16 @@ async fn apply_artifact_retention_policy(
          WHERE user_id = ? AND session_id = ? AND artifact_id = ?
            AND (status <=> 'active' OR status <=> 'expiring')
            AND retention_until IS NOT NULL
-           AND retention_until > NOW(6)",
+           AND retention_until > NOW(6)
+           AND referenced_by_manifest_count = 0
+           AND referenced_by_state_items_count = 0
+           AND referenced_by_citation_count = 0
+           AND NOT EXISTS (
+               SELECT 1 FROM session_artifact_references refs
+               WHERE refs.user_id = session_artifacts.user_id
+                 AND refs.session_id = session_artifacts.session_id
+                 AND refs.artifact_id = session_artifacts.artifact_id
+           )",
     )
     .bind(&artifact.user_id)
     .bind(&artifact.session_id)
@@ -343,6 +414,7 @@ mod tests {
         referenced_by_manifest_count: i64,
         referenced_by_state_items_count: i64,
         referenced_by_citation_count: i64,
+        referenced_by_durable_count: i64,
     }
 
     impl Default for FakeArtifactRetentionRow {
@@ -353,6 +425,7 @@ mod tests {
                 referenced_by_manifest_count: 1,
                 referenced_by_state_items_count: 2,
                 referenced_by_citation_count: 3,
+                referenced_by_durable_count: 4,
             }
         }
     }
@@ -378,6 +451,7 @@ mod tests {
                 "referenced_by_manifest_count" => row.referenced_by_manifest_count = value,
                 "referenced_by_state_items_count" => row.referenced_by_state_items_count = value,
                 "referenced_by_citation_count" => row.referenced_by_citation_count = value,
+                "referenced_by_durable_count" => row.referenced_by_durable_count = value,
                 _ => unreachable!("unexpected count column: {column}"),
             }
             row
@@ -411,6 +485,7 @@ mod tests {
                 "referenced_by_manifest_count" => Ok(self.referenced_by_manifest_count),
                 "referenced_by_state_items_count" => Ok(self.referenced_by_state_items_count),
                 "referenced_by_citation_count" => Ok(self.referenced_by_citation_count),
+                "referenced_by_durable_count" => Ok(self.referenced_by_durable_count),
                 _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
             }
         }
@@ -427,6 +502,7 @@ mod tests {
         assert_eq!(row.referenced_by_manifest_count, 1);
         assert_eq!(row.referenced_by_state_items_count, 2);
         assert_eq!(row.referenced_by_citation_count, 3);
+        assert_eq!(row.referenced_by_durable_count, 4);
     }
 
     #[test]
@@ -439,6 +515,7 @@ mod tests {
             "referenced_by_manifest_count",
             "referenced_by_state_items_count",
             "referenced_by_citation_count",
+            "referenced_by_durable_count",
         ] {
             let error = decode_artifact_retention_row(&FakeArtifactRetentionRow::fail_on(column))
                 .unwrap_err();
@@ -464,6 +541,7 @@ mod tests {
             "referenced_by_manifest_count",
             "referenced_by_state_items_count",
             "referenced_by_citation_count",
+            "referenced_by_durable_count",
         ] {
             let error =
                 decode_artifact_retention_row(&FakeArtifactRetentionRow::with_count(column, -1))

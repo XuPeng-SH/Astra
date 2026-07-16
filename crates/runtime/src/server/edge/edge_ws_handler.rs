@@ -21,6 +21,7 @@ use tokio::sync::mpsc;
 
 /// Maximum concurrent edge WebSocket connections.
 const MAX_EDGE_WS_CONNECTIONS: usize = 1024;
+const EDGE_REGISTRY_UNREGISTER_ATTEMPTS: usize = 3;
 
 /// Global counter of active edge WebSocket connections.
 static EDGE_WS_CONNECTION_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -251,8 +252,8 @@ async fn handle_edge_connection(
     let (pool_tx, mut pool_rx) = mpsc::channel::<EdgeServerMessage>(
         astra_server_types::edge_connection_pool::EDGE_WS_CHANNEL_CAPACITY,
     );
-    // B1: capture generation so cleanup can use unregister_if_generation,
-    // preventing a late-arriving cleanup from removing a newer connection.
+    // Capture the connection incarnation so cleanup cannot remove a faster
+    // reconnect that has already replaced this socket.
     let pool_generation = state.edge_connection_pool.register_with_capabilities(
         &user_id,
         &edge_agent_id,
@@ -290,11 +291,9 @@ async fn handle_edge_connection(
             error = %e,
             "edge WebSocket: DB registry registration failed; rejecting connection"
         );
-        state.edge_connection_pool.unregister_if_generation(
-            &user_id,
-            &edge_agent_id,
-            pool_generation,
-        );
+        state
+            .edge_connection_pool
+            .unregister_generation(&user_id, &edge_agent_id, pool_generation);
         let _ = send_edge_msg(
             &ws_sink,
             EdgeServerMessage::AuthError {
@@ -414,6 +413,7 @@ async fn handle_edge_connection(
     let pool_for_cleanup = state.edge_connection_pool.clone();
     let user_id_cleanup = user_id.clone();
     let edge_agent_id_cleanup = edge_agent_id.clone();
+    let edge_id_for_registry_cleanup = edge_id_for_registry.clone();
     let read_inflight = inflight_dispatches.clone();
 
     // Task: forward server → edge messages from the pool channel
@@ -442,36 +442,55 @@ async fn handle_edge_connection(
                             match serde_json::from_str::<EdgeClientMessage>(&text) {
                                 Ok(EdgeClientMessage::ToolResult {
                                     request_id,
+                                    identity,
+                                    delivery_generation,
                                     output,
                                     is_error,
                                     duration_ms,
                                     tool_result_fields,
                                 }) => {
-                                    let inflight = read_inflight.remove(&request_id).await;
-                                    state.edge_connection_pool.deliver_tool_result(
-                                        &user_id,
-                                        &edge_agent_id,
-                                        &request_id,
-                                        EdgeToolResult {
-                                            output: output.clone(),
-                                            is_error,
-                                            duration_ms,
-                                            tool_result_fields: tool_result_fields.clone(),
-                                        },
-                                    );
-
-                                    // Cross-pod: also deliver result via dispatch table
-                                    // so other pods' turn bridges waiting on wait_result() can see it.
-                                    let Some(inflight) = inflight else {
+                                    if request_id != identity.storage_key() {
                                         tracing::warn!(
                                             target: "astra_runtime::edge_ws",
-                                            user_id = %user.user_id,
-                                            edge_agent_id = %edge_agent_id,
+                                            authenticated_user_id = %user_id,
+                                            result_user_id = %identity.user_id,
                                             request_id = %request_id,
-                                            "Edge WS: unmatched tool result did not match an inflight dispatch"
+                                            "Edge WS: rejected result with mismatched durable identity"
                                         );
                                         continue;
+                                    }
+                                    let inflight = read_inflight.remove(&request_id).await;
+                                    let direct_result = EdgeToolResult {
+                                        output: output.clone(),
+                                        is_error,
+                                        duration_ms,
+                                        tool_result_fields: tool_result_fields.clone(),
                                     };
+
+                                    let dispatch_identity =
+                                        astra_services::multi_agent::EdgeDispatchIdentity::new(
+                                            &user_id,
+                                            &identity.session_id,
+                                            &identity.run_id,
+                                            &identity.turn_chain_id,
+                                            &request_id,
+                                        );
+                                    if inflight.as_ref().is_some_and(|tracked| {
+                                        tracked.identity != dispatch_identity
+                                            || tracked.edge_agent_id != edge_agent_id
+                                    }) {
+                                        tracing::warn!(
+                                            target: "astra_runtime::edge_ws",
+                                            user_id = %user_id,
+                                            edge_agent_id = %edge_agent_id,
+                                            request_id = %request_id,
+                                            "Edge WS: rejected result that conflicts with tracked dispatch identity"
+                                        );
+                                        continue;
+                                    }
+
+                                    // Persist before ACK. The client journal must retain the result
+                                    // if this write fails or the connection closes.
                                     let dispatch_svc = &state.execution.edge_dispatch_service;
                                     let status = if is_error {
                                         "failed".to_string()
@@ -482,13 +501,10 @@ async fn handle_edge_connection(
                                     let tool_result =
                                         astra_thin_client::ToolResultRequest::new_with_hash(
                                             astra_thin_client::ToolResultRequestParts {
-                                                session_id: inflight.identity.session_id.clone(),
-                                                run_id: inflight.identity.run_id.clone(),
-                                                turn_chain_id: inflight
-                                                    .identity
-                                                    .turn_chain_id
-                                                    .clone(),
-                                                request_id: inflight.identity.request_id.clone(),
+                                                session_id: identity.session_id.clone(),
+                                                run_id: identity.run_id.clone(),
+                                                turn_chain_id: identity.turn_chain_id.clone(),
+                                                request_id: request_id.clone(),
                                                 edge_agent_id: edge_agent_id.clone(),
                                                 status,
                                                 output,
@@ -498,39 +514,72 @@ async fn handle_edge_connection(
                                         );
                                     let result_json = match serde_json::to_string(&tool_result) {
                                         Ok(json) => json,
-                                        Err(e) => {
+                                        Err(error) => {
                                             tracing::error!(
                                                 target: "astra_runtime::edge_ws",
-                                                user_id = %user.user_id,
+                                                user_id = %user_id,
                                                 request_id = %request_id,
-                                                error = %e,
-                                                "Edge WS: failed to serialize tool result body"
+                                                %error,
+                                                "Edge WS: result serialization failed before durable acceptance"
                                             );
-                                            // Fallback: use serde_json to build valid JSON safely.
-                                            serde_json::to_string(&serde_json::json!({
-                                                "session_id": inflight.identity.session_id.clone(),
-                                                "run_id": inflight.identity.run_id.clone(),
-                                                "turn_chain_id": inflight.identity.turn_chain_id.clone(),
-                                                "request_id": request_id,
-                                                "status": "failed",
-                                                "edge_agent_id": edge_agent_id.clone(),
-                                                "output": "serialization failed",
-                                                "duration_ms": 0,
-                                                "result_hash": "serialization-failed",
-                                            }))
-                                            .unwrap_or_else(|_| r#"{"status":"failed","output":"serialization failed"}"#.to_string())
+                                            continue;
                                         }
                                     };
-                                    if let Err(e) = dispatch_svc
-                                        .deliver_result(&inflight.identity, &edge_agent_id, &result_json)
+                                    let durable_accepted = match dispatch_svc
+                                        .deliver_result(&dispatch_identity, &edge_agent_id, &result_json)
+                                        .await {
+                                        Ok(accepted) => accepted,
+                                        Err(error) => {
+                                            tracing::warn!(
+                                            target: "astra_runtime::edge_ws",
+                                            user_id = %user_id,
+                                            request_id = %request_id,
+                                            %error,
+                                            "Edge WS: failed to deliver tool result for cross-pod"
+                                        );
+                                            false
+                                        }
+                                    };
+                                    if durable_accepted {
+                                        // A direct same-pod waiter is released only after the
+                                        // exact outcome is durable. Returning it earlier would
+                                        // recreate a caller-visible result with no ACK authority.
+                                        let direct_accepted = state
+                                            .edge_connection_pool
+                                            .deliver_tool_result(
+                                                &user_id,
+                                                &edge_agent_id,
+                                                &request_id,
+                                                delivery_generation,
+                                                direct_result,
+                                            );
+                                        if send_edge_msg(
+                                            &ws_sink_write,
+                                            EdgeServerMessage::ToolResultAck {
+                                                request_id: request_id.clone(),
+                                                delivery_generation,
+                                            },
+                                        )
                                         .await
-                                    {
+                                        .is_err()
+                                        {
+                                            break;
+                                        }
+                                        tracing::debug!(
+                                            target: "astra_runtime::edge_ws",
+                                            user_id = %user_id,
+                                            edge_agent_id = %edge_agent_id,
+                                            request_id = %request_id,
+                                            direct_accepted,
+                                            "Edge WS: result durably accepted"
+                                        );
+                                    } else {
                                         tracing::warn!(
                                             target: "astra_runtime::edge_ws",
-                                            user_id = %user.user_id,
+                                            user_id = %user_id,
+                                            edge_agent_id = %edge_agent_id,
                                             request_id = %request_id,
-                                            error = %e,
-                                            "Edge WS: failed to deliver tool result for cross-pod"
+                                            "Edge WS: result was not durably accepted; withholding acknowledgement"
                                         );
                                     }
                                 }
@@ -615,51 +664,82 @@ async fn handle_edge_connection(
         let _ = tokio::time::timeout(Duration::from_secs(2), &mut dispatch_task).await;
     }
     let disconnected_dispatches = inflight_dispatches.drain().await;
-    fail_inflight_edge_dispatches(
-        state.execution.edge_dispatch_service.as_ref(),
-        &disconnected_dispatches,
-        "edge_ws_disconnected",
-    )
-    .await;
-    // B1: only remove our own pool entry; a faster reconnect may have already
-    // replaced it with a higher-generation entry — leave that intact.
-    let _was_our_entry = pool_for_cleanup.unregister_if_generation(
+    if !disconnected_dispatches.is_empty() {
+        tracing::warn!(
+            user_id = %user_id_cleanup,
+            edge_agent_id = %edge_agent_id_cleanup,
+            count = disconnected_dispatches.len(),
+            "Edge disconnected with durable dispatches in flight; preserving them for result replay"
+        );
+    }
+    let removed_current_generation = pool_for_cleanup.unregister_generation(
         &user_id_cleanup,
         &edge_agent_id_cleanup,
         pool_generation,
     );
 
-    // Always attempt DB unregister, regardless of whether we still owned the
-    // pool slot. The WHERE edge_id = ? guard in the SQL prevents us from
-    // deleting a newer connection's row written by a cross-pod reconnect.
-    // This also covers the gap where a new connection registered in DB but
-    // then failed and rolled back its pool entry — without this call the old
-    // DB row would linger until the sweeper expires it.
-    if let Err(e) = state
-        .execution
-        .edge_registry_service
-        .unregister(
-            &user_id_cleanup,
-            &edge_agent_id_cleanup,
-            &edge_id_for_registry,
-        )
-        .await
+    // The DB registry has the same generation fence. A stale connection may
+    // finish cleanup after a replacement has already updated the registry.
+    match unregister_durable_edge_generation(
+        state.execution.edge_registry_service.as_ref(),
+        &user_id_cleanup,
+        &edge_agent_id_cleanup,
+        &edge_id_for_registry_cleanup,
+    )
+    .await
     {
-        tracing::warn!(
-            target: "astra_runtime::edge_ws",
-            user_id = %user_id_cleanup,
-            edge_agent_id = %edge_agent_id_cleanup,
-            edge_id = %edge_id_for_registry,
-            error = %e,
-            "edge WebSocket cleanup: DB unregister failed; sweeper will expire the record"
-        );
+        Ok(_) => {}
+        Err(error) => {
+            tracing::error!(
+                user_id = %user_id_cleanup,
+                edge_agent_id = %edge_agent_id_cleanup,
+                edge_id = %edge_id_for_registry_cleanup,
+                %error,
+                "failed to unregister disconnected edge generation from durable registry"
+            );
+        }
     }
 
     tracing::info!(
         user_id = %user_id_cleanup,
         edge_agent_id = %edge_agent_id_cleanup,
+        pool_generation,
+        removed_current_generation,
         "Edge agent disconnected"
     );
+}
+
+async fn unregister_durable_edge_generation(
+    registry: &dyn astra_services::multi_agent::EdgeRegistryService,
+    user_id: &str,
+    edge_agent_id: &str,
+    edge_id: &str,
+) -> Result<bool, String> {
+    let mut last_error = None;
+    for attempt in 1..=EDGE_REGISTRY_UNREGISTER_ATTEMPTS {
+        match registry
+            .unregister_generation(user_id, edge_agent_id, edge_id)
+            .await
+        {
+            Ok(removed) => return Ok(removed),
+            Err(error) => {
+                if attempt < EDGE_REGISTRY_UNREGISTER_ATTEMPTS {
+                    tracing::warn!(
+                        user_id,
+                        edge_agent_id,
+                        edge_id,
+                        attempt,
+                        max_attempts = EDGE_REGISTRY_UNREGISTER_ATTEMPTS,
+                        %error,
+                        "durable edge unregister failed; retrying"
+                    );
+                    tokio::time::sleep(Duration::from_millis(50 * attempt as u64)).await;
+                }
+                last_error = Some(error);
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| "durable edge unregister failed".to_string()))
 }
 
 #[derive(Debug)]
@@ -739,7 +819,10 @@ async fn fail_inflight_edge_dispatches(
 ) -> usize {
     let mut failed = 0;
     for row in rows {
-        match dispatch.fail_dispatch(&row.identity, reason).await {
+        match dispatch
+            .fail_dispatch(&row.identity, &row.edge_agent_id, reason)
+            .await
+        {
             Ok(true) => failed += 1,
             Ok(false) => {
                 tracing::debug!(
@@ -824,7 +907,10 @@ async fn fail_claimed_edge_dispatch(
     row: &astra_services::multi_agent::EdgeDispatchRow,
     reason: &'static str,
 ) -> bool {
-    match dispatch.fail_dispatch(&row.identity(), reason).await {
+    match dispatch
+        .fail_dispatch(&row.identity(), &row.edge_agent_id, reason)
+        .await
+    {
         Ok(true) => true,
         Ok(false) => {
             tracing::warn!(
@@ -974,6 +1060,65 @@ mod tests {
     use astra_services::multi_agent::{EdgeDispatchIdentity, EdgeDispatchRow, EdgeDispatchService};
     use std::sync::Mutex;
 
+    struct FlakyEdgeRegistry {
+        failures_before_success: usize,
+        attempts: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl astra_services::multi_agent::EdgeRegistryService for FlakyEdgeRegistry {
+        async fn register_or_update(
+            &self,
+            _user_id: &str,
+            _edge_agent_id: &str,
+            _edge_id_header: &str,
+            _hostname: Option<&str>,
+            _worktree_path: Option<&str>,
+            _capabilities: Option<serde_json::Value>,
+            _workspace_id: Option<&str>,
+        ) -> Result<astra_services::multi_agent::EdgeAgentRecord, String> {
+            unreachable!("register is not used by unregister retry tests")
+        }
+
+        async fn heartbeat(
+            &self,
+            _user_id: &str,
+            _edge_agent_id: &str,
+            _edge_id_header: &str,
+        ) -> Result<(), astra_services::multi_agent::HeartbeatError> {
+            unreachable!("heartbeat is not used by unregister retry tests")
+        }
+
+        async fn find_by_agent_id_and_workspace(
+            &self,
+            _edge_agent_id: &str,
+            _workspace_id: Option<&str>,
+        ) -> Result<Option<astra_services::multi_agent::EdgeAgentRecord>, String> {
+            unreachable!("lookup is not used by unregister retry tests")
+        }
+
+        async fn list_by_user(
+            &self,
+            _user_id: &str,
+        ) -> Result<Vec<astra_services::multi_agent::EdgeAgentRecord>, String> {
+            unreachable!("list is not used by unregister retry tests")
+        }
+
+        async fn unregister_generation(
+            &self,
+            _user_id: &str,
+            _edge_agent_id: &str,
+            _edge_id_header: &str,
+        ) -> Result<bool, String> {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            if attempt <= self.failures_before_success {
+                Err(format!("transient unregister failure {attempt}"))
+            } else {
+                Ok(true)
+            }
+        }
+    }
+
     #[derive(Default)]
     struct RecordingEdgeDispatch {
         failed: Mutex<Vec<(String, String, String)>>,
@@ -1010,6 +1155,7 @@ mod tests {
         async fn fail_dispatch(
             &self,
             identity: &EdgeDispatchIdentity,
+            _edge_agent_id: &str,
             reason: &str,
         ) -> Result<bool, String> {
             self.failed.lock().unwrap().push((
@@ -1046,6 +1192,35 @@ mod tests {
             status: "dispatched".to_string(),
             pending_wait_us: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn durable_unregister_retries_transient_failures_with_a_hard_bound() {
+        let transient = FlakyEdgeRegistry {
+            failures_before_success: 2,
+            attempts: AtomicUsize::new(0),
+        };
+        assert!(
+            unregister_durable_edge_generation(&transient, "user-1", "edge-1", "generation-1")
+                .await
+                .expect("third unregister attempt succeeds")
+        );
+        assert_eq!(transient.attempts.load(Ordering::SeqCst), 3);
+
+        let persistent = FlakyEdgeRegistry {
+            failures_before_success: usize::MAX,
+            attempts: AtomicUsize::new(0),
+        };
+        let error =
+            unregister_durable_edge_generation(&persistent, "user-1", "edge-1", "generation-1")
+                .await
+                .expect_err("persistent registry failure must remain visible");
+        assert!(error.contains("transient unregister failure 3"), "{error}");
+        assert_eq!(
+            persistent.attempts.load(Ordering::SeqCst),
+            EDGE_REGISTRY_UNREGISTER_ATTEMPTS,
+            "cleanup retries must be bounded so a broken registry cannot stall socket teardown"
+        );
     }
 
     fn edge_advertisement_with_tools(tool_names: &[&str]) -> serde_json::Value {

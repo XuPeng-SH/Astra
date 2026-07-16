@@ -81,6 +81,7 @@ pub(crate) mod tool_execution_service;
 pub(crate) mod tool_external_transport;
 pub(crate) mod tool_file_runtime;
 pub(crate) mod tool_introspect;
+pub mod tool_invocation_compactor;
 pub(crate) mod tool_invocation_decision;
 pub(crate) mod tool_invocation_runtime;
 pub(crate) mod tool_local_execution;
@@ -601,6 +602,7 @@ mod tests {
         async fn fail_dispatch(
             &self,
             _identity: &EdgeDispatchIdentity,
+            _edge_agent_id: &str,
             _reason: &str,
         ) -> Result<bool, String> {
             unreachable!("fail_dispatch is not used in cleanup tests")

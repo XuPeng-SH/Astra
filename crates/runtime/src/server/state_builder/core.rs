@@ -261,6 +261,63 @@ mod tests {
 
     struct NoopLocalTransport;
 
+    #[derive(Default)]
+    struct AdmittingEdgeDispatch {
+        admissions: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl EdgeDispatchService for AdmittingEdgeDispatch {
+        async fn insert_dispatch(
+            &self,
+            _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
+            _edge_agent_id: &str,
+            _payload_json: &str,
+        ) -> Result<(), String> {
+            self.admissions
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
+
+        async fn poll_pending(
+            &self,
+            _user_id: &str,
+            _edge_agent_id: &str,
+        ) -> Result<Vec<astra_services::multi_agent::EdgeDispatchRow>, String> {
+            Ok(Vec::new())
+        }
+
+        async fn deliver_result(
+            &self,
+            _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
+            _edge_agent_id: &str,
+            _result_json: &str,
+        ) -> Result<bool, String> {
+            Ok(true)
+        }
+
+        async fn fail_dispatch(
+            &self,
+            _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
+            _edge_agent_id: &str,
+            _reason: &str,
+        ) -> Result<bool, String> {
+            Ok(true)
+        }
+
+        async fn wait_result(
+            &self,
+            _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
+            _timeout: std::time::Duration,
+        ) -> Result<Option<String>, String> {
+            Ok(None)
+        }
+
+        async fn cleanup_stale(&self, _older_than: std::time::Duration) -> Result<u64, String> {
+            Ok(0)
+        }
+    }
+
     #[async_trait]
     impl ServerLocalToolTransport for NoopLocalTransport {
         async fn execute_server_local_tool(
@@ -331,9 +388,10 @@ mod tests {
             tx,
         );
 
+        let dispatch = Arc::new(AdmittingEdgeDispatch::default());
         let service = build_shared_tool_execution_service(
             pool.clone(),
-            Arc::new(astra_services::multi_agent::UnconfiguredEdgeDispatchService),
+            dispatch.clone(),
             Arc::new(astra_services::multi_agent::UnconfiguredEdgeRegistryService),
             &DeploymentToolPolicy::default(),
         );
@@ -341,13 +399,19 @@ mod tests {
         let handle =
             tokio::spawn(async move { service.execute(request, &NoopLocalTransport).await });
 
-        let message = rx.recv().await.expect("edge tool request is delivered");
-        let request_id = match message {
+        let message = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("durably admitted edge request is delivered without hanging")
+            .expect("edge tool request is delivered");
+        let (request_id, delivery_generation) = match message {
             astra_server_types::EdgeServerMessage::ToolRequest {
-                request_id, tool, ..
+                request_id,
+                tool,
+                delivery_generation,
+                ..
             } => {
                 assert_eq!(tool, "bash");
-                request_id
+                (request_id, delivery_generation)
             }
             other => panic!("expected edge tool request, got {other:?}"),
         };
@@ -355,6 +419,7 @@ mod tests {
             "user-1",
             "edge-selected",
             &request_id,
+            delivery_generation,
             astra_server_types::edge_connection_pool::EdgeToolResult {
                 output: "ok".to_string(),
                 is_error: false,
@@ -366,5 +431,12 @@ mod tests {
         let result = handle.await.expect("edge execution task joins");
         assert!(!result.is_error, "{result:?}");
         assert_eq!(result.output, "ok");
+        assert_eq!(
+            dispatch
+                .admissions
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "socket delivery must be preceded by exactly one durable admission"
+        );
     }
 }

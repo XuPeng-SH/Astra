@@ -5,10 +5,8 @@ use astra_core::{
     internal_error,
 };
 use axum::{Json, http::StatusCode};
-use fs2::FileExt;
 use sqlx::{Executor, MySql, QueryBuilder, Row, query};
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::fs::OpenOptions;
 use std::sync::OnceLock;
 use uuid::Uuid;
 
@@ -35,6 +33,8 @@ const EDGE_PENDING_DISPATCH_LEGACY_COLUMNS: &[&str] = &[
 const EDGE_PENDING_DISPATCH_LEGACY_PRIMARY_KEY: &[&str] = &["user_id", "request_id"];
 const EDGE_PENDING_DISPATCH_LEGACY_ARCHIVE_TABLE: &str =
     "edge_pending_dispatch_legacy_owner_request_v1";
+const TOOL_INVOCATION_LEDGER_REQUIRED_COLUMNS: &[&str] = &["identity_key"];
+const TOOL_INVOCATION_LEDGER_REQUIRED_VARCHAR_WIDTHS: &[(&str, u64)] = &[("identity_key", 71)];
 
 /// Standard column width for `agent_id` across all tables.
 /// All `agent_id`, `edge_agent_id`, `holder_agent_id`, and `parent_agent_id`
@@ -48,6 +48,27 @@ pub const AGENT_ID_LEN: usize = 255;
 /// the run has already started.
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-07-16-v1";
+const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
+    component VARCHAR(64) NOT NULL PRIMARY KEY,
+    contract_version VARCHAR(64) NOT NULL,
+    completed_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+)";
+const CORE_SCHEMA_LEASE_TABLE_SQL: &str =
+    "CREATE TABLE IF NOT EXISTS astra_schema_bootstrap_leases (
+    component VARCHAR(64) NOT NULL PRIMARY KEY,
+    holder_id VARCHAR(64) NOT NULL,
+    lease_expires_at DATETIME(6) NOT NULL,
+    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+)";
+const CORE_SCHEMA_VISIBILITY_PROBES: &[&str] = &[
+    "SELECT 1 FROM agent_sessions LIMIT 0",
+    "SELECT 1 FROM prompt_deltas LIMIT 0",
+    "SELECT 1 FROM tool_invocation_ledger LIMIT 0",
+    "SELECT 1 FROM workspace_records LIMIT 0",
+    "SELECT 1 FROM config_versions LIMIT 0",
+];
 
 pub(crate) fn rows_affected_to_i64(rows: u64, context: &str) -> Result<i64, sqlx::Error> {
     i64::try_from(rows).map_err(|_| {
@@ -127,57 +148,239 @@ const EVAL_CALIBRATION_ASSESSMENTS_CREATE_SQL: &str =
             INDEX idx_eval_calibration_session (user_id, session_id, created_at)
         )";
 
-struct CoreSchemaFileLock {
-    file: std::fs::File,
+struct CoreSchemaDatabaseLease {
+    pool: sqlx::Pool<MySql>,
+    holder_id: String,
+    stop_heartbeat: Option<tokio::sync::oneshot::Sender<()>>,
+    heartbeat: Option<tokio::task::JoinHandle<()>>,
 }
 
-impl Drop for CoreSchemaFileLock {
-    fn drop(&mut self) {
-        let _ = self.file.unlock();
+impl CoreSchemaDatabaseLease {
+    async fn acquire(pool: &sqlx::Pool<MySql>) -> Result<Self, sqlx::Error> {
+        query(CORE_SCHEMA_LEASE_TABLE_SQL).execute(pool).await?;
+        let holder_id = Uuid::new_v4().to_string();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            query(
+                "INSERT INTO astra_schema_bootstrap_leases \
+                 (component, holder_id, lease_expires_at, updated_at) \
+                 VALUES (?, ?, DATE_ADD(NOW(6), INTERVAL 30 SECOND), NOW(6)) \
+                 ON DUPLICATE KEY UPDATE \
+                   updated_at = IF(lease_expires_at <= NOW(6), VALUES(updated_at), updated_at), \
+                   holder_id = IF(lease_expires_at <= NOW(6), VALUES(holder_id), holder_id), \
+                   lease_expires_at = IF(lease_expires_at <= NOW(6), VALUES(lease_expires_at), lease_expires_at)",
+            )
+            .bind(CORE_SCHEMA_CONTRACT_COMPONENT)
+            .bind(&holder_id)
+            .execute(pool)
+            .await?;
+            let current_holder: String = sqlx::query_scalar(
+                "SELECT holder_id FROM astra_schema_bootstrap_leases WHERE component = ?",
+            )
+            .bind(CORE_SCHEMA_CONTRACT_COMPONENT)
+            .fetch_one(pool)
+            .await?;
+            if current_holder == holder_id {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(sqlx::Error::Protocol(
+                    "timed out waiting for the current core schema bootstrap lease".to_string(),
+                ));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        let heartbeat_pool = pool.clone();
+        let heartbeat_holder = holder_id.clone();
+        let (stop_heartbeat, mut stop_rx) = tokio::sync::oneshot::channel();
+        let heartbeat = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut stop_rx => break,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                        let renewal = query(
+                            "UPDATE astra_schema_bootstrap_leases \
+                             SET lease_expires_at = DATE_ADD(NOW(6), INTERVAL 30 SECOND), \
+                                 updated_at = NOW(6) \
+                             WHERE component = ? AND holder_id = ? \
+                               AND lease_expires_at > NOW(6)",
+                        )
+                        .bind(CORE_SCHEMA_CONTRACT_COMPONENT)
+                        .bind(&heartbeat_holder)
+                        .execute(&heartbeat_pool)
+                        .await;
+                        match renewal {
+                            Ok(_) => {
+                                let still_owned: Result<i64, sqlx::Error> = sqlx::query_scalar(
+                                    "SELECT COUNT(*) FROM astra_schema_bootstrap_leases \
+                                     WHERE component = ? AND holder_id = ? \
+                                       AND lease_expires_at > NOW(6)",
+                                )
+                                .bind(CORE_SCHEMA_CONTRACT_COMPONENT)
+                                .bind(&heartbeat_holder)
+                                .fetch_one(&heartbeat_pool)
+                                .await;
+                                match still_owned {
+                                    Ok(1) => continue,
+                                    Ok(_) => tracing::error!(
+                                        holder_id = %heartbeat_holder,
+                                        "core schema bootstrap lease was lost before completion"
+                                    ),
+                                    Err(error) => tracing::error!(
+                                        holder_id = %heartbeat_holder,
+                                        error = %error,
+                                        "core schema bootstrap lease ownership check failed"
+                                    ),
+                                }
+                                break;
+                            }
+                            Err(error) => {
+                                tracing::error!(
+                                    holder_id = %heartbeat_holder,
+                                    error = %error,
+                                    "core schema bootstrap lease heartbeat failed"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        Ok(Self {
+            pool: pool.clone(),
+            holder_id,
+            stop_heartbeat: Some(stop_heartbeat),
+            heartbeat: Some(heartbeat),
+        })
+    }
+
+    fn holder_id(&self) -> &str {
+        &self.holder_id
+    }
+
+    async fn release(mut self) -> Result<(), sqlx::Error> {
+        if let Some(stop_heartbeat) = self.stop_heartbeat.take() {
+            let _ = stop_heartbeat.send(());
+        }
+        if let Some(heartbeat) = self.heartbeat.take() {
+            heartbeat.await.map_err(|error| {
+                sqlx::Error::Protocol(format!(
+                    "core schema bootstrap lease heartbeat task failed: {error}"
+                ))
+            })?;
+        }
+        query("DELETE FROM astra_schema_bootstrap_leases WHERE component = ? AND holder_id = ?")
+            .bind(CORE_SCHEMA_CONTRACT_COMPONENT)
+            .bind(&self.holder_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 }
 
-fn schema_lock_component(raw: &str) -> String {
-    raw.chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
-        .collect()
+impl Drop for CoreSchemaDatabaseLease {
+    fn drop(&mut self) {
+        if let Some(stop_heartbeat) = self.stop_heartbeat.take() {
+            let _ = stop_heartbeat.send(());
+        }
+        if let Some(heartbeat) = self.heartbeat.take() {
+            heartbeat.abort();
+        }
+    }
 }
 
-fn acquire_core_schema_file_lock(
-    settings: &MatrixOneSettings,
-) -> Result<CoreSchemaFileLock, sqlx::Error> {
-    let user = schema_lock_component(
-        &std::env::var("USER")
-            .or_else(|_| std::env::var("LOGNAME"))
-            .unwrap_or_else(|_| "unknown".into()),
-    );
-    let lock_dir = std::env::temp_dir().join(format!("astra-engine-locks-{user}"));
-    std::fs::create_dir_all(&lock_dir).map_err(sqlx::Error::Io)?;
-    let lock_path = lock_dir.join(format!(
-        "core-schema-{}-{}-{}.lock",
-        schema_lock_component(&settings.host),
-        settings.port,
-        schema_lock_component(&settings.database),
-    ));
-    let file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(lock_path)
-        .map_err(sqlx::Error::Io)?;
-    file.lock_exclusive().map_err(sqlx::Error::Io)?;
-    Ok(CoreSchemaFileLock { file })
+async fn core_schema_contract_is_current(pool: &sqlx::Pool<MySql>) -> Result<bool, sqlx::Error> {
+    query(CORE_SCHEMA_CONTRACT_TABLE_SQL).execute(pool).await?;
+    let persisted: Option<String> = sqlx::query_scalar(
+        "SELECT contract_version FROM astra_schema_contracts WHERE component = ?",
+    )
+    .bind(CORE_SCHEMA_CONTRACT_COMPONENT)
+    .fetch_optional(pool)
+    .await?;
+    match persisted {
+        None => Ok(false),
+        Some(version) if version == CORE_SCHEMA_CONTRACT_VERSION => Ok(true),
+        Some(version) => Err(sqlx::Error::Protocol(format!(
+            "core schema contract mismatch: database has {version}, binary requires {CORE_SCHEMA_CONTRACT_VERSION}; provision a database with the current canonical schema"
+        ))),
+    }
 }
 
-async fn acquire_core_schema_file_lock_blocking(
-    settings: MatrixOneSettings,
-) -> Result<CoreSchemaFileLock, sqlx::Error> {
-    tokio::task::spawn_blocking(move || acquire_core_schema_file_lock(&settings))
-        .await
-        .map_err(|error| {
-            sqlx::Error::Protocol(format!("core schema file lock task failed: {error}"))
-        })?
+async fn mark_core_schema_contract_current(
+    pool: &sqlx::Pool<MySql>,
+    holder_id: &str,
+) -> Result<(), sqlx::Error> {
+    let result = query(
+        "INSERT INTO astra_schema_contracts (component, contract_version) \
+         SELECT ?, ? FROM astra_schema_bootstrap_leases \
+         WHERE component = ? AND holder_id = ? AND lease_expires_at > NOW(6)",
+    )
+    .bind(CORE_SCHEMA_CONTRACT_COMPONENT)
+    .bind(CORE_SCHEMA_CONTRACT_VERSION)
+    .bind(CORE_SCHEMA_CONTRACT_COMPONENT)
+    .bind(holder_id)
+    .execute(pool)
+    .await?;
+    if result.rows_affected() != 1 {
+        return Err(sqlx::Error::Protocol(
+            "core schema bootstrap lost its lease before publishing completion".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+async fn verify_core_schema_visible(pool: &sqlx::Pool<MySql>) -> Result<(), sqlx::Error> {
+    let persisted: Option<String> = sqlx::query_scalar(
+        "SELECT contract_version FROM astra_schema_contracts WHERE component = ?",
+    )
+    .bind(CORE_SCHEMA_CONTRACT_COMPONENT)
+    .fetch_optional(pool)
+    .await?;
+    if persisted.as_deref() != Some(CORE_SCHEMA_CONTRACT_VERSION) {
+        return Err(sqlx::Error::Protocol(
+            "core schema completion marker is not visible on a fresh connection".to_string(),
+        ));
+    }
+    for probe in CORE_SCHEMA_VISIBILITY_PROBES {
+        query(probe).execute(pool).await?;
+    }
+    Ok(())
+}
+
+fn is_schema_catalog_visibility_lag(error: &sqlx::Error) -> bool {
+    let detail = error.to_string().to_ascii_lowercase();
+    detail.contains("does not exist")
+        || detail.contains("unknown table")
+        || detail.contains("no such table")
+}
+
+async fn wait_for_core_schema_visibility(settings: &MatrixOneSettings) -> Result<(), sqlx::Error> {
+    let mut verify_settings = settings.clone();
+    verify_settings.db_pool_max_connections = 1;
+    verify_settings.db_pool_min_connections = 0;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let verify_pool = DedicatedPool::new(connect_matrixone(&verify_settings).await?, 1);
+        let visibility_result = verify_core_schema_visible(&verify_pool).await;
+        verify_pool.close().await;
+        match visibility_result {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if is_schema_catalog_visibility_lag(&error)
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            Err(error) if is_schema_catalog_visibility_lag(&error) => {
+                return Err(sqlx::Error::Protocol(format!(
+                    "core schema contract was published but canonical tables remained invisible to fresh connections: {error}"
+                )));
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn unique_event_ids(event_ids: &[String]) -> Vec<&str> {
@@ -536,17 +739,16 @@ async fn ensure_matrixone_database_exists(
         })?;
     let mut admin_settings = settings.clone();
     admin_settings.database = bootstrap_catalog.to_string();
-    let admin_pool = DedicatedPool::new(
-        connect_matrixone(&admin_settings).await?,
-        admin_settings.db_pool_max_connections as u64,
-    );
+    admin_settings.db_pool_max_connections = 1;
+    admin_settings.db_pool_min_connections = 0;
+    let admin_pool = DedicatedPool::new(connect_matrixone(&admin_settings).await?, 1);
     let ddl = format!(
         "CREATE DATABASE IF NOT EXISTS {}",
         crate::snapshot_sql::quote_mysql_identifier(&settings.database)
     );
-    query(&ddl).execute(&*admin_pool).await?;
-    // DedicatedPool::drop releases the global connection quota.
-    Ok(())
+    let create_result = query(&ddl).execute(&*admin_pool).await.map(|_| ());
+    admin_pool.close().await;
+    create_result
 }
 
 fn validate_schema_identifier(raw: &str, kind: &str) -> Result<(), sqlx::Error> {
@@ -1123,7 +1325,6 @@ pub async fn ensure_core_schema(
         .get_or_init(|| tokio::sync::Mutex::new(()))
         .lock()
         .await;
-    let _file_lock = acquire_core_schema_file_lock_blocking(settings.clone()).await?;
 
     if std::env::var("ASTRA_AUTO_CREATE_DATABASE")
         .map(|v| v == "1")
@@ -1131,7 +1332,53 @@ pub async fn ensure_core_schema(
     {
         ensure_matrixone_database_exists(settings, bootstrap_catalog).await?;
     }
-    let pool = connect_matrixone(settings).await?;
+    let mut schema_settings = settings.clone();
+    schema_settings.db_pool_max_connections = 1;
+    schema_settings.db_pool_min_connections = 0;
+    let pool = DedicatedPool::new(connect_matrixone(&schema_settings).await?, 1);
+    let lease_pool = match connect_matrixone(&schema_settings).await {
+        Ok(lease_pool) => DedicatedPool::new(lease_pool, 1),
+        Err(error) => {
+            pool.close().await;
+            return Err(error);
+        }
+    };
+    let database_lease = match CoreSchemaDatabaseLease::acquire(&lease_pool).await {
+        Ok(lease) => lease,
+        Err(error) => {
+            lease_pool.close().await;
+            pool.close().await;
+            return Err(error);
+        }
+    };
+    let schema_result =
+        ensure_core_schema_while_leased(settings, (*pool).clone(), database_lease.holder_id())
+            .await;
+    let release_result = database_lease.release().await;
+    lease_pool.close().await;
+    pool.close().await;
+    let bootstrap_result = match (schema_result, release_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(schema_error), Ok(())) => Err(schema_error),
+        (Ok(()), Err(release_error)) => Err(release_error),
+        (Err(schema_error), Err(release_error)) => Err(sqlx::Error::Protocol(format!(
+            "core schema bootstrap failed: {schema_error}; bootstrap lease release also failed: {release_error}"
+        ))),
+    };
+    match bootstrap_result {
+        Ok(()) => wait_for_core_schema_visibility(settings).await,
+        Err(error) => Err(error),
+    }
+}
+
+async fn ensure_core_schema_while_leased(
+    settings: &MatrixOneSettings,
+    pool: sqlx::Pool<MySql>,
+    holder_id: &str,
+) -> Result<(), sqlx::Error> {
+    if core_schema_contract_is_current(&pool).await? {
+        return Ok(());
+    }
 
     // Existing deployments may still have UUID-sized identity columns. Widen
     // them before table-specific shape checks run so every persistence path
@@ -2032,12 +2279,10 @@ pub async fn ensure_core_schema(
         .await?;
     }
 
-    // Retired semantic name+arguments dedup storage. Durable delivery is owned
-    // by `tool_invocation_ledger`; keeping this table would preserve a second,
-    // contradictory authority for external side effects.
-    query("DROP TABLE IF EXISTS tool_exactly_once_results")
-        .execute(&pool)
-        .await?;
+    // `tool_exactly_once_results` is retired and is not a runtime authority.
+    // Startup deliberately leaves any historical table untouched: removing
+    // side-effect evidence is an explicit administrative lifecycle action,
+    // not schema bootstrap. No compatibility read or migration is performed.
 
     query(
         "CREATE TABLE IF NOT EXISTS tool_invocation_ledger (
@@ -2046,6 +2291,7 @@ pub async fn ensure_core_schema(
             run_id              VARCHAR(128) NOT NULL,
             turn_chain_id       VARCHAR(128) NOT NULL,
             invocation_id       VARCHAR(128) NOT NULL,
+            identity_key        VARCHAR(71) NOT NULL,
             fingerprint_json    JSON NOT NULL,
             decision_json       JSON NOT NULL,
             state               VARCHAR(32) NOT NULL,
@@ -2058,10 +2304,79 @@ pub async fn ensure_core_schema(
             created_at          DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at          DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (user_id, session_id, run_id, turn_chain_id, invocation_id),
-            INDEX idx_tool_invocation_updated (updated_at)
+            INDEX idx_tool_invocation_updated (updated_at),
+            INDEX idx_tool_invocation_run_compaction
+                (user_id, session_id, run_id, state, identity_key)
         )",
     )
     .execute(&pool)
+    .await?;
+    fail_if_required_columns_missing_or_nullable(
+        &pool,
+        &settings.database,
+        "tool_invocation_ledger",
+        TOOL_INVOCATION_LEDGER_REQUIRED_COLUMNS,
+    )
+    .await?;
+    fail_if_varchar_columns_shorter_than(
+        &pool,
+        &settings.database,
+        "tool_invocation_ledger",
+        TOOL_INVOCATION_LEDGER_REQUIRED_VARCHAR_WIDTHS,
+    )
+    .await?;
+    ensure_index_shape(
+        &pool,
+        &settings.database,
+        "tool_invocation_ledger",
+        "idx_tool_invocation_run_compaction",
+        &["user_id", "session_id", "run_id", "state", "identity_key"],
+        "ALTER TABLE tool_invocation_ledger ADD INDEX idx_tool_invocation_run_compaction (user_id, session_id, run_id, state, identity_key)",
+    )
+    .await?;
+    query(
+        "CREATE TABLE IF NOT EXISTS tool_invocation_archive_chunks (
+            user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(64) NOT NULL,
+            run_id VARCHAR(64) NOT NULL,
+            chunk_index BIGINT UNSIGNED NOT NULL,
+            artifact_id VARCHAR(64) NOT NULL,
+            first_identity_key VARCHAR(71) NOT NULL,
+            last_identity_key VARCHAR(71) NOT NULL,
+            record_count BIGINT UNSIGNED NOT NULL,
+            encoded_bytes BIGINT UNSIGNED NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (user_id, session_id, run_id, chunk_index),
+            UNIQUE KEY uq_tool_invocation_archive_artifact
+                (user_id, session_id, artifact_id),
+            INDEX idx_tool_invocation_archive_lookup
+                (user_id, session_id, run_id, first_identity_key, last_identity_key)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+    ensure_primary_key_shape(
+        &pool,
+        &settings.database,
+        "tool_invocation_archive_chunks",
+        &["user_id", "session_id", "run_id", "chunk_index"],
+        "ALTER TABLE tool_invocation_archive_chunks ADD PRIMARY KEY (user_id, session_id, run_id, chunk_index)",
+    )
+    .await?;
+    ensure_index_shape(
+        &pool,
+        &settings.database,
+        "tool_invocation_archive_chunks",
+        "idx_tool_invocation_archive_lookup",
+        &[
+            "user_id",
+            "session_id",
+            "run_id",
+            "first_identity_key",
+            "last_identity_key",
+        ],
+        "ALTER TABLE tool_invocation_archive_chunks ADD INDEX idx_tool_invocation_archive_lookup (user_id, session_id, run_id, first_identity_key, last_identity_key)",
+    )
     .await?;
     add_column_if_missing(
         &pool,
@@ -2102,6 +2417,18 @@ pub async fn ensure_core_schema(
         "completion_source_json",
         "ALTER TABLE tool_invocation_ledger ADD COLUMN completion_source_json JSON NULL",
     )
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS semantic_read_observation_budgets (
+            user_id             VARCHAR(128) NOT NULL,
+            session_id          VARCHAR(128) NOT NULL,
+            created_at          DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at          DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (user_id, session_id)
+        )",
+    )
+    .execute(&pool)
     .await?;
 
     query(
@@ -2487,6 +2814,23 @@ pub async fn ensure_core_schema(
             owner_pod_id VARCHAR(256) NOT NULL,
             expires_at DATETIME(6) NOT NULL,
             version INT UNSIGNED NOT NULL DEFAULT 0,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // Durable keyset cursors keep bounded maintenance jobs fair across pod
+    // changes and process restarts. The cursor is progress, never authority:
+    // every mutation performed by a sweeper remains independently idempotent.
+    query(
+        "CREATE TABLE IF NOT EXISTS maintenance_sweep_cursors (
+            sweep_name VARCHAR(128) PRIMARY KEY,
+            cursor_updated_at DATETIME(6) NOT NULL,
+            cursor_user_id VARCHAR(128) NOT NULL,
+            cursor_run_id VARCHAR(64) NOT NULL,
+            scan_generation BIGINT UNSIGNED NOT NULL DEFAULT 0,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
         )",
@@ -4439,6 +4783,54 @@ pub async fn ensure_core_schema(
     )
     .await?;
 
+    query(
+        "CREATE TABLE IF NOT EXISTS session_artifact_references (
+            user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(64) NOT NULL,
+            artifact_id VARCHAR(64) NOT NULL,
+            reference_kind VARCHAR(32) NOT NULL,
+            reference_id VARCHAR(128) NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            CONSTRAINT chk_artifact_reference_kind CHECK (
+                reference_kind IN ('invocation_ledger', 'manifest', 'state_item', 'citation')
+            ),
+            PRIMARY KEY (user_id, session_id, artifact_id, reference_kind, reference_id),
+            INDEX idx_artifact_references_owner_reference
+                (user_id, session_id, reference_kind, reference_id, artifact_id)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+    ensure_primary_key_shape(
+        &pool,
+        &settings.database,
+        "session_artifact_references",
+        &[
+            "user_id",
+            "session_id",
+            "artifact_id",
+            "reference_kind",
+            "reference_id",
+        ],
+        "ALTER TABLE session_artifact_references ADD PRIMARY KEY (user_id, session_id, artifact_id, reference_kind, reference_id)",
+    )
+    .await?;
+    ensure_index_shape(
+        &pool,
+        &settings.database,
+        "session_artifact_references",
+        "idx_artifact_references_owner_reference",
+        &[
+            "user_id",
+            "session_id",
+            "reference_kind",
+            "reference_id",
+            "artifact_id",
+        ],
+        "ALTER TABLE session_artifact_references ADD INDEX idx_artifact_references_owner_reference (user_id, session_id, reference_kind, reference_id, artifact_id)",
+    )
+    .await?;
+
     for (table, column, ddl) in [
         (
             "agent_sessions",
@@ -5160,6 +5552,7 @@ pub async fn ensure_core_schema(
         .execute(&pool)
         .await?;
 
+    mark_core_schema_contract_current(&pool, holder_id).await?;
     Ok(())
 }
 
@@ -5730,6 +6123,51 @@ pub async fn cleanup_expired_data(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn dropping_schema_lease_cancels_heartbeat_task() {
+        struct NotifyOnDrop(Option<tokio::sync::oneshot::Sender<()>>);
+
+        impl Drop for NotifyOnDrop {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .connect_lazy("mysql://invalid:invalid@127.0.0.1:1/nonexistent")
+            .expect("lazy test pool");
+        let (stop_heartbeat, stop_rx) = tokio::sync::oneshot::channel();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let heartbeat = tokio::spawn(async move {
+            let _notify_on_drop = NotifyOnDrop(Some(dropped_tx));
+            let _ = started_tx.send(());
+            let _ = stop_rx.await;
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.expect("heartbeat task started");
+        let abort_handle = heartbeat.abort_handle();
+        let lease = CoreSchemaDatabaseLease {
+            pool,
+            holder_id: "test-holder".to_string(),
+            stop_heartbeat: Some(stop_heartbeat),
+            heartbeat: Some(heartbeat),
+        };
+
+        drop(lease);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("heartbeat future must be dropped promptly")
+            .expect("heartbeat drop notification");
+        assert!(
+            abort_handle.is_finished(),
+            "dropping the lease must not leave its heartbeat task detached"
+        );
+    }
 
     #[test]
     fn identity_column_widening_preserves_nullability() {
@@ -6542,20 +6980,6 @@ mod tests {
     }
 
     #[test]
-    fn core_schema_file_lock_uses_blocking_pool() {
-        let source = include_str!("storage.rs");
-        let body = source
-            .split("async fn acquire_core_schema_file_lock_blocking")
-            .nth(1)
-            .and_then(|rest| rest.split("fn unique_event_ids").next())
-            .expect("file lock async wrapper body");
-        assert!(
-            body.contains("tokio::task::spawn_blocking"),
-            "blocking file locks must not run on async worker threads"
-        );
-    }
-
-    #[test]
     fn obsolete_shape_checks_fail_without_dropping_tables() {
         let source = include_str!("storage.rs");
         let obsolete_shape_body = source
@@ -6605,6 +7029,15 @@ mod tests {
     }
 
     #[test]
+    fn invocation_ledger_bootstrap_requires_the_canonical_identity_key_shape() {
+        assert_eq!(TOOL_INVOCATION_LEDGER_REQUIRED_COLUMNS, &["identity_key"]);
+        assert_eq!(
+            TOOL_INVOCATION_LEDGER_REQUIRED_VARCHAR_WIDTHS,
+            &[("identity_key", 71)]
+        );
+    }
+
+    #[test]
     fn retired_external_auth_tables_are_not_dropped_by_schema_bootstrap() {
         let source = include_str!("storage.rs");
         let ensure_body = source
@@ -6612,7 +7045,11 @@ mod tests {
             .nth(1)
             .and_then(|rest| rest.split("#[cfg(test)]").next())
             .expect("ensure_core_schema body");
-        for table in ["auth_external_sessions", "auth_external_identities"] {
+        for table in [
+            "auth_external_sessions",
+            "auth_external_identities",
+            "tool_exactly_once_results",
+        ] {
             assert!(
                 !ensure_body.contains(&format!("DROP TABLE IF EXISTS {table}")),
                 "retired external auth table {table} must be left for an explicit migration, not dropped during startup"

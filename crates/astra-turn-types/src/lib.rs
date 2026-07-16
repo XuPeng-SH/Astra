@@ -6,6 +6,7 @@
 mod agent_communication;
 mod agent_transcript_evidence;
 mod agent_transcript_location;
+mod context_identity;
 mod context_window;
 mod correction_signal;
 mod implicit_feedback;
@@ -27,6 +28,12 @@ pub use agent_communication::{
 };
 pub use agent_transcript_evidence::AgentTranscriptEvidence;
 pub use agent_transcript_location::AgentTranscriptLocation;
+pub use context_identity::{
+    ContextIdentityError, LLM_ARTIFACT_EVIDENCE_CONTRACT_VERSION,
+    LLM_ARTIFACT_EVIDENCE_MAX_ENTRIES, LlmArtifactEvidenceEntryV1, LlmArtifactEvidenceManifestV1,
+    NormalizedPromptCacheUsage, PROMPT_CACHE_IDENTITY_CONTRACT_VERSION, PromptCacheIdentityV1,
+    PromptCacheInvalidationReason,
+};
 pub use context_window::{ContextWindowUsage, ContextWindowUsageSource};
 pub use correction_signal::{
     UserCorrectionSignalKind, classify_user_correction_signal, has_durable_correction_directive,
@@ -63,16 +70,22 @@ pub use runtime_scaffolding::{
     scaffolding_body_prefixes_for_filtering,
 };
 pub use semantic_read_cache::{
-    SEMANTIC_READ_CACHE_CONTRACT_VERSION, SEMANTIC_READ_OBSERVATION_CONTRACT_VERSION,
+    SEMANTIC_READ_CACHE_CONTRACT_VERSION, SEMANTIC_READ_CONDITION_ACK_METADATA_KEY,
+    SEMANTIC_READ_CONDITION_CONTRACT_VERSION, SEMANTIC_READ_OBSERVATION_CONTRACT_VERSION,
     SEMANTIC_READ_OBSERVATION_MAX_BYTES, SemanticFreshnessFact, SemanticFreshnessScope,
     SemanticReadCacheContractError, SemanticReadCacheKey, SemanticReadCacheLimits,
-    SemanticReadCacheLookup, SemanticReadFreshnessContext, SemanticReadFreshnessResolution,
+    SemanticReadCacheLookup, SemanticReadCondition, SemanticReadConditionAck,
+    SemanticReadFreshnessContext, SemanticReadFreshnessResolution,
     SemanticReadFreshnessUnavailableReason, SemanticReadObservation,
 };
 pub use tool_idempotency::{ToolIdempotency, classify_tool_idempotency};
 pub use tool_invocation::{
     DispatchCertainty, DurableToolReference, TOOL_INVOCATION_CACHE_COMPLETION_CONTRACT_VERSION,
     TOOL_INVOCATION_CONTRACT_VERSION, TOOL_INVOCATION_DISPATCH_OWNER_MAX_BYTES,
+    TOOL_INVOCATION_RESULT_ARTIFACT_METADATA_KEY, TOOL_INVOCATION_RESULT_CLASSIFIER_MAX_BYTES,
+    TOOL_INVOCATION_RESULT_MAX_BYTES, TOOL_INVOCATION_RESULT_METADATA_MAX_BYTES,
+    TOOL_INVOCATION_RESULT_METADATA_MAX_DEPTH, TOOL_INVOCATION_RESULT_METADATA_MAX_NODES,
+    TOOL_INVOCATION_RESULT_OUTPUT_MAX_BYTES, TOOL_INVOCATION_RUN_CLOSURE_CONTRACT_VERSION,
     ToolInvocationCompletionSource, ToolInvocationContractError, ToolInvocationDecision,
     ToolInvocationDispatchLease, ToolInvocationFingerprint, ToolInvocationIdentity,
     ToolInvocationPrepareOutcome, ToolInvocationRecord, ToolInvocationResultPayload,

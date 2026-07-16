@@ -17,6 +17,7 @@ use astra_turn_types::{
 };
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::time::Duration;
 use uuid::Uuid;
 
 fn identity(prefix: &str, invocation_id: &str) -> ToolInvocationIdentity {
@@ -82,6 +83,433 @@ async fn cleanup(pool: &sqlx::Pool<sqlx::MySql>, identity: &ToolInvocationIdenti
         .bind(&identity.session_id)
         .execute(pool)
         .await;
+    let _ = sqlx::query(
+        "DELETE FROM tool_invocation_archive_chunks WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&identity.user_id)
+    .bind(&identity.session_id)
+    .execute(pool)
+    .await;
+    let _ =
+        sqlx::query("DELETE FROM session_artifact_references WHERE user_id = ? AND session_id = ?")
+            .bind(&identity.user_id)
+            .bind(&identity.session_id)
+            .execute(pool)
+            .await;
+    let _ = sqlx::query("DELETE FROM session_artifacts WHERE user_id = ? AND session_id = ?")
+        .bind(&identity.user_id)
+        .bind(&identity.session_id)
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM agent_runs WHERE user_id = ? AND run_id = ?")
+        .bind(&identity.user_id)
+        .bind(&identity.run_id)
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+        .bind(&identity.user_id)
+        .bind(&identity.session_id)
+        .execute(pool)
+        .await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn terminal_run_compaction_atomically_preserves_replay_and_blocks_new_dispatch() {
+    let shared = common::setup_pool().await;
+    let pool = shared.get().clone();
+    let prefix = Uuid::new_v4().simple().to_string();
+    let identities = (0..3)
+        .map(|index| identity(&prefix, &format!("archive-call-{index}")))
+        .collect::<Vec<_>>();
+    cleanup(&pool, &identities[0]).await;
+    insert_active_run(&pool, &identities[0]).await;
+    let ledger = DatabaseToolInvocationLedger::new(shared);
+    let invocation_fingerprint = fingerprint("archive-result");
+    let invocation_decision = decision();
+    let mut expected = Vec::new();
+    for (index, identity) in identities.iter().enumerate() {
+        ledger
+            .prepare(identity, &invocation_fingerprint, &invocation_decision)
+            .await
+            .unwrap();
+        ledger
+            .claim_dispatch(identity, "archive-worker", 90_000)
+            .await
+            .unwrap();
+        expected.push(
+            ledger
+                .compare_and_complete(
+                    identity,
+                    ToolInvocationState::Dispatched,
+                    Some("archive-worker"),
+                    &success(&format!("archived output {index}")),
+                )
+                .await
+                .unwrap(),
+        );
+    }
+    let result_artifact_id = Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO session_artifacts
+         (artifact_id, session_id, user_id, artifact_kind, content_json,
+          retention_until, status, created_at)
+         VALUES (?, ?, ?, 'tool_result_evidence_v1', '{}',
+                 TIMESTAMPADD(DAY, 1, CURRENT_TIMESTAMP(6)), 'active', CURRENT_TIMESTAMP(6))",
+    )
+    .bind(&result_artifact_id)
+    .bind(&identities[0].session_id)
+    .bind(&identities[0].user_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let result_retention_before: String = sqlx::query_scalar(
+        "SELECT CAST(retention_until AS CHAR) FROM session_artifacts
+         WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+    )
+    .bind(&identities[0].user_id)
+    .bind(&identities[0].session_id)
+    .bind(&result_artifact_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO session_artifact_references
+         (user_id, session_id, artifact_id, reference_kind, reference_id)
+         VALUES (?, ?, ?, 'invocation_ledger', ?)",
+    )
+    .bind(&identities[0].user_id)
+    .bind(&identities[0].session_id)
+    .bind(&result_artifact_id)
+    .bind(identities[0].storage_key())
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(matches!(
+        ledger
+            .compact_terminal_run_batch(
+                &identities[0].user_id,
+                &identities[0].session_id,
+                &identities[0].run_id,
+            )
+            .await,
+        Err(ToolInvocationLedgerStoreError::RunNotTerminal { .. })
+    ));
+    let stranded = identity(&prefix, "prepared-at-run-closure");
+    ledger
+        .prepare(&stranded, &invocation_fingerprint, &invocation_decision)
+        .await
+        .unwrap();
+    let expired_dispatch = identity(&prefix, "expired-dispatch-at-run-closure");
+    ledger
+        .prepare(
+            &expired_dispatch,
+            &invocation_fingerprint,
+            &invocation_decision,
+        )
+        .await
+        .unwrap();
+    ledger
+        .claim_dispatch(&expired_dispatch, "expired-worker", 90_000)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE tool_invocation_ledger
+         SET dispatch_lease_expires_at = TIMESTAMPADD(SECOND, -1, CURRENT_TIMESTAMP(6))
+         WHERE user_id = ? AND session_id = ? AND run_id = ?
+           AND turn_chain_id = ? AND invocation_id = ?",
+    )
+    .bind(&expired_dispatch.user_id)
+    .bind(&expired_dispatch.session_id)
+    .bind(&expired_dispatch.run_id)
+    .bind(&expired_dispatch.turn_chain_id)
+    .bind(&expired_dispatch.invocation_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let active_dispatch = identity(&prefix, "active-dispatch-at-run-closure");
+    ledger
+        .prepare(
+            &active_dispatch,
+            &invocation_fingerprint,
+            &invocation_decision,
+        )
+        .await
+        .unwrap();
+    ledger
+        .claim_dispatch(&active_dispatch, "active-worker", 90_000)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE agent_runs SET status = 'completed' WHERE user_id = ? AND run_id = ?")
+        .bind(&identities[0].user_id)
+        .bind(&identities[0].run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let first_reconciliation = ledger
+        .reconcile_terminal_run(
+            &identities[0].user_id,
+            &identities[0].session_id,
+            &identities[0].run_id,
+        )
+        .await
+        .unwrap();
+    assert_eq!(first_reconciliation.prepared_rejected, 1);
+    assert_eq!(first_reconciliation.inconsistent_prepared_unknown, 0);
+    assert_eq!(first_reconciliation.expired_dispatches_unknown, 1);
+    assert_eq!(first_reconciliation.active_dispatches_remaining, 1);
+    let rejected = ledger.get(&stranded).await.unwrap().unwrap();
+    assert_eq!(rejected.state, ToolInvocationState::Rejected);
+    assert_eq!(
+        rejected.dispatch_certainty,
+        DispatchCertainty::NotDispatched
+    );
+    assert_eq!(rejected.attempt_count, 0);
+    assert!(matches!(
+        rejected.completion_source,
+        Some(ToolInvocationCompletionSource::RunClosure { .. })
+    ));
+    assert!(matches!(
+        ledger
+            .prepare(&stranded, &invocation_fingerprint, &invocation_decision)
+            .await
+            .unwrap(),
+        ToolInvocationPrepareOutcome::Existing(record)
+            if record.state == ToolInvocationState::Rejected
+                && record.dispatch_certainty == DispatchCertainty::NotDispatched
+    ));
+    assert_eq!(
+        ledger.get(&expired_dispatch).await.unwrap().unwrap().state,
+        ToolInvocationState::OutcomeUnknown
+    );
+
+    assert!(matches!(
+        ledger
+            .compact_terminal_run_batch(
+                &identities[0].user_id,
+                &identities[0].session_id,
+                &identities[0].run_id,
+            )
+            .await,
+        Err(ToolInvocationLedgerStoreError::RunNotQuiescent {
+            non_terminal_count: 1,
+            ..
+        })
+    ));
+    let artifact_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM session_artifacts
+         WHERE user_id = ? AND session_id = ? AND artifact_kind = 'tool_invocation_archive_v1'",
+    )
+    .bind(&identities[0].user_id)
+    .bind(&identities[0].session_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        artifact_count, 0,
+        "a non-quiescent run must not partially compact"
+    );
+    sqlx::query(
+        "UPDATE tool_invocation_ledger
+         SET dispatch_lease_expires_at = TIMESTAMPADD(SECOND, -1, CURRENT_TIMESTAMP(6))
+         WHERE user_id = ? AND session_id = ? AND run_id = ?
+           AND turn_chain_id = ? AND invocation_id = ?",
+    )
+    .bind(&active_dispatch.user_id)
+    .bind(&active_dispatch.session_id)
+    .bind(&active_dispatch.run_id)
+    .bind(&active_dispatch.turn_chain_id)
+    .bind(&active_dispatch.invocation_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let second_reconciliation = ledger
+        .reconcile_terminal_run(
+            &identities[0].user_id,
+            &identities[0].session_id,
+            &identities[0].run_id,
+        )
+        .await
+        .unwrap();
+    assert_eq!(second_reconciliation.prepared_rejected, 0);
+    assert_eq!(second_reconciliation.expired_dispatches_unknown, 1);
+    assert_eq!(second_reconciliation.active_dispatches_remaining, 0);
+    let reconciliation_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_events
+         WHERE user_id = ? AND session_id = ? AND run_id = ?
+           AND event_type = 'tool_invocation_run_reconciled'",
+    )
+    .bind(&identities[0].user_id)
+    .bind(&identities[0].session_id)
+    .bind(&identities[0].run_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(reconciliation_events, 2);
+    let deferred_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_events
+         WHERE user_id = ? AND session_id = ? AND run_id = ?
+           AND event_type = 'tool_invocation_compaction_deferred'",
+    )
+    .bind(&identities[0].user_id)
+    .bind(&identities[0].session_id)
+    .bind(&identities[0].run_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(deferred_events, 1, "active lease deferral is recorded once");
+    let diagnostics = ledger
+        .lifecycle_diagnostics(
+            &identities[0].user_id,
+            &identities[0].session_id,
+            Some(&identities[0].run_id),
+        )
+        .await
+        .unwrap();
+    assert_eq!(diagnostics.hot_total, 6);
+    assert_eq!(diagnostics.succeeded, 3);
+    assert_eq!(diagnostics.rejected, 1);
+    assert_eq!(diagnostics.rejected_without_dispatch, 1);
+    assert_eq!(diagnostics.outcome_unknown, 2);
+    assert_eq!(diagnostics.durable_artifact_references, 1);
+    assert_eq!(diagnostics.reconciliation_events, 2);
+    assert_eq!(diagnostics.compaction_deferred_events, 1);
+
+    let compacted = ledger
+        .compact_terminal_run_batch(
+            &identities[0].user_id,
+            &identities[0].session_id,
+            &identities[0].run_id,
+        )
+        .await
+        .unwrap();
+    assert_eq!(compacted.archived_records, 6);
+    assert_eq!(compacted.remaining_records, 0);
+    assert!(compacted.artifact_id.is_some());
+    let archived_diagnostics = ledger
+        .lifecycle_diagnostics(
+            &identities[0].user_id,
+            &identities[0].session_id,
+            Some(&identities[0].run_id),
+        )
+        .await
+        .unwrap();
+    assert_eq!(archived_diagnostics.hot_total, 0);
+    assert_eq!(archived_diagnostics.archive_chunks, 1);
+    assert_eq!(archived_diagnostics.durable_artifact_references, 2);
+    let result_reference: (String, String) = sqlx::query_as(
+        "SELECT refs.reference_id,
+                CAST(artifacts.retention_until AS CHAR)
+         FROM session_artifact_references refs
+         JOIN session_artifacts artifacts
+           ON artifacts.user_id = refs.user_id
+          AND artifacts.session_id = refs.session_id
+          AND artifacts.artifact_id = refs.artifact_id
+         WHERE refs.user_id = ? AND refs.session_id = ? AND refs.artifact_id = ?
+           AND refs.reference_kind = 'invocation_ledger'",
+    )
+    .bind(&identities[0].user_id)
+    .bind(&identities[0].session_id)
+    .bind(&result_artifact_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(result_reference.0, identities[0].run_id);
+    assert_eq!(
+        result_reference.1, result_retention_before,
+        "reachability transfer must not rewrite the artifact retention policy"
+    );
+    let hot_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM tool_invocation_ledger
+         WHERE user_id = ? AND session_id = ? AND run_id = ?",
+    )
+    .bind(&identities[0].user_id)
+    .bind(&identities[0].session_id)
+    .bind(&identities[0].run_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(hot_rows, 0);
+    for (identity, expected) in identities.iter().zip(&expected) {
+        assert_eq!(ledger.get(identity).await.unwrap().as_ref(), Some(expected));
+        assert!(matches!(
+            ledger
+                .prepare(identity, &invocation_fingerprint, &invocation_decision)
+                .await
+                .unwrap(),
+            ToolInvocationPrepareOutcome::Existing(record) if record == *expected
+        ));
+    }
+    assert!(matches!(
+        ledger
+            .prepare(
+                &identities[0],
+                &fingerprint("conflicting archived invocation"),
+                &invocation_decision,
+            )
+            .await,
+        Err(ToolInvocationLedgerStoreError::IdentityConflict { .. })
+    ));
+    let replay = ledger
+        .compact_terminal_run_batch(
+            &identities[0].user_id,
+            &identities[0].session_id,
+            &identities[0].run_id,
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay.archived_records, 0);
+    assert_eq!(replay.artifact_id, None);
+    let stale = identity(&prefix, "stale-after-compaction");
+    assert!(matches!(
+        ledger
+            .prepare(&stale, &invocation_fingerprint, &invocation_decision)
+            .await,
+        Err(ToolInvocationLedgerStoreError::RunNotExecutable { .. })
+    ));
+    sqlx::query(
+        "UPDATE session_artifacts SET status = 'expired'
+         WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+    )
+    .bind(&identities[0].user_id)
+    .bind(&identities[0].session_id)
+    .bind(compacted.artifact_id.as_deref().unwrap())
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(matches!(
+        ledger.get(&identities[0]).await,
+        Err(ToolInvocationLedgerStoreError::ArchiveUnavailable { .. })
+    ));
+
+    cleanup(&pool, &identities[0]).await;
+}
+
+async fn insert_active_run(pool: &sqlx::Pool<sqlx::MySql>, identity: &ToolInvocationIdentity) {
+    sqlx::query(
+        "INSERT INTO agent_sessions
+         (session_id, user_id, title, status, event_count)
+         VALUES (?, ?, 'tool invocation ledger test', 'active', 0)",
+    )
+    .bind(&identity.session_id)
+    .bind(&identity.user_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO agent_runs
+         (run_id, user_id, session_id, root_run_id, ancestor_path, status)
+         VALUES (?, ?, ?, ?, ?, 'running')",
+    )
+    .bind(&identity.run_id)
+    .bind(&identity.user_id)
+    .bind(&identity.session_id)
+    .bind(&identity.run_id)
+    .bind(format!("/{}", identity.run_id))
+    .execute(pool)
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -95,9 +523,25 @@ async fn invocation_identity_conflict_and_state_cas_hold_on_live_matrixone() {
     let abandoned = identity(&prefix, "call-abandoned");
     let cached = identity(&prefix, "call-cached");
     cleanup(&pool, &first).await;
+    insert_active_run(&pool, &first).await;
     let ledger = DatabaseToolInvocationLedger::new(shared);
     let original = fingerprint("deploy");
     let original_decision = decision();
+
+    let wrong_session = ToolInvocationIdentity::new(
+        &first.user_id,
+        "another-session",
+        &first.run_id,
+        &first.turn_chain_id,
+        "call-wrong-session",
+    )
+    .unwrap();
+    assert!(matches!(
+        ledger
+            .prepare(&wrong_session, &original, &original_decision)
+            .await,
+        Err(ToolInvocationLedgerStoreError::RunSessionMismatch { .. })
+    ));
 
     assert!(matches!(
         ledger
@@ -346,5 +790,167 @@ async fn invocation_identity_conflict_and_state_cas_hold_on_live_matrixone() {
         Err(ToolInvocationLedgerStoreError::Contract(_))
     ));
 
+    let prepared_before_closure = identity(&prefix, "prepared-before-run-closure");
+    assert!(matches!(
+        ledger
+            .prepare(&prepared_before_closure, &original, &original_decision)
+            .await
+            .unwrap(),
+        ToolInvocationPrepareOutcome::Prepared(_)
+    ));
+
+    sqlx::query(
+        "UPDATE agent_runs SET status = 'completed'
+         WHERE user_id = ? AND run_id = ?",
+    )
+    .bind(&first.user_id)
+    .bind(&first.run_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(matches!(
+        ledger
+            .prepare(&cached, &original, &original_decision)
+            .await
+            .unwrap(),
+        ToolInvocationPrepareOutcome::Existing(record)
+            if record.state == ToolInvocationState::Succeeded
+                && record.outcome.as_ref().unwrap().result().output == "cached observation"
+    ));
+    assert!(matches!(
+        ledger
+            .prepare(&second, &original, &original_decision)
+            .await
+            .unwrap(),
+        ToolInvocationPrepareOutcome::Existing(record)
+            if record.state == ToolInvocationState::Failed
+                && record.outcome.as_ref().unwrap().result().output == "provider failed"
+    ));
+    assert!(matches!(
+        ledger
+            .claim_dispatch(&prepared_before_closure, "worker-after-closure", 90_000)
+            .await,
+        Err(ToolInvocationLedgerStoreError::RunNotExecutable { status, .. })
+            if status == "completed"
+    ));
+    assert!(matches!(
+        ledger.get(&prepared_before_closure).await.unwrap(),
+        Some(record)
+            if record.state == ToolInvocationState::Prepared
+                && record.attempt_count == 0
+                && record.dispatch_certainty == DispatchCertainty::NotDispatched
+    ));
+    let after_closure = identity(&prefix, "call-after-run-closure");
+    assert!(matches!(
+        ledger
+            .prepare(&after_closure, &original, &original_decision)
+            .await,
+        Err(ToolInvocationLedgerStoreError::RunNotExecutable { status, .. })
+            if status == "completed"
+    ));
+
     cleanup(&pool, &first).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn run_closure_serializes_with_new_admission_and_dispatch_claim() {
+    let shared = common::setup_pool().await;
+    let pool = shared.get().clone();
+    let prefix = Uuid::new_v4().simple().to_string();
+    let prepare_identity = identity(&format!("{prefix}-prepare"), "concurrent-prepare");
+    cleanup(&pool, &prepare_identity).await;
+    insert_active_run(&pool, &prepare_identity).await;
+    let ledger = DatabaseToolInvocationLedger::new(shared.clone());
+    let invocation_fingerprint = fingerprint("concurrent admission");
+    let invocation_decision = decision();
+
+    let mut closure_tx = pool.begin().await.unwrap();
+    sqlx::query(
+        "UPDATE agent_runs SET status = 'completed'
+         WHERE user_id = ? AND run_id = ?",
+    )
+    .bind(&prepare_identity.user_id)
+    .bind(&prepare_identity.run_id)
+    .execute(&mut *closure_tx)
+    .await
+    .unwrap();
+    let prepare_task = {
+        let ledger = ledger.clone();
+        let identity = prepare_identity.clone();
+        let fingerprint = invocation_fingerprint.clone();
+        let decision = invocation_decision.clone();
+        tokio::spawn(async move { ledger.prepare(&identity, &fingerprint, &decision).await })
+    };
+    tokio::pin!(prepare_task);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut prepare_task)
+            .await
+            .is_err(),
+        "new identity admission must wait for the run closure transaction"
+    );
+    closure_tx.commit().await.unwrap();
+    assert!(matches!(
+        prepare_task.await.unwrap(),
+        Err(ToolInvocationLedgerStoreError::RunNotExecutable { status, .. })
+            if status == "completed"
+    ));
+    assert!(matches!(
+        ledger.get(&prepare_identity).await,
+        Err(ToolInvocationLedgerStoreError::TerminalRunRecordUnavailable { .. })
+    ));
+
+    let dispatch_identity = identity(&format!("{prefix}-dispatch"), "concurrent-dispatch");
+    cleanup(&pool, &dispatch_identity).await;
+    insert_active_run(&pool, &dispatch_identity).await;
+    ledger
+        .prepare(
+            &dispatch_identity,
+            &invocation_fingerprint,
+            &invocation_decision,
+        )
+        .await
+        .unwrap();
+    let mut closure_tx = pool.begin().await.unwrap();
+    sqlx::query(
+        "UPDATE agent_runs SET status = 'completed'
+         WHERE user_id = ? AND run_id = ?",
+    )
+    .bind(&dispatch_identity.user_id)
+    .bind(&dispatch_identity.run_id)
+    .execute(&mut *closure_tx)
+    .await
+    .unwrap();
+    let dispatch_task = {
+        let ledger = ledger.clone();
+        let identity = dispatch_identity.clone();
+        tokio::spawn(async move {
+            ledger
+                .claim_dispatch(&identity, "concurrent-worker", 90_000)
+                .await
+        })
+    };
+    tokio::pin!(dispatch_task);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut dispatch_task)
+            .await
+            .is_err(),
+        "dispatch claim must wait for the run closure transaction"
+    );
+    closure_tx.commit().await.unwrap();
+    assert!(matches!(
+        dispatch_task.await.unwrap(),
+        Err(ToolInvocationLedgerStoreError::RunNotExecutable { status, .. })
+            if status == "completed"
+    ));
+    assert!(matches!(
+        ledger.get(&dispatch_identity).await.unwrap(),
+        Some(record)
+            if record.state == ToolInvocationState::Prepared
+                && record.attempt_count == 0
+                && record.dispatch_certainty == DispatchCertainty::NotDispatched
+    ));
+
+    cleanup(&pool, &prepare_identity).await;
+    cleanup(&pool, &dispatch_identity).await;
 }

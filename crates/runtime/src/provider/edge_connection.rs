@@ -395,6 +395,7 @@ mod tests {
             async fn fail_dispatch(
                 &self,
                 _identity: &EdgeDispatchIdentity,
+                _edge_agent_id: &str,
                 _reason: &str,
             ) -> Result<bool, String> {
                 Ok(false)
@@ -447,13 +448,13 @@ mod tests {
             ) -> Result<Vec<astra_services::multi_agent::EdgeAgentRecord>, String> {
                 Ok(vec![])
             }
-            async fn unregister(
+            async fn unregister_generation(
                 &self,
                 _user_id: &str,
                 _edge_agent_id: &str,
-                _edge_id: &str,
-            ) -> Result<(), String> {
-                Ok(())
+                _edge_id_header: &str,
+            ) -> Result<bool, String> {
+                Ok(true)
             }
         }
 

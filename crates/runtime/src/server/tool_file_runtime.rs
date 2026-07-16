@@ -5,10 +5,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
-use astra_services::{
-    DatabaseSessionArtifactStore, SessionArtifactJsonRecord, SessionArtifactJsonStore,
-    StoredSessionArtifact,
-};
+use astra_services::{SessionArtifactJsonRecord, SessionArtifactJsonStore, StoredSessionArtifact};
 use astra_turn_core::file_edit_journal::{EditType, FileEditJournal, UndoResult};
 
 use crate::server::tool_workspace_path_guard::unique_path_variants;
@@ -51,7 +48,7 @@ where
 
 pub(crate) async fn execute_publish_artifact(
     args: &Value,
-    store: Option<&DatabaseSessionArtifactStore>,
+    store: Option<&dyn SessionArtifactJsonStore>,
     workspace_root: &Path,
     session_id: &str,
     user_id: &str,
@@ -510,6 +507,7 @@ pub(crate) fn prepare_publish_artifact_record(
             "source_path": source_path,
             "normalize_version": "artifact_file_v1",
         })),
+        references: Vec::new(),
     };
 
     Ok(PreparedPublishArtifact {
@@ -1266,6 +1264,7 @@ mod tests {
             round: None,
             content: json!({}),
             metadata: None,
+            references: Vec::new(),
         };
         let prepared = PreparedPublishArtifact {
             record,
@@ -1290,6 +1289,7 @@ mod tests {
             referenced_by_manifest_count: 0,
             referenced_by_state_items_count: 0,
             referenced_by_citation_count: 0,
+            referenced_by_durable_count: 0,
             created_at: Some("2026-06-14T00:00:00Z".to_string()),
         };
 

@@ -156,6 +156,14 @@ const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
         sql: "DELETE FROM session_artifacts_grants WHERE session_id = ? AND user_id = ?",
     },
     SessionDeleteStatement {
+        label: "tool_invocation_archive_chunks",
+        sql: "DELETE FROM tool_invocation_archive_chunks WHERE session_id = ? AND user_id = ?",
+    },
+    SessionDeleteStatement {
+        label: "session_artifact_references",
+        sql: "DELETE FROM session_artifact_references WHERE session_id = ? AND user_id = ?",
+    },
+    SessionDeleteStatement {
         label: "session_artifacts",
         sql: "DELETE FROM session_artifacts WHERE session_id = ? AND user_id = ?",
     },
@@ -258,6 +266,10 @@ const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
     SessionDeleteStatement {
         label: "semantic_read_observations",
         sql: "DELETE FROM semantic_read_observations WHERE session_id = ? AND user_id = ?",
+    },
+    SessionDeleteStatement {
+        label: "semantic_read_observation_budgets",
+        sql: "DELETE FROM semantic_read_observation_budgets WHERE session_id = ? AND user_id = ?",
     },
 ];
 

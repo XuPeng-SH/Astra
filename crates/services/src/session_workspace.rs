@@ -627,13 +627,14 @@ pub fn to_remote_artifact_record(
             "status": metadata.status,
             "git_branch": metadata.git_branch,
         })),
+        references: Vec::new(),
     })
 }
 
 pub async fn persist_remote_workspace(
     metadata: &WorkspaceMetadata,
     user_id: &str,
-    store: &impl SessionArtifactJsonStore,
+    store: &(impl SessionArtifactJsonStore + ?Sized),
 ) -> Result<StoredSessionArtifact, String> {
     let record = to_remote_artifact_record(metadata, user_id).map_err(|error| error.to_string())?;
     store
@@ -940,6 +941,7 @@ mod tests {
                 referenced_by_manifest_count: 0,
                 referenced_by_state_items_count: 0,
                 referenced_by_citation_count: 0,
+                referenced_by_durable_count: 0,
                 created_at: Some("2026-04-25T14:00:00Z".into()),
             })
         }

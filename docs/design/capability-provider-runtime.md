@@ -1,7 +1,7 @@
 # Capability provider runtime
 
 > Status: target design contract.
-> Last updated: 2026-07-15.
+> Last updated: 2026-07-16.
 
 This document defines Astra's protocol-independent provider, tool identity,
 discovery snapshot, invocation, and typed outcome contracts. It is a detailed
@@ -386,6 +386,35 @@ If revalidation changes, fails, or becomes unavailable, Astra retains the
 durable invocation result but abandons the cache fill. This is an observable
 uncached/degraded path, not a tool failure and not a session stop.
 
+Production adapters must negotiate this as one atomic capability, not as
+independent cache and transport switches. For the Astra MCP extension:
+
+- a provider-authorized runtime capability descriptor names the exact native
+  tools covered by `astra-semantic-read-mcp-v1`; model-facing aliases and
+  provider self-declarations cannot grant this authority;
+- Astra calls the side-effect-free `astra/semantic-read/prepare` method with
+  canonical public arguments and receives raw revision facts plus an opaque
+  protocol/token precondition;
+- the resulting content-addressed condition is attached to the exact
+  `tools/call` request under `_meta.astra.semantic_read_condition`;
+- the provider returns `_meta.astra.semantic_read_condition_ack` confirming
+  that exact condition. Astra validates and consumes the acknowledgement
+  before events or durable result persistence; all other raw provider metadata
+  remains non-authoritative and is only represented by a bounded summary.
+
+Malformed evidence, transport failure, missing or mismatched acknowledgement,
+and unsupported providers all execute the underlying read uncached. They do
+not publish an observation, fabricate freshness, or stop the session. Standard
+MCP remains explicitly disabled because its annotations do not define this
+conditional revision contract.
+
+Freshness preparation has its own short end-to-end deadline, including response
+body consumption, so a cache optimization cannot inherit the provider tool's
+execution timeout. Its timeout is side-effect-free and therefore certain. In
+contrast, transport failure after a real tool request may have been sent is
+`OutcomeUnknown`; an explicit JSON-RPC provider error remains an acknowledged
+failure. Retry policy must preserve that distinction.
+
 ## Durable invocation ledger
 
 ```text
@@ -412,13 +441,46 @@ The ledger records:
 Execution rules:
 
 - persist `Prepared` before dispatch;
+- resolve an existing invocation identity from hot or retained archive
+  evidence independently of current run executability, so terminal outcomes
+  remain deterministically replayable after closure and resume;
+- serialize creation of a new identity with the run closure boundary;
 - use a compare-and-set transition so concurrent workers cannot dispatch one
   invocation twice;
+- revalidate run executability under the same durable closure lock and
+  transaction as `Prepared -> Dispatched`; prior admission is not authority to
+  cross the provider boundary after the run closes;
 - persist the terminal typed result before exposing durable success;
 - retry idempotent work only when the downstream contract makes it safe;
 - never retry a non-idempotent call after ambiguous dispatch;
 - represent a lost acknowledgement after possible external application as
   `OutcomeUnknown`;
+- at an independent execution edge, acquire a separate execution permit and
+  persist `Running` in one WAL sync before crossing the local executor
+  boundary. The execution generation remains fixed while reconnect may update
+  the delivery/ACK generation; restored `Running` becomes `OutcomeUnknown`
+  and is never implicitly redispatched;
+- keep the independent Edge inbox/outbox crash-safe with a bounded append-only
+  WAL and periodic atomic snapshots. Capacity exhaustion is an explicit
+  retryable `NotDispatched` admission result, not a fabricated tool outcome;
+  the rejection carries bounded journal occupancy/capacity evidence and the
+  Edge logs the same structured status;
+- every Server-to-Edge path creates or verifies the same durable dispatch row
+  before socket delivery. Existing terminal evidence replays without another
+  socket send, owner/payload conflicts fail loudly, callers are released only
+  after result persistence, and the Edge drops evidence only after the exact
+  ACK generation;
+- connection and registry cleanup are generation-fenced. Result convergence
+  uses one shared bounded batch poller (with same-pod completion wakeup), not
+  one independent database polling loop per invocation;
+- reconcile terminal runs before archival: zero-attempt `Prepared` becomes a
+  typed, non-dispatched run-closure rejection; expired or malformed dispatched
+  leases become `OutcomeUnknown`; a valid live dispatch lease remains active
+  until completion or expiry;
+- scan terminal runs through a durable keyset cursor so a bounded page of
+  non-quiescent runs cannot starve later runs after restart or leader change;
+- record reconciliation and first-observed active-lease deferral as durable
+  owner-scoped events without emitting one warning per maintenance interval;
 - reconcile through the provider when supported; otherwise expose uncertainty
   and require an explicit decision.
 
@@ -467,10 +529,34 @@ Model, client, trace, and learning surfaces receive bounded projections derived
 from the same envelope. A client event limit applies to the entire event, not a
 few known fields.
 
+Persisting the required raw result is part of the durable result contract. If
+artifact materialization fails after the provider has acknowledged an outcome,
+the invocation is recorded as a non-retryable durability failure with
+`NotDispatched` false and provider acknowledgement preserved; Astra must not
+record a truncated projection as a successful, complete result or retry a
+possibly effectful provider call.
+
+Artifact reachability has one durable edge authority. Invocation completion
+owns result-artifact edges by invocation identity. Ledger compaction transfers
+those edges transactionally to the retained run archive before deleting hot
+rows; archive expiry releases every run-owned edge before ordinary artifact GC
+may reclaim content. A reference prevents collection while it exists but does
+not silently extend or rewrite the artifact's retention policy. Forward and
+reverse edge queries must expose exactly which durable owner keeps an artifact
+reachable.
+
+Introspect and reflect project, but never control, these durable facts. The
+runtime introspect evidence includes hot state counts, non-dispatched closure
+rejections, outcome-unknown rows, archive chunks, artifact-reference counts,
+reconciliation/deferred events, and compaction cursor progress. Reflect keeps
+the lifecycle events in its durable evidence graph even when they are not
+children of a context decision.
+
 ## Resource context
 
-Provider resources, request attachments, catalog files, and authoring resources
-are normalized into a typed, versioned, owner-scoped resource manifest.
+A complete provider-resource subsystem must normalize provider resources,
+request attachments, catalog files, and authoring resources into a typed,
+versioned, owner-scoped resource manifest.
 
 The complete manifest is durable and addressable. Prompt projection is bounded
 by aggregate encoded-byte/token budget and includes manifest identity, version,
@@ -482,6 +568,34 @@ This avoids both failure extremes:
 - unbounded request-controlled prompt growth.
 
 Replay records the exact manifest and projected entry set the model saw.
+
+That target contract must not be simulated by an in-memory helper. The current
+production boundary is narrower and is named accordingly: each LLM attempt
+records content-addressed evidence only for governed tool-result artifacts that
+actually occur in that attempt. Collection retains at most 64 valid unique
+entries and records observed, omitted, and invalid counts; one malformed or
+overflowing reference never discards the other evidence. The evidence is
+stored inline with the context manifest and does not publish a fake locator,
+page, search, or read API. A general resource manifest becomes real only when
+ingestion, durable lookup, authorization, paging, and prompt projection share
+one production authority.
+
+## Local session fork boundary
+
+A local fork is not a portable session snapshot. Fork creation freezes
+immutable transcript, workspace, and eligible checkpoint bytes, records their
+canonical local paths and hashes in a content-addressed fork-basis evidence
+file, and verifies both the frozen bytes and active child files before the
+child can be activated. Task, artifact, invocation, and memory dimensions stay
+explicit gaps until they have real immutable materialization semantics. Task
+copying is a post-basis child-state transition, not evidence that task state was
+part of the fork cursor.
+
+This local evidence is owned by the session-fork domain, not the edge/cloud
+sync wire protocol. Cross-machine synchronization or migration requires a
+separate portable manifest, common as-of transaction, transfer/materialization
+consumer, and restore verification; local paths and explicit gaps must never be
+presented as that capability.
 
 ## Prompt-cache interaction
 

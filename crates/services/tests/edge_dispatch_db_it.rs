@@ -6,9 +6,11 @@
 
 mod common;
 
+use std::sync::Arc;
+
 use astra_services::multi_agent::{
-    DatabaseEdgeDispatchService, DatabaseEdgeRegistryService, EdgeDispatchIdentity,
-    EdgeDispatchService, EdgeRegistryService,
+    DatabaseEdgeDispatchService, DatabaseEdgeRegistryService, EdgeDispatchAdmission,
+    EdgeDispatchAdmissionError, EdgeDispatchIdentity, EdgeDispatchService, EdgeRegistryService,
 };
 use sqlx::Row;
 use uuid::Uuid;
@@ -98,6 +100,131 @@ async fn edge_dispatch_full_lifecycle() {
     );
 }
 
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn edge_dispatch_admission_replays_terminal_and_rejects_identity_conflicts() {
+    require_env();
+    let pool = common::setup_pool().await;
+    let svc = DatabaseEdgeDispatchService::new(pool.get().clone());
+    let user_id = format!("ed-admit-usr-{}", unique_suffix());
+    let agent_id = format!("ed-admit-agent-{}", unique_suffix());
+    let identity = dispatch_identity(&user_id, &Uuid::new_v4().to_string());
+    let payload = r#"{"tool":"bash","args":{"command":"echo once"}}"#;
+
+    assert_eq!(
+        svc.admit_dispatch(&identity, &agent_id, payload)
+            .await
+            .expect("first admission"),
+        EdgeDispatchAdmission::Pending
+    );
+    assert!(matches!(
+        svc.admit_dispatch(&identity, "different-agent", payload)
+            .await,
+        Err(EdgeDispatchAdmissionError::Rejected(message)) if message.contains("conflicts")
+    ));
+    assert!(matches!(
+        svc.admit_dispatch(&identity, &agent_id, r#"{"tool":"different"}"#)
+            .await,
+        Err(EdgeDispatchAdmissionError::Rejected(message)) if message.contains("conflicts")
+    ));
+    assert!(
+        svc.claim_direct_dispatch(&identity, &agent_id)
+            .await
+            .expect("first direct claim")
+    );
+    assert!(
+        !svc.claim_direct_dispatch(&identity, &agent_id)
+            .await
+            .expect("duplicate direct claim"),
+        "only one delivery path may own the durable dispatch boundary"
+    );
+
+    let result_json = r#"{"status":"completed","output":"once"}"#;
+    assert!(
+        svc.deliver_result(&identity, &agent_id, result_json)
+            .await
+            .expect("terminal result")
+    );
+    let EdgeDispatchAdmission::Terminal(replayed_json) = svc
+        .admit_dispatch(&identity, &agent_id, payload)
+        .await
+        .expect("terminal replay admission")
+    else {
+        panic!("terminal identity must replay its durable result");
+    };
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&replayed_json)
+            .expect("persisted terminal result must remain valid JSON"),
+        serde_json::from_str::<serde_json::Value>(result_json)
+            .expect("fixture terminal result must be valid JSON"),
+        "durable replay preserves JSON meaning independently of object-key storage order"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn edge_dispatch_batched_wait_converges_across_pods_under_concurrency() {
+    require_env();
+    let pool = common::setup_pool().await;
+    let producer = Arc::new(DatabaseEdgeDispatchService::new(pool.get().clone()));
+    let waiter = Arc::new(DatabaseEdgeDispatchService::new(pool.get().clone()));
+    let user_id = format!("ed-batch-usr-{}", unique_suffix());
+    let agent_id = format!("ed-batch-agent-{}", unique_suffix());
+    let identities = (0..129)
+        .map(|index| dispatch_identity(&user_id, &format!("batch-{index}-{}", unique_suffix())))
+        .collect::<Vec<_>>();
+
+    let mut inserts = tokio::task::JoinSet::new();
+    for identity in identities.clone() {
+        let producer = producer.clone();
+        let agent_id = agent_id.clone();
+        inserts.spawn(async move { producer.insert_dispatch(&identity, &agent_id, "{}").await });
+    }
+    while let Some(insert) = inserts.join_next().await {
+        insert.unwrap().expect("concurrent dispatch insert");
+    }
+
+    let mut waits = tokio::task::JoinSet::new();
+    for identity in identities.clone() {
+        let waiter = waiter.clone();
+        waits.spawn(async move {
+            waiter
+                .wait_result(&identity, std::time::Duration::from_secs(10))
+                .await
+        });
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    let mut completions = tokio::task::JoinSet::new();
+    for identity in identities {
+        let producer = producer.clone();
+        let agent_id = agent_id.clone();
+        completions.spawn(async move {
+            producer
+                .deliver_result(
+                    &identity,
+                    &agent_id,
+                    &serde_json::json!({
+                        "status": "completed",
+                        "output": identity.request_id.clone(),
+                    })
+                    .to_string(),
+                )
+                .await
+        });
+    }
+    while let Some(completion) = completions.join_next().await {
+        assert!(completion.unwrap().expect("concurrent dispatch completion"));
+    }
+
+    let mut resolved = 0;
+    while let Some(wait) = waits.join_next().await {
+        assert!(wait.unwrap().expect("batched wait_result").is_some());
+        resolved += 1;
+    }
+    assert_eq!(resolved, 129);
+}
+
 /// deliver_result for unknown request_id returns false.
 #[tokio::test]
 #[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
@@ -154,6 +281,53 @@ async fn edge_dispatch_deliver_result_wrong_agent_rejected() {
     assert!(
         ok,
         "correct agent_id should succeed after wrong agent rejection"
+    );
+}
+
+/// fail_dispatch must enforce the same durable owner boundary as result delivery.
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn edge_dispatch_fail_wrong_agent_cannot_terminate_dispatch() {
+    require_env();
+    let pool = common::setup_pool().await;
+    let svc = DatabaseEdgeDispatchService::new(pool.get().clone());
+    let user_id = format!("ed-fail-owner-usr-{}", unique_suffix());
+    let agent_id = format!("ed-fail-owner-agent-{}", unique_suffix());
+    let identity = dispatch_identity(&user_id, &Uuid::new_v4().to_string());
+
+    svc.insert_dispatch(&identity, &agent_id, r#"{"test":true}"#)
+        .await
+        .expect("insert dispatch");
+
+    assert!(
+        !svc.fail_dispatch(&identity, "wrong-agent-id", "forged cancellation")
+            .await
+            .expect("wrong-owner failure attempt"),
+        "a different edge owner must not terminate the dispatch"
+    );
+    assert_eq!(
+        svc.admit_dispatch(&identity, &agent_id, r#"{"test":true}"#)
+            .await
+            .expect("dispatch remains replayable"),
+        EdgeDispatchAdmission::Pending,
+        "the forged failure must leave the durable dispatch executable"
+    );
+    assert!(
+        svc.fail_dispatch(&identity, &agent_id, "cancelled")
+            .await
+            .expect("owner failure"),
+        "the owning edge may terminate its own dispatch"
+    );
+    let EdgeDispatchAdmission::Terminal(result_json) = svc
+        .admit_dispatch(&identity, &agent_id, r#"{"test":true}"#)
+        .await
+        .expect("failed dispatch replay")
+    else {
+        panic!("owner failure must create terminal durable evidence");
+    };
+    assert!(
+        result_json.contains("cancelled"),
+        "terminal replay must preserve the failure reason"
     );
 }
 
@@ -458,10 +632,31 @@ async fn edge_registry_register_list_unregister() {
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].edge_agent_id, edge_agent_id);
 
-    // Unregister (guarded by edge_id so cross-pod stale cleanup cannot delete a newer row)
-    svc.unregister(&user_id, &edge_agent_id, &edge_id_header)
-        .await
-        .expect("unregister");
+    let replacement_edge_id = format!("edge-replacement-{}", uuid::Uuid::new_v4());
+    svc.register_or_update(
+        &user_id,
+        &edge_agent_id,
+        &replacement_edge_id,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("replace registration generation");
+    assert!(
+        !svc.unregister_generation(&user_id, &edge_agent_id, &edge_id_header)
+            .await
+            .expect("stale unregister is a successful no-op"),
+        "stale connection generation must not delete its replacement"
+    );
+
+    // The current generation can unregister itself.
+    assert!(
+        svc.unregister_generation(&user_id, &edge_agent_id, &replacement_edge_id)
+            .await
+            .expect("unregister current generation")
+    );
 
     // List returns empty
     let list = svc.list_by_user(&user_id).await.expect("list_by_user");

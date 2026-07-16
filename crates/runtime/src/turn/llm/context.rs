@@ -606,6 +606,7 @@ pub(crate) struct LlmWireAssemblyInput<'a> {
 }
 
 pub(crate) struct ContextManifestProjectionInput<'a> {
+    pub owner_id: &'a str,
     pub session_id: &'a str,
     pub run_id: &'a str,
     pub turn_index: usize,
@@ -622,6 +623,109 @@ pub(crate) struct ContextManifestProjectionInput<'a> {
     pub turn_intent: &'a str,
     pub reason: &'a str,
     pub context_window_tokens: u32,
+}
+
+struct LlmArtifactEvidenceCollection {
+    manifest: Option<astra_turn_types::LlmArtifactEvidenceManifestV1>,
+    status: &'static str,
+}
+
+fn llm_artifact_evidence_from_tool_results(
+    input: &ContextManifestProjectionInput<'_>,
+) -> LlmArtifactEvidenceCollection {
+    let mut entries = Vec::new();
+    let mut seen_artifacts = std::collections::HashSet::new();
+    let mut observed_reference_count = 0_usize;
+    let mut invalid_reference_count = 0_usize;
+    for tool_result in input.tool_results {
+        let Some(reference) =
+            tool_result.get(astra_turn_types::TOOL_INVOCATION_RESULT_ARTIFACT_METADATA_KEY)
+        else {
+            continue;
+        };
+        observed_reference_count = observed_reference_count.saturating_add(1);
+        let Some(reference) = reference.as_object() else {
+            invalid_reference_count = invalid_reference_count.saturating_add(1);
+            continue;
+        };
+        let Some(artifact_id) = reference
+            .get("artifactId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        else {
+            invalid_reference_count = invalid_reference_count.saturating_add(1);
+            continue;
+        };
+        let Some(content_hash) =
+            reference
+                .get("contentHash")
+                .and_then(Value::as_str)
+                .filter(|value| {
+                    value.len() == 71
+                        && value.starts_with("sha256:")
+                        && value[7..].bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+        else {
+            invalid_reference_count = invalid_reference_count.saturating_add(1);
+            continue;
+        };
+        let tool_name = tool_result
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("tool_result");
+        let Ok(mut entry) =
+            astra_turn_types::LlmArtifactEvidenceEntryV1::new(artifact_id, tool_name, content_hash)
+        else {
+            invalid_reference_count = invalid_reference_count.saturating_add(1);
+            continue;
+        };
+        if !seen_artifacts.insert(artifact_id.to_string())
+            || entries.len() >= astra_turn_types::LLM_ARTIFACT_EVIDENCE_MAX_ENTRIES
+        {
+            continue;
+        }
+        entry.media_type = Some("application/json".to_string());
+        entry.encoded_bytes = reference.get("encodedBytes").and_then(Value::as_u64);
+        entries.push(entry);
+    }
+    if observed_reference_count == 0 {
+        return LlmArtifactEvidenceCollection {
+            manifest: None,
+            status: "absent",
+        };
+    }
+    let manifest = astra_turn_types::LlmArtifactEvidenceManifestV1::new(
+        input.owner_id,
+        input.session_id,
+        format!(
+            "run:{}:turn:{}:attempt:{}",
+            input.run_id, input.turn_index, input.llm_attempt_index
+        ),
+        entries,
+        observed_reference_count,
+        invalid_reference_count,
+    );
+    match manifest {
+        Ok(manifest) => {
+            let status = if manifest.invalid_reference_count == manifest.observed_reference_count {
+                "all_invalid"
+            } else if manifest.invalid_reference_count > 0 {
+                "partial_invalid"
+            } else if manifest.omitted_reference_count > 0 {
+                "partial_bounded"
+            } else {
+                "ready"
+            };
+            LlmArtifactEvidenceCollection {
+                manifest: Some(manifest),
+                status,
+            }
+        }
+        Err(_) => LlmArtifactEvidenceCollection {
+            manifest: None,
+            status: "identity_invalid",
+        },
+    }
 }
 
 pub(crate) struct ContextManifestProjection {
@@ -657,6 +761,7 @@ pub(crate) fn build_context_manifest_projection(
             .saturating_add(tool_result_tokens)
             .saturating_add(input.schema_tokens)
     });
+    let artifact_evidence = llm_artifact_evidence_from_tool_results(&input);
 
     let mut items = vec![
         astra_services::ContextManifestItemWrite {
@@ -722,6 +827,22 @@ pub(crate) fn build_context_manifest_projection(
             raw_ref: None,
         });
     }
+    if let Some(manifest) = artifact_evidence.manifest.as_ref() {
+        items.push(astra_services::ContextManifestItemWrite {
+            session_id: input.session_id.to_string(),
+            item_order: 4,
+            zone: "llm_artifact_evidence".to_string(),
+            source_table: "session_artifacts".to_string(),
+            source_id: manifest.content_id.clone(),
+            source_hash: Some(manifest.content_id.clone()),
+            included: true,
+            token_estimate: 0,
+            budget_tokens: 0,
+            reason: "content_addressed_attempt_artifact_evidence".to_string(),
+            render_mode: "inline_manifest_evidence".to_string(),
+            raw_ref: None,
+        });
+    }
 
     let estimated_input = message_tokens
         .saturating_add(tool_result_tokens)
@@ -746,6 +867,18 @@ pub(crate) fn build_context_manifest_projection(
         });
     }
 
+    let normalized_prompt_cache_usage = if input.observed_fresh_input_tokens.is_some()
+        || input.observed_cache_read_tokens.is_some()
+        || input.observed_cache_creation_tokens.is_some()
+    {
+        Some(astra_turn_types::NormalizedPromptCacheUsage {
+            fresh_input_tokens: input.observed_fresh_input_tokens.unwrap_or_default(),
+            cache_read_tokens: input.observed_cache_read_tokens.unwrap_or_default(),
+            cache_creation_tokens: input.observed_cache_creation_tokens.unwrap_or_default(),
+        })
+    } else {
+        None
+    };
     let manifest_json = json!({
         "source": "llm_context",
         "llm_attempt_index": input.llm_attempt_index,
@@ -758,6 +891,9 @@ pub(crate) fn build_context_manifest_projection(
             "cache_creation_tokens": input.observed_cache_creation_tokens,
             "output_tokens": input.observed_output_tokens
         },
+        "normalized_prompt_cache_usage": normalized_prompt_cache_usage,
+        "llm_artifact_evidence_status": artifact_evidence.status,
+        "llm_artifact_evidence": artifact_evidence.manifest,
         "assembly_trace": input.assembly_trace,
         "budget_template_id": "budget_v1_8k",
         "budget_flex": {
@@ -1570,6 +1706,19 @@ pub(crate) fn augment_manifest_trace_with_wire(
         .filter(|message| message_role(message) == "system")
         .cloned()
         .collect();
+    let stable_system_prefix = stable_cache_prefix(&system_messages);
+    let stable_tool_prefix = stable_cache_prefix(tool_schemas);
+    let cache_layout = if message_cache_control_count + tool_cache_control_count > 0 {
+        "explicit-breakpoints-v1"
+    } else {
+        "provider-prefix-v1"
+    };
+    let prompt_cache_identity = astra_turn_types::PromptCacheIdentityV1::from_prefixes(
+        &stable_system_prefix,
+        &stable_tool_prefix,
+        cache_layout,
+    )
+    .expect("wire prompt cache identity inputs are bounded constants and JSON");
     let message_hashes: Vec<Value> = messages
         .iter()
         .enumerate()
@@ -1619,10 +1768,21 @@ pub(crate) fn augment_manifest_trace_with_wire(
                         "system_messages": system_messages,
                         "tool_schemas": tool_schemas,
                     })),
+                    "prompt_cache_identity": prompt_cache_identity,
                     "message_hashes": message_hashes,
                 },
             }),
         );
+    }
+}
+
+fn stable_cache_prefix(values: &[Value]) -> Vec<Value> {
+    match values
+        .iter()
+        .rposition(|value| cache_control_count(value) > 0)
+    {
+        Some(last_marker) => values[..=last_marker].to_vec(),
+        None => values.to_vec(),
     }
 }
 
@@ -2274,6 +2434,171 @@ mod context_cache_contract_tests {
     }
 
     #[test]
+    fn context_manifest_persists_provider_neutral_prompt_cache_accounting() {
+        let messages = vec![json!({"role": "user", "content": "hello"})];
+        let projection = build_context_manifest_projection(ContextManifestProjectionInput {
+            owner_id: "user-a",
+            session_id: "session-a",
+            run_id: "run-a",
+            turn_index: 3,
+            llm_attempt_index: 2,
+            pre_llm_messages: &messages,
+            tool_results: &[],
+            schema_tokens: 7,
+            result_prompt_tokens: Some(500),
+            observed_fresh_input_tokens: Some(100),
+            observed_cache_read_tokens: Some(300),
+            observed_cache_creation_tokens: Some(100),
+            observed_output_tokens: Some(20),
+            assembly_trace: None,
+            turn_intent: "implementation",
+            reason: "test",
+            context_window_tokens: 64_000,
+        });
+
+        assert_eq!(
+            projection.manifest_json["normalized_prompt_cache_usage"],
+            json!({
+                "fresh_input_tokens": 100,
+                "cache_read_tokens": 300,
+                "cache_creation_tokens": 100
+            })
+        );
+    }
+
+    #[test]
+    fn context_manifest_persists_bounded_attempt_artifact_evidence_without_all_or_nothing_loss() {
+        let artifact_result = json!({
+            "name": "catalog_read",
+            "result": "bounded preview",
+            (astra_turn_types::TOOL_INVOCATION_RESULT_ARTIFACT_METADATA_KEY): {
+                "artifactId": "artifact-7",
+                "contentHash": format!("sha256:{:064x}", 7),
+                "encodedBytes": 4096
+            }
+        });
+        let tool_results = vec![artifact_result];
+        let projection = build_context_manifest_projection(ContextManifestProjectionInput {
+            owner_id: "user-a",
+            session_id: "session-a",
+            run_id: "run-a",
+            turn_index: 3,
+            llm_attempt_index: 2,
+            pre_llm_messages: &[],
+            tool_results: &tool_results,
+            schema_tokens: 0,
+            result_prompt_tokens: None,
+            observed_fresh_input_tokens: None,
+            observed_cache_read_tokens: None,
+            observed_cache_creation_tokens: None,
+            observed_output_tokens: None,
+            assembly_trace: None,
+            turn_intent: "implementation",
+            reason: "test",
+            context_window_tokens: 64_000,
+        });
+        assert_eq!(
+            projection.manifest_json["llm_artifact_evidence_status"],
+            "ready"
+        );
+        let manifest = serde_json::from_value::<astra_turn_types::LlmArtifactEvidenceManifestV1>(
+            projection.manifest_json["llm_artifact_evidence"].clone(),
+        )
+        .expect("persisted attempt artifact evidence revalidates");
+        assert_eq!(manifest.entries[0].artifact_id, "artifact-7");
+        assert_eq!(manifest.entries[0].tool_name, "catalog_read");
+        assert_eq!(manifest.entries[0].encoded_bytes, Some(4096));
+        assert!(projection.items.iter().any(|item| {
+            item.zone == "llm_artifact_evidence"
+                && item.source_hash.as_deref() == Some(manifest.content_id.as_str())
+                && item.raw_ref.is_none()
+        }));
+
+        let invalid_results = vec![json!({
+            "name": "catalog_read",
+            (astra_turn_types::TOOL_INVOCATION_RESULT_ARTIFACT_METADATA_KEY): {
+                "artifactId": "artifact-7",
+                "contentHash": "forged"
+            }
+        })];
+        let invalid = build_context_manifest_projection(ContextManifestProjectionInput {
+            owner_id: "user-a",
+            session_id: "session-a",
+            run_id: "run-a",
+            turn_index: 3,
+            llm_attempt_index: 2,
+            pre_llm_messages: &[],
+            tool_results: &invalid_results,
+            schema_tokens: 0,
+            result_prompt_tokens: None,
+            observed_fresh_input_tokens: None,
+            observed_cache_read_tokens: None,
+            observed_cache_creation_tokens: None,
+            observed_output_tokens: None,
+            assembly_trace: None,
+            turn_intent: "implementation",
+            reason: "test",
+            context_window_tokens: 64_000,
+        });
+        assert_eq!(
+            invalid.manifest_json["llm_artifact_evidence_status"],
+            "all_invalid"
+        );
+        let invalid_manifest = serde_json::from_value::<
+            astra_turn_types::LlmArtifactEvidenceManifestV1,
+        >(invalid.manifest_json["llm_artifact_evidence"].clone())
+        .expect("invalid references remain explicit evidence instead of disappearing");
+        assert_eq!(invalid_manifest.observed_reference_count, 1);
+        assert_eq!(invalid_manifest.invalid_reference_count, 1);
+        assert!(invalid_manifest.entries.is_empty());
+
+        let bounded_results = (0..=astra_turn_types::LLM_ARTIFACT_EVIDENCE_MAX_ENTRIES)
+            .map(|index| {
+                json!({
+                    "name": "catalog_read",
+                    (astra_turn_types::TOOL_INVOCATION_RESULT_ARTIFACT_METADATA_KEY): {
+                        "artifactId": format!("artifact-{index:03}"),
+                        "contentHash": format!("sha256:{index:064x}")
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let bounded = build_context_manifest_projection(ContextManifestProjectionInput {
+            owner_id: "user-a",
+            session_id: "session-a",
+            run_id: "run-a",
+            turn_index: 3,
+            llm_attempt_index: 2,
+            pre_llm_messages: &[],
+            tool_results: &bounded_results,
+            schema_tokens: 0,
+            result_prompt_tokens: None,
+            observed_fresh_input_tokens: None,
+            observed_cache_read_tokens: None,
+            observed_cache_creation_tokens: None,
+            observed_output_tokens: None,
+            assembly_trace: None,
+            turn_intent: "implementation",
+            reason: "test",
+            context_window_tokens: 64_000,
+        });
+        assert_eq!(
+            bounded.manifest_json["llm_artifact_evidence_status"],
+            "partial_bounded"
+        );
+        let bounded_manifest = serde_json::from_value::<
+            astra_turn_types::LlmArtifactEvidenceManifestV1,
+        >(bounded.manifest_json["llm_artifact_evidence"].clone())
+        .expect("bounded evidence revalidates");
+        assert_eq!(
+            bounded_manifest.entries.len(),
+            astra_turn_types::LLM_ARTIFACT_EVIDENCE_MAX_ENTRIES
+        );
+        assert_eq!(bounded_manifest.observed_reference_count, 65);
+        assert_eq!(bounded_manifest.omitted_reference_count, 1);
+    }
+
+    #[test]
     fn augment_manifest_trace_records_final_wire_cache_control_counts() {
         let mut trace = json!({"source": "llm_context"});
         let messages = vec![
@@ -2328,6 +2653,64 @@ mod context_cache_contract_tests {
                 .unwrap()
                 .len(),
             2
+        );
+        let prompt_identity = &trace["wire"]["fingerprint"]["prompt_cache_identity"];
+        assert_eq!(
+            prompt_identity["contract_version"],
+            astra_turn_types::PROMPT_CACHE_IDENTITY_CONTRACT_VERSION
+        );
+        assert!(
+            prompt_identity["content_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("sha256:")
+        );
+    }
+
+    #[test]
+    fn prompt_cache_identity_excludes_volatile_tail_and_invalidates_schema_changes() {
+        let messages = vec![
+            json!({
+                "role": "system",
+                "content": [{
+                    "type": "text",
+                    "text": "stable policy",
+                    "cache_control": {"type": "ephemeral"}
+                }]
+            }),
+            json!({"role": "system", "content": "volatile task state A"}),
+            json!({"role": "user", "content": "request A"}),
+        ];
+        let tools = vec![json!({
+            "type": "function",
+            "function": {"name": "read_file", "parameters": {"type": "object"}},
+            "cache_control": {"type": "ephemeral"}
+        })];
+        let mut baseline = json!({"source": "llm_context"});
+        augment_manifest_trace_with_wire(&mut baseline, &messages, &tools);
+
+        let mut changed_tail_messages = messages.clone();
+        changed_tail_messages[1]["content"] = json!("volatile task state B");
+        changed_tail_messages[2]["content"] = json!("request B");
+        let mut changed_tail = json!({"source": "llm_context"});
+        augment_manifest_trace_with_wire(&mut changed_tail, &changed_tail_messages, &tools);
+        assert_eq!(
+            baseline["wire"]["fingerprint"]["prompt_cache_identity"],
+            changed_tail["wire"]["fingerprint"]["prompt_cache_identity"],
+            "task/resource/user volatility after the marker must not churn the stable prefix"
+        );
+
+        let mut changed_tools = tools.clone();
+        changed_tools[0]["function"]["parameters"] = json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}}
+        });
+        let mut changed_schema = json!({"source": "llm_context"});
+        augment_manifest_trace_with_wire(&mut changed_schema, &messages, &changed_tools);
+        assert_ne!(
+            baseline["wire"]["fingerprint"]["prompt_cache_identity"],
+            changed_schema["wire"]["fingerprint"]["prompt_cache_identity"],
+            "a stable tool-schema change must invalidate the prompt identity"
         );
     }
 

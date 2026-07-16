@@ -70,6 +70,16 @@ pub struct IntrospectSnapshot {
     /// schemas remain canonical and do not include provider placement.
     #[serde(default)]
     pub tool_admission: Vec<ToolAdmissionSnapshotEntry>,
+    /// Recent governed semantic-read decisions projected from authoritative
+    /// tool-result evidence. This is bounded runtime evidence, not a second
+    /// cache state store.
+    #[serde(default)]
+    pub semantic_cache_decisions: Vec<SemanticCacheDecisionSnapshotEntry>,
+    /// Owner-scoped durable invocation, archive, artifact-reference, and
+    /// reconciliation evidence loaded from the execution ledger. This is a
+    /// read-only projection and never becomes execution authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation_lifecycle: Option<InvocationLifecycleSnapshot>,
     /// Provider-reported input token total for this snapshot. This includes
     /// fresh input tokens, cached-read input tokens, and cache-creation tokens.
     pub total_input_tokens: u64,
@@ -263,6 +273,36 @@ pub struct ToolAdmissionSnapshotEntry {
     pub candidates: Vec<ToolAdmissionCandidateSnapshotEntry>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticCacheDecisionSnapshotEntry {
+    pub tool_name: String,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InvocationLifecycleSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    pub hot_total: u64,
+    pub prepared: u64,
+    pub dispatched: u64,
+    pub succeeded: u64,
+    pub failed: u64,
+    pub rejected: u64,
+    pub outcome_unknown: u64,
+    pub rejected_without_dispatch: u64,
+    pub archive_chunks: u64,
+    pub durable_artifact_references: u64,
+    pub reconciliation_events: u64,
+    pub compaction_deferred_events: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_cursor_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_cursor_updated_at: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ToolAdmissionCandidateSnapshotEntry {
     pub offer_id: String,
@@ -384,6 +424,23 @@ fn render_hint(s: &IntrospectSnapshot) -> String {
         out.push_str(" tool_admission=");
         out.push_str(&tool_admission_inline_summary(s));
     }
+    if !s.semantic_cache_decisions.is_empty() {
+        out.push_str(&format!(
+            " semantic_cache_decisions={}",
+            s.semantic_cache_decisions.len()
+        ));
+    }
+    if let Some(lifecycle) = s.invocation_lifecycle.as_ref() {
+        out.push_str(&format!(
+            " invocation_lifecycle=hot:{} prepared:{} dispatched:{} unknown:{} archives:{} refs:{}",
+            lifecycle.hot_total,
+            lifecycle.prepared,
+            lifecycle.dispatched,
+            lifecycle.outcome_unknown,
+            lifecycle.archive_chunks,
+            lifecycle.durable_artifact_references,
+        ));
+    }
     out
 }
 
@@ -461,6 +518,34 @@ fn render_summary(s: &IntrospectSnapshot) -> String {
         out.push_str(&format!(
             "Tool admission: {}\n",
             tool_admission_inline_summary(s)
+        ));
+    }
+    if !s.semantic_cache_decisions.is_empty() {
+        out.push_str("Semantic read cache decisions: ");
+        out.push_str(
+            &s.semantic_cache_decisions
+                .iter()
+                .map(|entry| format!("{}={}", entry.tool_name, entry.state))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        out.push('\n');
+    }
+    if let Some(lifecycle) = s.invocation_lifecycle.as_ref() {
+        out.push_str(&format!(
+            "Invocation lifecycle: hot={} prepared={} dispatched={} succeeded={} failed={} rejected={} not_dispatched_rejections={} outcome_unknown={} archive_chunks={} artifact_refs={} reconciliations={} deferred={}\n",
+            lifecycle.hot_total,
+            lifecycle.prepared,
+            lifecycle.dispatched,
+            lifecycle.succeeded,
+            lifecycle.failed,
+            lifecycle.rejected,
+            lifecycle.rejected_without_dispatch,
+            lifecycle.outcome_unknown,
+            lifecycle.archive_chunks,
+            lifecycle.durable_artifact_references,
+            lifecycle.reconciliation_events,
+            lifecycle.compaction_deferred_events,
         ));
     }
     out.trim_end().to_string()
@@ -561,6 +646,58 @@ fn render_full(s: &IntrospectSnapshot) -> String {
     if !s.step_latency.is_empty() {
         out.push('\n');
         out.push_str(&render_step_latency(s));
+    }
+
+    if !s.semantic_cache_decisions.is_empty() {
+        out.push_str("\n## Semantic Read Cache Decisions\n");
+        for decision in &s.semantic_cache_decisions {
+            out.push_str("- ");
+            out.push_str(&decision.tool_name);
+            out.push_str(": ");
+            out.push_str(&decision.state);
+            if let Some(key_id) = decision.key_id.as_deref() {
+                out.push_str(" key=");
+                out.push_str(key_id);
+            }
+            out.push('\n');
+        }
+    }
+
+    if let Some(lifecycle) = s.invocation_lifecycle.as_ref() {
+        out.push_str("\n## Durable Invocation Lifecycle\n");
+        if let Some(run_id) = lifecycle.run_id.as_deref() {
+            out.push_str(&format!("Run: {run_id}\n"));
+        } else {
+            out.push_str("Scope: session\n");
+        }
+        out.push_str(&format!(
+            "Hot: total={} prepared={} dispatched={} succeeded={} failed={} rejected={} outcome_unknown={}\n",
+            lifecycle.hot_total,
+            lifecycle.prepared,
+            lifecycle.dispatched,
+            lifecycle.succeeded,
+            lifecycle.failed,
+            lifecycle.rejected,
+            lifecycle.outcome_unknown,
+        ));
+        out.push_str(&format!(
+            "Evidence: not_dispatched_rejections={} archive_chunks={} artifact_refs={} reconciliation_events={} deferred_events={}\n",
+            lifecycle.rejected_without_dispatch,
+            lifecycle.archive_chunks,
+            lifecycle.durable_artifact_references,
+            lifecycle.reconciliation_events,
+            lifecycle.compaction_deferred_events,
+        ));
+        if let Some(generation) = lifecycle.compaction_cursor_generation {
+            out.push_str(&format!(
+                "Compaction cursor: generation={} updated_at={}\n",
+                generation,
+                lifecycle
+                    .compaction_cursor_updated_at
+                    .as_deref()
+                    .unwrap_or("unknown"),
+            ));
+        }
     }
 
     if s.alerts.len() > 3 {
@@ -987,6 +1124,8 @@ mod tests {
                     .into(),
             capacity_provider_coverage: Vec::new(),
             tool_admission: Vec::new(),
+            semantic_cache_decisions: Vec::new(),
+            invocation_lifecycle: None,
             total_input_tokens: 145_000,
             total_output_tokens: 12_000,
             cache_read_tokens: 95_000,
@@ -1022,6 +1161,76 @@ mod tests {
         assert!(output.contains("turns=8/20"));
         assert!(output.contains("alerts=2"));
         assert!(output.contains("model=deepseek-v4-pro-official(thinking:high)"));
+    }
+
+    #[test]
+    fn semantic_cache_decisions_are_visible_without_breaking_hint_geometry() {
+        let mut snapshot = sample_snapshot();
+        snapshot.semantic_cache_decisions = vec![SemanticCacheDecisionSnapshotEntry {
+            tool_name: "catalog_read".to_string(),
+            state: "freshness_unavailable".to_string(),
+            key_id: None,
+        }];
+
+        let hint = render_introspect(&snapshot, IntrospectTextDepth::Hint);
+        assert!(!hint.contains('\n'));
+        assert!(hint.contains("semantic_cache_decisions=1"));
+        let summary = render_introspect(&snapshot, IntrospectTextDepth::Summary);
+        assert!(summary.contains("catalog_read=freshness_unavailable"));
+        let full = render_introspect(&snapshot, IntrospectTextDepth::Full);
+        assert!(full.contains("## Semantic Read Cache Decisions"));
+    }
+
+    #[test]
+    fn durable_invocation_lifecycle_is_visible_in_text_and_json_evidence() {
+        let mut snapshot = sample_snapshot();
+        snapshot.invocation_lifecycle = Some(InvocationLifecycleSnapshot {
+            run_id: Some("run-1".to_string()),
+            hot_total: 3,
+            prepared: 1,
+            dispatched: 0,
+            succeeded: 1,
+            failed: 0,
+            rejected: 0,
+            outcome_unknown: 1,
+            rejected_without_dispatch: 0,
+            archive_chunks: 2,
+            durable_artifact_references: 4,
+            reconciliation_events: 1,
+            compaction_deferred_events: 1,
+            compaction_cursor_generation: Some(7),
+            compaction_cursor_updated_at: Some("2026-07-16 10:00:00.000000".to_string()),
+        });
+
+        let hint = render_introspect(&snapshot, IntrospectTextDepth::Hint);
+        assert!(hint.contains("invocation_lifecycle=hot:3"));
+        let full = render_introspect(&snapshot, IntrospectTextDepth::Full);
+        assert!(full.contains("## Durable Invocation Lifecycle"));
+        assert!(full.contains("outcome_unknown=1"));
+        let request = IntrospectRequest::from_args(&serde_json::json!({
+            "facet": "session",
+            "depth": "diagnostic",
+            "format": "json"
+        }));
+        let report: serde_json::Value =
+            serde_json::from_str(&render_introspect_request(&snapshot, &request)).unwrap();
+        assert!(
+            report["observations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| {
+                    entry["kind"] == "durable_invocation_lifecycle"
+                        && entry["severity"] == "warning"
+                })
+        );
+        assert!(
+            report["evidence"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| { entry["source"] == "matrixone.tool_invocation_lifecycle" })
+        );
     }
 
     #[test]

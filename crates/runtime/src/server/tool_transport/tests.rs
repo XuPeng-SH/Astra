@@ -6,6 +6,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
+use super::super::tool_transport_metadata::{
+    TOOL_ERROR_KIND_ROUTE_MISMATCH, TOOL_ERROR_KIND_TRANSPORT_UNAVAILABLE,
+};
 use super::super::tool_transport_plan::{EdgeBoundExecutionPlan, edge_executor_id};
 use astra_services::multi_agent::{EdgeDispatchIdentity, EdgeDispatchRow};
 
@@ -344,18 +347,24 @@ fn runtime_outcome_for_request(
 
 struct StaticEdgeDispatch {
     inserted_edge_agent_ids: Mutex<Vec<String>>,
+    inserted_identities: Mutex<Vec<EdgeDispatchIdentity>>,
     failed_dispatches: Mutex<Vec<(String, String)>>,
     return_result: bool,
     result_status: &'static str,
+    terminal_admission_result: Option<String>,
+    admission_error: Option<astra_services::multi_agent::EdgeDispatchAdmissionError>,
 }
 
 impl Default for StaticEdgeDispatch {
     fn default() -> Self {
         Self {
             inserted_edge_agent_ids: Mutex::new(Vec::new()),
+            inserted_identities: Mutex::new(Vec::new()),
             failed_dispatches: Mutex::new(Vec::new()),
             return_result: true,
             result_status: "completed",
+            terminal_admission_result: None,
+            admission_error: None,
         }
     }
 }
@@ -364,18 +373,60 @@ impl StaticEdgeDispatch {
     fn no_result() -> Self {
         Self {
             inserted_edge_agent_ids: Mutex::new(Vec::new()),
+            inserted_identities: Mutex::new(Vec::new()),
             failed_dispatches: Mutex::new(Vec::new()),
             return_result: false,
             result_status: "completed",
+            terminal_admission_result: None,
+            admission_error: None,
         }
     }
 
     fn failed_result() -> Self {
         Self {
             inserted_edge_agent_ids: Mutex::new(Vec::new()),
+            inserted_identities: Mutex::new(Vec::new()),
             failed_dispatches: Mutex::new(Vec::new()),
             return_result: true,
             result_status: "failed",
+            terminal_admission_result: None,
+            admission_error: None,
+        }
+    }
+
+    fn terminal_admission(output: &str) -> Self {
+        Self {
+            inserted_edge_agent_ids: Mutex::new(Vec::new()),
+            inserted_identities: Mutex::new(Vec::new()),
+            failed_dispatches: Mutex::new(Vec::new()),
+            return_result: false,
+            result_status: "completed",
+            terminal_admission_result: Some(
+                serde_json::json!({"status":"completed","output":output}).to_string(),
+            ),
+            admission_error: None,
+        }
+    }
+
+    fn admission_rejected(message: &str) -> Self {
+        Self {
+            admission_error: Some(
+                astra_services::multi_agent::EdgeDispatchAdmissionError::Rejected(
+                    message.to_string(),
+                ),
+            ),
+            ..Self::default()
+        }
+    }
+
+    fn admission_outcome_unknown(message: &str) -> Self {
+        Self {
+            admission_error: Some(
+                astra_services::multi_agent::EdgeDispatchAdmissionError::OutcomeUnknown(
+                    message.to_string(),
+                ),
+            ),
+            ..Self::default()
         }
     }
 }
@@ -384,7 +435,7 @@ impl StaticEdgeDispatch {
 impl astra_services::multi_agent::EdgeDispatchService for StaticEdgeDispatch {
     async fn insert_dispatch(
         &self,
-        _identity: &EdgeDispatchIdentity,
+        identity: &EdgeDispatchIdentity,
         edge_agent_id: &str,
         _payload_json: &str,
     ) -> Result<(), String> {
@@ -392,7 +443,39 @@ impl astra_services::multi_agent::EdgeDispatchService for StaticEdgeDispatch {
             .lock()
             .expect("inserted edge agent ids lock")
             .push(edge_agent_id.to_string());
+        self.inserted_identities
+            .lock()
+            .expect("inserted identities lock")
+            .push(identity.clone());
         Ok(())
+    }
+
+    async fn admit_dispatch(
+        &self,
+        identity: &EdgeDispatchIdentity,
+        edge_agent_id: &str,
+        payload_json: &str,
+    ) -> Result<
+        astra_services::multi_agent::EdgeDispatchAdmission,
+        astra_services::multi_agent::EdgeDispatchAdmissionError,
+    > {
+        if let Some(error @ astra_services::multi_agent::EdgeDispatchAdmissionError::Rejected(_)) =
+            &self.admission_error
+        {
+            return Err(error.clone());
+        }
+        self.insert_dispatch(identity, edge_agent_id, payload_json)
+            .await
+            .map_err(astra_services::multi_agent::EdgeDispatchAdmissionError::OutcomeUnknown)?;
+        if let Some(error) = &self.admission_error {
+            return Err(error.clone());
+        }
+        Ok(match &self.terminal_admission_result {
+            Some(result) => {
+                astra_services::multi_agent::EdgeDispatchAdmission::Terminal(result.clone())
+            }
+            None => astra_services::multi_agent::EdgeDispatchAdmission::Pending,
+        })
     }
 
     async fn poll_pending(
@@ -415,6 +498,7 @@ impl astra_services::multi_agent::EdgeDispatchService for StaticEdgeDispatch {
     async fn fail_dispatch(
         &self,
         identity: &EdgeDispatchIdentity,
+        _edge_agent_id: &str,
         reason: &str,
     ) -> Result<bool, String> {
         self.failed_dispatches
@@ -510,6 +594,7 @@ impl astra_services::multi_agent::EdgeDispatchService for PendingEdgeDispatch {
     async fn fail_dispatch(
         &self,
         identity: &EdgeDispatchIdentity,
+        _edge_agent_id: &str,
         reason: &str,
     ) -> Result<bool, String> {
         self.failed_dispatches
@@ -650,13 +735,16 @@ impl astra_services::multi_agent::EdgeDispatchService for SharedNoStickyEdgeDisp
     async fn fail_dispatch(
         &self,
         identity: &EdgeDispatchIdentity,
+        edge_agent_id: &str,
         reason: &str,
     ) -> Result<bool, String> {
         let mut rows = self.rows.lock().expect("shared dispatch rows");
         let Some(row) = rows.get_mut(identity) else {
             return Ok(false);
         };
-        if !matches!(row.status.as_str(), "pending" | "dispatched") {
+        if row.edge_agent_id != edge_agent_id
+            || !matches!(row.status.as_str(), "pending" | "dispatched")
+        {
             return Ok(false);
         }
         row.status = "failed".to_string();
@@ -760,13 +848,13 @@ impl astra_services::multi_agent::EdgeRegistryService for StaticEdgeRegistry {
         Ok(self.agents.clone())
     }
 
-    async fn unregister(
+    async fn unregister_generation(
         &self,
         _user_id: &str,
         _edge_agent_id: &str,
-        _edge_id: &str,
-    ) -> Result<(), String> {
-        Ok(())
+        _edge_id_header: &str,
+    ) -> Result<bool, String> {
+        Ok(true)
     }
 }
 
@@ -941,14 +1029,12 @@ fn route_boundary_tool_call_end_includes_structured_artifact_result_metadata() {
     assert_eq!(end_event["type"], "tool_call_end");
     assert_eq!(end_event["result"], "created main.go");
     assert_eq!(
-        end_event["output"]["artifacts"][0]["artifact_id"],
-        "artifact_file_1"
-    );
-    assert_eq!(
         end_event["structuredContent"]["artifacts"][0]["artifact_id"],
         "artifact_file_1"
     );
-    assert_eq!(end_event["artifacts"][0]["artifact_id"], "artifact_file_1");
+    assert!(end_event.get("output").is_none());
+    assert!(end_event.get("artifacts").is_none());
+    assert!(end_event.get("artifact").is_none());
 }
 
 #[test]
@@ -1404,17 +1490,17 @@ fn edge_bound_execution_plan_builds_dispatch_payload_and_delivery_metadata() {
         "command": "pwd"
     });
 
-    let plan = EdgeBoundExecutionPlan::from_request_with_dispatch_id(&request, "edge-dispatch-1");
+    let plan = EdgeBoundExecutionPlan::try_from_request(&request).unwrap();
 
     assert_eq!(plan.selected_executor_id(), Some("edge-1"));
-    assert_eq!(plan.dispatch_request_id(), "edge-dispatch-1");
+    assert_eq!(plan.dispatch_request_id(), plan.identity().storage_key());
     assert_eq!(plan.wait_timeout(), std::time::Duration::from_secs(310));
 
     let payload: Value =
         serde_json::from_str(&plan.dispatch_payload_json().expect("dispatch payload"))
             .expect("payload json");
     assert_eq!(payload["type"], "edge_tool_request");
-    assert_eq!(payload["request_id"], "edge-dispatch-1");
+    assert_eq!(payload["request_id"], plan.identity().storage_key());
     assert_eq!(payload["tool"], "bash");
     assert_eq!(payload["timeout_secs"], 300);
     assert_eq!(payload["args"]["command"], "pwd");
@@ -1457,17 +1543,13 @@ fn edge_bound_execution_plan_uses_policy_timeout_from_binding() {
     });
     let binding = request.runtime_environment_binding(&registry);
 
-    let plan = EdgeBoundExecutionPlan::from_request_with_binding_and_dispatch_id(
-        &request,
-        &binding,
-        "edge-dispatch-read",
-    );
+    let plan = EdgeBoundExecutionPlan::try_from_request_with_binding(&request, &binding).unwrap();
 
     assert_eq!(plan.wait_timeout(), std::time::Duration::from_secs(40));
     let payload: Value =
         serde_json::from_str(&plan.dispatch_payload_json().expect("dispatch payload"))
             .expect("payload json");
-    assert_eq!(payload["request_id"], "edge-dispatch-read");
+    assert_eq!(payload["request_id"], plan.identity().storage_key());
     assert_eq!(payload["tool"], "read_file");
     assert_eq!(payload["timeout_secs"], 30);
 }
@@ -1492,11 +1574,7 @@ fn edge_bound_execution_plan_uses_policy_snapshot_timeout_override() {
     request.policy.max_execution_secs = Some(7.2);
     let binding = request.runtime_environment_binding(&registry);
 
-    let plan = EdgeBoundExecutionPlan::from_request_with_binding_and_dispatch_id(
-        &request,
-        &binding,
-        "edge-dispatch-short",
-    );
+    let plan = EdgeBoundExecutionPlan::try_from_request_with_binding(&request, &binding).unwrap();
 
     assert_eq!(plan.wait_timeout(), std::time::Duration::from_secs(18));
     let payload: Value =
@@ -2536,8 +2614,10 @@ async fn edge_bound_selected_executor_does_not_route_to_other_connected_edge() {
         Some("/Users/test/other".to_string()),
         tx,
     );
+    let dispatch = Arc::new(StaticEdgeDispatch::default());
     let service = ToolExecutionService::builder()
         .edge_connection_pool(pool)
+        .edge_dispatch_service(dispatch.clone())
         .build();
     let local = CountingLocalTransport::new();
 
@@ -2563,10 +2643,25 @@ async fn edge_bound_selected_executor_does_not_route_to_other_connected_edge() {
 
     assert!(result.is_error, "{result:?}");
     assert!(
-        result.output.contains("transport 'edge_ws' disconnected")
-            || result.output.contains("transport disconnected"),
+        result
+            .output
+            .contains("unavailable before tool 'bash' was dispatched"),
         "{}",
         result.output
+    );
+    let metadata = result.metadata.expect("transport metadata");
+    assert_eq!(
+        metadata["error_kind"],
+        TOOL_ERROR_KIND_TRANSPORT_UNAVAILABLE
+    );
+    assert_eq!(metadata["execution_started"], false);
+    assert!(
+        dispatch
+            .inserted_edge_agent_ids
+            .lock()
+            .expect("inserted edge agent ids lock")
+            .is_empty(),
+        "missing selected executor must not admit a dispatch for another connected edge"
     );
     assert_eq!(local.calls(), 0);
     assert!(
@@ -2576,7 +2671,7 @@ async fn edge_bound_selected_executor_does_not_route_to_other_connected_edge() {
 }
 
 #[tokio::test]
-async fn edge_ws_result_preserves_tool_result_fields() {
+async fn edge_websocket_without_durable_dispatch_authority_does_not_send() {
     let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<astra_server_types::EdgeServerMessage>(1);
     pool.register_with_capabilities(
@@ -2589,7 +2684,199 @@ async fn edge_ws_result_preserves_tool_result_fields() {
         tx,
     );
     let service = ToolExecutionService::builder()
+        .edge_connection_pool(pool)
+        .build();
+
+    let result = service
+        .execute(
+            request(
+                "bash",
+                WorkspaceBinding::edge_workspace(
+                    "MacBook Pro",
+                    "/Users/test/project",
+                    WorkspaceAuthority::ReadWrite,
+                ),
+                ExecutorBinding::edge_agent(
+                    "edge-selected",
+                    "MacBook Pro",
+                    ToolTransportKind::EdgeWs,
+                    ExecutorStatus::Online,
+                ),
+            ),
+            &CountingLocalTransport::new(),
+        )
+        .await;
+
+    assert!(result.is_error, "{result:?}");
+    assert!(
+        rx.try_recv().is_err(),
+        "socket delivery without a durable ACK authority must be rejected before send"
+    );
+    let metadata = result.metadata.expect("transport metadata");
+    assert_eq!(
+        metadata["side_effects_maybe"], false,
+        "an invocation rejected before delivery has a certain not-dispatched outcome"
+    );
+    assert_eq!(metadata["execution_started"], false);
+    assert_eq!(metadata["retryable"], true);
+}
+
+#[tokio::test]
+async fn terminal_durable_dispatch_replays_without_socket_redispatch() {
+    let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
+    let dispatch = Arc::new(StaticEdgeDispatch::terminal_admission("durable-result"));
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<astra_server_types::EdgeServerMessage>(1);
+    pool.register_with_capabilities(
+        "user-1",
+        "edge-selected",
+        Some("MacBook Pro".to_string()),
+        Some("/Users/test/project".to_string()),
+        Some(edge_runtime_environment_advertisement("edge-selected")),
+        None,
+        tx,
+    );
+    let service = ToolExecutionService::builder()
+        .edge_connection_pool(pool)
+        .edge_dispatch_service(dispatch)
+        .build();
+
+    let result = service
+        .execute(
+            request(
+                "bash",
+                WorkspaceBinding::edge_workspace(
+                    "MacBook Pro",
+                    "/Users/test/project",
+                    WorkspaceAuthority::ReadWrite,
+                ),
+                ExecutorBinding::edge_agent(
+                    "edge-selected",
+                    "MacBook Pro",
+                    ToolTransportKind::EdgeWs,
+                    ExecutorStatus::Online,
+                ),
+            ),
+            &CountingLocalTransport::new(),
+        )
+        .await;
+
+    assert!(!result.is_error, "{result:?}");
+    assert_eq!(result.output, "durable-result");
+    assert!(
+        rx.try_recv().is_err(),
+        "terminal durable evidence must replay without crossing the socket boundary again"
+    );
+    assert_eq!(result.metadata.unwrap()["transport"], "edge_ledger");
+}
+
+#[tokio::test]
+async fn workspace_service_account_edge_separates_route_owner_from_invocation_owner() {
+    let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
+    let dispatch = Arc::new(StaticEdgeDispatch::default());
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<astra_server_types::EdgeServerMessage>(1);
+    pool.register_with_capabilities(
+        "sandbox-service-account",
+        "edge-selected",
+        Some("sandbox".to_string()),
+        Some("/workspace".to_string()),
+        Some(edge_runtime_environment_advertisement("edge-selected")),
+        Some("workspace-1".to_string()),
+        tx,
+    );
+    let service = ToolExecutionService::builder()
         .edge_connection_pool(pool.clone())
+        .edge_dispatch_service(dispatch.clone())
+        .build();
+    let mut tool_request = request(
+        "bash",
+        WorkspaceBinding::edge_workspace("sandbox", "/workspace", WorkspaceAuthority::ReadWrite),
+        ExecutorBinding::edge_agent(
+            "edge-selected",
+            "sandbox",
+            ToolTransportKind::EdgeWs,
+            ExecutorStatus::Online,
+        ),
+    );
+    tool_request.workspace_record = Some(astra_runtime_env::WorkspaceRecord {
+        workspace_id: "workspace-1".to_string(),
+        owner_scope: astra_runtime_env::WorkspaceOwnerScope::Executor,
+        kind: astra_runtime_env::WorkspaceBindingKind::EdgeWorkspace,
+        authority: astra_runtime_env::WorkspaceAuthority::ReadWrite,
+        root_or_volume_ref: "/workspace".to_string(),
+        source: astra_runtime_env::WorkspaceSource::EdgePath {
+            executor_id: "edge-selected".to_string(),
+            path: "/workspace".to_string(),
+        },
+        persistence: astra_runtime_env::WorkspacePersistence::Persistent,
+        revision: "rev-1".to_string(),
+        display_name: "sandbox".to_string(),
+    });
+
+    let handle = tokio::spawn(async move {
+        service
+            .execute(tool_request, &CountingLocalTransport::new())
+            .await
+    });
+
+    let message = rx.recv().await.expect("service-account edge tool request");
+    let (request_id, delivery_generation, identity) = match message {
+        astra_server_types::EdgeServerMessage::ToolRequest {
+            request_id,
+            delivery_generation,
+            identity,
+            ..
+        } => (request_id, delivery_generation, identity),
+        other => panic!("expected tool request, got {other:?}"),
+    };
+    assert_eq!(
+        identity.user_id, "user-1",
+        "the protocol must preserve the logical invocation owner"
+    );
+    let admitted = dispatch
+        .inserted_identities
+        .lock()
+        .expect("inserted identities lock");
+    assert_eq!(admitted.len(), 1);
+    assert_eq!(
+        admitted[0].user_id, "sandbox-service-account",
+        "the durable dispatch row must use the authenticated route owner"
+    );
+    drop(admitted);
+
+    assert!(pool.deliver_tool_result(
+        "sandbox-service-account",
+        "edge-selected",
+        &request_id,
+        delivery_generation,
+        astra_server_types::edge_connection_pool::EdgeToolResult {
+            output: "sandbox-result".to_string(),
+            is_error: false,
+            duration_ms: Some(3),
+            tool_result_fields: None,
+        },
+    ));
+    let result = handle.await.expect("edge execution join");
+    assert!(!result.is_error, "{result:?}");
+    assert_eq!(result.output, "sandbox-result");
+}
+
+#[tokio::test]
+async fn edge_ws_result_preserves_tool_result_fields() {
+    let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
+    let dispatch = Arc::new(StaticEdgeDispatch::default());
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<astra_server_types::EdgeServerMessage>(1);
+    pool.register_with_capabilities(
+        "user-1",
+        "edge-selected",
+        Some("MacBook Pro".to_string()),
+        Some("/Users/test/project".to_string()),
+        Some(edge_runtime_environment_advertisement("edge-selected")),
+        None,
+        tx,
+    );
+    let service = ToolExecutionService::builder()
+        .edge_connection_pool(pool.clone())
+        .edge_dispatch_service(dispatch.clone())
         .build();
     let request = request(
         "bash",
@@ -2611,8 +2898,20 @@ async fn edge_ws_result_preserves_tool_result_fields() {
     });
 
     let message = rx.recv().await.expect("edge tool request");
-    let request_id = match message {
-        astra_server_types::EdgeServerMessage::ToolRequest { request_id, .. } => request_id,
+    assert_eq!(
+        *dispatch
+            .inserted_edge_agent_ids
+            .lock()
+            .expect("inserted edge agent ids lock"),
+        vec!["edge-selected".to_string()],
+        "the durable dispatch row must exist before direct socket delivery"
+    );
+    let (request_id, delivery_generation) = match message {
+        astra_server_types::EdgeServerMessage::ToolRequest {
+            request_id,
+            delivery_generation,
+            ..
+        } => (request_id, delivery_generation),
         other => panic!("expected tool request, got {other:?}"),
     };
     let mut fields = serde_json::Map::new();
@@ -2625,6 +2924,7 @@ async fn edge_ws_result_preserves_tool_result_fields() {
         "user-1",
         "edge-selected",
         &request_id,
+        delivery_generation,
         astra_server_types::edge_connection_pool::EdgeToolResult {
             output: "failed".to_string(),
             is_error: true,
@@ -2790,6 +3090,7 @@ async fn edge_dispatch_waiter_poller_and_callback_do_not_require_sticky_pod() {
                 tool,
                 args,
                 timeout_secs,
+                ..
             } => {
                 assert_eq!(request_id, row.request_id);
                 assert_eq!(tool, "bash");
@@ -2904,6 +3205,128 @@ async fn edge_bound_offline_or_unknown_status_blocks_without_dispatch() {
 }
 
 #[tokio::test]
+async fn edge_admission_rejection_is_reported_as_certain_and_is_not_retried() {
+    let dispatch = Arc::new(StaticEdgeDispatch::admission_rejected(
+        "durable identity conflicts with its owner",
+    ));
+    let service = ToolExecutionService::builder()
+        .edge_dispatch_service(dispatch.clone())
+        .edge_registry_service(Arc::new(StaticEdgeRegistry {
+            agents: vec![edge_agent_record("edge-selected")],
+        }))
+        .build();
+    let local = CountingLocalTransport::new();
+
+    let result = service
+        .execute(
+            request(
+                "bash",
+                WorkspaceBinding::edge_workspace(
+                    "MacBook Pro",
+                    "/Users/test/project",
+                    WorkspaceAuthority::ReadWrite,
+                ),
+                ExecutorBinding::edge_agent(
+                    "edge-selected",
+                    "MacBook Pro",
+                    ToolTransportKind::EdgeWs,
+                    ExecutorStatus::Online,
+                ),
+            ),
+            &local,
+        )
+        .await;
+
+    assert!(result.is_error, "{result:?}");
+    let metadata = result.metadata.expect("admission rejection metadata");
+    assert_eq!(metadata["error_kind"], TOOL_ERROR_KIND_ROUTE_MISMATCH);
+    assert_eq!(metadata["reason"], TOOL_ERROR_KIND_ROUTE_MISMATCH);
+    assert!(
+        metadata.get("outcome_certainty").is_none(),
+        "a proven admission rejection must not claim the tool may have executed"
+    );
+    assert!(
+        result.output.contains("The tool was not dispatched"),
+        "{}",
+        result.output
+    );
+    assert_eq!(
+        local.calls(),
+        0,
+        "an edge-bound tool must never fall back locally"
+    );
+    assert!(
+        dispatch
+            .inserted_edge_agent_ids
+            .lock()
+            .expect("inserted edge agent ids lock")
+            .is_empty(),
+        "the rejected admission fixture proves no durable dispatch was created"
+    );
+}
+
+#[tokio::test]
+async fn ambiguous_admission_commit_is_reported_as_outcome_unknown() {
+    let dispatch = Arc::new(StaticEdgeDispatch::admission_outcome_unknown(
+        "database response was lost after insert",
+    ));
+    let service = ToolExecutionService::builder()
+        .edge_dispatch_service(dispatch.clone())
+        .edge_registry_service(Arc::new(StaticEdgeRegistry {
+            agents: vec![edge_agent_record("edge-selected")],
+        }))
+        .build();
+    let local = CountingLocalTransport::new();
+
+    let result = service
+        .execute(
+            request(
+                "bash",
+                WorkspaceBinding::edge_workspace(
+                    "MacBook Pro",
+                    "/Users/test/project",
+                    WorkspaceAuthority::ReadWrite,
+                ),
+                ExecutorBinding::edge_agent(
+                    "edge-selected",
+                    "MacBook Pro",
+                    ToolTransportKind::EdgeWs,
+                    ExecutorStatus::Online,
+                ),
+            ),
+            &local,
+        )
+        .await;
+
+    assert!(result.is_error, "{result:?}");
+    let metadata = result.metadata.expect("ambiguous admission metadata");
+    assert_eq!(
+        metadata["error_kind"],
+        TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED
+    );
+    assert_eq!(metadata["outcome_certainty"], "unknown");
+    assert_eq!(metadata["side_effects_maybe"], true);
+    assert!(result.output.contains("reconcile its durable invocation"));
+    assert_eq!(
+        metadata["diagnostics"][0],
+        "edge-dispatch: admission outcome is unknown: database response was lost after insert"
+    );
+    assert_eq!(
+        local.calls(),
+        0,
+        "unknown outcome must never be retried locally"
+    );
+    assert_eq!(
+        *dispatch
+            .inserted_edge_agent_ids
+            .lock()
+            .expect("inserted edge agent ids lock"),
+        vec!["edge-selected".to_string()],
+        "the fixture models an insert that may have committed before the response was lost"
+    );
+}
+
+#[tokio::test]
 async fn edge_dispatch_without_result_reports_transport_disconnected() {
     let dispatch = Arc::new(StaticEdgeDispatch::no_result());
     let _local = CountingLocalTransport::new();
@@ -2952,6 +3375,9 @@ async fn edge_dispatch_without_result_reports_transport_disconnected() {
         RUN_BLOCKED_REASON_TRANSPORT_DISCONNECTED
     );
     assert_eq!(metadata["blocked"], true);
+    assert_eq!(metadata["side_effects_maybe"], true);
+    assert_eq!(metadata["outcome_certainty"], "unknown");
+    assert!(result.output.contains("reconcile its durable invocation"));
     assert_eq!(metadata["executor"]["status"], "degraded");
     assert_eq!(metadata["workspace"]["kind"], "edge_workspace");
     assert_eq!(local.calls(), 0);
@@ -3806,7 +4232,7 @@ async fn edge_dispatch_cancel_during_wait_reports_side_effect_uncertainty() {
 // ── Both transports unavailable with Online executor ──────────────────
 
 #[tokio::test]
-async fn online_executor_with_no_transports_reports_disconnected_with_diagnostics() {
+async fn online_executor_without_durable_authority_is_unavailable_before_dispatch() {
     let dispatch = Arc::new(StaticEdgeDispatch::no_result());
     let _local = CountingLocalTransport::new();
 
@@ -3840,18 +4266,20 @@ async fn online_executor_with_no_transports_reports_disconnected_with_diagnostic
 
     assert!(result.is_error, "{result:?}");
     assert!(
-        result.output.contains("transport 'edge_ws' disconnected")
-            || result.output.contains("transport disconnected"),
-        "{}",
-        result.output
+        result
+            .output
+            .contains("unavailable before tool 'bash' was dispatched")
     );
     let metadata = result.metadata.expect("diagnostics metadata");
     assert_eq!(
         metadata["error_kind"],
-        TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED
+        TOOL_ERROR_KIND_TRANSPORT_UNAVAILABLE
     );
+    assert_eq!(metadata["reason"], TOOL_ERROR_KIND_TRANSPORT_UNAVAILABLE);
     assert_eq!(metadata["executor"]["status"], "degraded");
     assert_eq!(metadata["workspace"]["kind"], "edge_workspace");
+    assert_eq!(metadata["execution_started"], false);
+    assert_eq!(metadata["side_effects_maybe"], false);
     assert_eq!(local.calls(), 0);
 }
 

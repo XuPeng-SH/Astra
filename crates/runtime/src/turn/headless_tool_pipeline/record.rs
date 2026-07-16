@@ -3,6 +3,7 @@ use std::time::Duration;
 use astra_services::SessionArtifactStore;
 
 use super::super::agentic::headless_round::HeadlessStderrStyle;
+use super::execute::execution_error_kind;
 use super::*;
 use astra_turn_core::edge_prompt_context::make_args_preview;
 use astra_turn_core::headless_tool_assembly::{
@@ -115,16 +116,22 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             mut execution,
             idem_key,
             pre_tool_context,
-            is_err,
-            error_kind,
+            mut is_err,
+            error_kind: source_error_kind,
             executed_ms,
         } = executed;
-        let cache_observation = execution.result_str.clone();
+        // Reusable observations exclude invocation-specific PostTool
+        // presentation, but they are never allowed to retain raw credentials
+        // or prompt-injection payloads.
+        let cache_observation =
+            astra_turn_core::safety_middleware::sanitize_tool_output_for_llm(&execution.result_str)
+                .content;
         if let Some(context) = pre_tool_context {
             execution
                 .result_str
                 .push_str(&format!("\n\n[Hook context]: {context}"));
         }
+        let mut post_tool_modified = false;
         if !self.ctx.tool_event_hooks.is_empty() && !is_err {
             if let Some(modified) = crate::skills::hooks::evaluate_post_tool_hooks(
                 self.ctx.tool_event_hooks,
@@ -135,11 +142,58 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             .await
             {
                 execution.result_str = modified;
+                post_tool_modified = true;
             }
         }
+        let exit_semantics = execution
+            .tool_result_fields
+            .as_ref()
+            .and_then(|metadata| metadata.get("exit_semantics"))
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok());
+        let governed = crate::server::runtime_tool_executor::govern_runtime_tool_result(
+            astra_tools::ToolResult {
+                output: execution.result_str,
+                metadata: execution.tool_result_fields,
+                is_error: is_err,
+                exit_semantics,
+            },
+            post_tool_modified,
+        );
+        let finalized = if let Some(pending) = execution.pending_runtime_completion.take() {
+            let executor = self
+                .ctx
+                .runtime_tool_executor
+                .expect("only a runtime executor can create a pending tool completion");
+            executor
+                .finish_governed_tool_result(governed, Some(pending))
+                .await
+        } else {
+            governed.into_inner()
+        };
+        is_err = finalized.is_error;
+        let error_kind = execution_error_kind(&finalized.output, finalized.metadata.as_ref())
+            .or(source_error_kind);
+        execution.result_str = finalized.output;
+        execution.tool_result_fields = finalized.metadata;
+
+        let journal_result_source =
+            tool_result_content_for_model_unbounded(&execution.name, &execution.result_str);
+        let journal_result_inline =
+            truncate_tool_result_for_model(&execution.name, &journal_result_source);
+        let journal_result = maybe_persist_model_tool_result(
+            self.ctx.current_session_id,
+            &execution.id,
+            &execution.name,
+            &journal_result_source,
+            journal_result_inline,
+        );
 
         let args_json = serde_json::to_string(&execution.args).ok();
-        let args_size = args_json.as_ref().map(|s| s.len() as u32).unwrap_or(0);
+        let args_size = args_json
+            .as_ref()
+            .map(|value| u32::try_from(value.len()).unwrap_or(u32::MAX))
+            .unwrap_or(0);
         let args_preview = make_args_preview(&execution.name, &execution.args);
         let args_full = args_json;
         let file_path = execution
@@ -154,7 +208,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 is_err,
                 executed_ms,
                 args_size,
-                execution.result_str.as_str(),
+                journal_result.as_str(),
                 args_preview.clone(),
                 file_path,
                 args_full,

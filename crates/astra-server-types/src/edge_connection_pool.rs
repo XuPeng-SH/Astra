@@ -10,14 +10,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use dashmap::DashMap;
+use dashmap::{DashMap, mapref::entry::Entry};
 use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 
-use crate::edge_ws_protocol::{EDGE_TOOL_TIMEOUT_SECS, EdgeServerMessage};
+use crate::edge_ws_protocol::{EDGE_TOOL_TIMEOUT_SECS, EdgeServerMessage, ToolInvocationIdentity};
 
 /// Maximum number of inflight dispatched tool requests tracked for dedup.
 /// When exceeded, the oldest entry (by dispatch time) is evicted before inserting.
@@ -56,6 +55,9 @@ pub struct DispatchedToolRequest {
 /// Metadata about a connected edge agent.
 #[derive(Debug)]
 pub struct EdgeConnection {
+    /// Monotonic in-process connection incarnation. Cleanup from an older
+    /// socket may remove only the exact generation it registered.
+    pub generation: u64,
     pub user_id: String,
     pub edge_agent_id: String,
     pub hostname: Option<String>,
@@ -68,12 +70,14 @@ pub struct EdgeConnection {
     pub workspace_id: Option<String>,
     pub sender: EdgeWsSender,
     pub connected_at: std::time::Instant,
-    /// Monotonically increasing generation counter assigned at registration.
-    /// Used by `unregister_if_generation` to guard against stale cleanup
-    /// overwriting a newer connection that replaced this one in the pool.
-    pub generation: u64,
     /// Pending tool call responses: request_id → oneshot sender.
-    pending_results: Arc<DashMap<String, oneshot::Sender<EdgeToolResult>>>,
+    pending_results: Arc<DashMap<String, PendingEdgeResult>>,
+}
+
+#[derive(Debug)]
+struct PendingEdgeResult {
+    delivery_generation: u64,
+    sender: oneshot::Sender<EdgeToolResult>,
 }
 
 /// Result from an edge tool execution.
@@ -104,15 +108,13 @@ pub struct EdgeConnectionPool {
     /// Global FIFO of dispatched request IDs for O(1)-amortized eviction when
     /// the pending set reaches capacity. Stale IDs are lazily skipped.
     pending_request_order: Arc<Mutex<VecDeque<String>>>,
-    /// Monotonically increasing counter used to assign a unique generation to
-    /// each registered connection. Guards `unregister_if_generation` against
-    /// stale cleanup overwriting a newer connection.
-    next_generation: Arc<AtomicU64>,
     /// Maximum number of inflight dispatched tool requests. When exceeded,
     /// the oldest entry is evicted before insertion.
     max_pending: usize,
     /// Maximum number of inflight dispatched tool requests per user.
     max_pending_per_user: usize,
+    next_connection_generation: Arc<AtomicU64>,
+    next_delivery_generation: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone)]
@@ -128,9 +130,10 @@ impl EdgeConnectionPool {
             pending_requests: Arc::new(DashMap::new()),
             pending_request_ids_by_user: Arc::new(DashMap::new()),
             pending_request_order: Arc::new(Mutex::new(VecDeque::new())),
-            next_generation: Arc::new(AtomicU64::new(1)),
             max_pending: MAX_PENDING_REQUESTS,
             max_pending_per_user: MAX_PENDING_REQUESTS_PER_USER,
+            next_connection_generation: Arc::new(AtomicU64::new(0)),
+            next_delivery_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -158,7 +161,7 @@ impl EdgeConnectionPool {
     /// Register a new edge connection with its structured runtime capability advertisement.
     /// Replaces any existing connection for the same key.
     /// Returns the generation ID assigned to this connection for use with
-    /// `unregister_if_generation` during cleanup.
+    /// `unregister_generation` during cleanup.
     ///
     /// `workspace_id` is the owning workspace, captured from the edge registration
     /// token's `provider_scope_id`.  Pass `None` for internal (non-moi) tokens.
@@ -173,57 +176,55 @@ impl EdgeConnectionPool {
         workspace_id: Option<String>,
         sender: EdgeWsSender,
     ) -> u64 {
-        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let key = pool_key(user_id, edge_agent_id);
-        self.connections.insert(
-            key,
-            EdgeConnection {
-                user_id: user_id.to_string(),
-                edge_agent_id: edge_agent_id.to_string(),
-                hostname,
-                workspace_dir,
-                capabilities,
-                workspace_id,
-                sender,
-                connected_at: std::time::Instant::now(),
-                generation,
-                pending_results: Arc::new(DashMap::new()),
-            },
-        );
+        let generation = self
+            .next_connection_generation
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        let mut connection = EdgeConnection {
+            generation,
+            user_id: user_id.to_string(),
+            edge_agent_id: edge_agent_id.to_string(),
+            hostname,
+            workspace_dir,
+            capabilities,
+            workspace_id,
+            sender,
+            connected_at: std::time::Instant::now(),
+            pending_results: Arc::new(DashMap::new()),
+        };
+        match self.connections.entry(key) {
+            Entry::Occupied(mut entry) => {
+                // A reconnect changes delivery ownership, not invocation
+                // identity. Preserve exact pending generations so a replayed
+                // durable result can still release its original waiter.
+                connection.pending_results = entry.get().pending_results.clone();
+                entry.insert(connection);
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(connection);
+            }
+        }
         generation
     }
 
-    /// Remove an edge connection only if its generation matches `expected_gen`.
-    ///
-    /// Returns `true` if the entry was removed, `false` if the generation did not
-    /// match (meaning a newer connection has already replaced this one in the pool).
-    ///
-    /// Follow-up cleanup is the caller's responsibility. It is safe when
-    /// additionally guarded by a connection-unique identifier (e.g. `edge_id`)
-    /// so that it cannot affect the replacement connection.
-    pub fn unregister_if_generation(
+    /// Remove only the connection incarnation registered by the caller.
+    /// Returns false when a newer socket already replaced it.
+    pub fn unregister_generation(
         &self,
         user_id: &str,
         edge_agent_id: &str,
-        expected_gen: u64,
+        generation: u64,
     ) -> bool {
         let key = pool_key(user_id, edge_agent_id);
-        if let Some((_, conn)) = self
+        let removed = self
             .connections
-            .remove_if(&key, |_, conn| conn.generation == expected_gen)
-        {
-            conn.pending_results.clear();
-            return true;
-        }
-        false
-    }
-
-    /// Remove an edge connection. Cancels any pending tool requests.
-    pub fn unregister(&self, user_id: &str, edge_agent_id: &str) {
-        let key = pool_key(user_id, edge_agent_id);
-        if let Some((_, conn)) = self.connections.remove(&key) {
-            // Drop all pending oneshot senders so execute_tool callers get None
-            conn.pending_results.clear();
+            .remove_if(&key, |_, connection| connection.generation == generation);
+        if let Some((_, connection)) = removed {
+            connection.pending_results.clear();
+            true
+        } else {
+            false
         }
     }
 
@@ -299,29 +300,38 @@ impl EdgeConnectionPool {
             .collect()
     }
 
-    /// Send a tool execution request to an edge agent and await the result.
-    ///
-    /// Returns `None` if the edge is not connected or the request times out.
-    ///
-    /// Stores the dispatched request in `pending_requests` for reconnection
-    /// dedup. When the edge reconnects, cloud can cross-reference its completed
-    /// request IDs against this set.
-    pub async fn execute_tool(
+    /// Deliver an invocation whose exact identity, edge owner, and payload
+    /// were already admitted by the durable dispatch authority.
+    pub async fn execute_durably_admitted_invocation_with_cancel(
         &self,
-        user_id: &str,
+        identity: &ToolInvocationIdentity,
         edge_agent_id: &str,
         tool: &str,
         args: &serde_json::Value,
+        cancel_token: Option<&CancellationToken>,
     ) -> Option<EdgeToolResult> {
-        self.execute_tool_with_cancel(user_id, edge_agent_id, tool, args, None)
-            .await
+        self.execute_durably_admitted_invocation_on_connection_with_cancel(
+            &identity.user_id,
+            identity,
+            edge_agent_id,
+            tool,
+            args,
+            cancel_token,
+        )
+        .await
     }
 
-    /// Send a tool execution request to an edge agent and await the result.
-    /// Cleans up the pending request on timeout, disconnect, or cancellation.
-    pub async fn execute_tool_with_cancel(
+    /// Execute a logical invocation through a connection owned by a distinct
+    /// authenticated principal.
+    ///
+    /// Sandbox edges may connect with a workspace-scoped service account while
+    /// the invocation identity remains owned by the end user. The connection
+    /// owner selects the socket; the durable identity remains unchanged in the
+    /// request and result protocol.
+    pub async fn execute_durably_admitted_invocation_on_connection_with_cancel(
         &self,
-        user_id: &str,
+        connection_user_id: &str,
+        identity: &ToolInvocationIdentity,
         edge_agent_id: &str,
         tool: &str,
         args: &serde_json::Value,
@@ -330,7 +340,7 @@ impl EdgeConnectionPool {
         if cancel_token.is_some_and(CancellationToken::is_cancelled) {
             return None;
         }
-        let key = pool_key(user_id, edge_agent_id);
+        let key = pool_key(connection_user_id, edge_agent_id);
         let (pending_results, sender) = {
             let Some(entry) = self.connections.get(&key) else {
                 tracing::warn!(
@@ -354,12 +364,24 @@ impl EdgeConnectionPool {
             (conn.pending_results.clone(), conn.sender.clone())
         };
 
-        let request_id = Uuid::new_v4().to_string();
+        let request_id = identity.storage_key();
+        let delivery_generation = self
+            .next_delivery_generation
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
         let (tx, rx) = oneshot::channel();
-        pending_results.insert(request_id.clone(), tx);
+        pending_results.insert(
+            request_id.clone(),
+            PendingEdgeResult {
+                delivery_generation,
+                sender: tx,
+            },
+        );
 
         let msg = EdgeServerMessage::ToolRequest {
             request_id: request_id.clone(),
+            identity: identity.clone(),
+            delivery_generation,
             tool: tool.to_string(),
             args: args.clone(),
             timeout_secs: EDGE_TOOL_TIMEOUT_SECS,
@@ -372,7 +394,7 @@ impl EdgeConnectionPool {
             args: args.clone(),
             dispatched_at: Instant::now(),
         };
-        self.insert_pending_request(user_id, &request_id, dispatched);
+        self.insert_pending_request(&identity.user_id, &request_id, dispatched);
 
         if let Err(e) = sender.send(msg).await {
             tracing::warn!(
@@ -400,6 +422,7 @@ impl EdgeConnectionPool {
         let cancel_edge = || {
             let _ = sender.try_send(EdgeServerMessage::ToolCancel {
                 request_id: request_id.clone(),
+                delivery_generation,
             });
         };
 
@@ -441,50 +464,34 @@ impl EdgeConnectionPool {
         }
     }
 
-    /// Send a tool execution request to the first available edge for a user.
-    pub async fn execute_tool_any_edge(
-        &self,
-        user_id: &str,
-        tool: &str,
-        args: &serde_json::Value,
-    ) -> Option<EdgeToolResult> {
-        self.execute_tool_any_edge_with_cancel(user_id, tool, args, None)
-            .await
-    }
-
-    /// Send a tool execution request to the first available edge for a user.
-    /// Cleans up the selected edge request if the caller cancels.
-    pub async fn execute_tool_any_edge_with_cancel(
-        &self,
-        user_id: &str,
-        tool: &str,
-        args: &serde_json::Value,
-        cancel_token: Option<&CancellationToken>,
-    ) -> Option<EdgeToolResult> {
-        // Find the first connected edge for this user
-        let edge_agent_id = self
-            .connections
-            .iter()
-            .find(|entry| entry.value().user_id == user_id && !entry.value().sender.is_closed())
-            .map(|entry| entry.value().edge_agent_id.clone())?;
-
-        self.execute_tool_with_cancel(user_id, &edge_agent_id, tool, args, cancel_token)
-            .await
-    }
-
     /// Deliver a tool result from an edge agent (called from the edge WS read loop).
     pub fn deliver_tool_result(
         &self,
         user_id: &str,
         edge_agent_id: &str,
         request_id: &str,
+        delivery_generation: u64,
         result: EdgeToolResult,
     ) -> bool {
         let key = pool_key(user_id, edge_agent_id);
         if let Some(entry) = self.connections.get(&key)
-            && let Some((_, tx)) = entry.value().pending_results.remove(request_id)
+            && let Some(pending) = entry.value().pending_results.get(request_id)
         {
-            return tx.send(result).is_ok();
+            if pending.delivery_generation != delivery_generation {
+                tracing::warn!(
+                    user_id = %user_id,
+                    edge_agent_id = %edge_agent_id,
+                    request_id = %request_id,
+                    expected_generation = pending.delivery_generation,
+                    delivery_generation,
+                    "edge tool result generation did not match pending delivery"
+                );
+                return false;
+            }
+            drop(pending);
+            if let Some((_, pending)) = entry.value().pending_results.remove(request_id) {
+                return pending.sender.send(result).is_ok();
+            }
         }
         // No pending entry: the request was already cancelled, timed out, or the
         // connection was reset. Log so operators can correlate late edge results
@@ -643,25 +650,30 @@ impl EdgeConnectionPool {
         // Per-sender drain: send Closing, then unregister.
         // DashMap retain takes &K, &mut V — we copy keys inline so we can call
         // unregister (which requires a shared reference to self).
-        let keys: Vec<String> = self
+        let connections: Vec<(String, String, u64)> = self
             .connections
             .iter()
             .filter(|entry| !entry.value().sender.is_closed())
-            .map(|entry| entry.key().clone())
+            .map(|entry| {
+                (
+                    entry.value().user_id.clone(),
+                    entry.value().edge_agent_id.clone(),
+                    entry.value().generation,
+                )
+            })
             .collect();
-        let count = keys.len();
+        let count = connections.len();
 
-        for key in &keys {
-            if let Some(entry) = self.connections.get(key) {
+        for (user_id, edge_agent_id, _) in &connections {
+            if let Some(entry) = self.connections.get(&pool_key(user_id, edge_agent_id)) {
                 let _ = entry.sender.try_send(closing.clone());
             }
         }
 
-        // Parse user_id:edge_agent_id back; unregister cleans up pending results.
-        for key in &keys {
-            if let Some((user_id, edge_agent_id)) = key.split_once(':') {
-                self.unregister(user_id, edge_agent_id);
-            }
+        // Generation fencing prevents a replacement that raced the drain
+        // snapshot from being removed.
+        for (user_id, edge_agent_id, generation) in &connections {
+            self.unregister_generation(user_id, edge_agent_id, *generation);
         }
 
         count
@@ -722,6 +734,10 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn admitted_identity(call_id: &str) -> ToolInvocationIdentity {
+        ToolInvocationIdentity::new("user-1", "session", "run", "turn", call_id).unwrap()
+    }
+
     #[test]
     fn register_and_check_connected() {
         let pool = EdgeConnectionPool::new();
@@ -736,15 +752,69 @@ mod tests {
     }
 
     #[test]
-    fn unregister_removes_connection() {
+    fn unregister_generation_removes_only_the_registered_incarnation() {
         let pool = EdgeConnectionPool::new();
-        let (tx, _rx) = mpsc::channel(1);
-        pool.register("user-1", "edge-a", None, None, tx);
+        let (old_tx, _old_rx) = mpsc::channel(1);
+        let old_generation = pool.register("user-1", "edge-a", None, None, old_tx);
+        let (new_tx, _new_rx) = mpsc::channel(1);
+        let new_generation = pool.register("user-1", "edge-a", None, None, new_tx);
         assert!(pool.has_connected_edge("user-1"));
 
-        pool.unregister("user-1", "edge-a");
+        assert!(!pool.unregister_generation("user-1", "edge-a", old_generation));
+        assert!(pool.has_connected_edge("user-1"));
+        assert!(pool.unregister_generation("user-1", "edge-a", new_generation));
         assert!(!pool.has_connected_edge("user-1"));
         assert_eq!(pool.connection_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn replacement_connection_preserves_exact_pending_result_waiters() {
+        let pool = EdgeConnectionPool::new();
+        let (old_tx, mut old_rx) = mpsc::channel(1);
+        let old_generation = pool.register("user-1", "edge-a", None, None, old_tx);
+        let identity = admitted_identity("replacement-result");
+        let caller_pool = pool.clone();
+        let caller = tokio::spawn(async move {
+            caller_pool
+                .execute_durably_admitted_invocation_with_cancel(
+                    &identity,
+                    "edge-a",
+                    "bash",
+                    &json!({"command":"effect"}),
+                    None,
+                )
+                .await
+        });
+        let request = old_rx.recv().await.expect("old socket request");
+        let (request_id, delivery_generation) = match request {
+            EdgeServerMessage::ToolRequest {
+                request_id,
+                delivery_generation,
+                ..
+            } => (request_id, delivery_generation),
+            other => panic!("expected tool request, got {other:?}"),
+        };
+
+        let (replacement_tx, _replacement_rx) = mpsc::channel(1);
+        pool.register("user-1", "edge-a", None, None, replacement_tx);
+        assert!(!pool.unregister_generation("user-1", "edge-a", old_generation));
+        assert!(pool.deliver_tool_result(
+            "user-1",
+            "edge-a",
+            &request_id,
+            delivery_generation,
+            EdgeToolResult {
+                output: "durable-replay".to_string(),
+                is_error: false,
+                duration_ms: Some(1),
+                tool_result_fields: None,
+            }
+        ));
+        assert_eq!(
+            caller.await.unwrap().unwrap().output,
+            "durable-replay",
+            "connection replacement must not strand the admitted caller"
+        );
     }
 
     #[test]
@@ -821,11 +891,17 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
         pool.register("user-1", "edge-a", None, None, tx);
 
-        // Spawn a task that will call execute_tool
+        let identity = admitted_identity("deliver-result");
         let pool_clone = pool.clone();
         let handle = tokio::spawn(async move {
             pool_clone
-                .execute_tool("user-1", "edge-a", "bash", &json!({"command": "ls"}))
+                .execute_durably_admitted_invocation_with_cancel(
+                    &identity,
+                    "edge-a",
+                    "bash",
+                    &json!({"command": "ls"}),
+                    None,
+                )
                 .await
         });
 
@@ -834,8 +910,12 @@ mod tests {
 
         // Read the tool request from the receiver
         let msg = rx.recv().await.unwrap();
-        let request_id = match msg {
-            EdgeServerMessage::ToolRequest { request_id, .. } => request_id,
+        let (request_id, delivery_generation) = match msg {
+            EdgeServerMessage::ToolRequest {
+                request_id,
+                delivery_generation,
+                ..
+            } => (request_id, delivery_generation),
             _ => panic!("expected ToolRequest"),
         };
 
@@ -844,6 +924,7 @@ mod tests {
             "user-1",
             "edge-a",
             &request_id,
+            delivery_generation,
             EdgeToolResult {
                 output: "file1.txt\nfile2.txt".into(),
                 is_error: false,
@@ -873,10 +954,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_tool_returns_none_for_missing_edge() {
+    async fn durably_admitted_invocation_returns_none_for_missing_edge() {
         let pool = EdgeConnectionPool::new();
+        let identity = admitted_identity("missing-edge");
         let result = pool
-            .execute_tool("user-1", "nonexistent", "bash", &json!({}))
+            .execute_durably_admitted_invocation_with_cancel(
+                &identity,
+                "nonexistent",
+                "bash",
+                &json!({}),
+                None,
+            )
             .await;
         assert!(result.is_none());
     }
@@ -1055,10 +1143,17 @@ mod tests {
         pool.register("user-1", "edge-a", None, None, tx);
 
         // Dispatch a tool call so there's an in-flight oneshot.
+        let identity = admitted_identity("drain-inflight");
         let pool_clone = pool.clone();
         let handle = tokio::spawn(async move {
             pool_clone
-                .execute_tool("user-1", "edge-a", "bash", &json!({"command":"ls"}))
+                .execute_durably_admitted_invocation_with_cancel(
+                    &identity,
+                    "edge-a",
+                    "bash",
+                    &json!({"command":"ls"}),
+                    None,
+                )
                 .await
         });
 
@@ -1096,7 +1191,7 @@ mod tests {
     /// Register gen-1 then gen-2 for the same edge; cleaning up with gen-1 must
     /// leave gen-2 intact. Only a subsequent gen-2 cleanup removes the entry.
     #[test]
-    fn unregister_if_generation_skips_stale_cleanup() {
+    fn unregister_generation_skips_stale_cleanup() {
         let pool = EdgeConnectionPool::new();
 
         let (tx1, _rx1) = mpsc::channel(1);
@@ -1109,7 +1204,7 @@ mod tests {
         assert!(gen2 > gen1, "generations must be strictly increasing");
 
         // Old connection's cleanup fires with gen-1: must be a no-op.
-        let removed = pool.unregister_if_generation("user-1", "edge-a", gen1);
+        let removed = pool.unregister_generation("user-1", "edge-a", gen1);
         assert!(
             !removed,
             "stale gen-1 cleanup must not remove the gen-2 entry"
@@ -1120,7 +1215,7 @@ mod tests {
         );
 
         // Current connection's cleanup fires with gen-2: must remove the entry.
-        let removed = pool.unregister_if_generation("user-1", "edge-a", gen2);
+        let removed = pool.unregister_generation("user-1", "edge-a", gen2);
         assert!(removed, "gen-2 cleanup must remove the entry");
         assert!(
             !pool.has_connected_edge("user-1"),
@@ -1131,12 +1226,12 @@ mod tests {
     /// A single connection registered and cleaned up with its own generation
     /// removes the entry normally.
     #[test]
-    fn unregister_if_generation_removes_own_entry() {
+    fn unregister_generation_removes_own_entry() {
         let pool = EdgeConnectionPool::new();
         let (tx, _rx) = mpsc::channel(1);
         let my_gen = pool.register("user-1", "edge-a", None, None, tx);
 
-        let removed = pool.unregister_if_generation("user-1", "edge-a", my_gen);
+        let removed = pool.unregister_generation("user-1", "edge-a", my_gen);
         assert!(removed);
         assert!(!pool.has_connected_edge("user-1"));
     }
@@ -1144,7 +1239,7 @@ mod tests {
     /// Three rapid reconnects: gen-1 and gen-2 cleanups must both be no-ops;
     /// only gen-3 cleanup drains the pool.
     #[test]
-    fn unregister_if_generation_multiple_replacements() {
+    fn unregister_generation_handles_multiple_replacements() {
         let pool = EdgeConnectionPool::new();
 
         let (tx1, _rx1) = mpsc::channel(1);
@@ -1156,13 +1251,13 @@ mod tests {
         let (tx3, _rx3) = mpsc::channel(1);
         let gen3 = pool.register("user-1", "edge-a", None, None, tx3);
 
-        assert!(!pool.unregister_if_generation("user-1", "edge-a", gen1));
+        assert!(!pool.unregister_generation("user-1", "edge-a", gen1));
         assert!(pool.has_connected_edge("user-1"));
 
-        assert!(!pool.unregister_if_generation("user-1", "edge-a", gen2));
+        assert!(!pool.unregister_generation("user-1", "edge-a", gen2));
         assert!(pool.has_connected_edge("user-1"));
 
-        assert!(pool.unregister_if_generation("user-1", "edge-a", gen3));
+        assert!(pool.unregister_generation("user-1", "edge-a", gen3));
         assert!(!pool.has_connected_edge("user-1"));
     }
 
@@ -1261,7 +1356,7 @@ mod tests {
 
     /// Cleanups for different edges must be fully independent.
     #[test]
-    fn unregister_if_generation_different_edges_are_independent() {
+    fn unregister_generation_keeps_different_edges_independent() {
         let pool = EdgeConnectionPool::new();
 
         let (tx_a1, _rx_a1) = mpsc::channel(1);
@@ -1274,11 +1369,11 @@ mod tests {
         let gen_b = pool.register("user-1", "edge-b", None, None, tx_b);
 
         // Stale cleanup for edge-a must not touch edge-b.
-        assert!(!pool.unregister_if_generation("user-1", "edge-a", gen_a1));
+        assert!(!pool.unregister_generation("user-1", "edge-a", gen_a1));
         assert!(pool.has_connected_edge("user-1")); // edge-b is still present
 
         // Cleaning up edge-b with its own generation succeeds.
-        assert!(pool.unregister_if_generation("user-1", "edge-b", gen_b));
+        assert!(pool.unregister_generation("user-1", "edge-b", gen_b));
 
         // edge-a's gen-2 is still present.
         assert!(pool.has_connected_edge("user-1"));

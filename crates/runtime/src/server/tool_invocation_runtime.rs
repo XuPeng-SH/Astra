@@ -202,6 +202,25 @@ impl RuntimeToolInvocationLedger {
         }
     }
 
+    pub(crate) async fn lifecycle_diagnostics(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: Option<&str>,
+    ) -> Result<
+        Option<astra_services::tool_invocation_ledger::ToolInvocationLifecycleDiagnostics>,
+        RuntimeInvocationLedgerError,
+    > {
+        match self {
+            Self::Database(ledger) => Ok(Some(
+                ledger
+                    .lifecycle_diagnostics(user_id, session_id, run_id)
+                    .await?,
+            )),
+            Self::InMemory(_) => Ok(None),
+        }
+    }
+
     pub(crate) async fn complete(
         &self,
         identity: &ToolInvocationIdentity,
@@ -596,20 +615,20 @@ fn disposition_for_existing_record(
 pub(crate) fn terminal_outcome_from_result(
     result: &astra_tools::ToolResult,
 ) -> ToolInvocationTerminalOutcome {
-    let payload = ToolInvocationResultPayload {
-        output: result.output.clone(),
-        metadata: result
+    let payload = ToolInvocationResultPayload::bounded_projection(
+        result.output.clone(),
+        result
             .metadata
             .clone()
             .unwrap_or_default()
             .into_iter()
             .collect::<BTreeMap<_, _>>(),
-        exit_semantics: result.exit_semantics.and_then(|semantics| {
+        result.exit_semantics.and_then(|semantics| {
             serde_json::to_value(semantics)
                 .ok()
                 .and_then(|value| value.as_str().map(str::to_string))
         }),
-    };
+    );
     if !result.is_error {
         return ToolInvocationTerminalOutcome::Succeeded { result: payload };
     }
@@ -712,25 +731,35 @@ fn project_terminal_record(
         ))
     })?;
     let mut result = project_terminal_outcome(outcome, record.state, replay);
-    if let Some(ToolInvocationCompletionSource::SemanticReadCache {
-        cache_key_id,
-        observation_id,
-        ..
-    }) = record.completion_source.as_ref()
-    {
+    if let Some(completion_source) = record.completion_source.as_ref() {
         let metadata = result.metadata.get_or_insert_with(Map::new);
-        metadata.insert(
-            "semantic_read_cache_state".to_string(),
-            Value::String("hit".to_string()),
-        );
-        metadata.insert(
-            "semantic_read_cache_key_id".to_string(),
-            Value::String(cache_key_id.clone()),
-        );
-        metadata.insert(
-            "semantic_read_observation_id".to_string(),
-            Value::String(observation_id.clone()),
-        );
+        match completion_source {
+            ToolInvocationCompletionSource::SemanticReadCache {
+                cache_key_id,
+                observation_id,
+                ..
+            } => {
+                metadata.insert(
+                    "semantic_read_cache_state".to_string(),
+                    Value::String("hit".to_string()),
+                );
+                metadata.insert(
+                    "semantic_read_cache_key_id".to_string(),
+                    Value::String(cache_key_id.clone()),
+                );
+                metadata.insert(
+                    "semantic_read_observation_id".to_string(),
+                    Value::String(observation_id.clone()),
+                );
+            }
+            ToolInvocationCompletionSource::RunClosure { run_status, .. } => {
+                metadata.insert(
+                    "tool_invocation_completion_source".to_string(),
+                    Value::String("run_closure".to_string()),
+                );
+                metadata.insert("run_status".to_string(), Value::String(run_status.clone()));
+            }
+        }
     }
     Ok(result)
 }
@@ -1375,6 +1404,30 @@ mod tests {
                 ..
             } if code == "tenant_policy"
         ));
+    }
+
+    #[tokio::test]
+    async fn oversized_acknowledged_result_completes_with_explicit_bounded_projection() {
+        let ledger = RuntimeToolInvocationLedger::new(None);
+        let identity = identity("call-large-result");
+        let fingerprint = fingerprint(&json!({"command": "verbose"}));
+        let owner = execute_owner(begin(&ledger, &identity, &fingerprint).await.unwrap());
+        let raw = astra_tools::ToolResult::text(
+            "界".repeat(astra_turn_types::TOOL_INVOCATION_RESULT_OUTPUT_MAX_BYTES),
+        );
+
+        let projected = ledger.finish(&identity, &owner, raw).await;
+        assert!(!projected.is_error, "{projected:?}");
+        assert!(
+            projected
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("astraResultProjection"))
+                .is_some()
+        );
+        let record = ledger.get(&identity).await.unwrap().unwrap();
+        assert_eq!(record.state, ToolInvocationState::Succeeded);
+        record.outcome.as_ref().unwrap().validate().unwrap();
     }
 
     #[tokio::test]
