@@ -6534,6 +6534,31 @@ fn cloud_workspace_provision_error(
     }
 }
 
+/// Returns the effective WorkspaceRecord for tool execution:
+/// - If a cloud workspace record is present, use it (standard path).
+/// - Otherwise, if the request carries a provider_workspace_id (from the
+///   edge-registration token's provider_scope_id on MOI provider-authorized
+///   turns), synthesise a minimal WorkspaceRecord so that edge workspace
+///   isolation checks in the transport layer work correctly.
+fn provider_effective_workspace_record(
+    cloud: Option<&astra_runtime_env::WorkspaceRecord>,
+    provider_workspace_id: Option<&str>,
+) -> Option<astra_runtime_env::WorkspaceRecord> {
+    cloud.cloned().or_else(|| {
+        provider_workspace_id.map(|ws_id| astra_runtime_env::WorkspaceRecord {
+            workspace_id: ws_id.to_string(),
+            owner_scope: astra_runtime_env::WorkspaceOwnerScope::None,
+            kind: astra_runtime_env::WorkspaceBindingKind::None,
+            authority: astra_runtime_env::WorkspaceAuthority::None,
+            root_or_volume_ref: String::new(),
+            source: astra_runtime_env::WorkspaceSource::None,
+            persistence: astra_runtime_env::WorkspacePersistence::None,
+            revision: String::new(),
+            display_name: String::new(),
+        })
+    })
+}
+
 fn workspace_record_store_error(
     error: WorkspaceRecordStoreError,
 ) -> (StatusCode, Json<ErrorResponse>) {
@@ -6768,6 +6793,18 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             host.install_runtime_tool_schemas(bundle.schemas.clone(), bundle.control_tools.clone());
             host.install_runtime_stop_after_success_tools(bundle.stop_after_success_tools.clone());
         }
+        // In agent-binding mode with an EdgeAgent executor, the host only installs
+        // MCP schemas by default. Merge edge-builtin tool schemas (bash, read_file, …)
+        // for any tools explicitly listed in allow_tools so the model can see and call
+        // them via the edge dispatch path.
+        if let Some(snapshot) = execution_bindings.as_ref() {
+            if snapshot.executor.kind == ExecutorBindingKind::EdgeAgent {
+                if let Some(allow_tools) = request.allow_tools.as_deref() {
+                    let tools: Vec<String> = allow_tools.iter().map(|s| s.to_string()).collect();
+                    host.merge_allowlisted_edge_tool_schemas(&tools);
+                }
+            }
+        }
         let mut loop_state = self.build_initial_state_inner(
             &user_id,
             &request,
@@ -6966,7 +7003,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             let agent_working_dir =
                 agent_working_dir_for_bindings(execution_bindings.as_ref(), workspace.as_path());
             executor.set_execution_binding_snapshot(binding_snapshot);
-            executor.set_workspace_record(cloud_workspace_record.clone());
+            executor.set_workspace_record(provider_effective_workspace_record(
+                cloud_workspace_record.as_ref(),
+                request.provider_workspace_id.as_deref(),
+            ));
             host.set_execution_metadata(executor.binding_metadata());
 
             self.wire_server_dynamic_agent_tools(
@@ -7830,6 +7870,18 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             host.install_runtime_tool_schemas(bundle.schemas.clone(), bundle.control_tools.clone());
             host.install_runtime_stop_after_success_tools(bundle.stop_after_success_tools.clone());
         }
+        // In agent-binding mode with an EdgeAgent executor, the host only installs
+        // MCP schemas by default. Merge edge-builtin tool schemas (bash, read_file, …)
+        // for any tools explicitly listed in allow_tools so the model can see and call
+        // them via the edge dispatch path.
+        if let Some(snapshot) = execution_bindings.as_ref() {
+            if snapshot.executor.kind == ExecutorBindingKind::EdgeAgent {
+                if let Some(allow_tools) = request.allow_tools.as_deref() {
+                    let tools: Vec<String> = allow_tools.iter().map(|s| s.to_string()).collect();
+                    host.merge_allowlisted_edge_tool_schemas(&tools);
+                }
+            }
+        }
 
         // Guard: reject if this session already has a blocking run.
         // Hold write lock across check+insert to prevent TOCTOU race.
@@ -8059,7 +8111,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             let agent_working_dir =
                 agent_working_dir_for_bindings(execution_bindings.as_ref(), workspace.as_path());
             executor.set_execution_binding_snapshot(binding_snapshot);
-            executor.set_workspace_record(cloud_workspace_record.clone());
+            executor.set_workspace_record(provider_effective_workspace_record(
+                cloud_workspace_record.as_ref(),
+                request.provider_workspace_id.as_deref(),
+            ));
             host.set_execution_metadata(executor.binding_metadata());
             executor.set_work_surface_event_tx(event_tx.clone());
             self.wire_server_dynamic_agent_tools(
