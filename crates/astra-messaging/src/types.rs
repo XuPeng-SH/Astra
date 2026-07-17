@@ -30,7 +30,15 @@ impl AgentAddress {
 
 impl std::fmt::Display for AgentAddress {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}@{}", self.agent_id, self.run_id)
+        if self
+            .agent_id
+            .strip_suffix(&self.run_id)
+            .is_some_and(|prefix| prefix.ends_with('@'))
+        {
+            f.write_str(&self.agent_id)
+        } else {
+            write!(f, "{}@{}", self.agent_id, self.run_id)
+        }
     }
 }
 
@@ -129,8 +137,10 @@ pub enum AgentSignal {
     Heartbeat,
     /// Agent is idle / waiting for work.
     Idle,
-    /// Agent detected a stall condition.
+    /// Agent detected a stall condition (likely permanent without intervention).
     Stalled { reason: String },
+    /// Agent is waiting on an external dependency (may resolve without intervention).
+    Waiting { reason: String },
     /// Agent completed successfully.
     Completed { output: String },
     /// Agent failed.
@@ -147,7 +157,7 @@ pub enum AgentSignal {
 /// - **Expirable**: Optional `ttl_ms` for time-sensitive messages.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentMessage {
-    /// Unique message ID (UUID v4).
+    /// Unique message envelope ID (UUID).
     pub id: String,
     /// Sender address.
     pub from: AgentAddress,
@@ -167,6 +177,11 @@ pub struct AgentMessage {
     /// Whether the sender expects an acknowledgment for this message.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub requires_ack: bool,
+
+    /// Logical message id an acknowledgement should reference when a durable
+    /// delivery has to be re-enveloped with a fresh queue identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ack_message_id: Option<String>,
 }
 
 const AGENT_COMMUNICATION_SUMMARY_CHARS: usize = 1_000;
@@ -292,6 +307,7 @@ impl AgentMessage {
             correlation_id: None,
             ttl_ms: None,
             requires_ack: false,
+            ack_message_id: None,
         }
     }
 
@@ -326,7 +342,10 @@ impl AgentMessage {
                 address: self.from.clone(),
             },
             MessagePayload::Ack {
-                message_id: self.id.clone(),
+                message_id: self
+                    .ack_message_id
+                    .clone()
+                    .unwrap_or_else(|| self.id.clone()),
             },
         )
     }
@@ -339,7 +358,10 @@ impl AgentMessage {
                 address: self.from.clone(),
             },
             MessagePayload::Nack {
-                message_id: self.id.clone(),
+                message_id: self
+                    .ack_message_id
+                    .clone()
+                    .unwrap_or_else(|| self.id.clone()),
                 reason,
             },
         )
@@ -437,6 +459,18 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn address_display_does_not_duplicate_embedded_run_identity() {
+        assert_eq!(
+            AgentAddress::new("run-1", "reviewer@run-1").to_string(),
+            "reviewer@run-1"
+        );
+        assert_eq!(
+            AgentAddress::new("run-1", "reviewer").to_string(),
+            "reviewer@run-1"
+        );
+    }
+
+    #[test]
     fn message_roundtrip_json() {
         let msg = AgentMessage::new(
             AgentAddress::new("run-1", "coder"),
@@ -480,6 +514,23 @@ mod tests {
         let json = serde_json::to_value(&payload).unwrap();
         assert_eq!(json["type"], "progress");
         assert_eq!(json["turn_index"], 3);
+    }
+
+    #[test]
+    fn waiting_signal_roundtrip_preserves_recoverable_state() {
+        let payload = MessagePayload::Signal(AgentSignal::Waiting {
+            reason: "executor_offline".into(),
+        });
+        let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(json["type"], "signal");
+        assert_eq!(json["waiting"]["reason"], "executor_offline");
+
+        let restored: MessagePayload = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            restored,
+            MessagePayload::Signal(AgentSignal::Waiting { reason })
+                if reason == "executor_offline"
+        ));
     }
 
     #[test]
