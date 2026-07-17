@@ -18,6 +18,7 @@ vi.mock("lucide-react", () => {
     Check: Icon,
     FilePlus2: Icon,
     Globe: Icon,
+    GitPullRequest: Icon,
     HardDrive: Icon,
     Image: Icon,
     Monitor: Icon,
@@ -40,6 +41,26 @@ function renderMenu(
     <ComposerPlusMenu
       webSearch={false}
       onWebSearchChange={vi.fn()}
+      webAccess={{
+        available: true,
+        description: "Run via Server",
+        provider: {
+          provider_id: "server-builtin",
+          kind: "server",
+          display_name: "Server",
+          status: "ready",
+        },
+      }}
+      githubAccess={{
+        available: true,
+        description: "Run via Server",
+        provider: {
+          provider_id: "server-builtin",
+          kind: "server",
+          display_name: "Server",
+          status: "ready",
+        },
+      }}
       activeSkills={[]}
       onActiveSkillsChange={vi.fn()}
       {...props}
@@ -153,6 +174,36 @@ describe("ComposerPlusMenu environment selection", () => {
 
     expect(screen.queryByText("Bound edge is offline")).not.toBeInTheDocument();
     expect(screen.getByText("MacBook Pro")).toBeInTheDocument();
+  });
+});
+
+describe("ComposerPlusMenu connectors", () => {
+  it("presents search and fetch as one user-facing Web capability", async () => {
+    const user = userEvent.setup();
+    const onWebSearchChange = vi.fn();
+    renderMenu({ onWebSearchChange });
+
+    await user.click(screen.getByRole("button", { name: "Open add menu" }));
+    await user.click(screen.getByRole("button", { name: /Web access/i }));
+
+    expect(onWebSearchChange).toHaveBeenCalledWith(true);
+    expect(screen.getByText(/Search and read public pages/i)).toBeInTheDocument();
+    expect(screen.queryByText("Web search")).not.toBeInTheDocument();
+  });
+
+  it("lets the user attach the GitHub connector for the next turn", async () => {
+    const user = userEvent.setup();
+    const onActiveToolsChange = vi.fn();
+    renderMenu({ activeTools: [], onActiveToolsChange });
+
+    await user.click(screen.getByRole("button", { name: "Open add menu" }));
+    await user.click(screen.getByRole("button", { name: /Connectors/i }));
+    await user.click(screen.getByRole("button", { name: /GitHub/i }));
+
+    expect(onActiveToolsChange).toHaveBeenCalledWith(["github"]);
+    expect(
+      screen.getByText(/credentials configured on the selected server or edge/i),
+    ).toBeInTheDocument();
   });
 });
 

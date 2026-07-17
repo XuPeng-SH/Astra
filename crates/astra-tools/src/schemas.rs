@@ -61,7 +61,7 @@ fn task_board_schema() -> Value {
     );
     props.insert(
         "new_status".to_string(),
-        json!({"type": "string", "enum": ["pending","in_progress","paused","completed","failed","cancelled","deleted"], "description": "(update only; never with create) Parent/subtask status. deleted keeps an audit tombstone."}),
+        json!({"type": "string", "enum": ["pending","in_progress","paused","completed","failed","cancelled","deleted"], "description": "(update only; never with create) Parent/subtask outcome. Use completed only when the task's definition of done is satisfied; use failed when execution finished but the requested outcome was not achieved; paused when work is resumable. deleted keeps an audit tombstone."}),
     );
     props.insert(
         "status_filter".to_string(),
@@ -115,7 +115,7 @@ fn task_board_schema() -> Value {
     );
     props.insert(
         "reason".to_string(),
-        json!({"type": "string", "description": "(update/stop/archive) Reason or subtask note."}),
+        json!({"type": "string", "description": "(update/stop/archive) Outcome evidence or subtask note. For terminal updates, state what was actually achieved or why it failed."}),
     );
     props.insert(
         "error_message".to_string(),
@@ -472,7 +472,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "web_search",
-                "description": "Perform a web search and get results. Returns search URLs for multiple engines that can be fetched with web_fetch. Use for finding current information, documentation, or answers not in local knowledge.",
+                "description": "Perform a web search and return the fetched result page as structured JSON with extracted Markdown and result links. Use for current information, documentation, or answers not in local knowledge; do not call web_fetch on the search page separately.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -483,7 +483,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "engine": {
                             "type": "string",
                             "enum": ["google", "duckduckgo", "bing", "wikipedia", "github"],
-                            "description": "Search engine to use (default: google). Use 'wikipedia' for encyclopedic info, 'github' for code/repos."
+                            "description": "Search engine to use (default: bing). Use 'wikipedia' for encyclopedic info, 'github' for code/repos."
                         },
                         "num_results": {
                             "type": "integer",
@@ -885,8 +885,8 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "agent_type": {"type": "string", "enum": ["explore","code-review","task","general-purpose"], "description": "Sub-agent persona (spawn). Default: general-purpose."},
                         "model": {"type": "string", "description": "Model override (spawn). Default: parent's model."},
                         "name": {"type": "string", "description": "Addressable mailbox name (spawn). Optional; auto-generated if omitted. Not the runtime agent_id used by get_result."},
-                        "max_turns": {"type": "integer", "description": "Requested max turns (spawn). Runtime may raise too-small values for deep/code-review fanouts; omit it and use `complexity` when unsure."},
-                        "complexity": {"type": "string", "enum": ["light","normal","deep"], "description": "Task-complexity hint scaling the default budget. `light`≈10 turns, `normal`=agent default, `deep`=2× default. Use `deep` for review/refactor/multi-file tasks that routinely exhaust the default."},
+                        "max_turns": {"type": "integer", "minimum": 1, "description": "Numeric child ceiling. When complexity is also present, the smaller of the numeric and complexity-derived ceilings wins."},
+                        "complexity": {"type": "string", "enum": ["light","normal","deep"], "description": "Task-complexity ceiling: `light`≤10 turns, `normal`=agent default, `deep`=2× default. Prefer normal for scoped review/refactor work; use deep only when this child independently needs broad multi-step investigation. It never expands a smaller max_turns."},
                         "isolated": {"type": "boolean", "description": "Use isolated worktree (spawn)"},
                         "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Tool allowlist (spawn)"},
                         "agent_id": {"type": "string", "description": "ONLY for action='get_result'. Must be the exact runtime-generated agent_id returned by a prior spawn, not the optional spawn name. Never prefill this on spawn."},
@@ -915,7 +915,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
          - `start`: requires `action`, `target_count`, and exactly target_count slots. Every slot has description+prompt; optional `id` is only a caller-facing label. Minimal valid start: `{\"action\":\"start\",\"target_count\":2,\"slots\":[{\"id\":\"api\",\"description\":\"Review API\",\"prompt\":\"Review the API and report findings.\"},{\"id\":\"ui\",\"description\":\"Review UI\",\"prompt\":\"Review the UI and report findings.\"}]}`. Shared optional configuration belongs in `defaults`; omit it unless needed.\n\
          - `get_results`: requires `action` and returned `group_id`. Use optional `slot_index`, `offset`, and `max_bytes` for one bounded result window; `results[].next_call` gives the next window.\n\
          - `stop_slot`: requires `action`, `group_id`, and `slot_index`; it stops one running child.\n\n\
-         Use this for independent parallel work. Put each full child instruction only in `slots[i].prompt`. Use no brief/agents/background fields: never send top-level `brief`, `agents`, or `run_in_background`, and never put generated `agent_id` inside a slot. Start returns stable child identities without waiting for the full group to finish; terminal results flow back through parent mailboxes and get_results remains available for explicit inspection.",
+         Use this for independent parallel work. Put each full child instruction only in `slots[i].prompt`. Fanout already decomposes work: keep each slot narrowly scoped and normally use `normal` or an explicit bounded max_turns; do not mark every review slot `deep`. Use no brief/agents/background fields: never send top-level `brief`, `agents`, or `run_in_background`, and never put generated `agent_id` inside a slot. Start returns stable child identities without waiting for the full group to finish; terminal results flow back through parent mailboxes and get_results remains available for explicit inspection.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -935,7 +935,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                                     "prompt": {"type": "string", "description": "Full child task brief for this slot."},
                                     "agent_type": {"type": "string", "enum": ["explore","code-review","task","general-purpose"]},
                                     "model": {"type": "string"},
-                                    "max_turns": {"type": "integer"},
+                                    "max_turns": {"type": "integer", "minimum": 1},
                                     "max_output_tokens": {"type": "integer"},
                                     "complexity": {"type": "string", "enum": ["light","normal","deep"]},
                                     "isolated": {"type": "boolean"},
@@ -951,7 +951,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                             "properties": {
                                 "agent_type": {"type": "string", "enum": ["explore","code-review","task","general-purpose"]},
                                 "model": {"type": "string"},
-                                "max_turns": {"type": "integer"},
+                                "max_turns": {"type": "integer", "minimum": 1},
                                 "max_output_tokens": {"type": "integer"},
                                 "complexity": {"type": "string", "enum": ["light","normal","deep"]},
                                 "isolated": {"type": "boolean"},

@@ -121,7 +121,7 @@ use astra_runtime_env::{
 };
 
 use crate::orchestration::spawner::{
-    agent_status_to_progress_event, project_subrun_status_to_spawn,
+    DescendantCancellationReason, agent_status_to_progress_event, project_subrun_status_to_spawn,
 };
 use crate::server::agent_binding_skill_runtime;
 use crate::server::deployment_tool_policy::{
@@ -2139,35 +2139,6 @@ impl Drop for ActiveRunControlWatcher {
     }
 }
 
-struct ClientStreamDisconnectWatcher {
-    join: tokio::task::JoinHandle<()>,
-}
-
-impl Drop for ClientStreamDisconnectWatcher {
-    fn drop(&mut self) {
-        self.join.abort();
-    }
-}
-
-fn start_client_stream_disconnect_watcher(
-    run_id: String,
-    client_event_tx: mpsc::Sender<Value>,
-    cancel_flag: Arc<AtomicBool>,
-    cancel_token: Arc<CancellationToken>,
-) -> ClientStreamDisconnectWatcher {
-    let join = tokio::spawn(async move {
-        client_event_tx.closed().await;
-        cancel_flag.store(true, Ordering::SeqCst);
-        cancel_token.cancel();
-        tracing::info!(
-            target: "astra_runtime::run_lifecycle",
-            run_id = %run_id,
-            "client SSE stream disconnected; cancelling active run"
-        );
-    });
-    ClientStreamDisconnectWatcher { join }
-}
-
 fn start_active_run_control_watcher(
     run_control: Option<Arc<dyn RunControlProvider>>,
     user_id: String,
@@ -2704,19 +2675,24 @@ impl AgenticRunLifecycleService {
             return entry;
         }
 
-        let executor = Arc::new(
-            ServerSpawnAgentExecutor::new(
-                self.matrixone.clone(),
-                Arc::clone(&self.encryptor),
-                Arc::clone(&self.edge_callback_ledger),
-            )
-            .with_run_engine(self.run_engine.clone())
-            .with_pool(self.shared_pool.clone())
-            .with_edge_connection_pool(self.edge_connection_pool.clone())
-            .with_skill_service(self.skill_service.clone())
-            .with_memory_extraction_service(self.memory_extraction_service.clone())
-            .with_reflect_service(Arc::clone(&self.reflect_service)),
-        );
+        let mut executor = ServerSpawnAgentExecutor::new(
+            self.matrixone.clone(),
+            Arc::clone(&self.encryptor),
+            Arc::clone(&self.edge_callback_ledger),
+        )
+        .with_run_engine(self.run_engine.clone())
+        .with_pool(self.shared_pool.clone())
+        .with_edge_connection_pool(self.edge_connection_pool.clone())
+        .with_skill_service(self.skill_service.clone())
+        .with_memory_extraction_service(self.memory_extraction_service.clone())
+        .with_reflect_service(Arc::clone(&self.reflect_service));
+        if let Some(service) = self.edge_dispatch_service.clone() {
+            executor = executor.with_edge_dispatch_service(service);
+        }
+        if let Some(service) = self.edge_registry_service.clone() {
+            executor = executor.with_edge_registry_service(service);
+        }
+        let executor = Arc::new(executor);
         let executor_for_spawner: Arc<dyn SpawnAgentExecutor> = executor.clone();
         let mut spawner = DynamicAgentSpawner::with_broadcaster(
             Arc::clone(&self.server_agent_mailbox_router),
@@ -2750,6 +2726,144 @@ impl AgenticRunLifecycleService {
         };
         guard.insert(registry_key, entry.clone());
         entry
+    }
+
+    async fn existing_server_agent_spawner_for_session(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> Option<Arc<DynamicAgentSpawner>> {
+        let registry_key = format!("{user_id}\0{session_id}");
+        self.server_agent_spawners
+            .read()
+            .await
+            .get(&registry_key)
+            .map(|entry| Arc::clone(&entry.spawner))
+    }
+
+    async fn cancel_durable_run_descendants(
+        run_engine: &RunEngine,
+        user_id: &str,
+        session_id: &str,
+        parent_run_id: &str,
+        reason: &str,
+    ) -> Result<usize, String> {
+        const PAGE_LIMIT: u32 = 200;
+        const MAX_PAGES: usize = 32;
+        let mut cancelled = 0;
+
+        for _ in 0..MAX_PAGES {
+            let page = run_engine
+                .list_session_runs(user_id, session_id, PAGE_LIMIT)
+                .await?;
+            let mut descendants = page
+                .runs
+                .into_iter()
+                .filter(|run| {
+                    run.run_id != parent_run_id
+                        && matches!(
+                            run.status.as_str(),
+                            STATUS_RUNNING | STATUS_WAITING | STATUS_PAUSED
+                        )
+                        && run.ancestor_path.as_deref().is_some_and(|path| {
+                            path.split('/').any(|segment| segment == parent_run_id)
+                        })
+                })
+                .collect::<Vec<_>>();
+            if descendants.is_empty() {
+                return Ok(cancelled);
+            }
+            descendants.sort_by_key(|run| std::cmp::Reverse(run.depth));
+
+            let mut page_updates = 0;
+            for descendant in descendants {
+                let event = json!({
+                    "event_type": "run_finished",
+                    "data": {
+                        "cancelled": true,
+                        "reason": reason,
+                        "source": "ancestor_run",
+                        "ancestor_run_id": parent_run_id,
+                    }
+                });
+                if run_engine
+                    .transition_status_with_event_if_current(
+                        user_id,
+                        &descendant.run_id,
+                        &[descendant.status.as_str()],
+                        STATUS_CANCELLED,
+                        None,
+                        None,
+                        event,
+                    )
+                    .await?
+                {
+                    page_updates += 1;
+                    cancelled += 1;
+                }
+            }
+            if page_updates == 0 {
+                break;
+            }
+        }
+        Ok(cancelled)
+    }
+
+    async fn converge_cancelled_run_descendants(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+    ) {
+        if let Some(de) = &self.delegation_engine {
+            de.cancel_children_of(run_id).await;
+        }
+        if let Some(spawner) = self
+            .existing_server_agent_spawner_for_session(user_id, session_id)
+            .await
+        {
+            let cancelled_children = spawner
+                .cancel_descendants_of_parent_run(
+                    run_id,
+                    DescendantCancellationReason::AncestorCancelled,
+                )
+                .await;
+            if cancelled_children > 0 {
+                tracing::info!(
+                    target: "astra_runtime::run_lifecycle",
+                    run_id,
+                    cancelled_children,
+                    "cancel endpoint converged dynamic-agent descendants"
+                );
+            }
+        }
+        match Self::cancel_durable_run_descendants(
+            &self.run_engine,
+            user_id,
+            session_id,
+            run_id,
+            DescendantCancellationReason::AncestorCancelled.as_str(),
+        )
+        .await
+        {
+            Ok(cancelled_children) if cancelled_children > 0 => {
+                tracing::info!(
+                    target: "astra_runtime::run_lifecycle",
+                    run_id,
+                    cancelled_children,
+                    "cancel endpoint converged durable descendants"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra_runtime::run_lifecycle",
+                    run_id,
+                    error = %error,
+                    "cancel endpoint durable descendant sweep failed"
+                );
+            }
+        }
     }
 
     async fn prune_idle_server_agent_spawners(&self) {
@@ -2796,8 +2910,12 @@ impl AgenticRunLifecycleService {
     /// previous `.expect("validated before state build")` ladder is gone
     /// because validation and construction now happen together.
     fn try_request_constraints(request: &ChatRequestData) -> Result<RequestConstraints, String> {
+        let enabled_tools =
+            normalize_request_allowlist(request.enabled_tools.as_deref(), "enabled_tools")?
+                .or_else(|| Some(HashSet::new()));
         Ok(RequestConstraints::new(
             normalize_request_allowlist(request.allow_tools.as_deref(), "allow_tools")?,
+            enabled_tools,
             normalize_request_allowlist(request.allow_skills.as_deref(), "allow_skills")?,
             normalize_request_skill_sources(
                 request.allow_skill_sources.as_deref(),
@@ -2923,15 +3041,17 @@ impl AgenticRunLifecycleService {
                 &request_constraints,
             ),
             active_skills: Vec::new(),
-            live_event_sink: work_surface_event_tx.zip(work_surface_gap_tracker).map(
-                |(tx, gap_tracker)| {
+            live_event_sink: work_surface_event_tx
+                .clone()
+                .zip(work_surface_gap_tracker)
+                .map(|(tx, gap_tracker)| {
                     Arc::new(WorkSurfaceAgentLiveEventSink::new(
                         tx,
                         execution_metadata.clone(),
                         gap_tracker,
                     )) as SharedAgentLiveEventSink
-                },
-            ),
+                }),
+            client_tool_delivery_tx: work_surface_event_tx.clone(),
             trace_context: Some(server_trace_context(user_id, session_id, run_id, turn_seq)),
             execution_metadata,
             transcript_location: AgentTranscriptLocation::DurableServer,
@@ -3746,12 +3866,79 @@ impl AgenticRunLifecycleService {
         }
         let request_constraints = Self::try_request_constraints(request)
             .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
+        if let Some(enabled_tools) = request_constraints.enabled_tools.as_ref() {
+            let fallback_registry = astra_runtime_env::ToolRegistry::builtins();
+            let registry = self
+                .tool_execution_service
+                .as_ref()
+                .map(ToolExecutionService::tool_registry)
+                .unwrap_or(&fallback_registry);
+            for tool_name in enabled_tools {
+                let Some(spec) = registry.get(tool_name) else {
+                    return Err(error_response_coded(
+                        StatusCode::BAD_REQUEST,
+                        format!("enabled_tools contains unknown tool '{tool_name}'"),
+                        "enabled_tools_invalid",
+                    ));
+                };
+                if !spec.requires_explicit_user_enablement() {
+                    return Err(error_response_coded(
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "enabled_tools may contain only product-optional external tools; '{tool_name}' is a core runtime tool"
+                        ),
+                        "enabled_tools_invalid",
+                    ));
+                }
+            }
+        }
         if request.agent_binding.is_none() && request.runtime_skill_binding.is_none() {
             let (_, resolver) = build_server_skill_resolver(self.skill_service.clone(), user_id);
             apply_normalized_skill_allowlist(resolver, &request_constraints)
                 .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
         }
         Ok(request_constraints)
+    }
+
+    async fn validate_optional_tool_availability(
+        &self,
+        user_id: &str,
+        constraints: &RequestConstraints,
+        execution_bindings: Option<&ExecutionBindingSnapshot>,
+    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        let Some(enabled_tools) = constraints
+            .enabled_tools
+            .as_ref()
+            .filter(|tools| !tools.is_empty())
+        else {
+            return Ok(());
+        };
+        let Some(service) = self.tool_execution_service.as_ref() else {
+            return Err(error_response_coded(
+                StatusCode::CONFLICT,
+                "optional tools were enabled, but this runtime has no tool execution provider"
+                    .to_string(),
+                "optional_tool_provider_unavailable",
+            ));
+        };
+        let unavailable = service
+            .unavailable_optional_tools_for_binding(user_id, enabled_tools, execution_bindings)
+            .await;
+        if unavailable.is_empty() {
+            return Ok(());
+        }
+        let selected_provider = execution_bindings
+            .filter(|snapshot| snapshot.executor.kind == ExecutorBindingKind::EdgeAgent)
+            .map(|snapshot| format!("bound edge '{}'", snapshot.executor.executor_id))
+            .unwrap_or_else(|| "server deployment".to_string());
+        Err(error_response_coded(
+            StatusCode::CONFLICT,
+            format!(
+                "{selected_provider} does not currently provide the enabled optional tools: {}",
+                unavailable.join(", ")
+            ),
+            "optional_tool_provider_unavailable",
+        ))
     }
 
     fn prepare_chat_request(
@@ -4994,6 +5181,7 @@ impl AgenticRunLifecycleService {
         if let Some(ref shared_tes) = self.tool_execution_service {
             builder = builder
                 .with_disabled_tool_offers(shared_tes.disabled_tool_offers_handle())
+                .with_provider_capabilities(shared_tes.provider_capabilities_handle())
                 .with_provider_allowed_tools(shared_tes.provider_allowed_tools_handle());
         }
         // Wire test LLM rounds from request context (E2E test hook).
@@ -6001,6 +6189,9 @@ impl AgenticRunLifecycleService {
         RunStatusRecord {
             run_id: run.run_id.clone(),
             session_id: run.session_id.clone(),
+            parent_run_id: run.parent_run_id.clone(),
+            root_run_id: run.root_run_id.clone(),
+            depth: run.depth,
             status: run.status.clone(),
             waiting_for: run.waiting_for.clone(),
             events_count: run.events.len() as i64,
@@ -6810,6 +7001,27 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         ExecutionBindingSnapshot::inferred(workspace, executor)
                     })
             });
+        if let Err(error) = self
+            .validate_optional_tool_availability(
+                &user_id,
+                &request_constraints,
+                execution_bindings.as_ref(),
+            )
+            .await
+        {
+            self.runs.write().await.remove(&run_id);
+            if let Some(record) = cloud_workspace_record.as_ref() {
+                self.cleanup_cloud_workspace_after_failed_start(
+                    &user_id,
+                    &session_id,
+                    &run_id,
+                    record,
+                    "enabled optional tools became unavailable before run start".to_string(),
+                )
+                .await;
+            }
+            return Err(error);
+        }
         let tool_runtime_workspace = cloud_workspace.clone().or_else(|| server_workspace.clone());
         let server_tool_executor_workspace = if let Some(workspace) = tool_runtime_workspace.clone()
         {
@@ -7775,6 +7987,26 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         ExecutionBindingSnapshot::inferred(workspace, executor)
                     })
             });
+        if let Err(error) = self
+            .validate_optional_tool_availability(
+                &user_id,
+                &request_constraints,
+                execution_bindings.as_ref(),
+            )
+            .await
+        {
+            if let Some(record) = cloud_workspace_record.as_ref() {
+                self.cleanup_cloud_workspace_after_failed_start(
+                    &user_id,
+                    &session_id,
+                    &run_id,
+                    record,
+                    "enabled optional tools became unavailable before stream start".to_string(),
+                )
+                .await;
+            }
+            return Err(error);
+        }
         let tool_runtime_workspace = cloud_workspace.clone().or_else(|| server_workspace.clone());
         let server_tool_executor_workspace = if let Some(workspace) = tool_runtime_workspace.clone()
         {
@@ -7818,11 +8050,18 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                                 break;
                             };
                             let approval_requests = canonical_edge_approval_requests(&event);
+                            let approval_run_id = event
+                                .get("run_id")
+                                .and_then(Value::as_str)
+                                .map(str::trim)
+                                .filter(|run_id| !run_id.is_empty())
+                                .unwrap_or(&fanout_run_id)
+                                .to_string();
                             if !approval_requests.is_empty()
                                 && let Err(error) = fanout_run_engine
                                     .append_events_batch(
                                         &fanout_user_id,
-                                        &fanout_run_id,
+                                        &approval_run_id,
                                         &approval_requests,
                                     )
                                     .await
@@ -7844,7 +8083,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                                 tracing::error!(
                                     target: "astra_runtime::run_lifecycle",
                                     user_id = %fanout_user_id,
-                                    run_id = %fanout_run_id,
+                                    run_id = %approval_run_id,
                                     error = %error,
                                     "edge approval request persistence failed before delivery"
                                 );
@@ -8368,7 +8607,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let bg_cancel_flag = cancel_flag.clone();
         let bg_pause_flag = pause_flag.clone();
         let bg_llm_cancel_token = llm_cancel_token.clone();
-        let bg_client_event_tx = client_event_tx.clone();
         let bg_root_mailbox_router = Arc::clone(&self.server_agent_mailbox_router);
         let bg_root_mailbox_agent_id = request
             .agent_id
@@ -8501,17 +8739,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     bg_pause_flag.clone(),
                     bg_llm_cancel_token.clone(),
                 );
-                let client_disconnect_watcher = start_client_stream_disconnect_watcher(
-                    bg_run_id.clone(),
-                    bg_client_event_tx,
-                    bg_cancel_flag.clone(),
-                    bg_llm_cancel_token.clone(),
-                );
                 let loop_result =
                     run_agentic_loop_with_host_panic_safe(&mut host, &mut state).await;
                 park_server_root_mailbox(&mut state).await;
                 let loop_success = loop_result.is_ok();
-                drop(client_disconnect_watcher);
 
                 // Best-effort post-loop persistence (core events, tool events,
                 // hook DB, observer, session-end hooks, promotion events).
@@ -8526,6 +8757,38 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
                 let (final_events, final_status, error_msg) =
                     Self::finalize_run_events(loop_result, host.take_emitted_events(), &state);
+                if matches!(&final_status, RunStatus::Cancelled) {
+                    let cancelled_children = missing_lifecycle_spawner
+                        .cancel_descendants_of_parent_run(
+                            &bg_run_id,
+                            DescendantCancellationReason::AncestorCancelled,
+                        )
+                        .await;
+                    if cancelled_children > 0 {
+                        tracing::info!(
+                            target: "astra_runtime::run_lifecycle",
+                            run_id = %bg_run_id,
+                            cancelled_children,
+                            "cancelled dynamic-agent descendants with parent run"
+                        );
+                    }
+                    if let Err(error) = Self::cancel_durable_run_descendants(
+                        &run_engine,
+                        &bg_user_id,
+                        &bg_session_id,
+                        &bg_run_id,
+                        DescendantCancellationReason::AncestorCancelled.as_str(),
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            target: "astra_runtime::run_lifecycle",
+                            run_id = %bg_run_id,
+                            error = %error,
+                            "durable descendant cancellation sweep failed"
+                        );
+                    }
+                }
                 // Ensure fast synchronous child-agent progress has reached both
                 // durable replay and the live SSE stream before parent terminal
                 // markers close the turn.
@@ -9326,6 +9589,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let durable_status = Self::run_status_from_durable(&durable.status)?;
         let Some(cancelled_status) = durable_status.control_action_target(RunControlAction::Cancel)
         else {
+            if durable_status == RunStatus::Cancelled {
+                self.converge_cancelled_run_descendants(&user_id, &durable.session_id, &run_id)
+                    .await;
+            }
             return Ok(CancelRunRecord {
                 run_id,
                 status: durable.status,
@@ -9356,6 +9623,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     | RunStatus::Failed
                     | RunStatus::Cancelled
             ) {
+                if current_status == RunStatus::Cancelled {
+                    self.converge_cancelled_run_descendants(&user_id, &current.session_id, &run_id)
+                        .await;
+                }
                 return Ok(CancelRunRecord {
                     run_id,
                     status: current.status,
@@ -9376,9 +9647,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             }
         }
 
-        if let Some(de) = &self.delegation_engine {
-            de.cancel_children_of(&run_id).await;
-        }
+        self.converge_cancelled_run_descendants(&user_id, &durable.session_id, &run_id)
+            .await;
         Self::schedule_run_eviction(&self.runs, run_id.clone());
 
         Ok(CancelRunRecord {
@@ -9881,6 +10151,7 @@ impl ServerSpawnAgentExecutor {
         &self,
         inherited_permissions: InheritedPermissions,
         dynamic_agent_spawner: Arc<DynamicAgentSpawner>,
+        client_tool_delivery_tx: Option<mpsc::Sender<Value>>,
     ) -> ServerSubRunExecutor {
         let mut executor = ServerSubRunExecutor::new(
             self.matrixone.clone(),
@@ -9911,7 +10182,8 @@ impl ServerSpawnAgentExecutor {
         }
         executor = executor
             .with_reflect_service(Arc::clone(&self.reflect_service))
-            .with_dynamic_agent_spawner(dynamic_agent_spawner);
+            .with_dynamic_agent_spawner(dynamic_agent_spawner)
+            .with_client_tool_delivery_tx(client_tool_delivery_tx);
         executor
     }
 }
@@ -9951,6 +10223,7 @@ fn spawn_child_request_constraints(
 
     RequestConstraints::new(
         allowed_tools,
+        parent.enabled_tools.clone(),
         parent.allowed_skills.clone(),
         parent.allowed_skill_sources.clone(),
     )
@@ -10195,6 +10468,52 @@ fn server_subrun_waiting_for<'a>(
 
 #[async_trait]
 impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
+    async fn cancel_spawned_run(
+        &self,
+        run_id: &str,
+        user_id: Option<&str>,
+        reason: &str,
+    ) -> Result<(), String> {
+        let runtime_context = self.runtime_contexts.read().await.get(run_id).cloned();
+        if let Some(token) = runtime_context
+            .as_ref()
+            .and_then(|context| context.cancel_token.as_ref())
+        {
+            token.cancel();
+        }
+
+        let resolved_user_id = user_id.map(str::to_string).or_else(|| {
+            runtime_context
+                .as_ref()
+                .map(|context| context.user_id.clone())
+        });
+        if let (Some(run_engine), Some(user_id)) =
+            (self.run_engine.as_ref(), resolved_user_id.as_deref())
+        {
+            let event = json!({
+                "event_type": "run_finished",
+                "data": {
+                    "cancelled": true,
+                    "reason": reason,
+                    "source": "ancestor_run",
+                }
+            });
+            run_engine
+                .transition_status_with_event_if_current(
+                    user_id,
+                    run_id,
+                    &[STATUS_RUNNING, STATUS_WAITING, STATUS_PAUSED],
+                    STATUS_CANCELLED,
+                    None,
+                    None,
+                    event,
+                )
+                .await?;
+        }
+        self.remove_runtime_context(run_id).await;
+        Ok(())
+    }
+
     async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
         let context = self.runtime_context_for_config(&config).await?;
         let dynamic_agent_spawner = context.spawner.upgrade().ok_or_else(|| {
@@ -10207,7 +10526,7 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
             .await;
 
         let mut profile =
-            AgentProfile::new(&config.agent_id, &config.agent_type, AgentTier::System);
+            AgentProfile::new(&config.agent_id, &config.description, AgentTier::System);
         profile.system_prompt = Some(spawn_system_prompt(&config));
         profile.model_override = config.model.clone();
         profile.skill_filter = config.allowed_tools.clone();
@@ -10304,7 +10623,11 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
             harness_sink: context.harness_sink.clone(),
         };
 
-        let executor = self.build_subrun_executor(child_permissions, dynamic_agent_spawner);
+        let executor = self.build_subrun_executor(
+            child_permissions,
+            dynamic_agent_spawner,
+            config.client_tool_delivery_tx.clone(),
+        );
         #[cfg(feature = "bridge-e2e-hooks")]
         let executor = if !context.test_child_llm_rounds.is_empty() {
             executor.with_test_llm_rounds(context.test_child_llm_rounds.clone())
@@ -10344,6 +10667,70 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
     }
 }
 
+struct ChildClientToolDeliveryBridge {
+    join: tokio::task::JoinHandle<()>,
+}
+
+fn child_uses_client_tool_delivery(
+    parent_delivery_available: bool,
+    bindings: Option<&ExecutionBindingSnapshot>,
+) -> bool {
+    parent_delivery_available
+        && bindings.is_some_and(|snapshot| {
+            matches!(snapshot.executor.transport, ToolTransportKind::EdgeLedger)
+        })
+}
+
+impl Drop for ChildClientToolDeliveryBridge {
+    fn drop(&mut self) {
+        self.join.abort();
+    }
+}
+
+fn is_client_tool_delivery_event(event: &Value) -> bool {
+    matches!(
+        event.get("type").and_then(Value::as_str),
+        Some("approval_required" | "approval_batch_required" | "tool_request")
+    )
+}
+
+fn start_child_client_tool_delivery_bridge(
+    parent_tx: mpsc::Sender<Value>,
+    child_run_id: String,
+    child_agent_id: String,
+    session_id: String,
+    mut child_rx: mpsc::Receiver<Value>,
+) -> ChildClientToolDeliveryBridge {
+    let join = tokio::spawn(async move {
+        while let Some(mut event) = child_rx.recv().await {
+            if !is_client_tool_delivery_event(&event) {
+                continue;
+            }
+            let Some(event) = event.as_object_mut() else {
+                continue;
+            };
+            event
+                .entry("run_id".to_string())
+                .or_insert_with(|| Value::String(child_run_id.clone()));
+            event
+                .entry("agent_id".to_string())
+                .or_insert_with(|| Value::String(child_agent_id.clone()));
+            event
+                .entry("session_id".to_string())
+                .or_insert_with(|| Value::String(session_id.clone()));
+            if parent_tx.send(Value::Object(event.clone())).await.is_err() {
+                tracing::debug!(
+                    run_id = %child_run_id,
+                    agent_id = %child_agent_id,
+                    "parent client tool-delivery lane closed"
+                );
+                break;
+            }
+        }
+    });
+    ChildClientToolDeliveryBridge { join }
+}
+
 /// Production sub-run executor backed by [`ServerAgenticLoopHost`].
 ///
 /// Creates a real agentic loop for each sub-run with the agent's system prompt,
@@ -10367,6 +10754,8 @@ pub struct ServerSubRunExecutor {
     /// engine sub-runs can omit it; dynamic children must receive the same
     /// session-owned spawner so they can create governed grandchildren.
     dynamic_agent_spawner: Option<Arc<DynamicAgentSpawner>>,
+    /// Parent-owned delivery lane for browser/edge callback tool execution.
+    client_tool_delivery_tx: Option<mpsc::Sender<Value>>,
     /// Shared ToolExecutionService so executors share the same disabled_tool_offers set.
     pub tool_execution_service: Option<ToolExecutionService>,
     #[cfg(feature = "bridge-e2e-hooks")]
@@ -10393,6 +10782,7 @@ impl ServerSubRunExecutor {
             reflect_service: Arc::new(astra_services::UnconfiguredReflectService),
             inherited_permissions: InheritedPermissions::auto_approve(),
             dynamic_agent_spawner: None,
+            client_tool_delivery_tx: None,
             tool_execution_service: None,
             #[cfg(feature = "bridge-e2e-hooks")]
             test_llm_rounds: Vec::new(),
@@ -10427,6 +10817,11 @@ impl ServerSubRunExecutor {
 
     fn with_dynamic_agent_spawner(mut self, spawner: Arc<DynamicAgentSpawner>) -> Self {
         self.dynamic_agent_spawner = Some(spawner);
+        self
+    }
+
+    fn with_client_tool_delivery_tx(mut self, tx: Option<mpsc::Sender<Value>>) -> Self {
+        self.client_tool_delivery_tx = tx;
         self
     }
 
@@ -10491,7 +10886,7 @@ impl ServerSubRunExecutor {
             return Ok(());
         }
         run_engine
-            .start_run_ext(
+            .start_run_ext_with_context(
                 &config.run_id,
                 &config.user_id,
                 &config.session_id,
@@ -10499,6 +10894,10 @@ impl ServerSubRunExecutor {
                 config.context.get("delegation_id").and_then(Value::as_str),
                 Some(config.agent_profile.agent_id.as_str()),
                 None,
+                crate::server::run::engine::RunStartContext {
+                    agent_binding_name: Some(config.agent_profile.name.clone()),
+                    ..Default::default()
+                },
             )
             .await
     }
@@ -10603,17 +11002,20 @@ fn resolve_subrun_agentic_turn_budget(
     explicit_max_turns: Option<u32>,
 ) -> astra_turn_core::chat_turn_heuristics::AgenticTurnBudget {
     let runtime_ceiling = astra_core::RuntimeLimits::global().max_turns;
-    let base = astra_turn_core::chat_turn_heuristics::resolve_agentic_turn_budget(
-        task_profile,
-        runtime_ceiling,
-        None,
-    );
     let Some(explicit_max_turns) = explicit_max_turns.map(|turns| turns as usize) else {
-        return base;
+        return astra_turn_core::chat_turn_heuristics::resolve_agentic_turn_budget(
+            task_profile,
+            runtime_ceiling,
+            None,
+        );
     };
-    if explicit_max_turns <= base.hard_turn_limit {
-        return base;
-    }
+
+    // A child budget is an execution boundary selected by the caller after
+    // agent-type and complexity resolution. Treating small values as mere
+    // hints silently inflated focused review children from 12 turns to the
+    // generic 60/90-turn profile budget. Preserve one source of truth all the
+    // way into the child loop; the shared resolver still clamps an excessive
+    // value to the process-wide runtime ceiling.
     astra_turn_core::chat_turn_heuristics::resolve_agentic_turn_budget(
         task_profile,
         runtime_ceiling,
@@ -10727,6 +11129,15 @@ impl SubRunExecutor for ServerSubRunExecutor {
             self.provision_subrun_workspace(&config.session_id, &config.run_id)?;
         let execution_bindings =
             execution_bindings_from_metadata(config.execution_metadata.as_ref(), &subrun_workspace);
+        // Only a true thin-client callback transport may borrow the parent's
+        // SSE `/tools/result` lane. An `edge_ws` workspace has an executable
+        // server-to-edge dispatch service and must use RuntimeToolExecutor;
+        // routing it through the browser callback lane waits forever because
+        // the browser is not the selected workspace executor.
+        let client_tool_delivery_available = child_uses_client_tool_delivery(
+            self.client_tool_delivery_tx.is_some(),
+            execution_bindings.as_ref(),
+        );
 
         // Build the host with agent-specific configuration.
         let mut builder = ServerAgenticLoopHostBuilder::new(
@@ -10765,9 +11176,11 @@ impl SubRunExecutor for ServerSubRunExecutor {
         if let Some(ref shared_tes) = self.tool_execution_service {
             builder = builder
                 .with_disabled_tool_offers(shared_tes.disabled_tool_offers_handle())
+                .with_provider_capabilities(shared_tes.provider_capabilities_handle())
                 .with_provider_allowed_tools(shared_tes.provider_allowed_tools_handle());
         }
         let mut host = builder.build();
+        host.set_client_cancel(local_cancel_flag.clone(), local_cancel_token.clone());
         if let Some(sink) = config.live_event_sink.clone() {
             host.set_agent_live_event_sink(
                 config.run_id.clone(),
@@ -10775,6 +11188,22 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 sink,
             );
         }
+        let _client_tool_delivery_bridge = if client_tool_delivery_available {
+            let (child_tx, child_rx) = mpsc::channel(512);
+            host.set_event_tx(child_tx);
+            host.prefer_client_tool_delivery();
+            Some(start_child_client_tool_delivery_bridge(
+                self.client_tool_delivery_tx
+                    .clone()
+                    .expect("availability checked above"),
+                config.run_id.clone(),
+                config.agent_profile.agent_id.clone(),
+                config.session_id.clone(),
+                child_rx,
+            ))
+        } else {
+            None
+        };
 
         // Build the task prompt, incorporating previous output if pipeline.
         let full_task = if let Some(prev) = &config.previous_output {
@@ -11106,6 +11535,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                     inherited_permissions: self.inherited_permissions.clone(),
                     active_skills: Vec::new(),
                     live_event_sink: config.live_event_sink.clone(),
+                    client_tool_delivery_tx: self.client_tool_delivery_tx.clone(),
                     trace_context: trace_context_from_subrun_context(&config.context),
                     execution_metadata: config.execution_metadata.clone(),
                     transcript_location: AgentTranscriptLocation::DurableServer,
@@ -11135,6 +11565,11 @@ impl SubRunExecutor for ServerSubRunExecutor {
         let live_started_at = Instant::now();
         let live_agent_id = config.agent_profile.agent_id.clone();
         let outcome = run_agentic_loop_with_host(&mut host, &mut loop_state).await;
+        if matches!(&outcome, Ok(AgenticLoopOutcome::Completed)) {
+            crate::turn::agentic_loop::finalization::mark_execution_incomplete_from_turn_evaluation(
+                &mut loop_state,
+            );
+        }
 
         // Commit the durable lifecycle fact before slower transcript,
         // observability, and cleanup work. Otherwise a completed child can

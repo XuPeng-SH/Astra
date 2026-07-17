@@ -122,6 +122,10 @@ pub struct ChatRequest {
     pub allow_skill_sources: Option<Vec<String>>,
     #[serde(default)]
     pub allow_tools: Option<Vec<String>>,
+    /// Optional external tools explicitly enabled by the embedding product.
+    /// Unlike `allow_tools`, this does not restrict core tools.
+    #[serde(default)]
+    pub enabled_tools: Option<Vec<String>>,
     #[serde(default)]
     pub workspace_binding: Option<astra_services::runs::WorkspaceBindingRequest>,
     #[serde(default)]
@@ -413,6 +417,9 @@ pub struct ChatResponse {
 pub struct RunStatusResponse {
     pub run_id: String,
     pub session_id: String,
+    pub parent_run_id: Option<String>,
+    pub root_run_id: Option<String>,
+    pub depth: u32,
     pub status: String,
     pub waiting_for: Option<String>,
     pub events_count: i64,
@@ -1117,6 +1124,9 @@ impl From<RunStatusRecord> for RunStatusResponse {
         Self {
             run_id: value.run_id,
             session_id: value.session_id,
+            parent_run_id: value.parent_run_id,
+            root_run_id: value.root_run_id,
+            depth: value.depth,
             status: value.status,
             waiting_for: value.waiting_for,
             events_count: value.events_count,
@@ -1233,6 +1243,7 @@ pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
         allow_skills: request.allow_skills,
         allow_skill_sources: request.allow_skill_sources,
         allow_tools: request.allow_tools,
+        enabled_tools: request.enabled_tools,
         workspace_binding: request.workspace_binding,
         executor_binding: request.executor_binding,
         runtime_mcp_bindings: request.runtime_mcp_bindings,

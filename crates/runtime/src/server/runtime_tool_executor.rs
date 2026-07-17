@@ -3903,7 +3903,8 @@ mod tests {
 
         assert!(names.contains("ask_user"));
         assert!(names.contains("tool_search"));
-        assert!(names.contains("web_search"));
+        assert!(!names.contains("web_search"));
+        assert!(!names.contains("web_fetch"));
         for hidden in [
             "bash",
             "read_file",
@@ -4863,28 +4864,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn web_search_executes_from_tool_engine_registry() {
+    async fn web_search_is_registered_as_a_server_tool_engine_handler() {
         let (exec, _dir) = test_executor();
         assert!(
             exec.tool_engine.contains("web_search"),
             "web_search should be registered in ToolEngine for server-local execution"
-        );
-
-        let result = exec
-            .execute_with_metadata(
-                "web_search",
-                &json!({"query": "astra runtime", "engine": "wikipedia"}),
-            )
-            .await;
-
-        assert!(!result.is_error, "{result:?}");
-        assert!(result.output.contains("search_url"), "{result:?}");
-        let metadata = result
-            .metadata
-            .expect("binding metadata should be attached");
-        assert!(
-            metadata.contains_key("runtime_environment"),
-            "execute_with_metadata should still wrap ToolEngine results with runtime metadata"
         );
     }
 
@@ -5043,12 +5027,39 @@ mod tests {
 
     #[tokio::test]
     async fn github_executes_from_tool_engine_registry() {
-        let (exec, _dir) = test_executor();
+        let (mut exec, _dir) = test_executor();
         assert!(
             exec.tool_engine.contains("github"),
             "consolidated github should be registered in ToolEngine for server-local execution"
         );
 
+        let unavailable = exec.execute_with_metadata("github", &json!({})).await;
+        assert!(unavailable.is_error, "{unavailable:?}");
+        assert!(
+            unavailable.output.contains("provider"),
+            "a credential-backed optional tool must fail closed without declared capacity: {unavailable:?}"
+        );
+
+        exec = exec.with_tool_execution_service(
+            ToolExecutionService::builder()
+                .initial_provider_capabilities(HashMap::from([(
+                    crate::server::tool_execution_service::SERVER_OPTIONAL_TOOL_PROVIDER_ID
+                        .to_string(),
+                    HashSet::from([
+                        astra_core::PROVIDER_CAPABILITY_PUBLIC_NETWORK.to_string(),
+                        astra_core::PROVIDER_CAPABILITY_CREDENTIAL_BROKER.to_string(),
+                    ]),
+                )]))
+                .build(),
+        );
+        exec.set_current_selected_tool_offers(HashMap::from([(
+            "github".to_string(),
+            SelectedToolOfferSnapshot::new_with_route(
+                "github",
+                crate::server::tool_execution_service::SERVER_OPTIONAL_TOOL_PROVIDER_ID,
+                crate::server::tool_route_selection::ToolExecutionRouteKind::ServerRuntime,
+            ),
+        )]));
         let result = exec.execute_with_metadata("github", &json!({})).await;
 
         assert!(result.is_error, "{result:?}");
@@ -5350,16 +5361,17 @@ mod tests {
         let registry = astra_runtime_env::ToolRegistry::builtins();
 
         for handler_name in exec.tool_engine.handler_names() {
-            if !(handler_name == "run_script" && cfg!(not(unix))) {
+            let runtime_spec = registry.get(handler_name).unwrap_or_else(|| {
+                panic!("ToolEngine handler `{handler_name}` has no runtime capability spec")
+            });
+            if !(handler_name == "run_script" && cfg!(not(unix)))
+                && !runtime_spec.requires_explicit_user_enablement()
+            {
                 assert!(
                     schema_names.contains(handler_name),
                     "ToolEngine handler `{handler_name}` must have a model-visible schema"
                 );
             }
-            assert!(
-                registry.get(handler_name).is_some(),
-                "ToolEngine handler `{handler_name}` must have a runtime capability spec"
-            );
         }
     }
 
@@ -5413,7 +5425,11 @@ mod tests {
         let unclassified: Vec<_> = handler_names
             .iter()
             .filter(|n| {
-                !schema_names.contains(*n) && !astra_runtime_env::is_mcp_namespaced_tool_name(n)
+                !schema_names.contains(*n)
+                    && !astra_runtime_env::is_mcp_namespaced_tool_name(n)
+                    && !astra_runtime_env::ToolRegistry::builtins()
+                        .get(n)
+                        .is_some_and(astra_runtime_env::ToolSpec::requires_explicit_user_enablement)
             })
             .cloned()
             .collect();
@@ -5835,6 +5851,7 @@ esac
             inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
             active_skills: Vec::new(),
             live_event_sink: None,
+            client_tool_delivery_tx: None,
             trace_context: None,
             execution_metadata: None,
             transcript_location: crate::orchestration::AgentTranscriptLocation::DurableServer,
@@ -7364,7 +7381,7 @@ esac
 
         assert!(result.is_error, "{result:?}");
         assert!(
-            result.output.contains("No alternate execution provider"),
+            result.output.contains("changing the tool name"),
             "{}",
             result.output
         );
@@ -7404,13 +7421,11 @@ esac
         assert!(result.is_error, "{result:?}");
         let metadata = result.metadata.as_ref().expect("edge runtime metadata");
         assert_eq!(metadata["error_kind"], "transport_unavailable");
-        assert_eq!(metadata["reason"], "transport_unavailable");
         assert_eq!(metadata["execution_started"], false);
-        assert_eq!(metadata["side_effects_maybe"], false);
+        assert_eq!(metadata["disposition"], "rejected");
+        assert_eq!(metadata["failure_scope"], "executor_transport");
         assert_eq!(metadata["workspace"]["kind"], "edge_workspace");
         assert_eq!(metadata["executor"]["kind"], "edge_agent");
-        assert_eq!(metadata["executor"]["display_name"], "MacBook Pro");
-        assert_eq!(metadata["transport"], "edge_ws");
 
         let mut events = Vec::new();
         while let Ok(event) = rx.try_recv() {
@@ -7436,18 +7451,10 @@ esac
         assert_eq!(started["workspace"]["kind"], "edge_workspace");
         assert_eq!(started["executor"]["display_name"], "MacBook Pro");
         assert_eq!(started["transport"], "edge_ws");
-
         assert!(
-            !events
-                .iter()
-                .any(|event| event["type"] == "tool_transport_completed"),
-            "transport-disconnected edge route must not be reported as completed: {events:?}"
+            events.iter().any(|event| event["type"] == "run_blocked"),
+            "unavailable selected edge route must be observable: {events:?}"
         );
-        let blocked = events
-            .iter()
-            .find(|event| event["type"] == "run_blocked")
-            .expect("run_blocked");
-        assert_eq!(blocked["reason"], "transport_unavailable");
     }
 
     #[tokio::test]
@@ -7542,7 +7549,7 @@ esac
         assert!(
             blocked["message"]
                 .as_str()
-                .is_some_and(|message| message.contains("No alternate execution provider")),
+                .is_some_and(|message| message.contains("changing the tool name")),
             "{blocked:?}"
         );
     }
@@ -8107,22 +8114,23 @@ esac
 
     #[tokio::test]
     async fn server_tool_search_finds_catalog_tool() {
-        let (exec, _dir) = test_executor();
+        let (exec, _dir) = test_executor_with_agent_context();
         assert!(
             exec.tool_engine.contains("tool_search"),
             "tool_search should be registered in ToolEngine as a context-aware handler"
         );
+        exec.set_current_activatable_tool_names(HashSet::from(["agent_fanout".to_string()]));
         let result = exec
-            .execute_with_metadata("tool_search", &json!({"query": "select:github"}))
+            .execute_with_metadata("tool_search", &json!({"query": "select:agent_fanout"}))
             .await;
         assert!(
             !result.is_error,
-            "tool_search must succeed for select:github"
+            "tool_search must succeed for select:agent_fanout"
         );
         let parsed: Value = serde_json::from_str(&result.output).unwrap();
         assert!(
             parsed["missing"].as_array().unwrap().is_empty(),
-            "select:github must resolve on server path; got: {}",
+            "select:agent_fanout must resolve on server path; got: {}",
             result.output
         );
     }

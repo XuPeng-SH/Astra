@@ -82,6 +82,16 @@ const AUX_LLM_POLICY_ENV: &str = "ASTRA_AUX_LLM_POLICY";
 const METRIC_LLM_MAIN_ATTEMPTS_TOTAL: &str = "astra_llm_main_attempts_total";
 const METRIC_LLM_MAIN_ATTEMPT_TOKENS_TOTAL: &str = "astra_llm_main_attempt_tokens_total";
 
+fn observed_ttft_ms(
+    first_stream_update_ms: Option<u64>,
+    first_visible_text_ms: Option<u64>,
+    completed_ms: u64,
+) -> u64 {
+    first_stream_update_ms
+        .or(first_visible_text_ms)
+        .unwrap_or(completed_ms)
+}
+
 fn insert_event_fields(event: &mut Map<String, Value>, fields: &Map<String, Value>) {
     for (key, value) in fields {
         event.entry(key.clone()).or_insert_with(|| value.clone());
@@ -1153,11 +1163,14 @@ pub struct ServerAgenticLoopHost {
     /// incremental streaming (web agent mode). The HTTP handler reads
     /// from the corresponding receiver to stream SSE to the client.
     event_tx: Option<tokio::sync::mpsc::Sender<Value>>,
-    /// When the SSE channel's receiver is dropped (client disconnected),
-    /// this flag is set so the agentic loop cancels at the next turn boundary.
+    /// A server-side child may share its parent's client tool-delivery lane
+    /// while retaining a separate transcript stream. Only edge-bound tool
+    /// requests use that lane; ordinary child output stays on the typed live
+    /// mirror.
+    prefer_client_tool_delivery: bool,
+    /// Explicit run cancellation flag. Observer disconnects never mutate it.
     client_cancel_flag: Option<Arc<AtomicBool>>,
-    /// Low-latency cancellation token — cancelled alongside `client_cancel_flag`
-    /// for immediate LLM abort on client disconnect.
+    /// Low-latency explicit run cancellation token.
     client_cancel_token: Option<Arc<CancellationToken>>,
 
     // ── Agent progress ──
@@ -1219,6 +1232,10 @@ pub struct ServerAgenticLoopHost {
     /// Shared handle to the runtime-disabled tool offers (admin API). Used to
     /// exclude admin-disabled tool offers from the LLM tool surface.
     disabled_tool_offers: Arc<tokio::sync::RwLock<HashSet<String>>>,
+    /// Deployment-declared provider capacity used by both prompt admission and
+    /// dispatch. User selection is tracked separately in request constraints.
+    /// Frozen at startup — no runtime writes, so we use a plain Arc (no lock).
+    provider_capabilities: Arc<HashMap<String, HashSet<String>>>,
     /// Shared exact provider allowlist. Missing provider id means unrestricted.
     provider_allowed_tools: Arc<tokio::sync::RwLock<HashMap<String, HashSet<String>>>>,
     /// Optional LLM-based turn intent judge. When set, every turn first asks
@@ -1292,6 +1309,8 @@ pub struct ServerAgenticLoopHostBuilder {
     prefix_store: Option<std::sync::Arc<dyn astra_turn_core::fork_prefix_store::PrefixCaptureSink>>,
     /// Shared handle to the runtime-disabled tool offers (admin API).
     disabled_tool_offers: Option<Arc<tokio::sync::RwLock<HashSet<String>>>>,
+    /// Deployment-declared provider capacity. Frozen at startup (no runtime writes).
+    provider_capabilities: Option<Arc<HashMap<String, HashSet<String>>>>,
     /// Shared exact provider allowlist. Missing provider id means unrestricted.
     provider_allowed_tools: Option<Arc<tokio::sync::RwLock<HashMap<String, HashSet<String>>>>>,
 }
@@ -1349,6 +1368,7 @@ impl ServerAgenticLoopHostBuilder {
             shared_dedup_state: None,
             prefix_store: None,
             disabled_tool_offers: None,
+            provider_capabilities: None,
             provider_allowed_tools: None,
         }
     }
@@ -1591,6 +1611,11 @@ impl ServerAgenticLoopHostBuilder {
             control_plane_provider_ready: self.control_plane_tool_catalog_enabled,
             runtime_declared_tool_names: (!runtime_declared_tool_names.is_empty())
                 .then(|| runtime_declared_tool_names.clone()),
+            provider_capabilities: self
+                .provider_capabilities
+                .as_deref()
+                .cloned()
+                .unwrap_or_default(),
             disabled_tool_offers: snapshot_builder_policy_handle(&self.disabled_tool_offers),
             provider_allowed_tools: snapshot_builder_policy_handle(&self.provider_allowed_tools),
             ..ToolAdmissionContext::default()
@@ -1724,6 +1749,7 @@ impl ServerAgenticLoopHostBuilder {
             ),
             emitted_events: Vec::new(),
             event_tx: self.event_tx,
+            prefer_client_tool_delivery: false,
             client_cancel_flag: None,
             client_cancel_token: None,
             progress_rx,
@@ -1759,6 +1785,9 @@ impl ServerAgenticLoopHostBuilder {
             disabled_tool_offers: self
                 .disabled_tool_offers
                 .unwrap_or_else(|| Arc::new(tokio::sync::RwLock::new(HashSet::new()))),
+            provider_capabilities: self
+                .provider_capabilities
+                .unwrap_or_else(|| Arc::new(HashMap::new())),
             provider_allowed_tools: self
                 .provider_allowed_tools
                 .unwrap_or_else(|| Arc::new(tokio::sync::RwLock::new(HashMap::new()))),
@@ -1790,6 +1819,14 @@ impl ServerAgenticLoopHostBuilder {
         handle: Arc<tokio::sync::RwLock<HashSet<String>>>,
     ) -> Self {
         self.disabled_tool_offers = Some(handle);
+        self
+    }
+
+    pub fn with_provider_capabilities(
+        mut self,
+        handle: Arc<HashMap<String, HashSet<String>>>,
+    ) -> Self {
+        self.provider_capabilities = Some(handle);
         self
     }
 
@@ -2433,9 +2470,8 @@ impl ServerAgenticLoopHost {
     }
 
     /// Push an SSE event to both the internal buffer and the streaming channel.
-    /// If the streaming channel is closed (client disconnected), triggers
-    /// cancellation so the agentic loop stops at the next turn boundary. If the
-    /// channel is full, live streaming is detached but the run continues.
+    /// If the observer channel is closed or full, detach live delivery. The
+    /// durable run continues and may be observed again through run replay.
     fn emit_event(&mut self, mut event: Value) {
         self.attach_execution_metadata_to_tool_event(&mut event);
         self.mirror_agent_live_event(&event);
@@ -2444,13 +2480,7 @@ impl ServerAgenticLoopHost {
             match tx.try_send(event.clone()) {
                 Ok(()) => {}
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                    // Client disconnected — cancel the loop to stop wasting LLM tokens.
-                    if let Some(flag) = &self.client_cancel_flag {
-                        flag.store(true, Ordering::SeqCst);
-                    }
-                    if let Some(token) = &self.client_cancel_token {
-                        token.cancel();
-                    }
+                    tracing::debug!(target: "sse_channel", "SSE observer disconnected; detaching live stream while durable run continues");
                     self.event_tx = None;
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
@@ -2638,8 +2668,7 @@ impl ServerAgenticLoopHost {
     }
     /// Attach an incremental SSE channel. Events will be pushed through
     /// this sender as they are emitted, enabling streaming to the client.
-    /// When the channel closes (client disconnect), `cancel_flag` and
-    /// `cancel_token` are triggered to stop the agentic loop.
+    /// Channel closure detaches this observer; it does not cancel the run.
     pub fn set_event_tx(&mut self, tx: tokio::sync::mpsc::Sender<Value>) {
         // In live streaming mode, run_lifecycle owns the dedicated progress
         // bridge. Keeping the host subscription active would replay the same
@@ -2648,6 +2677,12 @@ impl ServerAgenticLoopHost {
         self.progress_rx = None;
         self.progress_filter = None;
         self.event_tx = Some(tx);
+    }
+
+    /// Use the attached event channel as the executable client lane for
+    /// edge-bound tools owned by a server-side child run.
+    pub fn prefer_client_tool_delivery(&mut self) {
+        self.prefer_client_tool_delivery = true;
     }
 
     pub fn set_execution_metadata(&mut self, metadata: Value) {
@@ -2674,7 +2709,7 @@ impl ServerAgenticLoopHost {
         });
     }
 
-    /// Set the cancellation handles used when client disconnects.
+    /// Set the handles used by explicit run cancellation and runtime boundaries.
     pub fn set_client_cancel(&mut self, flag: Arc<AtomicBool>, token: Arc<CancellationToken>) {
         self.client_cancel_flag = Some(flag);
         self.client_cancel_token = Some(token);
@@ -3324,6 +3359,9 @@ impl ServerAgenticLoopHost {
     }
 
     fn should_deliver_edge_bound_tools_via_client_ledger(&self, state: &AgenticLoopState) -> bool {
+        if self.prefer_client_tool_delivery && self.event_tx.is_some() {
+            return true;
+        }
         should_deliver_edge_bound_tools_via_client_ledger_for_binding(
             self.workspace_binding.kind,
             self.executor_binding.transport,
@@ -3750,12 +3788,17 @@ impl ServerAgenticLoopHost {
         identity: &astra_services::multi_agent::EdgeDispatchIdentity,
         ledger_wait: Duration,
     ) -> astra_turn_core::cloud_tool_delivery::EdgeToolRoundDelivery {
-        use astra_turn_core::cloud_tool_delivery::wait_tool_result_ledger_for_tool;
+        use astra_turn_core::cloud_tool_delivery::wait_tool_result_ledger_for_tool_with_cancel;
         use astra_turn_core::edge_ledger::tool_callback_key;
 
-        let delivery =
-            wait_tool_result_ledger_for_tool(&self.edge_callback_ledger, identity, tc, ledger_wait)
-                .await;
+        let delivery = wait_tool_result_ledger_for_tool_with_cancel(
+            &self.edge_callback_ledger,
+            identity,
+            tc,
+            ledger_wait,
+            self.client_cancel_token.as_deref(),
+        )
+        .await;
         if !edge_tool_delivery_timed_out(&delivery) {
             return delivery;
         }
@@ -3801,11 +3844,12 @@ impl ServerAgenticLoopHost {
             });
         }
 
-        wait_tool_result_ledger_for_tool(
+        wait_tool_result_ledger_for_tool_with_cancel(
             &self.edge_callback_ledger,
             identity,
             tc,
             Duration::from_millis(0),
+            self.client_cancel_token.as_deref(),
         )
         .await
     }
@@ -3898,6 +3942,10 @@ impl ServerAgenticLoopHost {
             .unwrap_or_default()
     }
 
+    fn provider_capabilities_snapshot(&self) -> HashMap<String, HashSet<String>> {
+        self.provider_capabilities.as_ref().clone()
+    }
+
     fn tool_admission_context(&self) -> ToolAdmissionContext {
         ToolAdmissionContext {
             server_service_provider_ready: self.server_service_provider_catalog_enabled,
@@ -3910,6 +3958,7 @@ impl ServerAgenticLoopHost {
                 .unwrap_or(astra_runtime_env::RuntimePlatform::Unknown),
             runtime_declared_tool_names: (!self.runtime_declared_tool_names.is_empty())
                 .then(|| self.runtime_declared_tool_names.clone()),
+            provider_capabilities: self.provider_capabilities_snapshot(),
             disabled_tool_offers: self.disabled_tool_offers_snapshot(),
             provider_allowed_tools: self.provider_allowed_tools_snapshot(),
         }
@@ -5256,6 +5305,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         }
                     }
                     LlmStreamUpdate::Reasoning(content) => {
+                        if !content.is_empty() {
+                            attempt_first_stream_update_ms.get_or_insert_with(|| {
+                                llm_round_start.elapsed().as_millis() as u64
+                            });
+                            first_stream_update_turn_ms
+                                .get_or_insert_with(|| turn_started.elapsed().as_millis() as u64);
+                        }
                         attempt_reasoning.push_str(&content);
                         if self.terminal_handoff_window.is_open() {
                             action_window_updates.push(LlmStreamUpdate::Reasoning(content));
@@ -5689,7 +5745,11 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         };
 
         // ── 6. Build turn result ────────────────────────────────────────
-        let ttft_ms = Some(turn_started.elapsed().as_millis() as u64);
+        let ttft_ms = Some(observed_ttft_ms(
+            first_stream_update_turn_ms,
+            first_visible_text_turn_ms,
+            turn_started.elapsed().as_millis() as u64,
+        ));
         let mut accum = Self::result_to_accum(&result);
         accum.system_prompt_tokens = Some(final_system_prompt_breakdown.total_tokens);
         accum.system_prompt_breakdown = serde_json::to_value(&final_system_prompt_breakdown).ok();
@@ -6527,6 +6587,13 @@ mod tests {
     use astra_turn_core::sse_stream_host::EdgeToolExecResult;
     use std::ffi::OsString;
 
+    #[test]
+    fn ttft_prefers_the_first_stream_update_including_reasoning() {
+        assert_eq!(observed_ttft_ms(Some(240), Some(900), 1_600), 240);
+        assert_eq!(observed_ttft_ms(None, Some(900), 1_600), 900);
+        assert_eq!(observed_ttft_ms(None, None, 1_600), 1_600);
+    }
+
     struct EnvVarGuard {
         key: &'static str,
         previous: Option<OsString>,
@@ -6807,6 +6874,13 @@ mod tests {
                 }
             }),
         ]
+    }
+
+    fn server_public_network_capabilities() -> Arc<HashMap<String, HashSet<String>>> {
+        Arc::new(HashMap::from([(
+            "server-builtin".to_string(),
+            HashSet::from([astra_core::PROVIDER_CAPABILITY_PUBLIC_NETWORK.to_string()]),
+        )]))
     }
 
     fn sample_edge_tools_with_ask_user() -> Vec<Value> {
@@ -7264,7 +7338,7 @@ mod tests {
             "u-route".to_string(),
             "s-route".to_string(),
         )
-        .with_edge_tools(sample_edge_tools())
+        .with_edge_tools(sample_edge_tools_with_web_fetch())
         .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
 
@@ -7277,7 +7351,7 @@ mod tests {
             json!({
                 "id": "web-1",
                 "type": "function",
-                "function": {"name": "web_search", "arguments": r#"{"query":"astra"}"#}
+                "function": {"name": "web_fetch", "arguments": r#"{"url":"https://example.com"}"#}
             }),
             json!({
                 "id": "mcp-1",
@@ -7304,7 +7378,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        assert_eq!(names, vec!["read_file", "web_search"]);
+        assert_eq!(names, vec!["read_file", "web_fetch"]);
     }
 
     #[test]
@@ -7391,6 +7465,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn server_child_can_inherit_the_parent_client_tool_delivery_lane() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-child-edge".to_string(),
+            "s-child-edge".to_string(),
+        )
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        host.set_event_tx(tx);
+        host.prefer_client_tool_delivery();
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut runtime_executor = runtime_tool_executor_with_agent_context(dir.path());
+        runtime_executor.set_execution_binding_snapshot(edge_runtime_snapshot());
+        let mut state = create_test_state();
+        state.runtime_tool_executor = Some(Arc::new(runtime_executor));
+
+        assert!(
+            host.should_deliver_edge_bound_tools_via_client_ledger(&state),
+            "a child with an inherited executable client lane must not fall through to an unavailable server edge transport"
+        );
+    }
+
     #[tokio::test]
     async fn thin_client_ledger_does_not_emit_server_owned_task_request() {
         let mut host = ServerAgenticLoopHostBuilder::new(
@@ -7438,6 +7538,7 @@ mod tests {
         ))
         .with_edge_tools(sample_edge_tools())
         .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .with_provider_capabilities(server_public_network_capabilities())
         .build();
 
         let names = schema_names(&host.tool_schemas);
@@ -7631,6 +7732,7 @@ mod tests {
             inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
             active_skills: Vec::new(),
             live_event_sink: None,
+            client_tool_delivery_tx: None,
             trace_context: None,
             execution_metadata: None,
             transcript_location: crate::orchestration::AgentTranscriptLocation::DurableServer,
@@ -8004,6 +8106,7 @@ mod tests {
         )
         .with_edge_tools(sample_edge_tools())
         .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .with_provider_capabilities(server_public_network_capabilities())
         .build();
 
         let dir = tempfile::TempDir::new().unwrap();
@@ -8253,8 +8356,9 @@ mod tests {
         let names = schema_names(&host.tool_schemas);
         assert!(names.contains("ask_user"));
         assert!(names.contains("tool_search"));
-        assert!(names.contains("web_search"));
         for hidden in [
+            "web_fetch",
+            "web_search",
             "bash",
             "read_file",
             "write_file",
@@ -8284,6 +8388,7 @@ mod tests {
             "user1".to_string(),
             "sess1".to_string(),
         )
+        .with_provider_capabilities(server_public_network_capabilities())
         .with_disabled_tool_offers(disabled_offers)
         .build();
 
@@ -10369,7 +10474,7 @@ mod tests {
     }
 
     #[test]
-    fn visible_turn_tools_excludes_disabled_edge_offer_with_default_catalog() {
+    fn visible_turn_tools_excludes_only_the_disabled_edge_offer() {
         let disabled: HashSet<String> = ["bash@edge-1".to_string()].into_iter().collect();
         let disabled_handle = Arc::new(tokio::sync::RwLock::new(disabled));
 
@@ -10388,16 +10493,12 @@ mod tests {
         let visible = host.visible_turn_tools(&mut state);
         let visible_names = schema_names(&visible);
 
-        assert!(
-            visible_names.contains("web_search"),
-            "default server catalog must stay active in this regression guard"
-        );
         assert!(visible_names.contains("read_file"));
         assert!(!visible_names.contains("bash"));
     }
 
     #[test]
-    fn disabled_edge_shared_offer_does_not_fallback_to_server_offer() {
+    fn disabled_unselected_edge_shared_offer_keeps_server_offer() {
         let disabled: HashSet<String> = ["web_fetch@edge-1".to_string()].into_iter().collect();
         let disabled_handle = Arc::new(tokio::sync::RwLock::new(disabled));
 
@@ -10409,6 +10510,7 @@ mod tests {
         )
         .with_edge_tools(sample_edge_tools_with_web_fetch())
         .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .with_provider_capabilities(server_public_network_capabilities())
         .with_disabled_tool_offers(disabled_handle)
         .build();
 
@@ -10416,10 +10518,7 @@ mod tests {
         let visible = host.visible_turn_tools(&mut state);
         let visible_names = schema_names(&visible);
 
-        assert!(
-            !visible_names.contains("web_fetch"),
-            "disabled edge-owned shared offer must not be silently replaced by the server offer"
-        );
+        assert!(visible_names.contains("web_fetch"));
         assert!(
             visible_names.contains("web_search"),
             "server-owned shared tools remain available when the selected runtime provider did not advertise that tool"
@@ -10428,6 +10527,10 @@ mod tests {
 
     #[test]
     fn tool_admission_snapshot_reports_selected_offer_candidates() {
+        let provider_capabilities = Arc::new(HashMap::from([(
+            "server-builtin".to_string(),
+            HashSet::from([astra_core::PROVIDER_CAPABILITY_PUBLIC_NETWORK.to_string()]),
+        )]));
         let host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -10436,6 +10539,7 @@ mod tests {
         )
         .with_edge_tools(sample_edge_tools_with_web_fetch())
         .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .with_provider_capabilities(provider_capabilities)
         .build();
 
         let admission = host.tool_admission_snapshot_entries();
@@ -10549,11 +10653,6 @@ mod tests {
                 && candidate.scope == "workspace"
                 && candidate.reason == "ProviderUnavailable"
         }));
-        assert!(web_fetch.candidates.iter().any(|candidate| {
-            candidate.offer_id == "web_fetch@server-builtin"
-                && !candidate.selected
-                && candidate.reason == "CurrentProviderPreferred"
-        }));
     }
 
     #[test]
@@ -10606,6 +10705,7 @@ mod tests {
             "u".to_string(),
             "s".to_string(),
         )
+        .with_provider_capabilities(server_public_network_capabilities())
         .with_disabled_tool_offers(disabled_handle.clone())
         .build();
         let mut server_state = create_test_state();
@@ -10627,6 +10727,7 @@ mod tests {
         )
         .with_edge_tools(sample_edge_tools_with_web_fetch())
         .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .with_provider_capabilities(server_public_network_capabilities())
         .with_disabled_tool_offers(disabled_handle)
         .build();
         let mut edge_state = create_test_state();
@@ -10652,6 +10753,7 @@ mod tests {
             "u".to_string(),
             "s".to_string(),
         )
+        .with_provider_capabilities(server_public_network_capabilities())
         .with_disabled_tool_offers(disabled_handle)
         .build();
 
@@ -12442,6 +12544,30 @@ mod tests {
             host.event_tx.is_none(),
             "live stream sender should be detached after bounded channel backpressure"
         );
+        assert_eq!(host.emitted_events.len(), 1);
+    }
+
+    #[test]
+    fn disconnected_sse_observer_detaches_without_cancelling_durable_run() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .build();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let cancel_token = Arc::new(CancellationToken::new());
+        host.set_client_cancel(Arc::clone(&cancel_flag), Arc::clone(&cancel_token));
+
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+        host.set_event_tx(tx);
+        host.emit_event(json!({"type": "text_delta", "content": "detached"}));
+
+        assert!(!cancel_flag.load(Ordering::SeqCst));
+        assert!(!cancel_token.is_cancelled());
+        assert!(host.event_tx.is_none());
         assert_eq!(host.emitted_events.len(), 1);
     }
 

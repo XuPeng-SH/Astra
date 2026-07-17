@@ -176,12 +176,20 @@ export const MessageBubble = memo(function MessageBubble({
   const reasoning = orphanStreamingReasoning ? rawContent : rawReasoning;
   const hasReasoning = Boolean(reasoning.trim());
   const assistantStillStreaming = message.status === "streaming";
+  const reasoningPending =
+    assistantStillStreaming && message.reasoningStatus === "streaming";
   const reasoningStreaming =
     assistantStillStreaming &&
-    (hasReasoning || splitContent.reasoningOpen || orphanStreamingReasoning);
+    (reasoningPending ||
+      hasReasoning ||
+      splitContent.reasoningOpen ||
+      orphanStreamingReasoning);
   const showReasoning = !isUser && (hasReasoning || reasoningStreaming);
   const isStreamingEmpty =
-    message.status === "streaming" && !content.trim() && !hasReasoning;
+    message.status === "streaming" &&
+    !content.trim() &&
+    !hasReasoning &&
+    !showReasoning;
   const artifacts = message.artifacts ?? [];
   const hasArtifacts = artifacts.length > 0;
   const isSettledEmptyAssistant =
@@ -229,6 +237,18 @@ export const MessageBubble = memo(function MessageBubble({
             skills={message.activeSkills}
             className="text-[15px] leading-[1.55]"
           />
+          {message.activeTools?.length ? (
+            <div className="mt-2 flex flex-wrap justify-end gap-1.5 border-t border-border/60 pt-2 font-ui text-[11px] text-text-muted">
+              {toolCapabilityLabels(message.activeTools).map((tool) => (
+                <span
+                  key={tool}
+                  className="rounded-full border border-border/70 bg-surface px-2 py-0.5"
+                >
+                  {tool}
+                </span>
+              ))}
+            </div>
+          ) : null}
         </div>
       </article>
     );
@@ -274,6 +294,30 @@ export const MessageBubble = memo(function MessageBubble({
     </article>
   );
 });
+
+function toolLabel(tool: string) {
+  switch (tool) {
+    case "github":
+      return "GitHub";
+    case "web_search":
+    case "web_fetch":
+      return "Web access";
+    default:
+      return tool.replace(/[_-]+/g, " ");
+  }
+}
+
+function toolCapabilityLabels(tools: string[]) {
+  const labels: string[] = [];
+  const seen = new Set<string>();
+  for (const tool of tools) {
+    const label = toolLabel(tool);
+    if (seen.has(label)) continue;
+    seen.add(label);
+    labels.push(label);
+  }
+  return labels;
+}
 
 function AssistantTypingIndicator() {
   return (
@@ -515,7 +559,7 @@ function ReasoningPanel({
   startedAt: string;
   completedAt?: string | null;
 }) {
-  const [open, setOpen] = useState(streaming);
+  const [open, setOpen] = useState(streaming && Boolean(reasoning.trim()));
   const userToggledRef = useRef(false);
   const bodyRef = useRef<HTMLDivElement | null>(null);
   const bodyPinnedRef = useRef(true);
@@ -526,6 +570,7 @@ function ReasoningPanel({
   const elapsed = useReasoningElapsed(startedAt, completedAt, displayStreaming);
   const body =
     reasoning.trim() || (displayStreaming ? "Preparing response..." : "Done");
+  const hasReasoningContent = Boolean(reasoning.trim());
   const blocks = splitReasoningBlocks(body);
   const summary = displayStreaming
     ? elapsed
@@ -540,8 +585,8 @@ function ReasoningPanel({
     if (userToggledRef.current) {
       return;
     }
-    setOpen(displayStreaming);
-  }, [displayStreaming]);
+    setOpen(displayStreaming && hasReasoningContent);
+  }, [displayStreaming, hasReasoningContent]);
 
   useEffect(() => {
     if (open && displayStreaming && bodyPinnedRef.current) {
@@ -573,9 +618,11 @@ function ReasoningPanel({
         >
           {summary}
         </span>
-        <span className="min-w-0 max-w-[min(34rem,70vw)] truncate font-normal text-text-muted/90">
-          {preview}
-        </span>
+        {hasReasoningContent ? (
+          <span className="min-w-0 max-w-[min(34rem,70vw)] truncate font-normal text-text-muted/90">
+            {preview}
+          </span>
+        ) : null}
         <ChevronDown
           className={cn(
             "size-3.5 shrink-0 text-text-muted transition-transform duration-200 group-hover:text-text-secondary",

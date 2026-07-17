@@ -133,6 +133,9 @@ type SessionListWire = RuntimeSessionListResponse;
 type RunStatusWire = {
   run_id: string;
   session_id: string;
+  parent_run_id?: string | null;
+  root_run_id?: string | null;
+  depth?: number;
   status: string;
   waiting_for?: string | null;
   events_count: number;
@@ -178,6 +181,9 @@ function normalizeRunStatus(w: RunStatusWire): RunStatus {
   return {
     runId: w.run_id,
     sessionId: w.session_id,
+    parentRunId: w.parent_run_id ?? null,
+    rootRunId: w.root_run_id ?? w.run_id,
+    depth: Number.isSafeInteger(w.depth) && Number(w.depth) >= 0 ? Number(w.depth) : 0,
     status: w.status as RunStatus["status"],
     eventsCount: Number(w.events_count),
     waitingFor: w.waiting_for ?? undefined,
@@ -230,6 +236,51 @@ function normalizeEventList(raw: EventListResponse): EventListResponse {
   };
 }
 
+function normalizeReflectReport(
+  raw: unknown,
+  fallback: { sessionId: string; focus: string },
+): ReflectReport {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("Astra returned an invalid reflection report.");
+  }
+  const report = raw as Record<string, unknown>;
+  const overview =
+    report.overview &&
+    typeof report.overview === "object" &&
+    !Array.isArray(report.overview)
+      ? (report.overview as Record<string, unknown>)
+      : {};
+  return {
+    session_id:
+      typeof report.session_id === "string" && report.session_id.trim()
+        ? report.session_id
+        : fallback.sessionId,
+    focus:
+      typeof report.focus === "string" && report.focus.trim()
+        ? report.focus
+        : fallback.focus,
+    overview,
+    diagnoses: Array.isArray(report.diagnoses) ? report.diagnoses : [],
+    insights: Array.isArray(report.insights) ? report.insights : [],
+    recommendations: Array.isArray(report.recommendations)
+      ? report.recommendations.filter(
+          (value): value is string =>
+            typeof value === "string" && value.trim().length > 0,
+        )
+      : [],
+    ...(report.reflection_context !== undefined
+      ? { reflection_context: report.reflection_context }
+      : {}),
+    ...(typeof report.prompt_preview === "string" ||
+    report.prompt_preview === null
+      ? { prompt_preview: report.prompt_preview }
+      : {}),
+    ...(report.evidence_graph !== undefined
+      ? { evidence_graph: report.evidence_graph }
+      : {}),
+  };
+}
+
 export function chatRequestToWire(req: ChatRequest): Record<string, unknown> {
   const body: Record<string, unknown> = {
     message: req.message,
@@ -268,6 +319,7 @@ export function chatRequestToWire(req: ChatRequest): Record<string, unknown> {
   if (req.capabilities?.length) body.capabilities = req.capabilities;
   if (req.allowSkills?.length) body.allow_skills = req.allowSkills;
   if (req.allowTools?.length) body.allow_tools = req.allowTools;
+  if (req.enabledTools !== undefined) body.enabled_tools = req.enabledTools;
   if (req.workspaceBinding) body.workspace_binding = req.workspaceBinding;
   if (req.executorBinding) body.executor_binding = req.executorBinding;
   if (req.skillSearch) {
@@ -622,9 +674,13 @@ export class AstraClient {
       ...(params?.last_n !== undefined ? { last_n: params.last_n } : {}),
       ...(params?.question !== undefined ? { question: params.question } : {}),
     });
-    return this.fetch<ReflectReport>(
+    const raw = await this.fetch<unknown>(
       `${chatSessionReflectPath(sessionId)}${q}`,
     );
+    return normalizeReflectReport(raw, {
+      sessionId,
+      focus: params?.focus ?? "auto",
+    });
   }
 
   /** `GET /chat/session/{id}/decision-trace` (server uses focus `tool_surface`). */
@@ -637,9 +693,13 @@ export class AstraClient {
       ...(params?.last_n !== undefined ? { last_n: params.last_n } : {}),
       ...(params?.question !== undefined ? { question: params.question } : {}),
     });
-    return this.fetch<ReflectReport>(
+    const raw = await this.fetch<unknown>(
       `${chatSessionDecisionTracePath(sessionId)}${q}`,
     );
+    return normalizeReflectReport(raw, {
+      sessionId,
+      focus: params?.focus ?? "tool_surface",
+    });
   }
 
   /** `GET /events/session/{session_id}` */
@@ -719,6 +779,9 @@ export class AstraClient {
     return {
       runId: raw.run_id,
       sessionId: raw.session_id,
+      parentRunId: null,
+      rootRunId: raw.run_id,
+      depth: 0,
       status: raw.status,
       eventsCount: 0,
     };

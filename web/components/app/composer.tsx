@@ -1,6 +1,6 @@
 'use client';
 
-import { Mic, SendHorizontal, Square } from 'lucide-react';
+import { SendHorizontal, Square } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { IconButton } from '@/components/ui/icon-button';
 import {
@@ -13,8 +13,14 @@ import type {
   AttachmentRef,
   ComposerOptions,
   EdgeStatusResponse,
+  RuntimeCapabilitiesResponse,
   WorkspaceSelection,
 } from '@/lib/api/types';
+import { getRuntimeCapabilities } from '@/lib/api/chats';
+import {
+  resolveGitHubAccessAvailability,
+  resolveWebAccessAvailability,
+} from '@/lib/runtime-capabilities';
 import { filterSlashCommands, skillToSlashCommand, type SlashCommandItem } from '@/lib/composer/slash-commands';
 import { useSkillCatalog } from '@/hooks/use-skill-catalog';
 import { cn } from '@/lib/utils/cn';
@@ -228,10 +234,13 @@ export function Composer({
 }: ComposerProps) {
   const [text, setText] = useState(initialValue);
   const [webSearch, setWebSearch] = useState(false);
+  const [runtimeCapabilities, setRuntimeCapabilities] =
+    useState<RuntimeCapabilitiesResponse | null>(null);
   const [thinking, setThinking] = useState(true);
   const [model, setModel] = useState(initialModel ?? 'sonnet-4.6-adaptive');
   const [modelAvailable, setModelAvailable] = useState(false);
   const [activeSkills, setActiveSkills] = useState<string[]>([]);
+  const [activeTools, setActiveTools] = useState<string[]>([]);
   const [slashQuery, setSlashQuery] = useState<string | null>(null);
   const [activeSlashIndex, setActiveSlashIndex] = useState(0);
   const {
@@ -260,6 +269,44 @@ export function Composer({
     return filterSlashCommands(commands, slashQuery);
   }, [activeSkills, skillCatalogItems, slashQuery]);
   const showSlashPanel = slashQuery !== null && !disabled && !submitting;
+  const edgeCapabilityRevision = (edgeWorkspaces ?? [])
+    .map(
+      (edge) =>
+        `${edge.edge_agent_id}:${JSON.stringify(edge.capabilities ?? null)}`,
+    )
+    .join('|');
+  const webAccess = useMemo(
+    () => resolveWebAccessAvailability(runtimeCapabilities, workspaceSelection),
+    [runtimeCapabilities, workspaceSelection],
+  );
+  const githubAccess = useMemo(
+    () => resolveGitHubAccessAvailability(runtimeCapabilities, workspaceSelection),
+    [runtimeCapabilities, workspaceSelection],
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+    void getRuntimeCapabilities()
+      .then((snapshot) => {
+        if (!cancelled) setRuntimeCapabilities(snapshot);
+      })
+      .catch(() => {
+        if (!cancelled) setRuntimeCapabilities({ tools: [] });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [edgeCapabilityRevision]);
+
+  useEffect(() => {
+    if (!webAccess.available) setWebSearch(false);
+  }, [webAccess.available]);
+
+  useEffect(() => {
+    if (!githubAccess.available) {
+      setActiveTools((tools) => tools.filter((tool) => tool !== 'github'));
+    }
+  }, [githubAccess.available]);
 
   useEffect(() => {
     const storedThinking = window.localStorage.getItem('astra.composer.thinking');
@@ -469,13 +516,25 @@ export function Composer({
       activeSkills,
     };
     const submittedSkills = [...activeSkills];
+    const submittedTools = [
+      ...new Set([
+        ...activeTools,
+        ...(webSearch ? ['web_search', 'web_fetch'] : []),
+      ]),
+    ];
     setSubmitting(true);
     clearEditor();
     try {
       await onSubmit({
         text: trimmed,
         attachments: [],
-        options: { webSearch, thinking, model, activeSkills: submittedSkills },
+        options: {
+          webSearch,
+          thinking,
+          model,
+          activeSkills: submittedSkills,
+          activeTools: submittedTools,
+        },
       });
     } catch (error) {
       restoreEditor(snapshot);
@@ -576,9 +635,13 @@ export function Composer({
         <ComposerPlusMenu
           inProject={Boolean(projectContext)}
           webSearch={webSearch}
+          webAccess={webAccess}
+          githubAccess={githubAccess}
           onWebSearchChange={setWebSearch}
           activeSkills={activeSkills}
           onActiveSkillsChange={handleActiveSkillsChange}
+          activeTools={activeTools}
+          onActiveToolsChange={setActiveTools}
           workspaceSelection={workspaceSelection}
           edgeWorkspaces={edgeWorkspaces}
           edgeWorkspacesLoading={edgeWorkspacesLoading}
@@ -594,21 +657,15 @@ export function Composer({
           onWorkspaceSelectionChange={onWorkspaceSelectionChange}
           onRefreshEdgeWorkspaces={onRefreshEdgeWorkspaces}
         />
-        <IconButton icon={Mic} label="Voice input" tooltip="Coming soon" disabled />
-        <span
-          className={cn(
-            'ml-auto size-2 rounded-full',
-            submitting ? 'animate-pulse bg-warning' : disabled ? 'bg-border-strong' : 'bg-success',
-          )}
-          aria-label={submitting ? 'Streaming' : 'Ready'}
-        />
-        <ModelSwitcher
-          value={model}
-          onChange={handleModelChange}
-          onModelAvailabilityChange={setModelAvailable}
-          thinking={thinking}
-          onThinkingChange={setThinking}
-        />
+        <div className="ml-auto">
+          <ModelSwitcher
+            value={model}
+            onChange={handleModelChange}
+            onModelAvailabilityChange={setModelAvailable}
+            thinking={thinking}
+            onThinkingChange={setThinking}
+          />
+        </div>
         {showStop ? (
           <IconButton
             icon={Square}

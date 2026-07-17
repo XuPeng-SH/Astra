@@ -88,6 +88,10 @@ pub enum EvalSignal {
     /// orchestration incomplete class). Carries the normalized result class and
     /// number of unresolved streams.
     ToolOutcomeFailure { class: String, count: usize },
+    /// Coverage for classified outcome failures across materially attempted
+    /// tool calls. This distinguishes one failed optional probe in a productive
+    /// review from a turn where most execution evidence is unavailable.
+    ToolOutcomeFailureCoverage { unresolved: usize, observed: usize },
     /// One or more tool calls were rejected before execution by policy or
     /// runtime admission. They are not material `tools_used`, but they are
     /// still user-visible failed tool attempts and must not be evaluated as
@@ -272,6 +276,61 @@ pub fn turn_evaluation_status_notice(eval: &TurnEvaluation) -> Option<String> {
         "Turn evaluation marked this turn incomplete (quality {:.2}): {reason}.",
         eval.quality
     ))
+}
+
+/// Whether the turn ended with unresolved execution evidence.
+///
+/// This is narrower than `!eval.success`: conversational turns and low-quality
+/// answers may score unsuccessfully without having an execution failure. Child
+/// run lifecycle projection uses this predicate so a model-produced explanation
+/// after failed tools is not mislabeled as successful task completion.
+pub fn turn_evaluation_has_unresolved_execution_failure(eval: &TurnEvaluation) -> bool {
+    let has_nested_incomplete_run = eval.signals.iter().any(|signal| {
+        matches!(
+            signal,
+            EvalSignal::ToolOutcomeFailure { class, .. }
+                if class == RESULT_CLASS_AGENT_INCOMPLETE
+                    || class == RESULT_CLASS_FANOUT_INCOMPLETE
+        )
+    });
+    if has_nested_incomplete_run {
+        return true;
+    }
+
+    let has_execution_failure = eval.signals.iter().any(|signal| {
+        matches!(
+            signal,
+            EvalSignal::ToolOutcomeFailure { .. } | EvalSignal::BlockedToolCall { .. }
+        )
+    });
+    if !has_execution_failure {
+        return false;
+    }
+
+    // A minority failure in an otherwise productive turn remains visible as
+    // evaluation evidence, but must not poison the child lifecycle. Fanout
+    // review agents commonly use optional probes; one unavailable probe among
+    // dozens of successful reads does not make the review itself incomplete.
+    // Majority failure still means the delegated task lacks reliable execution
+    // evidence. Evaluations without a rate are treated conservatively because
+    // hand-built/external evaluations cannot prove successful recovery.
+    if let Some(is_majority) = eval.signals.iter().find_map(|signal| match signal {
+        EvalSignal::ToolOutcomeFailureCoverage {
+            unresolved,
+            observed,
+        } => Some(*observed == 0 || unresolved.saturating_mul(2) >= *observed),
+        _ => None,
+    }) {
+        return is_majority;
+    }
+
+    eval.signals
+        .iter()
+        .find_map(|signal| match signal {
+            EvalSignal::ToolErrorRate(rate) => Some(*rate >= 0.5),
+            _ => None,
+        })
+        .unwrap_or(true)
 }
 
 pub fn turn_evaluation_signal_reason(signal: &EvalSignal) -> Option<&'static str> {
@@ -534,7 +593,7 @@ pub fn evaluate_tool_call_records_with_thresholds_and_telemetry(
             no_op: record.is_noop_or_cached_result(),
         })
         .collect::<Vec<_>>();
-    let is_live_query = false;
+    let is_live_query = records_include_live_query(tool_call_records);
     let mut eval = evaluate_turn(
         &tool_calls,
         stall_count,
@@ -854,7 +913,11 @@ fn unresolved_tool_outcome_failure_counts(
     let mut unresolved_by_key = std::collections::BTreeMap::<String, String>::new();
 
     for record in records {
-        if !record_was_executed(record) {
+        if !matches!(
+            record.effective_disposition(),
+            astra_services::session_journal::ToolCallDisposition::Executed
+                | astra_services::session_journal::ToolCallDisposition::Rejected
+        ) {
             continue;
         }
         let Some(class) = effective_tool_result_class(record) else {
@@ -952,6 +1015,14 @@ fn apply_unresolved_tool_outcome_failures(eval: &mut TurnEvaluation, records: &[
         eval.signals
             .push(EvalSignal::ToolOutcomeFailure { class, count });
     }
+    let observed = records
+        .iter()
+        .filter(|record| record_was_executed(record) || record.was_blocked_by_policy())
+        .count();
+    eval.signals.push(EvalSignal::ToolOutcomeFailureCoverage {
+        unresolved: total,
+        observed,
+    });
 
     let penalty = (0.25 + 0.08 * total.saturating_sub(1) as f64).clamp(0.25, 0.50);
     eval.quality = (eval.quality - penalty).clamp(0.0, 1.0);
@@ -1535,6 +1606,17 @@ pub fn eval_signal_to_json_with_thresholds(
                 "Detected {count} unresolved tool outcome failure(s) classified as `{class}`"
             ),
         }),
+        EvalSignal::ToolOutcomeFailureCoverage {
+            unresolved,
+            observed,
+        } => json!({
+            "kind": "tool_outcome_failure_coverage",
+            "unresolved": unresolved,
+            "observed": observed,
+            "message": format!(
+                "{unresolved} unresolved classified tool outcome failure(s) across {observed} materially attempted call(s)"
+            ),
+        }),
         EvalSignal::BlockedToolCall { count } => json!({
             "kind": "blocked_tool_call",
             "count": count,
@@ -1565,25 +1647,57 @@ pub fn build_turn_evaluation_journal_event(
     budget_pressure: f64,
     eval: &TurnEvaluation,
 ) -> JournalEvent {
-    JournalEvent::turn_evaluation(
+    let tool_attempt_count = tool_call_records
+        .iter()
+        .filter(|record| !record.is_synthetic_placeholder())
+        .count();
+    let tool_execution_count = tool_call_records
+        .iter()
+        .filter(|record| record_was_executed(record))
+        .count();
+    let tool_rejected_count = tool_call_records
+        .iter()
+        .filter(|record| {
+            !record.is_synthetic_placeholder()
+                && (matches!(
+                    record.disposition,
+                    Some(astra_services::session_journal::ToolCallDisposition::Rejected)
+                ) || record.was_blocked_by_policy())
+        })
+        .count();
+    let live_query = records_include_live_query(tool_call_records);
+    let mut event = JournalEvent::turn_evaluation(
         session_id,
         turn,
         source,
-        false,
+        live_query,
         eval.success,
         eval.quality,
         eval.confidence,
         budget_pressure,
         stall_count,
         verdict_warning,
-        // Count only calls that reached an executor. Admission/cache/suppression
-        // dimensions are persisted separately in the turn outcome ledger.
-        tool_call_records
-            .iter()
-            .filter(|r| record_was_executed(r))
-            .count(),
+        tool_attempt_count,
         eval_signals_to_json_with_thresholds(&eval.signals, eval.thresholds),
-    )
+    );
+    if let Some(metadata) = event.metadata.as_mut().and_then(Value::as_object_mut) {
+        metadata.insert(
+            "tool_execution_count".to_string(),
+            Value::from(tool_execution_count),
+        );
+        metadata.insert(
+            "tool_rejected_count".to_string(),
+            Value::from(tool_rejected_count),
+        );
+    }
+    event
+}
+
+fn records_include_live_query(records: &[ToolCallRecord]) -> bool {
+    records.iter().any(|record| {
+        !record.is_synthetic_placeholder()
+            && matches!(record.name.as_str(), "web_search" | "web_fetch")
+    })
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -1699,7 +1813,9 @@ mod tests {
             &eval,
         );
         let metadata = event.metadata.expect("turn evaluation metadata");
-        assert_eq!(metadata["tool_call_count"], 0);
+        assert_eq!(metadata["tool_call_count"], 1);
+        assert_eq!(metadata["tool_execution_count"], 0);
+        assert_eq!(metadata["tool_rejected_count"], 1);
         assert!(
             metadata["signals"]
                 .as_array()
@@ -1776,6 +1892,60 @@ mod tests {
                 .iter()
                 .any(|s| matches!(s, EvalSignal::ToolErrorRate(_)))
         );
+    }
+
+    #[test]
+    fn unresolved_execution_failure_is_distinct_from_generic_low_quality() {
+        let low_quality = TurnEvaluation {
+            success: false,
+            quality: 0.2,
+            confidence: 0.8,
+            signals: vec![EvalSignal::VerdictWarning],
+            thresholds: EvaluationThresholds::default(),
+        };
+        assert!(!turn_evaluation_has_unresolved_execution_failure(
+            &low_quality
+        ));
+
+        let execution_incomplete = TurnEvaluation {
+            signals: vec![EvalSignal::ToolOutcomeFailure {
+                class: "transport_unavailable".to_string(),
+                count: 2,
+            }],
+            ..low_quality.clone()
+        };
+        assert!(turn_evaluation_has_unresolved_execution_failure(
+            &execution_incomplete
+        ));
+
+        let recovered_with_partial_evidence = TurnEvaluation {
+            signals: vec![
+                EvalSignal::ToolErrorRate(0.01),
+                EvalSignal::ToolOutcomeFailure {
+                    class: "execution_error".to_string(),
+                    count: 1,
+                },
+            ],
+            ..low_quality.clone()
+        };
+        assert!(
+            !turn_evaluation_has_unresolved_execution_failure(&recovered_with_partial_evidence),
+            "a minority optional-probe failure is advisory evidence, not a failed child lifecycle"
+        );
+
+        let nested_agent_incomplete = TurnEvaluation {
+            signals: vec![
+                EvalSignal::ToolErrorRate(0.01),
+                EvalSignal::ToolOutcomeFailure {
+                    class: RESULT_CLASS_AGENT_INCOMPLETE.to_string(),
+                    count: 1,
+                },
+            ],
+            ..low_quality
+        };
+        assert!(turn_evaluation_has_unresolved_execution_failure(
+            &nested_agent_incomplete
+        ));
     }
 
     #[test]
@@ -2050,6 +2220,61 @@ mod tests {
             json.iter()
                 .any(|signal| signal["kind"] == "tool_outcome_failure"
                     && signal["class"] == "test_failure")
+        );
+    }
+
+    #[test]
+    fn rejected_runtime_route_remains_an_unresolved_execution_failure() {
+        let mut record = journal_ok_call("web_fetch");
+        record.args_full = Some(serde_json::json!({"url": "https://news.example/"}).to_string());
+        record.ok = false;
+        record.result_class = Some("execution_error".to_string());
+        record.disposition = Some(astra_services::session_journal::ToolCallDisposition::Rejected);
+
+        let eval =
+            evaluate_tool_call_records("fetch a current headline", &[], &[record], 0, false, 0.2);
+
+        assert!(!eval.success, "{eval:?}");
+        assert!(eval.signals.iter().any(|signal| matches!(
+            signal,
+            EvalSignal::ToolOutcomeFailure { class, count }
+                if class == "execution_error" && *count == 1
+        )));
+        assert!(turn_evaluation_has_unresolved_execution_failure(&eval));
+    }
+
+    #[test]
+    fn minority_optional_probe_failure_does_not_poison_completed_execution() {
+        let mut failed_probe = journal_ok_call("bash");
+        failed_probe.args_full =
+            Some(serde_json::json!({"command": "optional-environment-probe"}).to_string());
+        failed_probe.ok = false;
+        failed_probe.result_class = Some("execution_error".to_string());
+
+        let successful_reads = ["src/lib.rs", "src/runtime.rs", "tests/e2e.rs"]
+            .into_iter()
+            .map(|path| {
+                let mut record = journal_ok_call("read_file");
+                record.args_full = Some(serde_json::json!({"path": path}).to_string());
+                record
+            })
+            .collect::<Vec<_>>();
+        let mut records = vec![failed_probe];
+        records.extend(successful_reads);
+
+        let eval =
+            evaluate_tool_call_records("review the implementation", &[], &records, 0, false, 0.2);
+
+        assert!(eval.signals.iter().any(|signal| matches!(
+            signal,
+            EvalSignal::ToolOutcomeFailureCoverage {
+                unresolved: 1,
+                observed: 4
+            }
+        )));
+        assert!(
+            !turn_evaluation_has_unresolved_execution_failure(&eval),
+            "the failed probe remains advisory evidence, while the productive child lifecycle completes"
         );
     }
 
@@ -2347,9 +2572,35 @@ mod tests {
         assert_eq!(metadata["source"], "cli_repl");
         assert_eq!(metadata["live_query"], false);
         assert_eq!(metadata["tool_call_count"], 1);
+        assert_eq!(metadata["tool_execution_count"], 1);
+        assert_eq!(metadata["tool_rejected_count"], 0);
         assert_eq!(metadata["signal_count"], 2);
         assert_eq!(metadata["signals"][0]["kind"], "tool_error_rate");
         assert_eq!(metadata["signals"][1]["kind"], "all_tools_healthy");
+    }
+
+    #[test]
+    fn web_tool_records_mark_live_queries_without_parsing_user_text() {
+        let records = vec![journal_ok_call("web_search")];
+        let eval = evaluate_tool_call_records("试一试", &[], &records, 0, false, 0.2);
+        let event = build_turn_evaluation_journal_event(
+            Some("sess-live"),
+            Some(3),
+            "server_runtime",
+            "试一试",
+            &[],
+            &records,
+            0,
+            false,
+            0.2,
+            &eval,
+        );
+        let metadata = event.metadata.expect("turn evaluation metadata");
+
+        assert_eq!(metadata["live_query"], true);
+        assert_eq!(metadata["tool_call_count"], 1);
+        assert_eq!(metadata["tool_execution_count"], 1);
+        assert_eq!(metadata["tool_rejected_count"], 0);
     }
 
     #[test]

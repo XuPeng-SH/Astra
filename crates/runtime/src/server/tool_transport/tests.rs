@@ -1744,6 +1744,13 @@ async fn orchestrator_managed_without_transport_returns_transport_unavailable() 
     assert_eq!(metadata["blocked"], true);
     assert_eq!(metadata["execution_started"], false);
     assert_eq!(metadata["runtime_error"]["kind"], "transport_unavailable");
+    assert_eq!(metadata["failure_scope"], "executor_transport");
+    assert_eq!(metadata["disposition"], "rejected");
+    assert_eq!(
+        metadata["route_failure"]["executor_id"],
+        "orchestrator:snapshot"
+    );
+    assert_eq!(metadata["route_failure"]["shared_across_bound_tools"], true);
     assert!(
         metadata["runtime_error"]["message"]
             .as_str()
@@ -2592,7 +2599,7 @@ async fn edge_offline_does_not_call_server_local() {
 
     assert!(result.is_error, "{result:?}");
     assert!(
-        result.output.contains("No alternate execution provider"),
+        result.output.contains("changing the tool name"),
         "{}",
         result.output
     );
@@ -2600,6 +2607,8 @@ async fn edge_offline_does_not_call_server_local() {
     assert_eq!(metadata["error_kind"], TOOL_ERROR_KIND_EXECUTOR_OFFLINE);
     assert_eq!(metadata["blocked"], true);
     assert_eq!(metadata["executor"]["status"], "offline");
+    assert_eq!(metadata["failure_scope"], "executor_transport");
+    assert_eq!(metadata["disposition"], "rejected");
     assert_eq!(local.calls(), 0);
 }
 
@@ -3485,12 +3494,7 @@ async fn control_plane_tool_bypasses_edge_transport() {
 async fn server_runtime_tools_bypass_edge_transport() {
     let service = ToolExecutionService::new_for_test();
     let local = CountingLocalTransport::new();
-    let server_runtime_tools = [
-        "memory",
-        "mo_query",
-        "rollback_database_snapshots",
-        "github",
-    ];
+    let server_runtime_tools = ["memory", "mo_query", "rollback_database_snapshots"];
 
     for tool in server_runtime_tools {
         let edge_request = request(
@@ -3560,6 +3564,10 @@ async fn shared_network_tools_use_server_without_runtime_and_edge_with_edge_bind
         .edge_registry_service(Arc::new(StaticEdgeRegistry {
             agents: vec![edge_agent_record("edge-selected")],
         }))
+        .initial_provider_capabilities(HashMap::from([(
+            crate::server::tool_execution_service::SERVER_OPTIONAL_TOOL_PROVIDER_ID.to_string(),
+            HashSet::from([astra_core::PROVIDER_CAPABILITY_PUBLIC_NETWORK.to_string()]),
+        )]))
         .build();
     let local = CountingLocalTransport::new();
 
@@ -3568,7 +3576,12 @@ async fn shared_network_tools_use_server_without_runtime_and_edge_with_edge_bind
             tool,
             WorkspaceBinding::none(),
             ExecutorBinding::server_local(),
-        );
+        )
+        .with_selected_offer(SelectedToolOfferSnapshot::new_with_route(
+            tool,
+            crate::server::tool_execution_service::SERVER_OPTIONAL_TOOL_PROVIDER_ID,
+            ToolExecutionRouteKind::ServerRuntime,
+        ));
         assert_eq!(
             service.routing_decision(&server_request),
             ToolExecutionRouteKind::ServerRuntime,
@@ -3614,7 +3627,7 @@ async fn shared_network_tools_use_server_without_runtime_and_edge_with_edge_bind
 }
 
 #[tokio::test]
-async fn disabled_shared_network_tool_blocks_server_route_not_edge_route() {
+async fn disabled_shared_network_server_offer_does_not_block_explicit_edge_offer() {
     let dispatch = Arc::new(StaticEdgeDispatch::default());
     let service = ToolExecutionService::builder()
         .edge_dispatch_service(dispatch.clone())
@@ -3631,7 +3644,12 @@ async fn disabled_shared_network_tool_blocks_server_route_not_edge_route() {
                 "web_fetch",
                 WorkspaceBinding::none(),
                 ExecutorBinding::server_local(),
-            ),
+            )
+            .with_selected_offer(SelectedToolOfferSnapshot::new_with_route(
+                "web_fetch",
+                crate::server::tool_execution_service::SERVER_OPTIONAL_TOOL_PROVIDER_ID,
+                ToolExecutionRouteKind::ServerRuntime,
+            )),
             &local,
         )
         .await;
@@ -3655,7 +3673,12 @@ async fn disabled_shared_network_tool_blocks_server_route_not_edge_route() {
                     ToolTransportKind::EdgeWs,
                     ExecutorStatus::Online,
                 ),
-            ),
+            )
+            .with_selected_offer(SelectedToolOfferSnapshot::new_with_route(
+                "web_fetch",
+                "edge-selected",
+                ToolExecutionRouteKind::EdgeBound,
+            )),
             &local,
         )
         .await;

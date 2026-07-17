@@ -116,7 +116,6 @@ export function selectedWebModel(model?: string | null): string {
 }
 
 declare global {
-  // eslint-disable-next-line no-var
   var __astraWebStores: Record<string, Store> | undefined;
 }
 
@@ -238,6 +237,18 @@ function normalizedActiveSkills(skills?: string[]) {
   }
   return [...new Set(skills.map((skill) => skill.trim()).filter(Boolean))].sort(
     (left, right) => left.localeCompare(right),
+  );
+}
+
+function normalizedActiveTools(tools?: string[], webSearch = false) {
+  const normalized = Array.isArray(tools)
+    ? tools.map((tool) => tool.trim()).filter(Boolean)
+    : [];
+  if (webSearch) {
+    normalized.push("web_search", "web_fetch");
+  }
+  return [...new Set(normalized)].sort((left, right) =>
+    left.localeCompare(right),
   );
 }
 
@@ -838,6 +849,10 @@ export async function createChatWithMessage(
     role: "user",
     content: payload.message,
     activeSkills: payload.options.activeSkills,
+    activeTools: normalizedActiveTools(
+      payload.options.activeTools,
+      payload.options.webSearch,
+    ),
     createdAt: timestamp,
     status: "complete",
   };
@@ -892,6 +907,10 @@ export async function sendMessage(
     role: "user",
     content: payload.content,
     activeSkills: payload.options?.activeSkills,
+    activeTools: normalizedActiveTools(
+      payload.options?.activeTools,
+      payload.options?.webSearch,
+    ),
     createdAt: timestamp,
     status: "complete",
   };
@@ -911,6 +930,8 @@ export async function sendMessage(
     text: payload.content,
     model: selectedWebModel(payload.options?.model ?? chat.model),
     activeSkills: payload.options?.activeSkills,
+    activeTools: payload.options?.activeTools,
+    webSearch: payload.options?.webSearch,
   });
   assertBackendSessionMatchesChat(backendSessionId, agentResult.sessionId);
   const assistantMessage = appendAssistantMessage(
@@ -1210,6 +1231,10 @@ export async function queueDeferredRunInput(
   );
 
   const activeSkills = normalizedActiveSkills(payload.options?.activeSkills);
+  const activeTools = normalizedActiveTools(
+    payload.options?.activeTools,
+    payload.options?.webSearch,
+  );
   try {
     await client.sdk.submitRunInput(activeRunId, {
       idempotencyKey: deferredRunInputIdempotencyKey(
@@ -1219,6 +1244,7 @@ export async function queueDeferredRunInput(
       input: {
         content: payload.content,
         active_skills: activeSkills,
+        active_tools: activeTools,
       },
     });
   } catch (error) {
@@ -1245,6 +1271,7 @@ export async function queueDeferredRunInput(
     role: "user",
     content: payload.content,
     activeSkills: activeSkills.length ? activeSkills : undefined,
+    activeTools: activeTools.length ? activeTools : undefined,
     createdAt: timestamp,
     status: "complete",
   };
@@ -1749,6 +1776,7 @@ export async function ensureChatBackendSession(
 
   const model = selectedWebModel(params.model ?? chat.model);
   const session = await createBackendSession({
+    chatId: chat.id,
     title: chat.title,
     projectId: chat.projectId,
     model,
@@ -1853,7 +1881,10 @@ function chatRecordFromBackendSession(
     : existing?.workspaceSelection;
 
   return {
-    id: existing?.id ?? session.session_id,
+    id:
+      existing?.id ??
+      metadataString(session.metadata, "web_chat_id") ??
+      session.session_id,
     title,
     projectId,
     createdAt,
@@ -1975,6 +2006,12 @@ async function syncBackendSessions(ownerUserId: string): Promise<void> {
     if (isLocallyStoppedRun(existingForRun, run.runId, syncNow)) {
       continue;
     }
+    // One chat owns one root run at a time. Child runs share its session but
+    // are managed through the agent workbench; selecting one here makes Stop,
+    // input routing, and refresh target the wrong execution.
+    if (run.parentRunId !== null || run.depth !== 0) {
+      continue;
+    }
     if (!runBlocksChatTurn(run.status)) {
       continue;
     }
@@ -2053,6 +2090,12 @@ function transcriptItemToMessage(
   }
   const reasoning =
     typeof item.reasoning === "string" ? item.reasoning.trim() : "";
+  // Canonical transcripts retain assistant tool-call scaffolding even when it
+  // has no user-visible text. It is valid replay state, but rendering it as a
+  // blank chat message makes a cancelled/refreshed turn look like data loss.
+  if (item.role === "assistant" && !item.content.trim() && !reasoning) {
+    return null;
+  }
   const reasoningStatus =
     item.reasoning_status === "streaming" ||
     item.reasoning_status === "complete"
@@ -2113,13 +2156,67 @@ async function syncBackendTranscript(
   if (!messages.length) {
     return;
   }
+
+  // The transcript is authoritative for committed history, while the active
+  // run is authoritative for the in-flight turn. A turn's assistant row is
+  // not committed until output arrives, so replacing local state with the
+  // transcript during refresh leaves no message for SSE resume to target.
+  // Preserve that overlay, and synthesize it after a Web process restart.
+  const activeRun = chat.activeRun;
+  if (activeRun && runBlocksChatTurn(activeRun.status)) {
+    const localAssistant =
+      (activeRun.assistantMessageId
+        ? chat.messages.find(
+            (message) =>
+              message.id === activeRun.assistantMessageId &&
+              message.role === "assistant",
+          )
+        : undefined) ??
+      [...chat.messages]
+        .reverse()
+        .find(
+          (message) =>
+            message.role === "assistant" && message.status === "streaming",
+        );
+    const localAssistantIndex = localAssistant
+      ? chat.messages.findIndex((message) => message.id === localAssistant.id)
+      : -1;
+    const localUser =
+      localAssistantIndex > 0 &&
+      chat.messages[localAssistantIndex - 1]?.role === "user"
+        ? chat.messages[localAssistantIndex - 1]
+        : undefined;
+    const canonicalTail = messages[messages.length - 1];
+    const canonicalHasCurrentUser =
+      canonicalTail?.role === "user" &&
+      (!localUser || canonicalTail.content === localUser.content);
+
+    if (!canonicalHasCurrentUser && localUser) {
+      messages.push(localUser);
+    }
+    const assistant =
+      localAssistant ??
+      ({
+        id: `inflight:${activeRun.runId}`,
+        role: "assistant",
+        content: "",
+        createdAt: nowIso(),
+        reasoning: "",
+        reasoningStatus: "streaming",
+        status: "streaming",
+      } satisfies ChatMessage);
+    messages.push(assistant);
+    activeRun.assistantMessageId = assistant.id;
+  }
+
   chat.messages = messages;
   const latest = messages[messages.length - 1];
   chat.lastMessageAt = latest?.createdAt ?? chat.lastMessageAt;
-  chat.lastMessagePreview = latest?.content ?? chat.lastMessagePreview;
+  chat.lastMessagePreview = latest?.content || chat.lastMessagePreview;
 }
 
 async function createBackendSession(params: {
+  chatId: string;
   title: string | null;
   projectId: string | null;
   model: string;
@@ -2139,6 +2236,7 @@ async function createBackendSession(params: {
       title: params.title,
       metadata: {
         source: "web_v1",
+        web_chat_id: params.chatId,
         project_id: params.projectId,
         initial_model: params.model,
         current_model: params.model,
@@ -2346,6 +2444,8 @@ async function callBackendAgent(params: {
   text: string;
   model: string;
   activeSkills?: string[];
+  activeTools?: string[];
+  webSearch?: boolean;
 }): Promise<{ ok: boolean; sessionId?: string; assistantText: string }> {
   const controller = new AbortController();
   const timeout = setTimeout(
@@ -2360,6 +2460,10 @@ async function callBackendAgent(params: {
     });
     const selectedModel = await resolveBackendModelName(client, params.model);
     const activeSkills = normalizedActiveSkills(params.activeSkills);
+    const activeTools = normalizedActiveTools(
+      params.activeTools,
+      params.webSearch,
+    );
 
     const run = await client.sdk.createRun(
       {
@@ -2367,10 +2471,16 @@ async function callBackendAgent(params: {
         sessionId: params.sessionId,
         selectedModel,
         allowSkills: activeSkills.length ? activeSkills : undefined,
+        enabledTools: activeTools,
         context: {
           source: "web_v1",
-          edge_profile: activeSkills.length
-            ? { active_skills: activeSkills }
+          edge_profile: activeSkills.length || activeTools.length
+            ? {
+                ...(activeSkills.length
+                  ? { active_skills: activeSkills }
+                  : {}),
+                ...(activeTools.length ? { active_tools: activeTools } : {}),
+              }
             : undefined,
         },
       },

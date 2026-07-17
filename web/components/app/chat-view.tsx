@@ -28,7 +28,7 @@ import {
 } from "@/hooks/use-stream-lifecycle";
 import { useWorkspaceSelection } from "@/hooks/use-workspace-selection";
 import { subscribeChatLifecycleChange } from "@/lib/chat-lifecycle-events";
-import { getChat } from "@/lib/api/chats";
+import { getChat, getChatInsights } from "@/lib/api/chats";
 import type { ChatDetail } from "@/lib/api/types";
 import {
   deriveChatRunUiState,
@@ -45,6 +45,7 @@ import {
   type SessionTask,
   type ToolSurfaceItem,
 } from "@/lib/work-surface";
+import { cn } from "@/lib/utils/cn";
 import { useToast } from "@/components/ui/toast";
 
 // ── ChatView ─────────────────────────────────────────────────────────────────
@@ -191,6 +192,9 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
         toolAttentionCount,
       ].join(":")
     : "";
+  const headerRunState = chatHeaderRunState(
+    stoppingRun ? "cancelling" : activeRunStatus,
+  );
 
   // ── effects ────────────────────────────────────────────────────────────────
 
@@ -360,8 +364,18 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
               {detail.chat.title ?? "Untitled"}
             </h1>
             <div className="mt-0.5 flex items-center gap-1.5 text-xs text-text-muted">
-              <span className="size-1.5 rounded-full bg-success" />
-              <span>{detail.chat.model ?? "Default model"}</span>
+              <span
+                className={cn(
+                  "size-1.5 rounded-full",
+                  headerRunState.dotClass,
+                  headerRunState.pulse && "animate-pulse",
+                )}
+              />
+              <span>{headerRunState.label}</span>
+              <span aria-hidden="true">·</span>
+              <span className="truncate">
+                {detail.chat.model ?? "Default model"}
+              </span>
             </div>
           </div>
           <div className="min-w-0 flex-1" />
@@ -617,14 +631,63 @@ export function ChatView({ initial }: { initial: ChatDetail }) {
         activeRun={workSurfaceActiveRun}
         tab={workSurfaceTab}
         onTabChange={setWorkSurfaceTab}
+        defaultCollapsed
         onRefresh={() => {
           void stream.hydrateWorkSurfaceForChat();
         }}
         onLoadAgentRun={stream.loadAgentRunProjection}
+        onLoadInsights={() => getChatInsights(detail.chat.id)}
         openSignal={workSurfaceOpenSignal}
       />
     </div>
   );
+}
+
+function chatHeaderRunState(status: string | null) {
+  const normalized = status?.trim().toLowerCase();
+  if (
+    normalized &&
+    ["running", "starting", "input-queued", "cancelling"].includes(normalized)
+  ) {
+    return {
+      label:
+        normalized === "input-queued"
+          ? "Message queued"
+          : normalized === "cancelling"
+            ? "Stopping"
+            : normalized === "starting"
+              ? "Starting"
+              : "Working",
+      dotClass: "bg-accent",
+      pulse: true,
+    };
+  }
+  if (normalized === "waiting" || normalized === "paused") {
+    return {
+      label: normalized === "paused" ? "Paused" : "Waiting",
+      dotClass: "bg-warning",
+      pulse: false,
+    };
+  }
+  if (normalized === "blocked" || normalized === "failed") {
+    return {
+      label: normalized === "blocked" ? "Needs attention" : "Run failed",
+      dotClass: "bg-danger",
+      pulse: false,
+    };
+  }
+  if (normalized && isTerminalChatRunStatus(normalized)) {
+    return { label: "Ready", dotClass: "bg-success", pulse: false };
+  }
+  if (normalized) {
+    const label = statusLabel(normalized);
+    return {
+      label: label.charAt(0).toUpperCase() + label.slice(1),
+      dotClass: "bg-accent",
+      pulse: true,
+    };
+  }
+  return { label: "Ready", dotClass: "bg-success", pulse: false };
 }
 
 function ConversationWorkCard({
@@ -727,13 +790,6 @@ function ConversationWorkCard({
     },
   ];
   const actions = actionCandidates.filter((action) => action.count > 0);
-  const summary = actions
-    .map((action) => {
-      const activeCount = action.activeCount ?? action.count;
-      const count = activeCount > 0 ? activeCount : action.count;
-      return `${count} ${action.label.toLowerCase()}`;
-    })
-    .join(" · ");
   const rows = [
     primaryTask
       ? {
@@ -783,6 +839,17 @@ function ConversationWorkCard({
         }
       : null,
   ].filter((row): row is NonNullable<typeof row> => Boolean(row));
+  const primaryRow =
+    (toolAttentionCount > 0
+      ? rows.find((row) => row.tab === "tools")
+      : undefined) ??
+    (taskBoardIntervention
+      ? rows.find((row) => row.tab === "tasks")
+      : undefined) ??
+    (agentSignalCount > 0
+      ? rows.find((row) => row.tab === "agents")
+      : undefined) ??
+    rows[0];
 
   return (
     <section className="my-3 flex justify-center" aria-label="Background work">
@@ -801,11 +868,6 @@ function ConversationWorkCard({
               }
             />
             <span className="shrink-0">{title}</span>
-            {summary ? (
-              <span className="truncate text-xs font-normal text-text-muted">
-                {summary}
-              </span>
-            ) : null}
           </div>
           {actions.length ? (
             <div className="flex shrink-0 flex-wrap items-center justify-end gap-1">
@@ -819,19 +881,17 @@ function ConversationWorkCard({
             </div>
           ) : null}
         </div>
-        {rows.length ? (
-          <div className="mt-2 divide-y divide-border/60 overflow-hidden rounded-[8px] border border-border/60 bg-bg/70">
-            {rows.map((row) => (
-              <ConversationWorkRow
-                key={row.key}
-                icon={row.icon}
-                title={row.title}
-                meta={row.meta}
-                status={row.status}
-                tone={row.tone ?? "neutral"}
-                onOpen={() => onOpen(row.tab)}
-              />
-            ))}
+        {primaryRow ? (
+          <div className="mt-2 overflow-hidden rounded-[8px] border border-border/60 bg-bg/70">
+            <ConversationWorkRow
+              key={primaryRow.key}
+              icon={primaryRow.icon}
+              title={primaryRow.title}
+              meta={primaryRow.meta}
+              status={primaryRow.status}
+              tone={primaryRow.tone ?? "neutral"}
+              onOpen={() => onOpen(primaryRow.tab)}
+            />
           </div>
         ) : null}
       </div>

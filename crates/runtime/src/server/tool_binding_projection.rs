@@ -611,6 +611,17 @@ fn builtin_tool_registry() -> &'static astra_runtime_env::ToolRegistry {
 }
 
 #[cfg(test)]
+fn server_public_network_admission_context() -> ToolAdmissionContext {
+    ToolAdmissionContext {
+        provider_capabilities: std::collections::HashMap::from([(
+            crate::server::tool_execution_service::SERVER_OPTIONAL_TOOL_PROVIDER_ID.to_string(),
+            HashSet::from([astra_core::PROVIDER_CAPABILITY_PUBLIC_NETWORK.to_string()]),
+        )]),
+        ..ToolAdmissionContext::default()
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
 
@@ -901,13 +912,15 @@ mod tests {
             None,
         ));
 
-        for expected in ["ask_user", "agent", "tool_search", "web_fetch", "memory"] {
+        for expected in ["ask_user", "agent", "tool_search", "memory"] {
             assert!(
                 names.contains(expected),
                 "{expected} should be visible from server builtin provider capacity"
             );
         }
         for hidden in [
+            "web_fetch",
+            "web_search",
             "bash",
             "read_file",
             "write_file",
@@ -918,7 +931,7 @@ mod tests {
         ] {
             assert!(
                 !names.contains(hidden),
-                "{hidden} must be absent until an explicit runtime provider is bound"
+                "{hidden} must be absent until its server or runtime provider capability is declared"
             );
         }
     }
@@ -1266,11 +1279,12 @@ mod tests {
     #[test]
     fn shared_network_tool_schema_is_stable_across_selected_offers() {
         let canonical_schema = schema("web_fetch");
-        let server_visible = capability_filter_tool_schemas_for_binding(
+        let server_visible = capability_filter_tool_schemas_for_binding_with_context(
             vec![canonical_schema.clone()],
             &no_workspace(),
             &ExecutorBinding::server_local(),
             None,
+            server_public_network_admission_context(),
         );
         let edge_visible = capability_filter_tool_schemas_for_binding(
             vec![canonical_schema.clone()],
@@ -1687,7 +1701,7 @@ mod provider_decision_projection_tests {
     }
 
     #[test]
-    fn provider_decision_prefers_edge_web_fetch_over_server_offer() {
+    fn provider_decision_prefers_bound_edge_web_fetch_over_server_egress() {
         let registry = astra_runtime_env::ToolRegistry::builtins();
         let workspace =
             WorkspaceBinding::edge_workspace("Edge", "/repo", WorkspaceAuthority::ReadWrite);
@@ -1702,24 +1716,24 @@ mod provider_decision_projection_tests {
             &executor,
             Some(&runtime),
             &registry,
-            ToolAdmissionContext::default(),
+            server_public_network_admission_context(),
         );
 
         assert!(decision.visible);
         assert_eq!(decision.selected_route(), ToolExecutionRouteKind::EdgeBound);
         assert_eq!(decision.selected_offer_id(), Some("web_fetch@edge-1"));
         assert!(decision.candidates.iter().any(|candidate| {
-            candidate.offer.offer_id == "web_fetch@server-builtin"
-                && !candidate.selected
+            candidate.offer.offer_id == "web_fetch@edge-1"
+                && candidate.selected
                 && matches!(
                     candidate.reason,
-                    crate::server::tool_admission::ToolOfferCandidateReason::CurrentProviderPreferred
+                    crate::server::tool_admission::ToolOfferCandidateReason::Selected
                 )
         }));
     }
 
     #[test]
-    fn provider_decision_reports_offline_edge_without_server_fallback() {
+    fn provider_decision_does_not_silently_fallback_when_selected_edge_is_offline() {
         let registry = astra_runtime_env::ToolRegistry::builtins();
         let workspace =
             WorkspaceBinding::edge_workspace("Edge", "/repo", WorkspaceAuthority::ReadWrite);
@@ -1739,7 +1753,7 @@ mod provider_decision_projection_tests {
             &executor,
             Some(&runtime),
             &registry,
-            ToolAdmissionContext::default(),
+            server_public_network_admission_context(),
         );
 
         assert!(!decision.visible);
@@ -1750,11 +1764,11 @@ mod provider_decision_projection_tests {
         assert_eq!(decision.selected_route(), ToolExecutionRouteKind::EdgeBound);
         assert_eq!(decision.selected_offer_id(), Some("web_fetch@edge-1"));
         assert!(decision.candidates.iter().any(|candidate| {
-            candidate.offer.offer_id == "web_fetch@server-builtin"
-                && !candidate.selected
+            candidate.offer.offer_id == "web_fetch@edge-1"
+                && candidate.selected
                 && matches!(
                     candidate.reason,
-                    crate::server::tool_admission::ToolOfferCandidateReason::CurrentProviderPreferred
+                    crate::server::tool_admission::ToolOfferCandidateReason::ProviderUnavailable
                 )
         }));
     }
@@ -1892,7 +1906,7 @@ mod prompt_cache_provider_decision_tests {
             &WorkspaceBinding::none(),
             &ExecutorBinding::server_control_plane(),
             None,
-            ToolAdmissionContext::default(),
+            server_public_network_admission_context(),
         );
         let server_web_fetch = no_edge_surface
             .into_iter()
@@ -1903,7 +1917,7 @@ mod prompt_cache_provider_decision_tests {
             &edge_workspace(WorkspaceAuthority::ReadWrite),
             &edge_executor(ExecutorStatus::Online),
             Some(&runtime),
-            ToolAdmissionContext::default(),
+            server_public_network_admission_context(),
         );
         let selected = edge_surface
             .iter()

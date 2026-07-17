@@ -46,6 +46,20 @@ pub const SPAWN_STATUS_CANCELLED: &str = "cancelled";
 pub const SPAWN_STATUS_FAILED: &str = "failed";
 pub const SPAWN_STATUS_WAITING: &str = "waiting";
 
+/// Stable causes shared by descendant cancellation and durable run cleanup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DescendantCancellationReason {
+    AncestorCancelled,
+}
+
+impl DescendantCancellationReason {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::AncestorCancelled => "ancestor run cancelled before child completion",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpawnRunStatusKind {
     Completed,
@@ -552,6 +566,9 @@ pub struct SpawnContext {
     pub inherited_skills: Vec<String>,
     /// Optional live-event sink for child token/tool/status mirroring.
     pub live_event_sink: Option<astra_turn_core::agent_live_event::SharedAgentLiveEventSink>,
+    /// Per-run client lane for executable edge requests. Its ownership is
+    /// bounded by the active spawn tree, not the session registry.
+    pub client_tool_delivery_tx: Option<tokio::sync::mpsc::Sender<serde_json::Value>>,
     /// DB trace identity shared with the parent Web turn.
     pub trace_context: Option<TraceContext>,
     /// Tool call id of the parent `agent(action='spawn')` invocation.
@@ -663,6 +680,8 @@ pub struct SpawnRunConfig {
     pub recursion_depth: u8,
     /// The agent type (explore, code-review, task, general-purpose).
     pub agent_type: String,
+    /// Stable caller-facing label for durable run trees and work surfaces.
+    pub description: String,
     /// Detailed task prompt for the agent.
     pub task: String,
     /// System prompt addendum from agent type definition.
@@ -696,6 +715,8 @@ pub struct SpawnRunConfig {
     pub inherited_skills: Vec<String>,
     /// Optional live-event sink for child token/tool/status mirroring.
     pub live_event_sink: Option<astra_turn_core::agent_live_event::SharedAgentLiveEventSink>,
+    /// Client delivery lane inherited from the active parent run.
+    pub client_tool_delivery_tx: Option<tokio::sync::mpsc::Sender<serde_json::Value>>,
     /// Captured parent prefix for prompt-cache inheritance. Present
     /// only when the child spawn requested inherit_prefix AND the
     /// resolver returned `Resolved`. Executors (CLI / server) that
@@ -772,6 +793,7 @@ impl std::fmt::Debug for SpawnRunConfig {
             .field("agent_id", &self.agent_id)
             .field("recursion_depth", &self.recursion_depth)
             .field("agent_type", &self.agent_type)
+            .field("description", &self.description)
             .field("task", &self.task)
             .field("model", &self.model)
             .field("max_turns", &self.max_turns)
@@ -838,6 +860,19 @@ pub struct SpawnRunResult {
 pub trait SpawnAgentExecutor: Send + Sync {
     /// Execute a spawned agent run.
     async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String>;
+
+    /// Cancel executor-owned control and durable state before the spawner
+    /// aborts the task future. Implementations that only execute in-memory
+    /// test work may keep the default no-op; server executors use this hook to
+    /// cancel remote tools and CAS the child run to a terminal state.
+    async fn cancel_spawned_run(
+        &self,
+        _run_id: &str,
+        _user_id: Option<&str>,
+        _reason: &str,
+    ) -> Result<(), String> {
+        Ok(())
+    }
 
     /// Bind a parent session after the executor has been installed.
     ///
@@ -1352,20 +1387,6 @@ impl DynamicAgentSpawner {
         Ok(())
     }
 
-    pub async fn set_fanout_group_budget_adjustment(
-        &self,
-        group_id: &str,
-        budget_adjustment: Option<String>,
-    ) -> bool {
-        let mut groups = self.fanout_groups.write().await;
-        let Some(group) = groups.get_mut(group_id) else {
-            return false;
-        };
-        group.budget_adjustment = budget_adjustment;
-        group.touch();
-        true
-    }
-
     pub async fn fanout_group_for_agent(
         &self,
         agent_id: &str,
@@ -1657,7 +1678,12 @@ impl DynamicAgentSpawner {
         for evicted_agent_id in &evicted_agent_ids {
             index.remove(evicted_agent_id);
         }
-        let group = groups.get_mut(&identity.group_id).unwrap();
+        let group = groups.get_mut(&identity.group_id).ok_or_else(|| {
+            SpawnError::Race(format!(
+                "fanout group '{}' disappeared while its write guard was held",
+                identity.group_id
+            ))
+        })?;
         let active_before = group.summary().active;
         group
             .set_slot_request(
@@ -1705,7 +1731,12 @@ impl DynamicAgentSpawner {
         for evicted_agent_id in &evicted_agent_ids {
             index.remove(evicted_agent_id);
         }
-        let group = groups.get_mut(&identity.group_id).unwrap();
+        let group = groups.get_mut(&identity.group_id).ok_or_else(|| {
+            SpawnError::Race(format!(
+                "fanout group '{}' disappeared while its write guard was held",
+                identity.group_id
+            ))
+        })?;
         let active_before = group.summary().active;
         group
             .set_slot_request(
@@ -2252,9 +2283,9 @@ impl DynamicAgentSpawner {
             .model
             .clone()
             .or_else(|| agent_def.default_model.clone());
-        // Budget resolution: explicit `max_turns` wins, else the
-        // `complexity` hint scales the agent-type default, else the
-        // default is used as-is. See `resolve_turn_budget`.
+        // Budget resolution composes numeric and complexity ceilings by
+        // taking the smaller value; with only one constraint, that constraint
+        // is authoritative. See `resolve_turn_budget`.
         let max_turns = astra_turn_core::orchestration_spawn_tool::resolve_turn_budget(
             input.max_turns,
             input.complexity.as_deref(),
@@ -2559,6 +2590,7 @@ impl DynamicAgentSpawner {
             spawn_tool_call_id: context.spawn_tool_call_id.clone(),
             recursion_depth: child_recursion_depth,
             agent_type: input.agent_type.clone(),
+            description: input.description.clone(),
             task: input.prompt.clone(),
             system_prompt_addendum: coordination_addendum,
             model,
@@ -2578,6 +2610,7 @@ impl DynamicAgentSpawner {
             // Skills inherited from parent
             inherited_skills: context.inherited_skills.clone(),
             live_event_sink: context.live_event_sink.clone(),
+            client_tool_delivery_tx: context.client_tool_delivery_tx.clone(),
             execution_metadata: context.execution_metadata.clone(),
             is_fork_child: inherited_prefix.is_some(),
             inherited_prefix,
@@ -2819,6 +2852,57 @@ impl DynamicAgentSpawner {
             .await
     }
 
+    /// Cancel every live dynamic-agent descendant of `parent_run_id`.
+    ///
+    /// Dynamic fanout tasks are owned by the session spawner rather than the
+    /// parent loop's `JoinHandle`, so dropping/cancelling the parent future is
+    /// not sufficient. Snapshot the run tree first, then cancel deepest-first
+    /// without holding an agent-map lock across persistence or mailbox I/O.
+    pub(crate) async fn cancel_descendants_of_parent_run(
+        &self,
+        parent_run_id: &str,
+        reason: DescendantCancellationReason,
+    ) -> usize {
+        let reason = reason.as_str();
+        let mut children_by_parent: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        {
+            let active = self.active_agents.read().await;
+            for state in active.values() {
+                children_by_parent
+                    .entry(state.parent_run_id.clone())
+                    .or_default()
+                    .push((state.agent_id.clone(), state.run_id.clone()));
+            }
+        }
+
+        let mut pending = VecDeque::from([parent_run_id.to_string()]);
+        let mut visited_runs = HashSet::new();
+        let mut descendants = Vec::new();
+        while let Some(run_id) = pending.pop_front() {
+            if !visited_runs.insert(run_id.clone()) {
+                continue;
+            }
+            let Some(children) = children_by_parent.get(&run_id) else {
+                continue;
+            };
+            for (agent_id, child_run_id) in children {
+                descendants.push(agent_id.clone());
+                pending.push_back(child_run_id.clone());
+            }
+        }
+
+        let mut cancelled = 0;
+        for agent_id in descendants.into_iter().rev() {
+            if self
+                .cancel_agent_with_origin(&agent_id, reason, CancelOrigin::System)
+                .await
+            {
+                cancelled += 1;
+            }
+        }
+        cancelled
+    }
+
     async fn cancel_agent_with_origin(
         &self,
         agent_id: &str,
@@ -2850,7 +2934,27 @@ impl DynamicAgentSpawner {
             (handle, state)
         };
 
+        let durable_cancel = if let Some(executor) = self.executor.as_ref() {
+            executor
+                .cancel_spawned_run(
+                    &state.run_id,
+                    state
+                        .trace_context
+                        .as_ref()
+                        .map(|trace| trace.user_id.as_str()),
+                    reason,
+                )
+                .await
+        } else {
+            Ok(())
+        };
         abort_handle.abort();
+        if let Err(error) = durable_cancel {
+            astra_core::agent_warn!(
+                "spawner",
+                "executor cancellation for {agent_id} failed: {error}"
+            );
+        }
         // Public `cancel_agent` is user-driven (Ctrl+G x, /agent cancel,
         // etc.); bounded one-shot shutdown uses the same atomic finalization
         // without mislabeling the deadline as user intent.
@@ -3091,7 +3195,7 @@ impl DynamicAgentSpawner {
             &state.agent_type,
             status,
             finish_reason,
-            state.metrics.turns_completed,
+            (state.metrics.turns_completed > 0).then_some(state.metrics.turns_completed),
             state.metrics.tool_calls,
             state.metrics.prompt_tokens,
             state.metrics.completion_tokens,
@@ -4047,6 +4151,7 @@ mod tests {
             inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
             inherited_skills: vec![],
             live_event_sink: None,
+            client_tool_delivery_tx: None,
             trace_context: None,
             spawn_tool_call_id: None,
             execution_metadata: None,
@@ -4080,6 +4185,7 @@ mod tests {
             ),
             inherited_skills: vec![],
             live_event_sink: None,
+            client_tool_delivery_tx: None,
             trace_context: None,
             spawn_tool_call_id: None,
             execution_metadata: None,
@@ -4152,6 +4258,7 @@ mod tests {
             inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
             inherited_skills: vec![],
             live_event_sink: None,
+            client_tool_delivery_tx: None,
             trace_context: None,
             spawn_tool_call_id: None,
             execution_metadata: None,
@@ -4205,6 +4312,7 @@ mod tests {
             inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
             inherited_skills: vec![],
             live_event_sink: None,
+            client_tool_delivery_tx: None,
             trace_context: None,
             spawn_tool_call_id: None,
             execution_metadata: None,
@@ -4259,6 +4367,7 @@ mod tests {
             inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
             inherited_skills: vec![],
             live_event_sink: None,
+            client_tool_delivery_tx: None,
             trace_context: None,
             spawn_tool_call_id: None,
             execution_metadata: None,
@@ -4311,6 +4420,7 @@ mod tests {
             inherited_skills: vec![],
             working_dir: PathBuf::from("/tmp"),
             live_event_sink: None,
+            client_tool_delivery_tx: None,
             trace_context: None,
             spawn_tool_call_id: None,
             execution_metadata: None,
@@ -4901,6 +5011,7 @@ mod tests {
             inherited_skills: vec![],
             working_dir: PathBuf::from("/tmp"),
             live_event_sink: None,
+            client_tool_delivery_tx: None,
             trace_context: None,
             spawn_tool_call_id: None,
             execution_metadata: None,
@@ -4964,6 +5075,7 @@ mod tests {
             inherited_skills: vec![],
             working_dir: PathBuf::from("/tmp"),
             live_event_sink: None,
+            client_tool_delivery_tx: None,
             trace_context: None,
             spawn_tool_call_id: None,
             execution_metadata: None,
@@ -5001,6 +5113,7 @@ mod tests {
             inherited_skills: vec![],
             working_dir: PathBuf::from("/tmp"),
             live_event_sink: None,
+            client_tool_delivery_tx: None,
             trace_context: None,
             spawn_tool_call_id: None,
             execution_metadata: None,
@@ -5038,6 +5151,7 @@ mod tests {
             inherited_skills: vec![],
             working_dir: PathBuf::from("/tmp"),
             live_event_sink: None,
+            client_tool_delivery_tx: None,
             trace_context: None,
             spawn_tool_call_id: None,
             execution_metadata: None,
@@ -5073,6 +5187,7 @@ mod tests {
             inherited_skills: vec![],
             working_dir: PathBuf::from("/tmp"),
             live_event_sink: None,
+            client_tool_delivery_tx: None,
             trace_context: None,
             spawn_tool_call_id: None,
             execution_metadata: None,
@@ -5177,6 +5292,7 @@ mod tests {
             inherited_skills: vec![],
             working_dir: PathBuf::from("/tmp"),
             live_event_sink: None,
+            client_tool_delivery_tx: None,
             trace_context: None,
             spawn_tool_call_id: None,
             execution_metadata: None,
@@ -5217,6 +5333,7 @@ mod tests {
             inherited_skills: vec![],
             working_dir: PathBuf::from("/tmp"),
             live_event_sink: None,
+            client_tool_delivery_tx: None,
             trace_context: None,
             spawn_tool_call_id: None,
             execution_metadata: None,
@@ -5271,6 +5388,7 @@ mod tests {
             inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
             inherited_skills: vec!["review-changes".to_string(), "analyze-session".to_string()],
             live_event_sink: None,
+            client_tool_delivery_tx: None,
             trace_context: None,
             spawn_tool_call_id: None,
             execution_metadata: None,
@@ -5299,6 +5417,7 @@ mod tests {
             inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
             inherited_skills: Vec::new(),
             live_event_sink: None,
+            client_tool_delivery_tx: None,
             trace_context: None,
             spawn_tool_call_id: None,
             execution_metadata: None,
@@ -5376,6 +5495,7 @@ mod tests {
             inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
             inherited_skills: vec![],
             live_event_sink: None,
+            client_tool_delivery_tx: None,
             trace_context: None,
             spawn_tool_call_id: None,
             execution_metadata: None,
@@ -6666,6 +6786,69 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn cancelling_parent_run_converges_the_entire_dynamic_agent_tree() {
+        struct NeverCompletes;
+
+        #[async_trait]
+        impl SpawnAgentExecutor for NeverCompletes {
+            async fn execute(&self, _config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
+                std::future::pending::<Result<SpawnRunResult, String>>().await
+            }
+        }
+
+        let spawner = DynamicAgentSpawner::new(mock_router())
+            .with_executor(Arc::new(NeverCompletes) as Arc<dyn SpawnAgentExecutor>);
+
+        let first = spawner
+            .spawn(make_bg_input(), &make_bg_context())
+            .await
+            .expect("first child should launch");
+        let (first_agent_id, first_run_id) = match first {
+            SpawnAgentOutput::Launched {
+                agent_id, run_id, ..
+            } => (agent_id, run_id),
+            other => panic!("expected launched first child, got {other:?}"),
+        };
+
+        let mut nested_context = make_bg_context();
+        nested_context.parent_run_id = first_run_id;
+        nested_context.parent_agent_id = first_agent_id.clone();
+        nested_context.recursion_depth = 1;
+        let nested = spawner
+            .spawn(make_bg_input(), &nested_context)
+            .await
+            .expect("nested child should launch");
+        let nested_agent_id = match nested {
+            SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
+            other => panic!("expected launched nested child, got {other:?}"),
+        };
+
+        assert_eq!(
+            spawner
+                .cancel_descendants_of_parent_run(
+                    "root",
+                    DescendantCancellationReason::AncestorCancelled,
+                )
+                .await,
+            2
+        );
+        assert!(spawner.list_all_agents().await.is_empty());
+        for agent_id in [&first_agent_id, &nested_agent_id] {
+            let archived = spawner
+                .get_agent_state_any(agent_id)
+                .await
+                .expect("cancelled descendant should remain queryable");
+            assert!(matches!(
+                archived.status,
+                AgentStatus::Cancelled {
+                    by_user: false,
+                    ref reason,
+                } if reason == DescendantCancellationReason::AncestorCancelled.as_str()
+            ));
+        }
+    }
+
     /// REGRESSION (reviewer L2-3): after `spawn(run_in_background:true)`
     /// returned `Launched` immediately (the auto-wait timeout was
     /// removed in commit a4719d7ca), there's a tiny window where
@@ -7294,6 +7477,7 @@ mod tests {
             inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
             inherited_skills: vec![],
             live_event_sink: None,
+            client_tool_delivery_tx: None,
             trace_context: None,
             spawn_tool_call_id: None,
             execution_metadata: None,

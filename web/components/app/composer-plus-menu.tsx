@@ -6,6 +6,7 @@ import {
   Check,
   FilePlus2,
   Globe,
+  GitPullRequest,
   HardDrive,
   Image,
   Monitor,
@@ -22,13 +23,14 @@ import { IconButton } from '@/components/ui/icon-button';
 import { SkillPickerPanel } from '@/components/app/skill-picker-panel';
 import type { EdgeStatusResponse, WorkspaceSelection } from '@/lib/api/types';
 import { cn } from '@/lib/utils/cn';
+import type { WebAccessAvailability } from '@/lib/runtime-capabilities';
 
 type EdgeWorkspace = EdgeStatusResponse['edges'][number];
 type EdgeWorkspaceSelection = Extract<
   WorkspaceSelection,
   { kind: 'edge_workspace' }
 >;
-type MenuPanel = 'main' | 'skills' | 'environment';
+type MenuPanel = 'main' | 'skills' | 'connectors' | 'environment';
 type EnvironmentPickerProps = {
   workspaceSelection?: WorkspaceSelection | null;
   edgeWorkspaces?: EdgeStatusResponse['edges'];
@@ -371,9 +373,13 @@ export function ComposerEnvironmentChip({
 export function ComposerPlusMenu({
   inProject,
   webSearch,
+  webAccess,
+  githubAccess,
   onWebSearchChange,
   activeSkills,
   onActiveSkillsChange,
+  activeTools = [],
+  onActiveToolsChange = () => undefined,
   workspaceSelection,
   edgeWorkspaces = [],
   edgeWorkspacesLoading = false,
@@ -383,9 +389,13 @@ export function ComposerPlusMenu({
 }: {
   inProject?: boolean;
   webSearch: boolean;
+  webAccess: WebAccessAvailability;
+  githubAccess: WebAccessAvailability;
   onWebSearchChange: (value: boolean) => void;
   activeSkills: string[];
   onActiveSkillsChange: (skills: string[]) => void;
+  activeTools?: string[];
+  onActiveToolsChange?: (tools: string[]) => void;
   workspaceSelection?: WorkspaceSelection | null;
   edgeWorkspaces?: EdgeStatusResponse['edges'];
   edgeWorkspacesLoading?: boolean;
@@ -398,6 +408,7 @@ export function ComposerPlusMenu({
     workspaceSelection,
     edgeWorkspaces,
   ).label;
+  const connectorCount = activeTools.includes('github') ? 1 : 0;
 
   return (
     <Popover
@@ -413,6 +424,13 @@ export function ComposerPlusMenu({
         <SkillPickerPanel
           selected={activeSkills}
           onChange={onActiveSkillsChange}
+          onBack={() => setPanel('main')}
+        />
+      ) : panel === 'connectors' ? (
+        <ConnectorPanel
+          activeTools={activeTools}
+          githubAccess={githubAccess}
+          onActiveToolsChange={onActiveToolsChange}
           onBack={() => setPanel('main')}
         />
       ) : panel === 'environment' ? (
@@ -452,10 +470,22 @@ export function ComposerPlusMenu({
               </span>
             ) : null}
           />
-          <Row icon={Plug} label="Add connectors" disabled />
+          <Row
+            icon={Plug}
+            label="Connectors"
+            description="Attach optional external capabilities"
+            onClick={() => setPanel('connectors')}
+            trailing={connectorCount ? (
+              <span className="rounded-full bg-surface-muted px-2 py-0.5 text-xs text-text-muted">
+                {connectorCount}
+              </span>
+            ) : null}
+          />
           <Row
             icon={Globe}
-            label="Web search"
+            label="Web access"
+            description={`${webAccess.description} · Search and read public pages`}
+            disabled={!webAccess.available}
             onClick={() => onWebSearchChange(!webSearch)}
             trailing={webSearch ? <Check className="size-4 text-accent" /> : null}
           />
@@ -463,5 +493,54 @@ export function ComposerPlusMenu({
         </>
       )}
     </Popover>
+  );
+}
+
+function ConnectorPanel({
+  activeTools,
+  githubAccess,
+  onActiveToolsChange,
+  onBack,
+}: {
+  activeTools: string[];
+  githubAccess: WebAccessAvailability;
+  onActiveToolsChange: (tools: string[]) => void;
+  onBack: () => void;
+}) {
+  const githubSelected = activeTools.includes('github');
+
+  function toggleTool(tool: string) {
+    onActiveToolsChange(
+      activeTools.includes(tool)
+        ? activeTools.filter((item) => item !== tool)
+        : [...activeTools, tool],
+    );
+  }
+
+  return (
+    <>
+      <button
+        type="button"
+        onClick={onBack}
+        className="mb-1 flex w-full items-center gap-2 rounded-control px-2 py-2 text-sm font-medium text-text hover:bg-surface-muted"
+      >
+        <ChevronLeft className="size-4 text-text-muted" />
+        Connectors
+      </button>
+      <div className="px-3 pb-2 text-xs leading-5 text-text-muted">
+        Connectors are scoped to this turn. Astra still applies runtime permissions and execution boundaries.
+      </div>
+      <Row
+        icon={GitPullRequest}
+        label="GitHub"
+        description={githubAccess.description}
+        disabled={!githubAccess.available}
+        selected={githubSelected}
+        onClick={() => toggleTool('github')}
+      />
+      <div className="mx-3 mt-2 rounded-control border border-border/70 bg-surface-muted/55 px-3 py-2 text-xs leading-5 text-text-muted">
+        GitHub uses credentials configured on the selected server or edge runtime. Missing credentials remain visible as actionable tool evidence.
+      </div>
+    </>
   );
 }

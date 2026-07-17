@@ -49,15 +49,19 @@ describe("MessageBubble", () => {
     });
   });
 
-  it("shows only the typing indicator while a response has no visible content yet", () => {
+  it("shows thinking immediately while the first reasoning chunk is pending", () => {
     render(<MessageBubble message={assistantMessage()} />);
 
+    expect(screen.getByText(/^Thinking/)).toBeInTheDocument();
     expect(
-      screen.getByRole("status", { name: "Astra is responding" }),
-    ).toBeInTheDocument();
+      screen.queryByRole("status", { name: "Astra is responding" }),
+    ).not.toBeInTheDocument();
     expect(screen.queryByText("Working")).not.toBeInTheDocument();
-    expect(screen.queryByText("Thinking")).not.toBeInTheDocument();
     expect(screen.queryByText("Preparing response...")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^Thinking/ })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
   });
 
   it("does not render settled empty assistant messages", () => {
@@ -71,6 +75,26 @@ describe("MessageBubble", () => {
     );
 
     expect(container).toBeEmptyDOMElement();
+  });
+
+  it("groups search and fetch into one Web capability on user messages", () => {
+    render(
+      <MessageBubble
+        message={{
+          id: "user-1",
+          role: "user",
+          content: "Find the latest release notes.",
+          activeTools: ["web_search", "web_fetch", "github"],
+          createdAt: new Date().toISOString(),
+          status: "complete",
+        }}
+      />,
+    );
+
+    expect(screen.getAllByText("Web access")).toHaveLength(1);
+    expect(screen.getByText("GitHub")).toBeInTheDocument();
+    expect(screen.queryByText("web search")).not.toBeInTheDocument();
+    expect(screen.queryByText("web fetch")).not.toBeInTheDocument();
   });
 
   it("shows the reasoning panel once reasoning content is available", async () => {

@@ -512,6 +512,9 @@ describe("AstraClient — Runs", () => {
         {
           run_id: "r1",
           session_id: "s1",
+          parent_run_id: "root-1",
+          root_run_id: "root-1",
+          depth: 1,
           status: "running",
           waiting_for: null,
           events_count: 3,
@@ -539,6 +542,9 @@ describe("AstraClient — Runs", () => {
     });
     const r = await createClient().listRuns();
     expect(r.runs[0].runId).toBe("r1");
+    expect(r.runs[0].parentRunId).toBe("root-1");
+    expect(r.runs[0].rootRunId).toBe("root-1");
+    expect(r.runs[0].depth).toBe(1);
     expect(r.runs[0].eventsCount).toBe(3);
     expect(r.runs[0].workspace?.kind).toBe("server_sandbox");
     expect(r.runs[0].executor?.kind).toBe("server_local");
@@ -771,6 +777,24 @@ describe("AstraClient — Session lifecycle and reflect", () => {
     expect(url).toContain("/chat/session/sx/reflect");
     expect(url).toContain("focus=tools");
     expect(url).toContain("last_n=5");
+  });
+
+  test("getSessionReflect normalizes omitted collection fields", async () => {
+    globalThis.fetch = mockFetch(200, {
+      session_id: "sx",
+      focus: "auto",
+      overview: null,
+      recommendations: [null, "", "Continue with verification."],
+    });
+    const report = await createClient().getSessionReflect("sx");
+    expect(report).toMatchObject({
+      session_id: "sx",
+      focus: "auto",
+      overview: {},
+      diagnoses: [],
+      insights: [],
+      recommendations: ["Continue with verification."],
+    });
   });
 
   test("getSessionDecisionTrace", async () => {
@@ -1191,12 +1215,13 @@ describe("AstraClient — Errors", () => {
 // ─── chatRequestToWire ─────────────────────────────────────────────
 
 describe("chatRequestToWire", () => {
-  test("maps allow_skills, allow_tools, and skill_search", () => {
+  test("maps hard allowlists separately from optional tool enablement", () => {
     const body = chatRequestToWire({
       message: "hi",
       selectedModel: { model: "test-model" },
       allowSkills: ["a", "b"],
       allowTools: ["t1"],
+      enabledTools: ["web_search", "web_fetch"],
       skillSearch: {
         dynamicSurface: false,
         minCatalogSize: 10,
@@ -1205,6 +1230,7 @@ describe("chatRequestToWire", () => {
     });
     expect(body.allow_skills).toEqual(["a", "b"]);
     expect(body.allow_tools).toEqual(["t1"]);
+    expect(body.enabled_tools).toEqual(["web_search", "web_fetch"]);
     expect(body.skill_search).toEqual({
       dynamic_surface: false,
       min_catalog_size: 10,
@@ -1221,6 +1247,15 @@ describe("chatRequestToWire", () => {
     });
     expect(body.allow_skills).toBeUndefined();
     expect(body.allow_tools).toBeUndefined();
+  });
+
+  test("preserves an empty optional-tool set as an explicit disablement", () => {
+    const body = chatRequestToWire({
+      message: "x",
+      selectedModel: { model: "test-model" },
+      enabledTools: [],
+    });
+    expect(body.enabled_tools).toEqual([]);
   });
 
   test("default request omits execution_budget", () => {

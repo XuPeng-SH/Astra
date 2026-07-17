@@ -1,5 +1,6 @@
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { useState } from "react";
 import { WorkSurfacePanel } from "@/components/app/work-surface-panel";
 import { WORKSPACE_EXECUTION_BLOCKED_MESSAGE } from "@/lib/run-status-messages";
 import { createEmptyWorkSurface } from "@/lib/work-surface";
@@ -18,6 +19,7 @@ vi.mock("lucide-react", () => {
     Loader2: Icon,
     Pause: Icon,
     RotateCw: Icon,
+    Sparkles: Icon,
     Terminal: Icon,
     Wrench: Icon,
     X: Icon,
@@ -25,6 +27,257 @@ vi.mock("lucide-react", () => {
 });
 
 describe("WorkSurfacePanel", () => {
+  it("loads durable reflection and decision evidence on demand", async () => {
+    const user = userEvent.setup();
+    const onLoadInsights = vi.fn().mockResolvedValue({
+      sessionId: "session-1",
+      audit: null,
+      reflection: {
+        session_id: "session-1",
+        focus: "auto",
+        overview: {},
+        diagnoses: [],
+        insights: [],
+        recommendations: ["Verify the failing integration path next."],
+      },
+      decisionTrace: {
+        session_id: "session-1",
+        focus: "tool_surface",
+        overview: { selected_route: "edge workspace" },
+        diagnoses: [],
+        insights: [],
+        recommendations: [],
+      },
+      warnings: ["audit: temporarily unavailable"],
+      generatedAt: "2026-07-16T10:00:00.000Z",
+    });
+
+    function Surface() {
+      const [tab, setTab] = useState<"tasks" | "agents" | "tools" | "insights">(
+        "tasks",
+      );
+      return (
+        <WorkSurfacePanel
+          state={{
+            ...createEmptyWorkSurface("session-1", "run-1"),
+            hydrated: true,
+          }}
+          tab={tab}
+          onTabChange={setTab}
+          onRefresh={vi.fn()}
+          onLoadAgentRun={vi.fn()}
+          onLoadInsights={onLoadInsights}
+        />
+      );
+    }
+
+    render(<Surface />);
+    await user.click(screen.getByRole("button", { name: /Insights/i }));
+
+    expect(onLoadInsights).toHaveBeenCalledTimes(1);
+    expect(
+      await screen.findByText("Verify the failing integration path next."),
+    ).toBeInTheDocument();
+    expect(screen.getByText("edge workspace")).toBeInTheDocument();
+    expect(screen.getByText("Partial evidence")).toBeInTheDocument();
+  });
+
+  it("renders incomplete insight evidence without crashing", async () => {
+    const user = userEvent.setup();
+    const onLoadInsights = vi.fn().mockResolvedValue({
+      sessionId: "session-1",
+      audit: null,
+      reflection: {
+        session_id: "session-1",
+        focus: "auto",
+        overview: {},
+      },
+      decisionTrace: null,
+      warnings: [],
+      generatedAt: "2026-07-16T10:00:00.000Z",
+    });
+
+    function Surface() {
+      const [tab, setTab] = useState<"tasks" | "agents" | "tools" | "insights">(
+        "tasks",
+      );
+      return (
+        <WorkSurfacePanel
+          state={{
+            ...createEmptyWorkSurface("session-1", "run-1"),
+            hydrated: true,
+          }}
+          tab={tab}
+          onTabChange={setTab}
+          onRefresh={vi.fn()}
+          onLoadAgentRun={vi.fn()}
+          onLoadInsights={onLoadInsights}
+        />
+      );
+    }
+
+    render(<Surface />);
+    await user.click(screen.getByRole("button", { name: /Insights/i }));
+
+    expect(await screen.findByText("Reflect")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "No recommendations were produced for the current evidence.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("opens a child run as a canonical transcript workspace", async () => {
+    const user = userEvent.setup();
+    const onLoadAgentRun = vi.fn().mockResolvedValue({
+      runId: "child-run-1",
+      sessionId: "session-1",
+      status: "completed",
+      events: [],
+      transcript: [
+        {
+          session_id: "session-1",
+          item_seq: 1,
+          run_id: "child-run-1",
+          role: "user",
+          content: "Review the concurrency boundary.",
+          created_at: "2026-07-16T10:00:00.000Z",
+        },
+        {
+          session_id: "session-1",
+          item_seq: 2,
+          run_id: "child-run-1",
+          role: "assistant",
+          content: "The boundary is race-safe.",
+          reasoning: "Checked the durable CAS path.",
+          created_at: "2026-07-16T10:00:02.000Z",
+        },
+      ],
+      transcriptComplete: true,
+      transcriptWarning: null,
+      generatedAt: "2026-07-16T10:00:03.000Z",
+    });
+
+    render(
+      <WorkSurfacePanel
+        state={{
+          ...createEmptyWorkSurface("session-1", "root-run"),
+          hydrated: true,
+          agents: [
+            {
+              agentId: "agent-1",
+              runId: "child-run-1",
+              parentRunId: "root-run",
+              agentType: "code-review",
+              description: "Concurrency review",
+              status: "completed",
+              updatedAt: Date.parse("2026-07-16T10:00:03.000Z"),
+            },
+          ],
+        }}
+        tab="agents"
+        onTabChange={vi.fn()}
+        onRefresh={vi.fn()}
+        onLoadAgentRun={onLoadAgentRun}
+      />,
+    );
+
+    await waitFor(() =>
+      expect(onLoadAgentRun).toHaveBeenCalledWith("child-run-1"),
+    );
+    await user.click(
+      await screen.findByRole("button", { name: /Open transcript/i }),
+    );
+
+    expect(
+      screen.getByRole("dialog", { name: "Concurrency review transcript" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Review the concurrency boundary."),
+    ).toBeInTheDocument();
+    expect(screen.getByText("The boundary is race-safe.")).toBeInTheDocument();
+    expect(
+      screen.getByText("Checked the durable CAS path."),
+    ).toBeInTheDocument();
+  });
+
+  it("switches between durable parent and child agent transcripts without closing the workspace", async () => {
+    const user = userEvent.setup();
+    const onLoadAgentRun = vi.fn(async (runId: string) => ({
+      runId,
+      sessionId: "session-1",
+      status: "completed",
+      events: [],
+      transcript: [
+        {
+          session_id: "session-1",
+          item_seq: 1,
+          run_id: runId,
+          role: "assistant",
+          content:
+            runId === "run-review"
+              ? "Review coordinator result"
+              : "Nested security finding",
+          created_at: "2026-07-16T10:00:02.000Z",
+        },
+      ],
+      transcriptComplete: true,
+      transcriptWarning: null,
+      generatedAt: "2026-07-16T10:00:03.000Z",
+    }));
+
+    render(
+      <WorkSurfacePanel
+        state={{
+          ...createEmptyWorkSurface("session-1", "root-run"),
+          hydrated: true,
+          agents: [
+            {
+              agentId: "agent-review",
+              runId: "run-review",
+              parentRunId: "root-run",
+              description: "Review coordinator",
+              status: "completed",
+              updatedAt: 2_000,
+            },
+            {
+              agentId: "agent-security",
+              runId: "run-security",
+              parentRunId: "run-review",
+              description: "Security review",
+              status: "completed",
+              updatedAt: 3_000,
+            },
+          ],
+        }}
+        tab="agents"
+        onTabChange={vi.fn()}
+        onRefresh={vi.fn()}
+        onLoadAgentRun={onLoadAgentRun}
+      />,
+    );
+
+    expect(screen.getByText("Child of Main conversation")).toBeInTheDocument();
+    expect(screen.getByText("Child of Review coordinator")).toBeInTheDocument();
+    await user.click(
+      await screen.findByRole("button", { name: /Open transcript/i }),
+    );
+    expect(
+      await screen.findByText("Review coordinator result"),
+    ).toBeInTheDocument();
+
+    await user.click(
+      screen.getByRole("button", { name: /Security review, Completed/i }),
+    );
+    expect(
+      await screen.findByText("Nested security finding"),
+    ).toBeInTheDocument();
+    expect(onLoadAgentRun).toHaveBeenCalledWith("run-security");
+
+    await user.click(screen.getByRole("button", { name: "Main conversation" }));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
   it("renders concise run status text in the panel header", () => {
     render(
       <WorkSurfacePanel
@@ -84,6 +337,107 @@ describe("WorkSurfacePanel", () => {
     ).toBeTruthy();
   });
 
+  it("never fabricates task completion when no measured progress exists", () => {
+    render(
+      <WorkSurfacePanel
+        state={{
+          ...createEmptyWorkSurface("session-1", "run-1"),
+          hydrated: true,
+          tasks: [
+            {
+              id: "task-unmeasured",
+              title: "Investigate the production failure",
+              status: "in_progress",
+              created_at: "2026-06-10T00:00:00.000Z",
+              updated_at: "2026-06-10T00:01:00.000Z",
+            },
+          ],
+        }}
+        activeRun={{ runId: "run-1", status: "running" }}
+        tab="tasks"
+        onTabChange={vi.fn()}
+        onRefresh={vi.fn()}
+        onLoadAgentRun={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.getByText("Investigate the production failure"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("45%")).not.toBeInTheDocument();
+    expect(screen.getByText(/Updated/)).toBeInTheDocument();
+  });
+
+  it("names the actual tasks that block downstream work", () => {
+    render(
+      <WorkSurfacePanel
+        state={{
+          ...createEmptyWorkSurface("session-1", "run-1"),
+          hydrated: true,
+          tasks: [
+            {
+              id: "schema",
+              title: "Apply schema migration",
+              status: "in_progress",
+              blocks: ["api"],
+              created_at: "2026-06-10T00:00:00.000Z",
+              updated_at: "2026-06-10T00:01:00.000Z",
+            },
+            {
+              id: "api",
+              title: "Start API rollout",
+              status: "pending",
+              blocked_by: ["schema"],
+              created_at: "2026-06-10T00:00:00.000Z",
+              updated_at: "2026-06-10T00:01:00.000Z",
+            },
+          ],
+        }}
+        activeRun={{ runId: "run-1", status: "running" }}
+        tab="tasks"
+        onTabChange={vi.fn()}
+        onRefresh={vi.fn()}
+        onLoadAgentRun={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("Blocked by")).toBeInTheDocument();
+    expect(screen.getAllByText("Apply schema migration")).toHaveLength(2);
+    expect(screen.getByText("Unblocks 1")).toBeInTheDocument();
+  });
+
+  it("labels measured subtask completion as evidence-backed progress", () => {
+    render(
+      <WorkSurfacePanel
+        state={{
+          ...createEmptyWorkSurface("session-1", "run-1"),
+          hydrated: true,
+          tasks: [
+            {
+              id: "task-measured",
+              title: "Ship the runtime repair",
+              status: "in_progress",
+              created_at: "2026-06-10T00:00:00.000Z",
+              updated_at: "2026-06-10T00:01:00.000Z",
+              subtasks: [
+                { id: "sub-1", title: "Fix", status: "completed" },
+                { id: "sub-2", title: "Verify", status: "pending" },
+              ],
+            },
+          ],
+        }}
+        activeRun={{ runId: "run-1", status: "running" }}
+        tab="tasks"
+        onTabChange={vi.fn()}
+        onRefresh={vi.fn()}
+        onLoadAgentRun={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("Subtask completion")).toBeInTheDocument();
+    expect(screen.getByText("50%")).toBeInTheDocument();
+  });
+
   it("orders tool cards by most recent activity first", () => {
     render(
       <WorkSurfacePanel
@@ -124,6 +478,42 @@ describe("WorkSurfacePanel", () => {
       completedLater.compareDocumentPosition(startedEarlier) &
         Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
+  });
+
+  it("keeps successful tool evidence compact until the user expands it", async () => {
+    const user = userEvent.setup();
+    render(
+      <WorkSurfacePanel
+        state={{
+          ...createEmptyWorkSurface("session-1", "run-1"),
+          hydrated: true,
+          tools: [
+            {
+              callId: "call-read",
+              tool: "read_file",
+              arguments: '{"path":"src/main.rs"}',
+              result: "fn main() {}",
+              status: "done",
+              startedAt: 1_000,
+              finishedAt: 2_000,
+              durationMs: 1_000,
+            },
+          ],
+        }}
+        tab="tools"
+        onTabChange={vi.fn()}
+        onRefresh={vi.fn()}
+        onLoadAgentRun={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByText("Args")).not.toBeInTheDocument();
+    expect(screen.queryByText("Result")).not.toBeInTheDocument();
+    await user.click(
+      screen.getByRole("button", { name: "Expand read_file details" }),
+    );
+    expect(screen.getByText("Args")).toBeInTheDocument();
+    expect(screen.getByText("Result")).toBeInTheDocument();
   });
 
   it("focuses tool failures when an activity link opens the tools tab", async () => {
@@ -284,6 +674,37 @@ describe("WorkSurfacePanel", () => {
     await waitFor(() => {
       expect(loadAgentRun).toHaveBeenCalledWith("run-new");
     });
+  });
+
+  it("presents agent turns as budget usage rather than completion progress", () => {
+    render(
+      <WorkSurfacePanel
+        state={{
+          ...createEmptyWorkSurface("session-1", "run-1"),
+          hydrated: true,
+          agents: [
+            {
+              agentId: "agent-budget",
+              agentType: "research",
+              description: "Investigate the incident",
+              status: "running",
+              turn: 2,
+              maxTurns: 8,
+              updatedAt: 2_000,
+            },
+          ],
+        }}
+        activeRun={{ runId: "run-1", status: "running" }}
+        tab="agents"
+        onTabChange={vi.fn()}
+        onRefresh={vi.fn()}
+        onLoadAgentRun={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("Turn budget")).toBeInTheDocument();
+    expect(screen.getByText("2/8")).toBeInTheDocument();
+    expect(screen.queryByText("25%")).not.toBeInTheDocument();
   });
 
   it("opens the first active subagent instead of chasing latest timestamps", async () => {
@@ -503,7 +924,7 @@ describe("WorkSurfacePanel", () => {
 
     expect(screen.getAllByText("Needs final answer").length).toBeGreaterThan(0);
     expect(screen.queryByText("Interrupted")).toBeNull();
-    expect(screen.queryByText("Needs attention")).toBeNull();
+    expect(screen.getByText("Needs attention")).toBeInTheDocument();
     expect(await screen.findByText("No final answer")).toBeInTheDocument();
     expect(
       screen.getAllByText("上海今日小雨，33°C / 25°C。").length,

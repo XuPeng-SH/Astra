@@ -578,6 +578,7 @@ pub struct ChatRequestData {
     pub allow_skills: Option<Vec<String>>,
     pub allow_skill_sources: Option<Vec<String>>,
     pub allow_tools: Option<Vec<String>>,
+    pub enabled_tools: Option<Vec<String>>,
     pub workspace_binding: Option<WorkspaceBindingRequest>,
     pub executor_binding: Option<ExecutorBindingRequest>,
     pub runtime_mcp_bindings: Vec<RuntimeMcpBindingRequest>,
@@ -690,6 +691,11 @@ pub struct ChatStreamRecord {
 pub struct RunStatusRecord {
     pub run_id: String,
     pub session_id: String,
+    /// Durable run-tree identity. A missing parent identifies the root
+    /// conversation run; clients must not infer lineage from event timing.
+    pub parent_run_id: Option<String>,
+    pub root_run_id: Option<String>,
+    pub depth: u32,
     pub status: String,
     pub waiting_for: Option<String>,
     pub events_count: i64,
@@ -7560,11 +7566,16 @@ mod tests {
             "DELETE FROM agent_run_events WHERE user_id = ? AND run_id = ?",
             "DELETE FROM agent_runs WHERE user_id = ? AND run_id = ?",
         ] {
-            let _ = sqlx::query(sql)
+            sqlx::query(sql)
                 .bind(user_id)
                 .bind(run_id)
                 .execute(pool.get())
-                .await;
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "database run fixture cleanup failed for user={user_id} run={run_id} sql={sql}: {error}"
+                    )
+                });
         }
     }
 
@@ -10121,6 +10132,7 @@ mod tests {
             allow_skills: None,
             allow_skill_sources: None,
             allow_tools: None,
+            enabled_tools: None,
             workspace_binding: None,
             executor_binding: None,
             runtime_mcp_bindings: Vec::new(),
@@ -10191,6 +10203,7 @@ mod tests {
             allow_skills: None,
             allow_skill_sources: None,
             allow_tools: None,
+            enabled_tools: None,
             workspace_binding: None,
             executor_binding: None,
             runtime_mcp_bindings: Vec::new(),
@@ -10274,6 +10287,7 @@ mod tests {
                     allow_skills: None,
                     allow_skill_sources: None,
                     allow_tools: None,
+                    enabled_tools: None,
                     workspace_binding: None,
                     executor_binding: None,
                     runtime_mcp_bindings: Vec::new(),
