@@ -10,7 +10,7 @@
 //!   per occurrence
 //! - Factual no-recent-output advisory without guessing process intent
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
@@ -919,6 +919,50 @@ impl BackgroundTaskRegistry {
             BackgroundTaskError::output_unavailable(
                 id,
                 format!("background output read task failed: {error}"),
+            )
+        })?
+    }
+
+    pub async fn search_combined_output_async(
+        &mut self,
+        id: &str,
+        pattern: &str,
+        context_lines: usize,
+        max_bytes: usize,
+    ) -> Result<(String, u64, bool), BackgroundTaskError> {
+        self.drain_join_set();
+        let handle = self
+            .tasks
+            .get(id)
+            .ok_or_else(|| BackgroundTaskError::not_found(id))?;
+        let stdout_path = handle.stdout_path.clone();
+        let stderr_path = handle.stderr_path.clone();
+        let terminal = handle.status().is_terminal();
+        let task_id = id.to_string();
+        let pattern = pattern.to_string();
+        tokio::task::spawn_blocking(move || {
+            let stdout_missing = !stdout_path.exists();
+            let stderr_has_output = file_len(&stderr_path) > 0;
+            if terminal && stdout_missing && !stderr_has_output {
+                return Err(BackgroundTaskError::output_artifact_missing(
+                    &task_id,
+                    &stdout_path,
+                ));
+            }
+            search_combined_output(
+                &stdout_path,
+                &stderr_path,
+                &pattern,
+                context_lines,
+                max_bytes,
+            )
+            .map_err(|detail| BackgroundTaskError::output_unavailable(&task_id, detail))
+        })
+        .await
+        .map_err(|error| {
+            BackgroundTaskError::output_unavailable(
+                id,
+                format!("background output search task failed: {error}"),
             )
         })?
     }
@@ -2020,6 +2064,158 @@ fn read_combined_from_str(
     ))
 }
 
+fn search_combined_output(
+    stdout_path: &Path,
+    stderr_path: &Path,
+    pattern: &str,
+    context_lines: usize,
+    max_bytes: usize,
+) -> Result<(String, u64, bool), String> {
+    let mut output = String::new();
+    let mut matching_lines = 0_u64;
+    let mut truncated = false;
+
+    for (label, path) in [("stdout", stdout_path), ("stderr", stderr_path)] {
+        if !path.exists() || file_len(path) == 0 {
+            continue;
+        }
+        search_output_source(
+            label,
+            path,
+            pattern,
+            context_lines,
+            max_bytes,
+            &mut output,
+            &mut matching_lines,
+            &mut truncated,
+        )?;
+    }
+
+    Ok((output, matching_lines, truncated))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn search_output_source(
+    label: &str,
+    path: &Path,
+    pattern: &str,
+    context_lines: usize,
+    max_bytes: usize,
+    output: &mut String,
+    matching_lines: &mut u64,
+    truncated: &mut bool,
+) -> Result<(), String> {
+    use std::io::BufRead;
+
+    let file = std::fs::File::open(path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut bytes = Vec::new();
+    let mut prior_lines = VecDeque::<(u64, String)>::with_capacity(context_lines);
+    let mut following_context = 0_usize;
+    let mut line_number = 0_u64;
+
+    loop {
+        bytes.clear();
+        let read = reader
+            .read_until(b'\n', &mut bytes)
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        line_number = line_number.saturating_add(1);
+        let line = String::from_utf8_lossy(&bytes);
+        let line = line.trim_end_matches(&['\r', '\n'][..]);
+        let is_match = line.contains(pattern);
+        if is_match {
+            *matching_lines = matching_lines.saturating_add(1);
+        }
+
+        // Once the bounded response is full, keep scanning only to return an
+        // accurate match count. In particular, do not retain per-line state:
+        // captured shell output can contain millions of very short lines.
+        if *truncated {
+            continue;
+        }
+
+        if is_match {
+            if following_context == 0 {
+                if !output.is_empty() && append_utf8_bounded(output, "\n", max_bytes) {
+                    *truncated = true;
+                    continue;
+                }
+                let header = format!("[{label} context near line {line_number}]\n");
+                if append_utf8_bounded(output, &header, max_bytes) {
+                    *truncated = true;
+                    continue;
+                }
+                for (number, prior) in prior_lines.drain(..) {
+                    if append_numbered_search_line(output, number, &prior, max_bytes) {
+                        *truncated = true;
+                        break;
+                    }
+                }
+                if *truncated {
+                    continue;
+                }
+            } else {
+                prior_lines.clear();
+            }
+            if append_numbered_search_line(output, line_number, line, max_bytes) {
+                *truncated = true;
+                continue;
+            }
+            following_context = context_lines;
+        } else if following_context > 0 {
+            if append_numbered_search_line(output, line_number, line, max_bytes) {
+                *truncated = true;
+                continue;
+            }
+            following_context -= 1;
+        } else if context_lines > 0 {
+            // A retained context line can never contribute more than the
+            // response byte budget, so cap it before storing it in the ring.
+            let mut end = line.len().min(max_bytes);
+            while end > 0 && !line.is_char_boundary(end) {
+                end -= 1;
+            }
+            prior_lines.push_back((line_number, line[..end].to_string()));
+            if prior_lines.len() > context_lines {
+                prior_lines.pop_front();
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn append_numbered_search_line(
+    output: &mut String,
+    line_number: u64,
+    line: &str,
+    max_bytes: usize,
+) -> bool {
+    let prefix = format!("{line_number}: ");
+    append_utf8_bounded(output, &prefix, max_bytes)
+        || append_utf8_bounded(output, line, max_bytes)
+        || append_utf8_bounded(output, "\n", max_bytes)
+}
+
+/// Append as much UTF-8 text as fits and report whether any bytes were omitted.
+fn append_utf8_bounded(output: &mut String, text: &str, max_bytes: usize) -> bool {
+    let remaining = max_bytes.saturating_sub(output.len());
+    if text.len() <= remaining {
+        output.push_str(text);
+        return false;
+    }
+    let mut end = remaining.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    output.push_str(&text[..end]);
+    true
+}
+
 fn count_file_lines(path: &Path) -> Result<u64, String> {
     use std::io::Read;
     let mut file =
@@ -2876,6 +3072,69 @@ mod tests {
                 .0
                 .contains("completed output")
         );
+    }
+
+    #[test]
+    fn output_search_returns_literal_matches_with_bounded_context() {
+        let tmp = crate::tests::test_temp_dir();
+        let stdout = tmp.path().join("stdout.log");
+        let stderr = tmp.path().join("stderr.log");
+        std::fs::write(
+            &stdout,
+            "before one\nfailing_test_name\nafter one\nunrelated\nfailing_test_name again\nafter two\n",
+        )
+        .unwrap();
+        std::fs::write(&stderr, "panic detail for failing_test_name\n").unwrap();
+
+        let (output, matching_lines, truncated) =
+            search_combined_output(&stdout, &stderr, "failing_test_name", 1, 4096)
+                .expect("search captured output");
+
+        assert_eq!(matching_lines, 3, "{output}");
+        assert!(!truncated, "{output}");
+        assert!(output.contains("[stdout context near line 2]"), "{output}");
+        assert!(output.contains("1: before one"), "{output}");
+        assert!(output.contains("5: failing_test_name again"), "{output}");
+        assert!(output.contains("[stderr context near line 1]"), "{output}");
+    }
+
+    #[test]
+    fn output_search_enforces_utf8_safe_result_bound() {
+        let tmp = crate::tests::test_temp_dir();
+        let stdout = tmp.path().join("stdout.log");
+        let stderr = tmp.path().join("stderr.log");
+        std::fs::write(&stdout, "needle 中文中文中文中文中文中文\n").unwrap();
+        std::fs::write(&stderr, "").unwrap();
+
+        let (output, matching_lines, truncated) =
+            search_combined_output(&stdout, &stderr, "needle", 0, 43)
+                .expect("bounded search captured output");
+
+        assert_eq!(matching_lines, 1);
+        assert!(truncated, "{output}");
+        assert!(output.len() <= 43, "{} bytes: {output}", output.len());
+        assert!(std::str::from_utf8(output.as_bytes()).is_ok(), "{output:?}");
+    }
+
+    #[test]
+    fn output_search_counts_late_matches_after_result_is_full() {
+        let tmp = crate::tests::test_temp_dir();
+        let stdout = tmp.path().join("stdout.log");
+        let stderr = tmp.path().join("stderr.log");
+        std::fs::write(
+            &stdout,
+            "needle one\nignored\nneedle two\nignored\nneedle three\n",
+        )
+        .unwrap();
+        std::fs::write(&stderr, "needle four\n").unwrap();
+
+        let (output, matching_lines, truncated) =
+            search_combined_output(&stdout, &stderr, "needle", 0, 16)
+                .expect("bounded search captured output");
+
+        assert_eq!(matching_lines, 4, "{output}");
+        assert!(truncated, "{output}");
+        assert!(output.len() <= 16, "{} bytes: {output}", output.len());
     }
 
     #[test]

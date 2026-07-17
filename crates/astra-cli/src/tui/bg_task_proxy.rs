@@ -219,11 +219,29 @@ pub(crate) fn export_background_local_agent_task_projections_from_snapshot(
 }
 
 pub(crate) fn background_task_output_dir(session_id: Option<&str>) -> std::path::PathBuf {
-    std::env::temp_dir().join("astra").join("bg_tasks").join(
-        session_id
-            .filter(|sid| !sid.is_empty())
-            .unwrap_or("default"),
-    )
+    static UNBOUND_PROCESS_SCOPE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let scope = session_id.filter(|sid| !sid.is_empty()).map_or_else(
+        || {
+            UNBOUND_PROCESS_SCOPE
+                .get_or_init(|| {
+                    let started_at = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos();
+                    format!("unbound-{}-{started_at:x}", std::process::id())
+                })
+                .as_str()
+        },
+        |session_id| session_id,
+    );
+    // A TUI can launch work before the server assigns its durable session id.
+    // Give that pre-binding window a process-unique owner: the old shared
+    // `default/bg-shell-1.stdout` path let a second Astra process overwrite
+    // the first session's only failure evidence.
+    std::env::temp_dir()
+        .join("astra")
+        .join("bg_tasks")
+        .join(scope)
 }
 
 pub(crate) async fn restore_background_task_projections(
@@ -466,6 +484,53 @@ pub(crate) async fn background_task_output_snapshot(
         end_offset,
         total_bytes,
         total_lines,
+        status,
+        terminal,
+        output_ref,
+    })
+}
+
+pub(crate) async fn background_task_output_search_snapshot(
+    background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
+    task_id: &str,
+    pattern: &str,
+    context_lines: usize,
+    max_bytes: usize,
+) -> Result<crate::edge_tools::BgTaskOutputSearchSnapshot, BackgroundTaskError> {
+    background_registry.drain_join_set();
+    let (status, title, output_ref) = {
+        let handle = background_registry
+            .get(task_id)
+            .ok_or_else(|| BackgroundTaskError::not_found(task_id))?;
+        (
+            handle.projected_status().to_string(),
+            handle.description.clone(),
+            format!(
+                "stdout: {} · stderr: {}",
+                handle.stdout_path.display(),
+                handle.stderr_path.display()
+            ),
+        )
+    };
+    let terminal = background_task_status_is_terminal(&status);
+    if !terminal {
+        return Err(BackgroundTaskError::output_unavailable(
+            task_id,
+            format!(
+                "diagnostic search requires a terminal shell task; current status is {status}. Use one current task_output snapshot and wait for the automatic completion notification."
+            ),
+        ));
+    }
+    let (output, matching_lines, truncated) = background_registry
+        .search_combined_output_async(task_id, pattern, context_lines, max_bytes)
+        .await?;
+
+    Ok(crate::edge_tools::BgTaskOutputSearchSnapshot {
+        kind: "shell".to_string(),
+        title: Some(title),
+        output,
+        matching_lines,
+        truncated,
         status,
         terminal,
         output_ref,
@@ -733,7 +798,57 @@ pub(crate) fn background_task_event_system_messages(
 
 #[cfg(test)]
 mod tests {
-    use super::background_task_status_is_terminal;
+    use super::{
+        background_task_output_dir, background_task_output_search_snapshot,
+        background_task_status_is_terminal,
+    };
+
+    #[tokio::test]
+    async fn diagnostic_search_rejects_live_shell_output() {
+        let temp = crate::tests::test_temp_dir();
+        let mut registry =
+            super::super::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
+        let task_id = registry.spawn_shell("sleep 5", "long test");
+
+        let error =
+            background_task_output_search_snapshot(&mut registry, &task_id, "failure", 3, 8192)
+                .await
+                .expect_err("live output must not be treated as stable diagnostic evidence");
+
+        assert!(
+            matches!(
+                error,
+                crate::background_task_error::BackgroundTaskError::OutputUnavailable {
+                    ref detail,
+                    ..
+                } if detail.contains("requires a terminal shell task")
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn unbound_background_output_scope_is_process_owned_not_shared_default() {
+        let first = background_task_output_dir(None);
+        let second = background_task_output_dir(None);
+
+        assert_eq!(first, second, "one process must keep one provisional owner");
+        let scope = first
+            .file_name()
+            .and_then(|scope| scope.to_str())
+            .expect("UTF-8 provisional scope");
+        assert!(scope.starts_with("unbound-"), "{scope}");
+        assert_ne!(scope, "default");
+    }
+
+    #[test]
+    fn bound_background_output_scope_uses_durable_session_identity() {
+        let path = background_task_output_dir(Some("session-123"));
+        assert_eq!(
+            path.file_name().and_then(|scope| scope.to_str()),
+            Some("session-123")
+        );
+    }
 
     #[test]
     fn terminal_status_is_a_lifecycle_fact_not_an_availability_guess() {
