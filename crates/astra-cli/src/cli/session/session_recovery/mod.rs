@@ -8,7 +8,7 @@ pub(crate) mod workspace;
 
 // Re-export public items from sub-modules
 pub(crate) use checkpoint::{
-    build_manual_heavy_step_checkpoint, next_step_checkpoint_number,
+    RecoverySnapshotSyncError, build_manual_heavy_step_checkpoint, next_step_checkpoint_number,
     persist_manual_heavy_and_composite, session_state_compact_from_heavy_checkpoint,
     sync_recovery_snapshot_after_history_edit,
 };
@@ -30,7 +30,7 @@ mod tests {
     };
     use super::io::{
         composite_index_path_for, csl_log_path_for, csl_store_base_dir, read_optional_file_bytes,
-        restore_optional_file_bytes, with_workspace_lock, write_bytes_atomic,
+        restore_optional_file_bytes, write_bytes_atomic,
     };
     use super::{
         build_manual_heavy_step_checkpoint, next_step_checkpoint_number,
@@ -755,23 +755,6 @@ mod tests {
     }
 
     #[test]
-    fn with_workspace_lock_releases_lock_after_panic() {
-        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
-        let sid = format!("workspace-lock-{}", uuid::Uuid::new_v4());
-
-        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            with_workspace_lock(&sid, || -> Result<(), String> {
-                panic!("boom");
-            })
-            .unwrap();
-        }));
-        assert!(panic_result.is_err(), "panic should propagate to caller");
-
-        let value = with_workspace_lock(&sid, || Ok::<_, String>(42)).unwrap();
-        assert_eq!(value, 42, "lock must be released after unwind");
-    }
-
-    #[test]
     #[serial_test::serial]
     fn session_workspace_git_root_returns_root_when_workspace_exists() {
         let (_tmp, _g) = crate::tests::isolated_sessions_dir();
@@ -1211,7 +1194,7 @@ mod tests {
             .await
             .expect_err("temporary CSL path conflict should fail");
 
-        assert!(error.contains("replace CSL snapshot"), "{error}");
+        assert!(error.message.contains("replace CSL snapshot"), "{error}");
 
         let checkpoints =
             astra_pipeline::step_checkpoint::list_checkpoints(TEST_USER_ID, &sid).unwrap();

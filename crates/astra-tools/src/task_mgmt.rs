@@ -38,7 +38,7 @@ pub const MAX_SUBTASK_TITLE_CHARS: usize = 512;
 pub const MAX_SUBTASK_DESCRIPTION_CHARS: usize = 10_000;
 
 /// A durable checklist task tracked within the current CLI session.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionTask {
     pub id: String,
@@ -212,28 +212,36 @@ fn add_dependency_edge(
         return Err(format!("task '{}' not found", blocked_id));
     };
 
-    // Idempotent: already exists, skip
-    if tasks[blocker_index]
+    let blocker_has_edge = tasks[blocker_index]
         .blocks
         .iter()
-        .any(|id| id == blocked_id)
-    {
+        .any(|id| id == blocked_id);
+    let blocked_has_reverse = tasks[blocked_index]
+        .blocked_by
+        .iter()
+        .any(|id| id == blocker_id);
+    if blocker_has_edge && blocked_has_reverse {
         return Ok(());
     }
 
     // Cycle detection: adding blocker_id → blocked_id must not create a path
     // from blocked_id back to blocker_id.
-    if would_create_cycle(tasks, blocker_id, blocked_id) {
+    if !blocker_has_edge && would_create_cycle(tasks, blocker_id, blocked_id) {
         return Err(format!(
             "adding dependency '{}' → '{}' would create a cycle. Review the dependency graph",
             blocker_id, blocked_id
         ));
     }
 
-    push_unique_string(&mut tasks[blocker_index].blocks, blocked_id);
-    push_unique_string(&mut tasks[blocked_index].blocked_by, blocker_id);
-    tasks[blocker_index].updated_at = now.to_string();
-    tasks[blocked_index].updated_at = now.to_string();
+    // Repair either half of a legacy/asymmetric edge independently. Treating
+    // the forward half as proof that the whole relation exists would preserve
+    // corrupt graph state forever on an otherwise idempotent add.
+    if push_unique_string(&mut tasks[blocker_index].blocks, blocked_id) {
+        tasks[blocker_index].updated_at = now.to_string();
+    }
+    if push_unique_string(&mut tasks[blocked_index].blocked_by, blocker_id) {
+        tasks[blocked_index].updated_at = now.to_string();
+    }
     Ok(())
 }
 
@@ -302,9 +310,7 @@ fn projected_blockers_for_task(
     tasks: &[SessionTask],
     task_id: &str,
     add_blocked_by: &[String],
-    add_blocks: &[String],
     remove_blocked_by: &[String],
-    remove_blocks: &[String],
 ) -> HashSet<String> {
     let mut blockers: HashSet<String> = HashSet::new();
     if let Some(task) = tasks.iter().find(|task| task.id == task_id) {
@@ -318,50 +324,78 @@ fn projected_blockers_for_task(
     for blocker_id in remove_blocked_by {
         blockers.remove(blocker_id);
     }
-    for blocked_id in remove_blocks {
-        if blocked_id == task_id {
-            blockers.remove(task_id);
-        }
-    }
     for blocker_id in add_blocked_by {
         blockers.insert(blocker_id.clone());
-    }
-    for blocked_id in add_blocks {
-        if blocked_id == task_id {
-            blockers.insert(task_id.to_string());
-        }
     }
     blockers
 }
 
-fn validate_task_can_start_after_projected_edges(
+fn unresolved_blocker_ids(
+    tasks: &[SessionTask],
+    blocker_ids: impl IntoIterator<Item = String>,
+) -> Vec<String> {
+    let task_statuses = tasks
+        .iter()
+        .map(|task| (task.id.as_str(), task.status))
+        .collect::<HashMap<_, _>>();
+    let mut seen = HashSet::new();
+    let mut unresolved = blocker_ids
+        .into_iter()
+        .filter(|blocker_id| seen.insert(blocker_id.clone()))
+        .filter(|blocker_id| {
+            !task_statuses
+                .get(blocker_id.as_str())
+                .is_some_and(SessionTaskStatusKind::is_completed)
+        })
+        .collect::<Vec<_>>();
+    unresolved.sort();
+    unresolved
+}
+
+/// Return the task's unresolved dependency IDs from the canonical graph.
+///
+/// A dependency is resolved only when the referenced task exists and is
+/// completed. Missing references deliberately remain unresolved so a corrupt
+/// or partially-loaded graph cannot silently authorize work. Both edge
+/// directions are considered to keep projections truthful while legacy data
+/// with only one side of an edge is repaired.
+pub fn unresolved_task_blocker_ids(tasks: &[SessionTask], task: &SessionTask) -> Vec<String> {
+    let blockers = task.blocked_by.iter().cloned().chain(
+        tasks
+            .iter()
+            .filter(|candidate| candidate.blocks.iter().any(|id| id == &task.id))
+            .map(|candidate| candidate.id.clone()),
+    );
+    unresolved_blocker_ids(tasks, blockers)
+}
+
+fn projected_unresolved_task_blocker_ids(
     tasks: &[SessionTask],
     task_id: &str,
     add_blocked_by: &[String],
-    add_blocks: &[String],
     remove_blocked_by: &[String],
-    remove_blocks: &[String],
-) -> Result<(), String> {
-    let blockers = projected_blockers_for_task(
+) -> Vec<String> {
+    unresolved_blocker_ids(
         tasks,
-        task_id,
-        add_blocked_by,
-        add_blocks,
-        remove_blocked_by,
-        remove_blocks,
-    );
-    if blockers.is_empty() {
-        return Ok(());
-    }
+        projected_blockers_for_task(tasks, task_id, add_blocked_by, remove_blocked_by),
+    )
+}
 
+fn validate_task_blockers_resolved_after_projected_edges(
+    tasks: &[SessionTask],
+    task_id: &str,
+    add_blocked_by: &[String],
+    remove_blocked_by: &[String],
+) -> Result<(), String> {
+    let unresolved_ids =
+        projected_unresolved_task_blocker_ids(tasks, task_id, add_blocked_by, remove_blocked_by);
     let tasks_by_id: HashMap<&str, &SessionTask> =
         tasks.iter().map(|task| (task.id.as_str(), task)).collect();
-    let unresolved: Vec<String> = blockers
+    let unresolved: Vec<String> = unresolved_ids
         .into_iter()
-        .filter_map(|blocker_id| match tasks_by_id.get(blocker_id.as_str()) {
-            Some(task) if task.status.is_completed() => None,
-            Some(task) => Some(format!("{blocker_id} ({})", task.status)),
-            None => Some(format!("{blocker_id} (missing)")),
+        .map(|blocker_id| match tasks_by_id.get(blocker_id.as_str()) {
+            Some(task) => format!("{blocker_id} ({})", task.status),
+            None => format!("{blocker_id} (missing)"),
         })
         .collect();
     if unresolved.is_empty() {
@@ -369,7 +403,7 @@ fn validate_task_can_start_after_projected_edges(
     }
 
     Err(format!(
-        "task '{}' cannot start while blocked_by is unresolved: {}. Complete the blocker(s), or remove the dependency if it no longer applies",
+        "task '{}' cannot start or complete while blocked_by is unresolved: {}. Complete the blocker(s), or remove the dependency if it no longer applies",
         task_id,
         unresolved.join(", ")
     ))
@@ -420,7 +454,7 @@ fn validate_subtask_dependencies_resolved(
 }
 
 /// A subtask within a SessionTask.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionSubtask {
     pub id: String,
@@ -439,6 +473,27 @@ pub struct SessionSubtask {
     /// accept explanatory reasons without pretending they are parent failures.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+/// Compare semantic board state while deliberately excluding `updated_at`.
+/// Mutation code may stage timestamps before it knows whether an idempotent
+/// request changed anything; timestamp-only churn is not a task mutation.
+fn same_task_board_state(left: &[SessionTask], right: &[SessionTask]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            left.id == right.id
+                && left.title == right.title
+                && left.description == right.description
+                && left.status == right.status
+                && left.subtasks == right.subtasks
+                && left.created_at == right.created_at
+                && left.active_form == right.active_form
+                && left.owner == right.owner
+                && left.metadata == right.metadata
+                && left.blocks == right.blocks
+                && left.blocked_by == right.blocked_by
+                && left.archived_at == right.archived_at
+        })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -556,10 +611,6 @@ impl SessionTaskStatusKind {
     pub fn can_be_stopped(&self) -> bool {
         matches!(self, Self::Pending | Self::InProgress | Self::Paused)
     }
-
-    pub fn blocks_duplicate_create(&self) -> bool {
-        matches!(self, Self::Pending | Self::InProgress | Self::Paused)
-    }
 }
 
 impl SessionTaskStatusKind {
@@ -659,10 +710,140 @@ pub fn prepare_task_snapshot_for_fork(mut snapshot: TaskManagerSnapshot) -> Task
     snapshot
 }
 
+/// Machine-readable result of one atomic task-board mutation.
+///
+/// `output` is presentation for the model/UI. Callers must use `status` and
+/// `data` for control flow instead of parsing that text. `success` and
+/// `changed` remain denormalized wire-compatibility fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskMutationStatus {
+    Applied,
+    Unchanged,
+    Refused,
+    Failed,
+    /// The durable admission record exists, but the system cannot prove
+    /// whether the mutation committed. Callers must reconcile from the task
+    /// board instead of treating this as either success or a safe retry.
+    Indeterminate,
+}
+
+impl TaskMutationStatus {
+    pub fn is_success(self) -> bool {
+        matches!(self, Self::Applied | Self::Unchanged)
+    }
+
+    pub fn changed(self) -> bool {
+        self == Self::Applied
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TaskMutationOutcome {
+    pub output: String,
+    /// Canonical control-flow evidence. The booleans below remain on the wire
+    /// for compatibility, but internal callers must branch on this enum.
+    pub status: TaskMutationStatus,
+    pub success: bool,
+    pub changed: bool,
+    pub data: Value,
+}
+
+impl TaskMutationOutcome {
+    fn from_parts(summary: impl Into<String>, mut data: Value, status: TaskMutationStatus) -> Self {
+        let success = status.is_success();
+        let changed = status.changed();
+        if let Some(object) = data.as_object_mut() {
+            object.insert("success".to_string(), Value::Bool(success));
+            object.insert("mutation_status".to_string(), json!(status));
+        }
+        Self {
+            output: prefix_summary(summary.into(), data.to_string()),
+            status,
+            success,
+            changed,
+            data,
+        }
+    }
+
+    pub fn error(message: impl Into<String>) -> Self {
+        let message = message.into();
+        Self {
+            output: format!("Error: {message}"),
+            status: TaskMutationStatus::Failed,
+            success: false,
+            changed: false,
+            data: json!({
+                "success": false,
+                "mutation_status": TaskMutationStatus::Failed,
+                "message": message,
+            }),
+        }
+    }
+
+    pub fn applied(summary: impl Into<String>, data: Value) -> Self {
+        Self::from_parts(summary, data, TaskMutationStatus::Applied)
+    }
+
+    pub fn unchanged(summary: impl Into<String>, data: Value) -> Self {
+        Self::from_parts(summary, data, TaskMutationStatus::Unchanged)
+    }
+
+    pub fn refused(summary: impl Into<String>, data: Value) -> Self {
+        Self::from_parts(summary, data, TaskMutationStatus::Refused)
+    }
+
+    pub fn indeterminate(message: impl Into<String>) -> Self {
+        let message = message.into();
+        Self {
+            output: format!("Indeterminate: {message}"),
+            status: TaskMutationStatus::Indeterminate,
+            success: false,
+            changed: false,
+            data: json!({
+                "success": false,
+                "mutation_status": TaskMutationStatus::Indeterminate,
+                "message": message,
+            }),
+        }
+    }
+}
+
 pub struct TaskMutationResult {
     pub tasks: Vec<SessionTask>,
     pub next_task_id: Option<u32>,
-    pub response: String,
+    pub outcome: TaskMutationOutcome,
+}
+
+impl TaskMutationResult {
+    fn applied(
+        tasks: Vec<SessionTask>,
+        next_task_id: Option<u32>,
+        summary: impl Into<String>,
+        data: Value,
+    ) -> Self {
+        Self {
+            tasks,
+            next_task_id,
+            outcome: TaskMutationOutcome::applied(summary, data),
+        }
+    }
+
+    fn unchanged(tasks: Vec<SessionTask>, summary: impl Into<String>, data: Value) -> Self {
+        Self {
+            tasks,
+            next_task_id: None,
+            outcome: TaskMutationOutcome::unchanged(summary, data),
+        }
+    }
+
+    fn refused(tasks: Vec<SessionTask>, summary: impl Into<String>, data: Value) -> Self {
+        Self {
+            tasks,
+            next_task_id: None,
+            outcome: TaskMutationOutcome::refused(summary, data),
+        }
+    }
 }
 
 pub type TaskMutation =
@@ -735,7 +916,7 @@ pub trait TaskStore: Send + Sync {
     /// still have coherent semantics. SQL-backed stores should keep the same
     /// session-local default; cross-session cleanup belongs behind an explicit
     /// user-level action, not a model-triggered current-session archive.
-    async fn archive(&self, session_id: &str, args: &Value) -> Result<String, String> {
+    async fn archive(&self, session_id: &str, args: &Value) -> Result<TaskMutationOutcome, String> {
         let parsed = parse_archive_args(args)?;
         let task_id = parsed.task_id;
         let days = parsed.older_than_days;
@@ -748,97 +929,129 @@ pub trait TaskStore: Send + Sync {
         self.mutate(
             session_id,
             Box::new(move |mut tasks, _next| {
+                let original_tasks = tasks.clone();
                 if let Some(task_id) = task_id {
                     let Some(task_index) = tasks.iter().position(|t| t.id == task_id) else {
-                        return Ok(TaskMutationResult {
+                        return Ok(TaskMutationResult::refused(
                             tasks,
-                            next_task_id: None,
-                            response: prefix_summary(
-                                format!(
-                                    "Refused: task #{task_id} not found in session {session_label}"
-                                ),
-                                json!({
-                                    "success": false,
-                                    "task_id": task_id,
-                                    "message": format!(
-                                        "Task '{}' was not found in session '{}'",
-                                        task_id, session_label
-                                    ),
-                                })
-                                .to_string(),
+                            format!(
+                                "Refused: task #{task_id} not found in session {session_label}"
                             ),
-                        });
+                            json!({
+                                "task_id": task_id,
+                                "message": format!(
+                                    "Task '{}' was not found in session '{}'",
+                                    task_id, session_label
+                                ),
+                            }),
+                        ));
                     };
                     let previous_status = tasks[task_index].status;
-                    if previous_status == SessionTaskStatusKind::Archived
+                    if previous_status != SessionTaskStatusKind::Archived
+                        && !previous_status.can_be_archived()
                     {
-                        return Ok(TaskMutationResult {
+                        return Ok(TaskMutationResult::refused(
                             tasks,
-                            next_task_id: None,
-                            response: prefix_summary(
-                                format!("Refused: task #{task_id} is already archived"),
-                                json!({
-                                    "success": false,
-                                    "task_id": task_id,
-                                    "previous_status": previous_status,
-                                    "message": format!("Task '{}' is already archived", task_id),
-                                })
-                                .to_string(),
+                            format!(
+                                "Refused: task #{task_id} is '{previous_status}' — only completed, failed, or cancelled tasks can be archived"
                             ),
-                        });
-                    }
-                    if !previous_status.can_be_archived() {
-                        return Ok(TaskMutationResult {
-                            tasks,
-                            next_task_id: None,
-                            response: prefix_summary(
-                                format!(
-                                    "Refused: task #{task_id} is '{previous_status}' — only completed, failed, or cancelled tasks can be archived"
+                            json!({
+                                "task_id": task_id,
+                                "previous_status": previous_status,
+                                "message": format!(
+                                    "Task '{}' must be completed, failed, or cancelled before it can be archived",
+                                    task_id
                                 ),
-                                json!({
-                                    "success": false,
-                                    "task_id": task_id,
-                                    "previous_status": previous_status,
-                                    "message": format!(
-                                        "Task '{}' must be completed, failed, or cancelled before it can be archived",
-                                        task_id
-                                    ),
-                                })
-                                .to_string(),
-                            ),
-                        });
+                            }),
+                        ));
                     }
 
-                    tasks[task_index].status = SESSION_TASK_STATUS_ARCHIVED;
-                    tasks[task_index].updated_at = now_rfc3339.clone();
-                    tasks[task_index].archived_at = Some(now_rfc3339.clone());
-                    if let Some(reason) = reason.as_deref() {
-                        let meta = tasks[task_index]
-                            .metadata
-                            .get_or_insert_with(Default::default);
-                        meta.insert("archive_reason".to_string(), json!(reason));
+                    if previous_status != SessionTaskStatusKind::Archived {
+                        tasks[task_index].status = SESSION_TASK_STATUS_ARCHIVED;
+                        tasks[task_index].updated_at = now_rfc3339.clone();
+                        tasks[task_index].archived_at = Some(now_rfc3339.clone());
+                        if let Some(reason) = reason.as_deref() {
+                            let meta = tasks[task_index]
+                                .metadata
+                                .get_or_insert_with(Default::default);
+                            meta.insert("archive_reason".to_string(), json!(reason));
+                        }
+                    } else if tasks[task_index].archived_at.is_none() {
+                        // Legacy rows may predate archived_at. Preserve their
+                        // last known mutation time instead of inventing a new
+                        // archive time during replay.
+                        tasks[task_index].archived_at = Some(tasks[task_index].updated_at.clone());
                     }
                     let archived_ids = HashSet::from([task_id.clone()]);
                     detach_task_dependency_edges(&mut tasks, &archived_ids);
-                    return Ok(TaskMutationResult {
-                        tasks,
-                        next_task_id: None,
-                        response: prefix_summary(
-                            format!("Archived task #{task_id} (was {previous_status})"),
+                    reconcile_all_subtask_completion(&mut tasks, &now_rfc3339);
+                    if same_task_board_state(&original_tasks, &tasks) {
+                        return Ok(TaskMutationResult::unchanged(
+                            original_tasks,
+                            format!("Task #{task_id} is already archived"),
                             json!({
-                                "success": true,
                                 "task_id": task_id,
                                 "previous_status": previous_status,
                                 "status": SESSION_TASK_STATUS_ARCHIVED,
-                                "message": format!("Task '{}' archived", task_id),
-                            })
-                            .to_string(),
-                        ),
-                    });
+                                "already_current": true,
+                                "message": format!("Task '{}' is already archived", task_id),
+                            }),
+                        ));
+                    }
+                    let repaired_existing = previous_status == SessionTaskStatusKind::Archived;
+                    return Ok(TaskMutationResult::applied(
+                        tasks,
+                        None,
+                        if repaired_existing {
+                            format!("Reconciled archived task #{task_id}")
+                        } else {
+                            format!("Archived task #{task_id} (was {previous_status})")
+                        },
+                        json!({
+                            "task_id": task_id,
+                            "previous_status": previous_status,
+                            "status": SESSION_TASK_STATUS_ARCHIVED,
+                            "reconciled_existing_archive": repaired_existing,
+                            "message": if repaired_existing {
+                                format!("Task '{}' archive invariants reconciled", task_id)
+                            } else {
+                                format!("Task '{}' archived", task_id)
+                            },
+                        }),
+                    ));
                 }
 
+                let existing_archived_ids: HashSet<&str> = original_tasks
+                    .iter()
+                    .filter(|task| task.status == SessionTaskStatusKind::Archived)
+                    .map(|task| task.id.as_str())
+                    .collect();
+                let repaired_existing_archives = existing_archived_ids
+                    .iter()
+                    .filter(|archived_id| {
+                        original_tasks.iter().any(|task| {
+                            (task.id.as_str() == **archived_id
+                                && (task.archived_at.is_none()
+                                    || !task.blocks.is_empty()
+                                    || !task.blocked_by.is_empty()))
+                                || task.blocks.iter().any(|id| id.as_str() == **archived_id)
+                                || task
+                                    .blocked_by
+                                    .iter()
+                                    .any(|id| id.as_str() == **archived_id)
+                        })
+                    })
+                    .count() as u64;
                 let mut archived_ids: HashSet<String> = HashSet::new();
+                let mut newly_archived = 0_u64;
                 for task in &mut tasks {
+                    if task.status == SessionTaskStatusKind::Archived {
+                        if task.archived_at.is_none() {
+                            task.archived_at = Some(task.updated_at.clone());
+                        }
+                        archived_ids.insert(task.id.clone());
+                        continue;
+                    }
                     if !task.status.can_be_archived() {
                         continue;
                     }
@@ -859,31 +1072,36 @@ pub trait TaskStore: Send + Sync {
                             meta.insert("archive_reason".to_string(), json!(reason));
                         }
                         archived_ids.insert(task.id.clone());
+                        newly_archived = newly_archived.saturating_add(1);
                     }
                 }
-                let archived = archived_ids.len() as u64;
                 detach_task_dependency_edges(&mut tasks, &archived_ids);
-                Ok(TaskMutationResult {
-                    tasks,
-                    next_task_id: None,
-                    response: prefix_summary(
-                        format!(
-                            "Archived {archived} terminal task(s) older than {days} days in session {session_label}"
-                        ),
-                        json!({
-                            "success": true,
-                            "archived": archived,
-                            "older_than_days": days,
-                            "scope": "session",
-                            "session_id": session_label,
-                            "message": format!(
-                                "Archived {} terminal task(s) older than {} days in session '{}'",
-                                archived, days, session_label
-                            ),
-                        })
-                        .to_string(),
+                reconcile_all_subtask_completion(&mut tasks, &now_rfc3339);
+                let mut summary = format!(
+                    "Archived {newly_archived} terminal task(s) older than {days} days in session {session_label}"
+                );
+                let mut data = json!({
+                    "archived": newly_archived,
+                    "older_than_days": days,
+                    "scope": "session",
+                    "session_id": session_label,
+                    "reconciled_existing_archives": repaired_existing_archives,
+                    "message": format!(
+                        "Archived {} terminal task(s) older than {} days in session '{}'; reconciled {} existing archive(s)",
+                        newly_archived, days, session_label, repaired_existing_archives
                     ),
-                })
+                });
+                if same_task_board_state(&original_tasks, &tasks) {
+                    Ok(TaskMutationResult::unchanged(original_tasks, summary, data))
+                } else {
+                    if newly_archived == 0 {
+                        summary = format!(
+                            "Reconciled existing archive invariants in session {session_label}"
+                        );
+                        data["archive_invariants_reconciled"] = json!(true);
+                    }
+                    Ok(TaskMutationResult::applied(tasks, None, summary, data))
+                }
             }),
         )
         .await
@@ -896,15 +1114,22 @@ pub trait TaskStore: Send + Sync {
     /// Implementations that can be shared across processes must serialize this
     /// method per `session_id` so concurrent create/update/stop calls cannot
     /// overwrite each other with stale full-list saves.
-    async fn mutate(&self, session_id: &str, mutation: TaskMutation) -> Result<String, String> {
+    async fn mutate(
+        &self,
+        session_id: &str,
+        mutation: TaskMutation,
+    ) -> Result<TaskMutationOutcome, String> {
         let tasks = self.load(session_id).await?;
         let next = self.peek_next_task_id(session_id).await?;
         let result = mutation(tasks, next)?;
+        if !result.outcome.status.changed() {
+            return Ok(result.outcome);
+        }
         if let Some(next) = result.next_task_id {
             self.set_next_task_id(session_id, next).await?;
         }
         self.save(session_id, result.tasks).await?;
-        Ok(result.response)
+        Ok(result.outcome)
     }
     /// Return and consume the next integer to use when forming `task-<n>` ids.
     /// Must be monotonic per session_id.
@@ -936,6 +1161,49 @@ pub trait TaskStore: Send + Sync {
         let _ = (session_id, tasks, next_task_id, expected_version);
         Err("restore_snapshot_state is not supported for this store".to_string())
     }
+    /// Capture tasks, id allocator state, and the board version from one
+    /// logical point in time.
+    ///
+    /// The default uses an optimistic version fence so stores do not return a
+    /// torn snapshot when a writer commits between the individual reads.
+    /// Durable stores must increment the same version for every task-board
+    /// write path, including background lifecycle maintenance.
+    async fn load_snapshot_state(&self, session_id: &str) -> Result<TaskManagerSnapshot, String> {
+        const MAX_ATTEMPTS: usize = 3;
+        for attempt in 1..=MAX_ATTEMPTS {
+            let version_before = self
+                .get_session_version(session_id)
+                .await
+                .map_err(|e| format!("get_session_version before snapshot failed: {e}"))?;
+            let tasks = self
+                .load(session_id)
+                .await
+                .map_err(|e| format!("task load during snapshot failed: {e}"))?;
+            let next_task_id = self
+                .peek_next_task_id(session_id)
+                .await
+                .map_err(|e| format!("peek_next_task_id failed: {e}"))?;
+            let version_after = self
+                .get_session_version(session_id)
+                .await
+                .map_err(|e| format!("get_session_version after snapshot failed: {e}"))?;
+            if version_before == version_after {
+                return Ok(TaskManagerSnapshot {
+                    tasks,
+                    next_task_id,
+                    version: version_after,
+                    restore_version: None,
+                });
+            }
+            if attempt == MAX_ATTEMPTS {
+                return Err(format!(
+                    "task board changed while capturing snapshot \
+                     (version {version_before} -> {version_after}); retry"
+                ));
+            }
+        }
+        unreachable!("snapshot attempt loop always returns")
+    }
     /// Read the next id WITHOUT consuming or mutating the counter.
     /// Used by `try_snapshot_state` to capture the counter for rollback
     /// without leaving a hole in the id sequence.
@@ -954,8 +1222,9 @@ pub trait TaskStore: Send + Sync {
     /// `restore_snapshot` checks the snapshot version against the store
     /// to detect concurrent-mutation conflicts.
     ///
-    /// Default returns 0 — stores that do not support version tracking
-    /// disable the conflict check (restore_snapshot always succeeds).
+    /// Versions start at 0. Stores that support snapshot restore must
+    /// increment the version for every write so 0 remains a valid CAS value,
+    /// not a sentinel for disabling conflict detection.
     async fn get_session_version(&self, session_id: &str) -> Result<u64, String> {
         let _ = session_id;
         Ok(0)
@@ -1187,8 +1456,12 @@ impl TaskStore for InMemoryTaskStore {
         Ok(())
     }
 
-    async fn mutate(&self, session_id: &str, mutation: TaskMutation) -> Result<String, String> {
-        let response = {
+    async fn mutate(
+        &self,
+        session_id: &str,
+        mutation: TaskMutation,
+    ) -> Result<TaskMutationOutcome, String> {
+        let outcome = {
             let mut sessions = self.sessions.lock().await;
             let entry = sessions.entry(session_id.to_string()).or_default();
             let next = if entry.next_id == 0 { 1 } else { entry.next_id };
@@ -1206,19 +1479,23 @@ impl TaskStore for InMemoryTaskStore {
                      task board unchanged"
                 )
             })??;
-            if self.validate_on_save {
+            if self.validate_on_save && result.outcome.status.changed() {
                 Self::validate_tasks(&result.tasks)?;
             }
-            let entry = sessions.entry(session_id.to_string()).or_default();
-            entry.tasks = result.tasks;
-            if let Some(next_task_id) = result.next_task_id {
-                entry.next_id = u64::from(next_task_id);
+            if result.outcome.status.changed() {
+                let entry = sessions.entry(session_id.to_string()).or_default();
+                entry.tasks = result.tasks;
+                if let Some(next_task_id) = result.next_task_id {
+                    entry.next_id = u64::from(next_task_id);
+                }
+                entry.version = entry.version.wrapping_add(1);
             }
-            entry.version = entry.version.wrapping_add(1);
-            result.response
+            result.outcome
         };
-        let _ = self.changed_tx.send(session_id.to_string());
-        Ok(response)
+        if outcome.status.changed() {
+            let _ = self.changed_tx.send(session_id.to_string());
+        }
+        Ok(outcome)
     }
 
     async fn next_task_id(&self, session_id: &str) -> Result<u32, String> {
@@ -1268,7 +1545,7 @@ impl TaskStore for InMemoryTaskStore {
         {
             let mut sessions = self.sessions.lock().await;
             let entry = sessions.entry(session_id.to_string()).or_default();
-            if expected_version > 0 && entry.version != expected_version {
+            if entry.version != expected_version {
                 return Err(format!(
                     "restore_snapshot_state: version conflict (expected={}, current={}) — \
                      task board changed after rollback snapshot was sealed; retry with fresh state",
@@ -1281,6 +1558,21 @@ impl TaskStore for InMemoryTaskStore {
         }
         let _ = self.changed_tx.send(session_id.to_string());
         Ok(())
+    }
+
+    async fn load_snapshot_state(&self, session_id: &str) -> Result<TaskManagerSnapshot, String> {
+        let sessions = self.sessions.lock().await;
+        let entry = sessions.get(session_id);
+        let next_task_id = entry
+            .map(|state| if state.next_id == 0 { 1 } else { state.next_id })
+            .unwrap_or(1);
+        Ok(TaskManagerSnapshot {
+            tasks: entry.map(|state| state.tasks.clone()).unwrap_or_default(),
+            next_task_id: u32::try_from(next_task_id)
+                .map_err(|_| format!("task id counter exhausted for session {session_id}"))?,
+            version: entry.map(|state| state.version).unwrap_or(0),
+            restore_version: None,
+        })
     }
 
     async fn peek_next_task_id(&self, session_id: &str) -> Result<u32, String> {
@@ -1377,38 +1669,6 @@ pub const VALID_LIST_STATUS_FILTERS: &[&str] = &[
     "all",
     "active",
 ];
-
-/// Title normalization for U-4 duplicate detection. Lowercase, drop
-/// ASCII punctuation, collapse whitespace. Conservative on purpose:
-/// we'd rather miss a near-duplicate (model retries with different
-/// wording → 2 tasks, manageable) than false-positive a legitimate
-/// fresh task (refuse with `duplicate_of` → model confused).
-pub fn normalize_title(title: &str) -> String {
-    let mut out = String::with_capacity(title.len());
-    let mut prev_was_space = true; // skip leading whitespace
-    for ch in title.chars() {
-        if ch.is_whitespace() {
-            if !prev_was_space {
-                out.push(' ');
-                prev_was_space = true;
-            }
-        } else if ch.is_ascii_punctuation() {
-            // Drop punctuation entirely so "fix bug." matches "fix bug".
-            // Don't pretend it's a word boundary either — preserve
-            // adjacency so "auth-flow" matches "auth flow" without the
-            // hyphen merging into the next char.
-        } else {
-            for lc in ch.to_lowercase() {
-                out.push(lc);
-            }
-            prev_was_space = false;
-        }
-    }
-    if out.ends_with(' ') {
-        out.pop();
-    }
-    out
-}
 
 fn normalize_update_status(args: &Value) -> Result<Option<SessionTaskStatusKind>, String> {
     let raw_new_status = args.get("new_status");
@@ -1820,6 +2080,35 @@ fn optional_non_empty_string_field(args: &Value, field: &str) -> Result<Option<S
     }
 }
 
+/// Parse an update-only optional string where JSON `null` explicitly clears
+/// persisted state. Outer `None` means the field was absent; inner `None`
+/// means the caller requested a clear.
+fn optional_nullable_string_field(
+    args: &Value,
+    field: &str,
+) -> Result<Option<Option<String>>, String> {
+    match args.get(field) {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(value) => value
+            .as_str()
+            .map(|text| Some(Some(text.to_string())))
+            .ok_or_else(|| format!("field '{field}' must be a string or null")),
+    }
+}
+
+fn optional_nullable_non_empty_string_field(
+    args: &Value,
+    field: &str,
+) -> Result<Option<Option<String>>, String> {
+    match optional_nullable_string_field(args, field)? {
+        Some(Some(text)) if text.trim().is_empty() => {
+            Err(format!("field '{field}' must be non-empty or null"))
+        }
+        value => Ok(value),
+    }
+}
+
 fn optional_object_field(
     args: &Value,
     field: &str,
@@ -1903,26 +2192,42 @@ pub(crate) fn parse_archive_args(args: &Value) -> Result<ArchiveArgs, String> {
 /// - any started subtask (`in_progress` / `completed`) promotes a still-pending
 ///   parent to `in_progress`, so the task board stops reading the parent as
 ///   untouched work once execution has clearly begun.
-/// - all subtasks completed → parent completed, but only when the parent is in
-///   an *active* state (pending / in_progress). Terminal non-success states
-///   (failed / cancelled) stay as-is, since promoting them to completed would
+/// - all subtasks completed → parent completed, but only when the parent still
+///   represents open work (pending / in_progress / paused). Terminal
+///   non-success states stay as-is, since promoting them to completed would
 ///   silently erase a failure signal.
 ///
 /// Reverse arm (a subtask flipped back from completed → parent reopens):
 /// only fires when this function itself auto-completed the parent earlier.
 /// Explicit parent completion is terminal history and must not be resurrected
 /// by a later subtask edit.
-fn reconcile_subtask_completion(task: &mut SessionTask) {
+fn clear_auto_completed_marker(task: &mut SessionTask) {
+    if let Some(meta) = task.metadata.as_mut() {
+        meta.remove("auto_completed_by_subtasks");
+        if meta.is_empty() {
+            task.metadata = None;
+        }
+    }
+}
+
+fn reconcile_subtask_completion(task: &mut SessionTask, blockers_resolved: bool) {
     if task.subtasks.is_empty() {
         return;
     }
 
     let all_completed = task.subtasks.iter().all(|st| st.status.is_completed());
     if all_completed {
-        if task.status.is_active() && task.blocked_by.is_empty() {
+        if task.status.is_open_work() && blockers_resolved {
             task.status = SessionTaskStatusKind::Completed;
             let meta = task.metadata.get_or_insert_with(serde_json::Map::new);
             meta.insert("auto_completed_by_subtasks".to_string(), json!(true));
+        } else if !blockers_resolved && is_reversible_auto_completed_parent(task) {
+            // Completion derived from children is valid only while the task's
+            // own prerequisites remain resolved. If an upstream auto-complete
+            // is reversed, reopen this derived completion as waiting work so
+            // downstream projections never report success through a blocker.
+            task.status = SessionTaskStatusKind::Pending;
+            clear_auto_completed_marker(task);
         }
         return;
     }
@@ -1935,19 +2240,112 @@ fn reconcile_subtask_completion(task: &mut SessionTask) {
         .unwrap_or(false);
     if task.status.is_completed() && was_auto_completed {
         task.status = SessionTaskStatusKind::InProgress;
-        if let Some(meta) = task.metadata.as_mut() {
-            meta.remove("auto_completed_by_subtasks");
-            if meta.is_empty() {
-                task.metadata = None;
-            }
-        }
+        clear_auto_completed_marker(task);
         return;
     }
 
     let any_started = task.subtasks.iter().any(|st| st.status.is_started());
-    if any_started && task.status.is_pending() {
+    if any_started && task.status.is_pending() && blockers_resolved {
         task.status = SessionTaskStatusKind::InProgress;
     }
+}
+
+/// Reconcile every derived parent status until dependency-driven completion
+/// reaches a fixed point. A task completion can unblock another all-done
+/// parent, which can in turn unblock a third; one local callback is therefore
+/// not a complete trigger model.
+fn reconcile_all_subtask_completion(tasks: &mut [SessionTask], now: &str) {
+    for _ in 0..tasks.len() {
+        let task_statuses = tasks
+            .iter()
+            .map(|task| (task.id.clone(), task.status))
+            .collect::<HashMap<_, _>>();
+        let mut blocker_ids = tasks
+            .iter()
+            .map(|task| {
+                (
+                    task.id.clone(),
+                    task.blocked_by.iter().cloned().collect::<HashSet<_>>(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        for blocker in tasks.iter() {
+            for blocked_id in &blocker.blocks {
+                if let Some(ids) = blocker_ids.get_mut(blocked_id.as_str()) {
+                    ids.insert(blocker.id.clone());
+                }
+            }
+        }
+        let blockers_resolved = tasks
+            .iter()
+            .map(|task| {
+                blocker_ids.get(task.id.as_str()).is_none_or(|ids| {
+                    ids.iter().all(|id| {
+                        task_statuses
+                            .get(id)
+                            .is_some_and(SessionTaskStatusKind::is_completed)
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut changed = false;
+        for (task, blockers_resolved) in tasks.iter_mut().zip(blockers_resolved) {
+            let previous_status = task.status;
+            reconcile_subtask_completion(task, blockers_resolved);
+            if task.status != previous_status {
+                task.updated_at = now.to_string();
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
+/// Transition child work that cannot outlive a terminal parent while
+/// preserving already-terminal success/failure facts.
+fn transition_open_subtasks(task: &mut SessionTask, status: SessionTaskStatusKind) -> usize {
+    debug_assert!(!status.is_open_work());
+    let mut transitioned = 0;
+    for subtask in &mut task.subtasks {
+        if subtask.status.can_be_stopped() {
+            subtask.status = status;
+            transitioned += 1;
+        }
+    }
+    transitioned
+}
+
+fn cancel_open_subtasks(task: &mut SessionTask) -> usize {
+    transition_open_subtasks(task, SessionTaskStatusKind::Cancelled)
+}
+
+/// Apply the single cancellation invariant used by both `update(cancelled)`
+/// and `stop`: the parent and every still-open child become cancelled in the
+/// same atomic store mutation. Returns the number of child transitions.
+fn cancel_task_and_open_subtasks(task: &mut SessionTask, reason: Option<&str>, now: &str) -> usize {
+    let previous_status = task.status;
+    let transitioning = previous_status != SessionTaskStatusKind::Cancelled;
+    task.status = SessionTaskStatusKind::Cancelled;
+
+    let cancelled_subtasks = cancel_open_subtasks(task);
+
+    if let Some(reason) = reason {
+        let metadata = task.metadata.get_or_insert_with(Default::default);
+        metadata.insert("reason".to_string(), json!(reason));
+        if transitioning {
+            let note = format!("Cancelled: {reason} (was: {previous_status})");
+            task.description = Some(
+                match task.description.as_deref().filter(|s| !s.is_empty()) {
+                    Some(description) => format!("{description}\n\n{note}"),
+                    None => note,
+                },
+            );
+        }
+    }
+    task.updated_at = now.to_string();
+    cancelled_subtasks
 }
 
 impl TaskManager {
@@ -2021,14 +2419,36 @@ impl TaskManager {
     /// reads from the durable store, and flows through the context pipeline's
     /// proper token accounting.
     pub async fn build_active_task_context(&self) -> Option<String> {
-        fn compact_title(title: &str) -> String {
-            const MAX_CHARS: usize = 120;
-            if title.chars().count() <= MAX_CHARS {
-                return title.to_string();
+        fn compact_text(text: &str, max_chars: usize) -> String {
+            if max_chars == 0 {
+                return String::new();
             }
-            let mut out: String = title.chars().take(MAX_CHARS.saturating_sub(1)).collect();
+            if text.chars().count() <= max_chars {
+                return text.to_string();
+            }
+            let mut out: String = text.chars().take(max_chars.saturating_sub(1)).collect();
             out.push('…');
             out
+        }
+
+        fn compact_title(title: &str) -> String {
+            compact_text(title, 120)
+        }
+
+        fn compact_blocked_task(task: &SessionTask, blockers: &[String]) -> String {
+            const MAX_CHARS: usize = 120;
+            const MAX_BLOCKERS: usize = 2;
+            let mut blocker_summary = blockers
+                .iter()
+                .take(MAX_BLOCKERS)
+                .map(|id| compact_text(id, 32))
+                .collect::<Vec<_>>();
+            if blockers.len() > MAX_BLOCKERS {
+                blocker_summary.push(format!("+{} more", blockers.len() - MAX_BLOCKERS));
+            }
+            let suffix = format!(" (waiting on {})", blocker_summary.join(", "));
+            let title_budget = MAX_CHARS.saturating_sub(suffix.chars().count());
+            format!("{}{}", compact_text(&task.title, title_budget), suffix)
         }
 
         fn compact_titles(titles: &[&str]) -> String {
@@ -2059,23 +2479,29 @@ impl TaskManager {
             return None;
         }
 
-        let in_progress: Vec<&str> = tasks
+        let open_tasks = tasks
             .iter()
-            .filter(|t| t.status == SessionTaskStatusKind::InProgress)
-            .map(|t| t.title.as_str())
-            .collect();
-        let pending: Vec<&str> = tasks
+            .filter(|task| task.status.is_open_work())
+            .map(|task| (task, unresolved_task_blocker_ids(&tasks, task)))
+            .collect::<Vec<_>>();
+        let ready_titles = |status| {
+            open_tasks
+                .iter()
+                .filter(|(task, blockers)| task.status == status && blockers.is_empty())
+                .map(|(task, _)| task.title.as_str())
+                .collect::<Vec<_>>()
+        };
+        let in_progress = ready_titles(SessionTaskStatusKind::InProgress);
+        let pending = ready_titles(SessionTaskStatusKind::Pending);
+        let paused = ready_titles(SessionTaskStatusKind::Paused);
+        let blocked = open_tasks
             .iter()
-            .filter(|t| t.status == SessionTaskStatusKind::Pending)
-            .map(|t| t.title.as_str())
-            .collect();
-        let paused: Vec<&str> = tasks
-            .iter()
-            .filter(|t| t.status == SessionTaskStatusKind::Paused)
-            .map(|t| t.title.as_str())
-            .collect();
+            .filter(|(_, blockers)| !blockers.is_empty())
+            .map(|(task, blockers)| compact_blocked_task(task, blockers))
+            .collect::<Vec<_>>();
+        let blocked_titles = blocked.iter().map(String::as_str).collect::<Vec<_>>();
 
-        if in_progress.is_empty() && pending.is_empty() && paused.is_empty() {
+        if in_progress.is_empty() && pending.is_empty() && paused.is_empty() && blocked.is_empty() {
             return None;
         }
 
@@ -2104,6 +2530,13 @@ impl TaskManager {
                 compact_titles(&paused)
             ));
         }
+        if !blocked.is_empty() {
+            hint.push_str(&format!(
+                "- ⛔ Blocked ({}): {}\n",
+                blocked.len(),
+                compact_titles(&blocked_titles)
+            ));
+        }
         if in_progress.is_empty() && !pending.is_empty() {
             hint.push_str(&format!(
                 "Focus on the first pending task: {}\n",
@@ -2116,6 +2549,8 @@ impl TaskManager {
             ));
         } else if !in_progress.is_empty() {
             hint.push_str("Focus on completing the in-progress task before starting new work.\n");
+        } else if !blocked.is_empty() {
+            hint.push_str("Resolve the listed blockers before starting blocked work.\n");
         }
 
         Some(hint)
@@ -2132,35 +2567,10 @@ impl TaskManager {
     /// for an unreadable task board.
     pub async fn try_snapshot_state(&self) -> Result<TaskManagerSnapshot, String> {
         let sid = self.sid();
-        let tasks = self.store.load(&sid).await?;
-        // Read the counter without consuming or mutating it so concurrent
-        // allocators can't race us into duplicate ids (the old
-        // alloc-then-rewind dance clobbered concurrent increments).
-        //
-        // **Fail-closed on peek errors.** The old fallback to
-        // `max(existing task ids) + 1` looked safe but isn't: concurrent
-        // allocators may have already consumed ids beyond the snapshot's
-        // max, and `restore_snapshot` would rewind the counter to the
-        // stale value — guaranteeing duplicate id allocation on the
-        // next `next_task_id` call. Propagating the error forces the
-        // caller to abort the mutation instead of capturing a snapshot
-        // that could corrupt the id space on rollback.
-        let peeked = self
-            .store
-            .peek_next_task_id(&sid)
+        self.store
+            .load_snapshot_state(&sid)
             .await
-            .map_err(|e| format!("snapshot peek_next_task_id failed: {e}"))?;
-        let version = self
-            .store
-            .get_session_version(&sid)
-            .await
-            .map_err(|e| format!("snapshot get_session_version failed: {e}"))?;
-        Ok(TaskManagerSnapshot {
-            tasks,
-            next_task_id: peeked,
-            version,
-            restore_version: None,
-        })
+            .map_err(|e| format!("snapshot read failed: {e}"))
     }
 
     /// Seal a snapshot after this caller's own mutations have completed.
@@ -2217,19 +2627,17 @@ impl TaskManager {
         // snapshot was sealed for. If the snapshot was never sealed, it may
         // only restore over its original captured version.
         let expected_version = snapshot.restore_version.unwrap_or(snapshot.version);
-        if expected_version > 0 {
-            let current_version = self
-                .store
-                .get_session_version(&sid)
-                .await
-                .map_err(|e| format!("restore_snapshot: failed to read version: {e}"))?;
-            if current_version != expected_version {
-                return Err(format!(
-                    "restore_snapshot: version conflict (expected={}, current={}) — \
-                     task board changed after rollback snapshot was sealed; retry with fresh state",
-                    expected_version, current_version
-                ));
-            }
+        let current_version = self
+            .store
+            .get_session_version(&sid)
+            .await
+            .map_err(|e| format!("restore_snapshot: failed to read version: {e}"))?;
+        if current_version != expected_version {
+            return Err(format!(
+                "restore_snapshot: version conflict (expected={}, current={}) — \
+                 task board changed after rollback snapshot was sealed; retry with fresh state",
+                expected_version, current_version
+            ));
         }
 
         let current_next = self
@@ -2254,8 +2662,8 @@ impl TaskManager {
             .await
     }
 
-    /// Create a new task in the session-local task list.
-    pub async fn create(&self, args: &Value) -> String {
+    /// Create a new task and preserve its machine-readable mutation outcome.
+    pub async fn create_outcome(&self, args: &Value) -> TaskMutationOutcome {
         if let Err(error) = validate_allowed_fields(
             args,
             "create",
@@ -2271,46 +2679,46 @@ impl TaskManager {
                 "add_blocked_by",
             ],
         ) {
-            return format!("Error: {error}");
+            return TaskMutationOutcome::error(error);
         }
         let title = match required_non_empty_string_field(args, "title") {
             Ok(title) => title,
-            Err(error) => return format!("Error: {error}"),
+            Err(error) => return TaskMutationOutcome::error(error),
         };
         if let Err(error) = validate_string_chars(&title, "title", MAX_TASK_TITLE_CHARS) {
-            return format!("Error: {error}");
+            return TaskMutationOutcome::error(error);
         }
 
         let description = match optional_string_field(args, "description") {
             Ok(description) => description,
-            Err(error) => return format!("Error: {error}"),
+            Err(error) => return TaskMutationOutcome::error(error),
         };
         if let Some(description) = description.as_deref()
             && let Err(error) =
                 validate_string_chars(description, "description", MAX_TASK_DESCRIPTION_CHARS)
         {
-            return format!("Error: {error}");
+            return TaskMutationOutcome::error(error);
         }
         let now = chrono::Utc::now().to_rfc3339();
 
         let active_form = match optional_non_empty_string_field(args, "active_form") {
             Ok(active_form) => active_form,
-            Err(error) => return format!("Error: {error}"),
+            Err(error) => return TaskMutationOutcome::error(error),
         };
         if let Some(active_form) = active_form.as_deref()
             && let Err(error) =
                 validate_string_chars(active_form, "active_form", MAX_TASK_ACTIVE_FORM_CHARS)
         {
-            return format!("Error: {error}");
+            return TaskMutationOutcome::error(error);
         }
         let owner = match optional_non_empty_string_field(args, "owner") {
             Ok(owner) => owner,
-            Err(error) => return format!("Error: {error}"),
+            Err(error) => return TaskMutationOutcome::error(error),
         };
         if let Some(owner) = owner.as_deref()
             && let Err(error) = validate_string_chars(owner, "owner", MAX_TASK_OWNER_CHARS)
         {
-            return format!("Error: {error}");
+            return TaskMutationOutcome::error(error);
         }
         // U-7: subtasks inherit parent's `owner` when they don't
         // declare one explicitly. Without inheritance a sub-agent
@@ -2321,27 +2729,27 @@ impl TaskManager {
         let parent_owner_for_subtasks = owner.clone();
         let subtasks = match parse_create_subtasks(args, parent_owner_for_subtasks.as_deref()) {
             Ok(subtasks) => subtasks,
-            Err(error) => return format!("Error: {error}"),
+            Err(error) => return TaskMutationOutcome::error(error),
         };
         let metadata = match args.get("metadata") {
             Some(value) => match value.as_object() {
                 Some(metadata) => {
                     if let Err(error) = validate_metadata_size(metadata, "metadata") {
-                        return format!("Error: {error}");
+                        return TaskMutationOutcome::error(error);
                     }
                     Some(metadata.clone())
                 }
-                None => return "Error: field 'metadata' must be an object".to_string(),
+                None => return TaskMutationOutcome::error("field 'metadata' must be an object"),
             },
             None => None,
         };
         let proposed_blocks = match optional_string_array_field(args, "add_blocks") {
             Ok(proposed_blocks) => proposed_blocks,
-            Err(error) => return format!("Error: {error}"),
+            Err(error) => return TaskMutationOutcome::error(error),
         };
         let proposed_blocked_by = match optional_string_array_field(args, "add_blocked_by") {
             Ok(proposed_blocked_by) => proposed_blocked_by,
-            Err(error) => return format!("Error: {error}"),
+            Err(error) => return TaskMutationOutcome::error(error),
         };
         for (field, ids) in [
             ("add_blocks", &proposed_blocks),
@@ -2349,7 +2757,7 @@ impl TaskManager {
         ] {
             for id in ids {
                 if let Err(error) = validate_task_id_chars(id, field) {
-                    return format!("Error: {error}");
+                    return TaskMutationOutcome::error(error);
                 }
             }
         }
@@ -2360,42 +2768,6 @@ impl TaskManager {
             .mutate(
                 &sid,
                 Box::new(move |mut tasks, next| {
-                    // U-4 dedup: refuse exact-normalized title match
-                    // against open (pending/in_progress/paused) tasks.
-                    // Without this, a session restart can lead the
-                    // model to re-create work it already has open.
-                    // Returns the existing id so the model can
-                    // continue with the open task instead of
-                    // duplicating.
-                    let normalized_new = normalize_title(&mutation_title);
-                    if let Some(dup) = tasks.iter().find(|t| {
-                        t.status.blocks_duplicate_create()
-                            && normalize_title(&t.title) == normalized_new
-                    }) {
-                        let response = prefix_summary(
-                            format!(
-                                "Refused: open task #{} already has this title — use update / get instead",
-                                dup.id
-                            ),
-                            json!({
-                                "success": false,
-                                "duplicate_of": dup.id,
-                                "duplicate_title": dup.title,
-                                "duplicate_status": dup.status,
-                                "message": format!(
-                                    "Refused: an open task with the same normalized title already exists (id={}). Use task_board(action='update') or task_board(action='get') instead of creating a duplicate.",
-                                    dup.id
-                                ),
-                            })
-                            .to_string(),
-                        );
-                        return Ok(TaskMutationResult {
-                            tasks,
-                            next_task_id: None,
-                            response,
-                        });
-                    }
-
                     let task_id = format!("task-{next}");
                     // U-10: if the counter is desynced (corruption or
                     // partial init), `next` may point at an id that
@@ -2404,29 +2776,21 @@ impl TaskManager {
                     // silently producing an invisible duplicate or
                     // hitting a raw "Duplicate entry" DB error.
                     if tasks.iter().any(|t| t.id == task_id) {
-                        let response = prefix_summary(
-                            format!(
-                                "Error: task counter desync — id '{task_id}' already exists. \
-                                 The session's counter may need to be reset. \
-                                 Contact support or use `task_board(action='list')` to see the \
-                                 current task list and manually continue from the last id."
-                            ),
-                            json!({
-                                "success": false,
-                                "error": "counter_desync",
-                                "conflicting_id": task_id,
-                                "message": format!(
-                                    "Task id '{task_id}' already exists in this session; \
-                                     counter is out of sync with the task list."
-                                ),
-                            })
-                            .to_string(),
+                        let summary = format!(
+                            "Error: task counter desync — id '{task_id}' already exists. \
+                             The session's counter may need to be reset. \
+                             Contact support or use `task_board(action='list')` to see the \
+                             current task list and manually continue from the last id."
                         );
-                        return Ok(TaskMutationResult {
-                            tasks,
-                            next_task_id: None,
-                            response,
+                        let data = json!({
+                            "error": "counter_desync",
+                            "conflicting_id": task_id,
+                            "message": format!(
+                                "Task id '{task_id}' already exists in this session; \
+                                 counter is out of sync with the task list."
+                            ),
                         });
+                        return Ok(TaskMutationResult::refused(tasks, summary, data));
                     }
                     let task = SessionTask {
                         id: task_id.clone(),
@@ -2450,32 +2814,34 @@ impl TaskManager {
                     for id in &proposed_blocked_by {
                         add_dependency_edge(&mut tasks, id, &task_id, &now)?;
                     }
-                    let response = prefix_summary(
-                        format!("Task #{task_id} created: {mutation_title}"),
-                        json!({
-                            "success": true,
-                            "task_id": task_id,
-                            "blocks": proposed_blocks,
-                            "blocked_by": proposed_blocked_by,
-                            "message": format!("Task '{}' created successfully", mutation_title)
-                        })
-                        .to_string(),
-                    );
+                    let summary = format!("Task #{task_id} created: {mutation_title}");
+                    let data = json!({
+                        "task_id": task_id,
+                        "blocks": proposed_blocks,
+                        "blocked_by": proposed_blocked_by,
+                        "message": format!("Task '{}' created successfully", mutation_title)
+                    });
                     let next_task_id = next.checked_add(1).ok_or_else(|| {
                         "task id counter overflow for session during create".to_string()
                     })?;
-                    Ok(TaskMutationResult {
+                    Ok(TaskMutationResult::applied(
                         tasks,
-                        next_task_id: Some(next_task_id),
-                        response,
-                    })
+                        Some(next_task_id),
+                        summary,
+                        data,
+                    ))
                 }),
             )
             .await
         {
-            Ok(response) => response,
-            Err(e) => format!("Error: {e}"),
+            Ok(outcome) => outcome,
+            Err(error) => TaskMutationOutcome::error(error),
         }
+    }
+
+    /// Rendered compatibility surface for tool/UI consumers.
+    pub async fn create(&self, args: &Value) -> String {
+        self.create_outcome(args).await.output
     }
 
     /// List tasks in the session, optionally filtered by status.
@@ -2606,8 +2972,8 @@ impl TaskManager {
         }
     }
 
-    /// Update a task's status, metadata, or dependency edges.
-    pub async fn update(&self, args: &Value) -> String {
+    /// Update a task while preserving the typed mutation outcome.
+    pub async fn update_outcome(&self, args: &Value) -> TaskMutationOutcome {
         if let Err(error) = validate_allowed_fields(
             args,
             "update",
@@ -2629,42 +2995,42 @@ impl TaskManager {
                 "error_message",
             ],
         ) {
-            return format!("Error: {error}");
+            return TaskMutationOutcome::error(error);
         }
         let task_id = match required_non_empty_string_field(args, "task_id") {
             Ok(task_id) => task_id,
-            Err(error) => return format!("Error: {error}"),
+            Err(error) => return TaskMutationOutcome::error(error),
         };
         if let Err(error) = validate_task_id_chars(&task_id, "task_id") {
-            return format!("Error: {error}");
+            return TaskMutationOutcome::error(error);
         }
 
         let new_status = match normalize_update_status(args) {
             Ok(status) => status,
-            Err(e) => return format!("Error: {e}"),
+            Err(error) => return TaskMutationOutcome::error(error),
         };
         let subtask_id = match optional_non_empty_string_field(args, "subtask_id") {
             Ok(subtask_id) => subtask_id,
-            Err(error) => return format!("Error: {error}"),
+            Err(error) => return TaskMutationOutcome::error(error),
         };
         let mut error_message = match optional_non_empty_string_field(args, "error_message") {
             Ok(error_message) => error_message,
-            Err(error) => return format!("Error: {error}"),
+            Err(error) => return TaskMutationOutcome::error(error),
         };
         let reason = match optional_non_empty_string_field(args, "reason") {
             Ok(reason) => reason,
-            Err(error) => return format!("Error: {error}"),
+            Err(error) => return TaskMutationOutcome::error(error),
         };
         if let Some(error_message) = error_message.as_deref()
             && let Err(error) =
                 validate_string_chars(error_message, "error_message", MAX_TASK_ERROR_MESSAGE_CHARS)
         {
-            return format!("Error: {error}");
+            return TaskMutationOutcome::error(error);
         }
         if let Some(reason) = reason.as_deref()
             && let Err(error) = validate_string_chars(reason, "reason", MAX_TASK_STOP_REASON_CHARS)
         {
-            return format!("Error: {error}");
+            return TaskMutationOutcome::error(error);
         }
         if subtask_id.is_none()
             && error_message.is_none()
@@ -2674,79 +3040,84 @@ impl TaskManager {
         }
         if error_message.is_some() {
             if subtask_id.is_some() {
-                return "Error: field 'error_message' is only supported for parent task failure updates; subtask failures cannot store an error_message".to_string();
+                return TaskMutationOutcome::error(
+                    "field 'error_message' is only supported for parent task failure updates; subtask failures cannot store an error_message",
+                );
             }
             if !matches!(
                 new_status,
                 Some(SessionTaskStatusKind::Failed | SessionTaskStatusKind::Cancelled)
             ) {
-                return "Error: field 'error_message' requires new_status='failed' or new_status='cancelled'".to_string();
+                return TaskMutationOutcome::error(
+                    "field 'error_message' requires new_status='failed' or new_status='cancelled'",
+                );
             }
         }
         let now = chrono::Utc::now().to_rfc3339();
 
         let title_update = match optional_non_empty_string_field(args, "title") {
             Ok(title_update) => title_update,
-            Err(error) => return format!("Error: {error}"),
+            Err(error) => return TaskMutationOutcome::error(error),
         };
         if let Some(title) = title_update.as_deref()
             && let Err(error) = validate_string_chars(title, "title", MAX_TASK_TITLE_CHARS)
         {
-            return format!("Error: {error}");
+            return TaskMutationOutcome::error(error);
         }
-        let desc_update = match optional_string_field(args, "description") {
+        let desc_update = match optional_nullable_string_field(args, "description") {
             Ok(desc_update) => desc_update,
-            Err(error) => return format!("Error: {error}"),
+            Err(error) => return TaskMutationOutcome::error(error),
         };
-        if let Some(description) = desc_update.as_deref()
+        if let Some(Some(description)) = desc_update.as_ref()
             && let Err(error) =
                 validate_string_chars(description, "description", MAX_TASK_DESCRIPTION_CHARS)
         {
-            return format!("Error: {error}");
+            return TaskMutationOutcome::error(error);
         }
-        let active_form_update = match optional_non_empty_string_field(args, "active_form") {
+        let active_form_update = match optional_nullable_non_empty_string_field(args, "active_form")
+        {
             Ok(active_form_update) => active_form_update,
-            Err(error) => return format!("Error: {error}"),
+            Err(error) => return TaskMutationOutcome::error(error),
         };
-        if let Some(active_form) = active_form_update.as_deref()
+        if let Some(Some(active_form)) = active_form_update.as_ref()
             && let Err(error) =
                 validate_string_chars(active_form, "active_form", MAX_TASK_ACTIVE_FORM_CHARS)
         {
-            return format!("Error: {error}");
+            return TaskMutationOutcome::error(error);
         }
-        let owner_update = match optional_non_empty_string_field(args, "owner") {
+        let owner_update = match optional_nullable_non_empty_string_field(args, "owner") {
             Ok(owner_update) => owner_update,
-            Err(error) => return format!("Error: {error}"),
+            Err(error) => return TaskMutationOutcome::error(error),
         };
-        if let Some(owner) = owner_update.as_deref()
+        if let Some(Some(owner)) = owner_update.as_ref()
             && let Err(error) = validate_string_chars(owner, "owner", MAX_TASK_OWNER_CHARS)
         {
-            return format!("Error: {error}");
+            return TaskMutationOutcome::error(error);
         }
         let metadata_update = match optional_object_field(args, "metadata") {
             Ok(metadata_update) => metadata_update,
-            Err(error) => return format!("Error: {error}"),
+            Err(error) => return TaskMutationOutcome::error(error),
         };
         if let Some(metadata_update) = metadata_update.as_ref()
             && let Err(error) = validate_metadata_size(metadata_update, "metadata")
         {
-            return format!("Error: {error}");
+            return TaskMutationOutcome::error(error);
         }
         let proposed_blocks = match optional_string_array_field(args, "add_blocks") {
             Ok(proposed_blocks) => proposed_blocks,
-            Err(error) => return format!("Error: {error}"),
+            Err(error) => return TaskMutationOutcome::error(error),
         };
         let proposed_blocked_by = match optional_string_array_field(args, "add_blocked_by") {
             Ok(proposed_blocked_by) => proposed_blocked_by,
-            Err(error) => return format!("Error: {error}"),
+            Err(error) => return TaskMutationOutcome::error(error),
         };
         let remove_blocks = match optional_string_array_field(args, "remove_blocks") {
             Ok(remove_blocks) => remove_blocks,
-            Err(error) => return format!("Error: {error}"),
+            Err(error) => return TaskMutationOutcome::error(error),
         };
         let remove_blocked_by = match optional_string_array_field(args, "remove_blocked_by") {
             Ok(remove_blocked_by) => remove_blocked_by,
-            Err(error) => return format!("Error: {error}"),
+            Err(error) => return TaskMutationOutcome::error(error),
         };
         if subtask_id.is_some() {
             let unsupported = [
@@ -2764,15 +3135,39 @@ impl TaskManager {
             .filter_map(|(field, present)| present.then_some(field))
             .collect::<Vec<_>>();
             if !unsupported.is_empty() {
-                return format!(
-                    "Error: field 'subtask_id' only supports new_status updates; unsupported with subtask_id: {}",
+                return TaskMutationOutcome::error(format!(
+                    "field 'subtask_id' only supports new_status updates; unsupported with subtask_id: {}",
                     unsupported.join(", ")
-                );
+                ));
             }
             if new_status.is_none() {
-                return "Error: field 'new_status' is required when updating a subtask".to_string();
+                return TaskMutationOutcome::error(
+                    "field 'new_status' is required when updating a subtask",
+                );
             }
         } else {
+            if new_status == Some(SessionTaskStatusKind::Deleted) {
+                let unsupported = [
+                    ("title", title_update.is_some()),
+                    ("description", desc_update.is_some()),
+                    ("active_form", active_form_update.is_some()),
+                    ("owner", owner_update.is_some()),
+                    ("metadata", metadata_update.is_some()),
+                    ("add_blocks", !proposed_blocks.is_empty()),
+                    ("add_blocked_by", !proposed_blocked_by.is_empty()),
+                    ("remove_blocks", !remove_blocks.is_empty()),
+                    ("remove_blocked_by", !remove_blocked_by.is_empty()),
+                ]
+                .into_iter()
+                .filter_map(|(field, present)| present.then_some(field))
+                .collect::<Vec<_>>();
+                if !unsupported.is_empty() {
+                    return TaskMutationOutcome::error(format!(
+                        "new_status='deleted' only supports an optional reason; delete already detaches every dependency edge. Unsupported fields: {}",
+                        unsupported.join(", ")
+                    ));
+                }
+            }
             let has_parent_update = new_status.is_some()
                 || title_update.is_some()
                 || desc_update.is_some()
@@ -2788,7 +3183,9 @@ impl TaskManager {
                 || error_message.is_some()
                 || reason.is_some();
             if !has_parent_update {
-                return "Error: task_board.update requires at least one update field: new_status, title, description, active_form, owner, metadata, add_blocks, add_blocked_by, remove_blocks, remove_blocked_by, reason, or error_message".to_string();
+                return TaskMutationOutcome::error(
+                    "task_board.update requires at least one update field: new_status, title, description, active_form, owner, metadata, add_blocks, add_blocked_by, remove_blocks, remove_blocked_by, reason, or error_message",
+                );
             }
         }
         let sid = self.sid();
@@ -2798,19 +3195,15 @@ impl TaskManager {
             .mutate(
                 &sid,
                 Box::new(move |mut tasks, _next| {
+                    let original_tasks = tasks.clone();
                     // Subtask path short-circuits: all logic stays local to one SessionTask.
                     if let Some(st_id) = subtask_id.as_deref() {
                         let Some(task_index) = tasks.iter().position(|t| t.id == task_id) else {
                             return Err(format!("task '{}' not found", task_id));
                         };
                         let mut projected_task = tasks[task_index].clone();
-                        if matches!(
-                            projected_task.status,
-                            SessionTaskStatusKind::Completed
-                                | SessionTaskStatusKind::Failed
-                                | SessionTaskStatusKind::Cancelled
-                                | SessionTaskStatusKind::Archived
-                        ) && !is_reversible_auto_completed_parent(&projected_task)
+                        if !projected_task.status.is_open_work()
+                            && !is_reversible_auto_completed_parent(&projected_task)
                         {
                             return Err(format!(
                                 "task '{}' is already terminal ({}); create a new task for follow-up work instead of editing its subtasks",
@@ -2843,8 +3236,16 @@ impl TaskManager {
                             Some(SessionTaskStatusKind::InProgress | SessionTaskStatusKind::Completed)
                         ) {
                             validate_subtask_dependencies_resolved(&projected_task, st_id)?;
+                            validate_task_blockers_resolved_after_projected_edges(
+                                &tasks,
+                                &task_id,
+                                &[],
+                                &[],
+                            )?;
                         }
-                        reconcile_subtask_completion(&mut projected_task);
+                        let blockers_resolved =
+                            unresolved_task_blocker_ids(&tasks, &projected_task).is_empty();
+                        reconcile_subtask_completion(&mut projected_task, blockers_resolved);
 
                         let task = &mut tasks[task_index];
                         let Some(subtask) = task.subtasks.iter_mut().find(|st| st.id == st_id)
@@ -2868,64 +3269,80 @@ impl TaskManager {
                         task.status = projected_task.status;
                         task.metadata = projected_task.metadata;
                         let final_subtask_status = subtask.status;
-                        task.updated_at = now;
-                        let response = prefix_summary(
-                            format!(
-                                "Subtask {st_id} of #{task_id}: {previous_status} → {final_subtask_status}"
-                            ),
-                            json!({
-                                "success": true,
-                                "task_id": task_id,
-                                "subtask_id": st_id,
-                                "previous_status": previous_status,
-                                "status": final_subtask_status,
-                                "reason": reason,
-                                "message": format!("Subtask '{}' updated to '{}'", st_id, final_subtask_status)
-                            })
-                            .to_string(),
+                        task.updated_at = now.clone();
+                        let summary = format!(
+                            "Subtask {st_id} of #{task_id}: {previous_status} → {final_subtask_status}"
                         );
-                        return Ok(TaskMutationResult {
-                            tasks,
-                            next_task_id: None,
-                            response,
+                        let mut data = json!({
+                            "task_id": task_id,
+                            "subtask_id": st_id,
+                            "previous_status": previous_status,
+                            "status": final_subtask_status,
+                            "reason": reason,
+                            "message": format!("Subtask '{}' updated to '{}'", st_id, final_subtask_status)
                         });
+                        // Parent auto-completion is dependency-driven. If this
+                        // task just completed, reconcile any all-done parents
+                        // that it unblocked in the same atomic mutation.
+                        reconcile_all_subtask_completion(&mut tasks, &now);
+                        if same_task_board_state(&original_tasks, &tasks) {
+                            data["already_current"] = json!(true);
+                            return Ok(TaskMutationResult::unchanged(
+                                original_tasks,
+                                format!(
+                                    "Subtask {st_id} of #{task_id} is already {final_subtask_status}"
+                                ),
+                                data,
+                            ));
+                        }
+                        return Ok(TaskMutationResult::applied(tasks, None, summary, data));
                     }
 
                     if new_status == Some(SessionTaskStatusKind::Deleted) {
-                        let Some(previous_status) = tasks
+                        let Some((previous_status, deleted_subtasks)) = tasks
                             .iter_mut()
                             .find(|t| t.id == task_id)
                             .map(|task| {
                                 let previous_status = task.status;
                                 task.status = SessionTaskStatusKind::Deleted;
+                                let deleted_subtasks = transition_open_subtasks(
+                                    task,
+                                    SessionTaskStatusKind::Deleted,
+                                );
                                 task.updated_at = now.clone();
                                 if let Some(note) = reason.as_deref() {
                                     let meta = task.metadata.get_or_insert_with(Default::default);
                                     meta.insert("reason".to_string(), json!(note));
                                 }
-                                previous_status
+                                (previous_status, deleted_subtasks)
                             })
                         else {
                             return Err(format!("task '{}' not found", task_id));
                         };
                         let deleted_ids = HashSet::from([task_id.clone()]);
                         detach_task_dependency_edges(&mut tasks, &deleted_ids);
-                        let response = prefix_summary(
-                            format!("Task #{task_id} deleted (was: {previous_status})"),
-                            json!({
-                                "success": true,
+                        reconcile_all_subtask_completion(&mut tasks, &now);
+                        let mut data = json!({
                                 "task_id": task_id,
                                 "previous_status": previous_status.to_string(),
                                 "status": "deleted",
+                                "deleted_subtasks": deleted_subtasks,
                                 "message": format!("Task '{}' hidden from active views; audit tombstone retained", task_id)
-                            })
-                            .to_string(),
-                        );
-                        return Ok(TaskMutationResult {
+                            });
+                        if same_task_board_state(&original_tasks, &tasks) {
+                            data["already_current"] = json!(true);
+                            return Ok(TaskMutationResult::unchanged(
+                                original_tasks,
+                                format!("Task #{task_id} is already deleted"),
+                                data,
+                            ));
+                        }
+                        return Ok(TaskMutationResult::applied(
                             tasks,
-                            next_task_id: None,
-                            response,
-                        });
+                            None,
+                            format!("Task #{task_id} deleted (was: {previous_status})"),
+                            data,
+                        ));
                     }
 
                     let previous_status = match tasks.iter().find(|t| t.id == task_id) {
@@ -2933,44 +3350,10 @@ impl TaskManager {
                         None => return Err(format!("task '{}' not found", task_id)),
                     };
                     validate_parent_status_transition(previous_status, new_status)?;
+                    let transitioning_to_failure =
+                        previous_status != SessionTaskStatusKind::Failed
+                            && new_status == Some(SessionTaskStatusKind::Failed);
                     let projected_status = new_status.unwrap_or(previous_status);
-                    if let Some(title) = title_update.as_deref()
-                        && projected_status.blocks_duplicate_create()
-                    {
-                        let normalized_new = normalize_title(title);
-                        if let Some(dup) = tasks.iter().find(|t| {
-                            t.id != task_id
-                                && t.status.blocks_duplicate_create()
-                                && normalize_title(&t.title) == normalized_new
-                        }) {
-                            let response = prefix_summary(
-                                format!(
-                                    "Refused: open task #{} already has this title — keep task titles distinct or update the existing task",
-                                    dup.id
-                                ),
-                                json!({
-                                    "success": false,
-                                    "duplicate_of": dup.id,
-                                    "duplicate_title": dup.title,
-                                    "duplicate_status": dup.status,
-                                    "task_id": task_id,
-                                    "message": format!(
-                                        "Refused: renaming task '{}' would duplicate open task '{}' (id={}). Use task_board(action='update') or task_board(action='get') on the existing task instead.",
-                                        task_id,
-                                        dup.title,
-                                        dup.id
-                                    ),
-                                })
-                                .to_string(),
-                            );
-                            return Ok(TaskMutationResult {
-                                tasks,
-                                next_task_id: None,
-                                response,
-                            });
-                        }
-                    }
-
                     // Collect proposed edge changes before mutating so cycle detection
                     // sees a consistent view.
                     let existing_task_ids: HashSet<&str> =
@@ -2999,22 +3382,45 @@ impl TaskManager {
                             return Err(format!("task '{}' cannot be blocked by itself", task_id));
                         }
                     }
-                    if projected_status.is_in_progress() {
-                        let starting_now = new_status == Some(SessionTaskStatusKind::InProgress)
-                            && previous_status != SessionTaskStatusKind::InProgress;
-                        let dependency_edges_changed = !proposed_blocked_by.is_empty()
-                            || !proposed_blocks.is_empty()
-                            || !remove_blocked_by.is_empty()
-                            || !remove_blocks.is_empty();
-                        if starting_now || dependency_edges_changed {
-                            validate_task_can_start_after_projected_edges(
+                    if projected_status.is_in_progress() || projected_status.is_completed()
+                    {
+                        let advancing_now = matches!(
+                            new_status,
+                            Some(
+                                SessionTaskStatusKind::InProgress
+                                    | SessionTaskStatusKind::Completed
+                            )
+                        ) && previous_status != projected_status;
+                        let incoming_dependency_changed = !proposed_blocked_by.is_empty()
+                            || !remove_blocked_by.is_empty();
+                        if advancing_now || incoming_dependency_changed {
+                            validate_task_blockers_resolved_after_projected_edges(
                                 &tasks,
                                 &task_id,
                                 &proposed_blocked_by,
-                                &proposed_blocks,
                                 &remove_blocked_by,
-                                &remove_blocks,
                             )?;
+                        }
+                    }
+
+                    // `add_blocks` is the reverse spelling of adding an
+                    // incoming blocker to the target. Validate the affected
+                    // running task too; otherwise callers can bypass the same
+                    // invariant simply by mutating the other endpoint.
+                    if !projected_status.is_completed() {
+                        for blocked_id in &proposed_blocks {
+                            if let Some(blocked_task) = tasks
+                                .iter()
+                                .find(|task| task.id == *blocked_id)
+                                .filter(|task| {
+                                    task.status.is_in_progress() || task.status.is_completed()
+                                })
+                            {
+                                return Err(format!(
+                                    "task '{}' cannot become blocked by unresolved task '{}' while {}. Complete the blocker first, or move open work to a non-advancing state before adding the dependency",
+                                    blocked_id, task_id, blocked_task.status
+                                ));
+                            }
                         }
                     }
 
@@ -3080,13 +3486,15 @@ impl TaskManager {
                         }
                     }
 
-                    let final_status = {
+                    let cancelled_subtasks = {
                         let Some(task) = tasks.iter_mut().find(|t| t.id == task_id) else {
                             return Err(format!("task '{}' not found", task_id));
                         };
 
                         if let Some(ref status) = new_status {
-                            task.status = *status;
+                            if *status != SessionTaskStatusKind::Cancelled {
+                                task.status = *status;
+                            }
                             if *status == SessionTaskStatusKind::Completed {
                                 // Cascade parent→subtask completion, but preserve any
                                 // subtask already in a terminal non-success state.
@@ -3103,14 +3511,14 @@ impl TaskManager {
                         if let Some(title) = title_update.as_deref() {
                             task.title = title.to_string();
                         }
-                        if let Some(desc) = desc_update.as_deref() {
-                            task.description = Some(desc.to_string());
+                        if let Some(desc) = desc_update.as_ref() {
+                            task.description = desc.clone();
                         }
-                        if let Some(af) = active_form_update.as_deref() {
-                            task.active_form = Some(af.to_string());
+                        if let Some(active_form) = active_form_update.as_ref() {
+                            task.active_form = active_form.clone();
                         }
-                        if let Some(owner) = owner_update.as_deref() {
-                            task.owner = Some(owner.to_string());
+                        if let Some(owner) = owner_update.as_ref() {
+                            task.owner = owner.clone();
                         }
                         if let Some(meta_update) = metadata_update.as_ref() {
                             let meta = task.metadata.get_or_insert_with(serde_json::Map::new);
@@ -3125,36 +3533,45 @@ impl TaskManager {
                                 task.metadata = None;
                             }
                         }
-                        if let Some(err) = error_message.as_deref() {
-                            let meta = task.metadata.get_or_insert_with(Default::default);
-                            if new_status == Some(SessionTaskStatusKind::Cancelled) {
-                                task.description = Some(format!(
-                                    "{}\n\nCancelled: {}",
-                                    task.description.as_deref().unwrap_or(""),
-                                    err
-                                ));
-                                meta.insert("reason".to_string(), json!(err));
-                            } else {
-                                // Stash structured error in metadata so `list`
-                                // can surface a preview without parsing
-                                // description prose. Keep a human-readable copy in
-                                // description as well, after any description update.
-                                task.description = Some(format!(
-                                    "{}\n\nError: {}",
-                                    task.description.as_deref().unwrap_or(""),
-                                    err
-                                ));
-                                meta.insert("error_message".to_string(), json!(err));
+                        let cancelled_subtasks = match new_status {
+                            Some(SessionTaskStatusKind::Cancelled) => {
+                                cancel_task_and_open_subtasks(
+                                    task,
+                                    error_message.as_deref().or(reason.as_deref()),
+                                    &now,
+                                )
                             }
-                        } else if let Some(note) = reason.as_deref() {
-                            let meta = task.metadata.get_or_insert_with(Default::default);
-                            meta.insert("reason".to_string(), json!(note));
+                            Some(SessionTaskStatusKind::Failed) => cancel_open_subtasks(task),
+                            _ => 0,
+                        };
+                        if new_status != Some(SessionTaskStatusKind::Cancelled) {
+                            if let Some(err) = error_message.as_deref() {
+                                let meta = task.metadata.get_or_insert_with(Default::default);
+                                // Stash structured error in metadata so `list`
+                                // can surface a preview without parsing description prose.
+                                // Persist a human-readable copy only on the typed transition
+                                // into failure, or when this request explicitly replaces the
+                                // definition-of-done text. Same-state retries must not append
+                                // another copy of the error.
+                                if transitioning_to_failure || desc_update.is_some() {
+                                    let note = format!("Error: {err}");
+                                    task.description = Some(
+                                        match task.description.as_deref().filter(|s| !s.is_empty()) {
+                                            Some(description) => format!("{description}\n\n{note}"),
+                                            None => note,
+                                        },
+                                    );
+                                }
+                                meta.insert("error_message".to_string(), json!(err));
+                            } else if let Some(note) = reason.as_deref() {
+                                let meta = task.metadata.get_or_insert_with(Default::default);
+                                meta.insert("reason".to_string(), json!(note));
+                            }
                         }
 
                         task.updated_at = now.clone();
 
-                        reconcile_subtask_completion(task);
-                        task.status
+                        cancelled_subtasks
                     };
 
                     for id in &remove_blocks {
@@ -3170,52 +3587,75 @@ impl TaskManager {
                         add_dependency_edge(&mut tasks, id, &task_id, &now)?;
                     }
 
-                    let response = prefix_summary(
-                        format!("Task #{task_id}: {previous_status} → {final_status}"),
-                        json!({
+                    reconcile_all_subtask_completion(&mut tasks, &now);
+                    let final_status = tasks
+                        .iter()
+                        .find(|task| task.id == task_id)
+                        .map(|task| task.status)
+                        .ok_or_else(|| format!("task '{}' not found after update", task_id))?;
+
+                    let mut response_body = json!({
                             "success": true,
                             "task_id": task_id,
                             "previous_status": previous_status,
                             "status": final_status,
                             "message": format!("Task '{}' updated to '{}'", task_id, final_status)
-                        })
-                        .to_string(),
-                    );
-                    Ok(TaskMutationResult {
+                        });
+                    if matches!(
+                        new_status,
+                        Some(SessionTaskStatusKind::Failed | SessionTaskStatusKind::Cancelled)
+                    ) {
+                        response_body["cancelled_subtasks"] = json!(cancelled_subtasks);
+                    }
+                    if same_task_board_state(&original_tasks, &tasks) {
+                        response_body["already_current"] = json!(true);
+                        return Ok(TaskMutationResult::unchanged(
+                            original_tasks,
+                            format!("Task #{task_id} is already {final_status}"),
+                            response_body,
+                        ));
+                    }
+                    Ok(TaskMutationResult::applied(
                         tasks,
-                        next_task_id: None,
-                        response,
-                    })
+                        None,
+                        format!("Task #{task_id}: {previous_status} → {final_status}"),
+                        response_body,
+                    ))
                 }),
             )
             .await
         {
-            Ok(response) => response,
-            Err(e) => format!("Error: {e}"),
+            Ok(outcome) => outcome,
+            Err(error) => TaskMutationOutcome::error(error),
         }
     }
 
-    /// Stop/cancel a running task.
-    pub async fn stop(&self, args: &Value) -> String {
+    /// Rendered compatibility surface for tool/UI consumers.
+    pub async fn update(&self, args: &Value) -> String {
+        self.update_outcome(args).await.output
+    }
+
+    /// Stop/cancel a running task while preserving the typed outcome.
+    pub async fn stop_outcome(&self, args: &Value) -> TaskMutationOutcome {
         if let Err(error) = validate_allowed_fields(args, "stop", &["action", "task_id", "reason"])
         {
-            return format!("Error: {error}");
+            return TaskMutationOutcome::error(error);
         }
         let task_id = match required_non_empty_string_field(args, "task_id") {
             Ok(task_id) => task_id,
-            Err(error) => return format!("Error: {error}"),
+            Err(error) => return TaskMutationOutcome::error(error),
         };
         if let Err(error) = validate_task_id_chars(&task_id, "task_id") {
-            return format!("Error: {error}");
+            return TaskMutationOutcome::error(error);
         }
 
         let reason = match optional_non_empty_string_field(args, "reason") {
             Ok(Some(reason)) => reason,
             Ok(None) => "user requested".to_string(),
-            Err(error) => return format!("Error: {error}"),
+            Err(error) => return TaskMutationOutcome::error(error),
         };
         if let Err(error) = validate_string_chars(&reason, "reason", MAX_TASK_STOP_REASON_CHARS) {
-            return format!("Error: {error}");
+            return TaskMutationOutcome::error(error);
         }
         let now = chrono::Utc::now().to_rfc3339();
 
@@ -3230,43 +3670,49 @@ impl TaskManager {
                     };
                     let task_status = tasks[task_idx].status;
 
-                    if !task_status.can_be_stopped() {
-                        return Ok(TaskMutationResult {
-                            tasks,
-                            next_task_id: None,
-                            response: prefix_summary(
-                                format!(
-                                    "Refused: task #{task_id} is '{task_status}' — only pending, in_progress, or paused tasks can be stopped"
-                                ),
-                                json!({
-                                    "success": false,
-                                    "task_id": task_id,
-                                    "status": task_status,
-                                    "message": format!("Cannot stop task '{}': status is '{}' (only 'pending', 'in_progress', or 'paused' can be stopped)", task_id, task_status)
-                                })
-                                .to_string(),
-                            ),
+                    if task_status == SessionTaskStatusKind::Cancelled {
+                        let task = &mut tasks[task_idx];
+                        let open_subtasks = task
+                            .subtasks
+                            .iter()
+                            .filter(|subtask| subtask.status.can_be_stopped())
+                            .count();
+                        if open_subtasks > 0 {
+                            cancel_task_and_open_subtasks(task, Some(&reason), &now);
+                        }
+                        let summary = format!("Task #{task_id} is already cancelled");
+                        let data = json!({
+                            "task_id": task_id,
+                            "status": "cancelled",
+                            "already_cancelled": true,
+                            "cancelled_subtasks": open_subtasks,
+                            "message": format!("Task '{}' was already cancelled", task_id)
                         });
+                        return if open_subtasks == 0 {
+                            Ok(TaskMutationResult::unchanged(tasks, summary, data))
+                        } else {
+                            Ok(TaskMutationResult::applied(tasks, None, summary, data))
+                        };
+                    }
+
+                    if !task_status.can_be_stopped() {
+                        return Ok(TaskMutationResult::refused(
+                            tasks,
+                            format!(
+                                "Refused: task #{task_id} is '{task_status}' — only pending, in_progress, or paused tasks can be stopped"
+                            ),
+                            json!({
+                                "task_id": task_id,
+                                "status": task_status,
+                                "message": format!("Cannot stop task '{}': status is '{}' (only 'pending', 'in_progress', or 'paused' can be stopped)", task_id, task_status)
+                            }),
+                        ));
                     }
 
                     let task = &mut tasks[task_idx];
                     let previous_status = task.status;
-                    task.status = SessionTaskStatusKind::Cancelled;
-                    task.description = Some(format!(
-                        "{}\n\nCancelled: {} (was: {})",
-                        task.description.as_deref().unwrap_or(""),
-                        reason,
-                        previous_status
-                    ));
-                    task.updated_at = now;
-
-                    let mut cancelled_subtasks = 0;
-                    for subtask in &mut task.subtasks {
-                        if subtask.status.can_be_stopped() {
-                            subtask.status = SessionTaskStatusKind::Cancelled;
-                            cancelled_subtasks += 1;
-                        }
-                    }
+                    let cancelled_subtasks =
+                        cancel_task_and_open_subtasks(task, Some(&reason), &now);
 
                     let summary = if cancelled_subtasks > 0 {
                         format!(
@@ -3275,41 +3721,47 @@ impl TaskManager {
                     } else {
                         format!("Task #{task_id} cancelled (was {previous_status}): {reason}")
                     };
-                    let response = prefix_summary(
+                    Ok(TaskMutationResult::applied(
+                        tasks,
+                        None,
                         summary,
                         json!({
-                            "success": true,
                             "task_id": task_id,
                             "previous_status": previous_status,
+                            "status": "cancelled",
                             "reason": reason,
                             "cancelled_subtasks": cancelled_subtasks,
                             "message": format!("Task '{}' cancelled (was: {})", task_id, previous_status)
-                        })
-                        .to_string(),
-                    );
-                    Ok(TaskMutationResult {
-                        tasks,
-                        next_task_id: None,
-                        response,
-                    })
+                        }),
+                    ))
                 }),
             )
             .await
         {
-            Ok(response) => response,
-            Err(e) => format!("Error: {e}"),
+            Ok(outcome) => outcome,
+            Err(error) => TaskMutationOutcome::error(error),
         }
+    }
+
+    /// Rendered compatibility surface for tool/UI consumers.
+    pub async fn stop(&self, args: &Value) -> String {
+        self.stop_outcome(args).await.output
     }
 
     /// Archive historical work. Single-task and bulk archive are both
     /// session-scoped; cross-session cleanup must use an explicit user-level
     /// surface so automatic task cleanup cannot unexpectedly mutate other
     /// sessions.
-    pub async fn archive(&self, args: &Value) -> String {
+    pub async fn archive_outcome(&self, args: &Value) -> TaskMutationOutcome {
         match self.store.archive(&self.sid(), args).await {
-            Ok(response) => response,
-            Err(e) => format!("Error: {e}"),
+            Ok(outcome) => outcome,
+            Err(error) => TaskMutationOutcome::error(error),
         }
+    }
+
+    /// Rendered compatibility surface for tool/UI consumers.
+    pub async fn archive(&self, args: &Value) -> String {
+        self.archive_outcome(args).await.output
     }
 }
 
@@ -3476,11 +3928,6 @@ mod tests {
         assert!(SessionTaskStatusKind::InProgress.can_be_stopped());
         assert!(SessionTaskStatusKind::Paused.can_be_stopped());
         assert!(!SessionTaskStatusKind::Cancelled.can_be_stopped());
-        assert!(SessionTaskStatusKind::Pending.blocks_duplicate_create());
-        assert!(SessionTaskStatusKind::InProgress.blocks_duplicate_create());
-        assert!(SessionTaskStatusKind::Paused.blocks_duplicate_create());
-        assert!(!SessionTaskStatusKind::Completed.blocks_duplicate_create());
-        assert!(!SessionTaskStatusKind::Cancelled.blocks_duplicate_create());
         assert!(SessionTaskStatusKind::Failed.is_unsuccessful());
         assert!(SessionTaskStatusKind::Cancelled.is_unsuccessful());
         assert!(!SessionTaskStatusKind::Archived.is_unsuccessful());
@@ -4409,35 +4856,278 @@ mod tests {
         );
     }
 
-    /// U-4 (unhappy path): refuse to create an exact-normalized
-    /// duplicate of an active task. The model after a session
-    /// restore frequently re-creates work it already has open;
-    /// returning the existing id steers it to update/get instead.
     #[tokio::test]
-    async fn create_refuses_exact_normalized_duplicate_of_active_task() {
+    async fn update_cancelled_and_stop_enforce_the_same_parent_child_invariant() {
+        let m = mgr();
+        for title in ["cancel through update", "cancel through stop"] {
+            let created = m
+                .create(&json!({
+                    "title": title,
+                    "subtasks": [
+                        {"id": "running", "title": "running child"},
+                        {"id": "done", "title": "completed child"},
+                        {"id": "failed", "title": "failed child"}
+                    ]
+                }))
+                .await;
+            assert!(!created.starts_with("Error:"), "{created}");
+        }
+        for task_id in ["task-1", "task-2"] {
+            for (subtask_id, status) in [
+                ("running", "in_progress"),
+                ("done", "completed"),
+                ("failed", "failed"),
+            ] {
+                let updated = m
+                    .update(&json!({
+                        "task_id": task_id,
+                        "subtask_id": subtask_id,
+                        "new_status": status
+                    }))
+                    .await;
+                assert!(!updated.starts_with("Error:"), "{updated}");
+            }
+        }
+
+        let through_update = m
+            .update(&json!({
+                "task_id": "task-1",
+                "new_status": "cancelled",
+                "reason": "superseded"
+            }))
+            .await;
+        let through_stop = m
+            .stop(&json!({"task_id": "task-2", "reason": "superseded"}))
+            .await;
+        for response in [&through_update, &through_stop] {
+            assert!(!response.starts_with("Error:"), "{response}");
+            let body: Value = serde_json::from_str(
+                response
+                    .split_once('\n')
+                    .expect("summary and structured body")
+                    .1,
+            )
+            .expect("structured cancellation response");
+            assert_eq!(body["success"], true, "{response}");
+            assert_eq!(body["status"], "cancelled", "{response}");
+            assert_eq!(body["cancelled_subtasks"], 1, "{response}");
+        }
+
+        for task_id in ["task-1", "task-2"] {
+            let task: SessionTask =
+                serde_json::from_str(&m.get(&json!({"task_id": task_id})).await)
+                    .expect("cancelled task");
+            assert_eq!(task.status, SessionTaskStatusKind::Cancelled);
+            let statuses = task
+                .subtasks
+                .iter()
+                .map(|subtask| (subtask.id.as_str(), subtask.status))
+                .collect::<HashMap<_, _>>();
+            assert_eq!(statuses["running"], SessionTaskStatusKind::Cancelled);
+            assert_eq!(statuses["done"], SessionTaskStatusKind::Completed);
+            assert_eq!(statuses["failed"], SessionTaskStatusKind::Failed);
+            assert_eq!(
+                task.metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("reason"))
+                    .and_then(Value::as_str),
+                Some("superseded")
+            );
+            assert_eq!(
+                task.description.as_deref(),
+                Some("Cancelled: superseded (was: in_progress)"),
+                "cancellation should store one clean human-readable note: {task:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stopping_an_already_cancelled_task_is_idempotent() {
+        let m = mgr();
+        m.create(&json!({"title": "cancel once"})).await;
+        let first = m
+            .stop(&json!({"task_id": "task-1", "reason": "no longer needed"}))
+            .await;
+        assert!(!first.starts_with("Error:"), "{first}");
+        let before = m.get(&json!({"task_id": "task-1"})).await;
+
+        let second = m
+            .stop(&json!({"task_id": "task-1", "reason": "no longer needed"}))
+            .await;
+        let body: Value = serde_json::from_str(
+            second
+                .split_once('\n')
+                .expect("summary and structured body")
+                .1,
+        )
+        .expect("idempotent stop body");
+        assert_eq!(body["success"], true, "{second}");
+        assert_eq!(body["already_cancelled"], true, "{second}");
+        assert_eq!(body["cancelled_subtasks"], 0, "{second}");
+        assert_eq!(
+            m.get(&json!({"task_id": "task-1"})).await,
+            before,
+            "repeating stop must not append prose or advance task state"
+        );
+    }
+
+    #[tokio::test]
+    async fn failing_a_parent_closes_only_its_open_children() {
+        let m = mgr();
+        m.create(&json!({
+            "title": "parent that fails",
+            "subtasks": [
+                {"id": "running", "title": "running child"},
+                {"id": "done", "title": "completed child"},
+                {"id": "failed", "title": "failed child"}
+            ]
+        }))
+        .await;
+        for (subtask_id, status) in [
+            ("running", "in_progress"),
+            ("done", "completed"),
+            ("failed", "failed"),
+        ] {
+            let updated = m
+                .update(&json!({
+                    "task_id": "task-1",
+                    "subtask_id": subtask_id,
+                    "new_status": status
+                }))
+                .await;
+            assert!(!updated.starts_with("Error:"), "{updated}");
+        }
+
+        let failed = m
+            .update(&json!({
+                "task_id": "task-1",
+                "new_status": "failed",
+                "error_message": "parent execution failed"
+            }))
+            .await;
+        let body: Value = serde_json::from_str(
+            failed
+                .split_once('\n')
+                .expect("summary and structured body")
+                .1,
+        )
+        .expect("structured failure response");
+        assert_eq!(body["success"], true, "{failed}");
+        assert_eq!(body["cancelled_subtasks"], 1, "{failed}");
+
+        let task: SessionTask = serde_json::from_str(&m.get(&json!({"task_id": "task-1"})).await)
+            .expect("failed parent");
+        assert_eq!(task.status, SessionTaskStatusKind::Failed);
+        let statuses = task
+            .subtasks
+            .iter()
+            .map(|subtask| (subtask.id.as_str(), subtask.status))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(statuses["running"], SessionTaskStatusKind::Cancelled);
+        assert_eq!(statuses["done"], SessionTaskStatusKind::Completed);
+        assert_eq!(statuses["failed"], SessionTaskStatusKind::Failed);
+    }
+
+    #[tokio::test]
+    async fn create_does_not_use_title_similarity_as_an_idempotency_key() {
         let m = mgr();
         m.create(&json!({"title": "Implement dark mode toggle"}))
             .await;
-        // Same intent, different punctuation/spacing.
-        let dup = m
+        let second = m
             .create(&json!({"title": "  Implement DARK mode toggle. "}))
             .await;
-        assert!(
-            dup.contains("Refused"),
-            "second create should be refused with duplicate notice; got {dup}"
-        );
-        let dup_parsed: Value = serde_json::from_str(dup.split_once('\n').unwrap().1).unwrap();
-        assert_eq!(
-            dup_parsed["duplicate_of"], "task-1",
-            "response must name the existing task id; got {dup}"
-        );
-        // The store should still hold exactly one task (no second
-        // row appended even though the closure ran).
+        let second: Value =
+            serde_json::from_str(second.split_once('\n').unwrap().1).expect("create response");
+        assert_eq!(second["task_id"], "task-2");
         let list: Value =
             serde_json::from_str(&m.list(&json!({"status_filter": "all"})).await).unwrap();
         assert_eq!(
-            list["count"], 1,
-            "duplicate must not be persisted; got {list}"
+            list["count"], 2,
+            "titles are presentation, not a semantic uniqueness constraint: {list}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refused_mutation_does_not_advance_board_version_or_broadcast() {
+        let store = Arc::new(InMemoryTaskStore::new());
+        let manager = TaskManager::new("typed-refusal", store.clone());
+        manager.create(&json!({"title": "pending work"})).await;
+        let version = store
+            .get_session_version("typed-refusal")
+            .await
+            .expect("version after create");
+        let mut changes = store.subscribe().expect("in-memory change stream");
+
+        let outcome = manager.archive_outcome(&json!({"task_id": "task-1"})).await;
+
+        assert_eq!(outcome.status, TaskMutationStatus::Refused);
+        assert_eq!(outcome.data["task_id"], "task-1");
+        assert_eq!(
+            store
+                .get_session_version("typed-refusal")
+                .await
+                .expect("version after refusal"),
+            version,
+            "a business refusal must not create a phantom board revision"
+        );
+        assert!(
+            changes.try_recv().is_err(),
+            "a business refusal must not wake task-board observers"
+        );
+    }
+
+    #[tokio::test]
+    async fn mutation_control_flow_uses_typed_outcome_not_rendered_summary() {
+        let store = InMemoryTaskStore::new();
+        let before = store
+            .get_session_version("typed-protocol")
+            .await
+            .expect("initial version");
+
+        let applied = store
+            .mutate(
+                "typed-protocol",
+                Box::new(|tasks, _| {
+                    Ok(TaskMutationResult::applied(
+                        tasks,
+                        None,
+                        "Error: deliberately misleading presentation",
+                        json!({"message": "typed applied"}),
+                    ))
+                }),
+            )
+            .await
+            .expect("typed applied outcome");
+        assert!(applied.success && applied.changed);
+        assert_eq!(
+            store
+                .get_session_version("typed-protocol")
+                .await
+                .expect("version after applied outcome"),
+            before + 1
+        );
+
+        let refused = store
+            .mutate(
+                "typed-protocol",
+                Box::new(|tasks, _| {
+                    Ok(TaskMutationResult::refused(
+                        tasks,
+                        "Created successfully (presentation only)",
+                        json!({"message": "typed refusal"}),
+                    ))
+                }),
+            )
+            .await
+            .expect("typed refused outcome");
+        assert!(!refused.success && !refused.changed);
+        assert_eq!(
+            store
+                .get_session_version("typed-protocol")
+                .await
+                .expect("version after refused outcome"),
+            before + 1,
+            "rendered success-like text must not turn a refusal into a write"
         );
     }
 
@@ -4468,9 +5158,6 @@ mod tests {
         );
     }
 
-    /// Dedup must NOT block creating a task whose normalized title
-    /// matches a *completed* (non-active) task — the user is
-    /// resurrecting work intentionally.
     #[tokio::test]
     async fn create_allows_duplicate_of_completed_task() {
         let m = mgr();
@@ -4495,57 +5182,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_refuses_exact_normalized_duplicate_of_paused_task() {
+    async fn create_allows_same_title_as_paused_task() {
         let m = mgr();
         m.create(&json!({"title": "resume this later"})).await;
         m.update(&json!({"task_id": "task-1", "new_status": "paused"}))
             .await;
 
-        let dup = m.create(&json!({"title": "Resume this later."})).await;
-
-        assert!(
-            dup.contains("Refused") && dup.contains("duplicate_of"),
-            "paused work is still open and must not be duplicated: {dup}"
-        );
-        assert!(
-            dup.starts_with("Refused: open task"),
-            "duplicate refusal should name the open task, not call it only active: {dup}"
-        );
+        let second = m.create(&json!({"title": "Resume this later."})).await;
+        let second: Value =
+            serde_json::from_str(second.split_once('\n').unwrap().1).expect("create response");
+        assert_eq!(second["task_id"], "task-2");
         let list: Value =
             serde_json::from_str(&m.list(&json!({"status_filter": "all"})).await).unwrap();
         assert_eq!(
-            list["count"], 1,
-            "paused duplicate refusal must not persist a second task: {list}"
+            list["count"], 2,
+            "paused work does not make its title a uniqueness key: {list}"
         );
     }
 
     #[tokio::test]
-    async fn update_title_refuses_exact_normalized_duplicate_of_open_task() {
+    async fn update_title_allows_duplicate_open_task_titles() {
         let m = mgr();
         m.create(&json!({"title": "Implement OAuth callback"}))
             .await;
         m.create(&json!({"title": "Wire billing webhook"})).await;
 
-        let dup = m
+        let updated = m
             .update(&json!({
                 "task_id": "task-2",
                 "title": " implement oauth callback. "
             }))
             .await;
 
-        assert!(
-            dup.starts_with("Refused: open task #task-1"),
-            "renaming an open task to duplicate another open task should be refused: {dup}"
-        );
-        let dup_parsed: Value = serde_json::from_str(dup.split_once('\n').unwrap().1).unwrap();
-        assert_eq!(dup_parsed["success"], false, "{dup}");
-        assert_eq!(dup_parsed["duplicate_of"], "task-1", "{dup}");
+        let updated: Value =
+            serde_json::from_str(updated.split_once('\n').unwrap().1).expect("update response");
+        assert_eq!(updated["success"], true, "{updated}");
 
         let task_2: Value =
             serde_json::from_str(&m.get(&json!({"task_id": "task-2"})).await).unwrap();
         assert_eq!(
-            task_2["title"], "Wire billing webhook",
-            "refused duplicate rename must leave the original title unchanged: {task_2}"
+            task_2["title"], " implement oauth callback. ",
+            "title updates are not rejected by semantic string heuristics: {task_2}"
         );
     }
 
@@ -4768,20 +5445,184 @@ mod tests {
 
     #[tokio::test]
     async fn update_in_progress_is_idempotent_for_the_same_task() {
-        let m = mgr();
+        let store = Arc::new(InMemoryTaskStore::new());
+        let m = TaskManager::new("idempotent-parent-update", store.clone());
         m.create(&json!({"title": "already running"})).await;
         let first = m
-            .update(&json!({"task_id": "task-1", "new_status": "in_progress"}))
+            .update_outcome(&json!({"task_id": "task-1", "new_status": "in_progress"}))
             .await;
-        assert!(!first.starts_with("Error:"), "{first}");
+        assert_eq!(first.status, TaskMutationStatus::Applied, "{first:?}");
+        let version = store
+            .get_session_version("idempotent-parent-update")
+            .await
+            .unwrap();
+        let mut changes = store.subscribe().expect("in-memory change stream");
 
         let repeat = m
-            .update(&json!({"task_id": "task-1", "new_status": "in_progress"}))
+            .update_outcome(&json!({"task_id": "task-1", "new_status": "in_progress"}))
             .await;
-        assert!(
-            repeat.contains("\"success\":true") && repeat.contains("\"status\":\"in_progress\""),
-            "same-task in_progress repeat should be treated as idempotent success: {repeat}"
+        assert_eq!(repeat.status, TaskMutationStatus::Unchanged, "{repeat:?}");
+        assert_eq!(repeat.data["already_current"], true, "{repeat:?}");
+        assert_eq!(
+            store
+                .get_session_version("idempotent-parent-update")
+                .await
+                .unwrap(),
+            version,
+            "an idempotent update must not advance durable board state"
         );
+        assert!(matches!(
+            changes.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn repeated_subtask_status_is_unchanged_without_a_board_write() {
+        let store = Arc::new(InMemoryTaskStore::new());
+        let m = TaskManager::new("idempotent-subtask-update", store.clone());
+        m.create(&json!({
+            "title": "parent",
+            "subtasks": [{"id": "child", "title": "child"}]
+        }))
+        .await;
+        let first = m
+            .update_outcome(&json!({
+                "task_id": "task-1",
+                "subtask_id": "child",
+                "new_status": "in_progress"
+            }))
+            .await;
+        assert_eq!(first.status, TaskMutationStatus::Applied, "{first:?}");
+        let version = store
+            .get_session_version("idempotent-subtask-update")
+            .await
+            .unwrap();
+
+        let repeat = m
+            .update_outcome(&json!({
+                "task_id": "task-1",
+                "subtask_id": "child",
+                "new_status": "in_progress"
+            }))
+            .await;
+
+        assert_eq!(repeat.status, TaskMutationStatus::Unchanged, "{repeat:?}");
+        assert_eq!(
+            store
+                .get_session_version("idempotent-subtask-update")
+                .await
+                .unwrap(),
+            version
+        );
+    }
+
+    #[tokio::test]
+    async fn adding_existing_dependency_repairs_missing_reverse_edge() {
+        let m = mgr();
+        m.create(&json!({"title": "producer"})).await;
+        m.create(&json!({"title": "consumer"})).await;
+
+        let mut snapshot = m.try_snapshot_state().await.unwrap();
+        snapshot.tasks[0].blocks.push("task-2".to_string());
+        assert!(snapshot.tasks[1].blocked_by.is_empty());
+        m.restore_snapshot(&snapshot).await.unwrap();
+
+        let repaired = m
+            .update_outcome(&json!({"task_id": "task-1", "add_blocks": ["task-2"]}))
+            .await;
+
+        assert_eq!(repaired.status, TaskMutationStatus::Applied, "{repaired:?}");
+        let tasks = m.snapshot().await.unwrap();
+        assert_eq!(tasks[0].blocks, ["task-2"]);
+        assert_eq!(tasks[1].blocked_by, ["task-1"]);
+    }
+
+    #[tokio::test]
+    async fn repeated_failure_evidence_is_unchanged_without_duplicate_prose() {
+        let store = Arc::new(InMemoryTaskStore::new());
+        let m = TaskManager::new("idempotent-failure", store.clone());
+        m.create(&json!({"title": "compile", "description": "Build succeeds"}))
+            .await;
+        let args = json!({
+            "task_id": "task-1",
+            "new_status": "failed",
+            "error_message": "missing type Foo"
+        });
+        let first = m.update_outcome(&args).await;
+        assert_eq!(first.status, TaskMutationStatus::Applied, "{first:?}");
+        let before = m.get(&json!({"task_id": "task-1"})).await;
+        let version = store
+            .get_session_version("idempotent-failure")
+            .await
+            .unwrap();
+
+        let repeat = m.update_outcome(&args).await;
+
+        assert_eq!(repeat.status, TaskMutationStatus::Unchanged, "{repeat:?}");
+        assert_eq!(repeat.data["already_current"], true, "{repeat:?}");
+        assert_eq!(m.get(&json!({"task_id": "task-1"})).await, before);
+        assert_eq!(
+            store
+                .get_session_version("idempotent-failure")
+                .await
+                .unwrap(),
+            version
+        );
+        assert_eq!(
+            before.matches("Error: missing type Foo").count(),
+            1,
+            "{before}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_null_clears_optional_task_fields() {
+        let m = mgr();
+        m.create(&json!({
+            "title": "reassignable work",
+            "description": "old definition",
+            "active_form": "working",
+            "owner": "agent-1"
+        }))
+        .await;
+
+        let cleared = m
+            .update_outcome(&json!({
+                "task_id": "task-1",
+                "description": null,
+                "active_form": null,
+                "owner": null
+            }))
+            .await;
+
+        assert_eq!(cleared.status, TaskMutationStatus::Applied, "{cleared:?}");
+        let task: SessionTask =
+            serde_json::from_str(&m.get(&json!({"task_id": "task-1"})).await).unwrap();
+        assert_eq!(task.description, None);
+        assert_eq!(task.active_form, None);
+        assert_eq!(task.owner, None);
+    }
+
+    #[tokio::test]
+    async fn delete_rejects_fields_it_would_otherwise_ignore() {
+        let m = mgr();
+        m.create(&json!({"title": "keep identity"})).await;
+
+        let outcome = m
+            .update_outcome(&json!({
+                "task_id": "task-1",
+                "new_status": "deleted",
+                "title": "silently discarded"
+            }))
+            .await;
+
+        assert_eq!(outcome.status, TaskMutationStatus::Failed, "{outcome:?}");
+        assert!(outcome.output.contains("Unsupported fields: title"));
+        let task: SessionTask =
+            serde_json::from_str(&m.get(&json!({"task_id": "task-1"})).await).unwrap();
+        assert_eq!(task.title, "keep identity");
+        assert_eq!(task.status, SessionTaskStatusKind::Pending);
     }
 
     #[tokio::test]
@@ -5219,6 +6060,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reverse_add_blocks_cannot_bypass_running_task_dependency_validation() {
+        let m = mgr();
+        m.create(&json!({"title": "late prerequisite"})).await;
+        m.create(&json!({"title": "already running"})).await;
+        let started = m
+            .update(&json!({"task_id": "task-2", "new_status": "in_progress"}))
+            .await;
+        assert!(!started.starts_with("Error:"), "{started}");
+
+        let rejected = m
+            .update(&json!({"task_id": "task-1", "add_blocks": ["task-2"]}))
+            .await;
+        assert!(rejected.starts_with("Error:"), "{rejected}");
+        assert!(
+            rejected.contains("task-2")
+                && rejected.contains("task-1")
+                && rejected.contains("in_progress"),
+            "the reverse edge spelling should explain the same invariant: {rejected}"
+        );
+        let tasks = m.snapshot().await.expect("unchanged task graph");
+        assert!(tasks[0].blocks.is_empty(), "{tasks:?}");
+        assert!(tasks[1].blocked_by.is_empty(), "{tasks:?}");
+    }
+
+    #[tokio::test]
+    async fn completed_status_rejects_unresolved_parent_dependencies() {
+        let m = mgr();
+        m.create(&json!({"title": "prerequisite"})).await;
+        m.create(&json!({
+            "title": "blocked work",
+            "add_blocked_by": ["task-1"]
+        }))
+        .await;
+
+        let rejected = m
+            .update(&json!({"task_id": "task-2", "new_status": "completed"}))
+            .await;
+        assert!(rejected.starts_with("Error:"), "{rejected}");
+        assert!(
+            rejected.contains("cannot start or complete")
+                && rejected.contains("task-1")
+                && rejected.contains("pending"),
+            "completion must not turn blocked work into a downstream success signal: {rejected}"
+        );
+        let blocked: SessionTask =
+            serde_json::from_str(&m.get(&json!({"task_id": "task-2"})).await).unwrap();
+        assert_eq!(blocked.status, SessionTaskStatusKind::Pending);
+    }
+
+    #[tokio::test]
+    async fn subtask_cannot_start_through_an_unresolved_parent_dependency() {
+        let m = mgr();
+        m.create(&json!({"title": "prerequisite"})).await;
+        m.create(&json!({
+            "title": "blocked parent",
+            "add_blocked_by": ["task-1"],
+            "subtasks": [{"id": "child", "title": "must wait too"}]
+        }))
+        .await;
+
+        let rejected = m
+            .update(&json!({
+                "task_id": "task-2",
+                "subtask_id": "child",
+                "new_status": "in_progress"
+            }))
+            .await;
+        assert!(rejected.starts_with("Error:"), "{rejected}");
+        assert!(rejected.contains("task-1"), "{rejected}");
+        let parent: SessionTask =
+            serde_json::from_str(&m.get(&json!({"task_id": "task-2"})).await).unwrap();
+        assert_eq!(parent.status, SessionTaskStatusKind::Pending);
+        assert_eq!(parent.subtasks[0].status, SessionTaskStatusKind::Pending);
+    }
+
+    #[tokio::test]
     async fn in_progress_allows_same_update_to_remove_stale_dependency() {
         let m = mgr();
         m.create(&json!({"title": "old blocker"})).await;
@@ -5268,6 +6185,225 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completed_dependency_edge_does_not_block_parent_autocomplete() {
+        let m = mgr();
+        m.create(&json!({"title": "prerequisite"})).await;
+        let created = m
+            .create(&json!({
+                "title": "dependent parent",
+                "add_blocked_by": ["task-1"],
+                "subtasks": [{"id": "only", "title": "only child"}]
+            }))
+            .await;
+        assert!(!created.starts_with("Error:"), "{created}");
+        m.update(&json!({"task_id": "task-1", "new_status": "in_progress"}))
+            .await;
+        m.update(&json!({"task_id": "task-1", "new_status": "completed"}))
+            .await;
+
+        let child = m
+            .update(&json!({
+                "task_id": "task-2",
+                "subtask_id": "only",
+                "new_status": "completed"
+            }))
+            .await;
+        assert!(!child.starts_with("Error:"), "{child}");
+        let parent: SessionTask = serde_json::from_str(&m.get(&json!({"task_id": "task-2"})).await)
+            .expect("dependent parent");
+        assert_eq!(
+            parent.status,
+            SessionTaskStatusKind::Completed,
+            "a retained dependency edge is historical after its blocker completes: {parent:?}"
+        );
+        assert_eq!(parent.blocked_by, ["task-1"]);
+        assert!(
+            unresolved_task_blocker_ids(&m.try_snapshot_state().await.unwrap().tasks, &parent)
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn late_blocker_completion_reconciles_all_done_parent_chain() {
+        let m = mgr();
+        m.create(&json!({
+            "title": "prerequisite",
+            "subtasks": [{"id": "prereq-child", "title": "finish prerequisite"}]
+        }))
+        .await;
+        m.create(&json!({
+            "title": "dependent parent",
+            "add_blocked_by": ["task-1"],
+            "subtasks": [{"id": "dependent-child", "title": "already done"}]
+        }))
+        .await;
+        m.create(&json!({
+            "title": "transitive parent",
+            "add_blocked_by": ["task-2"],
+            "subtasks": [{"id": "transitive-child", "title": "already done too"}]
+        }))
+        .await;
+
+        // Simulate durable state written by an older client before parent
+        // dependency validation was enforced. A subsequent canonical
+        // mutation must reconcile it instead of leaving the board stuck.
+        let mut snapshot = m.try_snapshot_state().await.expect("legacy snapshot");
+        for task_id in ["task-2", "task-3"] {
+            let task = snapshot
+                .tasks
+                .iter_mut()
+                .find(|task| task.id == task_id)
+                .expect("dependent fixture task");
+            task.subtasks[0].status = SessionTaskStatusKind::Completed;
+        }
+        m.restore_snapshot(&snapshot)
+            .await
+            .expect("restore legacy all-done parents");
+        for task_id in ["task-2", "task-3"] {
+            let task: SessionTask =
+                serde_json::from_str(&m.get(&json!({"task_id": task_id})).await).unwrap();
+            assert_eq!(task.status, SessionTaskStatusKind::Pending, "{task:?}");
+        }
+
+        let completed = m
+            .update(&json!({
+                "task_id": "task-1",
+                "subtask_id": "prereq-child",
+                "new_status": "completed"
+            }))
+            .await;
+        assert!(!completed.starts_with("Error:"), "{completed}");
+        for task_id in ["task-1", "task-2", "task-3"] {
+            let task: SessionTask =
+                serde_json::from_str(&m.get(&json!({"task_id": task_id})).await).unwrap();
+            assert_eq!(
+                task.status,
+                SessionTaskStatusKind::Completed,
+                "completion should propagate through the dependency chain: {task:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reopened_prerequisite_reopens_derived_completion_chain() {
+        let m = mgr();
+        for (title, blocker) in [
+            ("root", None),
+            ("dependent", Some("task-1")),
+            ("transitive", Some("task-2")),
+        ] {
+            let mut create = json!({
+                "title": title,
+                "subtasks": [{"id": "only", "title": format!("{title} child")}]
+            });
+            if let Some(blocker) = blocker {
+                create["add_blocked_by"] = json!([blocker]);
+            }
+            let created = m.create(&create).await;
+            assert!(!created.starts_with("Error:"), "{created}");
+        }
+        for task_id in ["task-1", "task-2", "task-3"] {
+            let completed = m
+                .update(&json!({
+                    "task_id": task_id,
+                    "subtask_id": "only",
+                    "new_status": "completed"
+                }))
+                .await;
+            assert!(!completed.starts_with("Error:"), "{completed}");
+        }
+
+        let reopened = m
+            .update(&json!({
+                "task_id": "task-1",
+                "subtask_id": "only",
+                "new_status": "pending"
+            }))
+            .await;
+        assert!(!reopened.starts_with("Error:"), "{reopened}");
+        let tasks = m.try_snapshot_state().await.expect("reopened chain").tasks;
+        assert_eq!(tasks[0].status, SessionTaskStatusKind::InProgress);
+        assert_eq!(tasks[1].status, SessionTaskStatusKind::Pending);
+        assert_eq!(tasks[2].status, SessionTaskStatusKind::Pending);
+        assert_eq!(unresolved_task_blocker_ids(&tasks, &tasks[1]), ["task-1"]);
+        assert_eq!(unresolved_task_blocker_ids(&tasks, &tasks[2]), ["task-2"]);
+
+        let recompleted = m
+            .update(&json!({
+                "task_id": "task-1",
+                "subtask_id": "only",
+                "new_status": "completed"
+            }))
+            .await;
+        assert!(!recompleted.starts_with("Error:"), "{recompleted}");
+        assert!(
+            m.try_snapshot_state()
+                .await
+                .expect("recompleted chain")
+                .tasks
+                .iter()
+                .all(|task| task.status.is_completed())
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_task_rejects_new_unresolved_dependency_from_either_endpoint() {
+        let m = mgr();
+        m.create(&json!({"title": "unfinished prerequisite"})).await;
+        m.create(&json!({"title": "finished work"})).await;
+        let completed = m
+            .update(&json!({"task_id": "task-2", "new_status": "completed"}))
+            .await;
+        assert!(!completed.starts_with("Error:"), "{completed}");
+
+        let direct = m
+            .update(&json!({
+                "task_id": "task-2",
+                "add_blocked_by": ["task-1"]
+            }))
+            .await;
+        assert!(direct.starts_with("Error:"), "{direct}");
+        assert!(direct.contains("cannot start or complete"), "{direct}");
+
+        let reverse = m
+            .update(&json!({
+                "task_id": "task-1",
+                "add_blocks": ["task-2"]
+            }))
+            .await;
+        assert!(reverse.starts_with("Error:"), "{reverse}");
+        assert!(reverse.contains("while completed"), "{reverse}");
+
+        let tasks = m.try_snapshot_state().await.expect("unchanged graph").tasks;
+        assert!(tasks.iter().all(|task| task.blocks.is_empty()));
+        assert!(tasks.iter().all(|task| task.blocked_by.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn completing_all_children_finishes_a_paused_parent() {
+        let m = mgr();
+        m.create(&json!({
+            "title": "paused parent",
+            "subtasks": [{"id": "only", "title": "only child"}]
+        }))
+        .await;
+        m.update(&json!({"task_id": "task-1", "new_status": "paused"}))
+            .await;
+
+        let completed = m
+            .update(&json!({
+                "task_id": "task-1",
+                "subtask_id": "only",
+                "new_status": "completed"
+            }))
+            .await;
+        assert!(!completed.starts_with("Error:"), "{completed}");
+        let parent: SessionTask = serde_json::from_str(&m.get(&json!({"task_id": "task-1"})).await)
+            .expect("paused parent");
+        assert_eq!(parent.status, SessionTaskStatusKind::Completed);
+    }
+
+    #[tokio::test]
     async fn delete_cleans_symmetric_edges() {
         let m = mgr();
         m.create(&json!({"title": "a"})).await;
@@ -5298,6 +6434,84 @@ mod tests {
             !task_b.blocked_by.contains(&"task-1".to_string()),
             "b still references a: {task_b:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn deleting_last_blocker_reconciles_legacy_all_done_parent() {
+        let m = mgr();
+        m.create(&json!({"title": "obsolete blocker"})).await;
+        m.create(&json!({
+            "title": "dependent parent",
+            "add_blocked_by": ["task-1"],
+            "subtasks": [{"id": "done", "title": "legacy completed child"}]
+        }))
+        .await;
+        let mut snapshot = m.try_snapshot_state().await.expect("delete fixture");
+        snapshot.tasks[1].subtasks[0].status = SessionTaskStatusKind::Completed;
+        m.restore_snapshot(&snapshot)
+            .await
+            .expect("restore legacy delete fixture");
+
+        let deleted = m
+            .update(&json!({"task_id": "task-1", "new_status": "deleted"}))
+            .await;
+        assert!(!deleted.starts_with("Error:"), "{deleted}");
+        let dependent: SessionTask =
+            serde_json::from_str(&m.get(&json!({"task_id": "task-2"})).await).unwrap();
+        assert_eq!(dependent.status, SessionTaskStatusKind::Completed);
+        assert!(dependent.blocked_by.is_empty(), "{dependent:?}");
+    }
+
+    #[tokio::test]
+    async fn deleting_a_parent_deletes_only_its_open_children() {
+        let m = mgr();
+        m.create(&json!({
+            "title": "parent to delete",
+            "subtasks": [
+                {"id": "running", "title": "running child"},
+                {"id": "done", "title": "completed child"},
+                {"id": "failed", "title": "failed child"}
+            ]
+        }))
+        .await;
+        for (subtask_id, status) in [
+            ("running", "in_progress"),
+            ("done", "completed"),
+            ("failed", "failed"),
+        ] {
+            let updated = m
+                .update(&json!({
+                    "task_id": "task-1",
+                    "subtask_id": subtask_id,
+                    "new_status": status
+                }))
+                .await;
+            assert!(!updated.starts_with("Error:"), "{updated}");
+        }
+
+        let deleted = m
+            .update(&json!({"task_id": "task-1", "new_status": "deleted"}))
+            .await;
+        let body: Value = serde_json::from_str(
+            deleted
+                .split_once('\n')
+                .expect("summary and structured body")
+                .1,
+        )
+        .expect("structured delete response");
+        assert_eq!(body["success"], true, "{deleted}");
+        assert_eq!(body["deleted_subtasks"], 1, "{deleted}");
+
+        let task: SessionTask = serde_json::from_str(&m.get(&json!({"task_id": "task-1"})).await)
+            .expect("deleted parent");
+        let statuses = task
+            .subtasks
+            .iter()
+            .map(|subtask| (subtask.id.as_str(), subtask.status))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(statuses["running"], SessionTaskStatusKind::Deleted);
+        assert_eq!(statuses["done"], SessionTaskStatusKind::Completed);
+        assert_eq!(statuses["failed"], SessionTaskStatusKind::Failed);
     }
 
     #[tokio::test]
@@ -5428,59 +6642,6 @@ mod tests {
             after.status,
             SessionTaskStatusKind::InProgress,
             "an active subtask should make the parent read as in-progress so the task board doesn't show it as merely open"
-        );
-    }
-
-    #[tokio::test]
-    async fn subtask_autocomplete_preserves_terminal_parent_status() {
-        let m = mgr();
-        m.create(&json!({
-            "title": "parent",
-            "subtasks": [
-                {"id": "s1", "title": "first"},
-                {"id": "s2", "title": "second"}
-            ]
-        }))
-        .await;
-
-        m.update(&json!({"task_id": "task-1", "new_status": "in_progress"}))
-            .await;
-        m.update(&json!({"task_id": "task-1", "new_status": "failed"}))
-            .await;
-        m.update(&json!({"task_id": "task-1", "subtask_id": "s1", "new_status": "completed"}))
-            .await;
-        m.update(&json!({"task_id": "task-1", "subtask_id": "s2", "new_status": "completed"}))
-            .await;
-        let after_failed = m.get(&json!({"task_id": "task-1"})).await;
-        let after_failed: SessionTask =
-            serde_json::from_str(&after_failed).expect("task json after failed parent");
-        assert_eq!(
-            after_failed.status,
-            SessionTaskStatusKind::Failed,
-            "subtask auto-complete must not overwrite explicit failed status"
-        );
-
-        m.create(&json!({
-            "title": "cancelled parent",
-            "subtasks": [
-                {"id": "s1", "title": "first"},
-                {"id": "s2", "title": "second"}
-            ]
-        }))
-        .await;
-        m.stop(&json!({"task_id": "task-2", "reason": "no longer needed"}))
-            .await;
-        m.update(&json!({"task_id": "task-2", "subtask_id": "s1", "new_status": "completed"}))
-            .await;
-        m.update(&json!({"task_id": "task-2", "subtask_id": "s2", "new_status": "completed"}))
-            .await;
-        let after_cancelled = m.get(&json!({"task_id": "task-2"})).await;
-        let after_cancelled: SessionTask =
-            serde_json::from_str(&after_cancelled).expect("task json after cancelled parent");
-        assert_eq!(
-            after_cancelled.status,
-            SessionTaskStatusKind::Cancelled,
-            "subtask auto-complete must not overwrite explicit cancelled status"
         );
     }
 
@@ -5804,6 +6965,61 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn optimistic_snapshot_rejects_a_board_that_never_stabilizes() {
+        struct MovingVersionStore {
+            version_reads: std::sync::atomic::AtomicU64,
+        }
+
+        #[async_trait::async_trait]
+        impl TaskStore for MovingVersionStore {
+            async fn load(&self, _session_id: &str) -> Result<Vec<SessionTask>, String> {
+                Ok(Vec::new())
+            }
+
+            async fn save(
+                &self,
+                _session_id: &str,
+                _tasks: Vec<SessionTask>,
+            ) -> Result<(), String> {
+                Ok(())
+            }
+
+            async fn next_task_id(&self, _session_id: &str) -> Result<u32, String> {
+                Ok(1)
+            }
+
+            async fn peek_next_task_id(&self, _session_id: &str) -> Result<u32, String> {
+                Ok(1)
+            }
+
+            async fn get_session_version(&self, _session_id: &str) -> Result<u64, String> {
+                Ok(self
+                    .version_reads
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst))
+            }
+        }
+
+        let store = MovingVersionStore {
+            version_reads: std::sync::atomic::AtomicU64::new(0),
+        };
+        let error = store
+            .load_snapshot_state("sess-moving")
+            .await
+            .expect_err("a torn task/counter/version view must never be returned as a snapshot");
+        assert!(
+            error.contains("changed while capturing snapshot"),
+            "{error}"
+        );
+        assert_eq!(
+            store
+                .version_reads
+                .load(std::sync::atomic::Ordering::SeqCst),
+            6,
+            "snapshot capture should retry a bounded number of times"
+        );
+    }
+
     #[test]
     fn prepare_task_snapshot_for_fork_pauses_live_parent_work() {
         let snapshot = TaskManagerSnapshot {
@@ -5953,10 +7169,14 @@ mod tests {
         for _ in 0..5 {
             let _ = store.next_task_id("sess-order").await.unwrap();
         }
+        let version = store
+            .get_session_version("sess-order")
+            .await
+            .expect("current board version");
         let snap = TaskManagerSnapshot {
             tasks: vec![],
             next_task_id: 1,
-            version: 0,
+            version,
             restore_version: None,
         };
         let mut rx = store.subscribe().expect("inmemory supports subscribe");
@@ -6058,6 +7278,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn in_memory_restore_treats_zero_as_a_real_cas_version() {
+        let store = InMemoryTaskStore::new();
+        let empty_snapshot = store
+            .load_snapshot_state("sess-first-write")
+            .await
+            .expect("capture new board");
+        assert_eq!(empty_snapshot.version, 0);
+
+        let now = chrono::Utc::now().to_rfc3339();
+        store
+            .save(
+                "sess-first-write",
+                vec![SessionTask {
+                    archived_at: None,
+                    id: "task-1".to_string(),
+                    title: "concurrent first write".to_string(),
+                    description: None,
+                    status: SessionTaskStatusKind::Pending,
+                    subtasks: Vec::new(),
+                    created_at: now.clone(),
+                    updated_at: now,
+                    active_form: None,
+                    owner: None,
+                    metadata: None,
+                    blocks: Vec::new(),
+                    blocked_by: Vec::new(),
+                }],
+            )
+            .await
+            .expect("concurrent first write");
+
+        let error = store
+            .restore_snapshot_state(
+                "sess-first-write",
+                empty_snapshot.tasks,
+                empty_snapshot.next_task_id,
+                empty_snapshot.version,
+            )
+            .await
+            .expect_err("version-0 snapshot must not erase the first concurrent write");
+        assert!(error.contains("version conflict"), "{error}");
+        assert_eq!(store.load("sess-first-write").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn in_memory_mutate_validates_tasks_when_enabled() {
         let store = Arc::new(InMemoryTaskStore::new());
         let now = chrono::Utc::now().to_rfc3339();
@@ -6102,11 +7367,12 @@ mod tests {
                         blocks: Vec::new(),
                         blocked_by: Vec::new(),
                     });
-                    Ok(TaskMutationResult {
+                    Ok(TaskMutationResult::applied(
                         tasks,
-                        next_task_id: Some(next_id + 1),
-                        response: "should fail".to_string(),
-                    })
+                        Some(next_id + 1),
+                        "should fail",
+                        json!({"message": "should fail"}),
+                    ))
                 }),
             )
             .await
@@ -6527,15 +7793,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn archive_replay_is_a_successful_unchanged_mutation() {
+        let store = Arc::new(InMemoryTaskStore::new());
+        let m = TaskManager::new("idempotent-archive", store.clone());
+        m.create(&json!({"title": "historical work"})).await;
+        m.update(&json!({"task_id": "task-1", "new_status": "completed"}))
+            .await;
+        let first = m.archive_outcome(&json!({"task_id": "task-1"})).await;
+        assert_eq!(first.status, TaskMutationStatus::Applied, "{first:?}");
+        let version = store
+            .get_session_version("idempotent-archive")
+            .await
+            .unwrap();
+
+        let replay = m.archive_outcome(&json!({"task_id": "task-1"})).await;
+
+        assert_eq!(replay.status, TaskMutationStatus::Unchanged, "{replay:?}");
+        assert_eq!(replay.data["already_current"], true, "{replay:?}");
+        assert_eq!(
+            store
+                .get_session_version("idempotent-archive")
+                .await
+                .unwrap(),
+            version
+        );
+    }
+
+    #[tokio::test]
+    async fn archive_replay_repairs_legacy_dependency_edges() {
+        let store = Arc::new(InMemoryTaskStore::new());
+        let m = TaskManager::new("archive-repair", store.clone());
+        m.create(&json!({"title": "historical"})).await;
+        m.create(&json!({"title": "dependent"})).await;
+        m.update(&json!({"task_id": "task-1", "new_status": "completed"}))
+            .await;
+        m.archive_outcome(&json!({"task_id": "task-1"})).await;
+
+        // Simulate an old/corrupt row written before archive detached both
+        // sides of the dependency graph.
+        let mut snapshot = m.try_snapshot_state().await.unwrap();
+        snapshot.tasks[0].archived_at = None;
+        snapshot.tasks[0].blocks.push("task-2".to_string());
+        snapshot.tasks[1].blocked_by.push("task-1".to_string());
+        m.restore_snapshot(&snapshot).await.unwrap();
+        let version = store.get_session_version("archive-repair").await.unwrap();
+
+        let replay = m.archive_outcome(&json!({"task_id": "task-1"})).await;
+
+        assert_eq!(replay.status, TaskMutationStatus::Applied, "{replay:?}");
+        assert_eq!(
+            store.get_session_version("archive-repair").await.unwrap(),
+            version + 1
+        );
+        let tasks = m.snapshot().await.unwrap();
+        assert!(tasks.iter().all(|task| task.blocks.is_empty()));
+        assert!(tasks.iter().all(|task| task.blocked_by.is_empty()));
+        assert!(tasks[0].archived_at.is_some());
+        assert_eq!(replay.data["reconciled_existing_archive"], true);
+    }
+
+    #[tokio::test]
+    async fn bulk_archive_reports_only_new_transitions() {
+        let m = mgr();
+        m.create(&json!({"title": "historical"})).await;
+        m.update(&json!({"task_id": "task-1", "new_status": "completed"}))
+            .await;
+        m.archive_outcome(&json!({"task_id": "task-1"})).await;
+
+        let replay = m.archive_outcome(&json!({"older_than_days": 0})).await;
+
+        assert_eq!(replay.status, TaskMutationStatus::Unchanged, "{replay:?}");
+        assert_eq!(replay.data["archived"], 0, "{replay:?}");
+    }
+
+    #[tokio::test]
     async fn archive_single_task_detaches_dependency_edges() {
         let m = mgr();
         m.create(&json!({"title": "producer"})).await;
-        m.create(&json!({"title": "consumer"})).await;
+        m.create(&json!({
+            "title": "consumer",
+            "subtasks": [{"id": "done", "title": "legacy completed child"}]
+        }))
+        .await;
         let linked = m
             .update(&json!({"task_id": "task-1", "add_blocks": ["task-2"]}))
             .await;
         assert!(!linked.starts_with("Error:"), "{linked}");
-        set_task_status_fixture(&m, "task-1", SessionTaskStatusKind::Completed).await;
+        let mut snapshot = m.try_snapshot_state().await.expect("archive fixture");
+        snapshot.tasks[0].status = SessionTaskStatusKind::Completed;
+        snapshot.tasks[1].subtasks[0].status = SessionTaskStatusKind::Completed;
+        m.restore_snapshot(&snapshot)
+            .await
+            .expect("restore legacy archive fixture");
 
         let archived = m.archive(&json!({"task_id": "task-1"})).await;
         assert!(!archived.starts_with("Error:"), "{archived}");
@@ -6552,6 +7901,11 @@ mod tests {
         assert!(
             consumer.blocked_by.is_empty(),
             "open tasks should not remain blocked by archived history: {consumer:?}"
+        );
+        assert_eq!(
+            consumer.status,
+            SessionTaskStatusKind::Completed,
+            "detaching the last blocker must reconcile an all-done parent atomically"
         );
     }
 
@@ -6838,6 +8192,78 @@ mod tests {
         assert!(ctx.contains("⏳ Pending (1): Add feature"), "{ctx}");
         // in_progress takes priority for focus message
         assert!(ctx.contains("Focus on completing the in-progress"), "{ctx}");
+    }
+
+    #[tokio::test]
+    async fn build_active_task_context_does_not_focus_blocked_pending_work() {
+        let m = mgr();
+        m.create(&json!({"title": "Paused prerequisite"})).await;
+        m.update(&json!({"task_id": "task-1", "new_status": "paused"}))
+            .await;
+        m.create(&json!({
+            "title": "Dependent work",
+            "add_blocked_by": ["task-1"]
+        }))
+        .await;
+
+        let ctx = m.build_active_task_context().await.unwrap();
+        assert!(ctx.contains("⏸ Paused (1): Paused prerequisite"), "{ctx}");
+        assert!(
+            ctx.contains("⛔ Blocked (1): Dependent work (waiting on task-1)"),
+            "{ctx}"
+        );
+        assert!(!ctx.contains("⏳ Pending"), "{ctx}");
+        assert!(
+            ctx.contains("Resume or reprioritize the first paused task"),
+            "{ctx}"
+        );
+        assert!(!ctx.contains("Focus on the first pending"), "{ctx}");
+    }
+
+    #[tokio::test]
+    async fn build_active_task_context_bounds_blocker_details_without_hiding_them() {
+        let m = mgr();
+        for index in 1..=4 {
+            m.create(&json!({"title": format!("prerequisite {index}")}))
+                .await;
+        }
+        m.create(&json!({
+            "title": "x".repeat(200),
+            "add_blocked_by": ["task-1", "task-2", "task-3", "task-4"]
+        }))
+        .await;
+
+        let ctx = m.build_active_task_context().await.unwrap();
+        let blocked_line = ctx
+            .lines()
+            .find(|line| line.starts_with("- ⛔ Blocked"))
+            .expect("bounded blocked summary");
+        assert!(blocked_line.contains("waiting on task-1, task-2, +2 more"));
+        assert!(
+            blocked_line.chars().count() <= 140,
+            "prompt projection must stay bounded: {blocked_line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_active_task_context_treats_completed_blockers_as_resolved() {
+        let m = mgr();
+        m.create(&json!({"title": "Finished prerequisite"})).await;
+        m.update(&json!({"task_id": "task-1", "new_status": "completed"}))
+            .await;
+        m.create(&json!({
+            "title": "Ready dependent",
+            "add_blocked_by": ["task-1"]
+        }))
+        .await;
+
+        let ctx = m.build_active_task_context().await.unwrap();
+        assert!(ctx.contains("⏳ Pending (1): Ready dependent"), "{ctx}");
+        assert!(!ctx.contains("⛔ Blocked"), "{ctx}");
+        assert!(
+            ctx.contains("Focus on the first pending task: Ready dependent"),
+            "{ctx}"
+        );
     }
 
     #[tokio::test]

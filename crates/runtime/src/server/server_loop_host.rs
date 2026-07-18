@@ -3468,6 +3468,7 @@ impl ServerAgenticLoopHost {
             local_tool_execution_delivery, sse_maps_through_tool_request,
             wait_approval_ledger_for_tool,
         };
+        use astra_turn_core::edge_ledger::{expect_ledger_entry, tool_callback_key};
         use astra_turn_core::headless_tool_assembly::parse_flat_tool_call_event;
         use astra_turn_core::sse_stream_host::EdgeToolExecResult;
         use astra_turn_core::stream_events::{
@@ -3615,7 +3616,58 @@ impl ServerAgenticLoopHost {
                 executable_calls.extend(block.iter());
             }
 
-            for tc in &executable_calls {
+            // Resolve read-only cache hits before exposing tool requests. A
+            // cached result has no callback consumer; sending it to the edge
+            // would trigger duplicate work and create an unowned result.
+            let mut pending_calls = Vec::with_capacity(executable_calls.len());
+            for tc in executable_calls {
+                if !tc.is_object() {
+                    continue;
+                }
+                let (id, tool_name, args) = parse_flat_tool_call_event(tc);
+                let is_cacheable = astra_turn_core::parallel_tool_exec::is_read_only_tool_with_args(
+                    &tool_name,
+                    Some(&args),
+                );
+                let sig = if is_cacheable {
+                    Some(
+                        astra_turn_core::tool_result_dedup::CallSignature::from_args(
+                            &tool_name, &args,
+                        ),
+                    )
+                } else {
+                    None
+                };
+                let cached = sig.as_ref().and_then(|s| {
+                    self.tool_result_cache
+                        .lock()
+                        .ok()
+                        .and_then(|mut g| g.lookup(s))
+                });
+                if let Some(output) = cached {
+                    results_by_id.insert(
+                        id.clone(),
+                        EdgeToolExecResult {
+                            request_id: id.clone(),
+                            tool: tool_name.clone(),
+                            args: args.clone(),
+                            output,
+                            tool_result_fields: Some(
+                                self.edge_result_fields_with_runtime(&id, &tool_name, &args, None),
+                            ),
+                            status: "ok".to_string(),
+                            duration_ms: 0,
+                        },
+                    );
+                } else {
+                    pending_calls.push((tc, sig));
+                }
+            }
+
+            // Register every callback before its SSE request is visible. This
+            // makes the exact emitted identity—not session ownership alone—
+            // the authorization boundary for same-process delivery.
+            for (tc, _) in &pending_calls {
                 let request_id = tc.get("id").and_then(Value::as_str).unwrap_or("");
                 let identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
                     &self.user_id,
@@ -3624,6 +3676,7 @@ impl ServerAgenticLoopHost {
                     turn_chain_id,
                     request_id,
                 );
+                expect_ledger_entry(&self.edge_callback_ledger, &tool_callback_key(&identity));
                 for m in sse_maps_through_tool_request(tc, &identity) {
                     // L1094 (execute_mock_turn mock-LLM-response path) is the
                     // SINGLE owner of `tool_call` events per skill invocation.
@@ -3644,10 +3697,7 @@ impl ServerAgenticLoopHost {
                 }
             }
 
-            for tc in executable_calls {
-                if !tc.is_object() {
-                    continue;
-                }
+            for (tc, sig) in pending_calls {
                 let (id, tool_name, args) = parse_flat_tool_call_event(tc);
                 let identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
                     &self.user_id,
@@ -3656,96 +3706,44 @@ impl ServerAgenticLoopHost {
                     turn_chain_id,
                     &id,
                 );
-
-                // ── Dedup read-only tool invocations within a short window ──
-                // Only applies when the tool is parallelizable (args-aware);
-                // mutating tools skip the cache.
-                let is_cacheable = astra_turn_core::parallel_tool_exec::is_read_only_tool_with_args(
-                    &tool_name,
-                    Some(&args),
-                );
-                let sig = if is_cacheable {
-                    Some(
-                        astra_turn_core::tool_result_dedup::CallSignature::from_args(
-                            &tool_name, &args,
-                        ),
-                    )
-                } else {
-                    None
-                };
-
                 let started = std::time::Instant::now();
-                let cached = sig.as_ref().and_then(|s| {
-                    self.tool_result_cache
-                        .lock()
-                        .ok()
-                        .and_then(|mut g| g.lookup(s))
-                });
+                let delivery = self
+                    .wait_tool_result_with_dispatch_fallback(tc, &identity, ledger_wait)
+                    .await;
 
-                let (delivery_output, delivery_sse_maps, duration_ms, status, tool_result_fields): (
-                    String,
-                    Vec<Map<String, Value>>,
-                    u64,
-                    String,
-                    Map<String, Value>,
-                ) = if let Some(cached_output) = cached {
-                    (
-                        cached_output,
-                        Vec::new(),
-                        0,
-                        "ok".to_string(),
-                        self.edge_result_fields_with_runtime(&id, &tool_name, &args, None),
-                    )
-                } else {
-                    let delivery = self
-                        .wait_tool_result_with_dispatch_fallback(tc, &identity, ledger_wait)
-                        .await;
-
-                    let duration_ms = started.elapsed().as_millis() as u64;
-                    let sse_maps = delivery.sse_maps.clone();
-                    let output = delivery
-                        .tool_messages
-                        .first()
-                        .and_then(|m| m.get("content"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    let tool_result = delivery.tool_results.first().cloned();
-                    let status = tool_result
+                let duration_ms = started.elapsed().as_millis() as u64;
+                let delivery_sse_maps = delivery.sse_maps.clone();
+                let output = delivery
+                    .tool_messages
+                    .first()
+                    .and_then(|m| m.get("content"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let tool_result = delivery.tool_results.first().cloned();
+                let status = tool_result
+                    .as_ref()
+                    .map(|result| result.status.clone())
+                    .unwrap_or_else(|| "unknown".to_string());
+                if let Some(sig_ref) = sig.as_ref() {
+                    let is_err = tool_result
                         .as_ref()
-                        .map(|result| result.status.clone())
-                        .unwrap_or_else(|| "unknown".to_string());
-                    // Record successful read-only results only.
-                    if let Some(sig_ref) = sig.as_ref() {
-                        let is_err = tool_result
-                            .as_ref()
-                            .and_then(|result| edge_tool_status_exit_code(&result.status))
-                            .is_some_and(|exit_code| exit_code != 0);
-                        if !is_err {
-                            if let Ok(mut guard) = self.tool_result_cache.lock() {
-                                guard.record(sig_ref.clone(), output.clone());
-                            }
-                        }
+                        .and_then(|result| edge_tool_status_exit_code(&result.status))
+                        .is_some_and(|exit_code| exit_code != 0);
+                    if !is_err && let Ok(mut guard) = self.tool_result_cache.lock() {
+                        guard.record(sig_ref.clone(), output.clone());
                     }
-                    (
-                        output,
-                        sse_maps,
-                        duration_ms,
-                        status,
-                        self.edge_result_fields_with_runtime(
-                            &id,
-                            &tool_name,
-                            &args,
-                            tool_result.and_then(|result| result.tool_result_fields),
-                        ),
-                    )
-                };
+                }
+                let tool_result_fields = self.edge_result_fields_with_runtime(
+                    &id,
+                    &tool_name,
+                    &args,
+                    tool_result.and_then(|result| result.tool_result_fields),
+                );
 
                 for m in delivery_sse_maps {
                     self.emit_event(Value::Object(m));
                 }
-
-                let output = delivery_output;
 
                 results_by_id.insert(
                     id.clone(),
@@ -4076,6 +4074,16 @@ impl ServerAgenticLoopHost {
         wire_tools: &[Value],
         state: &AgenticLoopState,
     ) {
+        if state.hooks.completion_settlement.text_only {
+            if let Some(executor) = state.runtime_tool_executor.as_deref() {
+                executor.set_current_activatable_tool_names(HashSet::new());
+                executor.set_current_searchable_tool_schemas(&[]);
+                executor.set_current_selected_tool_offers(HashMap::new());
+            }
+            self.current_deferred_tool_names.clear();
+            self.valid_tools.clear();
+            return;
+        }
         let mut extras = self.admissible_extras.clone();
         let activatable_deferred_tool_names = self.deferred_tool_names_for_wire_tools(
             wire_tools,
@@ -4233,6 +4241,9 @@ impl ServerAgenticLoopHost {
         model_name: &str,
         model_context_window: Option<u32>,
     ) -> String {
+        if state.hooks.completion_settlement.text_only {
+            return String::new();
+        }
         let manifest_names = self.deferred_tool_names_for_wire_tools(
             wire_tools,
             Some(model_name),
@@ -4293,6 +4304,15 @@ impl ServerAgenticLoopHost {
         effective.extend(interaction_scoped_tool_restrictions(
             self.turn_interaction_mode(),
         ));
+        if state.hooks.completion_settlement.text_only {
+            effective.extend(
+                self.tool_schemas
+                    .iter()
+                    .chain(self.admission_tool_schemas.iter())
+                    .filter_map(tool_schema_name)
+                    .map(str::to_string),
+            );
+        }
         effective
     }
 
@@ -4953,6 +4973,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             .unwrap_or("")
             .to_string();
 
+        let final_answer_settlement_text_only = state.hooks.completion_settlement.text_only;
         let effective_restricted = self.compute_effective_restricted(state, true);
         let visible_tools = self.filtered_runtime_ready_turn_tools(&effective_restricted, state);
 
@@ -5114,14 +5135,20 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 &llm_cfg.provider,
                 &llm_cfg.model_name,
             );
-        let mut final_tools = crate::turn::llm::context::stabilize_tool_schemas_for_cache(
-            &final_pipeline_tool_schemas,
-            &state.sticky_tool_schemas,
-            &visible_tools,
-            cache_cap,
-            state.llm_rounds_completed,
-        );
-        state.sticky_tool_schemas = final_tools.clone();
+        let mut final_tools = if final_answer_settlement_text_only {
+            Vec::new()
+        } else {
+            crate::turn::llm::context::stabilize_tool_schemas_for_cache(
+                &final_pipeline_tool_schemas,
+                &state.sticky_tool_schemas,
+                &visible_tools,
+                cache_cap,
+                state.llm_rounds_completed,
+            )
+        };
+        if !final_answer_settlement_text_only {
+            state.sticky_tool_schemas = final_tools.clone();
+        }
         // Annotate tool schemas with cache_control for Anthropic.
         crate::turn::llm::context::annotate_tool_schemas_for_cache(
             &mut final_tools,
@@ -9804,6 +9831,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cached_edge_tool_result_does_not_emit_an_unowned_request() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-edge-cache".to_string(),
+            "s-edge-cache".to_string(),
+        )
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+        host.install_runtime_tool_schemas(
+            vec![json!({
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read file contents",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            })],
+            Default::default(),
+        );
+        let args = json!({"path": "cached.rs"});
+        host.tool_result_cache
+            .lock()
+            .expect("tool result cache")
+            .record(
+                astra_turn_core::tool_result_dedup::CallSignature::from_args("read_file", &args),
+                "cached contents".to_string(),
+            );
+        let tool_calls = vec![json!({
+            "id": "cached-read",
+            "type": "function",
+            "function": {"name": "read_file", "arguments": args.to_string()}
+        })];
+
+        let results = host
+            .deliver_edge_tools_via_ledger("test-run", "test-chain", &tool_calls)
+            .await;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].output, "cached contents");
+        assert!(
+            host.emitted_events
+                .iter()
+                .all(|event| { event.get("type").and_then(Value::as_str) != Some("tool_request") })
+        );
+        assert!(
+            !astra_turn_core::edge_ledger::ledger_entry_is_expected(
+                &host.edge_callback_ledger,
+                &tool_callback_key("u-edge-cache", "s-edge-cache", "cached-read"),
+            ),
+            "a cache hit must not authorize a callback nobody will consume"
+        );
+    }
+
+    #[tokio::test]
     async fn deliver_edge_tools_does_not_block_later_read_only_block_on_future_approval_block() {
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
@@ -10360,6 +10442,33 @@ mod tests {
             "soft health must not mutate hard restricted_tools"
         );
         assert!(state.restricted_tools.contains("read_file"));
+    }
+
+    #[test]
+    fn final_answer_settlement_has_no_server_or_edge_tool_surface() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u".to_string(),
+            "s".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+        let mut state = create_test_state();
+        state.hooks.completion_settlement.text_only = true;
+
+        let visible = host.visible_turn_tools(&mut state);
+
+        assert!(visible.is_empty(), "settlement must advertise no tools");
+        assert!(
+            host.valid_tools.is_empty(),
+            "runtime admission must mirror the empty settlement surface"
+        );
+        assert!(
+            host.current_deferred_tool_names.is_empty(),
+            "deferred activation cannot bypass text-only settlement"
+        );
     }
 
     #[test]

@@ -5,20 +5,14 @@
 //! reads/writes the same `session_todos` rows for a given owner/session pair,
 //! so a task created on the CLI is immediately visible to a cloud-resumed turn.
 //!
-//! # Sizing assumption
-//!
-//! [`TASK_SOFT_CAP`] encodes the Tier 1 "dozens of rows" budget as a concrete
-//! number. Callers should treat a failing `debug_assert!(len < TASK_SOFT_CAP)`
-//! in [`MatrixOneTaskStore::save`] as a signal to revisit the
-//! delete-all / insert-all strategy in favour of incremental upserts.
-//!
 //! This impl uses a simple **load-all / replace-all** strategy that matches
-//! the [`TaskStore`] trait semantics: a session's todo vec is small (dozens
-//! of rows at most), so a full rewrite on every mutation keeps the MO access
-//! pattern and the in-memory logic in perfect sync with no partial-update
-//! complexity. CLAUDE.md §5 compliance: no `WHERE` on JSON columns; every
-//! read is column-scoped; owner-bound session indexes cover load and active
-//! queries, while a separate user/status index powers cross-session views.
+//! the [`TaskStore`] trait semantics. Inserts are batched, and lifecycle
+//! archive/GC keeps ordinary live boards compact. There is deliberately no
+//! debug-only row limit: correctness and accepted inputs must not differ
+//! between development and release builds. CLAUDE.md §5 compliance: no
+//! `WHERE` on JSON columns; every read is column-scoped; owner-bound session
+//! indexes cover load and active queries, while a separate user/status index
+//! powers cross-session views.
 
 use astra_core::sqlx::{self, MySql, MySqlConnection, Pool, QueryBuilder, Row};
 use async_trait::async_trait;
@@ -29,17 +23,9 @@ use std::sync::Arc;
 use crate::task_mgmt::{
     InMemoryTaskStore, SESSION_TASK_STATUS_IN_PROGRESS, SESSION_TASK_STATUS_PAUSED,
     SESSION_TASK_STATUS_PENDING, SessionSubtask, SessionTask, SessionTaskStatusKind, TaskMutation,
-    TaskStore,
+    TaskMutationOutcome, TaskStore,
 };
 
-/// Soft cap on the number of rows a single `session_todos` full-replace
-/// is expected to handle. Above this the delete-all / insert-all strategy
-/// stops being cheap and callers should migrate to incremental upserts.
-///
-/// Tier 1 plan assumption: a session holds "dozens of rows"; 256 leaves
-/// ample headroom before the debug_assert in [`MatrixOneTaskStore::save`]
-/// trips.
-pub const TASK_SOFT_CAP: usize = 256;
 const INSERT_BATCH_ROWS: usize = 100;
 
 const EXHAUSTED_COUNTER_SENTINEL: u64 = u32::MAX as u64 + 1;
@@ -70,6 +56,26 @@ struct EncodedTaskDatetimes {
     archived_at: Option<String>,
     created_at: String,
     updated_at: String,
+}
+
+fn encode_task_datetimes(task: &SessionTask) -> Result<EncodedTaskDatetimes, String> {
+    let updated_at = to_mo_datetime(&task.updated_at, "updated_at", &task.id)?;
+    let archived_at = if task.status == SessionTaskStatusKind::Archived {
+        match task.archived_at.as_deref() {
+            Some(value) => Some(to_mo_datetime(value, "archived_at", &task.id)?),
+            // Compatibility for legacy archive rows created before the field
+            // was part of SessionTask. The first durable rewrite makes the
+            // inferred value explicit; subsequent loads preserve it exactly.
+            None => Some(updated_at.clone()),
+        }
+    } else {
+        None
+    };
+    Ok(EncodedTaskDatetimes {
+        archived_at,
+        created_at: to_mo_datetime(&task.created_at, "created_at", &task.id)?,
+        updated_at,
+    })
 }
 
 fn encode_task_json_fields(task: &SessionTask) -> EncodedTaskJsonFields {
@@ -107,15 +113,7 @@ async fn insert_session_tasks(
     for (start, end) in task_insert_batch_ranges(tasks.len()) {
         let encoded_datetimes = tasks[start..end]
             .iter()
-            .map(|task| {
-                let updated_at = to_mo_datetime(&task.updated_at, "updated_at", &task.id)?;
-                Ok(EncodedTaskDatetimes {
-                    archived_at: (task.status == SessionTaskStatusKind::Archived)
-                        .then(|| updated_at.clone()),
-                    created_at: to_mo_datetime(&task.created_at, "created_at", &task.id)?,
-                    updated_at,
-                })
-            })
+            .map(encode_task_datetimes)
             .collect::<Result<Vec<_>, String>>()?;
         let mut builder = QueryBuilder::<MySql>::new(
             "INSERT INTO session_todos (\
@@ -299,6 +297,7 @@ impl MatrixOneTaskStore {
         let rows = sqlx::query(
             "SELECT todo_id, title, description, active_form, status, owner, \
                     metadata, blocks, blocked_by, subtasks, \
+                    CAST(archived_at AS CHAR) AS archived_at, \
                     CAST(created_at AS CHAR) AS created_at, \
                     CAST(updated_at AS CHAR) AS updated_at \
              FROM session_todos \
@@ -351,6 +350,11 @@ fn row_to_task(row: &sqlx::mysql::MySqlRow) -> Result<SessionTask, sqlx::Error> 
             .ok_or_else(|| sqlx::Error::Decode("session_todos.updated_at is NULL".into()))?;
         let created_at = from_mo_datetime(&created_at_raw, "created_at")?;
         let updated_at = from_mo_datetime(&updated_at_raw, "updated_at")?;
+        let archived_at = row
+            .try_get::<Option<String>, _>("archived_at")?
+            .as_deref()
+            .map(|value| from_mo_datetime(value, "archived_at"))
+            .transpose()?;
 
         Ok(SessionTask {
             id,
@@ -365,7 +369,7 @@ fn row_to_task(row: &sqlx::mysql::MySqlRow) -> Result<SessionTask, sqlx::Error> 
             metadata,
             blocks,
             blocked_by,
-            archived_at: None, // populated on load from column below
+            archived_at,
         })
     })();
 
@@ -468,6 +472,7 @@ impl TaskStore for MatrixOneTaskStore {
         let rows = sqlx::query(
             "SELECT todo_id, title, description, active_form, status, owner, \
                     metadata, blocks, blocked_by, subtasks, \
+                    CAST(archived_at AS CHAR) AS archived_at, \
                     CAST(created_at AS CHAR) AS created_at, \
                     CAST(updated_at AS CHAR) AS updated_at \
              FROM session_todos \
@@ -536,16 +541,6 @@ impl TaskStore for MatrixOneTaskStore {
             return Err(e);
         }
 
-        // Full-replace is justified only while task counts stay small (per
-        // module docs: "dozens of rows at most"). Break loudly in debug
-        // builds if a session ever pushes past a soft cap so we catch the
-        // design assumption breaking before it becomes a perf problem.
-        debug_assert!(
-            tasks.len() < TASK_SOFT_CAP,
-            "session_todos full-replace exceeded soft cap ({} rows); revisit incremental upserts",
-            tasks.len()
-        );
-
         if let Err(e) = insert_session_tasks(&mut tx, session_id, &self.user_id, &tasks).await {
             if let Err(rollback_err) = tx.rollback().await {
                 return Err(format!("{e}; rollback failed: {rollback_err}"));
@@ -573,7 +568,11 @@ impl TaskStore for MatrixOneTaskStore {
         Ok(())
     }
 
-    async fn mutate(&self, session_id: &str, mutation: TaskMutation) -> Result<String, String> {
+    async fn mutate(
+        &self,
+        session_id: &str,
+        mutation: TaskMutation,
+    ) -> Result<TaskMutationOutcome, String> {
         let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
 
         if let Err(e) = ensure_counter_owner_available(&mut tx, session_id, &self.user_id).await {
@@ -637,6 +636,7 @@ impl TaskStore for MatrixOneTaskStore {
         let rows = match sqlx::query(
             "SELECT todo_id, title, description, active_form, status, owner, \
                     metadata, blocks, blocked_by, subtasks, \
+                    CAST(archived_at AS CHAR) AS archived_at, \
                     CAST(created_at AS CHAR) AS created_at, \
                     CAST(updated_at AS CHAR) AS updated_at \
              FROM session_todos \
@@ -680,6 +680,11 @@ impl TaskStore for MatrixOneTaskStore {
                 return Err(e);
             }
         };
+
+        if !result.outcome.status.changed() {
+            tx.commit().await.map_err(|e| e.to_string())?;
+            return Ok(result.outcome);
+        }
 
         if let Some(next_task_id) = result.next_task_id
             && let Err(e) = sqlx::query(
@@ -738,7 +743,7 @@ impl TaskStore for MatrixOneTaskStore {
 
         tx.commit().await.map_err(|e| e.to_string())?;
         let _ = self.changed_tx.send(session_id.to_string());
-        Ok(result.response)
+        Ok(result.outcome)
     }
 
     fn subscribe(&self) -> Option<tokio::sync::broadcast::Receiver<String>> {
@@ -885,36 +890,34 @@ impl TaskStore for MatrixOneTaskStore {
             return Err(e);
         }
 
-        if expected_version > 0 {
-            // CAS: atomically verify the session version hasn't changed since
-            // the snapshot was captured.  Without this, a concurrent sweeper
-            // auto-pause or plan-mirror mutation could be silently overwritten.
-            let row: Option<(i64,)> = sqlx::query_as(
-                "SELECT version FROM session_todo_counters WHERE session_id = ? AND user_id = ? FOR UPDATE",
-            )
-            .bind(session_id)
-            .bind(&self.user_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| format!("restore_snapshot_state: version check failed: {e}"))?;
-            let current_version = row.map(|(v,)| v as u64).unwrap_or(0);
-            if current_version != expected_version {
-                return Err(format!(
-                    "restore_snapshot_state: version conflict (expected={}, current={}) — \
-                     task board changed after rollback snapshot was sealed; retry with fresh state",
-                    expected_version, current_version
-                ));
-            }
+        // CAS even at version 0: an absent/new board is a real state, not a
+        // request to disable conflict detection. The owner row lock prevents
+        // a concurrent first writer from inserting the counter between this
+        // check and the upsert below.
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT version FROM session_todo_counters WHERE session_id = ? AND user_id = ? FOR UPDATE",
+        )
+        .bind(session_id)
+        .bind(&self.user_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| format!("restore_snapshot_state: version check failed: {e}"))?;
+        let current_version = row.map(|(v,)| v as u64).unwrap_or(0);
+        if current_version != expected_version {
+            return Err(format!(
+                "restore_snapshot_state: version conflict (expected={}, current={}) — \
+                 task board changed after rollback snapshot was sealed; retry with fresh state",
+                expected_version, current_version
+            ));
         }
 
         sqlx::query(
-            "INSERT INTO session_todo_counters (session_id, user_id, next_id, version) VALUES (?, ?, ?, ?) \
-             ON DUPLICATE KEY UPDATE next_id = VALUES(next_id), version = version + 1",
+            "INSERT INTO session_todo_counters (session_id, user_id, next_id, version) VALUES (?, ?, ?, 0) \
+             ON DUPLICATE KEY UPDATE next_id = VALUES(next_id)",
         )
         .bind(session_id)
         .bind(&self.user_id)
         .bind(counter_bind_value(next_task_id))
-        .bind(expected_version as i64)
         .execute(&mut *tx)
         .await
         .map_err(|e| format!("restore_snapshot_state: counter upsert failed: {e}"))?;
@@ -932,12 +935,6 @@ impl TaskStore for MatrixOneTaskStore {
             }
             return Err(e);
         }
-
-        debug_assert!(
-            tasks.len() < TASK_SOFT_CAP,
-            "session_todos full-replace exceeded soft cap ({} rows); revisit incremental upserts",
-            tasks.len()
-        );
 
         if let Err(e) = insert_session_tasks(&mut tx, session_id, &self.user_id, &tasks).await {
             if let Err(rollback_err) = tx.rollback().await {
@@ -1018,6 +1015,7 @@ impl TaskStore for MatrixOneTaskStore {
         let rows = sqlx::query(
             "SELECT session_id, todo_id, title, description, active_form, status, owner, \
                     metadata, blocks, blocked_by, subtasks, \
+                    CAST(archived_at AS CHAR) AS archived_at, \
                     CAST(created_at AS CHAR) AS created_at, \
                     CAST(updated_at AS CHAR) AS updated_at \
              FROM session_todos \
@@ -1060,6 +1058,7 @@ impl TaskStore for MatrixOneTaskStore {
         let rows = sqlx::query(
             "SELECT session_id, todo_id, title, description, active_form, status, owner, \
                     metadata, blocks, blocked_by, subtasks, \
+                    CAST(archived_at AS CHAR) AS archived_at, \
                     CAST(created_at AS CHAR) AS created_at, \
                     CAST(updated_at AS CHAR) AS updated_at \
              FROM session_todos \
@@ -1246,6 +1245,44 @@ mod tests {
                 r#"[{"id":"sub-1","title":"subtask","description":null,"status":"pending","depends_on":["sub-0"],"reason":"waiting on dependency"}]"#
             )
         );
+    }
+
+    #[test]
+    fn archived_datetime_round_trip_preserves_original_archive_time() {
+        let mut task = SessionTask {
+            id: "task-archive".into(),
+            title: "historical".into(),
+            description: None,
+            status: SessionTaskStatusKind::Archived,
+            subtasks: vec![],
+            created_at: "2025-01-01T00:00:00Z".into(),
+            updated_at: "2025-03-01T00:00:00Z".into(),
+            active_form: None,
+            owner: None,
+            metadata: None,
+            blocks: vec![],
+            blocked_by: vec![],
+            archived_at: Some("2025-02-01T00:00:00Z".into()),
+        };
+
+        let encoded = encode_task_datetimes(&task).expect("archive datetimes");
+        assert_eq!(
+            encoded.archived_at.as_deref(),
+            Some("2025-02-01 00:00:00.000000")
+        );
+        assert_eq!(encoded.updated_at, "2025-03-01 00:00:00.000000");
+
+        task.archived_at = None;
+        let legacy = encode_task_datetimes(&task).expect("legacy archive fallback");
+        assert_eq!(
+            legacy.archived_at.as_deref(),
+            Some(legacy.updated_at.as_str())
+        );
+
+        task.status = SessionTaskStatusKind::Completed;
+        task.archived_at = Some("2025-02-01T00:00:00Z".into());
+        let active = encode_task_datetimes(&task).expect("non-archive datetime");
+        assert_eq!(active.archived_at, None);
     }
 
     #[test]

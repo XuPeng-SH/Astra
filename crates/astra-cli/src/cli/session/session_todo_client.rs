@@ -13,12 +13,40 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 const TODOS_HTTP_TIMEOUT_SECS: u64 = 15;
 
 #[derive(Deserialize)]
-struct ExecuteTodoResponse {
-    output: String,
+pub(crate) struct ExecuteTodoResponse {
+    pub(crate) output: String,
+    #[serde(default)]
+    pub(crate) mutation: Option<TodoMutationResult>,
+    #[serde(default)]
+    fork_copy: Option<ForkTaskBoardCopyResult>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct TodoMutationResult {
+    pub(crate) status: astra_tools::task_mgmt::TaskMutationStatus,
+    pub(crate) data: Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ForkTaskBoardCopyStatus {
+    Copied,
+    PreservedExistingChild,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ForkTaskBoardCopyResult {
+    status: ForkTaskBoardCopyStatus,
+    source_session_id: String,
+    target_session_id: String,
+    #[serde(rename = "count")]
+    _count: usize,
 }
 
 #[derive(Deserialize)]
@@ -137,19 +165,51 @@ pub async fn execute_todo_action(
     action: &str,
     args: &Value,
 ) -> Result<String, String> {
+    execute_todo_request(cloud_base, token, session_id, action, args)
+        .await
+        .map(|response| response.output)
+}
+
+/// Typed variant for callers that make lifecycle, rollback, or refresh
+/// decisions. Rendered `output` is never parsed as a protocol.
+pub(crate) async fn execute_todo_action_typed(
+    cloud_base: &str,
+    token: Option<&str>,
+    session_id: &str,
+    action: &str,
+    args: &Value,
+) -> Result<ExecuteTodoResponse, String> {
+    execute_todo_request(cloud_base, token, session_id, action, args).await
+}
+
+async fn execute_todo_request(
+    cloud_base: &str,
+    token: Option<&str>,
+    session_id: &str,
+    action: &str,
+    args: &Value,
+) -> Result<ExecuteTodoResponse, String> {
     let url = format!(
         "{}/sessions/{}/todos:execute",
         cloud_base.trim_end_matches('/'),
         session_id
     );
+    // Runtime-only fields carry execution identity and observability context;
+    // they are not part of the public task-board contract and must never cross
+    // the REST boundary as task data.  The call id still gives create a stable
+    // idempotency identity, so a lost response followed by replay cannot create
+    // a duplicate task.  Direct callers without a runtime identity retain the
+    // old per-invocation UUID behavior, which deliberately does not collapse
+    // two legitimate tasks merely because their public fields are identical.
+    let public_args = astra_tools::task_tool_contract::strip_runtime_private_task_fields(args);
     let body = if action == "create" {
         json!({
             "action": action,
-            "args": args,
-            "idempotency_key": format!("todo-create:{}", uuid::Uuid::new_v4()),
+            "args": public_args,
+            "idempotency_key": todo_create_idempotency_key(session_id, args),
         })
     } else {
-        json!({ "action": action, "args": args })
+        json!({ "action": action, "args": public_args })
     };
 
     for attempt in 0..2 {
@@ -165,7 +225,7 @@ pub async fn execute_todo_action(
                         .json()
                         .await
                         .map_err(|e| format!("decode response: {e}"))?;
-                    return Ok(parsed.output);
+                    return Ok(parsed);
                 }
                 // Retry once on 5xx; 4xx surfaces immediately.
                 if status.is_server_error() && attempt == 0 {
@@ -191,18 +251,36 @@ pub async fn execute_todo_action(
     Err("execute_todo_action: retry loop exhausted".to_string())
 }
 
+fn todo_create_idempotency_key(session_id: &str, args: &Value) -> String {
+    let Some(tool_call_id) = args
+        .get("_tool_call_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    else {
+        return format!("todo-create:{}", uuid::Uuid::new_v4());
+    };
+
+    let mut digest = Sha256::new();
+    digest.update(b"astra:todo-create:v1\0");
+    digest.update(session_id.as_bytes());
+    digest.update(b"\0");
+    digest.update(tool_call_id.as_bytes());
+    format!("todo-create:{:x}", digest.finalize())
+}
+
 /// Internal fork support: copy the parent session task board into an
 /// empty child session without migrating the parent tasks. Uses the
 /// same server-side TaskManager/MatrixOne write surface as model-facing
 /// task actions, but `fork_copy` is intentionally not exposed in the
 /// tool schema.
-pub async fn copy_todos_for_fork(
+pub(crate) async fn copy_todos_for_fork(
     cloud_base: &str,
     token: Option<&str>,
     source_session_id: &str,
     target_session_id: &str,
-) -> Result<String, String> {
-    execute_todo_action(
+) -> Result<ForkTaskBoardCopyStatus, String> {
+    let response = execute_todo_request(
         cloud_base,
         token,
         target_session_id,
@@ -211,7 +289,23 @@ pub async fn copy_todos_for_fork(
             "source_session_id": source_session_id,
         }),
     )
-    .await
+    .await?;
+    let result = response.fork_copy.ok_or_else(|| {
+        format!(
+            "cloud fork task-board response omitted typed fork_copy result: {}",
+            response.output
+        )
+    })?;
+    if result.source_session_id != source_session_id
+        || result.target_session_id != target_session_id
+    {
+        return Err(format!(
+            "cloud fork task-board response identity mismatch: expected {source_session_id} -> \
+             {target_session_id}, got {} -> {}",
+            result.source_session_id, result.target_session_id
+        ));
+    }
+    Ok(result.status)
 }
 
 /// `GET /users/me/todos?status=...` — cross-session active list for
@@ -521,7 +615,11 @@ impl TaskStore for HttpTaskStore {
         Err("HttpTaskStore is read-only; mutations go through route_task_action".into())
     }
 
-    async fn mutate(&self, _session_id: &str, _mutation: TaskMutation) -> Result<String, String> {
+    async fn mutate(
+        &self,
+        _session_id: &str,
+        _mutation: TaskMutation,
+    ) -> Result<astra_tools::task_mgmt::TaskMutationOutcome, String> {
         Err("HttpTaskStore is read-only; mutations go through route_task_action".into())
     }
 
@@ -539,6 +637,41 @@ impl TaskStore for HttpTaskStore {
 
     fn subscribe(&self) -> Option<tokio::sync::broadcast::Receiver<String>> {
         Some(self.notify_tx.subscribe())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::todo_create_idempotency_key;
+    use serde_json::json;
+
+    #[test]
+    fn create_idempotency_uses_stable_runtime_execution_identity() {
+        let args = json!({
+            "action": "create",
+            "title": "ship",
+            "_tool_call_id": "call-1"
+        });
+        let first = todo_create_idempotency_key("session-1", &args);
+        let replay = todo_create_idempotency_key("session-1", &args);
+        assert_eq!(first, replay);
+        assert_ne!(first, todo_create_idempotency_key("session-2", &args));
+
+        let other_call = json!({
+            "action": "create",
+            "title": "ship",
+            "_tool_call_id": "call-2"
+        });
+        assert_ne!(first, todo_create_idempotency_key("session-1", &other_call));
+    }
+
+    #[test]
+    fn equal_public_creates_without_execution_identity_remain_distinct() {
+        let args = json!({"action": "create", "title": "ship"});
+        assert_ne!(
+            todo_create_idempotency_key("session-1", &args),
+            todo_create_idempotency_key("session-1", &args)
+        );
     }
 }
 
@@ -570,8 +703,8 @@ impl TaskStore for HttpTaskStore {
 #[cfg(test)]
 mod wiring_e2e {
     use super::{
-        HttpTaskStore, copy_todos_for_fork, execute_todo_action, health_for_http_status,
-        list_user_todos,
+        ForkTaskBoardCopyStatus, HttpTaskStore, copy_todos_for_fork, execute_todo_action,
+        health_for_http_status, list_user_todos,
     };
     use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
     use crate::lock_recovery::LockRecovery;
@@ -620,7 +753,7 @@ mod wiring_e2e {
                 let action = body.get("action").and_then(|v| v.as_str()).unwrap_or("");
                 let args = body.get("args").cloned().unwrap_or(Value::Null);
                 let mut tasks = state_exec.lock_recover();
-                let output = match action {
+                let (output, mutation) = match action {
                     "create" => {
                         let next = counter_exec.fetch_add(1, Ordering::SeqCst) + 1;
                         let id = format!("task-{next}");
@@ -644,7 +777,13 @@ mod wiring_e2e {
                             blocks: vec![],
                             blocked_by: vec![],
                         });
-                        format!("Task #{id} created: {title}")
+                        (
+                            format!("Task #{id} created: {title}"),
+                            Some(json!({
+                                "status": "applied",
+                                "data": {"success": true, "task_id": id}
+                            })),
+                        )
                     }
                     "update" => {
                         let id = args.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -656,11 +795,18 @@ mod wiring_e2e {
                             task.status =
                                 astra_tools::task_mgmt::SessionTaskStatusKind::from(new_status);
                         }
-                        format!("Task #{id} updated to {new_status}")
+                        (
+                            format!("Task #{id} updated to {new_status}"),
+                            Some(json!({
+                                "status": "applied",
+                                "data": {"success": true, "task_id": id, "status": new_status}
+                            })),
+                        )
                     }
-                    other => format!("Error: unsupported action {other}"),
+                    other => (format!("Error: unsupported action {other}"), None),
                 };
-                ResponseTemplate::new(200).set_body_json(json!({ "output": output }))
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "output": output, "mutation": mutation }))
             })
             .mount(&server)
             .await;
@@ -985,18 +1131,62 @@ mod wiring_e2e {
             .respond_with(|req: &Request| {
                 let body: Value = serde_json::from_slice(&req.body).expect("json body");
                 assert_eq!(body["action"], "fork_copy", "{body}");
-                assert_eq!(body["args"]["source_session_id"], "parent-session", "{body}");
+                assert_eq!(
+                    body["args"]["source_session_id"], "parent-session",
+                    "{body}"
+                );
                 ResponseTemplate::new(200).set_body_json(json!({
-                    "output": "Fork task board copied: 1 task(s)\n{\"success\":true,\"status\":\"copied\",\"count\":1}"
+                    "output": "Human-facing wording may change without breaking fork state",
+                    "fork_copy": {
+                        "status": "copied",
+                        "source_session_id": "parent-session",
+                        "target_session_id": "child-session",
+                        "count": 1
+                    }
                 }))
             })
             .mount(&server)
             .await;
 
-        let output = copy_todos_for_fork(&server.uri(), None, "parent-session", "child-session")
+        let status = copy_todos_for_fork(&server.uri(), None, "parent-session", "child-session")
             .await
             .expect("mock fork copy");
-        assert!(output.contains("\"status\":\"copied\""), "{output}");
+        assert_eq!(status, ForkTaskBoardCopyStatus::Copied);
+    }
+
+    #[tokio::test]
+    async fn create_uses_call_identity_but_does_not_leak_private_args() {
+        let server = MockServer::start().await;
+        let args = json!({
+            "action": "create",
+            "title": "ship",
+            "_tool_call_id": "call-create-1",
+            "_run_id": "run-1"
+        });
+        let expected_key = super::todo_create_idempotency_key("session-1", &args);
+        Mock::given(method("POST"))
+            .and(path("/sessions/session-1/todos:execute"))
+            .respond_with(move |request: &Request| {
+                let body: Value = serde_json::from_slice(&request.body).expect("json body");
+                assert_eq!(body["idempotency_key"], expected_key, "{body}");
+                assert_eq!(body["args"]["title"], "ship", "{body}");
+                assert!(body["args"].get("_tool_call_id").is_none(), "{body}");
+                assert!(body["args"].get("_run_id").is_none(), "{body}");
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "output": "created",
+                    "mutation": {
+                        "status": "applied",
+                        "data": {"task_id": "task-1"}
+                    }
+                }))
+            })
+            .mount(&server)
+            .await;
+
+        let output = execute_todo_action(&server.uri(), None, "session-1", "create", &args)
+            .await
+            .expect("create request");
+        assert_eq!(output, "created");
     }
 
     #[tokio::test]

@@ -169,6 +169,22 @@ impl TaskBoardProjection {
         }
     }
 
+    /// Whether the projection contains work that still needs attention.
+    ///
+    /// Terminal rows remain in [`Self::has_tasks`] so Ctrl+T can open durable
+    /// history. Compact surfaces use this narrower projection to avoid making
+    /// completed or cancelled history look like permanently active work.
+    pub(crate) fn has_open_work(&self) -> bool {
+        match self {
+            Self::Single { snapshot, .. } => snapshot.has_incomplete(),
+            Self::All { snapshot, .. } => snapshot
+                .per_session
+                .iter()
+                .flat_map(|(_, tasks)| tasks)
+                .any(|task| task.status.is_open_work()),
+        }
+    }
+
     /// Whether two projections render the same task-board surface. This lets
     /// the tick path refresh an already-open workspace without repainting on
     /// every timer wakeup, while still repainting truth/freshness transitions.
@@ -544,11 +560,9 @@ impl TaskBoardObserver {
                     && state.single_binding_generation == generation =>
                 {
                     state.single_lane.request_failed(Instant::now(), health);
-                    inner.single_dirty.store(true, Ordering::Release);
                 }
                 FetchIdentity::All => {
                     state.all_lane.request_failed(Instant::now(), health);
-                    inner.all_dirty.store(true, Ordering::Release);
                 }
                 FetchIdentity::Single { .. } => {}
             }
@@ -575,37 +589,35 @@ impl TaskBoardObserver {
         snap
     }
 
-    /// Cheap render-visible summary counts for the footer chip: `(open,
-    /// total, hidden)`. Only explicitly non-displayable tombstones are
-    /// omitted; completed and cancelled work remains inspectable.
+    /// Cheap lifecycle summary counts for the footer chip: `(open, total,
+    /// hidden)`. While work remains, `total` retains completed/failed/cancelled
+    /// progress. Once `open` reaches zero both counts collapse to zero so
+    /// terminal history does not keep an idle session's chip alive.
     pub fn counts(&self) -> (usize, usize, bool) {
         let (st, _) = lock_state(&self.inner, "counts");
         if st.view_mode == ViewMode::AllSessions {
-            let tasks = st
+            let total = st
                 .multi_snapshot
                 .per_session
                 .iter()
                 .flat_map(|(_, tasks)| tasks)
-                .filter(|task| task.status.is_open_work());
-            let (open, total) = tasks.fold((0, 0), |(open, total), task| {
+                .filter(|task| task.status.is_open_work())
+                .count();
+            return (total, total, false);
+        }
+        let (open, total) = st
+            .snapshot
+            .tasks
+            .iter()
+            .filter(|task| task_visible_in_render_snapshot(task))
+            .fold((0, 0), |(open, total), task| {
                 (open + usize::from(task.status.is_open_work()), total + 1)
             });
-            return (open, total, false);
+        if open == 0 {
+            (0, 0, st.snapshot.hidden)
+        } else {
+            (open, total, st.snapshot.hidden)
         }
-        let total = st
-            .snapshot
-            .tasks
-            .iter()
-            .filter(|task| task_visible_in_render_snapshot(task))
-            .count();
-        let open = st
-            .snapshot
-            .tasks
-            .iter()
-            .filter(|task| task_visible_in_render_snapshot(task))
-            .filter(|t| t.status.is_open_work())
-            .count();
-        (open, total, st.snapshot.hidden)
     }
 
     /// IDs of tasks that changed within [`EVENT_FRESH_WINDOW`] of
@@ -1041,16 +1053,12 @@ fn failure_backoff(consecutive_failures: u32) -> Duration {
     (POLL_INTERVAL * multiplier).min(MAX_FAILURE_BACKOFF)
 }
 
-/// Cheap equality check for Tier 1 boards (dozens of rows): compare
-/// `(id, status, title, updated_at)` tuples. Avoids forcing PartialEq
-/// on the public SessionTask struct in astra-tools.
+/// Equality for the complete renderer-facing task projection. Tier 1 boards
+/// contain only dozens of rows, so suppressing a repaint is not worth hiding
+/// an owner, dependency, subtask, metadata, or description update merely
+/// because a producer preserved the same `updated_at` value.
 fn same_board(a: &[SessionTask], b: &[SessionTask]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b.iter()).all(|(x, y)| {
-        x.id == y.id && x.status == y.status && x.title == y.title && x.updated_at == y.updated_at
-    })
+    a == b
 }
 
 /// Compose the task-board read model without assigning ownership of either
@@ -1106,10 +1114,15 @@ fn replace_single_snapshot(state: &mut ObserverState, tasks: Vec<SessionTask>) {
         state.snapshot.tasks = tasks;
     }
 
-    let empty = state.snapshot.tasks.is_empty();
-    // An empty source has nothing to render. Every non-empty source remains
-    // visible; terminal history is not a timeout-driven decoration.
-    state.snapshot.hidden = empty;
+    // A refresh must not undo an explicit collapse of terminal history. New
+    // open work always becomes visible, while a terminal-only refresh keeps
+    // the user's prior review/collapse choice. Empty snapshots hide their
+    // compact lane; the next open task clears that state immediately.
+    if state.snapshot.tasks.is_empty() {
+        state.snapshot.hidden = true;
+    } else if state.snapshot.has_incomplete() {
+        state.snapshot.hidden = false;
+    }
 }
 
 fn task_visible_in_render_snapshot(task: &SessionTask) -> bool {
@@ -2153,6 +2166,10 @@ mod tests {
         }
 
         let observer = TaskBoardObserver::new(Arc::new(StalledStore), "sess-stalled");
+        // Mirror the production fetch path: maybe_refresh consumes the dirty
+        // signal before marking a request in flight.  The supervisor must not
+        // manufacture a new dirty signal when that request later times out.
+        observer.inner.single_dirty.store(false, Ordering::Relaxed);
         {
             let (mut state, _) = lock_state(&observer.inner, "test_stalled_fetch");
             state.single_lane.request_started();
@@ -2171,6 +2188,10 @@ mod tests {
         tokio::task::yield_now().await;
 
         assert_eq!(observer.truth_state(), TaskBoardTruthState::Unavailable);
+        assert!(
+            !observer.inner.single_dirty.load(Ordering::Relaxed),
+            "a timeout is failure evidence, not a new store-change signal; automatic retries must honor backoff"
+        );
         assert!(observer.request_refresh());
     }
 
@@ -2390,10 +2411,35 @@ mod tests {
             || obs.maybe_refresh(),
         )
         .await;
-        {
-            let mut st = obs.inner.state.lock_recover();
-            st.snapshot.hidden = true;
-        }
+        obs.hide_completed_after_review();
+        assert!(
+            obs.snapshot().hidden,
+            "explicit collapse hides terminal history"
+        );
+
+        // Exercise the real observer refresh path. A periodic reconciliation
+        // of unchanged terminal rows must preserve the user's collapse.
+        let update = m
+            .update(&json!({
+                "task_id": "task-1",
+                "description": "authoritative terminal refresh"
+            }))
+            .await;
+        assert!(!update.starts_with("Error:"), "{update}");
+        wait_until(
+            || {
+                obs.snapshot().tasks.first().is_some_and(|task| {
+                    task.description.as_deref() == Some("authoritative terminal refresh")
+                })
+            },
+            500,
+            || obs.maybe_refresh(),
+        )
+        .await;
+        assert!(
+            obs.snapshot().hidden,
+            "refresh must not resurrect explicitly collapsed terminal history"
+        );
 
         assert!(
             obs.reveal_completed_for_review(),

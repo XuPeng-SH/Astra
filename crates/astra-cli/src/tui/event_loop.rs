@@ -54,9 +54,48 @@ const BASH_DETACH_HANDOFF_WAIT: Duration = Duration::from_millis(500);
 const BACKGROUND_REGISTRY_SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
 const LOCAL_AGENT_RECONCILE_INTERVAL: Duration = Duration::from_millis(500);
 const LOCAL_AGENT_SESSION_REBIND_DRAIN: Duration = Duration::from_millis(250);
-const RUNTIME_NOTIFICATION_TURN_SENTINEL: &str = "\u{2063}astra-runtime-notification-turn\u{2063}";
+const LOCAL_AGENT_SESSION_SHUTDOWN_DRAIN: Duration = Duration::from_secs(2);
+const RUNTIME_NOTIFICATION_SETTLE_DELAY: Duration = Duration::from_millis(200);
 const LOCAL_AGENT_SESSION_REBIND_REASON: &str =
     "session changed; local agent belonged to the previous session";
+const LOCAL_AGENT_SESSION_SHUTDOWN_REASON: &str = "interactive session is shutting down";
+
+async fn await_shutdown_signal(
+    mut receiver: tokio::sync::watch::Receiver<
+        Option<crate::cli::session::session_guard::ShutdownSignal>,
+    >,
+) -> crate::cli::session::session_guard::ShutdownSignal {
+    loop {
+        if let Some(signal) = *receiver.borrow_and_update() {
+            return signal;
+        }
+        if receiver.changed().await.is_err() {
+            // The process-global sender lives for the process lifetime. Keep
+            // this future inert if that invariant ever changes instead of
+            // turning a closed control channel into a busy shutdown loop.
+            return std::future::pending().await;
+        }
+    }
+}
+
+fn schedule_runtime_notification_wake(
+    wake_at: &mut Option<std::time::Instant>,
+    now: std::time::Instant,
+) {
+    wake_at.get_or_insert(now + RUNTIME_NOTIFICATION_SETTLE_DELAY);
+}
+
+fn release_runtime_notification_turn(
+    turn_pending: &mut bool,
+    wake_at: &mut Option<std::time::Instant>,
+    retry_needed: bool,
+    now: std::time::Instant,
+) {
+    *turn_pending = false;
+    if retry_needed {
+        schedule_runtime_notification_wake(wake_at, now);
+    }
+}
 
 /// A one-shot startup observation. These are deliberately presentation-only:
 /// the TUI can accept input before they arrive, and no effect changes the
@@ -880,25 +919,46 @@ async fn rebuild_local_agent_runtime_after_session_rebind(
 async fn retire_local_agent_spawner(
     spawner: Arc<astra_runtime::orchestration::DynamicAgentSpawner>,
 ) -> usize {
-    let active_agent_ids: Vec<_> = spawner
+    retire_local_agent_spawner_with_reason(
+        spawner,
+        LOCAL_AGENT_SESSION_REBIND_REASON,
+        LOCAL_AGENT_SESSION_REBIND_DRAIN,
+    )
+    .await
+}
+
+async fn retire_local_agent_spawner_with_reason(
+    spawner: Arc<astra_runtime::orchestration::DynamicAgentSpawner>,
+    reason: &str,
+    drain: Duration,
+) -> usize {
+    let active_agent_count = spawner
         .get_agent_history(None)
         .await
         .into_iter()
         .filter(|agent| !agent.status.is_terminal())
-        .map(|agent| agent.agent_id)
-        .collect();
-    let mut cancelled = 0;
-    for agent_id in active_agent_ids {
-        cancelled += usize::from(
-            spawner
-                .cancel_agent(&agent_id, LOCAL_AGENT_SESSION_REBIND_REASON)
-                .await,
+        .count();
+    // `drain` is the graceful-work budget, not merely the initial JoinSet
+    // wait. Bound the complete retirement future as well: durable cancellation
+    // may involve a slow server or mailbox store and must not pin terminal
+    // restoration indefinitely. Dropping the spawner-owned JoinSet aborts any
+    // remaining local hosts; durable active runs stay recoverable by lease.
+    let total_budget = drain.saturating_add(Duration::from_millis(500));
+    if tokio::time::timeout(
+        total_budget,
+        spawner.shutdown_and_wait_with_reason(drain, reason),
+    )
+    .await
+    .is_err()
+    {
+        tracing::warn!(
+            reason,
+            budget_ms = total_budget.as_millis(),
+            active_agent_count,
+            "local agent retirement exceeded the total shutdown budget"
         );
     }
-    spawner
-        .shutdown_and_wait(LOCAL_AGENT_SESSION_REBIND_DRAIN)
-        .await;
-    cancelled
+    active_agent_count
 }
 
 fn ctrl_b_promoted_agent_message(
@@ -1920,6 +1980,12 @@ fn drain_plan_updates_into_workbench(
     changed
 }
 
+fn reconcile_task_board_on_open(task_board: &task_board_observer::TaskBoardObserver) {
+    if task_board.request_refresh() && tokio::runtime::Handle::try_current().is_ok() {
+        task_board.maybe_refresh();
+    }
+}
+
 fn handle_task_surface_shortcut(
     key: &crossterm::event::KeyEvent,
     task_board: &task_board_observer::TaskBoardObserver,
@@ -1932,17 +1998,36 @@ fn handle_task_surface_shortcut(
         || !key
             .modifiers
             .contains(crossterm::event::KeyModifiers::CONTROL)
-        || (bottom_pane.has_active_view() && !bottom_pane.primary_workspace_is_open())
+        || (bottom_pane.has_active_view()
+            && !bottom_pane.primary_workspace_is_open()
+            && !bottom_pane.agent_monitor_is_open())
     {
         return false;
     }
 
-    // A focused transcript owns the primary canvas, so the compact board
-    // beneath the composer is deliberately not painted. Ctrl+T therefore
-    // opens the same canonical projection as a workspace, preserving the
-    // conversation tab below it instead of silently toggling an invisible
-    // strip. Ctrl+B remains the explicit background-task surface.
-    if bottom_pane.conversation_tab_is_open() {
+    // A primary workspace owns the canvas, so the compact board beneath the
+    // composer is not painted. Ctrl+T therefore switches to the canonical
+    // Task Board workspace instead of toggling invisible state behind a
+    // transcript, agent monitor, or other workbench view. The retained view
+    // is reactivated so its typed focus and scroll state survive navigation.
+    // Ctrl+B remains the explicit background-task surface.
+    if bottom_pane.task_board_is_open() {
+        if key
+            .modifiers
+            .contains(crossterm::event::KeyModifiers::SHIFT)
+        {
+            task_board.toggle_view_mode();
+            task_board.reveal_completed_for_review();
+            reconcile_task_board_on_open(task_board);
+            bottom_pane.refresh_task_board(&task_board.active_projection());
+            frame_requester.schedule_frame();
+            return true;
+        }
+        bottom_pane.close_active_view();
+        frame_requester.schedule_frame();
+        return true;
+    }
+    if bottom_pane.primary_workspace_is_open() || bottom_pane.agent_monitor_is_open() {
         if key
             .modifiers
             .contains(crossterm::event::KeyModifiers::SHIFT)
@@ -1950,9 +2035,12 @@ fn handle_task_surface_shortcut(
             task_board.toggle_view_mode();
         }
         task_board.reveal_completed_for_review();
-        bottom_pane.push_view(Box::new(bottom_pane::task_board_view::TaskBoardView::new(
-            task_board.active_projection(),
-        )));
+        reconcile_task_board_on_open(task_board);
+        if !bottom_pane.activate_task_board() {
+            bottom_pane.push_view(Box::new(bottom_pane::task_board_view::TaskBoardView::new(
+                task_board.active_projection(),
+            )));
+        }
         frame_requester.schedule_frame();
         return true;
     }
@@ -1968,6 +2056,7 @@ fn handle_task_surface_shortcut(
         // from an unavailable checklist service.
         *board_expanded = true;
         *board_user_pin = Some(true);
+        reconcile_task_board_on_open(task_board);
         frame_requester.schedule_frame();
         return true;
     }
@@ -1977,6 +2066,9 @@ fn handle_task_surface_shortcut(
     *board_expanded = new_pin;
     if new_pin {
         task_board.reveal_completed_for_review();
+        // Ctrl+T is an explicit inspection request. Reconcile immediately so
+        // an idle/terminal board does not first show a quiet-poll-old snapshot.
+        reconcile_task_board_on_open(task_board);
     } else {
         task_board.hide_completed_after_review();
     }
@@ -4189,10 +4281,54 @@ fn local_background_shell_started_message(task_id: &str, command: &str) -> Strin
     )
 }
 
-async fn run_interactive_shell_command(command: &str) -> std::io::Result<std::process::ExitStatus> {
+async fn run_interactive_shell_command(
+    command: &str,
+    shutdown: &tokio_util::sync::CancellationToken,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
     let mut child = tokio::process::Command::new("sh");
     child.arg("-c").arg(command).kill_on_drop(true);
-    child.status().await
+    #[cfg(unix)]
+    {
+        // Give the interactive command its own process group so shutdown also
+        // reaches grandchildren launched by the shell.
+        unsafe {
+            child.pre_exec(|| {
+                if nix::libc::setpgid(0, 0) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+    }
+    let mut child = child.spawn()?;
+    tokio::select! {
+        status = child.wait() => status.map(Some),
+        _ = shutdown.cancelled() => {
+            #[cfg(unix)]
+            if let Some(pid) = child.id() {
+                let _ = nix::sys::signal::killpg(
+                    nix::unistd::Pid::from_raw(pid as i32),
+                    nix::sys::signal::Signal::SIGTERM,
+                );
+            }
+            #[cfg(not(unix))]
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(Duration::from_millis(500), child.wait()).await;
+            if child.id().is_some() {
+                #[cfg(unix)]
+                if let Some(pid) = child.id() {
+                    let _ = nix::sys::signal::killpg(
+                        nix::unistd::Pid::from_raw(pid as i32),
+                        nix::sys::signal::Signal::SIGKILL,
+                    );
+                }
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+            }
+            Ok(None)
+        }
+    }
 }
 
 /// Whether a `!cmd` shell command needs a real TTY (inherited stdio).
@@ -4348,7 +4484,7 @@ pub(crate) async fn run_tui_session(
         initialize_session_state, install_task_service, install_task_store, resolve_task_service,
         resolve_task_store,
     };
-    use crate::cli::session::session_startup::complete_session_startup;
+    use crate::cli::session::session_startup::{SessionStartupArtifacts, complete_session_startup};
     use crate::cli::startup_trace::StartupTracer;
 
     // ── Ensure terminal is in sane state before startup output ────────
@@ -4379,7 +4515,7 @@ pub(crate) async fn run_tui_session(
         state.max_budget_limit = max_budget;
     }
     tracer.phase("state_init");
-    let _startup = complete_session_startup(
+    let startup = complete_session_startup(
         &mut state,
         &mut tracer,
         api,
@@ -4389,8 +4525,51 @@ pub(crate) async fn run_tui_session(
         cli_context,
     )
     .await?;
+    let SessionStartupArtifacts {
+        pipeline_modules,
+        mut edge_heartbeat_task,
+        shutdown_signal_rx,
+        ..
+    } = startup;
     tracer.finish(state.session_id.as_deref());
 
+    // Take terminal ownership before spawning any TUI-owned worker. If the
+    // terminal vanished during startup, retire the startup-owned runtime now
+    // instead of detaching heartbeat/agent work from a TUI that never ran.
+    let mut guard = match TerminalGuard::init() {
+        Ok(guard) => guard,
+        Err(error) => {
+            if let Some(spawner) = state.agent_spawner.take() {
+                retire_local_agent_spawner_with_reason(
+                    spawner,
+                    LOCAL_AGENT_SESSION_SHUTDOWN_REASON,
+                    LOCAL_AGENT_SESSION_SHUTDOWN_DRAIN,
+                )
+                .await;
+            }
+            if tokio::time::timeout(Duration::from_millis(750), state.unregister_root_mailbox())
+                .await
+                .is_err()
+            {
+                tracing::warn!("root mailbox unregister exceeded TUI init-failure budget");
+            }
+            if let Some(task) = edge_heartbeat_task.take() {
+                task.abort();
+                let _ = task.await;
+            }
+            crate::cli::session::session_cleanup::finalize_session_durable_boundary(&mut state);
+            crate::cli::session::session_cleanup::finalize_session_process_boundary(&mut state);
+            drop(pipeline_modules);
+            return Err(format!("TUI init failed: {error}"));
+        }
+    };
+    let session_shutdown_token = tokio_util::sync::CancellationToken::new();
+    let shutdown_monitor_token = session_shutdown_token.clone();
+    let mut shutdown_monitor = tokio::spawn(async move {
+        let signal = await_shutdown_signal(shutdown_signal_rx).await;
+        shutdown_monitor_token.cancel();
+        signal
+    });
     // Local and bundled skills are already available. External providers
     // converge in a supervised task after startup so DB/MCP latency cannot
     // delay the first interactive frame.
@@ -4410,7 +4589,7 @@ pub(crate) async fn run_tui_session(
     // ── TUI mode overrides ──────────────────────────────────────────────
     let (tui_tx, mut tui_rx) = stream_bridge::create_channels();
     state.tui_render_policy = Some(crate::cli::stream::stream_render::RenderPolicy::Silent);
-    let mut tui_cancel_token = std::sync::Arc::new(tokio_util::sync::CancellationToken::new());
+    let mut tui_cancel_token = std::sync::Arc::new(session_shutdown_token.child_token());
     state.tui_cancel_token = Some(tui_cancel_token.clone());
 
     // Approval channel: tool approval requests from SSE host → TUI overlay
@@ -4438,7 +4617,6 @@ pub(crate) async fn run_tui_session(
     let mut bottom_pane = BottomPane::new();
     bottom_pane.set_file_writer(file_writer.clone());
     // ── Enter TUI ───────────────────────────────────────────────────────
-    let mut guard = TerminalGuard::init().map_err(|e| format!("TUI init failed: {e}"))?;
     let (draw_tx, draw_rx) = broadcast::channel(16);
     let frame_requester = FrameRequester::new(draw_tx);
     guard.set_history_drain_requester(frame_requester.clone());
@@ -4718,6 +4896,9 @@ pub(crate) async fn run_tui_session(
         tokio::pin!(tick);
 
         tokio::select! {
+            _ = session_shutdown_token.cancelled() => {
+                break 'main Ok(());
+            }
             Some(completion) = turn_post_commit_completion_rx.recv() => {
                 let completed_session_id = completion.session_id.clone();
                 let errors = crate::cli::turn::turn_post_commit::apply_turn_post_commit_completion(
@@ -4805,8 +4986,25 @@ pub(crate) async fn run_tui_session(
                 frame_requester.schedule_frame();
             }
             Some(ev) = event_stream.next() => {
+                let runtime_notification_event = matches!(ev, TuiEvent::RuntimeNotificationTurn);
+                let ev = match ev {
+                    TuiEvent::RuntimeNotificationTurn => TuiEvent::Key(
+                        crossterm::event::KeyEvent::new(
+                            crossterm::event::KeyCode::Enter,
+                            crossterm::event::KeyModifiers::NONE,
+                        ),
+                    ),
+                    event => event,
+                };
                 match ev {
                     TuiEvent::Key(key) => {
+                        let runtime_notification_submission =
+                            runtime_notification_event && runtime_notification_turn_pending;
+                        if runtime_notification_event && !runtime_notification_submission {
+                            // A real user submission may have consumed and re-armed the
+                            // scheduled wake before this queued event was observed.
+                            continue;
+                        }
                         match handle_global_key_action(
                             key,
                             &mut guard,
@@ -4955,7 +5153,12 @@ pub(crate) async fn run_tui_session(
                         ) {
                             continue;
                         }
-                        match bottom_pane.handle_key(key) {
+                        let bottom_pane_action = if runtime_notification_submission {
+                            BottomPaneAction::SubmitInput(String::new())
+                        } else {
+                            bottom_pane.handle_key(key)
+                        };
+                        match bottom_pane_action {
                             BottomPaneAction::OpenPermissionModePicker => {
                                 bottom_pane.push_view(Box::new(
                                     slash_dispatch::build_permission_mode_picker(
@@ -4965,24 +5168,20 @@ pub(crate) async fn run_tui_session(
                                 frame_requester.schedule_frame();
                             }
                             BottomPaneAction::SubmitInput(text) => {
-                                let runtime_notification_submission =
-                                    runtime_notification_turn_pending
-                                        && text == RUNTIME_NOTIFICATION_TURN_SENTINEL;
                                 if runtime_notification_turn_pending {
                                     // The scheduled wake is consumed either by its
-                                    // sentinel or by a real user submission that won
-                                    // the race. In the latter case ordinary input
+                                    // typed event or by a real user submission that
+                                    // won the race. In the latter case ordinary input
                                     // finalization normally carries the pending runtime
                                     // facts. Re-arm as a fallback because the real input
                                     // may instead be a local slash/shell action that does
                                     // not enter a model boundary.
-                                    runtime_notification_turn_pending = false;
-                                    if !runtime_notification_submission {
-                                        runtime_notification_wake_at.get_or_insert_with(|| {
-                                            std::time::Instant::now()
-                                                + Duration::from_millis(200)
-                                        });
-                                    }
+                                    release_runtime_notification_turn(
+                                        &mut runtime_notification_turn_pending,
+                                        &mut runtime_notification_wake_at,
+                                        !runtime_notification_submission,
+                                        std::time::Instant::now(),
+                                    );
                                 }
                                 let text = if runtime_notification_submission {
                                     String::new()
@@ -5028,23 +5227,28 @@ pub(crate) async fn run_tui_session(
                                     }
                                     LocalShellSubmission::Interactive(command) => {
                                         let command_for_child = command.clone();
+                                        let shell_shutdown = session_shutdown_token.clone();
                                         let status = guard
                                             .with_restored(|| async move {
                                                 println!("! {command_for_child}");
-                                                run_interactive_shell_command(&command_for_child)
-                                                    .await
+                                                run_interactive_shell_command(
+                                                    &command_for_child,
+                                                    &shell_shutdown,
+                                                )
+                                                .await
                                             })
                                             .await;
                                         guard.terminal.invalidate_viewport();
                                         match status {
-                                            Ok(Ok(status)) if status.success() => {
+                                            Ok(Ok(None)) => break 'main Ok(()),
+                                            Ok(Ok(Some(status))) if status.success() => {
                                                 chat_widget.commit_system(
                                                     history_cell::system::SystemCell::response(
                                                         format!("! {command}"),
                                                     ),
                                                 );
                                             }
-                                            Ok(Ok(status)) => {
+                                            Ok(Ok(Some(status))) => {
                                                 chat_widget.commit_system(
                                                     history_cell::system::SystemCell::error(format!(
                                                         "! {command}: exit {}",
@@ -5740,6 +5944,9 @@ pub(crate) async fn run_tui_session(
                                             let itick = tokio::time::sleep(Duration::from_millis(80));
                                             tokio::pin!(itick);
                                             tokio::select! {
+                                                _ = session_shutdown_token.cancelled() => {
+                                                    break 'main Ok(());
+                                                }
                                                 // Fair selection keeps key storms from starving a
                                                 // ready Bash handoff or runtime event.
                                                 result = &mut fut, if turn_result_ready.is_none() => {
@@ -6237,8 +6444,22 @@ pub(crate) async fn run_tui_session(
                                         guard.terminal.size().map(|s| s.height).unwrap_or(24),
                                     );
                                     board_expanded = frame.resolved_board_expanded;
-                                    let _ = do_draw(&mut guard, frame.active, frame.multi_agent, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board);
+                                                            let _ = do_draw(&mut guard, frame.active, frame.multi_agent, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board);
                                 }
+                                                        }
+                                                        TuiEvent::RuntimeNotificationTurn => {
+                                                            // Runtime-notification wakes are only scheduled by
+                                                            // the idle loop. If one was already queued when a
+                                                            // foreground turn began, leave the durable facts in
+                                                            // SessionState and release the one-wake latch. Keeping
+                                                            // the latch set here would permanently suppress the
+                                                            // replacement wake after this turn settles.
+                                                            release_runtime_notification_turn(
+                                                                &mut runtime_notification_turn_pending,
+                                                                &mut runtime_notification_wake_at,
+                                                                true,
+                                                                std::time::Instant::now(),
+                                                            );
                                                         }
                                                     }
                                                 }
@@ -6871,10 +7092,10 @@ pub(crate) async fn run_tui_session(
                                         state
                                             .pending_bg_notifications
                                             .extend(deferred_active_bg_notifications);
-                                        runtime_notification_wake_at.get_or_insert_with(|| {
-                                            std::time::Instant::now()
-                                                + Duration::from_millis(200)
-                                        });
+                                        schedule_runtime_notification_wake(
+                                            &mut runtime_notification_wake_at,
+                                            std::time::Instant::now(),
+                                        );
                                     }
 
                                     if let Some(mode) = bottom_pane.take_staged_permission_mode() {
@@ -7068,7 +7289,9 @@ pub(crate) async fn run_tui_session(
                                     // scrollback in one shot.
                                     flush_chat_widget(&mut guard, &mut chat_widget, w);
 
-                                    let new_tok = std::sync::Arc::new(tokio_util::sync::CancellationToken::new());
+                                    let new_tok = std::sync::Arc::new(
+                                        session_shutdown_token.child_token(),
+                                    );
                                     tui_cancel_token = new_tok.clone();
                                     state.tui_cancel_token = Some(new_tok);
 
@@ -7673,6 +7896,9 @@ pub(crate) async fn run_tui_session(
                         bottom_pane.handle_paste(&text);
                         frame_requester.schedule_frame();
                     }
+                    TuiEvent::RuntimeNotificationTurn => unreachable!(
+                        "runtime notification events are normalized before dispatch"
+                    ),
                 }
             }
             Some(ae) = tui_rx.recv() => {
@@ -8021,9 +8247,10 @@ pub(crate) async fn run_tui_session(
                         .attention_notifications_since(&local_agent_snapshot);
                     if !agent_notifications.is_empty() {
                         state.pending_bg_notifications.extend(agent_notifications);
-                        runtime_notification_wake_at.get_or_insert_with(|| {
-                            std::time::Instant::now() + Duration::from_millis(200)
-                        });
+                        schedule_runtime_notification_wake(
+                            &mut runtime_notification_wake_at,
+                            std::time::Instant::now(),
+                        );
                     }
                     local_agent_snapshot = next_local_agent_snapshot;
                     let projection_changed = chat_widget.reconcile_local_agent_snapshot(
@@ -8055,9 +8282,10 @@ pub(crate) async fn run_tui_session(
                     let notification = super::background_tasks::format_notification_xml(ev);
                     if !notification.is_empty() {
                         state.pending_bg_notifications.push(notification);
-                        runtime_notification_wake_at.get_or_insert_with(|| {
-                            std::time::Instant::now() + Duration::from_millis(200)
-                        });
+                        schedule_runtime_notification_wake(
+                            &mut runtime_notification_wake_at,
+                            std::time::Instant::now(),
+                        );
                     }
                 }
                 for msg in background_task_event_system_messages(&bg_events) {
@@ -8078,15 +8306,7 @@ pub(crate) async fn run_tui_session(
                 {
                     runtime_notification_wake_at = None;
                     runtime_notification_turn_pending = true;
-                    bottom_pane
-                        .composer
-                        .set_text(RUNTIME_NOTIFICATION_TURN_SENTINEL);
-                    event_stream.push_front(TuiEvent::Key(
-                        crossterm::event::KeyEvent::new(
-                            crossterm::event::KeyCode::Enter,
-                            crossterm::event::KeyModifiers::NONE,
-                        ),
-                    ));
+                    event_stream.push_front(TuiEvent::RuntimeNotificationTurn);
                 }
                 persist_background_task_projections_if_changed(
                     &mut background_registry,
@@ -8162,6 +8382,53 @@ pub(crate) async fn run_tui_session(
             }
         }
     };
+    let shutdown_signal = if session_shutdown_token.is_cancelled() {
+        match (&mut shutdown_monitor).await {
+            Ok(signal) => Some(signal),
+            Err(error) => {
+                tracing::warn!(%error, "TUI shutdown monitor failed after requesting shutdown");
+                None
+            }
+        }
+    } else {
+        shutdown_monitor.abort();
+        let _ = shutdown_monitor.await;
+        None
+    };
+    let signal_driven_shutdown = shutdown_signal.is_some();
+    if let Some(signal) = shutdown_signal {
+        tracing::info!(
+            signal = signal.label(),
+            "TUI received process shutdown signal"
+        );
+    }
+
+    // Stop read-side observers first so teardown does not race fresh remote
+    // fetches into state that is already converging toward shutdown.
+    drop(task_board);
+    drop(plan_task_observer);
+    drop(server_agent_observer);
+    state.tui_cancel_token = None;
+    drop(state.plan_handle.take());
+
+    if let Some(spawner) = state.agent_spawner.take() {
+        retire_local_agent_spawner_with_reason(
+            spawner,
+            LOCAL_AGENT_SESSION_SHUTDOWN_REASON,
+            LOCAL_AGENT_SESSION_SHUTDOWN_DRAIN,
+        )
+        .await;
+    }
+    if tokio::time::timeout(Duration::from_millis(750), state.unregister_root_mailbox())
+        .await
+        .is_err()
+    {
+        tracing::warn!("root mailbox unregister exceeded TUI shutdown budget");
+    }
+    if let Some(task) = edge_heartbeat_task.take() {
+        task.abort();
+        let _ = task.await;
+    }
     if external_skill_discovery_pending {
         external_skill_discovery.abort();
         let _ = external_skill_discovery.await;
@@ -8199,8 +8466,10 @@ pub(crate) async fn run_tui_session(
         &mut background_task_projection_cache,
     )
     .await;
-    if let Err(error) = file_writer_runtime.shutdown().await {
-        tracing::warn!(%error, "TUI file writer did not shut down cleanly");
+    match tokio::time::timeout(Duration::from_secs(2), file_writer_runtime.shutdown()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(%error, "TUI file writer did not shut down cleanly"),
+        Err(_) => tracing::warn!("TUI file writer exceeded shutdown budget"),
     }
     surface_tui_file_write_errors(
         &mut file_write_errors,
@@ -8211,6 +8480,32 @@ pub(crate) async fn run_tui_session(
     );
     let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
     flush_chat_widget(&mut guard, &mut chat_widget, width);
+    let finalization_budget = if signal_driven_shutdown {
+        Duration::from_secs(2)
+    } else {
+        Duration::from_secs(8)
+    };
+    let finalization_completed = tokio::time::timeout(
+        finalization_budget,
+        crate::cli::session::session_cleanup::finalize_session(&mut state),
+    )
+    .await
+    .is_ok();
+    if !finalization_completed {
+        tracing::warn!(
+            budget_ms = finalization_budget.as_millis(),
+            "optional session finalization exceeded TUI shutdown budget"
+        );
+        // These two idempotent boundaries are mandatory even when optional
+        // memory governance timed out: the canonical session is resumable,
+        // cloud ingest is notified, and process-local lifecycle state is
+        // released.
+        crate::cli::session::session_cleanup::finalize_session_durable_boundary(&mut state);
+        crate::cli::session::session_cleanup::finalize_session_process_boundary(&mut state);
+    }
+    // The pipeline bundle owns the skill watcher. Drop it only after all
+    // turn/agent work has stopped so no consumer outlives its provider.
+    drop(pipeline_modules);
     drop(guard);
     result
 }
@@ -8362,6 +8657,42 @@ mod tests {
         let mut buffer = ratatui::buffer::Buffer::empty(area);
         bottom_pane.render(area, &mut buffer);
         crate::tui::testing::render::buffer_to_string(&buffer)
+    }
+
+    #[tokio::test]
+    async fn shutdown_signal_waiter_observes_the_typed_signal() {
+        let (sender, receiver) = tokio::sync::watch::channel(None);
+        let waiter = tokio::spawn(await_shutdown_signal(receiver));
+
+        sender
+            .send(Some(
+                crate::cli::session::session_guard::ShutdownSignal::Sighup,
+            ))
+            .expect("shutdown receiver remains connected");
+
+        assert_eq!(
+            waiter.await.expect("shutdown waiter task"),
+            crate::cli::session::session_guard::ShutdownSignal::Sighup,
+        );
+    }
+
+    #[test]
+    fn deferred_runtime_notification_releases_latch_and_rearms_once() {
+        let now = std::time::Instant::now();
+        let mut pending = true;
+        let mut wake_at = None;
+
+        release_runtime_notification_turn(&mut pending, &mut wake_at, true, now);
+
+        assert!(!pending);
+        assert_eq!(wake_at, Some(now + RUNTIME_NOTIFICATION_SETTLE_DELAY));
+
+        let existing = wake_at;
+        release_runtime_notification_turn(&mut pending, &mut wake_at, true, now);
+        assert_eq!(
+            wake_at, existing,
+            "releasing twice must not postpone the wake"
+        );
     }
 
     #[test]
@@ -9274,7 +9605,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_rebind_retires_active_local_agents_with_explicit_terminal_state() {
+    async fn session_rebind_retires_active_local_agents_as_system_lifecycle_work() {
         let spawner = test_agent_spawner(Arc::new(PendingAgentExecutor));
         let output = spawner
             .spawn(
@@ -9303,7 +9634,7 @@ mod tests {
         assert!(matches!(
             state.status,
             AgentStatus::Cancelled {
-                by_user: true,
+                by_user: false,
                 ref reason,
             } if reason == LOCAL_AGENT_SESSION_REBIND_REASON
         ));
@@ -9917,8 +10248,8 @@ mod tests {
             background_task_output_snapshot_for_rejected_fanout_slot(&group, &group.slots[1], 0, 9)
                 .expect("snapshot");
         assert_eq!(snapshot.kind, "local agent");
-        assert_eq!(snapshot.status, "failed");
-        assert!(snapshot.terminal);
+        assert_eq!(snapshot.status.as_str(), "failed");
+        assert!(snapshot.status.is_terminal());
         assert_eq!(snapshot.output, "concurren");
         assert_eq!(snapshot.total_bytes, "concurrency cap reached".len() as u64);
     }
@@ -9937,10 +10268,10 @@ mod tests {
 
         assert_eq!(snapshot.kind, "local agent");
         assert_eq!(snapshot.title.as_deref(), Some("review auth flow"));
-        assert_eq!(snapshot.status, "running");
+        assert_eq!(snapshot.status.as_str(), "running");
         assert_eq!(snapshot.output, "reviewing auth middleware");
         assert_eq!(snapshot.output_ref, "agent_state: agent-1");
-        assert!(!snapshot.terminal);
+        assert!(!snapshot.status.is_terminal());
     }
 
     fn restored_local_agent_projection(
@@ -10078,7 +10409,7 @@ mod tests {
             .expect("foreground tick must answer command")
             .expect("background output must be readable");
         assert_eq!(snapshot.output, "progress\n");
-        assert!(snapshot.terminal);
+        assert!(snapshot.status.is_terminal());
         assert!(commands.lock_recover().is_empty());
     }
 
@@ -10126,7 +10457,7 @@ mod tests {
             "{}",
             snapshot.output
         );
-        assert!(snapshot.terminal);
+        assert!(snapshot.status.is_terminal());
         assert!(commands.lock_recover().is_empty());
     }
 
@@ -10183,8 +10514,8 @@ mod tests {
         .expect("restored projection should be readable");
 
         assert_eq!(snapshot.kind, "local agent");
-        assert_eq!(snapshot.status, "running");
-        assert!(!snapshot.terminal);
+        assert_eq!(snapshot.status.as_str(), "unavailable");
+        assert!(snapshot.status.is_terminal());
         assert_eq!(snapshot.output, "reviewing auth middleware");
         assert_eq!(snapshot.output_ref, "workspace_projection: agent-restored");
     }
@@ -10523,6 +10854,28 @@ mod tests {
         assert!(bottom_pane.primary_workspace_is_open());
         assert!(render_bottom_pane_text(&bottom_pane, 80, 16).contains("Task board"));
 
+        assert!(handle_task_surface_shortcut(
+            &key,
+            &task_board,
+            &mut expanded,
+            &mut pin,
+            &mut bottom_pane,
+            &frame_requester,
+        ));
+        assert!(
+            bottom_pane.conversation_tab_is_open(),
+            "a second Ctrl+T should return to the retained conversation"
+        );
+
+        assert!(handle_task_surface_shortcut(
+            &key,
+            &task_board,
+            &mut expanded,
+            &mut pin,
+            &mut bottom_pane,
+            &frame_requester,
+        ));
+
         assert!(matches!(
             bottom_pane.handle_key(crossterm::event::KeyEvent::new(
                 crossterm::event::KeyCode::Esc,
@@ -10531,6 +10884,65 @@ mod tests {
             crate::tui::bottom_pane::BottomPaneAction::ViewCompleted { .. }
         ));
         assert!(bottom_pane.conversation_tab_is_open());
+    }
+
+    #[test]
+    fn ctrl_t_switches_between_agent_monitor_and_task_board() {
+        let store = Arc::new(astra_tools::task_mgmt::InMemoryTaskStore::new().with_validation());
+        let task_board = task_board_observer::TaskBoardObserver::new(store, "session-a");
+        let frame_requester = FrameRequester::test_dummy();
+        let key = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('t'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+        let mut expanded = false;
+        let mut pin = None;
+        let mut bottom_pane = BottomPane::new();
+        let mut chat_widget = chat_widget::ChatWidget::new(String::new());
+        chat_widget.handle_event(chat_widget::AppEvent::wire(
+            crate::tui::chat_widget::WireEvent::AgentLive(
+                astra_turn_core::agent_live_event::AgentLiveEvent {
+                    run_id: "run-review".into(),
+                    agent_id: "reviewer@run-review".into(),
+                    kind: astra_turn_core::agent_live_event::AgentLiveEventKind::OutputDelta(
+                        "reviewing".into(),
+                    ),
+                },
+            ),
+        ));
+        assert!(handle_agent_monitor_shortcut(
+            &crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('g'),
+                crossterm::event::KeyModifiers::CONTROL,
+            ),
+            &mut chat_widget,
+            &mut bottom_pane,
+            &frame_requester,
+        ));
+        assert!(bottom_pane.agent_monitor_is_open());
+
+        assert!(handle_task_surface_shortcut(
+            &key,
+            &task_board,
+            &mut expanded,
+            &mut pin,
+            &mut bottom_pane,
+            &frame_requester,
+        ));
+        assert!(bottom_pane.task_board_is_open());
+
+        assert!(handle_task_surface_shortcut(
+            &key,
+            &task_board,
+            &mut expanded,
+            &mut pin,
+            &mut bottom_pane,
+            &frame_requester,
+        ));
+        assert!(
+            bottom_pane.agent_monitor_is_open(),
+            "closing Task Board should restore the retained Agent Monitor"
+        );
     }
 
     #[test]
@@ -11068,8 +11480,8 @@ mod tests {
             .await
             .expect("snapshot");
 
-        assert_eq!(snapshot.status, "completed");
-        assert!(snapshot.terminal, "{snapshot:?}");
+        assert_eq!(snapshot.status.as_str(), "completed");
+        assert!(snapshot.status.is_terminal(), "{snapshot:?}");
         assert!(snapshot.output.contains("done"), "{snapshot:?}");
         assert!(snapshot.output_ref.contains("stdout:"), "{snapshot:?}");
         assert!(snapshot.output_ref.contains("stderr:"), "{snapshot:?}");
@@ -11088,8 +11500,8 @@ mod tests {
             .await
             .expect("snapshot");
 
-        assert_eq!(snapshot.status, "failed");
-        assert!(snapshot.terminal, "{snapshot:?}");
+        assert_eq!(snapshot.status.as_str(), "failed");
+        assert!(snapshot.status.is_terminal(), "{snapshot:?}");
         assert!(snapshot.output.contains("<stderr>"), "{snapshot:?}");
         assert!(snapshot.output.contains("stderr-line"), "{snapshot:?}");
         assert!(snapshot.output_ref.contains("stdout:"), "{snapshot:?}");
@@ -11126,8 +11538,8 @@ mod tests {
             .await
             .expect("snapshot");
 
-        assert_eq!(snapshot.status, "running");
-        assert!(!snapshot.terminal, "{snapshot:?}");
+        assert_eq!(snapshot.status.as_str(), "running");
+        assert!(!snapshot.status.is_terminal(), "{snapshot:?}");
         assert_eq!(snapshot.output, "old output\n");
     }
 
@@ -11994,7 +12406,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn interactive_shell_wait_yields_to_runtime_timers() {
-        let shell = run_interactive_shell_command("sleep 0.15");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let shell = run_interactive_shell_command("sleep 0.15", &shutdown);
         tokio::pin!(shell);
 
         assert!(
@@ -12003,7 +12416,35 @@ mod tests {
                 .is_err(),
             "the child should still be running while the runtime timer fires"
         );
-        assert!(shell.await.expect("wait for shell").success());
+        assert!(
+            shell
+                .await
+                .expect("wait for shell")
+                .expect("ordinary child exit")
+                .success()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn interactive_shell_converges_when_session_shuts_down() {
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let trigger = shutdown.clone();
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            trigger.cancel();
+        });
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_interactive_shell_command("sleep 30", &shutdown),
+        )
+        .await
+        .expect("shutdown must bound the interactive child wait")
+        .expect("spawn interactive child");
+        assert!(
+            outcome.is_none(),
+            "shutdown should not look like child exit"
+        );
     }
 
     #[test]

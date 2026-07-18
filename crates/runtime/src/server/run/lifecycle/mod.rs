@@ -3568,8 +3568,14 @@ impl AgenticRunLifecycleService {
             })
     }
 
-    async fn fail_started_run_before_spawn(&self, user_id: &str, run_id: &str, message: &str) {
-        let terminal_events = pre_spawn_failure_terminal_events(message);
+    async fn fail_started_run_before_spawn(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        message: &str,
+        failure_code: PreSpawnFailureCode,
+    ) {
+        let terminal_events = pre_spawn_failure_terminal_events(message, failure_code);
         astra_core::log_persist!(
             self.run_engine
                 .transition_status_with_events_if_current(
@@ -5426,7 +5432,7 @@ impl AgenticRunLifecycleService {
                 }
             };
         let manager = TaskManager::new(session_id.to_string(), store);
-        match manager.load_active_tasks().await {
+        match manager.load_tasks().await {
             Ok(tasks) => format_task_board_resume_hint(&tasks),
             Err(error) => {
                 tracing::warn!(
@@ -7230,8 +7236,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 Err(error) => {
                     let message =
                         format!("tool executor setup failed after durable run start: {error}");
-                    self.fail_started_run_before_spawn(&user_id, &run_id, &message)
-                        .await;
+                    self.fail_started_run_before_spawn(
+                        &user_id,
+                        &run_id,
+                        &message,
+                        PreSpawnFailureCode::PreSpawnFailure,
+                    )
+                    .await;
                     if let Some(record) = cloud_workspace_record.as_ref() {
                         self.cleanup_cloud_workspace_after_failed_start(
                             &user_id,
@@ -7489,7 +7500,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         "server capacity admission closed before agentic loop start"
                     }
                 };
-                self.fail_started_run_before_spawn(&user_id, &run_id, failure_reason)
+                self.fail_started_run_before_spawn(&user_id, &run_id, failure_reason, error.into())
                     .await;
                 self.remove_run_channels(&run_id).await;
                 if let Some(record) = cloud_workspace_record.as_ref() {
@@ -8321,6 +8332,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         &user_id,
                         &run_id,
                         "failed to start streaming run event stream",
+                        PreSpawnFailureCode::PreSpawnFailure,
                     )
                     .await;
                     if let Some(record) = cloud_workspace_record.as_ref() {
@@ -8392,8 +8404,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     let message = format!(
                         "streaming tool executor setup failed after durable run start: {error}"
                     );
-                    self.fail_started_run_before_spawn(&user_id, &run_id, &message)
-                        .await;
+                    self.fail_started_run_before_spawn(
+                        &user_id,
+                        &run_id,
+                        &message,
+                        PreSpawnFailureCode::PreSpawnFailure,
+                    )
+                    .await;
                     if let Some(record) = cloud_workspace_record.as_ref() {
                         self.cleanup_cloud_workspace_after_failed_start(
                             &user_id,
@@ -8641,7 +8658,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         "server capacity admission closed before streaming agentic loop start"
                     }
                 };
-                self.fail_started_run_before_spawn(&user_id, &run_id, failure_reason)
+                self.fail_started_run_before_spawn(&user_id, &run_id, failure_reason, error.into())
                     .await;
                 self.remove_run_channels(&run_id).await;
                 if let Some(record) = cloud_workspace_record.as_ref() {
@@ -10440,18 +10457,18 @@ fn server_subrun_durable_error(
         Ok(AgenticLoopOutcome::Completed)
             if agent_status == astra_services::coordination::AGENT_RESULT_STATUS_PARTIAL =>
         {
-            interruption_reason.map(|reason| {
-                format!(
-                    "{}{reason}",
-                    astra_services::coordination::AGENT_RESULT_PARTIAL_DURABLE_REASON_PREFIX
-                )
-            })
+            interruption_reason.map(ToString::to_string)
         }
         Ok(AgenticLoopOutcome::Completed) if agent_status == STATUS_FAILED => {
             interruption_reason.map(ToString::to_string)
         }
         _ => None,
     }
+}
+
+fn server_subrun_durable_error_code(agent_status: &str) -> Option<&'static str> {
+    (agent_status == astra_services::coordination::AGENT_RESULT_STATUS_PARTIAL)
+        .then_some(astra_services::coordination::AGENT_RESULT_PARTIAL_DURABLE_ERROR_CODE)
 }
 
 fn server_subrun_waiting_for<'a>(
@@ -10909,22 +10926,44 @@ impl ServerSubRunExecutor {
         run_id: &str,
         status: &str,
         waiting_for: Option<&str>,
+        error_code: Option<&str>,
         error_message: Option<&str>,
     ) {
         let Some(run_engine) = self.durable_run_engine() else {
             return;
         };
-        if let Err(error) = run_engine
-            .persist_status_if_current(
-                user_id,
-                run_id,
-                &[STATUS_RUNNING],
-                status,
-                waiting_for,
-                error_message,
-            )
-            .await
-        {
+        let persisted = if let Some(error_code) = error_code {
+            run_engine
+                .transition_status_with_event_if_current(
+                    user_id,
+                    run_id,
+                    &[STATUS_RUNNING],
+                    status,
+                    waiting_for,
+                    error_message,
+                    json!({
+                        "event_type": "run_finished",
+                        "data": {
+                            "status": status,
+                            "error_code": error_code,
+                            "error": error_message,
+                        }
+                    }),
+                )
+                .await
+        } else {
+            run_engine
+                .persist_status_if_current(
+                    user_id,
+                    run_id,
+                    &[STATUS_RUNNING],
+                    status,
+                    waiting_for,
+                    error_message,
+                )
+                .await
+        };
+        if let Err(error) = persisted {
             tracing::warn!(
                 target: "astra_runtime::subrun",
                 user_id,
@@ -11582,6 +11621,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
         let interruption_reason = server_subrun_interruption_reason(&loop_state);
         let durable_error =
             server_subrun_durable_error(&outcome, projected_status, interruption_reason.as_deref());
+        let durable_error_code = server_subrun_durable_error_code(projected_status);
         let waiting_for =
             server_subrun_waiting_for(&outcome, durable_status, interruption_reason.as_deref());
         self.persist_durable_subrun_status(
@@ -11590,6 +11630,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             &durable_run_id,
             durable_status,
             waiting_for,
+            durable_error_code,
             durable_error.as_deref(),
         )
         .await;

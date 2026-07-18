@@ -1160,6 +1160,39 @@ fn task_board_resume_hint_is_absent_without_open_work() {
 }
 
 #[test]
+fn task_board_resume_hint_distinguishes_resolved_and_unresolved_dependencies() {
+    use astra_tools::task_mgmt::SessionTaskStatusKind;
+
+    let completed = test_session_task(
+        "task-1",
+        "finished prerequisite",
+        SessionTaskStatusKind::Completed,
+    );
+    let mut ready = test_session_task("task-2", "ready dependent", SessionTaskStatusKind::Pending);
+    ready.blocked_by = vec!["task-1".into()];
+    let resolved = format_task_board_resume_hint(&[completed, ready]).expect("resolved hint");
+    assert!(resolved.contains("next=[pending] task-2"), "{resolved}");
+    assert!(!resolved.contains("blocked_by"), "{resolved}");
+
+    let mut blocked = test_session_task(
+        "task-3",
+        "waiting dependent",
+        SessionTaskStatusKind::Pending,
+    );
+    blocked.blocked_by = vec!["task-missing".into()];
+    let unresolved = format_task_board_resume_hint(&[blocked]).expect("unresolved hint");
+    assert!(
+        unresolved.contains("waiting=[pending] task-3"),
+        "{unresolved}"
+    );
+    assert!(
+        unresolved.contains("blocked_by=task-missing"),
+        "{unresolved}"
+    );
+    assert!(!unresolved.contains("next="), "{unresolved}");
+}
+
+#[test]
 fn trace_redaction_removes_nested_secrets_and_truncates_long_text() {
     let redacted = redact_trace_value(&json!({
         "Authorization": "Bearer secret",
@@ -1846,9 +1879,7 @@ fn server_subrun_tool_only_empty_completion_is_terminal_partial() {
         None,
         None,
     );
-    state.final_text =
-        "[turn_interrupted] 1 tool call(s) completed. Work preserved above.".to_string();
-    state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
+    let interruption = astra_turn_core::interruption::InterruptionRecord::new(
         astra_turn_core::interruption::InterruptionKind::EmptyCompletion,
         astra_turn_core::interruption::ResumeAction::ContinueImmediately,
         astra_turn_core::interruption::InterruptionStateSummary {
@@ -1860,7 +1891,9 @@ fn server_subrun_tool_only_empty_completion_is_terminal_partial() {
             stall_signal: None,
             resume_restricted_tools: vec![],
         },
-    ));
+    );
+    state.final_text = interruption.user_message.clone();
+    state.interruption = Some(interruption);
 
     assert_eq!(
         server_subrun_completed_agent_status(&state),
@@ -1921,7 +1954,11 @@ fn server_subrun_budget_exhaustion_preserves_reason_without_leaving_child_paused
             server_subrun_interruption_reason(&state).as_deref(),
         )
         .as_deref(),
-        Some("partial:budget_exhausted: adaptive hard turn limit reached")
+        Some("budget_exhausted: adaptive hard turn limit reached")
+    );
+    assert_eq!(
+        server_subrun_durable_error_code(server_subrun_outcome_status(&outcome, &state)),
+        Some(astra_services::coordination::AGENT_RESULT_PARTIAL_DURABLE_ERROR_CODE)
     );
 }
 
@@ -3489,6 +3526,53 @@ fn server_subrun_executor_reuses_the_lifecycle_run_engine() {
         Arc::ptr_eq(run_engine.store(), wired.store()),
         "subruns must retain the lifecycle store identity rather than reconstructing a new owner"
     );
+}
+
+#[tokio::test]
+async fn server_subrun_partial_status_persists_typed_error_code() {
+    let run_engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
+    run_engine
+        .start_run("child-run", "user-1", "session-1")
+        .await
+        .unwrap();
+    let executor = ServerSubRunExecutor::new(
+        test_settings(),
+        test_encryptor(),
+        Arc::new(TokioMutex::new(HashMap::new())),
+    )
+    .with_run_engine(run_engine.clone());
+
+    executor
+        .persist_durable_subrun_status(
+            "user-1",
+            "session-1",
+            "child-run",
+            STATUS_FAILED,
+            None,
+            Some(astra_services::coordination::AGENT_RESULT_PARTIAL_DURABLE_ERROR_CODE),
+            Some("budget_exhausted: adaptive hard turn limit reached"),
+        )
+        .await;
+
+    let run = run_engine
+        .load_run("user-1", "child-run")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.status, STATUS_FAILED);
+    assert_eq!(
+        run.error_code.as_deref(),
+        Some(astra_services::coordination::AGENT_RESULT_PARTIAL_DURABLE_ERROR_CODE)
+    );
+    assert_eq!(
+        run.error_message.as_deref(),
+        Some("budget_exhausted: adaptive hard turn limit reached")
+    );
+    assert!(run.events.iter().any(|event| {
+        event["event_type"] == "run_finished"
+            && event["data"]["error_code"]
+                == astra_services::coordination::AGENT_RESULT_PARTIAL_DURABLE_ERROR_CODE
+    }));
 }
 
 #[test]
@@ -11304,6 +11388,7 @@ async fn fail_started_run_before_spawn_persists_terminal_events() {
         "user-1",
         "run-pre-spawn",
         "server capacity timeout before agentic loop start",
+        PreSpawnFailureCode::RunAdmissionTimeout,
     )
     .await;
 
@@ -11354,6 +11439,7 @@ async fn fail_started_run_before_spawn_transition_failure_does_not_commit_partia
         "user-1",
         "run-pre-spawn-fail",
         "server capacity timeout before agentic loop start",
+        PreSpawnFailureCode::RunAdmissionTimeout,
     )
     .await;
 

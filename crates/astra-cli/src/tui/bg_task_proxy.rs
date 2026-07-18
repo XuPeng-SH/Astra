@@ -310,17 +310,14 @@ pub(crate) async fn persist_background_task_projections_if_changed(
     let model = model.unwrap_or("default").to_string();
     let projections_for_write = projections.clone();
     let persisted = tokio::task::spawn_blocking(move || {
-        let mut workspace =
-            match astra_services::session_workspace::read_workspace_optional(&session_id_owned)? {
-                Some(workspace) => workspace,
-                None => astra_services::session_workspace::WorkspaceMetadata::new(
-                    &session_id_owned,
-                    &model,
-                ),
-            };
-        workspace.background_shell_tasks = projections_for_write;
-        workspace.updated_at = chrono::Utc::now().to_rfc3339();
-        astra_services::session_workspace::write_workspace(&workspace)
+        astra_services::session_workspace::update_workspace(
+            &session_id_owned,
+            || astra_services::session_workspace::WorkspaceMetadata::new(&session_id_owned, &model),
+            |workspace| {
+                workspace.background_shell_tasks = projections_for_write;
+                workspace.updated_at = chrono::Utc::now().to_rfc3339();
+            },
+        )
     })
     .await;
     match persisted {
@@ -380,17 +377,14 @@ pub(crate) async fn persist_background_local_agent_task_projections_from_snapsho
     let model = model.unwrap_or("default").to_string();
     let projections_for_write = projections.clone();
     let persisted = tokio::task::spawn_blocking(move || {
-        let mut workspace =
-            match astra_services::session_workspace::read_workspace_optional(&session_id_owned)? {
-                Some(workspace) => workspace,
-                None => astra_services::session_workspace::WorkspaceMetadata::new(
-                    &session_id_owned,
-                    &model,
-                ),
-            };
-        workspace.background_local_agent_tasks = projections_for_write;
-        workspace.updated_at = chrono::Utc::now().to_rfc3339();
-        astra_services::session_workspace::write_workspace(&workspace)
+        astra_services::session_workspace::update_workspace(
+            &session_id_owned,
+            || astra_services::session_workspace::WorkspaceMetadata::new(&session_id_owned, &model),
+            |workspace| {
+                workspace.background_local_agent_tasks = projections_for_write;
+                workspace.updated_at = chrono::Utc::now().to_rfc3339();
+            },
+        )
     })
     .await;
     match persisted {
@@ -451,6 +445,28 @@ pub(crate) fn format_background_task_stop_error_system_message(
     }
 }
 
+fn shell_output_status(
+    status: super::background_tasks::BgTaskStatus,
+) -> crate::edge_tools::BgTaskOutputStatus {
+    match status {
+        super::background_tasks::BgTaskStatus::Running => {
+            crate::edge_tools::BgTaskOutputStatus::Running
+        }
+        super::background_tasks::BgTaskStatus::Stopping => {
+            crate::edge_tools::BgTaskOutputStatus::Stopping
+        }
+        super::background_tasks::BgTaskStatus::Completed => {
+            crate::edge_tools::BgTaskOutputStatus::Completed
+        }
+        super::background_tasks::BgTaskStatus::Failed => {
+            crate::edge_tools::BgTaskOutputStatus::Failed
+        }
+        super::background_tasks::BgTaskStatus::Killed => {
+            crate::edge_tools::BgTaskOutputStatus::Killed
+        }
+    }
+}
+
 pub(crate) async fn background_task_output_snapshot(
     background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
     task_id: &str,
@@ -463,7 +479,7 @@ pub(crate) async fn background_task_output_snapshot(
             .get(task_id)
             .ok_or_else(|| BackgroundTaskError::not_found(task_id))?;
         (
-            handle.projected_status().to_string(),
+            shell_output_status(handle.status()),
             handle.description.clone(),
             format!(
                 "stdout: {} · stderr: {}",
@@ -472,7 +488,6 @@ pub(crate) async fn background_task_output_snapshot(
             ),
         )
     };
-    let terminal = background_task_status_is_terminal(&status);
     let (output, end_offset, total_bytes, total_lines) = background_registry
         .get_combined_output_since_async(task_id, offset, max_bytes)
         .await?;
@@ -485,7 +500,6 @@ pub(crate) async fn background_task_output_snapshot(
         total_bytes,
         total_lines,
         status,
-        terminal,
         output_ref,
     })
 }
@@ -503,7 +517,7 @@ pub(crate) async fn background_task_output_search_snapshot(
             .get(task_id)
             .ok_or_else(|| BackgroundTaskError::not_found(task_id))?;
         (
-            handle.projected_status().to_string(),
+            shell_output_status(handle.status()),
             handle.description.clone(),
             format!(
                 "stdout: {} · stderr: {}",
@@ -512,12 +526,12 @@ pub(crate) async fn background_task_output_search_snapshot(
             ),
         )
     };
-    let terminal = background_task_status_is_terminal(&status);
-    if !terminal {
+    if !status.is_terminal() {
         return Err(BackgroundTaskError::output_unavailable(
             task_id,
             format!(
-                "diagnostic search requires a terminal shell task; current status is {status}. Use one current task_output snapshot and wait for the automatic completion notification."
+                "diagnostic search requires a terminal shell task; current status is {}. Use one current task_output snapshot and wait for the automatic completion notification.",
+                status.as_str()
             ),
         ));
     }
@@ -532,7 +546,6 @@ pub(crate) async fn background_task_output_search_snapshot(
         matching_lines,
         truncated,
         status,
-        terminal,
         output_ref,
     })
 }
@@ -545,19 +558,37 @@ pub(crate) fn background_task_output_snapshot_for_local_agent(
     use astra_turn_core::orchestration_types::AgentStatus;
 
     let (status, full_output) = match &agent.status {
-        AgentStatus::Initializing => ("pending", String::new()),
-        AgentStatus::Running { activity } => ("running", activity.clone()),
+        AgentStatus::Initializing => (
+            crate::edge_tools::BgTaskOutputStatus::Pending,
+            String::new(),
+        ),
+        AgentStatus::Running { activity } => (
+            crate::edge_tools::BgTaskOutputStatus::Running,
+            activity.clone(),
+        ),
         AgentStatus::Idle => (
-            "waiting_for_input",
+            crate::edge_tools::BgTaskOutputStatus::WaitingForInput,
             "Agent is waiting for input.".to_string(),
         ),
-        AgentStatus::Waiting { reason } => {
-            ("waiting_for_input", format!("Agent is waiting: {reason}"))
+        AgentStatus::Waiting { reason } => (
+            crate::edge_tools::BgTaskOutputStatus::WaitingForInput,
+            format!("Agent is waiting: {reason}"),
+        ),
+        AgentStatus::Completed { result, .. } => (
+            crate::edge_tools::BgTaskOutputStatus::Completed,
+            result.clone(),
+        ),
+        AgentStatus::Interrupted { partial_result, .. } => (
+            crate::edge_tools::BgTaskOutputStatus::Interrupted,
+            partial_result.clone(),
+        ),
+        AgentStatus::Failed { error, .. } => {
+            (crate::edge_tools::BgTaskOutputStatus::Failed, error.clone())
         }
-        AgentStatus::Completed { result, .. } => ("completed", result.clone()),
-        AgentStatus::Interrupted { partial_result, .. } => ("interrupted", partial_result.clone()),
-        AgentStatus::Failed { error, .. } => ("failed", error.clone()),
-        AgentStatus::Cancelled { reason, .. } => ("killed", reason.clone()),
+        AgentStatus::Cancelled { reason, .. } => (
+            crate::edge_tools::BgTaskOutputStatus::Killed,
+            reason.clone(),
+        ),
     };
     let total_bytes = full_output.len() as u64;
     let start = offset.min(total_bytes) as usize;
@@ -570,8 +601,7 @@ pub(crate) fn background_task_output_snapshot_for_local_agent(
         end_offset: end as u64,
         total_bytes,
         total_lines: full_output.lines().count() as u64,
-        status: status.to_string(),
-        terminal: background_task_status_is_terminal(status),
+        status,
         output_ref: format!("agent_state: {}", agent.agent_id),
     }
 }
@@ -586,7 +616,26 @@ pub(crate) fn background_task_output_snapshot_for_local_agent_projection(
     let start = offset.min(total_bytes) as usize;
     let end = start.saturating_add(max_bytes).min(full_output.len());
     let output = String::from_utf8_lossy(&full_output.as_bytes()[start..end]).into_owned();
-    let status = projection.status.as_str();
+    let status = match crate::edge_tools::BgTaskOutputStatus::from_protocol(&projection.status) {
+        Some(status) if status.is_terminal() => status,
+        Some(_) => {
+            // A workspace projection is last-observed evidence, not a live
+            // executor. If no current local-agent snapshot matched this id,
+            // reporting a restored `running`/`waiting` row as non-terminal
+            // makes task_output wait or poll forever for a process this
+            // runtime cannot observe. Keep the captured output but fail
+            // closed on lifecycle truth.
+            crate::edge_tools::BgTaskOutputStatus::Unavailable
+        }
+        None => {
+            tracing::warn!(
+                task_id = projection.id,
+                status = projection.status,
+                "restored local agent has unknown status; marking output unavailable"
+            );
+            crate::edge_tools::BgTaskOutputStatus::Unavailable
+        }
+    };
 
     crate::edge_tools::BgTaskOutputSnapshot {
         kind: "local agent".to_string(),
@@ -595,14 +644,9 @@ pub(crate) fn background_task_output_snapshot_for_local_agent_projection(
         end_offset: end as u64,
         total_bytes,
         total_lines: full_output.lines().count() as u64,
-        status: status.to_string(),
-        terminal: background_task_status_is_terminal(status),
+        status,
         output_ref: format!("workspace_projection: {}", projection.id),
     }
-}
-
-pub(crate) fn background_task_status_is_terminal(status: &str) -> bool {
-    matches!(status, "completed" | "failed" | "interrupted" | "killed")
 }
 
 pub(crate) fn format_background_task_output_system_message(
@@ -798,10 +842,7 @@ pub(crate) fn background_task_event_system_messages(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        background_task_output_dir, background_task_output_search_snapshot,
-        background_task_status_is_terminal,
-    };
+    use super::{background_task_output_dir, background_task_output_search_snapshot};
 
     #[tokio::test]
     async fn diagnostic_search_rejects_live_shell_output() {
@@ -851,18 +892,25 @@ mod tests {
     }
 
     #[test]
-    fn terminal_status_is_a_lifecycle_fact_not_an_availability_guess() {
-        for status in ["completed", "failed", "interrupted", "killed"] {
-            assert!(background_task_status_is_terminal(status), "{status}");
+    fn terminal_status_is_derived_from_the_shared_protocol() {
+        use crate::edge_tools::BgTaskOutputStatus;
+
+        for status in [
+            BgTaskOutputStatus::Completed,
+            BgTaskOutputStatus::Failed,
+            BgTaskOutputStatus::Interrupted,
+            BgTaskOutputStatus::Killed,
+            BgTaskOutputStatus::Unavailable,
+        ] {
+            assert!(status.is_terminal(), "{status:?}");
         }
         for status in [
-            "pending",
-            "running",
-            "stopping",
-            "waiting_for_input",
-            "unavailable",
+            BgTaskOutputStatus::Pending,
+            BgTaskOutputStatus::Running,
+            BgTaskOutputStatus::Stopping,
+            BgTaskOutputStatus::WaitingForInput,
         ] {
-            assert!(!background_task_status_is_terminal(status), "{status}");
+            assert!(!status.is_terminal(), "{status:?}");
         }
     }
 }

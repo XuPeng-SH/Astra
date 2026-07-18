@@ -1,6 +1,6 @@
 use chrono::Utc;
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::cli::cli_config::cli_args::{
     SelfCmd, SelfJournalArgs, SelfMutateCmd, SelfMutateConfigArgs, SelfReflectArgs,
@@ -17,10 +17,11 @@ use astra_core::{
     ObservationRecord, ObservationView, Urn,
 };
 use astra_runtime::self_model::ConstraintSet;
-use astra_services::reflect::{ReflectReport, ReflectRequest};
+use astra_services::reflect::{AgentDeliveryRollup, ReflectReport, ReflectRequest};
 use astra_services::self_surface::LoadedSelfSurfaceArtifacts;
 use astra_services::session_journal::{self, JournalEvent, JournalEventType};
 use astra_services::session_workspace::{self, WorkspaceMetadata};
+use astra_turn_core::orchestration::agent_result_wire::AgentToolResultStatusKind;
 use astra_turn_core::tool::schema::tool_schema_name;
 
 use super::surface::self_surface;
@@ -404,7 +405,7 @@ async fn build_reflect_response(
         .count() as i64;
     let data_coverage =
         local_reflect_data_coverage(&request, total_events, warnings.clone(), &recent_events);
-    let summary = if total_events == 0 {
+    let mut summary = if total_events == 0 {
         "No local session observations are available yet.".to_string()
     } else if adverse_count > 0 {
         format!(
@@ -431,6 +432,10 @@ async fn build_reflect_response(
             if recent_events.len() == 1 { "" } else { "s" },
         )
     };
+    if let Some(agent_delivery) = session_agent_delivery_summary(&artifacts.journal_events) {
+        summary.push(' ');
+        summary.push_str(&agent_delivery);
+    }
     let (observations, evidence, graph_slice) =
         local_reflect_observation_graph(&artifacts.session_id, &request, &summary, &recent_events);
     let view = ObservationView {
@@ -462,6 +467,61 @@ async fn build_reflect_response(
         graph_slice,
         budget_result: ObservationBudgetResult::default(),
     }
+}
+
+fn session_agent_delivery_summary(events: &[JournalEvent]) -> Option<String> {
+    // Journal append/replay is at-least-once evidence. Aggregate by durable
+    // child run identity so duplicate lifecycle records cannot manufacture a
+    // higher spawn count or multiple deliverables.
+    let mut spawned_runs = BTreeSet::new();
+    let mut terminal_by_run = BTreeMap::new();
+    let event_run_identity = |event: &JournalEvent| {
+        event
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("run_id").or_else(|| metadata.get("agent_id")))
+            .and_then(serde_json::Value::as_str)
+            .filter(|identity| !identity.is_empty())
+            .map(str::to_string)
+    };
+
+    for event in events {
+        match &event.event_type {
+            JournalEventType::AgentSpawned => {
+                if let Some(identity) = event_run_identity(event) {
+                    spawned_runs.insert(identity);
+                }
+            }
+            JournalEventType::AgentTerminated => {
+                if let Some(identity) = event_run_identity(event) {
+                    let status = event
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.get("status"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(AgentToolResultStatusKind::parse_wire);
+                    terminal_by_run.insert(identity, status);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut rollup = AgentDeliveryRollup::default();
+    rollup.spawned = spawned_runs.len();
+    for status in terminal_by_run
+        .into_iter()
+        .filter_map(|(identity, status)| spawned_runs.contains(&identity).then_some(status))
+    {
+        match status {
+            Some(AgentToolResultStatusKind::Completed) => rollup.completed += 1,
+            Some(AgentToolResultStatusKind::Interrupted) => rollup.interrupted += 1,
+            Some(AgentToolResultStatusKind::Failed) => rollup.failed += 1,
+            Some(AgentToolResultStatusKind::Cancelled) => rollup.cancelled += 1,
+            Some(_) | None => rollup.other_terminal += 1,
+        }
+    }
+    rollup.render_session_summary()
 }
 
 fn local_reflect_warnings(request: &ReflectRequest) -> Vec<String> {
@@ -622,6 +682,7 @@ fn local_reflect_observation_graph(
                 "ts": event.ts,
                 "tools_used": event.tools_used,
                 "source": event_source,
+                "event_metadata": event.metadata,
             })),
         });
         edges.push(ObservationGraphEdge {
@@ -711,23 +772,33 @@ fn persist_config_mutation_value(
     new_value: serde_json::Value,
     preview: &MutatePreviewResponse,
 ) -> Result<(), String> {
-    let mut ws = session_workspace::read_workspace(session_id).map_err(|e| e.to_string())?;
+    let ws = session_workspace::read_workspace(session_id).map_err(|e| e.to_string())?;
     let base_config = effective_runtime_config(Some(&ws))?;
     let mut value = serde_json::to_value(&base_config).map_err(|e| e.to_string())?;
     replace_json_path(&mut value, path, new_value)?;
     let candidate_config: RuntimeConfig =
         serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
     let baseline_json = serde_json::to_value(RuntimeConfig::load()).map_err(|e| e.to_string())?;
-    ws.tuned_config_json = if value == baseline_json {
+    let tuned_config_json = if value == baseline_json {
         None
     } else {
         Some(serde_json::to_string(&candidate_config).map_err(|e| e.to_string())?)
     };
-    ws.updated_at = Utc::now().to_rfc3339();
-    session_workspace::write_workspace(&ws).map_err(|e| e.to_string())?;
+    let mut turn = ws.turn_count;
+    let existed = session_workspace::update_existing_workspace(session_id, |workspace| {
+        workspace.tuned_config_json = tuned_config_json;
+        workspace.updated_at = Utc::now().to_rfc3339();
+        turn = workspace.turn_count;
+    })
+    .map_err(|e| e.to_string())?;
+    if !existed {
+        return Err(format!(
+            "workspace disappeared while persisting config for session {session_id}"
+        ));
+    }
     append_config_change_event(
         session_id,
-        ws.turn_count,
+        turn,
         path,
         &preview.new_value,
         Some(preview.old_value.clone()),
@@ -821,7 +892,9 @@ fn analysis_view_recent_event_previews(
             JournalEventType::TurnEvaluation,
             JournalEventType::PipelineAlert,
             JournalEventType::SessionMemoryExtraction,
+            JournalEventType::AgentSpawned,
             JournalEventType::AgentTerminated,
+            JournalEventType::InterruptionRecorded,
             JournalEventType::VerificationCompleted,
             JournalEventType::Turn,
         ],
@@ -832,14 +905,18 @@ fn analysis_view_recent_event_previews(
             JournalEventType::TurnEvaluation,
             JournalEventType::PipelineAlert,
             JournalEventType::SessionMemoryExtraction,
+            JournalEventType::AgentSpawned,
             JournalEventType::AgentTerminated,
+            JournalEventType::InterruptionRecorded,
             JournalEventType::AdaptivePerTurnApplied,
         ],
         "execution_tools" => &[
             JournalEventType::Turn,
             JournalEventType::TurnEvaluation,
             JournalEventType::PipelineAlert,
+            JournalEventType::AgentSpawned,
             JournalEventType::AgentTerminated,
+            JournalEventType::InterruptionRecorded,
             JournalEventType::AdaptiveScenarioApplied,
             JournalEventType::AdaptivePerTurnApplied,
         ],
@@ -852,7 +929,9 @@ fn analysis_view_recent_event_previews(
             JournalEventType::TurnEvaluation,
             JournalEventType::PipelineAlert,
             JournalEventType::SessionMemoryExtraction,
+            JournalEventType::AgentSpawned,
             JournalEventType::AgentTerminated,
+            JournalEventType::InterruptionRecorded,
             JournalEventType::AdaptiveScenarioApplied,
             JournalEventType::AdaptivePerTurnApplied,
             JournalEventType::VerificationCompleted,
@@ -866,7 +945,9 @@ fn analysis_view_recent_event_previews(
             JournalEventType::TurnEvaluation,
             JournalEventType::PipelineAlert,
             JournalEventType::SessionMemoryExtraction,
+            JournalEventType::AgentSpawned,
             JournalEventType::AgentTerminated,
+            JournalEventType::InterruptionRecorded,
             JournalEventType::AdaptiveScenarioApplied,
             JournalEventType::AdaptivePerTurnApplied,
         ],
@@ -1161,42 +1242,99 @@ fn compact_json_value(value: &serde_json::Value) -> String {
 }
 
 fn event_preview_summary(event: &EventPreview) -> String {
-    let metadata_detail =
-        event
-            .metadata
-            .as_ref()
-            .and_then(|metadata| match event.event_type.as_str() {
-                "turn_evaluation" => metadata
-                    .get("signals")
-                    .and_then(serde_json::Value::as_array)
-                    .and_then(|signals| {
-                        signals.iter().find_map(|signal| {
-                            signal.get("message").and_then(serde_json::Value::as_str)
-                        })
-                    })
-                    .or_else(|| {
-                        (metadata.get("success").and_then(serde_json::Value::as_bool)
-                            == Some(false))
-                        .then_some("turn evaluation reported unsuccessful execution")
-                    }),
-                "pipeline_alert" => metadata
-                    .get("alert_message")
-                    .and_then(serde_json::Value::as_str),
-                "session_memory_extraction" => metadata
-                    .get("llm_detail")
-                    .and_then(serde_json::Value::as_str)
-                    .or_else(|| metadata.get("reason").and_then(serde_json::Value::as_str)),
-                "agent_terminated" => metadata.get("status").and_then(serde_json::Value::as_str),
-                _ => None,
-            });
+    let metadata_detail = event
+        .metadata
+        .as_ref()
+        .and_then(|metadata| event_metadata_detail(&event.event_type, metadata));
     event
         .error
         .as_deref()
+        .or(metadata_detail.as_deref())
         .or(event.user_input_preview.as_deref())
         .or(event.assistant_output_preview.as_deref())
-        .or(metadata_detail)
         .map(|detail| format!("{}: {}", event.event_type, truncate(detail, 180)))
         .unwrap_or_else(|| event.event_type.clone())
+}
+
+fn event_metadata_detail(event_type: &str, metadata: &serde_json::Value) -> Option<String> {
+    match event_type {
+        "turn_evaluation" => metadata
+            .get("signals")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|signals| {
+                signals
+                    .iter()
+                    .find_map(|signal| signal.get("message").and_then(serde_json::Value::as_str))
+            })
+            .map(str::to_string)
+            .or_else(|| {
+                (metadata.get("success").and_then(serde_json::Value::as_bool) == Some(false))
+                    .then(|| "turn evaluation reported unsuccessful execution".to_string())
+            }),
+        "pipeline_alert" => metadata
+            .get("alert_message")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        "session_memory_extraction" => metadata
+            .get("llm_detail")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| metadata.get("reason").and_then(serde_json::Value::as_str))
+            .map(str::to_string),
+        "agent_spawned" => {
+            let agent_id = metadata
+                .get("agent_id")
+                .and_then(serde_json::Value::as_str)?;
+            let agent_type = metadata
+                .get("agent_type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            let description = metadata
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            Some(format!(
+                "agent={agent_id}; type={agent_type}; task={description}"
+            ))
+        }
+        "agent_terminated" => metadata_fields_summary(
+            metadata,
+            &[
+                "agent_id",
+                "status",
+                "finish_reason",
+                "turns_completed",
+                "tool_calls",
+                "prompt_tokens",
+                "completion_tokens",
+                "duration_ms",
+            ],
+        ),
+        "interruption_recorded" => metadata_fields_summary(
+            metadata.get("interruption")?,
+            &[
+                "kind",
+                "resume_mode",
+                "turns_completed",
+                "tool_calls_completed",
+                "remaining_turns",
+                "stall_signal",
+            ],
+        ),
+        _ => None,
+    }
+}
+
+fn metadata_fields_summary(metadata: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    let fields = keys
+        .iter()
+        .filter_map(|key| {
+            metadata
+                .get(*key)
+                .filter(|value| !value.is_null())
+                .map(|value| format!("{key}={}", compact_json_value(value)))
+        })
+        .collect::<Vec<_>>();
+    (!fields.is_empty()).then(|| fields.join("; "))
 }
 
 fn event_preview_has_adverse_signal(event: &EventPreview) -> bool {
@@ -1238,6 +1376,7 @@ fn event_preview_has_adverse_signal(event: &EventPreview) -> bool {
             .get("status")
             .and_then(serde_json::Value::as_str)
             .is_some_and(|status| matches!(status, "failed" | "cancelled" | "interrupted")),
+        "interruption_recorded" => true,
         _ => false,
     }
 }
@@ -1266,14 +1405,159 @@ fn event_preview_ref_namespace(event: &EventPreview) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_reflect_response, cli_provider_visible_tool_names, execute_self_command,
-        replace_json_path, resolve_session_id, verify_runtime_config,
+        EventPreview, build_reflect_response, cli_provider_visible_tool_names,
+        event_preview_has_adverse_signal, event_preview_summary, execute_self_command,
+        persist_config_override, replace_json_path, resolve_session_id,
+        session_agent_delivery_summary, verify_runtime_config,
     };
     use crate::cli::cli_config::cli_args::{SelfCmd, SelfReflectArgs, SelfSessionArgs};
     use crate::cli::cli_config::cli_utils::{
         CredentialsFile, Profile, load_credentials, save_credentials,
     };
     use astra_services::reflect::ReflectRequest;
+
+    #[test]
+    fn reflect_agent_termination_preserves_execution_metrics_and_reason() {
+        let event = EventPreview {
+            event_type: "agent_terminated".to_string(),
+            ts: "2026-07-18T00:00:00Z".to_string(),
+            turn: Some(2),
+            error: None,
+            tools_used: None,
+            metadata: Some(serde_json::json!({
+                "agent_id": "reviewer@abc",
+                "status": "interrupted",
+                "finish_reason": "empty_completion",
+                "turns_completed": 6,
+                "tool_calls": 5,
+                "prompt_tokens": 43086,
+                "completion_tokens": 120,
+                "duration_ms": 127900
+            })),
+            user_input_preview: None,
+            assistant_output_preview: None,
+        };
+
+        let summary = event_preview_summary(&event);
+
+        for evidence in [
+            "status=interrupted",
+            "finish_reason=empty_completion",
+            "turns_completed=6",
+            "tool_calls=5",
+            "prompt_tokens=43086",
+        ] {
+            assert!(summary.contains(evidence), "{summary}");
+        }
+    }
+
+    #[test]
+    fn reflect_interruption_preserves_resume_and_stall_causality() {
+        let event = EventPreview {
+            event_type: "interruption_recorded".to_string(),
+            ts: "2026-07-18T00:00:00Z".to_string(),
+            turn: Some(1),
+            error: None,
+            tools_used: None,
+            metadata: Some(serde_json::json!({
+                "interruption": {
+                    "kind": "empty_completion",
+                    "resume_mode": "settle",
+                    "turns_completed": 11,
+                    "tool_calls_completed": 17,
+                    "remaining_turns": 289,
+                    "stall_signal": "single_tool_streak=9"
+                }
+            })),
+            user_input_preview: Some("legacy flattened summary".to_string()),
+            assistant_output_preview: None,
+        };
+
+        let summary = event_preview_summary(&event);
+
+        assert!(summary.contains("kind=empty_completion"), "{summary}");
+        assert!(summary.contains("remaining_turns=289"), "{summary}");
+        assert!(
+            summary.contains("stall_signal=single_tool_streak=9"),
+            "{summary}"
+        );
+        assert!(event_preview_has_adverse_signal(&event));
+    }
+
+    #[test]
+    fn reflect_summary_reports_agent_deliverable_ratio_from_typed_lifecycle() {
+        let mut events = Vec::new();
+        for index in 0..3 {
+            events.push(
+                astra_services::session_journal::JournalEvent::agent_spawned(
+                    Some("session-1"),
+                    &format!("reviewer-{index}"),
+                    &format!("run-{index}"),
+                    "root-run",
+                    "code-review",
+                    "Review one angle",
+                    None,
+                    false,
+                    None,
+                ),
+            );
+        }
+        for index in 0..3 {
+            events.push(
+                astra_services::session_journal::JournalEvent::agent_terminated(
+                    Some("session-1"),
+                    &format!("reviewer-{index}"),
+                    &format!("run-{index}"),
+                    "code-review",
+                    "interrupted",
+                    Some("empty_completion"),
+                    Some(6 + index),
+                    5 + index,
+                    43_000,
+                    0,
+                    120_000,
+                    None,
+                ),
+            );
+        }
+        // Replayed lifecycle evidence must not change the delivery ratio.
+        events.push(
+            astra_services::session_journal::JournalEvent::agent_spawned(
+                Some("session-1"),
+                "reviewer-0",
+                "run-0",
+                "root-run",
+                "code-review",
+                "Review one angle",
+                None,
+                false,
+                None,
+            ),
+        );
+        events.push(
+            astra_services::session_journal::JournalEvent::agent_terminated(
+                Some("session-1"),
+                "reviewer-0",
+                "run-0",
+                "code-review",
+                "interrupted",
+                Some("empty_completion"),
+                Some(6),
+                5,
+                43_000,
+                0,
+                120_000,
+                None,
+            ),
+        );
+
+        let summary = session_agent_delivery_summary(&events).unwrap();
+
+        assert!(summary.contains("0/3"), "{summary}");
+        assert!(summary.contains("3 interrupted"), "{summary}");
+        assert!(summary.contains("0 other terminal"), "{summary}");
+        assert!(summary.contains("0 without terminal evidence"), "{summary}");
+    }
     use astra_services::self_surface::LoadedSelfSurfaceArtifacts;
     use astra_services::session_journal::{
         self, JournalDirGuard, JournalEvent, JournalEventType, ToolCallRecord,
@@ -1296,6 +1580,42 @@ mod tests {
             }
             Self { key, old }
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn config_override_preserves_background_task_projection() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(temp.path());
+        let session_id = "self-config-preserves-background";
+        let mut workspace = WorkspaceMetadata::new(session_id, "gpt-5");
+        workspace.background_shell_tasks = vec![session_workspace::BackgroundShellTaskProjection {
+            id: "shell-1".into(),
+            status: "running".into(),
+            title: "make check".into(),
+            started_at_ms: 1,
+            ended_at_ms: None,
+            stdout_path: "/tmp/shell-1.stdout".into(),
+            stderr_path: "/tmp/shell-1.stderr".into(),
+            exit_code: None,
+            terminal_reason: None,
+        }];
+        session_workspace::write_workspace(&workspace).unwrap();
+        let current = astra_config::runtime_config::RuntimeConfig::load()
+            .memory
+            .retrieval_top_k;
+        let replacement = if current == 5 { 6 } else { 5 };
+
+        persist_config_override(
+            session_id,
+            "memory.retrieval_top_k",
+            serde_json::json!(replacement),
+        )
+        .unwrap();
+
+        let persisted = session_workspace::read_workspace(session_id).unwrap();
+        assert_eq!(persisted.background_shell_tasks.len(), 1);
+        assert!(persisted.tuned_config_json.is_some());
     }
 
     impl Drop for EnvGuard {

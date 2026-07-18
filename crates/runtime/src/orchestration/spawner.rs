@@ -417,24 +417,19 @@ fn durable_agent_status(run: &astra_services::runs::DurableRunRecord) -> AgentSt
             finish_reason: "durable_result_unavailable".into(),
         },
         astra_core::STATUS_FAILED
-            if run.error_message.as_deref().is_some_and(|message| {
-                message.starts_with(
-                    astra_services::coordination::AGENT_RESULT_PARTIAL_DURABLE_REASON_PREFIX,
-                )
-            }) =>
+            if astra_services::coordination::durable_agent_result_is_partial(
+                run.error_code.as_deref(),
+                run.error_message.as_deref(),
+            ) =>
         {
             AgentStatus::Interrupted {
                 partial_result: output,
-                finish_reason: run
-                    .error_message
-                    .as_deref()
-                    .and_then(|message| {
-                        message.strip_prefix(
-                            astra_services::coordination::AGENT_RESULT_PARTIAL_DURABLE_REASON_PREFIX,
-                        )
-                    })
-                    .unwrap_or("partial")
-                    .to_string(),
+                finish_reason: astra_services::coordination::durable_agent_partial_reason(
+                    run.error_code.as_deref(),
+                    run.error_message.as_deref(),
+                )
+                .unwrap_or("partial")
+                .to_string(),
             }
         }
         astra_core::STATUS_FAILED => AgentStatus::Failed {
@@ -3397,6 +3392,24 @@ impl DynamicAgentSpawner {
     /// Tasks that exceed `deadline` are cancelled through the normal
     /// finalization path before their host tasks are reaped.
     pub async fn shutdown_and_wait(&self, deadline: std::time::Duration) -> Vec<(String, String)> {
+        self.shutdown_and_wait_with_reason(
+            deadline,
+            "one-shot caller deadline elapsed while waiting for background agent",
+        )
+        .await
+    }
+
+    /// Drain background agents within `deadline`, then cancel unfinished work
+    /// as a system lifecycle action using the caller-provided reason.
+    ///
+    /// Session shutdown and session rebind are not user cancellation. Keeping
+    /// that distinction here prevents frontends from calling the public
+    /// user-action API merely to converge owned work during teardown.
+    pub async fn shutdown_and_wait_with_reason(
+        &self,
+        deadline: std::time::Duration,
+        reason: &str,
+    ) -> Vec<(String, String)> {
         let mut set = self
             .background_tasks
             .lock()
@@ -3440,11 +3453,7 @@ impl DynamicAgentSpawner {
                     .clone();
                 for agent_id in unfinished {
                     let _ = self
-                        .cancel_agent_with_origin(
-                            &agent_id,
-                            "one-shot caller deadline elapsed while waiting for background agent",
-                            CancelOrigin::System,
-                        )
+                        .cancel_agent_with_origin(&agent_id, reason, CancelOrigin::System)
                         .await;
                 }
                 set.abort_all();
@@ -3977,10 +3986,9 @@ mod tests {
     #[test]
     fn durable_partial_child_restores_as_interrupted_with_exact_reason() {
         let mut run = durable_run("partial-child", 1, astra_core::STATUS_FAILED);
-        run.error_message = Some(format!(
-            "{}budget_exhausted: adaptive hard turn limit reached",
-            astra_services::coordination::AGENT_RESULT_PARTIAL_DURABLE_REASON_PREFIX
-        ));
+        run.error_code =
+            Some(astra_services::coordination::AGENT_RESULT_PARTIAL_DURABLE_ERROR_CODE.to_string());
+        run.error_message = Some("budget_exhausted: adaptive hard turn limit reached".to_string());
         run.events.push(json!({
             "event_type": "text_done",
             "data": {"full_text": "Partial architecture findings."}

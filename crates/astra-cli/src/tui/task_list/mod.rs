@@ -21,10 +21,12 @@
 //!   are hidden. Recent-completed TTL state lives in the observer.
 //! - **Responsive subject truncation** gated behind available columns.
 
-use astra_tools::task_mgmt::{OpenTaskSummary, SessionTask, SessionTaskStatusKind};
+use astra_tools::task_mgmt::{
+    OpenTaskSummary, SessionTask, SessionTaskStatusKind, unresolved_task_blocker_ids,
+};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use unicode_width::UnicodeWidthStr;
 
 const TASK_BOARD_TOGGLE_HINT: &str = " · Ctrl+T toggle";
@@ -293,12 +295,19 @@ fn sort_by_id_asc(mut tasks: Vec<&SessionTask>) -> Vec<&SessionTask> {
 /// in_progress → pending (open blockers last) → paused → completed →
 /// cancelled/failed/unknown diagnostics. Tombstones (archived/deleted/migrated)
 /// are audit rows and never belong on the live task board.
-fn prioritize<'a>(tasks: &'a [SessionTask], unresolved: &HashSet<String>) -> Vec<&'a SessionTask> {
+fn prioritize<'a>(
+    tasks: &'a [SessionTask],
+    unresolved_by_task: &HashMap<String, Vec<String>>,
+) -> Vec<&'a SessionTask> {
     let in_progress = sort_by_id_asc(tasks.iter().filter(|t| t.status.is_in_progress()).collect());
     let mut pending: Vec<&SessionTask> = tasks.iter().filter(|t| t.status.is_pending()).collect();
     pending.sort_by(|a, b| {
-        let a_blocked = a.blocked_by.iter().any(|id| unresolved.contains(id));
-        let b_blocked = b.blocked_by.iter().any(|id| unresolved.contains(id));
+        let a_blocked = unresolved_by_task
+            .get(&a.id)
+            .is_some_and(|blockers| !blockers.is_empty());
+        let b_blocked = unresolved_by_task
+            .get(&b.id)
+            .is_some_and(|blockers| !blockers.is_empty());
         match (a_blocked, b_blocked) {
             (true, false) => std::cmp::Ordering::Greater,
             (false, true) => std::cmp::Ordering::Less,
@@ -855,13 +864,12 @@ where
         };
     }
     let counts = counts(tasks);
-    let unresolved: HashSet<String> = tasks
+    let unresolved_by_task: HashMap<String, Vec<String>> = tasks
         .iter()
-        .filter(|t| !t.status.is_completed())
-        .map(|t| t.id.clone())
+        .map(|task| (task.id.clone(), unresolved_task_blocker_ids(tasks, task)))
         .collect();
 
-    let prioritized = prioritize(tasks, &unresolved);
+    let prioritized = prioritize(tasks, &unresolved_by_task);
     let (visible, hidden): (Vec<&SessionTask>, Vec<&SessionTask>) = if prioritized.len() > cap {
         let visible = prioritized.iter().take(cap).copied().collect();
         let hidden = prioritized.iter().skip(cap).copied().collect();
@@ -995,12 +1003,10 @@ where
     let mut subtask_rows_emitted = 0usize;
     let mut hidden_subtask_total = 0usize;
     for task in &visible {
-        let open_blockers: Vec<String> = task
-            .blocked_by
-            .iter()
-            .filter(|id| unresolved.contains(*id))
+        let open_blockers = unresolved_by_task
+            .get(&task.id)
             .cloned()
-            .collect();
+            .unwrap_or_default();
         let mut task_line = render_task_line(task, &open_blockers, columns, colors);
         if is_fresh(&task.id) {
             task_line.spans.insert(
@@ -1192,6 +1198,78 @@ pub fn render_collapsed_summary(tasks: &[SessionTask], columns: u16) -> Option<L
     Some(Line::from(spans))
 }
 
+/// Compact projection for the always-on active surface. Terminal rows stay in
+/// `tasks` so completed dependencies can be resolved correctly, but only open
+/// work is eligible for the summary. Ready work is preferred within a status;
+/// when the selected item is blocked, the reason is visible rather than
+/// presenting it as an executable "next" task.
+pub fn render_collapsed_active_summary(
+    tasks: &[SessionTask],
+    columns: u16,
+) -> Option<Line<'static>> {
+    let mut active = tasks
+        .iter()
+        .filter(|task| task_is_renderable(task) && task.status.is_open_work())
+        .cloned()
+        .collect::<Vec<_>>();
+    active.sort_by_key(|task| !unresolved_task_blocker_ids(tasks, task).is_empty());
+    if active.is_empty() {
+        return None;
+    }
+    let selected = active
+        .iter()
+        .find(|task| task.status.is_in_progress())
+        .or_else(|| active.iter().find(|task| task.status.is_pending()))
+        .or_else(|| {
+            active
+                .iter()
+                .find(|task| task.status == SessionTaskStatusKind::Paused)
+        });
+    let blockers = selected
+        .map(|task| unresolved_task_blocker_ids(tasks, task))
+        .unwrap_or_default();
+    let blocker_suffix = if blockers.is_empty() || columns < 40 {
+        None
+    } else {
+        let mut ids = blockers
+            .iter()
+            .take(2)
+            .map(|id| format!("#{}", id.trim_start_matches("task-")))
+            .collect::<Vec<_>>();
+        if blockers.len() > 2 {
+            ids.push(format!("+{}", blockers.len() - 2));
+        }
+        Some(truncate_to_width(
+            &format!(" · waiting on {}", ids.join(", ")),
+            columns as usize / 2,
+        ))
+    };
+    let summary_width = blocker_suffix.as_ref().map_or(columns, |suffix| {
+        columns.saturating_sub(suffix.width() as u16)
+    });
+    // Preserve lifecycle progress in a mixed board while keeping terminal
+    // rows ineligible for current/next selection. Putting the ordered open
+    // rows first lets `render_collapsed_summary` select the same ready task;
+    // appending terminal history keeps done/failed/cancelled counts truthful.
+    let mut lifecycle = active;
+    lifecycle.extend(
+        tasks
+            .iter()
+            .filter(|task| task_is_renderable(task) && !task.status.is_open_work())
+            .cloned(),
+    );
+    let mut line = render_collapsed_summary(&lifecycle, summary_width)?;
+    if let Some(suffix) = blocker_suffix {
+        line.spans.push(Span::styled(
+            suffix,
+            Style::default()
+                .fg(crate::tui::theme::current().warn)
+                .add_modifier(Modifier::DIM),
+        ));
+    }
+    Some(line)
+}
+
 /// One-line summary for the typed cross-session projection. Unlike the
 /// full-task variant, this never implies that omitted history or subtasks were
 /// loaded; it reports only the open rows the server confirmed.
@@ -1280,17 +1358,26 @@ pub fn render_collapsed_multi_summary(
 /// `Tasks` but a task is in flight. Matches the reference TUI's Spinner
 /// fallback at `components/Spinner.tsx:296`.
 pub fn render_next_hint(tasks: &[SessionTask], columns: u16) -> Option<Line<'static>> {
-    // Pick the first in-progress task, else first pending.
-    let candidate = tasks
+    let mut active = tasks
         .iter()
-        .find(|t| t.status.is_in_progress())
-        .or_else(|| tasks.iter().find(|t| t.status.is_pending()))?;
+        .filter(|task| task.status.is_open_work())
+        .map(|task| (task, unresolved_task_blocker_ids(tasks, task)))
+        .collect::<Vec<_>>();
+    active.sort_by_key(|(task, blockers)| (task.status.active_priority(), !blockers.is_empty()));
+    let (candidate, blockers) = active.first()?;
+    let label = if !blockers.is_empty() {
+        "Waiting · "
+    } else if candidate.status == SessionTaskStatusKind::Paused {
+        "Resume · "
+    } else {
+        "Focus · "
+    };
     let subject = truncate_to_width(
         &candidate.title,
-        max_subject_width(columns).saturating_sub(9), // "Focus · "
+        max_subject_width(columns).saturating_sub(label.width()),
     );
     Some(Line::from(Span::styled(
-        format!("Focus · {}", subject),
+        format!("{label}{subject}"),
         Style::default().add_modifier(Modifier::DIM),
     )))
 }
@@ -1544,6 +1631,36 @@ mod tests {
     }
 
     #[test]
+    fn blocker_badge_uses_dependency_state_not_edge_presence() {
+        let completed = mk_task("task-1", "finished prerequisite", "completed");
+        let mut ready = mk_task("task-2", "ready", "pending");
+        ready.blocked_by = vec!["task-1".into()];
+        let mut dangling = mk_task("task-3", "dangling", "pending");
+        dangling.blocked_by = vec!["task-missing".into()];
+
+        let lines = render(&[completed, ready, dangling], 100, 40, false);
+        let ready_line = lines
+            .iter()
+            .find(|line| spans_text(line).contains("ready"))
+            .map(spans_text)
+            .expect("ready row");
+        let dangling_line = lines
+            .iter()
+            .find(|line| spans_text(line).contains("dangling"))
+            .map(spans_text)
+            .expect("dangling row");
+
+        assert!(
+            !ready_line.contains("waiting on"),
+            "completed prerequisites must not look unresolved: {ready_line}"
+        );
+        assert!(
+            dangling_line.contains("waiting on #missing"),
+            "missing prerequisites must fail closed instead of disappearing: {dangling_line}"
+        );
+    }
+
+    #[test]
     fn next_hint_picks_in_progress_first() {
         let tasks = vec![
             mk_task("task-1", "done-thing", "completed"),
@@ -1560,6 +1677,24 @@ mod tests {
     fn next_hint_returns_none_when_all_completed() {
         let tasks = vec![mk_task("task-1", "done", "completed")];
         assert!(render_next_hint(&tasks, 80).is_none());
+    }
+
+    #[test]
+    fn next_hint_does_not_present_blocked_work_as_focus() {
+        let blocker = mk_task("task-1", "prerequisite", "pending");
+        let mut blocked = mk_task("task-2", "dependent", "pending");
+        blocked.blocked_by = vec!["task-1".into()];
+        let hint = render_next_hint(&[blocker, blocked], 80).expect("ready blocker hint");
+        assert_eq!(spans_text(&hint), "Focus · prerequisite");
+
+        let mut missing = mk_task("task-3", "needs missing input", "pending");
+        missing.blocked_by = vec!["task-missing".into()];
+        let waiting = render_next_hint(&[missing], 80).expect("blocked hint");
+        assert_eq!(spans_text(&waiting), "Waiting · needs missing input");
+
+        let paused = mk_task("task-4", "paused for review", "paused");
+        let resume = render_next_hint(&[paused], 80).expect("paused hint");
+        assert_eq!(spans_text(&resume), "Resume · paused for review");
     }
 
     #[test]
@@ -1601,6 +1736,56 @@ mod tests {
         assert!(text.contains("1 paused"), "{text}");
         assert!(text.contains("paused-thing"), "{text}");
         assert!(!text.contains("working"), "{text}");
+    }
+
+    #[test]
+    fn collapsed_active_summary_prefers_ready_work_and_explains_blocked_work() {
+        let blocker = mk_task("task-1", "prerequisite", "pending");
+        let mut blocked = mk_task("task-2", "blocked next", "pending");
+        blocked.blocked_by = vec!["task-1".into()];
+        let ready = mk_task("task-3", "ready next", "pending");
+        let tasks = vec![blocker, blocked, ready];
+        let ready_summary =
+            spans_text(&render_collapsed_active_summary(&tasks, 100).expect("active summary"));
+        assert!(ready_summary.contains("prerequisite"), "{ready_summary}");
+        assert!(!ready_summary.contains("blocked next"), "{ready_summary}");
+
+        let completed = mk_task("task-1", "finished prerequisite", "completed");
+        let mut dependent = mk_task("task-2", "dependent", "pending");
+        dependent.blocked_by = vec!["task-1".into()];
+        let resolved_summary = spans_text(
+            &render_collapsed_active_summary(&[completed, dependent], 100)
+                .expect("resolved active summary"),
+        );
+        assert!(resolved_summary.contains("dependent"), "{resolved_summary}");
+        assert!(
+            resolved_summary.contains("1 done"),
+            "mixed compact boards must retain terminal lifecycle progress: {resolved_summary}"
+        );
+        assert!(
+            !resolved_summary.contains("waiting on"),
+            "{resolved_summary}"
+        );
+
+        let mut dangling = mk_task("task-4", "dangling", "pending");
+        dangling.blocked_by = vec!["task-missing".into()];
+        let blocked_summary = spans_text(
+            &render_collapsed_active_summary(&[dangling], 100).expect("blocked active summary"),
+        );
+        assert!(
+            blocked_summary.contains("waiting on #missing"),
+            "{blocked_summary}"
+        );
+        let mut long_blocker = mk_task("task-4", "blocked with long id", "pending");
+        long_blocker.blocked_by = vec![format!("task-{}", "x".repeat(128))];
+        let narrow = spans_text(
+            &render_collapsed_active_summary(&[long_blocker], 40).expect("narrow blocked summary"),
+        );
+        assert!(narrow.width() <= 40, "summary overflowed: {narrow}");
+        assert!(
+            render_collapsed_active_summary(&[mk_task("task-5", "done", "completed")], 80)
+                .is_none()
+        );
     }
 
     #[test]
