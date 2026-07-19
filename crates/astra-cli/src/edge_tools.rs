@@ -12,6 +12,9 @@ use std::{
     time::Duration,
 };
 
+use astra_core::work_unit::{
+    WorkUnitObservation, WorkUnitObservationMode, WorkUnitStatus, WorkUnitWakePolicy,
+};
 use astra_runtime::tool_sandbox::{
     SandboxPolicy, sandbox_command, validate_path, wrap_command_with_limits,
 };
@@ -404,7 +407,6 @@ fn utf16_col_to_char_idx(line: &str, col_utf16: usize) -> usize {
 
 /// Normalize empty/whitespace-only tool output to a short marker.
 /// Prevents model confusion from truly empty tool results.
-/// Prevents model confusion from truly empty tool results.
 fn normalize_empty_output(output: String, tool_name: &str) -> String {
     if output.trim().is_empty() {
         format!("({tool_name} completed with no output)")
@@ -464,6 +466,20 @@ fn tool_result_from_cli_outcome(outcome: ToolExecutionOutcome) -> astra_tools::T
         is_error: outcome.is_error,
         exit_semantics: None,
     }
+}
+
+/// Lift the shared work-unit protocol out of structured tool output.
+///
+/// Runtime/server executors already perform this projection before the
+/// agentic loop sees metadata. The local CLI executor must do the same for
+/// tools such as `agent_fanout` whose canonical observation is produced by a
+/// shared handler inside its JSON result rather than a CLI-specific branch.
+fn embedded_work_unit_observation(output: &str) -> Option<WorkUnitObservation> {
+    serde_json::from_str::<Value>(output)
+        .ok()?
+        .get(astra_core::work_unit::WORK_UNIT_OBSERVATION_FIELD)
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+        .filter(WorkUnitObservation::is_valid)
 }
 
 struct EdgeToolRun {
@@ -685,6 +701,20 @@ impl BgTaskOutputStatus {
     fn should_wake_waiter(self) -> bool {
         self.is_terminal() || self == Self::WaitingForInput
     }
+
+    fn work_unit_status(self) -> WorkUnitStatus {
+        match self {
+            Self::Pending => WorkUnitStatus::Pending,
+            Self::Running => WorkUnitStatus::Running,
+            Self::WaitingForInput => WorkUnitStatus::WaitingForInput,
+            Self::Stopping => WorkUnitStatus::Stopping,
+            Self::Completed => WorkUnitStatus::Completed,
+            Self::Failed => WorkUnitStatus::Failed,
+            Self::Interrupted => WorkUnitStatus::Interrupted,
+            Self::Killed => WorkUnitStatus::Cancelled,
+            Self::Unavailable => WorkUnitStatus::Unavailable,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -697,6 +727,13 @@ pub struct BgTaskOutputSnapshot {
     pub total_lines: u64,
     pub status: BgTaskOutputStatus,
     pub output_ref: String,
+}
+
+#[derive(Debug, Clone)]
+struct FanoutTaskOutputProjection {
+    group_id: String,
+    revision: u64,
+    snapshot: BgTaskOutputSnapshot,
 }
 
 #[derive(Debug, Clone)]
@@ -1203,7 +1240,7 @@ fn background_task_output_result_fields(
             BgTaskOutputReadMode::Historical => "historical",
         }
     };
-    serde_json::Map::from_iter([(
+    let mut fields = serde_json::Map::from_iter([(
         "background_task_observation".to_string(),
         serde_json::json!({
             "task_id": task_id,
@@ -1212,7 +1249,22 @@ fn background_task_output_result_fields(
             "terminal": snapshot.status.is_terminal(),
             "mode": observation_mode,
         }),
-    )])
+    )]);
+    WorkUnitObservation::new(
+        task_id,
+        snapshot.kind.trim().to_ascii_lowercase().replace(' ', "_"),
+        snapshot.status.work_unit_status(),
+        format!("{}:{}", snapshot.status.as_str(), snapshot.total_bytes),
+        match observation_mode {
+            "wait" => WorkUnitObservationMode::Wait,
+            "historical" => WorkUnitObservationMode::Historical,
+            _ => WorkUnitObservationMode::Current,
+        },
+    )
+    .expect("background snapshots have a task id, kind, and version")
+    .with_wake_policy(WorkUnitWakePolicy::OnTerminal)
+    .insert_into(&mut fields);
+    fields
 }
 
 fn background_task_output_search_result_fields(
@@ -1220,7 +1272,7 @@ fn background_task_output_search_result_fields(
     pattern: &str,
     snapshot: &BgTaskOutputSearchSnapshot,
 ) -> serde_json::Map<String, Value> {
-    serde_json::Map::from_iter([(
+    let mut fields = serde_json::Map::from_iter([(
         "background_task_observation".to_string(),
         serde_json::json!({
             "task_id": task_id,
@@ -1232,7 +1284,23 @@ fn background_task_output_search_result_fields(
             "matching_lines": snapshot.matching_lines,
             "truncated": snapshot.truncated,
         }),
-    )])
+    )]);
+    WorkUnitObservation::new(
+        task_id,
+        snapshot.kind.trim().to_ascii_lowercase().replace(' ', "_"),
+        snapshot.status.work_unit_status(),
+        format!(
+            "diagnostic:{}:{}:{}",
+            snapshot.status.as_str(),
+            snapshot.matching_lines,
+            snapshot.truncated
+        ),
+        WorkUnitObservationMode::Diagnostic,
+    )
+    .expect("background diagnostics have a task id, kind, and version")
+    .with_wake_policy(WorkUnitWakePolicy::OnTerminal)
+    .insert_into(&mut fields);
+    fields
 }
 
 fn format_background_task_output_registry_timeout(task_id: &str, timeout: Duration) -> String {
@@ -3872,6 +3940,7 @@ impl ToolExecutor {
                     requested_offset.unwrap_or(0),
                     max_bytes,
                     read_mode,
+                    tool_result_fields,
                     None,
                 )
                 .await
@@ -4026,15 +4095,46 @@ impl ToolExecutor {
         offset: u64,
         max_bytes: usize,
         read_mode: BgTaskOutputReadMode,
+        tool_result_fields: &mut Option<serde_json::Map<String, Value>>,
         miss_reason: Option<&str>,
     ) -> Option<String> {
         match self
             .fanout_group_task_output_snapshot(task_id, offset, max_bytes)
             .await
         {
-            Some(snapshot) => Some(format_background_task_output(
-                task_id, offset, &snapshot, read_mode,
-            )),
+            Some(projection) => {
+                let observation_mode = match read_mode {
+                    BgTaskOutputReadMode::Current => WorkUnitObservationMode::Current,
+                    BgTaskOutputReadMode::Historical => WorkUnitObservationMode::Historical,
+                };
+                let observation = WorkUnitObservation::new(
+                    &projection.group_id,
+                    "agent_fanout",
+                    projection.snapshot.status.work_unit_status(),
+                    projection.revision.to_string(),
+                    observation_mode,
+                )
+                .expect("fanout task projections have canonical identities and revisions")
+                .with_wake_policy(WorkUnitWakePolicy::OnTerminal);
+                let mut fields = background_task_output_result_fields(
+                    &projection.group_id,
+                    &projection.snapshot,
+                    read_mode,
+                    false,
+                );
+                observation.insert_into(&mut fields);
+                fields.insert(
+                    "requested_task_output_id".to_string(),
+                    Value::String(task_id.to_string()),
+                );
+                *tool_result_fields = Some(fields);
+                Some(format_background_task_output(
+                    &projection.group_id,
+                    offset,
+                    &projection.snapshot,
+                    read_mode,
+                ))
+            }
             None => {
                 if let Some(reason) = miss_reason {
                     tracing::debug!(
@@ -4053,14 +4153,20 @@ impl ToolExecutor {
         task_id: &str,
         offset: u64,
         max_bytes: usize,
-    ) -> Option<BgTaskOutputSnapshot> {
+    ) -> Option<FanoutTaskOutputProjection> {
         let ctx = self.spawn_context.as_ref()?;
         let group = ctx
             .spawner
             .list_fanout_groups()
             .await
             .into_iter()
-            .find(|group| group.group_id == task_id)?;
+            .find(|group| {
+                group.group_id == task_id
+                    || group.slots.iter().any(|slot| {
+                        slot.agent_id.as_deref() == Some(task_id)
+                            || slot.run_id.as_deref() == Some(task_id)
+                    })
+            })?;
         let summary = group.summary();
         let terminal = group.is_terminal();
         let status = if terminal {
@@ -4135,15 +4241,21 @@ impl ToolExecutor {
         let start = output.floor_char_boundary((offset as usize).min(output.len()));
         let end = output.floor_char_boundary((start + max_bytes).min(output.len()));
         let chunk = output[start..end].to_string();
-        Some(BgTaskOutputSnapshot {
-            kind: "agent fanout".to_string(),
-            title: Some(group.title),
-            output: chunk,
-            end_offset: end as u64,
-            total_bytes: output.len() as u64,
-            total_lines: output.lines().count() as u64,
-            status,
-            output_ref: format!("agent_fanout:{}", group.group_id),
+        let group_id = group.group_id.clone();
+        let revision = group.revision;
+        Some(FanoutTaskOutputProjection {
+            group_id,
+            revision,
+            snapshot: BgTaskOutputSnapshot {
+                kind: "agent fanout".to_string(),
+                title: Some(group.title),
+                output: chunk,
+                end_offset: end as u64,
+                total_bytes: output.len() as u64,
+                total_lines: output.lines().count() as u64,
+                status,
+                output_ref: format!("agent_fanout:{}", group.group_id),
+            },
         })
     }
 
@@ -5082,12 +5194,27 @@ impl ToolExecutor {
         }
         let mut tool_result_fields = None;
         let output = self.execute_raw(name, args, &mut tool_result_fields).await;
+        let embedded_work_observation = embedded_work_unit_observation(&output);
         // Structural error propagation: `execute_raw` returns a plain String,
         // discarding any structured error kind at the source. Recover it here
         // so downstream `tool_work_surface_events` can route on `error_kind`
         // metadata instead of re-deriving it from fragile string matching.
         let is_error = cli_tool_output_is_error(&output);
-        let tool_result_fields = if is_error { None } else { tool_result_fields };
+        let tool_result_fields = if is_error {
+            // Preserve producer-owned lifecycle truth even when the tool's
+            // business result is an error. Other raw fields retain the
+            // existing error-path behavior and are intentionally discarded.
+            embedded_work_observation.map(|observation| {
+                let mut fields = serde_json::Map::new();
+                observation.insert_into(&mut fields);
+                fields
+            })
+        } else {
+            if let Some(observation) = embedded_work_observation {
+                observation.insert_into(tool_result_fields.get_or_insert_with(Default::default));
+            }
+            tool_result_fields
+        };
         if is_error {
             let kind = astra_core::classify_tool_output(&output);
             EdgeToolRun::classified_error(output, kind)
@@ -6324,11 +6451,11 @@ mod tests {
     use super::{
         AGGREGATE_SOFT_LIMIT, BgTaskCommand, BgTaskOutputReadMode, BgTaskOutputSearchSnapshot,
         BgTaskOutputSnapshot, BgTaskOutputStatus, PERSIST_THRESHOLD, ToolExecutor,
-        all_tool_schemas, cli_tool_output_is_error, detect_git_remote_repos,
-        extract_github_owner_repo, file_checkpoint_dir_for, format_background_task_error,
-        format_background_task_output, format_background_task_output_wait_timeout,
-        format_background_task_stop_error, git_stash_sub_action_args, memoria,
-        parse_memory_search_contents, utf16_col_to_char_idx,
+        WorkUnitObservation, WorkUnitStatus, all_tool_schemas, cli_tool_output_is_error,
+        detect_git_remote_repos, embedded_work_unit_observation, extract_github_owner_repo,
+        file_checkpoint_dir_for, format_background_task_error, format_background_task_output,
+        format_background_task_output_wait_timeout, format_background_task_stop_error,
+        git_stash_sub_action_args, memoria, parse_memory_search_contents, utf16_col_to_char_idx,
     };
     use crate::background_task_error::BackgroundTaskError;
     use crate::lock_recovery::LockRecovery;
@@ -6339,6 +6466,29 @@ mod tests {
     fn parse_control_result(output: &str) -> serde_json::Value {
         serde_json::from_str(output)
             .unwrap_or_else(|error| panic!("expected structured control result: {error}: {output}"))
+    }
+
+    #[test]
+    fn structured_tool_output_lifts_the_shared_work_observation() {
+        let observation = embedded_work_unit_observation(
+            &serde_json::json!({
+                "status": "completed",
+                "work_unit_observation": {
+                    "id": "fanout-group-1",
+                    "kind": "agent_fanout",
+                    "status": "completed",
+                    "version": "revision-4",
+                    "mode": "current",
+                    "wake_policy": "on_terminal"
+                }
+            })
+            .to_string(),
+        )
+        .expect("valid shared observation");
+
+        assert_eq!(observation.id, "fanout-group-1");
+        assert_eq!(observation.kind, "agent_fanout");
+        assert_eq!(observation.status, WorkUnitStatus::Completed);
     }
 
     #[test]
@@ -6906,7 +7056,7 @@ mod tests {
             .with_spawn_context(ctx)
             .with_bg_task_commands(commands);
 
-        let started = executor
+        let completed = executor
             .execute(
                 "agent_fanout",
                 &serde_json::json!({
@@ -6921,15 +7071,22 @@ mod tests {
                 }),
             )
             .await;
-        let started_value: serde_json::Value = serde_json::from_str(&started).unwrap();
-        assert_eq!(started_value["status"], "started", "{started}");
-        assert_eq!(started_value["fanout"]["status"], "running", "{started}");
+        let completed_value: serde_json::Value = serde_json::from_str(&completed).unwrap();
+        assert_eq!(completed_value["status"], "completed", "{completed}");
+        assert_eq!(
+            completed_value["fanout"]["status"], "finished",
+            "{completed}"
+        );
 
+        let mut result_fields = None;
         let result = executor
-            .task_output(&serde_json::json!({
-                "task_id": "review-fanout",
-                "timeout_ms": 5
-            }))
+            .task_output_with_fields(
+                &serde_json::json!({
+                    "task_id": "review-fanout",
+                    "timeout_ms": 5
+                }),
+                &mut result_fields,
+            )
             .await;
 
         assert!(
@@ -6944,6 +7101,48 @@ mod tests {
         assert!(
             !result.contains("Background task registry did not respond"),
             "{result}"
+        );
+        let observation = result_fields
+            .as_ref()
+            .and_then(WorkUnitObservation::from_fields)
+            .expect("fanout task_output must feed the canonical work tracker");
+        assert_eq!(observation.id, "review-fanout");
+        assert_eq!(observation.kind, "agent_fanout");
+        assert_eq!(observation.status, WorkUnitStatus::Completed);
+
+        let group = executor
+            .spawn_context
+            .as_ref()
+            .unwrap()
+            .spawner
+            .list_fanout_groups()
+            .await
+            .into_iter()
+            .find(|group| group.group_id == "review-fanout")
+            .unwrap();
+        let child_id = group.slots[0]
+            .agent_id
+            .as_deref()
+            .expect("accepted fanout slot has an agent id");
+        let mut alias_fields = None;
+        let alias_result = executor
+            .task_output_with_fields(
+                &serde_json::json!({ "task_id": child_id }),
+                &mut alias_fields,
+            )
+            .await;
+        assert!(
+            alias_result.contains("Read agent fanout output review-fanout"),
+            "{alias_result}"
+        );
+        let alias_observation = alias_fields
+            .as_ref()
+            .and_then(WorkUnitObservation::from_fields)
+            .expect("child aliases must resolve to the parent fanout observation");
+        assert_eq!(alias_observation.id, "review-fanout");
+        assert_eq!(
+            alias_fields.as_ref().unwrap()["requested_task_output_id"],
+            child_id
         );
     }
 
@@ -6967,9 +7166,14 @@ mod tests {
         let parsed: serde_json::Value =
             serde_json::from_str(&result).expect("agent spawn result must be structured JSON");
 
-        assert_eq!(parsed["status"], "launched", "{result}");
-        assert_eq!(parsed["lifecycle"], "running", "{result}");
-        assert_eq!(parsed["delivery"], "asynchronous", "{result}");
+        assert_eq!(parsed["status"], "completed", "{result}");
+        assert_eq!(parsed["result"], "child result", "{result}");
+        assert!(
+            parsed["run_id"]
+                .as_str()
+                .is_some_and(|run_id| !run_id.is_empty()),
+            "{result}"
+        );
         assert!(
             parsed["agent_id"]
                 .as_str()
@@ -6988,7 +7192,7 @@ mod tests {
         let ctx = fanout_test_context(spawner);
         let executor = test_executor().with_spawn_context(ctx);
 
-        let started = executor
+        let completed = executor
             .execute(
                 "agent_fanout",
                 &serde_json::json!({
@@ -7003,9 +7207,12 @@ mod tests {
                 }),
             )
             .await;
-        let started_value: serde_json::Value = serde_json::from_str(&started).unwrap();
-        assert_eq!(started_value["status"], "started", "{started}");
-        assert_eq!(started_value["fanout"]["status"], "running", "{started}");
+        let completed_value: serde_json::Value = serde_json::from_str(&completed).unwrap();
+        assert_eq!(completed_value["status"], "completed", "{completed}");
+        assert_eq!(
+            completed_value["fanout"]["status"], "finished",
+            "{completed}"
+        );
 
         let result = executor.task_list_bg().await;
 
@@ -7147,6 +7354,22 @@ mod tests {
         assert_eq!(observation["task_id"], "bg-shell-1");
         assert_eq!(observation["task_kind"], "shell");
         assert_eq!(observation["mode"], "current");
+        let work = result_fields
+            .as_ref()
+            .and_then(astra_core::work_unit::WorkUnitObservation::from_fields)
+            .expect("current task output must publish the shared work-unit contract");
+        assert_eq!(work.id, "bg-shell-1");
+        assert_eq!(work.kind, "shell");
+        assert_eq!(work.status, astra_core::work_unit::WorkUnitStatus::Running);
+        assert_eq!(work.version, "running:1000");
+        assert_eq!(
+            work.mode,
+            astra_core::work_unit::WorkUnitObservationMode::Current
+        );
+        assert_eq!(
+            work.wake_policy,
+            astra_core::work_unit::WorkUnitWakePolicy::OnTerminal
+        );
     }
 
     #[tokio::test]
@@ -7211,6 +7434,19 @@ mod tests {
         assert_eq!(observation["mode"], "diagnostic");
         assert_eq!(observation["terminal"], true);
         assert_eq!(observation["matching_lines"], 1);
+        let work = result_fields
+            .as_ref()
+            .and_then(astra_core::work_unit::WorkUnitObservation::from_fields)
+            .expect("diagnostic output must still publish its non-live observation mode");
+        assert_eq!(work.status, astra_core::work_unit::WorkUnitStatus::Failed);
+        assert_eq!(
+            work.mode,
+            astra_core::work_unit::WorkUnitObservationMode::Diagnostic
+        );
+        assert_eq!(
+            work.wake_policy,
+            astra_core::work_unit::WorkUnitWakePolicy::OnTerminal
+        );
     }
 
     #[tokio::test]

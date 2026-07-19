@@ -101,16 +101,6 @@ impl BackgroundTaskStatus {
         matches!(self, Self::Running | Self::WaitingForInput)
     }
 
-    pub(crate) fn attention_rank(self) -> u8 {
-        match self {
-            Self::WaitingForInput | Self::Interrupted | Self::Failed => 0,
-            Self::Running | Self::Pending => 1,
-            Self::Stopping | Self::Killed => 2,
-            Self::Completed => 3,
-            Self::Unavailable => 4,
-        }
-    }
-
     pub(crate) fn empty_output_state(self) -> &'static str {
         match self {
             Self::Pending => "Pending · no output yet",
@@ -183,6 +173,10 @@ pub(crate) struct BackgroundTaskRow {
     pub exit_code: Option<i32>,
     pub terminal_reason: Option<String>,
     pub fanout: Option<BackgroundTaskFanoutMembership>,
+    /// Whether the work unit has been explicitly detached from its parent.
+    /// Foreground fan-in remains observable in this view without pretending
+    /// that observation changed lifecycle ownership.
+    pub run_in_background: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -250,6 +244,7 @@ impl BackgroundTaskRow {
             exit_code: None,
             terminal_reason: None,
             fanout: None,
+            run_in_background: true,
         }
     }
 
@@ -312,6 +307,11 @@ impl BackgroundTaskRow {
         self.fanout = Some(fanout);
         self
     }
+
+    pub(crate) fn with_run_in_background(mut self, run_in_background: bool) -> Self {
+        self.run_in_background = run_in_background;
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -321,7 +321,40 @@ pub(crate) enum Mode {
 }
 
 pub(crate) fn sort_rows(mut rows: Vec<BackgroundTaskRow>) -> Vec<BackgroundTaskRow> {
-    rows.sort_by_key(|row| (row.status.attention_rank(), row.elapsed_ms));
+    // The view is refreshed on every TUI tick. Status and elapsed time are
+    // mutable, so including either in this key makes rows jump while the user
+    // is reading or navigating the list. Fanout slots additionally need one
+    // shared anchor so that independently-started children remain contiguous.
+    let mut fanout_started_at = std::collections::HashMap::<String, u64>::new();
+    for row in &rows {
+        let (Some(fanout), Some(started_at_ms)) = (row.fanout.as_ref(), row.started_at_ms) else {
+            continue;
+        };
+        fanout_started_at
+            .entry(fanout.group_id.clone())
+            .and_modify(|current| *current = (*current).min(started_at_ms))
+            .or_insert(started_at_ms);
+    }
+    rows.sort_by_key(|row| {
+        if let Some(fanout) = row.fanout.as_ref() {
+            (
+                fanout_started_at
+                    .get(&fanout.group_id)
+                    .copied()
+                    .unwrap_or(u64::MAX),
+                format!("fanout:{}", fanout.group_id),
+                fanout.slot_index,
+                row.id.clone(),
+            )
+        } else {
+            (
+                row.started_at_ms.unwrap_or(u64::MAX),
+                format!("task:{}", row.id),
+                0,
+                row.id.clone(),
+            )
+        }
+    });
     rows
 }
 

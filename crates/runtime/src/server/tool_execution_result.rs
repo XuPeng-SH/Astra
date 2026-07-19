@@ -1,10 +1,25 @@
 use serde_json::{Map, Value};
 
+use astra_core::work_unit::{WORK_UNIT_OBSERVATION_FIELD, WorkUnitObservation};
+
 use super::tool_transport_metadata::{
     TOOL_ERROR_KIND_AGENT_WAITING, TOOL_ERROR_KIND_APPROVAL_TIMEOUT, TOOL_ERROR_KIND_CANCELLED,
     TOOL_ERROR_KIND_EXECUTOR_OFFLINE, TOOL_ERROR_KIND_TOOL_TIMEOUT,
     TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED, TOOL_ERROR_KIND_WORKSPACE_PATH_MISMATCH,
 };
+
+fn parsed_work_unit_observation(parsed: Option<&Value>) -> Option<WorkUnitObservation> {
+    parsed?
+        .get(WORK_UNIT_OBSERVATION_FIELD)
+        .and_then(|value| serde_json::from_value::<WorkUnitObservation>(value.clone()).ok())
+        .filter(WorkUnitObservation::is_valid)
+}
+
+fn insert_parsed_work_unit_observation(parsed: Option<&Value>, metadata: &mut Map<String, Value>) {
+    if let Some(observation) = parsed_work_unit_observation(parsed) {
+        observation.insert_into(metadata);
+    }
+}
 
 pub(crate) fn tool_result_from_output(output: String) -> astra_tools::ToolResult {
     let parsed = serde_json::from_str::<Value>(&output).ok();
@@ -35,6 +50,10 @@ pub(crate) fn tool_result_from_output(output: String) -> astra_tools::ToolResult
             "error_kind".to_string(),
             Value::String(error_kind.to_string()),
         );
+    }
+    if let Some(observation) = parsed_work_unit_observation(parsed.as_ref()) {
+        let metadata = result.metadata.get_or_insert_with(Map::new);
+        observation.insert_into(metadata);
     }
     result
 }
@@ -113,6 +132,7 @@ pub(crate) fn agent_tool_result_from_output(output: String) -> astra_tools::Tool
     {
         metadata.insert("agent_id".to_string(), Value::String(agent_id.to_string()));
     }
+    insert_parsed_work_unit_observation(parsed.as_ref(), &mut metadata);
     result.metadata = Some(metadata);
     result
 }
@@ -204,4 +224,91 @@ pub(crate) fn result_metadata_str<'a>(
         .as_ref()
         .and_then(|metadata| metadata.get(key))
         .and_then(Value::as_str)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use astra_core::work_unit::{WorkUnitObservationMode, WorkUnitStatus};
+
+    #[test]
+    fn structured_work_observation_is_lifted_without_tool_specific_logic() {
+        let result = tool_result_from_output(
+            serde_json::json!({
+                "status": "ok",
+                "work_unit_observation": {
+                    "id": "future-work-1",
+                    "kind": "future_capability",
+                    "status": "running",
+                    "version": "revision-9",
+                    "mode": "current"
+                }
+            })
+            .to_string(),
+        );
+
+        let observation = result
+            .metadata
+            .as_ref()
+            .and_then(WorkUnitObservation::from_fields)
+            .expect("valid producer observation should cross the server tool boundary");
+        assert_eq!(observation.id, "future-work-1");
+        assert_eq!(observation.status, WorkUnitStatus::Running);
+        assert_eq!(observation.mode, WorkUnitObservationMode::Current);
+    }
+
+    #[test]
+    fn malformed_work_observation_is_not_promoted_to_runtime_truth() {
+        let result = tool_result_from_output(
+            serde_json::json!({
+                "status": "ok",
+                "work_unit_observation": {
+                    "id": "",
+                    "kind": "future_capability",
+                    "status": "running",
+                    "version": "revision-9",
+                    "mode": "current"
+                }
+            })
+            .to_string(),
+        );
+
+        assert!(
+            result
+                .metadata
+                .as_ref()
+                .and_then(WorkUnitObservation::from_fields)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn blocked_agent_result_preserves_work_observation_metadata() {
+        let result = agent_tool_result_from_output(
+            serde_json::json!({
+                "status": "waiting",
+                "agent_id": "future-agent-1",
+                "reason": "executor_offline",
+                "work_unit_observation": {
+                    "id": "future-agent-1",
+                    "kind": "future_capability",
+                    "status": "waiting_for_input",
+                    "version": "revision-10",
+                    "mode": "wait",
+                    "wake_policy": "on_attention_or_terminal"
+                }
+            })
+            .to_string(),
+        );
+
+        assert!(result.is_error);
+        let observation = result
+            .metadata
+            .as_ref()
+            .and_then(WorkUnitObservation::from_fields)
+            .expect("specialized waiting metadata must retain the generic observation");
+        assert_eq!(observation.id, "future-agent-1");
+        assert_eq!(observation.status, WorkUnitStatus::WaitingForInput);
+        assert_eq!(observation.mode, WorkUnitObservationMode::Wait);
+    }
 }

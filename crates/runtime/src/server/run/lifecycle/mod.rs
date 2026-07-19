@@ -143,6 +143,84 @@ const MAX_USER_INTENT_CHARS: usize = 20_000;
 const MAX_DURABLE_RUN_PROJECTION_RECENT_EVENTS: u32 = 500;
 const MAX_ACTIVE_RUN_LIVE_EVENTS: usize = MAX_DURABLE_RUN_PROJECTION_RECENT_EVENTS as usize;
 const AGENT_PROGRESS_STREAM_DRAIN_GRACE: Duration = Duration::from_millis(25);
+const ATTACHED_INTERACTION_DELIVERY_GRACE: Duration = Duration::from_millis(250);
+
+fn attached_stream_event_requires_reliable_delivery(event: &Value) -> bool {
+    matches!(
+        event.get("type").and_then(Value::as_str),
+        Some(
+            "approval_required"
+                | "approval_batch_required"
+                | "ask_user_prompted"
+                | "user_prompt_required"
+        )
+    )
+}
+
+/// Deliver to the currently attached SSE observer.
+///
+/// Ordinary progress is deliberately lossy: durable projection and the live
+/// broadcast lane can reconstruct it without stalling execution. Human-input
+/// boundaries are different. Dropping an approval or ask-user event while the
+/// observer is still attached leaves the run waiting for an action the user
+/// was never shown, so those events wait for channel capacity instead.
+async fn send_attached_stream_event(
+    sender: &mut Option<mpsc::Sender<Value>>,
+    event: Value,
+    run_id: &str,
+) {
+    let Some(attached) = sender.as_ref() else {
+        return;
+    };
+    if attached_stream_event_requires_reliable_delivery(&event) {
+        match tokio::time::timeout(ATTACHED_INTERACTION_DELIVERY_GRACE, attached.send(event)).await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                tracing::debug!(
+                    target: "astra_runtime::run_lifecycle",
+                    run_id,
+                    "SSE observer disconnected while delivering an interaction boundary; durable replay remains available"
+                );
+                *sender = None;
+            }
+            Err(_) => {
+                // Keeping a full attached queue alive while dropping this
+                // boundary is worse than ending the stale stream: the client
+                // can neither act nor know that it must reconcile. Closing
+                // this one delivery lane forces a reconnect, where the
+                // already-persisted interaction is replayed. The run and its
+                // reconnectable broadcast lane remain alive.
+                tracing::warn!(
+                    target: "astra_runtime::run_lifecycle",
+                    run_id,
+                    grace_ms = ATTACHED_INTERACTION_DELIVERY_GRACE.as_millis() as u64,
+                    "SSE observer stayed full at an interaction boundary; closing the stale delivery lane for durable replay"
+                );
+                *sender = None;
+            }
+        }
+        return;
+    }
+    match attached.try_send(event) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            tracing::debug!(
+                target: "astra_runtime::run_lifecycle",
+                run_id,
+                "SSE observer disconnected; durable run continues detached"
+            );
+            *sender = None;
+        }
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            tracing::warn!(
+                target: "astra_runtime::run_lifecycle",
+                run_id,
+                "SSE observer fell behind; dropping this live event while keeping the observer attached for subsequent events and durable replay"
+            );
+        }
+    }
+}
 
 /// Normalize edge-ledger approval presentation events into individually
 /// addressable durable interaction facts. A batch is one UI event but each
@@ -216,6 +294,7 @@ fn incrementally_persisted_edge_approval_event(event: &Value) -> bool {
     !canonical_edge_approval_requests(event).is_empty()
 }
 const ACTIVE_RUN_DURABLE_CONTROL_WATCH_INTERVAL: Duration = Duration::from_secs(2);
+const ACTIVE_RUN_DURABLE_CONTROL_POLL_TIMEOUT: Duration = Duration::from_secs(5);
 
 const RUNTIME_CONTEXT_TRACE_AGENT_ID: &str = "astra-server";
 #[cfg(test)]
@@ -580,46 +659,39 @@ impl DurableRunApprovalGate {
             &self.context.run_id,
             vec![indexed_event],
         );
-        if let Some(stream_event_tx) = &self.stream_event_tx {
-            for event in &client_events {
-                match stream_event_tx.try_send(event.clone()) {
-                    Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                        tracing::debug!(
-                            target: "astra_runtime::run_lifecycle",
-                            run_id = %self.context.run_id,
-                            "approval transition stream is detached; durable replay remains available"
-                        );
-                        break;
-                    }
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        tracing::warn!(
-                            target: "astra_runtime::run_lifecycle",
-                            run_id = %self.context.run_id,
-                            "approval transition stream is backpressured; durable replay remains available"
-                        );
-                        break;
-                    }
-                }
-            }
-        }
         let live_tx = {
             let mut runs = self.runs.write().await;
-            let Some(run) = runs.get_mut(&self.context.run_id) else {
-                return Ok(true);
-            };
-            run.status = status;
-            run.waiting_for = waiting_for.map(ToString::to_string);
-            run.events.push(event);
-            run.live_tx.clone()
-        };
+            runs.get_mut(&self.context.run_id).map(|run| {
+                run.status = status;
+                run.waiting_for = waiting_for.map(ToString::to_string);
+                run.events.push(event);
+                run.live_tx.clone()
+            })
+        }
+        .flatten();
+        // Durable state is already committed. Publish to the reconnectable
+        // live lane before waiting on one attached client's bounded queue, so
+        // a stalled observer cannot hide an interaction boundary from every
+        // other observer.
         if let Some(live_tx) = live_tx {
-            for event in client_events {
-                if live_tx.send(event).is_err() {
+            for event in &client_events {
+                if live_tx.send(event.clone()).is_err() {
                     tracing::debug!(
                         target: "astra_runtime::run_lifecycle",
                         run_id = %self.context.run_id,
                         "approval transition has no live stream subscribers"
+                    );
+                    break;
+                }
+            }
+        };
+        if let Some(stream_event_tx) = &self.stream_event_tx {
+            for event in &client_events {
+                if stream_event_tx.send(event.clone()).await.is_err() {
+                    tracing::debug!(
+                        target: "astra_runtime::run_lifecycle",
+                        run_id = %self.context.run_id,
+                        "approval transition stream is detached; durable replay remains available"
                     );
                     break;
                 }
@@ -909,35 +981,31 @@ impl DurableRunUserPromptGate {
             &self.context.run_id,
             vec![indexed_event],
         );
-        if let Some(stream_event_tx) = &self.stream_event_tx {
-            for event in &client_events {
-                match stream_event_tx.try_send(event.clone()) {
-                    Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Closed(_)) => break,
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        tracing::warn!(
-                            target: "astra_runtime::run_lifecycle",
-                            run_id = %self.context.run_id,
-                            "user prompt transition stream is backpressured; durable replay remains available"
-                        );
-                        break;
-                    }
-                }
-            }
-        }
         let live_tx = {
             let mut runs = self.runs.write().await;
-            let Some(run) = runs.get_mut(&self.context.run_id) else {
-                return Ok(true);
-            };
-            run.status = status;
-            run.waiting_for = waiting_for.map(ToString::to_string);
-            run.events.push(event);
-            run.live_tx.clone()
-        };
+            runs.get_mut(&self.context.run_id).map(|run| {
+                run.status = status;
+                run.waiting_for = waiting_for.map(ToString::to_string);
+                run.events.push(event);
+                run.live_tx.clone()
+            })
+        }
+        .flatten();
         if let Some(live_tx) = live_tx {
-            for event in client_events {
-                if live_tx.send(event).is_err() {
+            for event in &client_events {
+                if live_tx.send(event.clone()).is_err() {
+                    break;
+                }
+            }
+        };
+        if let Some(stream_event_tx) = &self.stream_event_tx {
+            for event in &client_events {
+                if stream_event_tx.send(event.clone()).await.is_err() {
+                    tracing::debug!(
+                        target: "astra_runtime::run_lifecycle",
+                        run_id = %self.context.run_id,
+                        "user prompt transition stream is detached; durable replay remains available"
+                    );
                     break;
                 }
             }
@@ -1970,9 +2038,9 @@ pub(crate) use persistence::{
     build_run_turn_complete_event_with_interruption, format_task_board_resume_hint,
     materialize_server_run_transcript_evidence, persist_server_loop_core_events,
     persist_server_loop_trace_events, persist_server_loop_transcript_items,
-    persist_session_transcript_items, restore_session_state_compact,
-    restore_step_checkpoint_runtime_state, server_loop_causal_chain_id, server_trace_context,
-    trace_context_from_subrun_context,
+    persist_session_transcript_items, persist_session_transcript_items_inner_in_tx,
+    restore_session_state_compact, restore_step_checkpoint_runtime_state,
+    server_loop_causal_chain_id, server_trace_context, trace_context_from_subrun_context,
 };
 use run_state::*;
 
@@ -2162,23 +2230,36 @@ fn start_active_run_control_watcher(
                     if cancel_flag.load(Ordering::Acquire) || cancel_token.is_cancelled() {
                         break;
                     }
-                    match run_control.control_status(&user_id, &run_id).await {
-                        Ok(Some(RunControlStatus::Cancelled)) => {
+                    let control_status = tokio::time::timeout(
+                        ACTIVE_RUN_DURABLE_CONTROL_POLL_TIMEOUT,
+                        run_control.control_status(&user_id, &run_id),
+                    )
+                    .await;
+                    match control_status {
+                        Err(_) => {
+                            tracing::warn!(
+                                target: "astra_runtime::run_lifecycle",
+                                run_id = %run_id,
+                                timeout_ms = ACTIVE_RUN_DURABLE_CONTROL_POLL_TIMEOUT.as_millis() as u64,
+                                "active run control watcher durable status poll timed out"
+                            );
+                        }
+                        Ok(Ok(Some(RunControlStatus::Cancelled))) => {
                             cancel_flag.store(true, Ordering::SeqCst);
                             cancel_token.cancel();
                             break;
                         }
-                        Ok(Some(RunControlStatus::Paused)) => {
+                        Ok(Ok(Some(RunControlStatus::Paused))) => {
                             pause_flag.store(true, Ordering::SeqCst);
                         }
-                        Ok(None) => {
+                        Ok(Ok(None)) => {
                             // Resume is a durable fact. Clear only this run's
                             // private flag; dynamic children never share a
                             // parent's pause flag, so a child cannot unpause
                             // unrelated work.
                             pause_flag.store(false, Ordering::SeqCst);
                         }
-                        Err(error) => {
+                        Ok(Err(error)) => {
                             tracing::warn!(
                                 target: "astra_runtime::run_lifecycle",
                                 run_id = %run_id,
@@ -2751,31 +2832,25 @@ impl AgenticRunLifecycleService {
         const PAGE_LIMIT: u32 = 200;
         const MAX_PAGES: usize = 32;
         let mut cancelled = 0;
+        let mut cursor = None;
 
-        for _ in 0..MAX_PAGES {
+        for page_index in 0..MAX_PAGES {
             let page = run_engine
-                .list_session_runs(user_id, session_id, PAGE_LIMIT)
+                .list_active_session_runs_cursor(user_id, session_id, PAGE_LIMIT, cursor.take())
                 .await?;
+            let next_cursor = page.next_cursor;
             let mut descendants = page
                 .runs
                 .into_iter()
                 .filter(|run| {
                     run.run_id != parent_run_id
-                        && matches!(
-                            run.status.as_str(),
-                            STATUS_RUNNING | STATUS_WAITING | STATUS_PAUSED
-                        )
                         && run.ancestor_path.as_deref().is_some_and(|path| {
                             path.split('/').any(|segment| segment == parent_run_id)
                         })
                 })
                 .collect::<Vec<_>>();
-            if descendants.is_empty() {
-                return Ok(cancelled);
-            }
             descendants.sort_by_key(|run| std::cmp::Reverse(run.depth));
 
-            let mut page_updates = 0;
             for descendant in descendants {
                 let event = json!({
                     "event_type": "run_finished",
@@ -2798,13 +2873,18 @@ impl AgenticRunLifecycleService {
                     )
                     .await?
                 {
-                    page_updates += 1;
                     cancelled += 1;
                 }
             }
-            if page_updates == 0 {
-                break;
+            let Some(next_cursor) = next_cursor else {
+                return Ok(cancelled);
+            };
+            if page_index + 1 == MAX_PAGES {
+                return Err(format!(
+                    "active descendant cancellation exceeded {MAX_PAGES} pages for session {session_id}"
+                ));
             }
+            cursor = Some(next_cursor);
         }
         Ok(cancelled)
     }
@@ -8040,7 +8120,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let (agent_live_gap_tracker, mut agent_live_gap_rx) = WorkSurfaceAgentLiveGapTracker::new();
         let (live_tx, _) = broadcast::channel::<Value>(SSE_CHANNEL_CAPACITY);
         let live_tx_for_fanout = live_tx.clone();
-        let client_event_tx_for_fanout = client_event_tx.clone();
+        let mut client_event_tx_for_fanout = Some(client_event_tx.clone());
         let fanout_runs = self.runs_handle();
         let fanout_run_engine = self.run_engine.clone();
         let fanout_user_id = user_id.clone();
@@ -8056,7 +8136,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                                 for gap in fanout_gap_tracker.drain() {
                                     let event = agent_live_gap_to_work_surface_sse(gap);
                                     let _ = live_tx_for_fanout.send(event.clone());
-                                    let _ = client_event_tx_for_fanout.send(event).await;
+                                    send_attached_stream_event(
+                                        &mut client_event_tx_for_fanout,
+                                        event,
+                                        &fanout_run_id,
+                                    )
+                                    .await;
                                 }
                                 break;
                             };
@@ -8099,7 +8184,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                                     "edge approval request persistence failed before delivery"
                                 );
                                 let _ = live_tx_for_fanout.send(failure.clone());
-                                let _ = client_event_tx_for_fanout.send(failure).await;
+                                send_attached_stream_event(
+                                    &mut client_event_tx_for_fanout,
+                                    failure,
+                                    &fanout_run_id,
+                                )
+                                .await;
                                 break;
                             }
                             if live_delta_event_for_persistence(&event) {
@@ -8108,7 +8198,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                                 }
                             }
                             let _ = live_tx_for_fanout.send(event.clone());
-                            let _ = client_event_tx_for_fanout.send(event).await;
+                            send_attached_stream_event(
+                                &mut client_event_tx_for_fanout,
+                                event,
+                                &fanout_run_id,
+                            )
+                            .await;
                         }
                         changed = agent_live_gap_rx.changed(), if gap_watch_open => {
                             if changed.is_err() {
@@ -8118,7 +8213,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                             for gap in fanout_gap_tracker.drain() {
                                 let event = agent_live_gap_to_work_surface_sse(gap);
                                 let _ = live_tx_for_fanout.send(event.clone());
-                                let _ = client_event_tx_for_fanout.send(event).await;
+                                send_attached_stream_event(
+                                    &mut client_event_tx_for_fanout,
+                                    event,
+                                    &fanout_run_id,
+                                )
+                                .await;
                             }
                         }
                     }
@@ -8356,7 +8456,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         if let Some(pool) = &self.shared_pool {
             let trace = server_trace_context(&user_id, &session_id, &run_id, state.session_turn);
             let user_transcript = TranscriptPersistItem {
-                run_id: run_id.clone(),
+                run_id: Some(run_id.clone()),
                 role: "user",
                 content: request.message.clone(),
                 payload: None,

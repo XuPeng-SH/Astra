@@ -47,10 +47,6 @@ pub(crate) struct StatusContext {
     /// visibility. `None` when the registry has no live/attention
     /// state to surface.
     pub bg_task_counts: Option<BackgroundTaskCounts>,
-    /// Fanout group summaries derived from the same typed background
-    /// task rows. Empty when no active/attention fanout group should
-    /// be called out separately.
-    pub bg_fanout_summaries: Vec<BackgroundTaskFanoutSummary>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -151,105 +147,6 @@ impl BackgroundTaskCounts {
             }
         }
         counts
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct BackgroundTaskFanoutSummary {
-    pub group_id: String,
-    pub title: String,
-    pub target_count: usize,
-    pub running: usize,
-    pub stopping: usize,
-    pub done: usize,
-    pub failed: usize,
-    pub stopped: usize,
-    pub unavailable: usize,
-}
-
-impl BackgroundTaskFanoutSummary {
-    pub(crate) fn from_rows(
-        rows: &[crate::tui::bottom_pane::background_task_view::BackgroundTaskRow],
-    ) -> Vec<Self> {
-        let mut groups = Vec::<Self>::new();
-        for row in rows {
-            let Some(fanout) = row.fanout.as_ref() else {
-                continue;
-            };
-            let idx = if let Some(idx) = groups
-                .iter()
-                .position(|group| group.group_id == fanout.group_id)
-            {
-                idx
-            } else {
-                groups.push(Self {
-                    group_id: fanout.group_id.clone(),
-                    title: fanout.group_title.clone(),
-                    target_count: fanout.target_count,
-                    ..Self::default()
-                });
-                groups.len() - 1
-            };
-            let group = &mut groups[idx];
-            group.target_count = group.target_count.max(fanout.target_count);
-            match row.status {
-                crate::tui::bottom_pane::background_task_view::BackgroundTaskStatus::Pending
-                | crate::tui::bottom_pane::background_task_view::BackgroundTaskStatus::Running
-                | crate::tui::bottom_pane::background_task_view::BackgroundTaskStatus::WaitingForInput => {
-                    group.running += 1;
-                }
-                crate::tui::bottom_pane::background_task_view::BackgroundTaskStatus::Stopping => {
-                    group.stopping += 1;
-                }
-                crate::tui::bottom_pane::background_task_view::BackgroundTaskStatus::Completed => {
-                    group.done += 1;
-                }
-                crate::tui::bottom_pane::background_task_view::BackgroundTaskStatus::Interrupted
-                | crate::tui::bottom_pane::background_task_view::BackgroundTaskStatus::Failed => {
-                    group.failed += 1;
-                }
-                crate::tui::bottom_pane::background_task_view::BackgroundTaskStatus::Killed => {
-                    group.stopped += 1;
-                }
-                crate::tui::bottom_pane::background_task_view::BackgroundTaskStatus::Unavailable => {
-                    group.unavailable += 1;
-                }
-            }
-        }
-
-        groups
-            .into_iter()
-            .filter(|group| {
-                group.running > 0 || group.stopping > 0 || group.failed > 0 || group.unavailable > 0
-            })
-            .collect()
-    }
-
-    fn text(&self) -> String {
-        let mut parts = Vec::new();
-        if self.running > 0 {
-            parts.push(format!(
-                "{}/{} running",
-                self.running,
-                self.target_count.max(self.running)
-            ));
-        }
-        if self.stopping > 0 {
-            parts.push(format!("{} stopping", self.stopping));
-        }
-        if self.done > 0 {
-            parts.push(format!("{} done", self.done));
-        }
-        if self.failed > 0 {
-            parts.push(format!("{} failed", self.failed));
-        }
-        if self.stopped > 0 {
-            parts.push(format!("{} stopped", self.stopped));
-        }
-        if self.unavailable > 0 {
-            parts.push(format!("{} unavailable", self.unavailable));
-        }
-        format!("{} {}", truncate_end(&self.title, 24), parts.join(" · "))
     }
 }
 
@@ -496,26 +393,20 @@ impl StatusLine {
             }
         }
 
-        for summary in &ctx.bg_fanout_summaries {
-            out.left.push(Segment::styled(
-                summary.text(),
-                Style::default().fg(if summary.failed > 0 {
-                    theme.error
-                } else if summary.unavailable > 0 {
-                    theme.warn
-                } else {
-                    theme.accent
-                }),
-            ));
-        }
-
         // BackgroundTaskRegistry chip. Running tasks are informational;
         // needs-input/failed tasks are attention states and stay visible
-        // even after no shell is making forward progress.
+        // even after no shell is making forward progress. Fanout title,
+        // target accounting, elapsed time, and slot detail belong in the
+        // Shift+Down task surface. Repeating them here made one work unit look
+        // like two unrelated status systems (for example a long group summary
+        // followed by "2 local agents"). Keep the footer as a compact
+        // discoverability pill, matching the user's background-task mental
+        // model.
         if let Some(counts) = ctx.bg_task_counts
             && !counts.is_empty()
         {
-            let parts = background_task_count_parts(counts);
+            let mut parts = background_task_count_parts(counts);
+            parts.push(crate::tui::background_shortcut::background_task_open_hint().to_string());
             let style = if counts.failed_total() > 0 {
                 Style::default().fg(theme.error)
             } else if counts.waiting > 0 {

@@ -1078,24 +1078,11 @@ pub struct ContextTracePersistenceContext {
 /// Stall and verdict tracking state for the agentic loop.
 #[derive(Default)]
 pub struct StallTrackingState {
-    /// Background task detached by Bash during this agentic turn. The runtime
-    /// uses this turn-scoped fact to reject immediate `task_output` polling
-    /// while still allowing the model to continue independent work.
-    pub same_turn_detached_task_ids: BTreeSet<String>,
-    /// Number of attempts to inspect a task detached by this same agentic
-    /// turn. One rejected attempt gives the model a chance to produce the
-    /// short running acknowledgement; a second attempt closes the loop with
-    /// a runtime-owned acknowledgement instead of burning dozens of rounds.
-    pub same_turn_detached_poll_attempts: u32,
-    /// Non-terminal shell background tasks already observed through
-    /// `task_output` in this turn. These are live-status observations, not
-    /// requests to page through the task's full log. Terminal observations
-    /// are intentionally excluded so failure diagnosis remains available.
-    pub observed_background_task_snapshots: BTreeSet<String>,
-    /// Repeated attempts to page a task after a current snapshot was already
-    /// returned. The first attempt is corrected; the second closes the
-    /// wasteful model loop while leaving the task itself running.
-    pub repeated_background_task_snapshot_attempts: u32,
+    /// Producer-owned observations for every asynchronously evolving work
+    /// unit seen in this turn. The tracker is intentionally tool-agnostic:
+    /// progress is a version change, not a tool name, argument shape, prose
+    /// fragment, elapsed timer, or low-level event count.
+    pub work_unit_observations: astra_core::work_unit::WorkUnitObservationTracker,
     /// Per-turn tool-call dedup signatures.
     pub turn_sigs: Vec<BTreeSet<String>>,
     /// Per-turn tool name sets.
@@ -1787,6 +1774,11 @@ pub enum VolatileKind {
     /// Runtime-owned terminal/needs-input facts from background work. These
     /// are required context, never synthetic user intent.
     BackgroundTaskNotification,
+    /// Point-in-time work projection captured with active-run guidance. This
+    /// keeps user speech and runtime truth in separate lanes while ensuring a
+    /// mid-turn status/correction boundary sees the same canonical work units
+    /// that the UI exposed when the input was accepted.
+    ActiveWorkSnapshot,
     /// Structured policy evidence suggesting a possible budget review. It does
     /// not mutate the active runtime budget.
     BudgetReview,
@@ -1857,7 +1849,8 @@ impl VolatileKind {
                 | Self::SelfStatus
                 | Self::PolicyAdvisory
                 | Self::BudgetUpdate
-                | Self::ActiveTurnFrame,
+                | Self::ActiveTurnFrame
+                | Self::ActiveWorkSnapshot,
         )
     }
 
@@ -1874,6 +1867,7 @@ impl VolatileKind {
             | Self::CompactResume
             | Self::Mailbox
             | Self::BackgroundTaskNotification
+            | Self::ActiveWorkSnapshot
             | Self::FinalAnswerSettlement
             | Self::SessionHookContext
             | Self::PlanModeMarker
@@ -2608,6 +2602,130 @@ impl AgenticLoopState {
             }
         }
         self.volatile_pending.push(injection);
+    }
+
+    /// Apply one producer-owned work observation to both settlement state and
+    /// any active-guidance snapshot waiting for the next model boundary.
+    ///
+    /// Guidance can be accepted while a foreground tool is still running. If
+    /// that tool reaches a newer revision before the model sees the guidance,
+    /// retaining the submission-time XML would make the newest-looking
+    /// context stale. Updating the structured observation and explicitly
+    /// retiring the textual projection gives producer revision order one
+    /// canonical path across both surfaces.
+    pub fn observe_work_unit(
+        &mut self,
+        observation: &astra_core::work_unit::WorkUnitObservation,
+    ) -> astra_core::work_unit::WorkUnitObservationOutcome {
+        let outcome = self.stall.work_unit_observations.observe(observation);
+        if outcome == astra_core::work_unit::WorkUnitObservationOutcome::Ignored {
+            return outcome;
+        }
+        let Ok(observation_value) = serde_json::to_value(observation) else {
+            return outcome;
+        };
+        for injection in self
+            .volatile_pending
+            .iter_mut()
+            .filter(|injection| injection.kind == VolatileKind::ActiveWorkSnapshot)
+        {
+            let Some(snapshots) = injection
+                .payload
+                .get_mut("snapshots")
+                .and_then(Value::as_array_mut)
+            else {
+                continue;
+            };
+            for snapshot in snapshots {
+                let Some(context) = snapshot.as_object_mut() else {
+                    continue;
+                };
+                let Some(observations) = context
+                    .get_mut("work_unit_observations")
+                    .and_then(Value::as_array_mut)
+                else {
+                    continue;
+                };
+                let mut replaced = false;
+                for current in observations.iter_mut() {
+                    let same_identity = current.get("id").and_then(Value::as_str)
+                        == Some(observation.id.as_str())
+                        && current.get("kind").and_then(Value::as_str)
+                            == Some(observation.kind.as_str());
+                    if same_identity && current != &observation_value {
+                        *current = observation_value.clone();
+                        replaced = true;
+                    }
+                }
+                if replaced {
+                    context.remove("background_work_snapshot");
+                    context.insert(
+                        "projection_state".to_string(),
+                        Value::String("superseded_by_newer_producer_observation".to_string()),
+                    );
+                }
+            }
+        }
+        outcome
+    }
+
+    /// Reconcile a submission-time work snapshot with producer truth already
+    /// observed by the turn before the snapshot reached its model boundary.
+    ///
+    /// Active guidance and foreground tool settlement are independent input
+    /// lanes. The guidance lane can therefore deliver an older `running`
+    /// projection after the tool lane has delivered `completed`. Terminal
+    /// producer state is absorbing for the work-unit identity, so replace the
+    /// delayed projection and retire its textual cache before prompt assembly.
+    pub fn reconcile_active_work_context(&mut self, context: &mut Value) {
+        let captured = context
+            .get("work_unit_observations")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut replacements = Vec::new();
+        for (index, value) in captured.into_iter().enumerate() {
+            let Ok(observation) =
+                serde_json::from_value::<astra_core::work_unit::WorkUnitObservation>(value)
+            else {
+                continue;
+            };
+            if !observation.is_valid() {
+                continue;
+            }
+            self.observe_work_unit(&observation);
+            let Some(terminal) = self
+                .stall
+                .work_unit_observations
+                .terminal_observation(&observation.id, &observation.kind)
+            else {
+                continue;
+            };
+            if terminal != &observation {
+                replacements.push((index, terminal.to_value()));
+            }
+        }
+        if replacements.is_empty() {
+            return;
+        }
+        let Some(context) = context.as_object_mut() else {
+            return;
+        };
+        if let Some(observations) = context
+            .get_mut("work_unit_observations")
+            .and_then(Value::as_array_mut)
+        {
+            for (index, replacement) in replacements {
+                if let Some(current) = observations.get_mut(index) {
+                    *current = replacement;
+                }
+            }
+        }
+        context.remove("background_work_snapshot");
+        context.insert(
+            "projection_state".to_string(),
+            Value::String("superseded_by_newer_producer_observation".to_string()),
+        );
     }
 
     /// Drain all pending volatile injections. Called by
@@ -3916,6 +4034,16 @@ pub(crate) mod tests {
         let mut fields = edge_runtime_environment_fields();
         fields.insert("bash_detached".to_string(), json!(true));
         fields.insert("background_task_id".to_string(), json!(task_id));
+        astra_core::work_unit::WorkUnitObservation::new(
+            task_id,
+            "shell",
+            astra_core::work_unit::WorkUnitStatus::Running,
+            "running:0",
+            astra_core::work_unit::WorkUnitObservationMode::Transition,
+        )
+        .unwrap()
+        .with_wake_policy(astra_core::work_unit::WorkUnitWakePolicy::OnTerminal)
+        .insert_into(&mut fields);
         EdgeToolExecResult {
             request_id: "req-bash".to_string(),
             tool: "bash".to_string(),
@@ -3930,6 +4058,17 @@ pub(crate) mod tests {
     }
 
     fn make_running_agent_fanout_edge_tool(group_id: &str) -> EdgeToolExecResult {
+        let mut fields = control_plane_runtime_environment_fields();
+        astra_core::work_unit::WorkUnitObservation::new(
+            group_id,
+            "agent_fanout",
+            astra_core::work_unit::WorkUnitStatus::Running,
+            "revision-1",
+            astra_core::work_unit::WorkUnitObservationMode::Transition,
+        )
+        .unwrap()
+        .with_wake_policy(astra_core::work_unit::WorkUnitWakePolicy::OnTerminal)
+        .insert_into(&mut fields);
         EdgeToolExecResult {
             request_id: "req-agent-fanout".to_string(),
             tool: "agent_fanout".to_string(),
@@ -3956,7 +4095,7 @@ pub(crate) mod tests {
                 }
             })
             .to_string(),
-            tool_result_fields: Some(control_plane_runtime_environment_fields()),
+            tool_result_fields: Some(fields),
             status: "completed".to_string(),
             duration_ms: 10,
         }
@@ -4000,6 +4139,33 @@ pub(crate) mod tests {
                 "mode": mode,
             }),
         );
+        let work_status = match status {
+            "pending" => astra_core::work_unit::WorkUnitStatus::Pending,
+            "running" => astra_core::work_unit::WorkUnitStatus::Running,
+            "waiting_for_input" => astra_core::work_unit::WorkUnitStatus::WaitingForInput,
+            "stopping" => astra_core::work_unit::WorkUnitStatus::Stopping,
+            "completed" => astra_core::work_unit::WorkUnitStatus::Completed,
+            "failed" => astra_core::work_unit::WorkUnitStatus::Failed,
+            "interrupted" => astra_core::work_unit::WorkUnitStatus::Interrupted,
+            "killed" => astra_core::work_unit::WorkUnitStatus::Cancelled,
+            _ => astra_core::work_unit::WorkUnitStatus::Unavailable,
+        };
+        let observation_mode = match mode {
+            "wait" => astra_core::work_unit::WorkUnitObservationMode::Wait,
+            "historical" => astra_core::work_unit::WorkUnitObservationMode::Historical,
+            "diagnostic" => astra_core::work_unit::WorkUnitObservationMode::Diagnostic,
+            _ => astra_core::work_unit::WorkUnitObservationMode::Current,
+        };
+        astra_core::work_unit::WorkUnitObservation::new(
+            task_id,
+            "shell",
+            work_status,
+            format!("{status}:0"),
+            observation_mode,
+        )
+        .unwrap()
+        .with_wake_policy(astra_core::work_unit::WorkUnitWakePolicy::OnTerminal)
+        .insert_into(&mut fields);
         let mut result = make_edge_tool_with_args(
             "task_output",
             json!({"task_id": task_id, "block": mode == "wait"}),
@@ -5647,7 +5813,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn detached_bash_continues_and_rejects_same_turn_poll() {
+    async fn detached_work_leaves_the_turn_available_for_independent_work() {
         let mut host = MockHost::new(vec![
             edge_tool_result(
                 vec![make_detached_bash_edge_tool("bg-shell-1")],
@@ -5656,18 +5822,14 @@ pub(crate) mod tests {
                 None,
             ),
             edge_tool_result(
-                vec![make_edge_tool_with_args(
-                    "task_output",
-                    json!({"task_id": "bg-shell-1", "block": false}),
-                    "should not run",
-                )],
+                vec![make_edge_tool("read_file", "independent evidence")],
                 10,
                 5,
                 None,
             ),
             text_result("done", 10, 5, None),
         ])
-        .with_valid_tools(&["bash", "task_output"]);
+        .with_valid_tools(&["bash", "read_file"]);
         let mut state = make_state();
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
@@ -5683,12 +5845,12 @@ pub(crate) mod tests {
         );
         assert_eq!(
             state.total_tool_calls, 2,
-            "the intercepted task_output is still a model-issued tool call"
+            "detach and independent work should both execute"
         );
         assert!(state.telemetry.all_tools_used.contains("bash"));
         assert!(
-            state.telemetry.all_tools_used.contains("task_output"),
-            "tool telemetry tracks model-issued calls even when runtime interception avoids execution"
+            state.telemetry.all_tools_used.contains("read_file"),
+            "independent work must remain available after detach"
         );
         assert!(
             state
@@ -5697,17 +5859,10 @@ pub(crate) mod tests {
                 .any(|message| message.to_string().contains("bg-shell-1")),
             "background task id must remain visible in the tool result messages"
         );
-        assert!(
-            state
-                .messages
-                .iter()
-                .any(|message| { message.to_string().contains("Do not poll or list it again") }),
-            "same-turn task_output must resolve to the runtime anti-poll receipt"
-        );
     }
 
     #[tokio::test]
-    async fn repeated_same_turn_background_polling_is_bounded_by_runtime() {
+    async fn repeated_unchanged_work_observations_are_bounded_by_runtime() {
         let mut host = MockHost::new(vec![
             edge_tool_result(
                 vec![make_detached_bash_edge_tool("bg-shell-1")],
@@ -5716,20 +5871,20 @@ pub(crate) mod tests {
                 None,
             ),
             edge_tool_result(
-                vec![make_edge_tool_with_args(
-                    "task_list",
-                    json!({"include_terminal": true}),
-                    "should not run",
+                vec![make_shell_task_output_observation(
+                    "bg-shell-1",
+                    "current",
+                    "still running",
                 )],
                 10,
                 5,
                 None,
             ),
             edge_tool_result(
-                vec![make_edge_tool_with_args(
-                    "task_output",
-                    json!({"task_id": "bg-shell-1", "block": false}),
-                    "should not run",
+                vec![make_shell_task_output_observation(
+                    "bg-shell-1",
+                    "current",
+                    "still running",
                 )],
                 10,
                 5,
@@ -5737,7 +5892,7 @@ pub(crate) mod tests {
             ),
             text_result("unreachable model response", 10, 5, None),
         ])
-        .with_valid_tools(&["bash", "task_list", "task_output"]);
+        .with_valid_tools(&["bash", "task_output"]);
         let mut state = make_state();
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
@@ -5749,7 +5904,7 @@ pub(crate) mod tests {
         assert_eq!(
             host.turn_count(),
             3,
-            "a second same-turn polling violation must close the loop without another model call"
+            "a second unchanged observation must close the loop without another model call"
         );
         assert_eq!(state.total_tool_calls, 3);
         assert!(
@@ -5758,7 +5913,7 @@ pub(crate) mod tests {
             state.final_text
         );
         assert!(
-            state.final_text.contains("surfaced automatically"),
+            state.final_text.contains("materially changed"),
             "{}",
             state.final_text
         );
@@ -5766,7 +5921,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn current_background_snapshot_blocks_same_turn_log_chasing() {
+    async fn explicit_historical_read_is_not_misclassified_as_live_polling() {
         let mut host = MockHost::new(vec![
             edge_tool_result(
                 vec![make_shell_task_output_observation(
@@ -5779,10 +5934,10 @@ pub(crate) mod tests {
                 None,
             ),
             edge_tool_result(
-                vec![make_edge_tool_with_args(
-                    "task_output",
-                    json!({"task_id": "bg-shell-1", "offset": 4096, "block": false}),
-                    "should not run",
+                vec![make_shell_task_output_observation(
+                    "bg-shell-1",
+                    "historical",
+                    "requested historical page",
                 )],
                 10,
                 5,
@@ -5802,12 +5957,81 @@ pub(crate) mod tests {
         assert_eq!(host.turn_count(), 3);
         assert_eq!(state.total_tool_calls, 2);
         assert!(
-            state.messages.iter().any(|message| {
-                let message = message.to_string();
-                message.contains("already has a current status snapshot")
-                    && message.contains("Do not page historical output")
-            }),
-            "a cursor follow-up after a current snapshot must be intercepted"
+            state.final_text.starts_with("The task is still running."),
+            "{}",
+            state.final_text
+        );
+        assert!(
+            state.final_text.contains("Runtime state (authoritative)"),
+            "{}",
+            state.final_text
+        );
+        assert!(
+            state
+                .final_text
+                .contains("partial snapshot, not a completion report"),
+            "{}",
+            state.final_text
+        );
+        assert!(
+            state
+                .stall
+                .work_unit_observations
+                .repeatedly_unchanged_ids(1)
+                .is_empty(),
+            "historical pagination must not increment live-observation counters"
+        );
+    }
+
+    #[tokio::test]
+    async fn nonterminal_work_observation_prevents_an_unqualified_completion_claim() {
+        let mut host = MockHost::new(vec![
+            edge_tool_result(
+                vec![make_shell_task_output_observation(
+                    "fanout-review",
+                    "current",
+                    "one reviewer completed; two reviewers still running",
+                )],
+                10,
+                5,
+                None,
+            ),
+            text_result("All three reviewers completed.", 10, 5, None),
+        ])
+        .with_valid_tools(&["task_output"]);
+        let mut state = make_state();
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+        assert!(
+            matches!(outcome, Ok(AgenticLoopOutcome::Completed)),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            host.turn_count(),
+            2,
+            "settlement must not spend another LLM round"
+        );
+        assert!(
+            state
+                .final_text
+                .contains("1 asynchronous work unit(s) remain non-terminal"),
+            "{}",
+            state.final_text
+        );
+        assert!(
+            state
+                .final_text
+                .contains("partial snapshot, not a completion report"),
+            "{}",
+            state.final_text
+        );
+        assert!(
+            state
+                .final_text
+                .contains("runtime owns their next meaningful update"),
+            "{}",
+            state.final_text
         );
     }
 
@@ -5853,20 +6077,20 @@ pub(crate) mod tests {
         assert_eq!(host.turn_count(), 3);
         assert_eq!(state.total_tool_calls, 2);
         assert!(
-            state.stall.observed_background_task_snapshots.is_empty(),
-            "terminal observations must not arm the live-poll guard"
+            state.stall.work_unit_observations.is_empty(),
+            "terminal observations must clear live progress tracking"
         );
-        assert_eq!(state.stall.repeated_background_task_snapshot_attempts, 0);
         assert!(
-            state.messages.iter().all(|message| !message
-                .to_string()
-                .contains("already has a current status snapshot")),
+            state
+                .messages
+                .iter()
+                .all(|message| !message.to_string().contains("has not materially changed")),
             "terminal failure diagnostics must execute instead of being treated as live polling"
         );
     }
 
     #[tokio::test]
-    async fn repeated_background_snapshot_pagination_is_runtime_bounded() {
+    async fn repeated_current_observations_are_runtime_bounded() {
         let mut host = MockHost::new(vec![
             edge_tool_result(
                 vec![make_shell_task_output_observation(
@@ -5879,20 +6103,20 @@ pub(crate) mod tests {
                 None,
             ),
             edge_tool_result(
-                vec![make_edge_tool_with_args(
-                    "task_output",
-                    json!({"task_id": "bg-shell-1", "offset": 4096}),
-                    "should not run",
+                vec![make_shell_task_output_observation(
+                    "bg-shell-1",
+                    "current",
+                    "same opaque current shell snapshot",
                 )],
                 10,
                 5,
                 None,
             ),
             edge_tool_result(
-                vec![make_edge_tool_with_args(
-                    "task_output",
-                    json!({"task_id": "bg-shell-1", "offset": 8192}),
-                    "should not run",
+                vec![make_shell_task_output_observation(
+                    "bg-shell-1",
+                    "current",
+                    "same opaque current shell snapshot",
                 )],
                 10,
                 5,
@@ -5912,7 +6136,7 @@ pub(crate) mod tests {
         assert_eq!(
             host.turn_count(),
             3,
-            "a second attempt to chase a running snapshot must close the loop"
+            "a second unchanged live observation must close the loop"
         );
         assert_eq!(state.total_tool_calls, 3);
         assert!(
@@ -5921,9 +6145,7 @@ pub(crate) mod tests {
             state.final_text
         );
         assert!(
-            state
-                .final_text
-                .contains("already has a current status snapshot"),
+            state.final_text.contains("has not materially changed"),
             "{}",
             state.final_text
         );

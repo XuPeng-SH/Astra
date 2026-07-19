@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use super::{BackgroundTaskCounts, BackgroundTaskFanoutSummary, StatusContext, StatusLine};
+use super::{BackgroundTaskCounts, StatusContext, StatusLine};
 use crate::tui::status_line::line::PermissionMode;
 use crate::tui::theme::current as current_theme;
 
@@ -642,6 +642,10 @@ fn bg_running_only_renders_count() {
         "running-only chip must show count; got {plain:?}"
     );
     assert!(
+        plain.contains("Shift+↓ manage"),
+        "live background work must advertise its management shortcut; got {plain:?}"
+    );
+    assert!(
         !plain.contains("background commands"),
         "chip must use typed task vocabulary; got {plain:?}"
     );
@@ -723,7 +727,7 @@ fn bg_stalled_only_chip_uses_yellow_for_attention() {
         .find(|seg| seg.text.contains("need input"))
         .expect("bg chip must render even when only stalled (the model needs to know)");
     assert_eq!(
-        chip.text, "2 need input",
+        chip.text, "2 need input · Shift+↓ manage",
         "stalled-only chip should be an attention state, not a vague background label"
     );
     assert_eq!(
@@ -750,7 +754,7 @@ fn bg_failed_only_chip_uses_error_attention() {
         .iter()
         .find(|seg| seg.text.contains("failed"))
         .expect("failed bg shell must stay visible as an attention state");
-    assert_eq!(chip.text, "1 shell failed");
+    assert_eq!(chip.text, "1 shell failed · Shift+↓ manage");
     assert_eq!(chip.style.fg, Some(current_theme().error));
 }
 
@@ -863,19 +867,8 @@ fn bg_footer_names_unavailable_typed_tasks() {
 }
 
 #[test]
-fn bg_footer_calls_out_active_fanout_group_accounting() {
+fn bg_footer_keeps_fanout_detail_in_the_task_surface() {
     let c = StatusContext {
-        bg_fanout_summaries: vec![BackgroundTaskFanoutSummary {
-            group_id: "review-1".into(),
-            title: "review fanout".into(),
-            target_count: 3,
-            running: 2,
-            stopping: 0,
-            done: 0,
-            failed: 0,
-            stopped: 1,
-            unavailable: 0,
-        }],
         bg_task_counts: Some(BackgroundTaskCounts {
             local_agents: 2,
             ..BackgroundTaskCounts::default()
@@ -885,40 +878,14 @@ fn bg_footer_calls_out_active_fanout_group_accounting() {
 
     let plain = StatusLine::from_context(&c).plain();
     assert!(
-        plain.contains("review fanout 2/3 running · 1 stopped"),
-        "fanout footer must preserve target count and stopped slots; got {plain:?}"
+        plain.contains("2 local agents · Shift+↓ manage"),
+        "the footer should expose one compact task pill and its route; got {plain:?}"
     );
     assert!(
-        plain.contains("2 local agents"),
-        "fanout summary should not erase typed task counts; got {plain:?}"
-    );
-}
-
-#[test]
-fn bg_fanout_summary_from_rows_hides_stopped_only_groups() {
-    use crate::tui::bottom_pane::background_task_view::{
-        BackgroundTaskFanoutMembership, BackgroundTaskKind, BackgroundTaskRow,
-        BackgroundTaskRowInit,
-    };
-
-    let row = BackgroundTaskRow::new(BackgroundTaskRowInit::new(
-        "agent-stopped",
-        BackgroundTaskKind::LocalAgent,
-        "killed",
-        1000,
-        "storage review",
-    ))
-    .with_fanout(BackgroundTaskFanoutMembership {
-        group_id: "review-1".into(),
-        group_title: "review fanout".into(),
-        target_count: 3,
-        slot_index: 1,
-        slot_label: "storage review".into(),
-    });
-
-    assert!(
-        BackgroundTaskFanoutSummary::from_rows(&[row]).is_empty(),
-        "stopped-only fanout groups should not pin the footer forever"
+        !plain.contains("review fanout")
+            && !plain.contains("2/3 running")
+            && !plain.contains("2m05s"),
+        "group title, accounting, and elapsed time belong in Shift+Down; got {plain:?}"
     );
 }
 

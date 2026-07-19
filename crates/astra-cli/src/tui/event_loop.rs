@@ -965,28 +965,29 @@ fn ctrl_b_promoted_agent_message(
     agents: &[astra_turn_core::orchestration_types::SpawnedAgentInfo],
 ) -> String {
     let Some(first) = agents.first() else {
-        return "Opened background tasks.".to_string();
+        return "Nothing was moved to background · Shift+↓ inspect tasks.".to_string();
     };
     if agents.len() > 1 {
-        let group_id = first
+        let (group_id, target_count) = first
             .fanout_slot
             .as_ref()
-            .map(|slot| slot.group_id.as_str())
-            .unwrap_or("agent group");
+            .map_or(("agent group", agents.len()), |slot| {
+                (slot.group_id.as_str(), slot.target_count)
+            });
         return format!(
-            "Backgrounded {group_id} ({} agents). Opened background tasks.",
-            agents.len()
+            "Backgrounded {group_id} ({} agents) · one update after the group settles · Shift+↓ inspect.",
+            target_count
         );
     }
     let description = first.description.trim();
     if description.is_empty() {
         format!(
-            "Backgrounded agent {}. Opened background tasks.",
+            "Backgrounded agent {} · Astra will update when it needs attention or finishes · Shift+↓ inspect.",
             first.agent_id
         )
     } else {
         format!(
-            "Backgrounded agent {} ({description}). Opened background tasks.",
+            "Backgrounded agent {} ({description}) · Astra will update when it needs attention or finishes · Shift+↓ inspect.",
             first.agent_id
         )
     }
@@ -1288,11 +1289,17 @@ async fn submit_active_run_guidance(
         >,
     >,
     text: &str,
+    background_work_snapshot: Option<&str>,
+    work_unit_observations: &[astra_core::work_unit::WorkUnitObservation],
 ) -> Result<crate::cli::turn::local_run_control::LocalUserIntentReceipt, String> {
     let provider = astra_core::sync_poison::recover_mutex_lock(run_control)
         .clone()
         .ok_or_else(|| "Run is changing state. Try again, or press Ctrl+C to stop.".to_string())?;
-    provider.accept_guidance(text)
+    provider.accept_guidance_with_runtime_context(
+        text,
+        background_work_snapshot,
+        work_unit_observations,
+    )
 }
 
 async fn submit_active_runtime_notification(
@@ -4237,6 +4244,13 @@ fn settle_visible_reply(
     if output_settled_at.is_some() {
         return false;
     }
+    // One model SSE segment commonly ends immediately after requesting a
+    // runtime-owned tool. That is a transport boundary, not visible-turn
+    // settlement: input must remain guidance for the active run, Ctrl+C must
+    // still stop it, and the tool cell must stay live until its own outcome.
+    if chat_widget.has_live_tool_projection() {
+        return false;
+    }
     *output_settled_at = Some(now);
     chat_widget.finish_stream_projection();
     bottom_pane.set_task_status(TaskStatus::Idle);
@@ -5867,6 +5881,10 @@ pub(crate) async fn run_tui_session(
                                     let mut bash_detach_request_pending = false;
                                     let mut active_bash_tool_use_id: Option<String> = None;
                                     let mut active_bash_description: Option<String> = None;
+                                    let mut active_agent_tools =
+                                        std::collections::BTreeMap::<String, (String, String)>::new();
+                                    let mut background_handoff_tool_ids =
+                                        std::collections::HashSet::<String>::new();
                                     let mut deferred_active_bg_notifications = Vec::new();
 
                                     let turn_tx = stream_bridge::create_per_turn_bridge(tui_tx.clone());
@@ -6062,14 +6080,53 @@ pub(crate) async fn run_tui_session(
                                                                         .await
                                                                     && !promoted.is_empty()
                                                                 {
-                                                                    chat_widget.commit_system(
-                                                                        history_cell::system::SystemCell::background_task(
-                                                                            ctrl_b_promoted_agent_message(&promoted),
-                                                                        ),
-                                                                    );
+                                                                    let handoff_message =
+                                                                        ctrl_b_promoted_agent_message(&promoted);
                                                                     promoted_agent_id = promoted
                                                                         .first()
                                                                         .map(|agent| agent.agent_id.clone());
+                                                                    // Backgrounding is a runtime-owned lifecycle
+                                                                    // transition, so settle the visible tool cell
+                                                                    // from that authoritative transition and cancel
+                                                                    // the old parent model boundary immediately. A
+                                                                    // later transport completion for this tool id is
+                                                                    // suppressed below; otherwise cancellation paints
+                                                                    // a false failure followed by a duplicate success.
+                                                                    for (tool_use_id, (name, description)) in
+                                                                        std::mem::take(&mut active_agent_tools)
+                                                                    {
+                                                                        let handoff_event = TuiAppEvent::ToolCompleted {
+                                                                            name,
+                                                                            description,
+                                                                            status: "completed".into(),
+                                                                            duration_ms: 0,
+                                                                            output_summary: Some(
+                                                                                "Lifecycle ownership moved to the background."
+                                                                                    .into(),
+                                                                            ),
+                                                                            output: None,
+                                                                            tool_use_id: tool_use_id.clone(),
+                                                                            parent_tool_use_id: None,
+                                                                        };
+                                                                        if let Some(event) = chat_widget::translate(
+                                                                            handoff_event.clone(),
+                                                                            chat_widget::TurnContext::default(),
+                                                                        ) {
+                                                                            chat_widget.handle_event(event);
+                                                                        }
+                                                                        handle_app_event(
+                                                                            &handoff_event,
+                                                                            &mut bottom_pane,
+                                                                            &mut status_indicator,
+                                                                            &frame_requester,
+                                                                        );
+                                                                        background_handoff_tool_ids.insert(tool_use_id);
+                                                                    }
+                                                                    chat_widget.commit_concurrent_system(
+                                                                        history_cell::system::SystemCell::background_task(
+                                                                            &handoff_message,
+                                                                        ),
+                                                                    );
                                                                     tui_cancel_token.cancel();
                                                                 }
 
@@ -6236,9 +6293,19 @@ pub(crate) async fn run_tui_session(
                                                                             frame_requester.schedule_frame();
                                                                             continue;
                                                                         }
+                                                                        let active_work_snapshot =
+                                                                            bg_task_list_cache_for_turn
+                                                                                .read()
+                                                                                .await
+                                                                                .clone();
+                                                                        let active_work_observations =
+                                                                            local_agent_snapshot
+                                                                                .fanout_work_unit_observations();
                                                                         match submit_active_run_guidance(
                                                                             &active_turn_local_run_control,
                                                                             &queued_text,
+                                                                            Some(&active_work_snapshot),
+                                                                            &active_work_observations,
                                                                         )
                                                                         .await
                                                                         {
@@ -6249,6 +6316,27 @@ pub(crate) async fn run_tui_session(
                                                                                         receipt.status,
                                                                                         queued_text,
                                                                                     );
+                                                                                    chat_widget.commit_concurrent_system(
+                                                                                        history_cell::system::SystemCell::runtime_work(
+                                                                                            local_agent_snapshot.active_guidance_receipt(),
+                                                                                        ),
+                                                                                    );
+                                                                                    // Guidance is accepted while the foreground
+                                                                                    // tool still owns the turn, so no normal
+                                                                                    // stream event may arrive for several seconds.
+                                                                                    // Explicitly wake the renderer instead of
+                                                                                    // leaving the receipt buffered behind fan-in.
+                                                                                    // Committed history is rendered through the
+                                                                                    // terminal scrollback queue, independently of
+                                                                                    // the live frame. Drain it now as well as
+                                                                                    // requesting a frame; otherwise the receipt is
+                                                                                    // invisible until the foreground tool commits.
+                                                                                    flush_chat_widget(
+                                                                                        &mut guard,
+                                                                                        &mut chat_widget,
+                                                                                        w,
+                                                                                    );
+                                                                                    frame_requester.schedule_frame();
                                                                                 }
                                                                             Err(error) => {
                                                                                 bottom_pane.composer.set_text(&queued_text);
@@ -6627,6 +6715,13 @@ pub(crate) async fn run_tui_session(
                                                 Some(ae) = tui_rx.recv() => {
                                                     if matches!(
                                                         &ae,
+                                                        TuiAppEvent::ToolCompleted { tool_use_id, .. }
+                                                            if background_handoff_tool_ids.contains(tool_use_id)
+                                                    ) {
+                                                        continue;
+                                                    }
+                                                    if matches!(
+                                                        &ae,
                                                         TuiAppEvent::AssistantOutputSettled
                                                             | TuiAppEvent::TurnStreamClosed
                                                     ) {
@@ -6670,6 +6765,27 @@ pub(crate) async fn run_tui_session(
                                                         TuiAppEvent::ExplainReport(items) if !items.is_empty() => {
                                                             explain_items.extend(items.clone());
                                                             continue;
+                                                        }
+                                                        _ => {}
+                                                    }
+                                                    match &ae {
+                                                        TuiAppEvent::ToolStarted {
+                                                            name,
+                                                            description,
+                                                            tool_use_id,
+                                                            parent_tool_use_id,
+                                                        } if parent_tool_use_id.is_none()
+                                                            && matches!(name.as_str(), "agent" | "agent_fanout") =>
+                                                        {
+                                                            active_agent_tools.insert(
+                                                                tool_use_id.clone(),
+                                                                (name.clone(), description.clone()),
+                                                            );
+                                                        }
+                                                        TuiAppEvent::ToolCompleted { tool_use_id, .. }
+                                                            if active_agent_tools.contains_key(tool_use_id) =>
+                                                        {
+                                                            active_agent_tools.remove(tool_use_id);
                                                         }
                                                         _ => {}
                                                     }
@@ -6942,6 +7058,17 @@ pub(crate) async fn run_tui_session(
                                                                 agent_spawner_for_cancel.as_ref(),
                                                             )
                                                             .await;
+                                                        for receipt in next_snapshot
+                                                            .launch_receipts_since(
+                                                                &local_agent_snapshot,
+                                                            )
+                                                        {
+                                                            chat_widget.commit_concurrent_system(
+                                                                history_cell::system::SystemCell::runtime_work(
+                                                                    receipt,
+                                                                ),
+                                                            );
+                                                        }
                                                         let notifications = next_snapshot
                                                             .attention_notifications_since(
                                                                 &local_agent_snapshot,
@@ -8243,6 +8370,14 @@ pub(crate) async fn run_tui_session(
                             state.agent_spawner.as_ref(),
                         )
                         .await;
+                    for receipt in next_local_agent_snapshot
+                        .launch_receipts_since(&local_agent_snapshot)
+                    {
+                        chat_widget.commit_concurrent_system(
+                            history_cell::system::SystemCell::runtime_work(receipt),
+                        );
+                        frame_requester.schedule_frame();
+                    }
                     let agent_notifications = next_local_agent_snapshot
                         .attention_notifications_since(&local_agent_snapshot);
                     if !agent_notifications.is_empty() {
@@ -8351,9 +8486,6 @@ pub(crate) async fn run_tui_session(
                 } else {
                     Some(bg_counts)
                 };
-                bottom_pane.footer.bg_fanout_summaries =
-                    status_line::BackgroundTaskFanoutSummary::from_rows(&rows_for_footer);
-
                 plan_task_observer.set_view_mode(task_board.view_mode());
                 plan_task_observer.maybe_refresh();
                 let plan_task_projection = plan_task_observer.projection();
@@ -8759,6 +8891,45 @@ mod tests {
             "duplicate stream-close notifications must not reset the completion boundary"
         );
         assert_eq!(output_settled_at, Some(now));
+    }
+
+    #[test]
+    fn stream_close_while_tool_runs_does_not_release_turn_ownership() {
+        let now = std::time::Instant::now();
+        let mut output_settled_at = None;
+        let mut chat_widget = chat_widget::ChatWidget::new(String::new());
+        let started = TuiAppEvent::ToolStarted {
+            name: "agent_fanout".into(),
+            description: "three reviews".into(),
+            tool_use_id: "fanout-live".into(),
+            parent_tool_use_id: None,
+        };
+        let event = chat_widget::translate(started, chat_widget::TurnContext::default())
+            .expect("tool start projects into scrollback");
+        chat_widget.handle_event(event);
+        let mut bottom_pane = BottomPane::new();
+        let mut indicator = status_indicator::StatusIndicator::new();
+        indicator.set_state(status_indicator::IndicatorState::Tool {
+            name: "agent_fanout".into(),
+            started_at: now,
+        });
+
+        assert!(
+            !settle_visible_reply(
+                &mut output_settled_at,
+                &mut chat_widget,
+                &mut bottom_pane,
+                &mut indicator,
+                now,
+            ),
+            "closing the requesting SSE segment must not settle its running tool"
+        );
+        assert!(output_settled_at.is_none());
+        assert!(chat_widget.has_live_tool_projection());
+        assert!(
+            indicator.render_at(now).is_some(),
+            "active tool feedback must remain visible"
+        );
     }
 
     #[test]
@@ -10021,7 +10192,8 @@ mod tests {
 
         assert!(message.contains("Backgrounded agent reviewer@run-1"));
         assert!(message.contains("review auth flow"));
-        assert!(message.contains("Opened background tasks"));
+        assert!(message.contains("Astra will update"));
+        assert!(message.contains("Shift+↓ inspect"));
         assert!(!message.contains("agent(action="), "{message}");
         assert!(!message.contains("task_output"), "{message}");
         assert!(!message.contains("job("), "{message}");
@@ -10041,7 +10213,7 @@ mod tests {
                 agent.fanout_slot = Some(
                     astra_turn_core::orchestration_fanout_group::AgentFanoutSlotIdentity::new(
                         "review-group",
-                        2,
+                        3,
                         slot_index,
                         None,
                     )
@@ -10052,12 +10224,16 @@ mod tests {
             .collect::<Vec<_>>();
 
         let message = ctrl_b_promoted_agent_message(&agents);
-        assert!(message.contains("Backgrounded review-group (2 agents)"));
-        assert!(message.contains("Opened background tasks"));
+        assert!(
+            message.contains("Backgrounded review-group (3 agents)"),
+            "a partially settled group still has its original target count: {message}"
+        );
+        assert!(message.contains("one update after the group settles"));
+        assert!(message.contains("Shift+↓ inspect"));
     }
 
     #[test]
-    fn background_task_row_for_local_agent_only_projects_background_agents() {
+    fn task_row_projects_foreground_agents_without_changing_lifecycle_ownership() {
         let foreground = agent_info(
             "agent-foreground",
             AgentStatus::Running {
@@ -10065,10 +10241,9 @@ mod tests {
             },
             false,
         );
-        assert!(
-            background_task_row_for_local_agent(&foreground).is_none(),
-            "foreground sync agents must not appear in the background task footer"
-        );
+        let foreground_row = background_task_row_for_local_agent(&foreground)
+            .expect("foreground fan-in must remain observable from Shift+Down");
+        assert!(!foreground_row.run_in_background);
 
         let background = agent_info(
             "agent-background",
@@ -10079,6 +10254,7 @@ mod tests {
         );
         let row = background_task_row_for_local_agent(&background)
             .expect("background agent should project to a task row");
+        assert!(row.run_in_background);
         assert_eq!(
             row.kind,
             bottom_pane::background_task_view::BackgroundTaskKind::LocalAgent
@@ -10145,7 +10321,7 @@ mod tests {
     }
 
     #[test]
-    fn background_local_agent_row_preserves_fanout_membership_for_footer_and_switcher() {
+    fn background_local_agent_row_preserves_fanout_membership_for_management_surface() {
         let mut agent = agent_info(
             "agent-auth",
             AgentStatus::Running {
@@ -10169,20 +10345,13 @@ mod tests {
         assert_eq!(fanout.target_count, 3);
         assert_eq!(fanout.slot_index, 0);
 
-        let summaries =
-            status_line::BackgroundTaskFanoutSummary::from_rows(std::slice::from_ref(&row));
-        assert_eq!(summaries.len(), 1);
-        assert_eq!(summaries[0].target_count, 3);
-        assert_eq!(summaries[0].running, 1);
-
         let xml = render_background_task_rows_xml(&[row]);
-        assert!(xml.contains("fanout_group_id=\"review-1\""), "{xml}");
-        assert!(
-            xml.contains("fanout_group_title=\"review fanout\""),
-            "{xml}"
-        );
-        assert!(xml.contains("fanout_target_count=\"3\""), "{xml}");
-        assert!(xml.contains("fanout_slot_index=\"0\""), "{xml}");
+        assert!(xml.contains("id=\"review-1\""), "{xml}");
+        assert!(xml.contains("kind=\"agent_fanout\""), "{xml}");
+        assert!(xml.contains("title=\"review fanout\""), "{xml}");
+        assert!(xml.contains("target_count=\"3\""), "{xml}");
+        assert!(xml.contains("active=\"1\""), "{xml}");
+        assert!(!xml.contains("agent-auth"), "{xml}");
     }
 
     #[test]
@@ -10231,18 +10400,14 @@ mod tests {
         assert_eq!(fanout.slot_index, 1);
         assert_eq!(fanout.slot_label, "review API surface");
 
-        let summaries =
-            status_line::BackgroundTaskFanoutSummary::from_rows(std::slice::from_ref(&row));
-        assert_eq!(summaries.len(), 1);
-        assert_eq!(summaries[0].failed, 1);
-
         let xml = render_background_task_rows_xml(std::slice::from_ref(&row));
+        assert!(xml.contains("id=\"review-1\""), "{xml}");
+        assert!(xml.contains("status=\"completed_with_issues\""), "{xml}");
+        assert!(xml.contains("failed=\"1\""), "{xml}");
         assert!(
-            xml.contains("id=\"fanout:review-1:slot:1:spawn_rejected\""),
+            !xml.contains("fanout:review-1:slot:1:spawn_rejected"),
             "{xml}"
         );
-        assert!(xml.contains("status=\"failed\""), "{xml}");
-        assert!(xml.contains("preview=\"concurrency cap reached\""), "{xml}");
 
         let snapshot =
             background_task_output_snapshot_for_rejected_fanout_slot(&group, &group.slots[1], 0, 9)
@@ -10462,7 +10627,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restored_local_agent_keeps_fanout_group_metadata_for_resume_footer() {
+    async fn restored_local_agent_keeps_fanout_group_metadata_for_resume_surface() {
         let temp = crate::tests::test_temp_dir();
         let mut registry =
             crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
@@ -10483,16 +10648,11 @@ mod tests {
             bottom_pane::background_task_view::BackgroundTaskStatus::Running
         );
 
-        let summaries = status_line::BackgroundTaskFanoutSummary::from_rows(&rows);
-        assert_eq!(summaries.len(), 1);
-        assert_eq!(summaries[0].target_count, 3);
-        assert_eq!(summaries[0].running, 1);
-        assert_eq!(summaries[0].unavailable, 0);
-
         let xml = render_background_task_rows_xml(&rows);
-        assert!(xml.contains("fanout_group_id=\"review-1\""), "{xml}");
-        assert!(xml.contains("fanout_target_count=\"3\""), "{xml}");
+        assert!(xml.contains("id=\"review-1\""), "{xml}");
+        assert!(xml.contains("target_count=\"3\""), "{xml}");
         assert!(xml.contains("live_control=\"stale_handle\""), "{xml}");
+        assert!(!xml.contains("agent-restored-fanout"), "{xml}");
     }
 
     #[tokio::test]
@@ -11605,7 +11765,12 @@ mod tests {
     async fn submit_active_run_guidance_enqueues_against_active_local_run_control() {
         let run_control = Arc::new(std::sync::Mutex::new(Some(LocalRunControl::shared())));
 
-        let receipt = submit_active_run_guidance(&run_control, "先停下来吧")
+        let receipt = submit_active_run_guidance(
+            &run_control,
+            "现在什么情况？",
+            Some("<background_tasks count=\"1\"><task id=\"review-group\" kind=\"agent_fanout\" status=\"running\" /></background_tasks>"),
+            &[],
+        )
             .await
             .expect("user intent should be accepted");
 
@@ -11617,7 +11782,15 @@ mod tests {
             .await;
         assert_eq!(polled.inputs.len(), 1, "one user intent should be queued");
         assert_eq!(polled.inputs[0].intent_id, receipt.intent_id);
-        assert_eq!(polled.inputs[0].input["content"], "先停下来吧");
+        assert_eq!(polled.inputs[0].input["content"], "现在什么情况？");
+        assert_eq!(
+            polled.inputs[0].input["astra_runtime_context"]["schema"],
+            "active_work_snapshot.v1"
+        );
+        assert_eq!(
+            polled.inputs[0].input["astra_runtime_context"]["background_work_snapshot"],
+            "<background_tasks count=\"1\"><task id=\"review-group\" kind=\"agent_fanout\" status=\"running\" /></background_tasks>"
+        );
     }
 
     #[tokio::test]
@@ -11641,7 +11814,7 @@ mod tests {
     #[tokio::test]
     async fn submit_active_run_guidance_rejects_missing_local_run_control() {
         let run_control = Arc::new(std::sync::Mutex::new(None));
-        let error = submit_active_run_guidance(&run_control, "先停下来吧")
+        let error = submit_active_run_guidance(&run_control, "先停下来吧", None, &[])
             .await
             .expect_err("missing run control must be rejected locally");
         assert!(
