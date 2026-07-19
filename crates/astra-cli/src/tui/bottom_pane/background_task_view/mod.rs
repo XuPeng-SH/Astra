@@ -18,7 +18,7 @@ pub(crate) use types::{
 };
 
 use list_render::background_task_list_entries;
-use types::{PAGE_STEP, sort_rows};
+use types::{BackgroundTaskStatusExt, PAGE_STEP, sort_rows};
 
 use super::view::{
     BottomPaneView, BottomPaneViewAction, CancellationEvent, ViewActionDisposition,
@@ -162,7 +162,7 @@ impl BackgroundTaskView {
 
     fn request_stop(&mut self) {
         if let Some(row) = self.selected_row()
-            && row.status.is_killable()
+            && row.status.can_kill()
             && row.live_control.can_stop()
         {
             self.pending_action = Some(ViewActionRequest {

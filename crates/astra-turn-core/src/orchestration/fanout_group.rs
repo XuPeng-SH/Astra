@@ -9,6 +9,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::SystemTime;
 
+use astra_core::work_unit::{
+    WorkUnitObservation, WorkUnitObservationMode, WorkUnitStatus, WorkUnitWakePolicy,
+};
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentFanoutSlotIdentity {
     pub group_id: String,
@@ -214,6 +218,45 @@ impl AgentFanoutGroupProjection {
             self.status,
             AgentFanoutStatus::Finished | AgentFanoutStatus::Incomplete
         )
+    }
+
+    /// Canonical lifecycle projection shared by runtime, CLI, and UI lanes.
+    ///
+    /// A fanout is one fixed-size work unit. Individual child failures,
+    /// interruptions, cancellations, timeouts, or rejected spawns therefore
+    /// settle the group *with issues*; they do not turn the same group into
+    /// `failed` on one surface and `completed` on another. Consumers must use
+    /// this producer-owned projection instead of re-counting slot causes.
+    pub fn work_unit_status(&self) -> WorkUnitStatus {
+        if !self.is_terminal() {
+            return if self.summary_cache.active > 0 {
+                WorkUnitStatus::Running
+            } else {
+                WorkUnitStatus::Pending
+            };
+        }
+        if self.summary_cache.completed == self.target_count {
+            WorkUnitStatus::Completed
+        } else {
+            WorkUnitStatus::CompletedWithIssues
+        }
+    }
+
+    /// Producer-owned lifecycle observation for this fanout as one work unit.
+    ///
+    /// Consumers must carry this value across model/UI boundaries instead of
+    /// rebuilding lifecycle truth from child events, XML projections, or
+    /// hand-copied agent IDs. The group revision is the opaque material-state
+    /// version and the runtime owns one update when the group settles.
+    pub fn work_unit_observation(&self) -> Option<WorkUnitObservation> {
+        WorkUnitObservation::new(
+            &self.group_id,
+            "agent_fanout",
+            self.work_unit_status(),
+            self.revision.to_string(),
+            WorkUnitObservationMode::Current,
+        )
+        .map(|observation| observation.with_wake_policy(WorkUnitWakePolicy::OnTerminal))
     }
 
     pub fn set_slot_request(
@@ -751,6 +794,60 @@ mod tests {
         assert_eq!(
             group.summary_sentence(),
             "3-agent fanout failed to start fully: 2 accepted, 1 spawn rejected."
+        );
+    }
+
+    #[test]
+    fn work_unit_status_is_one_canonical_projection_for_every_slot_outcome() {
+        let planned = AgentFanoutGroupProjection::new("planned", "Planned", 1);
+        assert_eq!(planned.work_unit_status(), WorkUnitStatus::Pending);
+        let planned_observation = planned.work_unit_observation().unwrap();
+        assert_eq!(planned_observation.id, "planned");
+        assert_eq!(planned_observation.kind, "agent_fanout");
+        assert_eq!(planned_observation.status, WorkUnitStatus::Pending);
+        assert_eq!(planned_observation.version, planned.revision.to_string());
+        assert_eq!(
+            planned_observation.wake_policy,
+            WorkUnitWakePolicy::OnTerminal
+        );
+
+        let mut completed = AgentFanoutGroupProjection::new("completed", "Completed", 1);
+        completed.record_spawn_accepted(0, "reviewer").unwrap();
+        assert_eq!(completed.work_unit_status(), WorkUnitStatus::Running);
+        completed
+            .record_terminal_by_agent("reviewer", AgentFanoutSlotStatus::Completed, None)
+            .unwrap();
+        assert_eq!(completed.work_unit_status(), WorkUnitStatus::Completed);
+
+        for (index, terminal_status) in [
+            AgentFanoutSlotStatus::Interrupted,
+            AgentFanoutSlotStatus::Failed,
+            AgentFanoutSlotStatus::CancelledByUser,
+            AgentFanoutSlotStatus::CancelledByParentBudget,
+            AgentFanoutSlotStatus::TimedOut,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let agent_id = format!("reviewer-{index}");
+            let mut group =
+                AgentFanoutGroupProjection::new(format!("issue-{index}"), "Terminal issue", 1);
+            group.record_spawn_accepted(0, &agent_id).unwrap();
+            group
+                .record_terminal_by_agent(&agent_id, terminal_status, Some("cause".into()))
+                .unwrap();
+            assert_eq!(
+                group.work_unit_status(),
+                WorkUnitStatus::CompletedWithIssues,
+                "{terminal_status:?} must not change meaning across consumers"
+            );
+        }
+
+        let mut rejected = AgentFanoutGroupProjection::new("rejected", "Rejected", 1);
+        rejected.record_spawn_rejected(0, "quota").unwrap();
+        assert_eq!(
+            rejected.work_unit_status(),
+            WorkUnitStatus::CompletedWithIssues
         );
     }
 

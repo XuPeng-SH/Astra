@@ -8,8 +8,8 @@ use ratatui::{
 };
 
 use super::types::{
-    BackgroundTaskKind, BackgroundTaskRow, DETAIL_TAIL_LINES, detail_actions_label, format_elapsed,
-    format_timestamp_ms, pluralize_with_count,
+    BackgroundTaskKind, BackgroundTaskRow, BackgroundTaskStatusExt, DETAIL_TAIL_LINES,
+    detail_actions_label, format_elapsed, format_timestamp_ms, pluralize_with_count,
 };
 
 pub(crate) fn render_detail(
@@ -131,7 +131,7 @@ pub(crate) fn render_detail(
     for (i, line) in lines.into_iter().take(body_height).enumerate() {
         buf.set_line(area.x, area.y + i as u16, &line, area.width);
     }
-    let can_stop = row.status.is_killable() && row.live_control.can_stop();
+    let can_stop = row.status.can_kill() && row.live_control.can_stop();
     let action = detail_actions_label(can_stop, area.width as usize);
     buf.set_line(
         area.x,

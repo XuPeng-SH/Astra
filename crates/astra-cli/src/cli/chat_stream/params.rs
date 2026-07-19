@@ -58,7 +58,6 @@ impl ToolProgressSink {
 /// These are distinct from `PlanUpdate` — they represent raw SSE-level activity
 /// without plan-specific context (subtask IDs, etc.).
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Variants sent through channel and matched on receiver side
 pub enum StreamEvent {
     /// Context occupancy estimated from the request before the runtime has
     /// assembled its system prompt. This is a per-request value, never a
@@ -402,6 +401,10 @@ pub(crate) struct ChatTurnParams<'a> {
     /// Dynamic text from external/session sources. Runtime-owned policy,
     /// guardrail, and telemetry signals use the typed injection lane instead.
     pub(crate) input_runtime_volatile_texts: &'a [String],
+    /// Producer-owned asynchronous work truth captured for this model
+    /// boundary. It seeds both the typed prompt lane and deterministic final
+    /// answer settlement; prose/UI projections are never parsed as state.
+    pub(crate) input_work_unit_observations: &'a [astra_core::work_unit::WorkUnitObservation],
     /// Structured semantic query derived before prompt wrapping when the CLI
     /// knows the message is an active-thread follow-up attachment.
     pub(crate) semantic_query_override: Option<&'a str>,
@@ -656,6 +659,7 @@ impl<'a> ChatTurnParams<'a> {
             user_intent: ctx.message,
             input_runtime_required_texts: &[],
             input_runtime_volatile_texts: &[],
+            input_work_unit_observations: &[],
             semantic_query_override: None,
             session_id,
             model_id: ctx.model_id.map(ToOwned::to_owned),

@@ -1,8 +1,4 @@
 #[cfg(feature = "server")]
-pub mod agent_mailbox;
-#[cfg(feature = "server")]
-pub mod agent_mcp;
-#[cfg(feature = "server")]
 mod chat_route;
 #[cfg(feature = "server")]
 pub mod conflict_resolver;
@@ -494,6 +490,7 @@ pub struct RunListResponse {
 pub struct HealthResponse {
     pub status: String,
     pub database: String,
+    pub memoria: String,
     pub persist_ok: u64,
     pub persist_fail: u64,
 }

@@ -1,12 +1,13 @@
 use super::spawn_mock;
-use crate::cli::chat_stream::{ChatTurnParams, DEFAULT_TURN_INDEX, stream_chat_sse};
-use crate::cli::idle_agent_messages::drain_root_mailbox_into_idle_queue;
+use crate::cli::chat_stream::{
+    BasicCliChatContext, ChatTurnParams, DEFAULT_TURN_INDEX, stream_chat_sse,
+};
 use crate::cli::permission_manager::PermissionManager;
-use crate::cli::session::session_state::{ExplainMode, SessionState};
+use crate::cli::session::session_state::ExplainMode;
 use crate::edge_tools;
 use astra_runtime::tool_registry;
 use astra_services::session_journal::{self, JournalDirGuard, JournalEventType};
-use axum::{Router, routing::post};
+use axum::{Json, Router, routing::post};
 
 // ── chat_stream (SSE agentic loop) ────────────────────────────────────
 
@@ -22,6 +23,120 @@ pub(super) fn sse_text_response(text: &str, session_id: &str) -> String {
              data: {{\"type\":\"turn_complete\",\"has_tool_calls\":false}}\n\n\
              data: [DONE]\n\n"
     )
+}
+
+#[tokio::test]
+async fn stream_chat_sse_cannot_turn_active_fanout_into_a_completion_claim() {
+    let captured_request = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let captured_request_for_route = captured_request.clone();
+    let app = Router::new().route(
+        "/chat/turn",
+        post(move |Json(payload): Json<serde_json::Value>| {
+            let captured_request = captured_request_for_route.clone();
+            async move {
+                *captured_request.lock().unwrap() = Some(payload);
+                (
+                    [("content-type", "text/event-stream")],
+                    sse_text_response(
+                        "All three agents completed. Here is the consolidated report.",
+                        "sess-active-fanout",
+                    ),
+                )
+            }
+        }),
+    );
+    let base = spawn_mock(app).await;
+    let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
+    let unified_skill_registry = astra_runtime::skills::empty_unified_registry().clone();
+    let context = BasicCliChatContext {
+        api: &api,
+        auth_profile: None,
+        message: "What is still running?",
+        model_id: None,
+        model: Some("test-model"),
+        provider: None,
+        explain: ExplainMode::Off,
+        render_md: false,
+        verbose_mode: false,
+        render_policy: crate::cli::stream::stream_render::RenderPolicy::Silent,
+        cli_context: None,
+        unified_skill_registry: &unified_skill_registry,
+        agent_spawner: None,
+        root_agent_id: None,
+        task_manager: None,
+        task_notify_tx: None,
+        bg_task_commands: None,
+        bg_task_list_cache: None,
+        bash_detach_slot: None,
+        stream_event_tx: None,
+        #[cfg(feature = "harness")]
+        harness_sink: None,
+        #[cfg(feature = "harness")]
+        harness_trace: None,
+        #[cfg(feature = "harness")]
+        benchmark_profile: None,
+    };
+    let observations = vec![
+        astra_core::work_unit::WorkUnitObservation::new(
+            "review-group",
+            "agent_fanout",
+            astra_core::work_unit::WorkUnitStatus::Running,
+            "7",
+            astra_core::work_unit::WorkUnitObservationMode::Current,
+        )
+        .unwrap()
+        .with_wake_policy(astra_core::work_unit::WorkUnitWakePolicy::OnTerminal),
+    ];
+    let mut permission_manager = PermissionManager::new(true);
+    let mut skill_quality_tracker = astra_skills::quality::SkillQualityTracker::new();
+    let mut params = ChatTurnParams::basic_cli(
+        &context,
+        "fake-token",
+        Some("sess-active-fanout"),
+        &mut permission_manager,
+        &mut skill_quality_tracker,
+    );
+    params.input_work_unit_observations = &observations;
+
+    let result = stream_chat_sse(params).await.unwrap();
+
+    assert!(
+        result
+            .full_text
+            .contains("All three agents completed. Here is the consolidated report.")
+    );
+    assert!(
+        result.full_text.contains(
+            "Runtime state (authoritative): 1 asynchronous work unit(s) remain non-terminal"
+        ),
+        "runtime must deterministically qualify a false completion claim: {}",
+        result.full_text
+    );
+    assert!(
+        result
+            .full_text
+            .contains("This response is a partial snapshot, not a completion report")
+    );
+
+    let request = captured_request.lock().unwrap().clone().unwrap();
+    let injections = request["edge_profile"]
+        [astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_VOLATILE_INJECTIONS]
+        .as_array()
+        .expect("typed runtime injection lane");
+    let active_work = injections
+        .iter()
+        .find(|injection| injection["kind"] == "active_work_snapshot")
+        .expect("active work snapshot reaches the model boundary");
+    assert_eq!(active_work["delivery_class"], "required_context");
+    assert_eq!(active_work["payload"]["authority"], "runtime_producer");
+    assert_eq!(
+        active_work["payload"]["work_unit_observations"][0]["id"],
+        "review-group"
+    );
+    assert_eq!(
+        active_work["payload"]["work_unit_observations"][0]["status"],
+        "running"
+    );
 }
 
 fn mock_mcp_server_binary() -> std::path::PathBuf {
@@ -55,6 +170,7 @@ async fn stream_chat_sse_persists_first_turn_step_events_under_adopted_session_i
         user_intent: "hi",
         input_runtime_required_texts: &[],
         input_runtime_volatile_texts: &[],
+        input_work_unit_observations: &[],
         semantic_query_override: None,
         session_id: None,
         model_id: None,
@@ -175,6 +291,7 @@ async fn stream_chat_sse_simple_text_response() {
         user_intent: "hi",
         input_runtime_required_texts: &[],
         input_runtime_volatile_texts: &[],
+        input_work_unit_observations: &[],
         semantic_query_override: None,
         session_id: None,
         model_id: None,
@@ -291,6 +408,7 @@ async fn stream_chat_sse_preserves_existing_session_id_for_server_scoped_trace()
         user_intent: "hi",
         input_runtime_required_texts: &[],
         input_runtime_volatile_texts: &[],
+        input_work_unit_observations: &[],
         semantic_query_override: None,
         session_id: Some("sess-traced"),
         model_id: None,
@@ -411,6 +529,7 @@ async fn stream_chat_sse_reuses_persistent_root_mailbox_across_turns() {
             user_intent: "hi",
             input_runtime_required_texts: &[],
             input_runtime_volatile_texts: &[],
+            input_work_unit_observations: &[],
             semantic_query_override: None,
             session_id,
             model_id: None,
@@ -521,6 +640,7 @@ async fn stream_chat_sse_executes_bound_agent_spawn_to_child_request() {
             user_intent: "delegate_one_child_and_keep_it_observable",
             input_runtime_required_texts: &[],
             input_runtime_volatile_texts: &[],
+            input_work_unit_observations: &[],
             semantic_query_override: None,
             session_id: None,
             model_id: None,
@@ -657,6 +777,7 @@ async fn stream_chat_sse_unregisters_ephemeral_root_mailbox() {
         user_intent: "hi",
         input_runtime_required_texts: &[],
         input_runtime_volatile_texts: &[],
+        input_work_unit_observations: &[],
         semantic_query_override: None,
         session_id: None,
         model_id: None,
@@ -736,44 +857,6 @@ async fn stream_chat_sse_unregisters_ephemeral_root_mailbox() {
 }
 
 #[tokio::test]
-async fn drain_root_mailbox_into_idle_queue_collects_pending_messages() {
-    let transport = std::sync::Arc::new(astra_messaging::InProcessTransport::new());
-    let tracker =
-        std::sync::Arc::new(astra_runtime::server::delegation::engine::DelegationTracker::new());
-    let router = std::sync::Arc::new(astra_messaging::AgentMailboxRouter::new(transport, tracker));
-    let root_addr = astra_messaging::AgentAddress::new("root-run", "main");
-    let worker_addr = astra_messaging::AgentAddress::new("worker-run", "worker");
-    let root_mailbox = router.register(root_addr.clone(), None).await.unwrap();
-    let worker_mailbox = router.register(worker_addr.clone(), None).await.unwrap();
-    worker_mailbox
-        .send(astra_messaging::AgentMessage::new(
-            worker_addr,
-            astra_messaging::MessageTarget::Direct { address: root_addr },
-            astra_messaging::MessagePayload::Text {
-                content: "done".to_string(),
-                summary: Some("worker finished".to_string()),
-            },
-        ))
-        .await
-        .unwrap();
-
-    let mut state = SessionState::default();
-    state.root_mailbox = Some(root_mailbox);
-
-    drain_root_mailbox_into_idle_queue(&mut state);
-
-    assert_eq!(state.pending_idle_agent_messages.len(), 1);
-    assert_eq!(state.pending_idle_agent_messages[0].from.agent_id, "worker");
-    assert!(
-        state
-            .root_mailbox
-            .as_mut()
-            .and_then(|mailbox| mailbox.try_recv())
-            .is_none()
-    );
-}
-
-#[tokio::test]
 async fn stream_chat_sse_api_error_propagated() {
     let app = Router::new().route(
         "/chat/turn",
@@ -797,6 +880,7 @@ async fn stream_chat_sse_api_error_propagated() {
         user_intent: "hi",
         input_runtime_required_texts: &[],
         input_runtime_volatile_texts: &[],
+        input_work_unit_observations: &[],
         semantic_query_override: None,
         session_id: None,
         model_id: None,
@@ -913,6 +997,7 @@ async fn stream_chat_sse_with_tool_call_loop() {
         user_intent: "run echo hi",
         input_runtime_required_texts: &[],
         input_runtime_volatile_texts: &[],
+        input_work_unit_observations: &[],
         semantic_query_override: None,
         session_id: None,
         model_id: None,
@@ -1074,6 +1159,7 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
         user_intent: "write inside a transaction",
         input_runtime_required_texts: &[],
         input_runtime_volatile_texts: &[],
+        input_work_unit_observations: &[],
         semantic_query_override: None,
         session_id: None,
         model_id: None,
@@ -1275,6 +1361,7 @@ async fn stream_chat_sse_reuses_authoritative_turn_identity_across_chat_turn_ret
         user_intent: "review local changes",
         input_runtime_required_texts: &[],
         input_runtime_volatile_texts: &[],
+        input_work_unit_observations: &[],
         semantic_query_override: None,
         session_id: None,
         model_id: None,
@@ -1423,6 +1510,7 @@ async fn stream_chat_sse_resynchronizes_stale_bridge_session_turn_once() {
         user_intent: "continue after interrupted turn",
         input_runtime_required_texts: &[],
         input_runtime_volatile_texts: &[],
+        input_work_unit_observations: &[],
         semantic_query_override: None,
         session_id: Some("sess-stale"),
         model_id: None,
@@ -1588,6 +1676,7 @@ async fn stream_chat_sse_dispatches_mcp_tool_call() {
         user_intent: "call echo",
         input_runtime_required_texts: &[],
         input_runtime_volatile_texts: &[],
+        input_work_unit_observations: &[],
         semantic_query_override: None,
         session_id: None,
         model_id: None,
