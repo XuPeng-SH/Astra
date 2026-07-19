@@ -665,6 +665,7 @@ pub(crate) async fn stream_chat_sse(
         message: p.message,
         user_intent: p.user_intent,
         input_runtime_required_texts: p.input_runtime_required_texts,
+        input_active_system_skills: p.input_active_system_skills,
         input_runtime_volatile_texts: p.input_runtime_volatile_texts,
         semantic_query_override: p.semantic_query_override,
         history: p.history,
@@ -1339,7 +1340,9 @@ fn load_turn_messages(
     current_message: &str,
 ) -> Vec<serde_json::Value> {
     if let Some(mut msgs) = pre_loaded_messages {
-        msgs = astra_turn_core::prompt_facing::sanitize_prompt_facing_messages(msgs);
+        msgs = astra_turn_core::prompt_facing::sanitize_prompt_facing_messages_with_turn_semantics(
+            msgs,
+        );
         msgs.push(json!({"role": "user", "content": current_message}));
         return msgs;
     }
@@ -1388,7 +1391,7 @@ mod tests {
     fn preloaded_turn_messages_drop_stale_pre_compaction_goal_and_trace() {
         let preloaded = vec![
             json!({"role": "user", "content": "3 agents review everything"}),
-            json!({"role": "system", "content": "[Context compacted: older messages were removed to reduce token pressure. The conversation continues below.]"}),
+            json!({"role": "system", "content": "arbitrary compaction boundary text", "_compact_boundary": true}),
             json!({"role": "user", "content": "不要review啊！"}),
             json!({"role": "assistant", "reasoning_content": "I may review anyway"}),
             json!({"role": "tool", "tool_call_id": "c1", "content": "No matches"}),

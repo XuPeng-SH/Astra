@@ -44,10 +44,21 @@ pub(crate) fn load_session_messages_for_continuation(session_id: &str) -> Option
         Ok(Some(cp)) if !cp.messages.is_empty() => {
             let prompt_state = heavy_checkpoint_prompt_state(&cp);
             let messages =
-                astra_turn_core::prompt_facing::sanitize_prompt_facing_messages_with_state(
+                match astra_turn_core::prompt_facing::sanitize_prompt_facing_messages_with_state(
                     cp.messages,
                     &prompt_state,
-                );
+                ) {
+                    Ok(messages) => messages,
+                    Err(error) => {
+                        tracing::warn!(
+                            user_id = %user_id,
+                            session_id = %session_id,
+                            error = %error,
+                            "continuation checkpoint contains invalid typed turn metadata"
+                        );
+                        return None;
+                    }
+                };
             if messages.is_empty() {
                 tracing::warn!(
                     user_id = %user_id,
@@ -114,7 +125,8 @@ fn load_csl_messages_for_continuation(session_id: &str) -> Result<Option<Vec<Val
     let messages = astra_turn_core::prompt_facing::sanitize_prompt_facing_messages_with_state(
         materialized.messages,
         &materialized.session_state,
-    );
+    )
+    .map_err(|error| error.to_string())?;
     Ok((!messages.is_empty()).then_some(messages))
 }
 
@@ -140,13 +152,8 @@ fn heavy_checkpoint_prompt_state(
 /// bias the model toward tool usage on the next turn even when the user's
 /// new message is purely conversational.
 pub(crate) fn sanitize_continuation_messages(mut msgs: Vec<Value>) -> Vec<Value> {
-    msgs = astra_turn_core::prompt_facing::sanitize_prompt_facing_messages(msgs);
-    msgs.retain(|m| {
-        let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
-        let content_text = extract_text_content(m);
-        let content = content_text.as_deref().unwrap_or("");
-        !astra_turn_core::runtime_scaffolding::is_continuation_scaffolding_for_role(role, content)
-    });
+    msgs =
+        astra_turn_core::prompt_facing::sanitize_prompt_facing_messages_with_turn_semantics(msgs);
     msgs
 }
 
@@ -382,11 +389,17 @@ mod tests {
             &checkpoint,
         )
         .unwrap();
+        let semantics = astra_turn_types::UserTurnSemantics::new(
+            astra_turn_types::ObjectiveRelation::Replace,
+            None,
+        );
+        let mut canonical_current = json!({"role": "user", "content": "canonical current"});
+        astra_turn_types::mark_user_turn_semantics(&mut canonical_current, semantics);
         crate::cli::session::session_recovery::csl::write_full_csl_snapshot_atomic(
             &session_id,
             2,
             &[
-                json!({"role": "user", "content": "canonical current"}),
+                canonical_current,
                 json!({"role": "assistant", "content": "current answer"}),
             ],
             &astra_turn_core::conversation_log::SessionStateCompact::default(),
@@ -400,32 +413,81 @@ mod tests {
 
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0]["content"], "canonical current");
+        assert_eq!(
+            astra_turn_types::user_turn_semantics(&messages[0]).expect("valid semantics"),
+            Some(semantics)
+        );
         assert_eq!(messages[1]["content"], "current answer");
     }
 
     #[test]
-    fn sanitize_strips_runtime_injected_messages() {
+    #[serial_test::serial]
+    fn csl_continuation_reports_corrupt_typed_metadata() {
+        let (_sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
+        let session_id = format!("test-session-csl-corrupt-{}", uuid::Uuid::new_v4());
+        crate::cli::session::session_recovery::csl::write_full_csl_snapshot_atomic(
+            &session_id,
+            1,
+            &[
+                json!({
+                    "role": "user",
+                    "content": "canonical current",
+                    (astra_turn_types::USER_TURN_SEMANTICS_FIELD): {
+                        "schema_version": "invalid",
+                        "objective_relation": "replace"
+                    }
+                }),
+                json!({"role": "assistant", "content": "current answer"}),
+            ],
+            &astra_turn_core::conversation_log::SessionStateCompact::default(),
+        )
+        .unwrap();
+
+        assert!(
+            super::load_csl_messages_for_continuation(&session_id).is_err(),
+            "corrupt canonical metadata must not become an untyped continuation"
+        );
+    }
+
+    #[test]
+    fn sanitize_routes_by_runtime_ownership_not_message_text() {
+        let ordinary =
+            json!({"role": "user", "content": "## Already Fetched is literal user text"});
         let msgs = vec![
             json!({"role": "user", "content": "review code"}),
             json!({"role": "assistant", "content": "Here is the review..."}),
-            json!({"role": "system", "content": "[working-set:v1]\ngoal: review code\npending_work: none"}),
-            json!({"role": "user", "content": "\n\n## ⚠ Sequential Tool Calls Detected\nYour last 4 rounds..."}),
-            json!({"role": "system", "content": "## Already Fetched (do NOT re-read)\nContext already fetched:\nGit: status"}),
-            json!({"role": "system", "content": "## Cross-Session Project Context\nBelow are summaries..."}),
-            json!({"role": "user", "content": "\n\n✓ Previous round: 2 tools executed in parallel — excellent."}),
-            json!({"role": "user", "content": "[attention:v1]\ngoal: stale goal\ncurrent_todo: none"}),
-            json!({"role": "user", "content": "[working-set:v1]\ngoal: stale\npending_work: none"}),
-            json!({"role": "user", "content": "[session-resume:v1]\nHydrated previous session context"}),
-            json!({"role": "user", "content": "[session-anchor] Goal: stale. State: t1."}),
-            json!({"role": "system", "content": "[attention:v1]\ngoal: stale system-role manifest"}),
-            json!({"role": "system", "content": "[session-anchor] Goal: stale. State: t1."}),
-            json!({"role": "user", "content": "你好"}),
+            astra_turn_types::runtime_owned_message(
+                "system",
+                "arbitrary runtime payload",
+                astra_turn_types::RuntimeMessageDelivery::EphemeralControl,
+            ),
+            ordinary.clone(),
         ];
         let result = super::sanitize_continuation_messages(msgs);
         assert_eq!(result.len(), 3);
         assert_eq!(result[0]["content"], "review code");
         assert_eq!(result[1]["content"], "Here is the review...");
-        assert_eq!(result[2]["content"], "你好");
+        assert_eq!(result[2], ordinary);
+    }
+
+    #[test]
+    fn sanitize_keeps_canonical_turn_semantics_for_the_next_runtime() {
+        let semantics = astra_turn_types::UserTurnSemantics::new(
+            astra_turn_types::ObjectiveRelation::Replace,
+            None,
+        );
+        let mut objective = json!({"role": "user", "content": "repair lifecycle"});
+        astra_turn_types::mark_user_turn_semantics(&mut objective, semantics);
+
+        let result = super::sanitize_continuation_messages(vec![
+            objective,
+            json!({"role": "assistant", "content": "working"}),
+        ]);
+
+        assert_eq!(
+            astra_turn_types::user_turn_semantics(&result[0]).expect("valid semantics"),
+            Some(semantics)
+        );
     }
 
     #[test]
@@ -433,7 +495,7 @@ mod tests {
         let msgs = vec![
             json!({"role": "user", "content": "3 agents 不同角度review这个分支的所有changes"}),
             json!({"role": "assistant", "content": "review summary"}),
-            json!({"role": "system", "content": "[Context compacted: older messages were removed to reduce token pressure. The conversation continues below.]"}),
+            json!({"role": "system", "content": "arbitrary boundary", "_compact_boundary": true}),
             json!({"role": "user", "content": "不要review啊！"}),
             json!({"role": "assistant", "reasoning_content": "Maybe continue the old review"}),
             json!({"role": "tool", "content": "No matches found", "tool_call_id": "c1"}),
@@ -442,10 +504,9 @@ mod tests {
 
         let result = super::sanitize_continuation_messages(msgs);
 
-        assert_eq!(result.len(), 3);
-        assert_eq!(result[0]["role"], "system");
-        assert_eq!(result[1]["content"], "不要review啊！");
-        assert_eq!(result[2]["content"], "明白，不做 review。");
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0]["content"], "不要review啊！");
+        assert_eq!(result[1]["content"], "明白，不做 review。");
         assert!(
             result
                 .iter()
@@ -454,27 +515,19 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_strips_runtime_injected_array_format_messages() {
-        let msgs = vec![
-            json!({"role": "user", "content": "hello"}),
-            json!({"role": "user", "content": [{"type": "text", "text": "[working-set:v1]\ngoal: stale"}]}),
-            json!({"role": "system", "content": [{"type": "text", "text": "## Already Fetched\nContext already fetched"}]}),
-            json!({"role": "user", "content": [{"type": "text", "text": "✓ Previous round: 2 tools executed in parallel — excellent."}]}),
-            json!({"role": "assistant", "content": "still here"}),
-        ];
-
-        let result = super::sanitize_continuation_messages(msgs);
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0]["content"], "hello");
-        assert_eq!(result[1]["content"], "still here");
-    }
-
-    #[test]
     fn history_pairs_use_user_visible_projection_not_prompt_recaps() {
         let msgs = vec![
             json!({"role": "user", "content": "continue\u{0}"}),
-            json!({"role": "system", "content": "[Runtime tool result]\nbash: binary-looking trace"}),
-            json!({"role": "system", "content": "[Session runtime recap]\nRecent tools: bash"}),
+            astra_turn_types::runtime_owned_message(
+                "system",
+                "arbitrary tool trace",
+                astra_turn_types::RuntimeMessageDelivery::EphemeralControl,
+            ),
+            astra_turn_types::runtime_owned_message(
+                "system",
+                "arbitrary recap",
+                astra_turn_types::RuntimeMessageDelivery::Projection,
+            ),
             json!({"role": "assistant", "content": ""}),
             json!({"role": "assistant", "content": "\u{1b}[32mvisible answer\u{1b}[0m"}),
             json!({"role": "tool", "content": "raw tool payload"}),
@@ -501,12 +554,6 @@ mod tests {
         let result = super::sanitize_continuation_messages(msgs);
         assert_eq!(result.len(), 3);
         assert_eq!(result[2]["content"], "hi");
-        assert!(result.iter().all(|message| {
-            !message["content"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("[Runtime tool result]")
-        }));
     }
 
     #[test]

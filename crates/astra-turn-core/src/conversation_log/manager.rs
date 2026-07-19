@@ -36,6 +36,7 @@ pub struct CslManager {
     config: CslManagerConfig,
     last_seq: u64,
     last_turn: u32,
+    last_canonical_messages: Vec<serde_json::Value>,
     last_canonical_message_hashes: Vec<CanonicalMessageHash>,
     trace_id: Option<String>,
     last_session_state: SessionStateCompact,
@@ -58,6 +59,7 @@ impl CslManager {
             config,
             last_seq: 0,
             last_turn: 0,
+            last_canonical_messages: Vec::new(),
             last_canonical_message_hashes: Vec::new(),
             trace_id: None,
             last_session_state: SessionStateCompact::default(),
@@ -103,6 +105,7 @@ impl CslManager {
         mat.session_state = mat.session_state.for_csl_continuity();
         self.last_seq = mat.last_seq;
         self.last_turn = mat.last_turn;
+        self.last_canonical_messages = mat.messages.clone();
         self.last_canonical_message_hashes = canonical_message_hashes(&mat.messages);
         self.last_session_state = mat.session_state.clone();
         Ok(Some(mat))
@@ -133,7 +136,8 @@ impl CslManager {
             self.load().await?;
         }
         let session_state = session_state.for_csl_continuity();
-        let canonical_messages = messages.to_vec();
+        let mut canonical_messages = messages.to_vec();
+        carry_forward_user_turn_semantics(&self.last_canonical_messages, &mut canonical_messages);
         let canonical_message_count = canonical_messages.len();
         let meta = AppendMeta {
             trace_id: self.trace_id.clone(),
@@ -153,6 +157,7 @@ impl CslManager {
                 .await?;
             self.last_seq = 1;
             self.last_turn = turn;
+            self.last_canonical_messages = canonical_messages;
             self.last_canonical_message_hashes = canonical_message_hashes;
             self.last_session_state = session_state.clone();
             return Ok(());
@@ -176,6 +181,7 @@ impl CslManager {
                 .await?;
             self.last_seq = next_seq;
             self.last_turn = turn;
+            self.last_canonical_messages = canonical_messages;
             self.last_canonical_message_hashes = canonical_message_hashes;
             self.last_session_state = session_state.clone();
             self.gc().await?;
@@ -194,6 +200,7 @@ impl CslManager {
         self.store.append(&self.session_id, &delta, &meta).await?;
         self.last_seq = next_seq;
         self.last_turn = turn;
+        self.last_canonical_messages = canonical_messages.clone();
         self.last_canonical_message_hashes = canonical_message_hashes.clone();
         self.last_session_state = session_state.clone();
 
@@ -253,6 +260,7 @@ impl CslManager {
             .await?;
         self.last_seq = 0;
         self.last_turn = 0;
+        self.last_canonical_messages.clear();
         self.last_canonical_message_hashes.clear();
         self.last_session_state = SessionStateCompact::default();
         self.loaded = true;
@@ -296,6 +304,67 @@ fn canonical_message_hash(message: &serde_json::Value) -> CanonicalMessageHash {
         canonical.to_string().into_bytes()
     });
     Sha256::digest(bytes).into()
+}
+
+fn canonical_message_identity_hash(message: &serde_json::Value) -> CanonicalMessageHash {
+    let mut identity = message.clone();
+    if let Some(object) = identity.as_object_mut() {
+        object.remove(astra_turn_types::USER_TURN_SEMANTICS_FIELD);
+    }
+    canonical_message_hash(&identity)
+}
+
+/// A prompt/display projection may omit producer-owned turn semantics while
+/// retaining the same canonical message prefix. Carry validated current-schema
+/// metadata forward at this persistence boundary so a later snapshot cannot
+/// silently erase it. Changed messages and non-prefix rewrites receive no
+/// inferred metadata.
+fn carry_forward_user_turn_semantics(
+    previous: &[serde_json::Value],
+    incoming: &mut [serde_json::Value],
+) {
+    let shared_prefix = previous
+        .iter()
+        .zip(incoming.iter())
+        .take_while(|(previous, incoming)| {
+            canonical_message_identity_hash(previous) == canonical_message_identity_hash(incoming)
+        })
+        .count();
+
+    for (index, (previous, incoming)) in previous
+        .iter()
+        .zip(incoming.iter_mut())
+        .take(shared_prefix)
+        .enumerate()
+    {
+        if !incoming.as_object().is_some_and(|message| {
+            !message.contains_key(astra_turn_types::USER_TURN_SEMANTICS_FIELD)
+        }) {
+            continue;
+        }
+        match astra_turn_types::user_turn_semantics(previous) {
+            Ok(Some(semantics)) => {
+                astra_turn_types::mark_user_turn_semantics(incoming, semantics);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    message_index = index,
+                    error = %error,
+                    "invalid user-turn semantics in canonical CSL prefix; preserving raw metadata for explicit restore degradation"
+                );
+                if let (Some(raw), Some(object)) = (
+                    previous.get(astra_turn_types::USER_TURN_SEMANTICS_FIELD),
+                    incoming.as_object_mut(),
+                ) {
+                    object.insert(
+                        astra_turn_types::USER_TURN_SEMANTICS_FIELD.to_string(),
+                        raw.clone(),
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// Recursively sort all object keys in a JSON value to guarantee
@@ -478,6 +547,97 @@ mod tests {
         let mat = mgr2.load().await.unwrap().unwrap();
         assert_eq!(mat.messages.len(), 4);
         assert_eq!(mat.messages[3]["content"], "r2");
+    }
+
+    #[tokio::test]
+    async fn later_prompt_projection_cannot_erase_producer_turn_semantics() {
+        let tmp = TempDir::new().unwrap();
+        let mut mgr = test_manager_with_config(
+            &tmp,
+            "typed-semantics",
+            CslManagerConfig {
+                snapshot_interval: 2,
+                gc_retain_snapshots: 2,
+            },
+        );
+        let semantics = astra_turn_types::UserTurnSemantics::new(
+            astra_turn_types::ObjectiveRelation::Replace,
+            None,
+        );
+        let mut objective = user_msg("repair lifecycle");
+        astra_turn_types::mark_user_turn_semantics(&mut objective, semantics);
+        mgr.persist_turn(1, &[objective, assistant_msg("working")], &default_state())
+            .await
+            .unwrap();
+
+        // CLI display history intentionally has no internal metadata. The
+        // unchanged canonical prefix must retain producer-owned semantics when
+        // the second turn produces both a delta and a periodic snapshot.
+        mgr.persist_turn(
+            2,
+            &[
+                user_msg("repair lifecycle"),
+                assistant_msg("working"),
+                user_msg("continue"),
+                assistant_msg("done"),
+            ],
+            &default_state(),
+        )
+        .await
+        .unwrap();
+
+        let mut loader =
+            test_manager_with_config(&tmp, "typed-semantics", CslManagerConfig::default());
+        let materialized = loader.load().await.unwrap().unwrap();
+        assert_eq!(
+            astra_turn_types::user_turn_semantics(&materialized.messages[0])
+                .expect("valid semantics"),
+            Some(semantics)
+        );
+    }
+
+    #[test]
+    fn semantic_carry_forward_never_claims_a_changed_message() {
+        let semantics = astra_turn_types::UserTurnSemantics::new(
+            astra_turn_types::ObjectiveRelation::Replace,
+            None,
+        );
+        let mut objective = user_msg("repair lifecycle");
+        astra_turn_types::mark_user_turn_semantics(&mut objective, semantics);
+        let mut rewritten = vec![user_msg("repair a different subsystem")];
+
+        carry_forward_user_turn_semantics(&[objective], &mut rewritten);
+
+        assert!(
+            astra_turn_types::user_turn_semantics(&rewritten[0])
+                .expect("valid unmarked message")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn corrupt_prefix_metadata_is_preserved_for_explicit_restore_degradation() {
+        let raw = serde_json::json!({
+            "schema_version": "invalid",
+            "objective_relation": "replace"
+        });
+        let objective = serde_json::json!({
+            "role": "user",
+            "content": "repair lifecycle",
+            (astra_turn_types::USER_TURN_SEMANTICS_FIELD): raw.clone()
+        });
+        let mut projected = vec![user_msg("repair lifecycle")];
+
+        carry_forward_user_turn_semantics(&[objective], &mut projected);
+
+        assert_eq!(
+            projected[0][astra_turn_types::USER_TURN_SEMANTICS_FIELD],
+            raw
+        );
+        assert!(matches!(
+            astra_turn_types::user_turn_semantics(&projected[0]),
+            Err(astra_turn_types::UserTurnSemanticsError::Malformed(_))
+        ));
     }
 
     #[tokio::test]
@@ -958,8 +1118,11 @@ mod tests {
         .unwrap();
 
         let t1 = vec![
-            user_msg(
-                "review changes\n\n<system-reminder>\n[session-resume:v1]\nresume hint\n</system-reminder>",
+            user_msg("review changes"),
+            astra_turn_types::runtime_owned_message(
+                "user",
+                "resume hint",
+                astra_turn_types::RuntimeMessageDelivery::RequiredContext,
             ),
             json!({"role": "assistant", "content": null, "tool_calls": [{"id": "c1", "function": {"name": "skill", "arguments": "{}"}}]}),
             json!({"role": "tool", "tool_call_id": "c1", "content": "<skill-loaded name=\"review-changes\"/>"}),
@@ -972,7 +1135,13 @@ mod tests {
             t1[1].clone(),
             t1[2].clone(),
             t1[3].clone(),
-            user_msg("next step\n\n<system-reminder>\nbackground update\n</system-reminder>"),
+            t1[4].clone(),
+            user_msg("next step"),
+            astra_turn_types::runtime_owned_message(
+                "user",
+                "background update",
+                astra_turn_types::RuntimeMessageDelivery::EphemeralControl,
+            ),
             json!({"role": "assistant", "content": null, "tool_calls": [{"id": "c2", "function": {"name": "bash", "arguments": "{}"}}]}),
             json!({"role": "tool", "tool_call_id": "c2", "content": "raw command output"}),
             assistant_msg("next done"),
@@ -982,18 +1151,13 @@ mod tests {
         let entries = store.load_after("manager-canonical", 0).await.unwrap();
         assert_eq!(entries.len(), 2);
         if let CslEntry::TurnDelta { appended, .. } = &entries[1] {
-            assert_eq!(appended.len(), 4);
+            assert_eq!(appended.len(), 5);
             assert_eq!(appended[0]["role"], "user");
-            assert!(
-                appended[0]["content"]
-                    .as_str()
-                    .unwrap()
-                    .contains("<system-reminder>")
-            );
-            assert!(appended[1].get("tool_calls").is_some());
-            assert_eq!(appended[2]["role"], "tool");
-            assert_eq!(appended[2]["content"], "raw command output");
-            assert_eq!(appended[3]["content"], "next done");
+            assert!(astra_turn_types::is_runtime_owned_message(&appended[1]));
+            assert!(appended[2].get("tool_calls").is_some());
+            assert_eq!(appended[3]["role"], "tool");
+            assert_eq!(appended[3]["content"], "raw command output");
+            assert_eq!(appended[4]["content"], "next done");
         } else {
             panic!("entry[1] should be TurnDelta");
         }
@@ -1005,16 +1169,14 @@ mod tests {
         )
         .unwrap();
         let mat = loader.load().await.unwrap().unwrap();
-        assert_eq!(mat.messages.len(), 8);
-        let joined = mat
-            .messages
-            .iter()
-            .filter_map(|msg| msg["content"].as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(joined.contains("<system-reminder>"));
-        assert!(joined.contains("[session-resume:v1]"));
-        assert!(joined.contains("<skill-loaded"));
+        assert_eq!(mat.messages.len(), 10);
+        assert_eq!(
+            mat.messages
+                .iter()
+                .filter(|message| astra_turn_types::is_runtime_owned_message(message))
+                .count(),
+            2
+        );
         assert!(mat.messages.iter().any(|msg| msg["role"] == "tool"));
         assert!(
             mat.messages

@@ -1336,6 +1336,7 @@ pub(crate) async fn handle_info_command(
                 message: &prompt,
                 user_intent: &prompt,
                 input_runtime_required_texts: &[],
+                input_active_system_skills: &[],
                 input_runtime_volatile_texts: &[],
                 input_work_unit_observations: &[],
                 semantic_query_override: None,
@@ -1815,11 +1816,11 @@ pub(crate) async fn handle_info_command(
 
             // ── Attention ──
             if let Some(ref anchor) = state.continuation_anchor {
-                if let Some(task) = anchor.latest_user_task.as_deref() {
+                if let Some(input) = anchor.recent_user_input.as_deref() {
                     eprintln!(
                         "  {:<12}  {}",
-                        "task".magenta(),
-                        truncate_str(task, 80).dim()
+                        "input".magenta(),
+                        truncate_str(input, 80).dim()
                     );
                 }
                 if let Some(direction) = anchor.assistant_direction.as_deref() {
@@ -1829,7 +1830,7 @@ pub(crate) async fn handle_info_command(
                         truncate_str(direction, 80).dim()
                     );
                 }
-                if anchor.latest_user_task.is_none() && anchor.assistant_direction.is_none() {
+                if anchor.recent_user_input.is_none() && anchor.assistant_direction.is_none() {
                     eprintln!(
                         "  {:<12}  {}",
                         "focus".magenta(),
@@ -2535,7 +2536,7 @@ mod tests {
         parse_grep_request, parse_review_git_target, parse_review_match, render_cognition,
         render_whoami, run_clipboard_candidate,
     };
-    use crate::cli::session::session_state::{ContinuationAnchor, SessionState};
+    use crate::cli::session::session_state::SessionState;
     use astra_services::session_journal;
 
     #[cfg(unix)]
@@ -2723,47 +2724,6 @@ mod tests {
         let prompt = build_review_prompt("latest 2 commits");
         assert!(prompt.contains("HEAD~2..HEAD"));
         assert!(prompt.contains("last 2 commits"));
-    }
-
-    #[test]
-    fn continuation_anchor_extracts_task_and_direction() {
-        let parsed = ContinuationAnchor::from_rendered(
-            "Latest user task: debug Chinese input drops\nLatest assistant direction: inspect prompt redraw path",
-        );
-        assert_eq!(
-            parsed.latest_user_task.as_deref(),
-            Some("debug Chinese input drops")
-        );
-        assert_eq!(
-            parsed.assistant_direction.as_deref(),
-            Some("inspect prompt redraw path")
-        );
-    }
-
-    #[test]
-    fn continuation_anchor_handles_task_only() {
-        let parsed = ContinuationAnchor::from_rendered("Latest user task: fix auth");
-        assert_eq!(parsed.latest_user_task.as_deref(), Some("fix auth"));
-        assert_eq!(parsed.assistant_direction, None);
-    }
-
-    #[test]
-    fn continuation_anchor_reads_multiline_summary_format() {
-        let parsed = ContinuationAnchor::from_rendered(
-            "Latest user task: review commit aa1f419b\n\
-             Latest assistant summary:\n\
-             ## Review\n\
-             P5 still blocks large merge commits.\n\
-             Recent tools: read_file, bash",
-        );
-        assert_eq!(
-            parsed.latest_user_task.as_deref(),
-            Some("review commit aa1f419b")
-        );
-        assert_eq!(
-            parsed.assistant_direction.as_deref(),
-            Some("## Review P5 still blocks large merge commits.")
-        );
     }
 
     #[test]

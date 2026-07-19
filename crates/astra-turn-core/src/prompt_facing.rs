@@ -7,10 +7,11 @@
 //! must retain raw runtime history.
 
 use crate::conversation_log::SessionStateCompact;
+use astra_turn_types::{RuntimeMessageDelivery, is_runtime_owned_message, runtime_owned_message};
 use serde_json::{Value, json};
 
 const MAX_PROMPT_FACING_MESSAGES: usize = 40;
-const RUNTIME_RECAP_PREFIX: &str = "[Session runtime recap]";
+const RUNTIME_RECAP_HEADING: &str = "[Session runtime recap]";
 
 pub fn extract_text_content(msg: &Value) -> Option<String> {
     if let Some(s) = msg.get("content").and_then(|c| c.as_str()) {
@@ -38,11 +39,50 @@ pub fn extract_text_content(msg: &Value) -> Option<String> {
 }
 
 pub fn sanitize_prompt_facing_messages(messages: Vec<Value>) -> Vec<Value> {
+    sanitize_prompt_facing_messages_impl(messages, false)
+}
+
+/// Canonical continuation/resume projection that retains validated user-turn
+/// semantics between runtime boundaries. Provider/session-memory projections
+/// use [`sanitize_prompt_facing_messages`] and therefore never receive this
+/// internal metadata.
+pub fn sanitize_prompt_facing_messages_with_turn_semantics(messages: Vec<Value>) -> Vec<Value> {
+    sanitize_prompt_facing_messages_impl(messages, true)
+}
+
+/// Strict canonical continuation projection. Invalid producer-owned metadata
+/// is returned to the restore boundary instead of being rewritten as absence.
+pub fn try_sanitize_prompt_facing_messages_with_turn_semantics(
+    messages: Vec<Value>,
+) -> Result<Vec<Value>, astra_turn_types::UserTurnSemanticsError> {
+    for message in &messages {
+        if message
+            .get(astra_turn_types::USER_TURN_SEMANTICS_FIELD)
+            .is_some()
+        {
+            astra_turn_types::user_turn_semantics(message)?;
+        }
+    }
+    Ok(sanitize_prompt_facing_messages_with_turn_semantics(
+        messages,
+    ))
+}
+
+fn sanitize_prompt_facing_messages_impl(
+    messages: Vec<Value>,
+    preserve_turn_semantics: bool,
+) -> Vec<Value> {
     let mut out = Vec::new();
     let start = latest_compaction_boundary_start(&messages).unwrap_or(0);
     let mut has_user_context = false;
 
     for msg in messages.into_iter().skip(start) {
+        if msg.get("_compact_boundary").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        if is_runtime_owned_message(&msg) {
+            continue;
+        }
         let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
         if role == "tool" {
             continue;
@@ -66,17 +106,28 @@ pub fn sanitize_prompt_facing_messages(messages: Vec<Value>) -> Vec<Value> {
         if content.trim().is_empty() {
             continue;
         }
-        if role == "system" && content.trim_start().starts_with(RUNTIME_RECAP_PREFIX) {
-            continue;
-        }
-
         if role == "assistant" && !has_user_context {
             continue;
         }
-        out.push(json!({
+        let mut projected = json!({
             "role": role,
             "content": content,
-        }));
+        });
+        if preserve_turn_semantics && role == "user" {
+            match astra_turn_types::user_turn_semantics(&msg) {
+                Ok(Some(semantics)) => {
+                    astra_turn_types::mark_user_turn_semantics(&mut projected, semantics);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "dropping invalid user-turn semantics from prompt-facing projection"
+                    );
+                }
+            }
+        }
+        out.push(projected);
         if role == "user" {
             has_user_context = true;
         }
@@ -88,12 +139,14 @@ pub fn sanitize_prompt_facing_messages(messages: Vec<Value>) -> Vec<Value> {
 pub fn sanitize_prompt_facing_messages_with_state(
     messages: Vec<Value>,
     state: &SessionStateCompact,
-) -> Vec<Value> {
-    let mut out = sanitize_prompt_facing_messages(messages);
+) -> Result<Vec<Value>, astra_turn_types::UserTurnSemanticsError> {
+    // This boundary feeds canonical continuation/resume state. Preserve typed
+    // objective metadata while provider-facing sanitizers continue to strip it.
+    let mut out = try_sanitize_prompt_facing_messages_with_turn_semantics(messages)?;
     if let Some(recap) = runtime_recap_message(state) {
         out.push(recap);
     }
-    trim_to_recent_messages(out)
+    Ok(trim_to_recent_messages(out))
 }
 
 pub fn sanitize_user_visible_messages(messages: Vec<Value>) -> Vec<Value> {
@@ -104,15 +157,15 @@ pub fn sanitize_user_visible_messages(messages: Vec<Value>) -> Vec<Value> {
 }
 
 pub fn user_visible_message(msg: &Value) -> Option<Value> {
+    if is_runtime_owned_message(msg) {
+        return None;
+    }
     let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
     if !matches!(role, "user" | "assistant" | "system") {
         return None;
     }
     let raw_content = extract_text_content(msg)?;
     let content = prompt_facing_content_for_role(role, &raw_content)?;
-    if role == "system" && is_prompt_internal_system_text(&content) {
-        return None;
-    }
     let content = sanitize_user_visible_text(&content);
     if content.trim().is_empty() {
         return None;
@@ -158,43 +211,23 @@ pub fn runtime_recap_message(state: &SessionStateCompact) -> Option<Value> {
     if lines.is_empty() {
         return None;
     }
-    Some(json!({
-        "role": "system",
-        "content": format!("{RUNTIME_RECAP_PREFIX}\n{}", lines.join("\n")),
-    }))
+    Some(runtime_owned_message(
+        "system",
+        format!("{RUNTIME_RECAP_HEADING}\n{}", lines.join("\n")),
+        RuntimeMessageDelivery::Projection,
+    ))
 }
 
 fn latest_compaction_boundary_start(messages: &[Value]) -> Option<usize> {
     messages.iter().rposition(|message| {
-        extract_text_content(message)
-            .map(|content| is_compaction_boundary_text(&content))
-            .unwrap_or(false)
+        message.get("_compact_boundary").and_then(Value::as_bool) == Some(true)
     })
 }
 
-fn is_compaction_boundary_text(content: &str) -> bool {
-    let trimmed = content.trim_start();
-    trimmed.starts_with("[Context compacted:")
-        || trimmed.starts_with("[Conversation summary")
-        || trimmed.starts_with("Context was compacted before this point.")
-        || trimmed.starts_with("前文上下文已压缩")
-}
-
-fn is_prompt_internal_system_text(content: &str) -> bool {
-    let trimmed = content.trim_start();
-    trimmed.starts_with("[Runtime tool result]") || trimmed.starts_with(RUNTIME_RECAP_PREFIX)
-}
-
 fn prompt_facing_content_for_role(role: &str, content: &str) -> Option<String> {
-    let content = if role == "user" {
-        crate::runtime_scaffolding::strip_user_runtime_scaffolding_affixes(content)
-    } else {
-        content.trim().to_string()
-    };
+    let _ = role;
+    let content = content.trim().to_string();
     if content.trim().is_empty() {
-        return None;
-    }
-    if crate::runtime_scaffolding::is_continuation_scaffolding_for_role(role, &content) {
         return None;
     }
     Some(content)
@@ -275,6 +308,7 @@ mod tests {
         sanitize_prompt_facing_messages_with_state, sanitize_user_visible_messages,
     };
     use crate::conversation_log::{DelegationCompact, SessionStateCompact};
+    use astra_turn_types::{RuntimeMessageDelivery, runtime_owned_message};
     use serde_json::json;
 
     #[test]
@@ -342,7 +376,7 @@ mod tests {
         let messages = vec![
             json!({"role": "user", "content": "3 agents review everything"}),
             json!({"role": "assistant", "content": "review summary"}),
-            json!({"role": "system", "content": "[Context compacted: older messages were removed to reduce token pressure. The conversation continues below.]"}),
+            json!({"role": "system", "content": "arbitrary boundary text", "_compact_boundary": true}),
             json!({"role": "user", "content": "不要review啊！"}),
             json!({"role": "assistant", "reasoning_content": "Maybe review anyway"}),
             json!({"role": "assistant", "content": "明白，不做 review。"}),
@@ -350,16 +384,9 @@ mod tests {
 
         let got = sanitize_prompt_facing_messages(messages);
 
-        assert_eq!(got.len(), 3);
-        assert_eq!(got[0]["role"], "system");
-        assert!(
-            got[0]["content"]
-                .as_str()
-                .unwrap()
-                .contains("Context compacted")
-        );
-        assert_eq!(got[1]["content"], "不要review啊！");
-        assert_eq!(got[2]["content"], "明白，不做 review。");
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0]["content"], "不要review啊！");
+        assert_eq!(got[1]["content"], "明白，不做 review。");
         assert!(
             got.iter()
                 .all(|msg| !msg["content"].as_str().unwrap_or("").contains("3 agents"))
@@ -387,78 +414,16 @@ mod tests {
     }
 
     #[test]
-    fn drops_persisted_runtime_scaffolding_directives() {
-        let messages = vec![
-            json!({"role": "user", "content": "continue"}),
-            json!({"role": "assistant", "content": "working"}),
-            json!({"role": "user", "content": "⚠️ VERIFICATION REQUIRED: Before you finish, run any missing checks"}),
-            json!({"role": "user", "content": "🔄 ERROR BUDGET EXHAUSTED: You've hit Unknown errors 3 turns in a row"}),
-            json!({"role": "user", "content": "## ⚡ Self-Status\nTurn 9/299 | Token pressure: 5% | Cache: 86%"}),
-            json!({"role": "assistant", "content": "Tools used: bash, grep, read_file"}),
-            json!({"role": "assistant", "content": "done"}),
-        ];
-
-        let got = sanitize_prompt_facing_messages(messages);
-        let joined = got
-            .iter()
-            .filter_map(|msg| msg["content"].as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        assert_eq!(
-            got,
-            vec![
-                json!({"role": "user", "content": "continue"}),
-                json!({"role": "assistant", "content": "working"}),
-                json!({"role": "assistant", "content": "done"}),
-            ]
+    fn runtime_ownership_not_text_controls_prompt_projection() {
+        let ordinary = json!({"role": "user", "content": "Tools used: literal user text"});
+        let owned = runtime_owned_message(
+            "user",
+            "arbitrary owned payload",
+            RuntimeMessageDelivery::EphemeralControl,
         );
-        assert!(!joined.contains("VERIFICATION REQUIRED"));
-        assert!(!joined.contains("ERROR BUDGET"));
-        assert!(!joined.contains("Self-Status"));
-        assert!(!joined.contains("Tools used:"));
-    }
-
-    #[test]
-    fn preserves_real_user_text_after_leading_system_reminder() {
         let messages = vec![
-            json!({"role": "user", "content": "<system-reminder>\n## Session Memory Advisory\nstale memory\n</system-reminder>\n\n你知道我们之前做什么？"}),
-            json!({"role": "assistant", "content": "We reviewed the branch."}),
-        ];
-
-        let got = sanitize_prompt_facing_messages(messages);
-
-        assert_eq!(
-            got,
-            vec![
-                json!({"role": "user", "content": "你知道我们之前做什么？"}),
-                json!({"role": "assistant", "content": "We reviewed the branch."}),
-            ]
-        );
-    }
-
-    #[test]
-    fn strips_trailing_system_reminder_without_mutating_user_text() {
-        let messages = vec![
-            json!({"role": "user", "content": "继续修复\n\n<system-reminder>\n[session-resume:v1]\nHydrated previous session context\n</system-reminder>"}),
-            json!({"role": "assistant", "content": "Continuing."}),
-        ];
-
-        let got = sanitize_prompt_facing_messages(messages);
-
-        assert_eq!(
-            got,
-            vec![
-                json!({"role": "user", "content": "继续修复"}),
-                json!({"role": "assistant", "content": "Continuing."}),
-            ]
-        );
-    }
-
-    #[test]
-    fn resume_scaffolding_and_skill_loaded_trace_do_not_reach_prompt_history() {
-        let messages = vec![
-            json!({"role": "user", "content": "我说过的所有话，还有回复\n\n<system-reminder>\n[session-resume:v1]\nHydrated previous session context\n</system-reminder>"}),
+            ordinary.clone(),
+            owned,
             json!({
                 "role": "assistant",
                 "content": null,
@@ -476,44 +441,14 @@ mod tests {
                 "tool_call_id": "skill-auto-route-analyze-session",
                 "content": "<skill-loaded name=\"analyze-session\"/>\nUse this workflow."
             }),
-            json!({"role": "assistant", "content": "你问过我总结这段会话。"}),
-        ];
-
-        let got = sanitize_prompt_facing_messages(messages);
-        let joined = got
-            .iter()
-            .filter_map(|msg| msg["content"].as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        assert_eq!(
-            got,
-            vec![
-                json!({"role": "user", "content": "我说过的所有话，还有回复"}),
-                json!({"role": "assistant", "content": "你问过我总结这段会话。"}),
-            ]
-        );
-        assert!(!joined.contains("<system-reminder>"));
-        assert!(!joined.contains("[session-resume:v1]"));
-        assert!(!joined.contains("<skill-loaded"));
-        assert!(!joined.contains("skill-auto-route"));
-    }
-
-    #[test]
-    fn preserves_user_suffix_after_legacy_leading_resume_hint() {
-        let messages = vec![
-            json!({"role": "user", "content": "[session-resume:v1]\nResume context hydration was requested but no prior prompt-facing history could be restored.\nReason: degraded\nTreat this as a degraded resume.\n\n之前我说的话？"}),
-            json!({"role": "assistant", "content": "I should recover the journal."}),
+            json!({"role": "assistant", "content": "done"}),
         ];
 
         let got = sanitize_prompt_facing_messages(messages);
 
         assert_eq!(
             got,
-            vec![
-                json!({"role": "user", "content": "之前我说的话？"}),
-                json!({"role": "assistant", "content": "I should recover the journal."}),
-            ]
+            vec![ordinary, json!({"role": "assistant", "content": "done"}),]
         );
     }
 
@@ -600,30 +535,70 @@ mod tests {
 
     #[test]
     fn sanitize_with_state_replaces_stale_runtime_recap_for_resume_prompt() {
+        let semantics = astra_turn_types::UserTurnSemantics::new(
+            astra_turn_types::ObjectiveRelation::Continue,
+            None,
+        );
+        let mut user = json!({"role": "user", "content": "continue"});
+        astra_turn_types::mark_user_turn_semantics(&mut user, semantics);
         let messages = vec![
-            json!({"role": "user", "content": "continue"}),
-            json!({"role": "system", "content": "[Session runtime recap]\nRecent tools: stale"}),
+            user,
+            runtime_owned_message(
+                "system",
+                "stale projection",
+                RuntimeMessageDelivery::Projection,
+            ),
         ];
         let state = SessionStateCompact {
             recent_tools: vec!["bash".into()],
             ..Default::default()
         };
 
-        let got = sanitize_prompt_facing_messages_with_state(messages, &state);
+        let got = sanitize_prompt_facing_messages_with_state(messages, &state)
+            .expect("valid typed continuation metadata");
 
         assert_eq!(got.len(), 2);
         assert_eq!(got[0]["content"], "continue");
+        assert_eq!(
+            astra_turn_types::user_turn_semantics(&got[0]).unwrap(),
+            Some(semantics)
+        );
         let recap = got[1]["content"].as_str().unwrap();
         assert!(recap.contains("Recent tools: bash"));
         assert!(!recap.contains("stale"));
     }
 
     #[test]
+    fn sanitize_with_state_rejects_corrupt_typed_metadata() {
+        let messages = vec![json!({
+            "role": "user",
+            "content": "continue",
+            (astra_turn_types::USER_TURN_SEMANTICS_FIELD): {
+                "schema_version": "invalid",
+                "objective_relation": "continue"
+            }
+        })];
+
+        assert!(matches!(
+            sanitize_prompt_facing_messages_with_state(messages, &SessionStateCompact::default(),),
+            Err(astra_turn_types::UserTurnSemanticsError::Malformed(_))
+        ));
+    }
+
+    #[test]
     fn user_visible_messages_drop_prompt_internal_recaps_and_control_bytes() {
         let messages = vec![
             json!({"role": "user", "content": "hello\u{0}"}),
-            json!({"role": "system", "content": "[Runtime tool result]\nread_file: secret trace"}),
-            json!({"role": "system", "content": "[Session runtime recap]\nRecent tools: bash"}),
+            runtime_owned_message(
+                "system",
+                "arbitrary internal trace",
+                RuntimeMessageDelivery::EphemeralControl,
+            ),
+            runtime_owned_message(
+                "system",
+                "arbitrary internal recap",
+                RuntimeMessageDelivery::Projection,
+            ),
             json!({"role": "tool", "content": "raw tool output"}),
             json!({"role": "assistant", "content": ""}),
             json!({"role": "assistant", "content": "\u{1b}[31mdone\u{1b}[0m"}),

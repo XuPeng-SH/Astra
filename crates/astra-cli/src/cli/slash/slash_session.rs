@@ -5691,32 +5691,40 @@ async fn apply_restored_session(
     state.csl_manager = prepared_history.csl_manager;
     state.last_response = state.history.last().map(|(_, resp)| resp.clone());
     state.last_turn_event = last_turn_event;
+    let fallback_resume_messages;
+    let canonical_resume_messages = if !restored.conversation_messages.is_empty() {
+        restored.conversation_messages.as_slice()
+    } else {
+        fallback_resume_messages =
+            session_continuation::load_session_messages_for_continuation(&restored.session_id)
+                .unwrap_or_else(|| session_projection::history_as_messages(&state.history));
+        fallback_resume_messages.as_slice()
+    };
+    session_projection::seed_continuation_objective_from_messages(state, canonical_resume_messages);
     session_projection::rebuild_continuation_anchor_from_live_state(state).await;
     state.continuation_anchor = session_projection::merge_continuation_anchor_with_session_memory(
         state.continuation_anchor.take(),
         session_memory.as_deref(),
     );
-    let session_resume_hydration = (if !restored.conversation_messages.is_empty() {
-        astra_turn_core::resume_hydration::build_resume_hydration_hint_from_messages(
-            &restored.conversation_messages,
-        )
-    } else if let Some(canonical_messages) =
-        session_continuation::load_session_messages_for_continuation(&restored.session_id)
-    {
-        astra_turn_core::resume_hydration::build_resume_hydration_hint_from_messages(
-            &canonical_messages,
-        )
-    } else {
-        let history_messages = session_projection::history_as_messages(&state.history);
-        astra_turn_core::resume_hydration::build_resume_hydration_hint_from_messages(
-            &history_messages,
-        )
-    })
-    .unwrap_or_else(|| {
-        astra_turn_core::resume_hydration::build_resume_hydration_failure_hint(
-            "resume restored session metadata but no prompt-facing transcript/history",
-        )
-    });
+    let session_resume_hydration =
+        match astra_turn_core::resume_hydration::build_resume_hydration_hint_from_messages(
+            canonical_resume_messages,
+        ) {
+            Ok(Some(hint)) => hint,
+            Ok(None) => astra_turn_core::resume_hydration::build_resume_hydration_failure_hint(
+                "resume restored session metadata but no prompt-facing transcript/history",
+            ),
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %restored.session_id,
+                    error = %error,
+                    "resume hydration degraded: restored typed turn metadata is invalid"
+                );
+                astra_turn_core::resume_hydration::build_resume_hydration_failure_hint(
+                    "restored session contains invalid typed turn metadata",
+                )
+            }
+        };
     state.resume_guidance = astra_turn_core::resume_hydration::merge_resume_hints(
         Some(session_resume_hydration),
         state.resume_guidance.take(),
@@ -6258,7 +6266,7 @@ mod resume_tests {
         switch_session_into_state, workspace_summary_line,
     };
     use crate::cli::permission_manager::PermissionMode;
-    use crate::cli::session::session_state::SessionState;
+    use crate::cli::session::session_state::{ContinuationAnchor, SessionState};
     use astra_services::session_journal::{self, JournalDirGuard};
     use astra_services::session_restore::RestoredSession;
     use astra_services::session_workspace;
@@ -7160,6 +7168,15 @@ mod resume_tests {
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
         write_local_resumable_session(&session_id, 2);
         write_invalid_local_step_checkpoint(&session_id, 2);
+        let mut objective =
+            serde_json::json!({"role": "user", "content": "repair session lifecycle"});
+        astra_turn_types::mark_user_turn_semantics(
+            &mut objective,
+            astra_turn_types::UserTurnSemantics::new(
+                astra_turn_types::ObjectiveRelation::Replace,
+                None,
+            ),
+        );
 
         let restored = RestoredSession {
             session_id: session_id.clone(),
@@ -7167,7 +7184,7 @@ mod resume_tests {
             model: Some("gpt-5".into()),
             last_status: "active".into(),
             conversation_messages: vec![
-                serde_json::json!({"role": "user", "content": "continue"}),
+                objective,
                 serde_json::json!({"role": "assistant", "content": "cloud fallback"}),
             ],
             interruption: Some(serde_json::json!({
@@ -7191,7 +7208,16 @@ mod resume_tests {
             .expect("cloud fallback should keep resume working");
 
         assert_eq!(state.session_id.as_deref(), Some(session_id.as_str()));
+        let anchor = state.continuation_anchor.as_ref().expect("restored anchor");
+        assert_eq!(
+            anchor.objective_context,
+            vec!["objective: repair session lifecycle"]
+        );
         let guidance = state.resume_guidance.expect("resume guidance");
+        assert!(
+            guidance.contains("objective: repair session lifecycle"),
+            "{guidance}"
+        );
         assert!(guidance.contains("3 attempt(s)"), "{guidance}");
         assert_eq!(
             state.runtime_compaction_state,
@@ -8368,7 +8394,7 @@ mod resume_tests {
         source.history = vec![("q1".into(), "a1".into())];
         source.recent_tools = vec!["bash".into(), "read_file".into()];
         source.last_response = Some("a1".into());
-        source.continuation_anchor = Some("anchor".into());
+        source.continuation_anchor = Some(ContinuationAnchor::rendered_for_test("anchor"));
         source.csl_manager = Some(mgr);
 
         let snapshot = ForkStateSnapshot::capture(&mut source);
@@ -8411,7 +8437,7 @@ mod resume_tests {
             history: vec![("q".into(), "a".into())],
             recent_tools: vec!["bash".into()],
             last_response: Some("a".into()),
-            continuation_anchor: Some("anchor".into()),
+            continuation_anchor: Some(ContinuationAnchor::rendered_for_test("anchor")),
             ..Default::default()
         };
         let snapshot = ForkStateSnapshot::capture(&mut source);
@@ -8423,7 +8449,7 @@ mod resume_tests {
         state.history = vec![("stale".into(), "state".into())];
         state.recent_tools = vec!["stale-tool".into()];
         state.last_response = Some("stale".into());
-        state.continuation_anchor = Some("stale-anchor".into());
+        state.continuation_anchor = Some(ContinuationAnchor::rendered_for_test("stale-anchor"));
 
         snapshot.restore(&mut state);
 
@@ -8445,7 +8471,7 @@ mod resume_tests {
         state.history = vec![("q1".into(), "a1".into())];
         state.recent_tools = vec!["bash".into()];
         state.last_response = Some("a1".into());
-        state.continuation_anchor = Some("anchor".into());
+        state.continuation_anchor = Some(ContinuationAnchor::rendered_for_test("anchor"));
 
         {
             let mut guard = ForkStateGuard::new(&mut state);
@@ -8685,7 +8711,7 @@ mod resume_tests {
         .unwrap();
 
         let finalized = crate::cli::session::session_input::finalize_effective_line(
-            "continue".into(),
+            crate::cli::session::session_input::PreparedInput::user_only("continue"),
             "continue".into(),
             None,
             &mut state,

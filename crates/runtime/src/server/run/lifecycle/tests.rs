@@ -842,7 +842,7 @@ fn shutdown_extraction_request_uses_outer_session_turn() {
 }
 
 #[test]
-fn shutdown_extraction_request_detects_correction_from_structured_user_intent() {
+fn shutdown_extraction_request_uses_typed_objective_relation() {
     let svc = test_service();
     let mut request = test_request(
         "<project-instructions>\nDo not classify this wrapper.\n</project-instructions>\n\ncontinue",
@@ -858,13 +858,17 @@ fn shutdown_extraction_request_detects_correction_from_structured_user_intent() 
         None,
     );
     state.context_manifest_user_id = Some("test-user".to_string());
+    state.turn_intent = Some(
+        astra_config::user_profile::TurnIntent::default()
+            .with_objective_relation(astra_turn_types::ObjectiveRelation::Correct),
+    );
 
     let req = build_shutdown_extraction_request(&state)
         .expect("shutdown extraction request should build");
 
     assert!(
-        req.had_user_correction,
-        "shutdown extraction must classify pure user intent, not prompt-facing runtime content"
+        req.reanchors_current_objective,
+        "shutdown extraction must consume the judge-owned objective relation without reclassifying message text"
     );
 }
 
@@ -2300,35 +2304,6 @@ fn build_run_turn_complete_event_marks_interrupted_turns() {
     assert_eq!(event["assistant_text"], "[Round budget hard-limit reached]");
 }
 
-#[test]
-fn correction_keywords_trigger_was_corrected_via_implicit_feedback() {
-    // Sanity-check that the detect_implicit_feedback_signal contract used in
-    // record_server_loop_learning_outcome still recognizes Chinese-language
-    // user corrections.
-    let signal = astra_turn_types::detect_implicit_feedback_signal(
-        "不对，你搞错了",
-        Some("previous assistant reply"),
-    );
-    assert!(
-        matches!(signal.signal_type.as_str(), "correction" | "frustration"),
-        "expected correction/frustration, got {:?}",
-        signal.signal_type
-    );
-}
-
-#[test]
-fn neutral_user_turn_does_not_flag_was_corrected() {
-    let signal = astra_turn_types::detect_implicit_feedback_signal(
-        "再列一下 docs 目录",
-        Some("previous assistant reply"),
-    );
-    assert!(
-        !matches!(signal.signal_type.as_str(), "correction" | "frustration"),
-        "expected non-correction, got {:?}",
-        signal.signal_type
-    );
-}
-
 /// Unwrap a `Result<T, (StatusCode, Json<ErrorResponse>)>` in tests.
 fn ok<T>(result: Result<T, (StatusCode, Json<ErrorResponse>)>) -> T {
     match result {
@@ -2980,9 +2955,10 @@ fn server_resume_hydration_uses_transcript_when_primary_restore_is_not_viable() 
         &primary,
         &transcript,
     )
+    .expect("transcript metadata should be valid")
     .expect("transcript fallback should provide viable resume context");
 
-    assert!(hint.contains("active_objective: review branch changes"));
+    assert!(hint.contains("latest_user_input: review branch changes"));
     assert!(hint.contains("last_assistant_state: The review found resume continuity issues."));
 }
 
@@ -3001,12 +2977,40 @@ fn server_resume_hydration_prefers_primary_restore_when_viable() {
         &primary,
         &transcript,
     )
+    .expect("primary metadata should be valid")
     .expect("primary restore should provide viable resume context");
 
-    assert!(hint.contains("active_objective: primary goal"));
+    assert!(hint.contains("latest_user_input: primary goal"));
     assert!(hint.contains("last_assistant_state: primary state"));
     assert!(!hint.contains("transcript goal"));
     assert!(!hint.contains("transcript state"));
+}
+
+#[test]
+fn server_resume_hydration_does_not_hide_corrupt_primary_metadata_with_a_fallback() {
+    let primary = vec![
+        json!({
+            "role": "user",
+            "content": "primary goal",
+            (astra_turn_types::USER_TURN_SEMANTICS_FIELD): {
+                "schema_version": "invalid",
+                "objective_relation": "replace"
+            }
+        }),
+        json!({"role": "assistant", "content": "primary state"}),
+    ];
+    let transcript = vec![
+        json!({"role": "user", "content": "fallback goal"}),
+        json!({"role": "assistant", "content": "fallback state"}),
+    ];
+
+    assert!(matches!(
+        AgenticRunLifecycleService::session_resume_hydration_hint_from_sources(
+            &primary,
+            &transcript,
+        ),
+        Err(astra_turn_types::UserTurnSemanticsError::Malformed(_))
+    ));
 }
 
 fn test_service_with_store(store: Arc<dyn RunStateStore>) -> AgenticRunLifecycleService {
@@ -5699,7 +5703,6 @@ fn build_runtime_turn_evaluation_event_uses_loop_state_signals() {
             advisory_threshold_reached: false,
             nudge_count: 1,
             interaction_mode: "prompt".into(),
-            suppressed_loop_nudges: false,
             recent_error_pressure: 0,
             recent_timeout_pressure: 0,
             total_errors: 0,
@@ -5928,6 +5931,47 @@ fn finalize_run_events_preserves_classified_error_code() {
     assert_eq!(
         events[1]["data"]["error"],
         "[network] LLM request failed: connection reset"
+    );
+}
+
+#[test]
+fn finalize_run_events_preserves_host_event_route_contract_code() {
+    let svc = test_service();
+    let request = test_request("route fault");
+    let state = svc.build_initial_state(
+        "test-user",
+        &request,
+        "session-1",
+        "run-1",
+        None,
+        None,
+        None,
+    );
+    let classified = astra_core::ClassifiedError::new(
+        astra_core::ErrorKind::ContractViolation,
+        "host_event_route_contract_violation: approval used the progress lane",
+    )
+    .with_details_json(
+        json!({
+            "source": server_loop_host::HOST_EVENT_ROUTER_SOURCE,
+            "error_code": server_loop_host::HOST_EVENT_ROUTE_CONTRACT_ERROR_CODE,
+        })
+        .to_string(),
+    );
+
+    let (events, status, error) =
+        AgenticRunLifecycleService::finalize_run_events(Err(classified), vec![], &state);
+
+    assert_eq!(status, RunStatus::Failed);
+    assert!(error.is_some());
+    assert_eq!(
+        events[0]["data"]["error_code"],
+        "host_event_route_contract_violation"
+    );
+    assert_eq!(events[0]["data"]["error_kind"], "contract_violation");
+    assert_eq!(
+        events[1]["data"]["error_code"],
+        "host_event_route_contract_violation"
     );
 }
 
@@ -7270,7 +7314,6 @@ async fn create_run_persists_interaction_mode_into_run_started_event() {
         .expect("run exists");
     assert_eq!(durable.events[0]["event_type"], "run_started");
     assert_eq!(durable.events[0]["data"]["interaction_mode"], "auto");
-    assert_eq!(durable.events[0]["data"]["suppressed_loop_nudges"], true);
     assert_eq!(durable.events[0]["data"]["interactive_client"], true);
     assert_eq!(durable.events[0]["data"]["workspace"]["kind"], "none");
     assert!(durable.events[0]["data"]["workspace"]["cwd"].is_null());
@@ -8014,19 +8057,20 @@ fn build_initial_state_sets_user_message() {
 }
 
 #[test]
-fn build_initial_state_strips_runtime_affix_from_user_message() {
+fn build_initial_state_preserves_literal_user_message_without_text_classification() {
     let svc = test_service();
-    let req = test_request(
-        "我说过的所有话\n\n<system-reminder>\n[session-resume:v1]\nHydrated previous session context\n</system-reminder>",
-    );
+    let req = test_request("我说过的 <system-reminder> 是字面内容");
 
     let state = svc.build_initial_state("test-user", &req, "sess-1", "run-1", None, None, None);
 
     assert_eq!(state.messages.len(), 1);
     assert_eq!(state.messages[0]["role"], "user");
-    assert_eq!(state.messages[0]["content"], "我说过的所有话");
-    assert_eq!(state.message, "我说过的所有话");
-    assert_eq!(state.user_intent, "我说过的所有话");
+    assert_eq!(
+        state.messages[0]["content"],
+        "我说过的 <system-reminder> 是字面内容"
+    );
+    assert_eq!(state.message, "我说过的 <system-reminder> 是字面内容");
+    assert_eq!(state.user_intent, "我说过的 <system-reminder> 是字面内容");
 }
 
 #[test]
@@ -8474,6 +8518,7 @@ fn build_initial_state_agent_binding_uses_binding_skills_and_max_steps() {
         None,
         None,
         None,
+        None,
         RequestConstraints::default(),
         &edge_context,
         Some(&edge_profile),
@@ -8580,6 +8625,7 @@ async fn request_scoped_runtime_skill_resolver_is_installed_from_provider_capabi
         &request,
         "session-1",
         "run-1",
+        None,
         None,
         None,
         None,
@@ -12666,7 +12712,7 @@ async fn full_live_queue_cannot_hide_or_precede_durable_approval_truth() {
         run_id: "run-approval".to_string(),
         session_id: "session-1".to_string(),
         agent_id: None,
-        event_tx,
+        event_tx: Some(event_tx),
     };
     let delivery = server_loop_host::HostInteractionSink::commit_and_deliver(
         &sink,
@@ -12704,6 +12750,47 @@ async fn full_live_queue_cannot_hide_or_precede_durable_approval_truth() {
     let approval = event_rx.recv().await.unwrap();
     assert_eq!(approval["type"], "approval_required");
     assert_eq!(approval[HOST_INTERACTION_COMMITTED_FIELD], true);
+}
+
+#[tokio::test]
+async fn detached_observer_does_not_revoke_committed_interaction() {
+    let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
+    engine
+        .start_run("run-detached-approval", "user-1", "session-1")
+        .await
+        .unwrap();
+    let (event_tx, event_rx) = mpsc::channel(1);
+    drop(event_rx);
+    let sink = DurableHostInteractionSink {
+        run_engine: engine.clone(),
+        user_id: "user-1".to_string(),
+        run_id: "run-detached-approval".to_string(),
+        session_id: "session-1".to_string(),
+        agent_id: None,
+        event_tx: Some(event_tx),
+    };
+
+    server_loop_host::HostInteractionSink::commit_and_deliver(
+        &sink,
+        json!({
+            "type": "approval_required",
+            "request_id": "approval-detached",
+            "tool": "bash",
+            "approval_kind": "standard"
+        }),
+    )
+    .await
+    .expect("durable interaction remains valid after live observer detaches");
+
+    let durable = engine
+        .load_run("user-1", "run-detached-approval")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(durable.events.iter().any(|event| {
+        event["event_type"] == "approval_required"
+            && event["data"]["request_id"] == "approval-detached"
+    }));
 }
 
 #[test]

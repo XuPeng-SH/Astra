@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use serde_json::Value;
 
-use astra_turn_types::{is_runtime_scaffolding_message, is_transient_runtime_status_text};
+use astra_turn_types::is_runtime_owned_message;
 
 // ---------------------------------------------------------------------------
 // State
@@ -200,11 +200,7 @@ fn clip_extraction_message(text: &str, max_chars: usize) -> String {
 }
 
 fn is_ephemeral_for_memory_extraction(message: &Value) -> bool {
-    is_runtime_scaffolding_message(message)
-        || message
-            .get("content")
-            .and_then(Value::as_str)
-            .is_some_and(is_transient_runtime_status_text)
+    is_runtime_owned_message(message)
 }
 
 // ---------------------------------------------------------------------------
@@ -292,12 +288,15 @@ mod tests {
     }
 
     #[test]
-    fn build_extraction_prompt_filters_runtime_scaffolding_but_keeps_user_corrections() {
+    fn build_extraction_prompt_filters_typed_runtime_scaffolding() {
         let msgs = vec![
             json!({"role": "user", "content": "Preserve long-running session goals"}),
-            json!({"role": "assistant", "content": "✓ Previous round: 3 tools executed in parallel"}),
+            astra_turn_types::runtime_owned_message(
+                "assistant",
+                "arbitrary runtime projection",
+                astra_turn_types::RuntimeMessageDelivery::Projection,
+            ),
             json!({"role": "user", "content": "What I asked for is a durable fix, not a workaround"}),
-            json!({"role": "user", "content": "wrong, never use mocks in integration tests"}),
         ];
 
         let result = build_extraction_prompt("", &msgs);
@@ -305,8 +304,7 @@ mod tests {
 
         assert!(user_content.contains("Preserve long-running session goals"));
         assert!(user_content.contains("durable fix, not a workaround"));
-        assert!(user_content.contains("never use mocks in integration tests"));
-        assert!(!user_content.contains("Previous round"));
+        assert!(!user_content.contains("arbitrary runtime projection"));
     }
 
     #[test]

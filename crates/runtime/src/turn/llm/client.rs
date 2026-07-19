@@ -314,22 +314,6 @@ fn canonical_valid_tool_name(name: &str) -> Option<&str> {
 
 // ── System Prompt ─────────────────────────────────────────────────────────
 
-/// Build a system prompt for the given tool+profile context.
-/// The underlying section builders are cached in `bridge::inprocess::section_cache`.
-#[cfg(test)]
-pub(crate) fn cached_system_prompt(
-    tool_names: &[&str],
-    profile_desc: &str,
-    task_type: Option<&str>,
-) -> String {
-    prompts::build_main_system_prompt_with_style(
-        tool_names,
-        profile_desc,
-        task_type,
-        current_output_style(),
-    )
-}
-
 /// Detect TPM (tokens per minute) exhaustion errors.
 ///
 /// TPM errors require longer wait times because they indicate the account-level
@@ -1965,6 +1949,11 @@ pub(crate) fn consolidate_system_messages_for_provider(
 fn strip_internal_runtime_markers(messages: &mut [Value]) {
     for message in messages {
         crate::turn::wire_assembly::strip_required_runtime_preamble_marker(message);
+        if let Some(object) = message.as_object_mut() {
+            object.remove(astra_turn_types::RUNTIME_MESSAGE_PROVENANCE_FIELD);
+            object.remove(astra_turn_types::USER_TURN_SEMANTICS_FIELD);
+            object.remove("_compact_boundary");
+        }
     }
 }
 
@@ -4794,20 +4783,6 @@ mod tests {
         assert!(!is_tpm_exhaustion("too many requests"));
         assert!(!is_tpm_exhaustion("429 quota exceeded"));
         assert!(!is_tpm_exhaustion(""));
-    }
-
-    #[test]
-    fn cached_system_prompt_is_deterministic() {
-        let p1 = cached_system_prompt(&["bash"], "", Some("code"));
-        let p2 = cached_system_prompt(&["bash"], "", Some("code"));
-        assert_eq!(p1, p2);
-    }
-
-    #[test]
-    fn cached_system_prompt_varies_by_profile() {
-        let p1 = cached_system_prompt(&["bash"], "", Some("code"));
-        let p2 = cached_system_prompt(&["bash"], "cwd: /tmp", Some("code"));
-        assert_ne!(p1, p2);
     }
 
     #[test]
@@ -7712,6 +7687,35 @@ mod tests {
         let out = consolidate_system_messages(&msgs);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["role"], "user");
+    }
+
+    #[test]
+    fn provider_projection_strips_runtime_ownership_and_boundary_metadata() {
+        let mut runtime = astra_turn_types::runtime_owned_message(
+            "user",
+            "model-visible required context",
+            astra_turn_types::RuntimeMessageDelivery::RequiredContext,
+        );
+        runtime["_compact_boundary"] = Value::Bool(true);
+        runtime[astra_turn_types::USER_TURN_SEMANTICS_FIELD] = json!({
+            "schema_version": 1,
+            "objective_relation": "continue"
+        });
+
+        let out = consolidate_system_messages_for_provider(&[runtime], "openai");
+
+        assert_eq!(out[0]["content"], "model-visible required context");
+        assert!(
+            out[0]
+                .get(astra_turn_types::RUNTIME_MESSAGE_PROVENANCE_FIELD)
+                .is_none()
+        );
+        assert!(
+            out[0]
+                .get(astra_turn_types::USER_TURN_SEMANTICS_FIELD)
+                .is_none()
+        );
+        assert!(out[0].get("_compact_boundary").is_none());
     }
 
     #[test]

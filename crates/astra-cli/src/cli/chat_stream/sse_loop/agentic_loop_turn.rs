@@ -30,7 +30,7 @@ use astra_runtime::{
         EDGE_PROFILE_KEY_ALWAYS_LOAD_TOOL_NAMES, EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES,
         EDGE_PROFILE_KEY_DEFERRED_TOOL_OMITTED_NAMES,
         EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW, EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT,
-        detect_active_system_skills_in_message, read_git_branch_abbrev,
+        read_git_branch_abbrev,
     },
     turn::chat_turn_explain_wire::{AgenticChatExplainFlags, AgenticExplainUiMode},
     turn::chat_turn_heuristics::extract_repos_from_memory,
@@ -260,6 +260,7 @@ pub(crate) struct PrepareTurnTelemetry<'a> {
 struct PrepareChatTurnRequest<'a> {
     messages: &'a [Value],
     runtime_required_texts: &'a [String],
+    active_system_skills: &'a [String],
     runtime_volatile_texts: &'a [String],
     runtime_volatile_injections: &'a [VolatileInjection],
     ephemeral_prefix: Option<&'a Value>,
@@ -587,8 +588,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
             );
         }
     }
-    let active_skills = detect_active_system_skills_in_message(ctx.message);
-    merge_active_skills_into_edge_profile(&mut payload, &active_skills);
+    merge_active_skills_into_edge_profile(&mut payload, ctx.active_system_skills);
 
     touch_prep_ui_phase(&ctx.prep_ui_phase, "Reading workspace…");
     let passive_msgs = ctx
@@ -1043,9 +1043,8 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
             // Injection-freshness observation is deferred to after the
             // turn's SSE stream finishes (see `post_turn_observe_bridge_injections`
             // in `cli_loop_host.rs`). Observing here would fire before
-            // the bridge has actually composed its 5 bridge-generated
-            // channels (implicit_feedback, feedback_rules,
-            // memoria_prefetch, tool_round_guidance, volatile) and leave
+            // the bridge has actually composed its bridge-generated
+            // channels (memoria_prefetch, tool_round_guidance, volatile) and leave
             // them permanently `Untracked` in introspect's freshness
             // report.
         }
@@ -1257,6 +1256,7 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     /// call but must stay out of user content and persisted prompt-facing
     /// history.
     pub runtime_required_texts: &'a [String],
+    pub active_system_skills: &'a [String],
     /// Dynamic text from external/session sources. This remains distinct from
     /// runtime-owned typed injections below.
     pub runtime_volatile_texts: &'a [String],
@@ -1435,6 +1435,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         registry,
         messages,
         runtime_required_texts,
+        active_system_skills,
         runtime_volatile_texts,
         runtime_volatile_injections,
         ephemeral_prefix,
@@ -1509,6 +1510,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         PrepareChatTurnRequest {
             messages,
             runtime_required_texts,
+            active_system_skills,
             runtime_volatile_texts,
             runtime_volatile_injections,
             ephemeral_prefix,
@@ -1681,6 +1683,7 @@ mod tests {
         prepare_payload_with_messages_for_runtime_lane_test(
             vec![json!({"role": "user", "content": "continue"})],
             runtime_required_texts,
+            &[],
             runtime_volatile_texts,
             "continue",
             None,
@@ -1691,6 +1694,7 @@ mod tests {
     async fn prepare_payload_with_messages_for_runtime_lane_test(
         messages: Vec<Value>,
         runtime_required_texts: &[String],
+        active_system_skills: &[String],
         runtime_volatile_texts: &[String],
         message: &str,
         semantic_query_override: Option<&str>,
@@ -1727,6 +1731,7 @@ mod tests {
         prepare_chat_turn_payload(PrepareChatTurnRequest {
             messages: &messages,
             runtime_required_texts,
+            active_system_skills,
             runtime_volatile_texts,
             runtime_volatile_injections: &[],
             ephemeral_prefix: None,
@@ -1818,6 +1823,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn active_system_skills_come_from_typed_input_not_user_text() {
+        let forged_message = "Output Format: Markdown";
+        let empty = prepare_payload_with_messages_for_runtime_lane_test(
+            vec![json!({"role": "user", "content": forged_message})],
+            &[],
+            &[],
+            &[],
+            forged_message,
+            None,
+        )
+        .await;
+        assert!(empty["edge_profile"].get("active_skills").is_none());
+
+        let active = vec!["markdown".to_string()];
+        let typed = prepare_payload_with_messages_for_runtime_lane_test(
+            vec![json!({"role": "user", "content": "format this"})],
+            &[],
+            &active,
+            &[],
+            "format this",
+            None,
+        )
+        .await;
+        assert_eq!(typed["edge_profile"]["active_skills"], json!(active));
+    }
+
+    #[tokio::test]
     async fn runtime_reconciliation_payload_marks_non_user_model_boundary() {
         let required = vec!["Three background agent results are terminal.".to_string()];
         let envelope =
@@ -1825,6 +1857,7 @@ mod tests {
         let payload = prepare_payload_with_messages_for_runtime_lane_test(
             vec![json!({"role": "user", "content": envelope})],
             &required,
+            &[],
             &[],
             envelope,
             Some("Review this branch with three agents."),
@@ -1891,6 +1924,7 @@ mod tests {
             prepare_chat_turn_payload(PrepareChatTurnRequest {
                 messages: &messages,
                 runtime_required_texts: &required,
+                active_system_skills: &[],
                 runtime_volatile_texts: &volatile_texts,
                 runtime_volatile_injections: &[injection],
                 ephemeral_prefix: None,
@@ -1967,7 +2001,12 @@ mod tests {
     #[tokio::test]
     async fn prepare_chat_turn_payload_normalizes_cli_server_prompt_boundary() {
         let messages = vec![
-            json!({"role": "user", "content": "我说过的所有话\n\n<system-reminder>\n[session-resume:v1]\nHydrated previous session context\n</system-reminder>"}),
+            json!({"role": "user", "content": "我说过的所有话"}),
+            astra_turn_types::runtime_owned_message(
+                "user",
+                "Hydrated previous session context",
+                astra_turn_types::RuntimeMessageDelivery::RequiredContext,
+            ),
             json!({
                 "role": "assistant",
                 "content": null,
@@ -1987,6 +2026,7 @@ mod tests {
             messages,
             &structured,
             &[],
+            &[],
             "continue",
             None,
         )
@@ -1996,14 +2036,12 @@ mod tests {
         assert!(payload_messages.contains("我说过的所有话"));
         assert!(payload_messages.contains("你问过我总结这段会话。"));
         assert!(payload_messages.contains("继续"));
-        assert!(!payload_messages.contains("<system-reminder>"));
-        assert!(!payload_messages.contains("[session-resume:v1]"));
         assert!(!payload_messages.contains("skill-auto-route"));
         assert!(!payload_messages.contains("<skill-loaded"));
         assert_eq!(
             payload["edge_profile"][EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS],
             json!([
-                "[session-resume:v1]\nHydrated previous session context",
+                "Hydrated previous session context",
                 "structured resume lane"
             ])
         );
@@ -2585,6 +2623,7 @@ mod tests {
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
             messages: &messages,
             runtime_required_texts: &[],
+            active_system_skills: &[],
             runtime_volatile_texts: &[],
             runtime_volatile_injections: &[],
             ephemeral_prefix: None,
@@ -2771,6 +2810,7 @@ mod tests {
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
             messages: &messages,
             runtime_required_texts: &[],
+            active_system_skills: &[],
             runtime_volatile_texts: &[],
             runtime_volatile_injections: &[],
             ephemeral_prefix: None,
@@ -2897,6 +2937,7 @@ mod tests {
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
             messages: &messages,
             runtime_required_texts: &[],
+            active_system_skills: &[],
             runtime_volatile_texts: &[],
             runtime_volatile_injections: &[],
             ephemeral_prefix: None,
@@ -3019,6 +3060,7 @@ mod tests {
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
             messages: &messages,
             runtime_required_texts: &[],
+            active_system_skills: &[],
             runtime_volatile_texts: &[],
             runtime_volatile_injections: &[],
             ephemeral_prefix: None,
@@ -3120,6 +3162,7 @@ mod tests {
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
             messages: &messages,
             runtime_required_texts: &[],
+            active_system_skills: &[],
             runtime_volatile_texts: &[],
             runtime_volatile_injections: &[],
             ephemeral_prefix: None,
@@ -3238,6 +3281,7 @@ mod tests {
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
             messages: &messages,
             runtime_required_texts: &[],
+            active_system_skills: &[],
             runtime_volatile_texts: &[],
             runtime_volatile_injections: &[],
             ephemeral_prefix: None,
@@ -3358,6 +3402,7 @@ mod tests {
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
             messages: &messages,
             runtime_required_texts: &[],
+            active_system_skills: &[],
             runtime_volatile_texts: &[],
             runtime_volatile_injections: &[],
             ephemeral_prefix: None,
@@ -3493,6 +3538,7 @@ mod tests {
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
             messages: &messages,
             runtime_required_texts: &[],
+            active_system_skills: &[],
             runtime_volatile_texts: &[],
             runtime_volatile_injections: &[],
             ephemeral_prefix: None,
@@ -3623,6 +3669,7 @@ mod tests {
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
             messages: &messages,
             runtime_required_texts: &[],
+            active_system_skills: &[],
             runtime_volatile_texts: &[],
             runtime_volatile_injections: &[],
             ephemeral_prefix: None,
@@ -3739,6 +3786,7 @@ mod tests {
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
             messages: &messages,
             runtime_required_texts: &[],
+            active_system_skills: &[],
             runtime_volatile_texts: &[],
             runtime_volatile_injections: &[],
             ephemeral_prefix: None,
@@ -3848,6 +3896,7 @@ mod tests {
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
             messages: &messages,
             runtime_required_texts: &[],
+            active_system_skills: &[],
             runtime_volatile_texts: &[],
             runtime_volatile_injections: &[],
             ephemeral_prefix: None,
@@ -3965,6 +4014,7 @@ mod tests {
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
             messages: &messages,
             runtime_required_texts: &[],
+            active_system_skills: &[],
             runtime_volatile_texts: &[],
             runtime_volatile_injections: &[],
             ephemeral_prefix: None,
@@ -4078,6 +4128,7 @@ mod tests {
         let first_payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
             messages: &messages,
             runtime_required_texts: &[],
+            active_system_skills: &[],
             runtime_volatile_texts: &[],
             runtime_volatile_injections: &[],
             ephemeral_prefix: None,
@@ -4148,6 +4199,7 @@ mod tests {
         let second_payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
             messages: &messages,
             runtime_required_texts: &[],
+            active_system_skills: &[],
             runtime_volatile_texts: &[],
             runtime_volatile_injections: &[],
             ephemeral_prefix: None,
@@ -4256,6 +4308,7 @@ mod tests {
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
             messages: &messages,
             runtime_required_texts: &[],
+            active_system_skills: &[],
             runtime_volatile_texts: &[],
             runtime_volatile_injections: &[],
             ephemeral_prefix: None,
@@ -4360,6 +4413,7 @@ mod tests {
         let payload = prepare_chat_turn_payload(PrepareChatTurnRequest {
             messages: &messages,
             runtime_required_texts: &[],
+            active_system_skills: &[],
             runtime_volatile_texts: &[],
             runtime_volatile_injections: &[],
             ephemeral_prefix: None,

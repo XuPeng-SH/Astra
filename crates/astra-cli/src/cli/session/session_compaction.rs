@@ -100,7 +100,7 @@ pub(crate) fn compact_assistant_message(
 #[cfg(test)]
 mod tests {
     use super::compact_assistant_message;
-    use crate::cli::session::session_state::SessionState;
+    use crate::cli::session::session_state::{ContinuationAnchor, SessionState};
 
     #[test]
     fn continuation_anchor_survives_simulated_compaction() {
@@ -128,30 +128,30 @@ mod tests {
         assert!(history[0].1.contains("Rust Pin<T>"));
 
         let state = SessionState {
-            continuation_anchor: Some(
-                "Latest user task: debug lifetime in tokio::spawn\n\
+            continuation_anchor: Some(ContinuationAnchor::rendered_for_test(
+                "Latest user input: debug lifetime in tokio::spawn\n\
                  Latest assistant direction: add 'static bound to closure"
-                    .to_string()
-                    .into(),
-            ),
+                    .to_string(),
+            )),
             history,
             ..SessionState::default()
         };
 
-        let effective = crate::cli::session::session_input::build_effective_line(
+        let effective = crate::cli::session::session_input::prepare_input(
             "继续",
             &state,
             &mut crate::cli::ui_adapter::LineUiAdapter,
         );
-        assert_eq!(effective, "继续");
+        assert_eq!(effective.user_message, "继续");
+        assert!(effective.runtime_required_texts.is_empty());
 
-        let normal = crate::cli::session::session_input::build_effective_line(
+        let normal = crate::cli::session::session_input::prepare_input(
             "explain Pin in detail",
             &state,
             &mut crate::cli::ui_adapter::LineUiAdapter,
         );
         assert!(
-            !normal.contains("[Active task attachment]"),
+            normal.runtime_required_texts.is_empty(),
             "normal prompt must not inject anchor"
         );
     }

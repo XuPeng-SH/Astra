@@ -244,31 +244,149 @@ pub(crate) fn merge_continuation_anchor_with_session_memory(
         return anchor;
     };
     if anchor
-        .as_deref()
-        .is_some_and(|existing| existing.contains("[Session memory recap]"))
+        .as_ref()
+        .is_some_and(|existing| existing.has_session_memory_recap)
     {
         return anchor;
     }
     let merged = match anchor {
         Some(anchor) if !anchor.trim().is_empty() => {
-            return Some(ContinuationAnchor::from_parts(
-                truncate_str(
-                    &format!("{}\n\n[Session memory recap]\n{recap}", anchor.text),
-                    900,
-                ),
-                anchor.latest_user_task,
-                anchor.assistant_direction,
-                anchor.active_task_board,
-            ));
+            return Some(
+                ContinuationAnchor::from_parts(
+                    truncate_str(
+                        &format!("{}\n\n[Session memory recap]\n{recap}", anchor.text),
+                        900,
+                    ),
+                    anchor.recent_user_input,
+                    anchor.objective_context,
+                    anchor.assistant_direction,
+                    anchor.active_task_board,
+                )
+                .with_session_memory_recap(),
+            );
         }
         _ => format!("[Session memory recap]\n{recap}"),
     };
-    Some(ContinuationAnchor::from_parts(
-        truncate_str(&merged, 900),
-        None,
-        None,
-        Vec::new(),
-    ))
+    Some(
+        ContinuationAnchor::from_parts(
+            truncate_str(&merged, 900),
+            None,
+            Vec::new(),
+            None,
+            Vec::new(),
+        )
+        .with_session_memory_recap(),
+    )
+}
+
+fn objective_context_for_anchor(state: &SessionState, result: &StreamResult) -> Vec<String> {
+    let projected = match astra_turn_core::resume_hydration::objective_context_from_messages(
+        &result.final_messages,
+    ) {
+        Ok(projected) => projected,
+        Err(error) => {
+            tracing::warn!(
+                session_id = %state.task_manager.session_id(),
+                error = %error,
+                "invalid typed objective metadata in completed turn; preserving previous continuation objective"
+            );
+            return state
+                .continuation_anchor
+                .as_ref()
+                .map(|anchor| anchor.objective_context.clone())
+                .unwrap_or_default();
+        }
+    };
+    if projected.is_empty() {
+        return state
+            .continuation_anchor
+            .as_ref()
+            .map(|anchor| anchor.objective_context.clone())
+            .unwrap_or_default();
+    }
+
+    let starts_new_objective = projected
+        .first()
+        .is_some_and(|item| item.relation == astra_turn_types::ObjectiveRelation::Replace);
+    let mut context = if starts_new_objective {
+        Vec::new()
+    } else {
+        state
+            .continuation_anchor
+            .as_ref()
+            .map(|anchor| anchor.objective_context.clone())
+            .unwrap_or_default()
+    };
+    for rendered in render_objective_context_items(projected) {
+        if !context.contains(&rendered) {
+            context.push(rendered);
+        }
+    }
+    while context.len() > 4 {
+        context.remove(1);
+    }
+    context
+}
+
+fn render_objective_context_items(
+    items: Vec<astra_turn_core::resume_hydration::ObjectiveContextItem>,
+) -> Vec<String> {
+    items
+        .into_iter()
+        .filter_map(|item| {
+            if matches!(
+                item.relation,
+                astra_turn_types::ObjectiveRelation::Acknowledge
+                    | astra_turn_types::ObjectiveRelation::Continue
+            ) {
+                return None;
+            }
+            let label = item.relation.objective_context_label();
+            Some(format!("{label}: {}", truncate_str(&item.text, 220)))
+        })
+        .collect()
+}
+
+/// Seed the live continuation projection from canonical typed messages before
+/// rebuilding the rest of the anchor. Untyped history is intentionally not
+/// interpreted.
+pub(crate) fn seed_continuation_objective_from_messages(
+    state: &mut SessionState,
+    messages: &[serde_json::Value],
+) {
+    let objective_context = match astra_turn_core::resume_hydration::objective_context_from_messages(
+        messages,
+    ) {
+        Ok(items) => render_objective_context_items(items),
+        Err(error) => {
+            tracing::warn!(
+                session_id = %state.task_manager.session_id(),
+                error = %error,
+                "invalid typed objective metadata in restored session; preserving existing continuation objective"
+            );
+            return;
+        }
+    };
+    if objective_context.is_empty() {
+        return;
+    }
+
+    match state.continuation_anchor.as_mut() {
+        Some(anchor) => anchor.objective_context = objective_context,
+        None => {
+            state.continuation_anchor = Some(ContinuationAnchor::from_parts(
+                String::new(),
+                None,
+                objective_context,
+                None,
+                Vec::new(),
+            ));
+        }
+    }
+}
+
+fn objective_context_section(items: &[String]) -> Option<String> {
+    (!items.is_empty()).then(|| format!("Current objective context:\n- {}", items.join("\n- ")))
 }
 
 async fn load_active_tasks_for_anchor(state: &SessionState) -> Result<Vec<SessionTask>, String> {
@@ -290,18 +408,14 @@ fn build_continuation_anchor_with_active_tasks(
         return state.continuation_anchor.clone();
     }
 
-    let latest_user_task = anchor_worthy_user_input(user_line)
-        .then(|| truncate_str(user_line, 220).to_string())
-        .or_else(|| {
-            state
-                .continuation_anchor
-                .as_ref()
-                .and_then(|anchor| anchor.latest_user_task.clone())
-                .filter(|task| anchor_worthy_user_input(task))
-        });
+    let recent_user_input = Some(truncate_str(user_line, 220).to_string());
+    let objective_context = objective_context_for_anchor(state, result);
     let mut sections = Vec::new();
-    if let Some(user_summary) = latest_user_task.as_deref() {
-        sections.push(format!("Latest user task: {user_summary}"));
+    if let Some(objective_section) = objective_context_section(&objective_context) {
+        sections.push(objective_section);
+    }
+    if let Some(user_summary) = recent_user_input.as_deref() {
+        sections.push(format!("Recent user input: {user_summary}"));
     }
     let active_task_board = active_task_anchor_items(active_tasks);
     if let Some(task_section) = active_task_anchor_section(active_tasks) {
@@ -326,7 +440,8 @@ fn build_continuation_anchor_with_active_tasks(
     } else {
         Some(ContinuationAnchor::from_parts(
             sections.join("\n"),
-            latest_user_task,
+            recent_user_input,
+            objective_context,
             assistant_direction,
             active_task_board,
         ))
@@ -357,8 +472,29 @@ fn rebuild_continuation_anchor_from_state_with_active_task_items(
 ) {
     state.last_response = state.history.last().map(|(_, assistant)| assistant.clone());
 
+    let objective_context = state
+        .continuation_anchor
+        .as_ref()
+        .map(|anchor| anchor.objective_context.clone())
+        .unwrap_or_default();
+
     let Some((user_line, assistant_text)) = state.history.last() else {
-        state.continuation_anchor = None;
+        let mut sections = Vec::new();
+        if let Some(objective_section) = objective_context_section(&objective_context) {
+            sections.push(objective_section);
+        }
+        if let Some(task_section) = active_task_anchor_section_from_items(&active_task_board) {
+            sections.push(task_section);
+        }
+        state.continuation_anchor = (!sections.is_empty()).then(|| {
+            ContinuationAnchor::from_parts(
+                sections.join("\n"),
+                None,
+                objective_context,
+                None,
+                active_task_board,
+            )
+        });
         return;
     };
     if user_line.trim().is_empty() {
@@ -366,18 +502,13 @@ fn rebuild_continuation_anchor_from_state_with_active_task_items(
         return;
     }
 
-    let latest_user_task = anchor_worthy_user_input(user_line)
-        .then(|| truncate_str(user_line, 220).to_string())
-        .or_else(|| {
-            state
-                .continuation_anchor
-                .as_ref()
-                .and_then(|anchor| anchor.latest_user_task.clone())
-                .filter(|task| anchor_worthy_user_input(task))
-        });
+    let recent_user_input = Some(truncate_str(user_line, 220).to_string());
     let mut sections = Vec::new();
-    if let Some(user_summary) = latest_user_task.as_deref() {
-        sections.push(format!("Latest user task: {user_summary}"));
+    if let Some(objective_section) = objective_context_section(&objective_context) {
+        sections.push(objective_section);
+    }
+    if let Some(user_summary) = recent_user_input.as_deref() {
+        sections.push(format!("Recent user input: {user_summary}"));
     }
     if let Some(task_section) = active_task_anchor_section_from_items(&active_task_board) {
         sections.push(task_section);
@@ -396,16 +527,11 @@ fn rebuild_continuation_anchor_from_state_with_active_task_items(
     ));
     state.continuation_anchor = Some(ContinuationAnchor::from_parts(
         sections.join("\n"),
-        latest_user_task,
+        recent_user_input,
+        objective_context,
         assistant_direction,
         active_task_board,
     ));
-}
-
-fn anchor_worthy_user_input(user_line: &str) -> bool {
-    astra_turn_types::should_store_in_memory(
-        &serde_json::json!({"role": "user", "content": user_line}),
-    )
 }
 
 pub(crate) async fn rebuild_continuation_anchor_from_live_state(state: &mut SessionState) {
@@ -435,7 +561,7 @@ pub(crate) async fn rebuild_continuation_anchor_from_live_state(state: &mut Sess
             );
         }
         Err(_) => {
-            tracing::debug!(
+            tracing::warn!(
                 session_id = %state.task_manager.session_id(),
                 budget_ms = ACTIVE_TASK_ANCHOR_REFRESH_BUDGET.as_millis() as u64,
                 "active task board refresh exceeded post-output budget; preserving previous anchor task board"
@@ -504,8 +630,10 @@ mod tests {
         CslCheckpointFields, build_continuation_anchor, build_full_session_state_compact,
         history_as_messages, merge_continuation_anchor_with_session_memory,
         rebuild_continuation_anchor_from_live_state,
+        rebuild_continuation_anchor_from_state_with_active_task_items,
+        seed_continuation_objective_from_messages,
     };
-    use crate::cli::session::session_input::build_effective_line;
+    use crate::cli::session::session_input::prepare_input;
     use crate::cli::session::session_state::{ContinuationAnchor, SessionState};
     use crate::cli::turn::turn_reporting::build_history_text;
     use astra_services::session_journal;
@@ -552,9 +680,9 @@ mod tests {
         let anchor = build_continuation_anchor(&state, &long_user_input, &result)
             .expect("should produce anchor");
 
-        assert!(anchor.contains("Latest user task: "));
+        assert!(anchor.contains("Recent user input: "));
         let user_part = anchor
-            .split("Latest user task: ")
+            .split("Recent user input: ")
             .nth(1)
             .unwrap()
             .split('\n')
@@ -575,7 +703,13 @@ mod tests {
     #[test]
     fn continuation_anchor_preserves_on_empty_input() {
         let state = SessionState {
-            continuation_anchor: Some("Previous anchor content".into()),
+            continuation_anchor: Some(ContinuationAnchor::from_parts(
+                "Previous anchor content",
+                None,
+                Vec::new(),
+                None,
+                Vec::new(),
+            )),
             ..SessionState::default()
         };
         let result = crate::tests::stub_stream_result("new response");
@@ -585,11 +719,12 @@ mod tests {
     }
 
     #[test]
-    fn continuation_anchor_does_not_replace_task_with_low_information_followup() {
+    fn continuation_anchor_separates_recent_input_from_current_objective() {
         let state = SessionState {
             continuation_anchor: Some(ContinuationAnchor::from_parts(
-                "Latest user task: fix tool closure telemetry",
+                "Current objective context:\n- objective: fix tool closure telemetry",
                 Some("fix tool closure telemetry".into()),
+                vec!["objective: fix tool closure telemetry".into()],
                 None,
                 Vec::new(),
             )),
@@ -599,13 +734,84 @@ mod tests {
 
         let anchor = build_continuation_anchor(&state, "继续", &result).expect("anchor");
 
-        assert!(anchor.contains("Latest user task: fix tool closure telemetry"));
-        assert!(!anchor.contains("Latest user task: 继续"), "{anchor}");
+        assert!(anchor.contains("Recent user input: 继续"));
+        assert!(anchor.contains("objective: fix tool closure telemetry"));
         assert!(anchor.contains("Updated telemetry to use final edge_tools."));
+        assert_eq!(anchor.recent_user_input.as_deref(), Some("继续"));
         assert_eq!(
-            anchor.latest_user_task.as_deref(),
-            Some("fix tool closure telemetry")
+            anchor.objective_context,
+            vec!["objective: fix tool closure telemetry"]
         );
+    }
+
+    #[test]
+    fn continuation_anchor_consumes_typed_objective_history() {
+        let mut result = crate::tests::stub_stream_result("Continuing the repair.");
+        result.final_messages = vec![
+            serde_json::json!({"role": "user", "content": "repair session lifecycle"}),
+            serde_json::json!({"role": "assistant", "content": "I will inspect it."}),
+            serde_json::json!({"role": "user", "content": "继续"}),
+        ];
+        astra_turn_types::mark_user_turn_semantics(
+            &mut result.final_messages[0],
+            astra_turn_types::UserTurnSemantics::new(
+                astra_turn_types::ObjectiveRelation::Replace,
+                None,
+            ),
+        );
+        astra_turn_types::mark_user_turn_semantics(
+            &mut result.final_messages[2],
+            astra_turn_types::UserTurnSemantics::new(
+                astra_turn_types::ObjectiveRelation::Continue,
+                None,
+            ),
+        );
+
+        let anchor =
+            build_continuation_anchor(&SessionState::default(), "继续", &result).expect("anchor");
+
+        assert_eq!(
+            anchor.objective_context,
+            vec!["objective: repair session lifecycle"]
+        );
+        assert_eq!(anchor.recent_user_input.as_deref(), Some("继续"));
+    }
+
+    #[test]
+    fn resumed_anchor_rebuild_keeps_canonical_objective_not_trivial_tail() {
+        let mut messages = vec![
+            serde_json::json!({"role": "user", "content": "repair session lifecycle"}),
+            serde_json::json!({"role": "assistant", "content": "I will inspect it."}),
+            serde_json::json!({"role": "user", "content": "继续"}),
+            serde_json::json!({"role": "assistant", "content": "Continuing."}),
+        ];
+        astra_turn_types::mark_user_turn_semantics(
+            &mut messages[0],
+            astra_turn_types::UserTurnSemantics::new(
+                astra_turn_types::ObjectiveRelation::Replace,
+                None,
+            ),
+        );
+        astra_turn_types::mark_user_turn_semantics(
+            &mut messages[2],
+            astra_turn_types::UserTurnSemantics::new(
+                astra_turn_types::ObjectiveRelation::Continue,
+                None,
+            ),
+        );
+        let mut state = SessionState::default();
+        state.history.push(("继续".into(), "Continuing.".into()));
+
+        seed_continuation_objective_from_messages(&mut state, &messages);
+        rebuild_continuation_anchor_from_state_with_active_task_items(&mut state, Vec::new());
+
+        let anchor = state.continuation_anchor.expect("resumed anchor");
+        assert_eq!(
+            anchor.objective_context,
+            vec!["objective: repair session lifecycle"]
+        );
+        assert!(anchor.contains("objective: repair session lifecycle"));
+        assert!(anchor.contains("Recent user input: 继续"));
     }
 
     #[tokio::test]
@@ -752,8 +958,9 @@ mod tests {
                 std::sync::Arc::new(LoadFailsTaskStore),
             )),
             continuation_anchor: Some(ContinuationAnchor::from_parts(
-                "Latest user task: 继续\nActive task board:\n- [in_progress] task-1: Preserve me",
+                "Latest user input: 继续\nActive task board:\n- [in_progress] task-1: Preserve me",
                 Some("继续".into()),
+                Vec::new(),
                 None,
                 vec!["[in_progress] task-1: Preserve me".into()],
             )),
@@ -815,8 +1022,9 @@ mod tests {
                 std::sync::Arc::new(StalledTaskStore),
             )),
             continuation_anchor: Some(ContinuationAnchor::from_parts(
-                "Latest user task: finish durable transcript loading\nActive task board:\n- [in_progress] task-1: Preserve live work",
+                "Latest user input: finish durable transcript loading\nActive task board:\n- [in_progress] task-1: Preserve live work",
                 Some("finish durable transcript loading".into()),
+                Vec::new(),
                 None,
                 vec!["[in_progress] task-1: Preserve live work".into()],
             )),
@@ -865,15 +1073,13 @@ mod tests {
 - Removed legacy extractor
 ";
         let merged = merge_continuation_anchor_with_session_memory(
-            Some(
-                "Latest user task: tighten session memory"
-                    .to_string()
-                    .into(),
-            ),
+            Some(ContinuationAnchor::rendered_for_test(
+                "Latest user input: tighten session memory".to_string(),
+            )),
             Some(memory),
         )
         .expect("merged anchor");
-        assert!(merged.contains("Latest user task: tighten session memory"));
+        assert!(merged.contains("Latest user input: tighten session memory"));
         assert!(merged.contains("[Session memory recap]"));
         assert!(merged.contains("Session pending"));
         assert!(merged.contains("Add shutdown flush"));
@@ -888,11 +1094,10 @@ mod tests {
             "Ownership in Rust means each value has exactly one owner...".into(),
         ));
         state.turn = 1;
-        state.continuation_anchor = Some(
-            "Latest user task: explain ownership\nLatest assistant summary:\nOwnership in Rust means each value has exactl"
-                .to_string()
-                .into(),
-        );
+        state.continuation_anchor = Some(ContinuationAnchor::rendered_for_test(
+            "Latest user input: explain ownership\nLatest assistant summary:\nOwnership in Rust means each value has exactl"
+                .to_string(),
+        ));
 
         state.history.push((
             "now explain borrowing".into(),
@@ -909,17 +1114,17 @@ mod tests {
         assert_eq!(messages[0]["content"], "explain ownership");
         assert_eq!(messages[2]["content"], "now explain borrowing");
 
-        state.continuation_anchor = Some(
-            "Latest user task: now explain borrowing\nLatest assistant summary:\nBorrowing lets you reference data"
-                .to_string()
-                .into(),
-        );
-        let effective = build_effective_line(
+        state.continuation_anchor = Some(ContinuationAnchor::rendered_for_test(
+            "Latest user input: now explain borrowing\nLatest assistant summary:\nBorrowing lets you reference data"
+                .to_string(),
+        ));
+        let effective = prepare_input(
             "continue",
             &state,
             &mut crate::cli::ui_adapter::LineUiAdapter,
         );
-        assert_eq!(effective, "continue");
+        assert_eq!(effective.user_message, "continue");
+        assert!(effective.runtime_required_texts.is_empty());
 
         let user_messages: Vec<_> = messages
             .iter()

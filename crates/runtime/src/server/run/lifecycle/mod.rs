@@ -358,7 +358,9 @@ struct DurableHostInteractionSink {
     run_id: String,
     session_id: String,
     agent_id: Option<String>,
-    event_tx: mpsc::Sender<Value>,
+    /// Optional live projection. Durable persistence is the interaction
+    /// authority; a detached observer can recover the committed event.
+    event_tx: Option<mpsc::Sender<Value>>,
 }
 
 #[async_trait]
@@ -388,17 +390,22 @@ impl server_loop_host::HostInteractionSink for DurableHostInteractionSink {
             .await
             .map_err(|error| format!("interaction persistence failed: {error}"))?;
 
-        event
+        let event_object = event
             .as_object_mut()
-            .expect("validated interaction object")
-            .insert(
-                HOST_INTERACTION_COMMITTED_FIELD.to_string(),
-                Value::Bool(true),
+            .ok_or_else(|| "interaction event must remain an object".to_string())?;
+        event_object.insert(
+            HOST_INTERACTION_COMMITTED_FIELD.to_string(),
+            Value::Bool(true),
+        );
+        if let Some(event_tx) = &self.event_tx
+            && event_tx.send(event).await.is_err()
+        {
+            tracing::debug!(
+                run_id = %self.run_id,
+                "durable interaction committed after live observer detached"
             );
-        self.event_tx
-            .send(event)
-            .await
-            .map_err(|_| "run interaction fanout is closed".to_string())
+        }
+        Ok(())
     }
 }
 const ACTIVE_RUN_DURABLE_CONTROL_WATCH_INTERVAL: Duration = Duration::from_secs(2);
@@ -1858,6 +1865,7 @@ fn build_server_skill_executor(
     edge_connection_pool: Option<&astra_server_types::edge_connection_pool::EdgeConnectionPool>,
     cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
     memory_extraction_service: Option<&Arc<crate::session_memory::MemoryExtractionService>>,
+    interaction_sink: Option<Arc<dyn server_loop_host::HostInteractionSink>>,
     #[cfg(feature = "harness")] harness_sink: Option<
         &std::sync::Arc<dyn astra_harness::SnapshotSink>,
     >,
@@ -1881,6 +1889,9 @@ fn build_server_skill_executor(
     .with_skill_resolver(skill_resolver)
     .with_reflect_service(reflect_service)
     .with_cancel_token(cancel_token);
+    if let Some(sink) = interaction_sink {
+        subrun_executor = subrun_executor.with_interaction_sink(sink);
+    }
     if let Some(snapshot) = execution_bindings {
         subrun_executor = subrun_executor.with_execution_binding_snapshot(snapshot.clone());
     }
@@ -5453,11 +5464,12 @@ impl AgenticRunLifecycleService {
             astra_services::session_restore::HybridRestoreService::new(shared.get().clone());
         match restore.restore_session(user_id, session_id).await {
             Ok(Some(restored)) => {
-                if let Some(hint) =
-                    astra_turn_core::resume_hydration::build_resume_hydration_hint_from_messages(
-                        &restored.conversation_messages,
-                    )
-                {
+                if let Some(hint) = Self::session_resume_hydration_hint_or_invalid_failure(
+                    user_id,
+                    session_id,
+                    &restored.conversation_messages,
+                    &[],
+                ) {
                     return Some(hint);
                 }
                 let transcript_messages = self
@@ -5468,7 +5480,9 @@ impl AgenticRunLifecycleService {
                         "hybrid_restore_unusable",
                     )
                     .await;
-                if let Some(hint) = Self::session_resume_hydration_hint_from_sources(
+                if let Some(hint) = Self::session_resume_hydration_hint_or_invalid_failure(
+                    user_id,
+                    session_id,
                     &restored.conversation_messages,
                     &transcript_messages,
                 ) {
@@ -5495,9 +5509,12 @@ impl AgenticRunLifecycleService {
                         "hybrid_restore_empty",
                     )
                     .await;
-                if let Some(hint) =
-                    Self::session_resume_hydration_hint_from_sources(&[], &transcript_messages)
-                {
+                if let Some(hint) = Self::session_resume_hydration_hint_or_invalid_failure(
+                    user_id,
+                    session_id,
+                    &[],
+                    &transcript_messages,
+                ) {
                     return Some(hint);
                 }
                 tracing::warn!(
@@ -5521,9 +5538,12 @@ impl AgenticRunLifecycleService {
                         "hybrid_restore_failed",
                     )
                     .await;
-                if let Some(hint) =
-                    Self::session_resume_hydration_hint_from_sources(&[], &transcript_messages)
-                {
+                if let Some(hint) = Self::session_resume_hydration_hint_or_invalid_failure(
+                    user_id,
+                    session_id,
+                    &[],
+                    &transcript_messages,
+                ) {
                     return Some(hint);
                 }
                 tracing::warn!(
@@ -5534,8 +5554,8 @@ impl AgenticRunLifecycleService {
                     "resume hydration skipped: session restore failed"
                 );
                 Some(
-                    astra_turn_core::resume_hydration::build_resume_hydration_failure_hint_for_error(
-                        &error,
+                    astra_turn_core::resume_hydration::build_resume_hydration_failure_hint(
+                        "session restore failed and transcript fallback was unavailable",
                     ),
                 )
             }
@@ -5596,15 +5616,45 @@ impl AgenticRunLifecycleService {
     fn session_resume_hydration_hint_from_sources(
         primary_messages: &[Value],
         transcript_messages: &[Value],
-    ) -> Option<String> {
-        astra_turn_core::resume_hydration::build_resume_hydration_hint_from_messages(
-            primary_messages,
-        )
-        .or_else(|| {
+    ) -> Result<Option<String>, astra_turn_types::UserTurnSemanticsError> {
+        if let Some(hint) =
             astra_turn_core::resume_hydration::build_resume_hydration_hint_from_messages(
-                transcript_messages,
-            )
-        })
+                primary_messages,
+            )?
+        {
+            return Ok(Some(hint));
+        }
+        astra_turn_core::resume_hydration::build_resume_hydration_hint_from_messages(
+            transcript_messages,
+        )
+    }
+
+    fn session_resume_hydration_hint_or_invalid_failure(
+        user_id: &str,
+        session_id: &str,
+        primary_messages: &[Value],
+        transcript_messages: &[Value],
+    ) -> Option<String> {
+        match Self::session_resume_hydration_hint_from_sources(
+            primary_messages,
+            transcript_messages,
+        ) {
+            Ok(hint) => hint,
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra_runtime::resume_hydration",
+                    user_id,
+                    session_id,
+                    error = %error,
+                    "resume hydration degraded: restored typed turn metadata is invalid"
+                );
+                Some(
+                    astra_turn_core::resume_hydration::build_resume_hydration_failure_hint(
+                        "restored resume source contains invalid typed turn metadata",
+                    ),
+                )
+            }
+        }
     }
 
     async fn task_board_resume_hint_for_session(
@@ -5690,6 +5740,7 @@ impl AgenticRunLifecycleService {
             workspace_override,
             execution_bindings,
             cancel_token,
+            None,
             request_constraints,
             &edge_context,
             None,
@@ -5707,6 +5758,7 @@ impl AgenticRunLifecycleService {
         workspace_override: Option<&std::path::Path>,
         execution_bindings: Option<&ExecutionBindingSnapshot>,
         cancel_token: Option<Arc<CancellationToken>>,
+        interaction_sink: Option<Arc<dyn server_loop_host::HostInteractionSink>>,
         request_constraints: RequestConstraints,
         edge_context: &EdgeContext,
         edge_profile_override: Option<&Map<String, Value>>,
@@ -5741,18 +5793,14 @@ impl AgenticRunLifecycleService {
         };
         use astra_turn_core::turn_guard::TurnGuard;
 
-        let prompt_user_message =
-            astra_turn_core::runtime_scaffolding::strip_user_runtime_scaffolding_affixes(
-                &request.message,
-            );
-        let prompt_user_intent =
-            astra_turn_core::runtime_scaffolding::strip_user_runtime_scaffolding_affixes(
-                request
-                    .user_intent
-                    .as_deref()
-                    .filter(|intent| !intent.trim().is_empty())
-                    .unwrap_or(request.message.as_str()),
-            );
+        let prompt_user_message = request.message.trim().to_string();
+        let prompt_user_intent = request
+            .user_intent
+            .as_deref()
+            .filter(|intent| !intent.trim().is_empty())
+            .unwrap_or(request.message.as_str())
+            .trim()
+            .to_string();
         let user_message = json!({
             "role": "user",
             "content": prompt_user_message,
@@ -5873,6 +5921,7 @@ impl AgenticRunLifecycleService {
             self.edge_connection_pool.as_ref(),
             cancel_token,
             memory_extraction_service.as_ref(),
+            interaction_sink,
             #[cfg(feature = "harness")]
             harness_sink_arc.as_ref(),
         );
@@ -6549,7 +6598,6 @@ fn build_shutdown_extraction_request(
     state: &AgenticLoopState,
 ) -> Option<crate::session_memory::ExtractionRequest> {
     state.context_manifest_user_id.as_ref()?;
-    let runtime_decision_user_intent = state.runtime_decision_user_intent();
     state
         .current_session_id
         .as_ref()
@@ -6558,9 +6606,10 @@ fn build_shutdown_extraction_request(
             messages: state.messages.clone(),
             session_facts: state.session_facts.clone(),
             had_error: state.error_recovery.consecutive_same_error > 0,
-            had_user_correction: astra_turn_core::input_classifier::is_reanchor_signal(
-                &runtime_decision_user_intent,
-            ),
+            reanchors_current_objective: state
+                .turn_intent
+                .as_ref()
+                .is_some_and(|intent| intent.reanchors_current_objective()),
             turn_number: state.current_session_turn_number(),
         })
 }
@@ -7314,6 +7363,16 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             plan_authoring_active,
             task_board_resume_hint,
         );
+        let interaction_sink: Arc<dyn server_loop_host::HostInteractionSink> =
+            Arc::new(DurableHostInteractionSink {
+                run_engine: self.run_engine.clone(),
+                user_id: user_id.clone(),
+                run_id: run_id.clone(),
+                session_id: session_id.clone(),
+                agent_id: None,
+                event_tx: None,
+            });
+        host.set_interaction_sink(Arc::clone(&interaction_sink));
         if let Some(snapshot) = execution_bindings.as_ref() {
             host.set_execution_metadata(Value::Object(binding_event_fields(
                 &snapshot.workspace,
@@ -7346,6 +7405,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 .or(server_workspace.as_deref()),
             execution_bindings.as_ref(),
             Some(llm_cancel_token.clone()),
+            Some(Arc::clone(&interaction_sink)),
             request_constraints.clone(),
             &edge_context,
             Some(&edge_profile),
@@ -7805,9 +7865,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 let outcome =
                     run_agentic_loop_with_host_panic_safe(&mut host, &mut loop_state).await;
                 park_server_root_mailbox(&mut loop_state).await;
+                let (outcome, events) = host.settle_loop_turn(outcome);
                 let loop_success = outcome.is_ok();
                 let (events, final_status, error_msg) =
-                    Self::finalize_run_events(outcome, host.take_emitted_events(), &loop_state);
+                    Self::finalize_run_events(outcome, events, &loop_state);
 
                 // Clean up channels for this run.
                 bg_approval_channels.lock().await.remove(&bg_run_id);
@@ -8359,6 +8420,15 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             Self::build_tracked_run_state(run_id.clone(), session_id.clone(), user_id.clone());
         run_state.live_tx = Some(live_tx.clone());
 
+        let interaction_sink: Arc<dyn server_loop_host::HostInteractionSink> =
+            Arc::new(DurableHostInteractionSink {
+                run_engine: self.run_engine.clone(),
+                user_id: user_id.clone(),
+                run_id: run_id.clone(),
+                session_id: session_id.clone(),
+                agent_id: None,
+                event_tx: Some(event_tx.clone()),
+            });
         let mut state = self.build_initial_state_inner(
             &user_id,
             &request,
@@ -8369,6 +8439,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 .or(server_workspace.as_deref()),
             execution_bindings.as_ref(),
             Some(llm_cancel_token.clone()),
+            Some(Arc::clone(&interaction_sink)),
             request_constraints.clone(),
             &edge_context,
             Some(&edge_profile),
@@ -8521,14 +8592,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             }
         });
         host.set_event_tx_with_gap(host_event_tx, host_event_gap);
-        host.set_interaction_sink(Arc::new(DurableHostInteractionSink {
-            run_engine: self.run_engine.clone(),
-            user_id: user_id.clone(),
-            run_id: run_id.clone(),
-            session_id: session_id.clone(),
-            agent_id: None,
-            event_tx: event_tx.clone(),
-        }));
+        host.set_interaction_sink(interaction_sink);
         host.set_client_cancel(cancel_flag.clone(), llm_cancel_token.clone());
         if let Some(snapshot) = execution_bindings.as_ref() {
             host.set_execution_metadata(Value::Object(binding_event_fields(
@@ -9068,6 +9132,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     }
                 }
                 park_server_root_mailbox(&mut state).await;
+                let (loop_result, emitted_events) = host.settle_loop_turn(loop_result);
                 let loop_success = loop_result.is_ok();
 
                 // Best-effort post-loop persistence (core events, tool events,
@@ -9082,7 +9147,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 }
 
                 let (final_events, final_status, error_msg) =
-                    Self::finalize_run_events(loop_result, host.take_emitted_events(), &state);
+                    Self::finalize_run_events(loop_result, emitted_events, &state);
                 if matches!(&final_status, RunStatus::Cancelled) {
                     let cancelled_children = missing_lifecycle_spawner
                         .cancel_descendants_of_parent_run(
@@ -11496,10 +11561,11 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 run_id: config.run_id.clone(),
                 session_id: config.session_id.clone(),
                 agent_id: Some(config.agent_profile.agent_id.clone()),
-                event_tx: self
-                    .client_tool_delivery_tx
-                    .clone()
-                    .expect("availability checked above"),
+                event_tx: Some(
+                    self.client_tool_delivery_tx
+                        .clone()
+                        .expect("availability checked above"),
+                ),
             }));
             host.prefer_client_tool_delivery();
         }
@@ -11864,6 +11930,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
         let live_started_at = Instant::now();
         let live_agent_id = config.agent_profile.agent_id.clone();
         let outcome = run_agentic_loop_with_host(&mut host, &mut loop_state).await;
+        let outcome = host.settle_loop_outcome(outcome);
         if matches!(&outcome, Ok(AgenticLoopOutcome::Completed)) {
             crate::turn::agentic_loop::finalization::mark_execution_incomplete_from_turn_evaluation(
                 &mut loop_state,
