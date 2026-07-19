@@ -5,9 +5,11 @@ use astra_core::{
     internal_error,
 };
 use axum::{Json, http::StatusCode};
-use sqlx::{Executor, MySql, QueryBuilder, Row, query};
-use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::OnceLock;
+use sha2::Digest;
+use sqlx::{Execute, Executor, MySql, QueryBuilder, Row, query};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::ops::Deref;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use uuid::Uuid;
 
 const CAUSAL_EDGE_KIND: &str = "causal";
@@ -49,7 +51,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-07-16-v1";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-07-19-v2";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -62,6 +64,16 @@ const CORE_SCHEMA_LEASE_TABLE_SQL: &str =
     lease_expires_at DATETIME(6) NOT NULL,
     updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
 )";
+const CORE_SCHEMA_TABLE_CONTRACT_SQL: &str =
+    "CREATE TABLE IF NOT EXISTS astra_schema_table_contracts (
+    table_name VARCHAR(128) NOT NULL PRIMARY KEY,
+    component VARCHAR(64) NOT NULL,
+    owner VARCHAR(128) NOT NULL,
+    contract_version VARCHAR(64) NOT NULL,
+    ddl_sha256 CHAR(64) NOT NULL,
+    updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    INDEX idx_schema_table_contract_component (component, contract_version, table_name)
+)";
 const CORE_SCHEMA_VISIBILITY_PROBES: &[&str] = &[
     "SELECT 1 FROM agent_sessions LIMIT 0",
     "SELECT 1 FROM prompt_deltas LIMIT 0",
@@ -69,6 +81,174 @@ const CORE_SCHEMA_VISIBILITY_PROBES: &[&str] = &[
     "SELECT 1 FROM workspace_records LIMIT 0",
     "SELECT 1 FROM config_versions LIMIT 0",
 ];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CoreSchemaTableSpec {
+    pub name: String,
+    pub owner: String,
+    pub ddl_sha256: String,
+}
+
+#[derive(Clone, Debug)]
+struct CoreSchemaDeclaration {
+    owner: String,
+    ddl_sha256: String,
+    count: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CoreSchemaAuthority(Arc<StdMutex<BTreeMap<String, CoreSchemaDeclaration>>>);
+
+impl CoreSchemaAuthority {
+    fn observe(&self, owner: &str, sql: &str) {
+        let Some(table_name) = created_table_name(sql) else {
+            return;
+        };
+        let ddl_sha256 = format!("{:x}", sha2::Sha256::digest(sql.trim().as_bytes()));
+        let mut declarations = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        declarations
+            .entry(table_name)
+            .and_modify(|declaration| declaration.count = declaration.count.saturating_add(1))
+            .or_insert_with(|| CoreSchemaDeclaration {
+                owner: owner.to_string(),
+                ddl_sha256,
+                count: 1,
+            });
+    }
+
+    fn declarations(&self) -> Result<Vec<CoreSchemaTableSpec>, sqlx::Error> {
+        let declarations = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        let conflicts = declarations
+            .iter()
+            .filter(|(_, declaration)| declaration.count != 1)
+            .map(|(table, declaration)| format!("{table} (claims={})", declaration.count))
+            .collect::<Vec<_>>();
+        if !conflicts.is_empty() {
+            return Err(sqlx::Error::Protocol(format!(
+                "core schema has multiple lifecycle producers for tables: {}",
+                conflicts.join(", ")
+            )));
+        }
+        Ok(declarations
+            .iter()
+            .map(|(name, declaration)| CoreSchemaTableSpec {
+                name: name.clone(),
+                owner: declaration.owner.clone(),
+                ddl_sha256: declaration.ddl_sha256.clone(),
+            })
+            .collect())
+    }
+}
+
+fn created_table_name(sql: &str) -> Option<String> {
+    let tokens = sql.split_whitespace().collect::<Vec<_>>();
+    if tokens.len() < 3
+        || !tokens[0].eq_ignore_ascii_case("create")
+        || !tokens[1].eq_ignore_ascii_case("table")
+    {
+        return None;
+    }
+    let name_index = if tokens.get(2..5).is_some_and(|tokens| {
+        tokens[0].eq_ignore_ascii_case("if")
+            && tokens[1].eq_ignore_ascii_case("not")
+            && tokens[2].eq_ignore_ascii_case("exists")
+    }) {
+        5
+    } else {
+        2
+    };
+    tokens.get(name_index).map(|name| {
+        name.trim_matches(|character: char| {
+            character == '`' || character == '(' || character == ';'
+        })
+        .to_string()
+    })
+}
+
+#[derive(Clone, Debug)]
+struct CoreSchemaExecutor {
+    pool: sqlx::Pool<MySql>,
+    authority: CoreSchemaAuthority,
+    owner: &'static str,
+}
+
+impl CoreSchemaExecutor {
+    fn new(pool: sqlx::Pool<MySql>) -> Self {
+        Self {
+            pool,
+            authority: CoreSchemaAuthority::default(),
+            owner: "storage",
+        }
+    }
+
+    fn owned_by(&self, owner: &'static str) -> Self {
+        Self {
+            pool: self.pool.clone(),
+            authority: self.authority.clone(),
+            owner,
+        }
+    }
+}
+
+impl Deref for CoreSchemaExecutor {
+    type Target = sqlx::Pool<MySql>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.pool
+    }
+}
+
+impl<'c> Executor<'c> for &'c CoreSchemaExecutor {
+    type Database = MySql;
+
+    fn fetch_many<'e, 'q: 'e, E>(
+        self,
+        query: E,
+    ) -> futures_util::stream::BoxStream<
+        'e,
+        Result<sqlx::Either<sqlx::mysql::MySqlQueryResult, sqlx::mysql::MySqlRow>, sqlx::Error>,
+    >
+    where
+        'c: 'e,
+        E: 'q + Execute<'q, Self::Database>,
+    {
+        self.authority.observe(self.owner, query.sql());
+        (&self.pool).fetch_many(query)
+    }
+
+    fn fetch_optional<'e, 'q: 'e, E>(
+        self,
+        query: E,
+    ) -> futures_util::future::BoxFuture<'e, Result<Option<sqlx::mysql::MySqlRow>, sqlx::Error>>
+    where
+        'c: 'e,
+        E: 'q + Execute<'q, Self::Database>,
+    {
+        self.authority.observe(self.owner, query.sql());
+        (&self.pool).fetch_optional(query)
+    }
+
+    fn prepare_with<'e, 'q: 'e>(
+        self,
+        sql: &'q str,
+        parameters: &'e [sqlx::mysql::MySqlTypeInfo],
+    ) -> futures_util::future::BoxFuture<'e, Result<sqlx::mysql::MySqlStatement<'q>, sqlx::Error>>
+    where
+        'c: 'e,
+    {
+        (&self.pool).prepare_with(sql, parameters)
+    }
+
+    fn describe<'e, 'q: 'e>(
+        self,
+        sql: &'q str,
+    ) -> futures_util::future::BoxFuture<'e, Result<sqlx::Describe<MySql>, sqlx::Error>>
+    where
+        'c: 'e,
+    {
+        (&self.pool).describe(sql)
+    }
+}
 
 pub(crate) fn rows_affected_to_i64(rows: u64, context: &str) -> Result<i64, sqlx::Error> {
     i64::try_from(rows).map_err(|_| {
@@ -293,6 +473,7 @@ impl Drop for CoreSchemaDatabaseLease {
 
 async fn core_schema_contract_is_current(pool: &sqlx::Pool<MySql>) -> Result<bool, sqlx::Error> {
     query(CORE_SCHEMA_CONTRACT_TABLE_SQL).execute(pool).await?;
+    query(CORE_SCHEMA_TABLE_CONTRACT_SQL).execute(pool).await?;
     let persisted: Option<String> = sqlx::query_scalar(
         "SELECT contract_version FROM astra_schema_contracts WHERE component = ?",
     )
@@ -302,16 +483,127 @@ async fn core_schema_contract_is_current(pool: &sqlx::Pool<MySql>) -> Result<boo
     match persisted {
         None => Ok(false),
         Some(version) if version == CORE_SCHEMA_CONTRACT_VERSION => Ok(true),
-        Some(version) => Err(sqlx::Error::Protocol(format!(
-            "core schema contract mismatch: database has {version}, binary requires {CORE_SCHEMA_CONTRACT_VERSION}; provision a database with the current canonical schema"
-        ))),
+        Some(_) => Ok(false),
     }
+}
+
+pub async fn load_core_schema_table_contracts(
+    pool: &sqlx::Pool<MySql>,
+) -> Result<Vec<CoreSchemaTableSpec>, sqlx::Error> {
+    query(
+        "SELECT table_name, owner, ddl_sha256
+         FROM astra_schema_table_contracts
+         WHERE component = ? AND contract_version = ?
+         ORDER BY table_name",
+    )
+    .bind(CORE_SCHEMA_CONTRACT_COMPONENT)
+    .bind(CORE_SCHEMA_CONTRACT_VERSION)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|row| {
+        Ok(CoreSchemaTableSpec {
+            name: row.try_get("table_name")?,
+            owner: row.try_get("owner")?,
+            ddl_sha256: row.try_get("ddl_sha256")?,
+        })
+    })
+    .collect()
+}
+
+async fn verify_core_schema_catalog(
+    pool: &sqlx::Pool<MySql>,
+    database: &str,
+) -> Result<(), sqlx::Error> {
+    let rows = query("SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = ?")
+        .bind(database)
+        .fetch_all(pool)
+        .await?;
+    let existing = rows
+        .into_iter()
+        .map(|row| row.try_get::<String, _>("TABLE_NAME"))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let contracts = load_core_schema_table_contracts(pool).await?;
+    if contracts.is_empty() {
+        return Err(sqlx::Error::Protocol(
+            "core schema table authority is empty for the current contract".to_string(),
+        ));
+    }
+    let malformed = contracts
+        .iter()
+        .filter(|table| {
+            table.name.trim().is_empty()
+                || table.owner.trim().is_empty()
+                || table.ddl_sha256.len() != 64
+        })
+        .map(|table| table.name.clone())
+        .collect::<Vec<_>>();
+    if !malformed.is_empty() {
+        return Err(sqlx::Error::Protocol(format!(
+            "core schema table authority contains malformed claims: {}",
+            malformed.join(", ")
+        )));
+    }
+    let missing = contracts
+        .iter()
+        .filter(|table| !existing.contains(&table.name))
+        .map(|table| format!("{} (owner={})", table.name, table.owner))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(sqlx::Error::Protocol(format!(
+            "core schema catalog is incomplete after bootstrap: missing {}",
+            missing.join(", ")
+        )))
+    }
+}
+
+async fn publish_core_schema_table_contracts(
+    pool: &sqlx::Pool<MySql>,
+    declarations: &[CoreSchemaTableSpec],
+) -> Result<(), sqlx::Error> {
+    if declarations.is_empty() {
+        return Err(sqlx::Error::Protocol(
+            "core schema bootstrap produced no table declarations".to_string(),
+        ));
+    }
+    let mut transaction = pool.begin().await?;
+    query("DELETE FROM astra_schema_table_contracts WHERE component = ?")
+        .bind(CORE_SCHEMA_CONTRACT_COMPONENT)
+        .execute(&mut *transaction)
+        .await?;
+    for declaration in declarations {
+        query(
+            "INSERT INTO astra_schema_table_contracts
+             (table_name, component, owner, contract_version, ddl_sha256)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(&declaration.name)
+        .bind(CORE_SCHEMA_CONTRACT_COMPONENT)
+        .bind(&declaration.owner)
+        .bind(CORE_SCHEMA_CONTRACT_VERSION)
+        .bind(&declaration.ddl_sha256)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| {
+            sqlx::Error::Protocol(format!(
+                "schema table {} is already claimed by another lifecycle owner: {error}",
+                declaration.name
+            ))
+        })?;
+    }
+    transaction.commit().await
 }
 
 async fn mark_core_schema_contract_current(
     pool: &sqlx::Pool<MySql>,
     holder_id: &str,
 ) -> Result<(), sqlx::Error> {
+    query("DELETE FROM astra_schema_contracts WHERE component = ?")
+        .bind(CORE_SCHEMA_CONTRACT_COMPONENT)
+        .execute(pool)
+        .await?;
     let result = query(
         "INSERT INTO astra_schema_contracts (component, contract_version) \
          SELECT ?, ? FROM astra_schema_bootstrap_leases \
@@ -1377,13 +1669,25 @@ async fn ensure_core_schema_while_leased(
     holder_id: &str,
 ) -> Result<(), sqlx::Error> {
     if core_schema_contract_is_current(&pool).await? {
-        return Ok(());
+        return verify_core_schema_catalog(&pool, &settings.database).await;
     }
 
     // Existing deployments may still have UUID-sized identity columns. Widen
     // them before table-specific shape checks run so every persistence path
     // observes the same principal contract during startup.
     migrate_user_identity_column_widths(&pool, &settings.database).await?;
+
+    // The executor observes the exact CREATE TABLE statements that bootstrap
+    // executes. This makes DDL the declaration and the ownership catalog its
+    // generated contract, rather than maintaining a second list of names.
+    let pool = CoreSchemaExecutor::new(pool);
+    for ddl in [
+        CORE_SCHEMA_CONTRACT_TABLE_SQL,
+        CORE_SCHEMA_LEASE_TABLE_SQL,
+        CORE_SCHEMA_TABLE_CONTRACT_SQL,
+    ] {
+        pool.authority.observe("storage", ddl);
+    }
 
     // Auth
     query(
@@ -1687,7 +1991,11 @@ async fn ensure_core_schema_while_leased(
         )
         .await?;
     }
-    crate::workspace_records::ensure_workspace_record_tables(&pool).await?;
+    let workspace_schema = pool.owned_by("workspace_records");
+    for ddl in crate::workspace_records::WORKSPACE_RECORD_TABLE_DDLS {
+        query(ddl).execute(&workspace_schema).await?;
+    }
+    crate::workspace_records::verify_workspace_record_tables(&workspace_schema).await?;
 
     // ── Durable web-agent run state (Phase 1 / G15 + G19) ────────────────
     query(
@@ -5557,9 +5865,12 @@ async fn ensure_core_schema_while_leased(
     // that the push / pull pipeline uses.
 
     query(crate::config_version_cloud::CONFIG_VERSIONS_CREATE_SQL)
-        .execute(&pool)
+        .execute(&pool.owned_by("config_version_cloud"))
         .await?;
 
+    let declarations = pool.authority.declarations()?;
+    publish_core_schema_table_contracts(&pool, &declarations).await?;
+    verify_core_schema_catalog(&pool, &settings.database).await?;
     mark_core_schema_contract_current(&pool, holder_id).await?;
     Ok(())
 }
@@ -7094,78 +7405,35 @@ mod tests {
     }
 
     #[test]
-    fn production_tables_have_one_schema_owner_across_the_workspace() {
-        fn rust_sources_under(directory: &std::path::Path, output: &mut Vec<std::path::PathBuf>) {
-            let mut entries = std::fs::read_dir(directory)
-                .unwrap_or_else(|error| panic!("read {}: {error}", directory.display()))
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap_or_else(|error| {
-                    panic!("read entry under {}: {error}", directory.display())
-                });
-            entries.sort_by_key(|entry| entry.path());
-            for entry in entries {
-                let path = entry.path();
-                if path.is_dir() {
-                    if path.file_name().is_some_and(|name| name == "tests") {
-                        continue;
-                    }
-                    rust_sources_under(&path, output);
-                } else if path.extension().is_some_and(|extension| extension == "rs") {
-                    output.push(path);
-                }
-            }
-        }
-
-        let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(std::path::Path::parent)
-            .expect("services crate must live under <workspace>/crates");
-        let crates_root = workspace_root.join("crates");
-        let mut sources = Vec::new();
-        rust_sources_under(&crates_root, &mut sources);
-        let marker = "CREATE TABLE IF NOT EXISTS ";
-        let mut owners = std::collections::BTreeMap::<String, Vec<String>>::new();
-        for path in sources {
-            let source = std::fs::read_to_string(&path)
-                .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
-            // Production modules keep inline tests behind a terminal cfg(test)
-            // module. Test fixtures must not become competing schema owners.
-            let production = source.split("#[cfg(test)]").next().unwrap_or(&source);
-            let uncommented = production
-                .lines()
-                .filter(|line| !line.trim_start().starts_with("//"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            for rest in uncommented.split(marker).skip(1) {
-                let table = rest
-                    .chars()
-                    .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
-                    .collect::<String>();
-                assert!(
-                    !table.is_empty(),
-                    "{} has a CREATE TABLE declaration without a parseable table name",
-                    path.display()
-                );
-                let owner = path
-                    .strip_prefix(workspace_root)
-                    .unwrap_or(&path)
-                    .display()
-                    .to_string();
-                owners.entry(table).or_default().push(owner);
-            }
-        }
-
-        let duplicates: Vec<_> = owners
-            .into_iter()
-            .filter_map(|(table, owners)| {
-                (owners.len() > 1).then_some(format!("{table} => {}", owners.join(", ")))
-            })
-            .collect();
-        assert!(
-            duplicates.is_empty(),
-            "each production table must have exactly one DDL owner; duplicate owners: {}",
-            duplicates.join("; ")
+    fn core_schema_authority_is_derived_from_executed_ddl() {
+        let authority = CoreSchemaAuthority::default();
+        authority.observe(
+            "storage",
+            "CREATE TABLE IF NOT EXISTS canonical_table (id BIGINT PRIMARY KEY)",
         );
+        authority.observe(
+            "storage",
+            "ALTER TABLE canonical_table ADD COLUMN value TEXT",
+        );
+
+        let declarations = authority.declarations().unwrap();
+        assert_eq!(declarations.len(), 1);
+        assert_eq!(declarations[0].name, "canonical_table");
+        assert_eq!(declarations[0].owner, "storage");
+        assert_eq!(declarations[0].ddl_sha256.len(), 64);
+    }
+
+    #[test]
+    fn core_schema_authority_rejects_multiple_lifecycle_producers() {
+        let authority = CoreSchemaAuthority::default();
+        authority.observe("storage", "CREATE TABLE duplicate_owner (id BIGINT)");
+        authority.observe(
+            "another_module",
+            "CREATE TABLE IF NOT EXISTS duplicate_owner (id BIGINT)",
+        );
+
+        let error = authority.declarations().unwrap_err().to_string();
+        assert!(error.contains("duplicate_owner (claims=2)"), "{error}");
     }
 
     #[test]

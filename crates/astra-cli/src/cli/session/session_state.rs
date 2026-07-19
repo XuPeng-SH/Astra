@@ -401,6 +401,10 @@ pub(crate) struct SessionState {
     pub dead_letter_queue: Option<std::sync::Arc<astra_messaging::dead_letter::DeadLetterQueue>>,
     /// Dynamic agent spawner for runtime agent creation.
     pub agent_spawner: Option<std::sync::Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
+    /// Session-scoped typed authority for every asynchronous work kind. Model
+    /// boundaries consume this registry instead of querying UI projections or
+    /// one producer-specific cache.
+    pub active_work_registry: std::sync::Arc<astra_core::work_unit::ActiveWorkRegistry>,
     /// Persistent top-level mailbox so spawned agents can reply across turns.
     pub root_mailbox: Option<astra_messaging::router::AgentMailbox>,
     /// Replies received while the REPL is idle at the prompt. Flushed only at safe redraw points.
@@ -678,6 +682,9 @@ impl Default for SessionState {
                 astra_messaging::dead_letter::DeadLetterQueue::new(),
             )),
             agent_spawner: None, // Created lazily when agent spawning is first used
+            active_work_registry: std::sync::Arc::new(
+                astra_core::work_unit::ActiveWorkRegistry::default(),
+            ),
             root_mailbox: None,
             redo_stack: Vec::new(),
             resume_guidance: None,
@@ -787,6 +794,12 @@ impl SessionState {
     /// session boundary; this synchronous reset does not tear down the
     /// asynchronously registered root mailbox.
     pub fn reset_for_new_session(&mut self) {
+        // A registry generation belongs to exactly one session. Old producers
+        // may still be retiring after the bounded rebind deadline; replacing
+        // the Arc keeps their late observations isolated from the new model
+        // boundary without requiring unbounded shutdown waits.
+        self.active_work_registry =
+            std::sync::Arc::new(astra_core::work_unit::ActiveWorkRegistry::default());
         self.pending_recovery = None;
         self.run_id = None;
         *astra_core::sync_poison::recover_mutex_lock(&self.active_turn_local_run_control) = None;
@@ -1002,6 +1015,53 @@ mod default_tests {
         assert!(state.pending_bg_notifications.is_empty());
         assert_eq!(state.turns_since_task_use, 0);
         assert_eq!(state.turns_since_task_reminder, 0);
+    }
+
+    #[test]
+    fn reset_for_new_session_rotates_active_work_generation() {
+        use astra_core::work_unit::{WorkUnitObservation, WorkUnitObservationMode, WorkUnitStatus};
+
+        let mut state = SessionState::default();
+        let old_registry = state.active_work_registry.clone();
+        let old_running = WorkUnitObservation::new(
+            "agent-old",
+            "agent",
+            WorkUnitStatus::Running,
+            1,
+            WorkUnitObservationMode::Transition,
+        )
+        .unwrap();
+        old_registry.observe(&old_running);
+
+        state.reset_for_new_session();
+
+        assert!(!std::sync::Arc::ptr_eq(
+            &old_registry,
+            &state.active_work_registry
+        ));
+        assert!(
+            state
+                .active_work_registry
+                .active_work_observations()
+                .is_empty()
+        );
+
+        let late_old_observation = WorkUnitObservation::new(
+            "agent-late",
+            "agent",
+            WorkUnitStatus::Running,
+            1,
+            WorkUnitObservationMode::Transition,
+        )
+        .unwrap();
+        old_registry.observe(&late_old_observation);
+        assert!(
+            state
+                .active_work_registry
+                .active_work_observations()
+                .is_empty(),
+            "late observations from a retiring producer must remain in the old generation"
+        );
     }
 
     #[test]
