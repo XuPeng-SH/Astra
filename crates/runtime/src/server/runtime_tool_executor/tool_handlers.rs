@@ -152,12 +152,12 @@ impl ToolHandler<RuntimeToolExecutor> for ToolSearchToolHandler {
 #[derive(Debug, Clone, Copy, Default)]
 struct MemoryToolHandler;
 
-#[async_trait]
-impl ToolHandler<RuntimeToolExecutor> for MemoryToolHandler {
-    async fn execute(
+impl MemoryToolHandler {
+    async fn execute_for_producer(
         &self,
         context: &RuntimeToolExecutor,
         args: &Value,
+        producer_id: Option<&str>,
         cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
         // P2-C: Cooperative cancellation check at heavy handler entry
@@ -172,7 +172,7 @@ impl ToolHandler<RuntimeToolExecutor> for MemoryToolHandler {
                 return astra_tools::ToolResult::error(format!("Error: {error}"));
             }
         };
-        if action == astra_tools::memory_tool_contract::MemoryAction::Inventory {
+        if action == astra_tools::memory_tool_contract::MemoryAction::SessionAudit {
             let inventory = if let Some(shared_pool) = context.context_manifest_pool.as_ref() {
                 match astra_services::session_memory_inventory::load_database_session_memory_inventory(
                     shared_pool.get(),
@@ -184,7 +184,7 @@ impl ToolHandler<RuntimeToolExecutor> for MemoryToolHandler {
                     Ok(inventory) => inventory,
                     Err(error) => {
                         return astra_tools::ToolResult::error(format!(
-                            "Error: session memory inventory failed: {error}"
+                            "Error: session memory extraction audit failed: {error}"
                         ));
                     }
                 }
@@ -195,7 +195,7 @@ impl ToolHandler<RuntimeToolExecutor> for MemoryToolHandler {
                     Ok(inventory) => inventory,
                     Err(error) => {
                         return astra_tools::ToolResult::error(format!(
-                            "Error: session memory inventory failed: {error}"
+                            "Error: session memory extraction audit failed: {error}"
                         ));
                     }
                 }
@@ -203,15 +203,18 @@ impl ToolHandler<RuntimeToolExecutor> for MemoryToolHandler {
             return match serde_json::to_string(&inventory) {
                 Ok(output) => astra_tools::ToolResult::text(output),
                 Err(error) => astra_tools::ToolResult::error(format!(
-                    "Error: serialize session memory inventory: {error}"
+                    "Error: serialize session memory extraction audit: {error}"
                 )),
             };
         }
+        let turn = context.journal_turn_index.load(Ordering::Relaxed);
+        let fallback_producer = format!("server-turn:{turn}");
         let isolated_args = memory_args_with_context(
             args,
             &context.session_id,
             &context.user_id,
-            context.journal_turn_index.load(Ordering::Relaxed),
+            turn,
+            producer_id.unwrap_or(&fallback_producer),
         );
         let output = context
             .memoria_client
@@ -222,6 +225,30 @@ impl ToolHandler<RuntimeToolExecutor> for MemoryToolHandler {
         } else {
             astra_tools::ToolResult::text(output)
         }
+    }
+}
+
+#[async_trait]
+impl ToolHandler<RuntimeToolExecutor> for MemoryToolHandler {
+    async fn execute(
+        &self,
+        context: &RuntimeToolExecutor,
+        args: &Value,
+        cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
+        self.execute_for_producer(context, args, None, cancel_token)
+            .await
+    }
+
+    async fn execute_invocation(
+        &self,
+        context: &RuntimeToolExecutor,
+        args: &Value,
+        invocation: ToolInvocationMetadata<'_>,
+        cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
+        self.execute_for_producer(context, args, invocation.run_id, cancel_token)
+            .await
     }
 }
 

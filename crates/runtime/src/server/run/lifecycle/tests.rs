@@ -393,6 +393,31 @@ fn post_loop_memory_cleanup_permit_respects_limit() {
     );
 }
 
+#[test]
+fn session_only_post_loop_boundary_does_not_consume_run_owned_attribution() {
+    let session_id = "server-run-selection-boundary";
+    astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(session_id);
+    astra_tools::memoria::MemoriaToolGateway::record_recall_for_producer(
+        session_id,
+        "run-1",
+        1,
+        vec!["memory-1".to_string()],
+    );
+
+    finish_post_loop_memory_run_boundary(session_id, None);
+
+    assert_eq!(
+        astra_tools::memoria::MemoriaToolGateway::pending_recall_count(session_id),
+        1,
+        "a session-only hook cannot consume a concurrent run's recall"
+    );
+    assert!(
+        astra_tools::memoria::MemoriaToolGateway::latest_selection_context(session_id).is_some(),
+        "a follow-up run must retain the producer-owned selection receipt"
+    );
+    astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(session_id);
+}
+
 #[tokio::test]
 async fn post_loop_memory_cleanup_metrics_stay_low_cardinality() {
     let _memoria = EnvVarGuard::remove("MEMORIA_MASTER_KEY");

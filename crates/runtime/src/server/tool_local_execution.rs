@@ -28,7 +28,14 @@ pub(crate) struct LocalToolPreflightContext<'a> {
     pub(crate) plan_mode_authoring_active: bool,
 }
 
-pub(crate) async fn run_local_tool_preflight(
+pub(crate) fn validate_local_tool_arguments(name: &str, args: &Value) -> LocalToolPreflight {
+    if let Err(error) = astra_tools::schemas::validate_tool_arguments(name, args) {
+        return LocalToolPreflight::ShortCircuit(error.into_tool_result());
+    }
+    LocalToolPreflight::Continue
+}
+
+pub(crate) async fn run_local_tool_policy_preflight(
     context: LocalToolPreflightContext<'_>,
     name: &str,
     args: &Value,
@@ -126,6 +133,7 @@ pub(crate) fn memory_args_with_context(
     session_id: &str,
     user_id: &str,
     turn_index: u32,
+    producer_id: &str,
 ) -> Value {
     let mut isolated_args = args.clone();
     if let Some(obj) = isolated_args.as_object_mut() {
@@ -138,6 +146,10 @@ pub(crate) fn memory_args_with_context(
         obj.insert(
             "turn".to_string(),
             Value::Number(serde_json::Number::from(turn_index)),
+        );
+        obj.insert(
+            "_attribution_id".to_string(),
+            Value::String(producer_id.to_string()),
         );
     }
     isolated_args
@@ -162,6 +174,7 @@ pub(crate) fn normalize_local_tool_result_output(
 
 pub(crate) fn spawn_memory_recall_feedback_after_success(
     session_id: &str,
+    producer_id: &str,
     name: &str,
     result: &astra_tools::ToolResult,
     memoria_client: &astra_tools::memoria::MemoriaToolGateway,
@@ -171,6 +184,7 @@ pub(crate) fn spawn_memory_recall_feedback_after_success(
     }
 
     let session_id = session_id.to_string();
+    let producer_id = producer_id.to_string();
     let context = format!("server-tool:{name}");
     let client = astra_tools::memoria::MemoriaToolGateway::new(
         memoria_client.cloud_base.clone(),
@@ -179,7 +193,7 @@ pub(crate) fn spawn_memory_recall_feedback_after_success(
     tokio::spawn(
         async move {
             let report = client
-                .feedback_pending_recalls(&session_id, "useful", &context)
+                .feedback_pending_recalls(&session_id, &producer_id, "useful", &context)
                 .await;
             if report.attempted > 0 {
                 tracing::debug!(
@@ -208,6 +222,7 @@ pub(crate) fn spawn_memory_recall_feedback_after_success(
 
 pub(crate) struct LocalToolExecutionLifecycle<'a> {
     pub(crate) session_id: &'a str,
+    pub(crate) producer_id: &'a str,
     pub(crate) aggregate_output_bytes: &'a AtomicUsize,
     pub(crate) memoria_client: &'a astra_tools::memoria::MemoriaToolGateway,
     pub(crate) progress_callback: Option<&'a dyn astra_tools::ToolProgressCallback>,
@@ -231,6 +246,7 @@ impl<'a> LocalToolExecutionLifecycle<'a> {
         normalize_local_tool_result_output(name, &mut result, self.aggregate_output_bytes);
         spawn_memory_recall_feedback_after_success(
             self.session_id,
+            self.producer_id,
             name,
             &result,
             self.memoria_client,
@@ -281,6 +297,26 @@ mod tests {
     }
 
     #[test]
+    fn server_preflight_rejects_invalid_arguments_before_policy_and_execution() {
+        let result = validate_local_tool_arguments(
+            "memory",
+            &json!({"action": "forget", "memory_id": "m1"}),
+        );
+
+        let LocalToolPreflight::ShortCircuit(result) = result else {
+            panic!("invalid built-in arguments must short-circuit server execution");
+        };
+        assert_eq!(
+            result
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("error_kind"))
+                .and_then(Value::as_str),
+            Some(astra_core::ErrorKind::ToolInvalidArgs.as_str())
+        );
+    }
+
+    #[test]
     fn memory_args_include_session_user_and_turn_without_action() {
         let args = memory_args_with_context(
             &json!({
@@ -290,12 +326,14 @@ mod tests {
             "session-1",
             "user-1",
             12,
+            "run-1",
         );
 
         assert!(args.get("action").is_none());
         assert_eq!(args["session_id"].as_str(), Some("session-1"));
         assert_eq!(args["user_id"].as_str(), Some("user-1"));
         assert_eq!(args["turn"].as_u64(), Some(12));
+        assert_eq!(args["_attribution_id"].as_str(), Some("run-1"));
     }
 
     #[test]
@@ -317,12 +355,14 @@ mod tests {
 
         assert!(!spawn_memory_recall_feedback_after_success(
             "session-1",
+            "run-1",
             "memory",
             &ok_memory,
             &client,
         ));
         assert!(!spawn_memory_recall_feedback_after_success(
             "session-1",
+            "run-1",
             "bash",
             &failed,
             &client,

@@ -1638,9 +1638,8 @@ impl<'a> CliSseStreamHost<'a> {
     }
 
     fn has_batch_transaction_metadata(args: &Value) -> bool {
-        args.as_object().is_some_and(|obj| {
-            obj.contains_key("transaction_id") || obj.contains_key("rollback_on_failure")
-        })
+        args.as_object()
+            .is_some_and(|obj| obj.contains_key("transaction_id"))
     }
 
     fn parse_batch_transaction_metadata(
@@ -1649,6 +1648,13 @@ impl<'a> CliSseStreamHost<'a> {
         let Some(obj) = args.as_object() else {
             return Ok(None);
         };
+
+        // `rollback_on_failure` is also a legitimate producer-owned field for
+        // tools such as agent.run_chain. The batch protocol owns it only when
+        // an explicit transaction_id selects that protocol.
+        if !obj.contains_key("transaction_id") {
+            return Ok(None);
+        }
 
         let transaction_id = match obj.get("transaction_id") {
             Some(Value::String(id)) if !id.trim().is_empty() => Some(id.trim().to_string()),
@@ -1670,15 +1676,29 @@ impl<'a> CliSseStreamHost<'a> {
         };
 
         match (transaction_id, rollback_on_failure) {
-            (None, None | Some(false)) => Ok(None),
-            (None, Some(true)) => {
-                Err("transaction_id is required when rollback_on_failure=true.".to_string())
-            }
+            (None, _) => unreachable!("transaction_id presence was checked above"),
             (Some(id), Some(true)) => Ok(Some(BatchTransactionMetadata { id })),
             (Some(id), None | Some(false)) => Err(format!(
                 "transaction `{id}` requires rollback_on_failure=true."
             )),
         }
+    }
+
+    /// Return only producer-owned tool arguments after the batch protocol has
+    /// consumed its transaction envelope. Transaction controls are not part of
+    /// any tool's advertised schema and must not leak into permission checks or
+    /// execution as if every tool independently owned them.
+    fn batch_tool_args(args: &Value, transaction: Option<&BatchTransactionMetadata>) -> Value {
+        if transaction.is_none() {
+            return args.clone();
+        }
+        let Some(object) = args.as_object() else {
+            return args.clone();
+        };
+        let mut tool_args = object.clone();
+        tool_args.remove("transaction_id");
+        tool_args.remove("rollback_on_failure");
+        Value::Object(tool_args)
     }
 
     fn batch_transaction_boundary_supported(tool: &str, args: &Value) -> bool {
@@ -2385,8 +2405,9 @@ impl<'a> CliSseStreamHost<'a> {
                 }
             }
 
+            let tool_args = Self::batch_tool_args(&req.args, metadata.as_ref());
             let mut result = self
-                .execute_tool(&req.request_id, &req.tool, &req.args)
+                .execute_tool(&req.request_id, &req.tool, &tool_args)
                 .await;
 
             if let Some(active) = active_tx.as_ref() {
@@ -9388,6 +9409,25 @@ mod tests {
             "git",
             &serde_json::json!({"action": "push"})
         ));
+    }
+
+    #[test]
+    fn tool_owned_rollback_flag_does_not_select_batch_transaction_protocol() {
+        let args = serde_json::json!({
+            "action": "run_chain",
+            "name": "review",
+            "description": "Review the current change",
+            "steps": [{"tool": "read_file", "args": {"path": "README.md"}}],
+            "rollback_on_failure": true,
+        });
+
+        assert!(!CliSseStreamHost::has_batch_transaction_metadata(&args));
+        assert!(
+            CliSseStreamHost::parse_batch_transaction_metadata(&args)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(CliSseStreamHost::batch_tool_args(&args, None), args);
     }
 
     #[serial_test::serial]

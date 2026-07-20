@@ -13,6 +13,7 @@
 use astra_services::session_journal;
 use crossterm::style::Stylize;
 use std::time::Duration;
+use tokio::task::JoinSet;
 
 use super::session_guard::{ShutdownSignal, clear_panic_guard};
 use crate::cli::cli_config::cli_utils::clear_profile_last_session_if_matches_or_warn;
@@ -164,18 +165,11 @@ pub(crate) async fn finalize_session(state: &mut SessionState) {
 
     finalize_session_durable_boundary(state);
     // 3. Trigger Memoria governance + consolidation (best-effort with timeout)
-    let (gov_handle, con_handle) = if typed_memory_governance_ran {
-        (None, None)
-    } else {
-        (
-            Some(tokio::spawn(
-                edge_tools::memoria::memoria_governance_fire_and_forget(),
-            )),
-            Some(tokio::spawn(
-                edge_tools::memoria::memoria_consolidate_fire_and_forget(),
-            )),
-        )
-    };
+    let mut memory_maintenance = JoinSet::new();
+    if !typed_memory_governance_ran {
+        memory_maintenance.spawn(edge_tools::memoria::memoria_governance_fire_and_forget());
+        memory_maintenance.spawn(edge_tools::memoria::memoria_consolidate_fire_and_forget());
+    }
     // 3c. L3 knowledge backflow: promote tool/stall signal lessons to
     //     semantic T3 (mid-session copies were working T4).
     if state.turn > 0 {
@@ -212,48 +206,54 @@ pub(crate) async fn finalize_session(state: &mut SessionState) {
         }
 
         if !all_lessons.is_empty() {
-            // Store T3 semantic lessons FIRST, then purge T4 working copies.
-            // Sequenced to prevent the purge from racing ahead and deleting
-            // in-flight T3 writes that share the same topic prefix.
-            let sid_for_purge = state.session_id.clone();
-            tokio::spawn(async move {
-                edge_tools::memoria::memoria_store_lessons_fire_and_forget(
-                    all_lessons,
-                    sid_for_purge.clone(),
-                )
-                .await;
-                // Only purge AFTER store completes.
-                if let Some(sid) = sid_for_purge {
-                    let _ = edge_tools::memoria::memoria_purge(&serde_json::json!({
-                        "topic": format!("LESSON session:{sid}"),
-                        "reason": "session-end promotion to semantic T3",
-                    }))
+            // Persist synthesized lessons. Broad topic deletion is not part of
+            // the authenticated user purge contract: it cannot prove record
+            // ownership or an exact mutation receipt, so cleanup must not
+            // issue it in the background and discard the deterministic error.
+            let session_id = state.session_id.clone();
+            memory_maintenance.spawn(async move {
+                edge_tools::memoria::memoria_store_lessons_fire_and_forget(all_lessons, session_id)
                     .await;
-                }
-            });
-        } else if let Some(ref sid) = state.session_id {
-            // No new lessons but still purge stale T4 working copies.
-            let sid = sid.clone();
-            tokio::spawn(async move {
-                let _ = edge_tools::memoria::memoria_purge(&serde_json::json!({
-                    "topic": format!("LESSON session:{sid}"),
-                    "reason": "session-end cleanup (no new lessons)",
-                }))
-                .await;
             });
         }
     }
-    // 4. Await Memoria maintenance (bounded 5s so we don't hang on exit)
-    let _ = tokio::time::timeout(Duration::from_secs(5), async {
-        if let Some(handle) = gov_handle {
-            let _ = handle.await;
-        }
-        if let Some(handle) = con_handle {
-            let _ = handle.await;
+    // 4. Await Memoria maintenance (bounded 5s so we don't hang on exit).
+    // A dropped JoinHandle detaches its task, so timeout must explicitly abort
+    // and drain every unfinished child before releasing the session boundary.
+    let aborted = settle_memory_maintenance(&mut memory_maintenance, Duration::from_secs(5)).await;
+    if aborted > 0 {
+        tracing::warn!(
+            target: "session_cleanup",
+            aborted,
+            "session-memory maintenance exceeded the shutdown budget and was cancelled"
+        );
+    }
+    finalize_session_process_boundary(state);
+}
+
+async fn settle_memory_maintenance(tasks: &mut JoinSet<()>, deadline: Duration) -> usize {
+    let timed_out = tokio::time::timeout(deadline, async {
+        while let Some(result) = tasks.join_next().await {
+            if let Err(error) = result {
+                tracing::warn!(
+                    target: "session_cleanup",
+                    error = %error,
+                    "session-memory maintenance task failed"
+                );
+            }
         }
     })
-    .await;
-    finalize_session_process_boundary(state);
+    .await
+    .is_err();
+
+    if !timed_out {
+        return 0;
+    }
+
+    let aborted = tasks.len();
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
+    aborted
 }
 
 /// Commit the local session boundary that must survive a slow or unavailable
@@ -288,15 +288,8 @@ pub(crate) fn finalize_session_process_boundary(state: &mut SessionState) {
         let _ = hub.end_session(session_id);
     }
     if let Some(sid) = state.session_id.as_deref() {
-        let dropped =
-            super::session_side_effects::drop_unattributed_memory_recalls_at_turn_end(Some(sid));
-        if dropped > 0 {
-            tracing::debug!(
-                session_id = %sid,
-                dropped,
-                "dropped unattributed memory recalls during session cleanup"
-            );
-        }
+        // This is the actual session boundary, so the canonical reset owns all
+        // remaining producer state. Per-turn cleanup must stay producer-scoped.
         astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(sid);
     }
     clear_panic_guard();
@@ -386,8 +379,8 @@ pub(crate) fn shutdown_session_facts(state: &SessionState) -> astra_runtime::Ses
 #[cfg(test)]
 mod tests {
     use super::{
-        SessionExit, finalize_session_exit, resume_hint_lines, should_clear_last_session_id,
-        should_show_resume_hint, shutdown_session_facts,
+        SessionExit, finalize_session_exit, resume_hint_lines, settle_memory_maintenance,
+        should_clear_last_session_id, should_show_resume_hint, shutdown_session_facts,
     };
     use crate::cli::cli_config::cli_utils::{
         CredentialsFile, Profile, load_credentials, save_credentials,
@@ -395,6 +388,39 @@ mod tests {
     use crate::cli::session::session_guard::ShutdownSignal;
     use crate::cli::session::session_state::SessionState;
     use astra_services::session_journal::JournalEvent;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+    use tokio::task::JoinSet;
+
+    struct DropSignal(Arc<AtomicBool>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    #[tokio::test]
+    async fn timed_out_memory_maintenance_is_cancelled_and_drained() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let mut tasks = JoinSet::new();
+        let task_dropped = Arc::clone(&dropped);
+        tasks.spawn(async move {
+            let _drop_signal = DropSignal(task_dropped);
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.expect("maintenance task must start");
+
+        assert_eq!(
+            settle_memory_maintenance(&mut tasks, Duration::ZERO).await,
+            1
+        );
+        assert!(tasks.is_empty());
+        assert!(dropped.load(Ordering::Acquire));
+    }
 
     #[test]
     fn resume_hint_is_shown_for_graceful_exit_paths() {

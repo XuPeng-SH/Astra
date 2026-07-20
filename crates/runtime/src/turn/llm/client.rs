@@ -1426,6 +1426,82 @@ fn strip_unsupported_schema_fields(value: &mut Value) {
 fn strip_internal_schema_extensions(value: &mut Value) {
     match value {
         Value::Object(object) => {
+            // Providers reject Astra's vendor extensions, but deleting them
+            // used to delete the only precise per-action argument contract as
+            // well. Materialize one compact, deterministic description before
+            // stripping so the provider sees the same contract the executor
+            // enforces without relying on unsupported schema composition.
+            let mut requirements = Vec::new();
+            if let Some(per_action) = object
+                .get(astra_tools::schemas::PER_ACTION_REQUIRED_KEY)
+                .and_then(Value::as_object)
+            {
+                for (action, fields) in per_action {
+                    let fields = fields
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>();
+                    if !fields.is_empty() {
+                        requirements.push(format!("{action} requires {}", fields.join(" + ")));
+                    }
+                }
+            }
+            if let Some(per_action) = object
+                .get(astra_tools::schemas::PER_ACTION_ANY_OF_REQUIRED_KEY)
+                .and_then(Value::as_object)
+            {
+                for (action, alternatives) in per_action {
+                    let alternatives = alternatives
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_array)
+                        .map(|fields| {
+                            fields
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .collect::<Vec<_>>()
+                                .join(" + ")
+                        })
+                        .filter(|fields| !fields.is_empty())
+                        .collect::<Vec<_>>();
+                    if !alternatives.is_empty() {
+                        requirements.push(format!(
+                            "{action} also requires one of {}",
+                            alternatives.join(" or ")
+                        ));
+                    }
+                }
+            }
+            if let Some(per_action) = object
+                .get(astra_tools::schemas::PER_ACTION_ALLOWED_KEY)
+                .and_then(Value::as_object)
+            {
+                for (action, fields) in per_action {
+                    let fields = fields
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>();
+                    if !fields.is_empty() {
+                        requirements.push(format!("{action} accepts only {}", fields.join(" + ")));
+                    }
+                }
+            }
+            if !requirements.is_empty() {
+                let contract = format!("Action contract: {}.", requirements.join("; "));
+                let description = object
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|description| !description.is_empty())
+                    .map(|description| format!("{description} {contract}"))
+                    .unwrap_or(contract);
+                object.insert("description".to_string(), Value::String(description));
+            }
             object.retain(|key, _| !key.starts_with("x-astra-"));
             for child in object.values_mut() {
                 strip_internal_schema_extensions(child);
@@ -10324,6 +10400,10 @@ mod tests {
         // Top-level required + properties + enum must survive.
         assert_eq!(schema["required"], json!(["action"]));
         assert!(schema["properties"]["action"].get("enum").is_some());
+        assert_eq!(
+            schema["description"],
+            "Action contract: spawn requires description + prompt."
+        );
     }
 
     #[test]
@@ -10344,6 +10424,9 @@ mod tests {
                     "required": ["action"],
                     "allOf": [{"required": ["description"]}],
                     "x-astra-per-action-required": {"spawn": ["description"]},
+                    "x-astra-per-action-allowed": {
+                        "spawn": ["action", "description"]
+                    },
                     "x-astra-discovery-summary": "spawn needs description"
                 }
             }
@@ -10357,6 +10440,10 @@ mod tests {
         );
         assert!(schema.get("x-astra-discovery-summary").is_none());
         assert_eq!(schema["required"], json!(["action"]));
+        assert_eq!(
+            schema["description"],
+            "Action contract: spawn requires description; spawn accepts only action + description."
+        );
     }
 
     #[test]
@@ -10369,6 +10456,7 @@ mod tests {
                 "parameters": {
                     "type": "object",
                     "x-astra-discovery-summary": "start needs action",
+                    "x-astra-per-action-required": {"start": ["action"]},
                     "properties": {
                         "action": {
                             "type": "string",
@@ -10396,6 +10484,10 @@ mod tests {
                 .is_none()
         );
         assert_eq!(schema["properties"]["action"]["type"], "string");
+        assert_eq!(
+            schema["description"],
+            "Action contract: start requires action."
+        );
     }
 
     // --- Regression: max_completion_tokens bump respects user's ceiling ---
